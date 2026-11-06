@@ -154,16 +154,29 @@ def truth(site: dict, day: date) -> dict:
 # ------------------------------------------------------------------------------------------------ policies
 
 def native_policy(site: dict, ts: np.ndarray) -> dict:
-    """The inverter's own table from the latest native capture (self-use with a backup floor when nothing was captured)."""
+    """The inverter's own table from the native capture (self-use with a backup floor when nothing was captured).
+
+    * Slots apply whenever the capture has them (a Deye-style TOU program is captured under the default work mode too), each with its floor, target and
+      grid-charge flag; the twin charges from the grid towards the slot's target where the flag is set.
+    * `backup` holds the battery while the grid is present (no discharge), charges it from the grid to the backup state of charge when grid charging is
+      allowed, and discharges only in outages.
+    * `feed_in_first` exports surplus PV first (up to the export cap) and charges the battery from what is left."""
     cap = (site.get("native") or {}).get("body") or {"work_mode": "self_use", "backup_soc_pct": 20.0, "slots": []}
     n = len(ts)
+    work = cap.get("work_mode") or "self_use"
+    backup = float(cap.get("backup_soc_pct", 20.0)) / 100.0
     mode = np.full(n, MODE_CODE["self_use"])
-    floor = np.full(n, cap.get("backup_soc_pct", 20.0) / 100.0)
+    floor = np.full(n, backup)
     target = np.full(n, 1.0)
     gch = np.zeros(n, dtype=bool)
+    export_first = np.full(n, work == "feed_in_first")
     slots = sorted(cap.get("slots") or [], key=lambda s: s["start"])
-    if slots and cap.get("work_mode") == "tou":
-        minute = ((ts + 5 * 3600) % 86400) // 60
+    if work == "backup":
+        mode[:] = MODE_CODE["hold"]
+        target[:] = backup
+        gch[:] = bool(cap.get("grid_charge_allowed", False))
+    elif slots:
+        minute = ((np.asarray(ts) + 5 * 3600) % 86400) // 60
         starts = [int(s["start"][:2]) * 60 + int(s["start"][3:]) for s in slots]
         for i in range(n):
             k = max((j for j, s0 in enumerate(starts) if s0 <= minute[i]), default=len(slots) - 1)
@@ -171,9 +184,9 @@ def native_policy(site: dict, ts: np.ndarray) -> dict:
             mode[i] = MODE_CODE.get(s["mode"], 0)
             floor[i] = s["soc_floor_pct"] / 100.0
             target[i] = s["soc_target_pct"] / 100.0
-            gch[i] = s.get("grid_charge", False)
+            gch[i] = bool(s.get("grid_charge", False))
     return {"mode": mode, "floor": floor, "target": target, "max_dis": np.full(n, np.inf), "max_ch": np.full(n, np.inf), "grid_charge": gch,
-            "genset": np.full(n, -1)}
+            "genset": np.full(n, -1), "export_first": export_first}
 
 
 def slots_policy(slots: list[dict], ts: np.ndarray) -> dict:
@@ -253,8 +266,14 @@ def plant_of(site: dict) -> Plant:
     return p
 
 
-def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: bool = False, gen_elapsed0: int = 0) -> dict:
-    """Run the plant minute by minute. Signs as OpenEMS: battery discharge positive, charge negative; grid import positive."""
+def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: bool = False, gen_elapsed0: int = 0, outage_min0: int = 0,
+             gen_rescue0: bool = False) -> dict:
+    """Run the plant minute by minute. Signs as OpenEMS: battery discharge positive, charge negative; grid import positive.
+
+    The genset command per minute (manual start control): 1 a planned run, 0 no planned run (a planned run's tail stops after its minimum run; the operator
+    still starts the genset when the lights would go out, and such a rescue run stops once the battery is charged or the grid returns), -1 the operator's own
+    rule (the native baseline). `gen_elapsed0`, `outage_min0` and `gen_rescue0` carry the state of a run cut into several calls (the live demo's ticks);
+    the result's `gen_elapsed_end`, `outage_min_end` and `gen_rescue_end` are what the next call takes."""
     pv_av, load, crit, grid = series["pv"], series["load"], series["crit"], series["grid"]
     n = len(pv_av)
     dt = 1.0 / 60.0
@@ -263,10 +282,14 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
     e = soc0 * plant.e_nom
     e_min, e_max = plant.soc_min * plant.e_nom, plant.soc_max * plant.e_nom
     gen_on, elapsed = gen_on0, gen_elapsed0
-    outage_min = 0
+    rescue = bool(gen_on0 and gen_rescue0)
+    outage_min = int(outage_min0)
     mode, floor, target = policy["mode"], policy["floor"], policy["target"]
     max_dis, max_ch, gch, gcmd = policy["max_dis"], policy["max_ch"], policy["grid_charge"], policy["genset"]
     gcap = policy.get("grid_cap", np.full(n, np.inf))
+    export_first = policy.get("export_first")
+    if export_first is None:
+        export_first = np.zeros(n, dtype=bool)
     has_bat = plant.e_nom > 0
     for i in range(n):
         g = grid[i] > 0.5
@@ -283,15 +306,30 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
             served = load[i]
             net = served - pv
             m = mode[i]
-            if gen_on and not plant.parallel:
-                gen_on, elapsed = False, 0
-            if m == 3:  # charge_grid, never above the slot's grid import cap (the peak-shaving setting)
+            # the genset with the grid present: a unit that may not run in parallel stops on grid return; a parallel unit runs out its minimum run and then
+            # stops unless a plan asks for a parallel run (which also starts it)
+            if gen_on:
+                if not plant.parallel or not (gcmd[i] == 1 or elapsed < plant.gen_min_run):
+                    gen_on, elapsed, rescue = False, 0, False
+                elif gcmd[i] == 1:
+                    rescue = False
+            elif plant.parallel and plant.gen_kw > 0 and plant.gen_control != "none" and gcmd[i] == 1:
+                gen_on, elapsed, rescue = True, 0, False
+            # a grid-charge flag in a self-use or hold slot charges from the grid towards the slot's target, and the battery then holds at that target
+            grid_ch = has_bat and bool(gch[i]) and m in (0, 2)
+            dis_room_m = dis_room
+            if grid_ch:
+                dis_room_m = max(0.0, (e - max(e_min, max(floor[i], target[i]) * plant.e_nom))) * plant.eta_d / dt
+            if m == 3 or (grid_ch and ch_room > 1e-9):  # charge_grid, never above the slot's grid import cap (the peak-shaving setting)
                 bat = -max(0.0, min(pch, ch_room, gcap[i] - net if net > 0 else gcap[i] + (-net)))
             elif m == 5:  # export: discharge at the cap
                 bat = min(pdis, dis_room)
             elif net > 0:
                 if m in (0, 1):
-                    bat = min(net, pdis, dis_room)
+                    bat = min(net, pdis, dis_room_m)
+            elif export_first[i]:  # feed-in first: surplus PV to the grid up to the cap, the rest into the battery
+                rest = max(0.0, -net - plant.x_max)
+                bat = -min(rest, pch, ch_room_abs if m in (0, 1) else ch_room)
             else:
                 bat = -min(-net, pch, ch_room_abs if m in (0, 1) else ch_room)
             flow = served - pv - bat
@@ -310,6 +348,10 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                 exp = min(-flow, plant.x_max)
                 curtail = -flow - exp
                 out["exp"][i] = exp
+                if curtail > pv and gen > 0:  # genset output nobody takes is not PV curtailment: the genset runs below its minimum load instead
+                    over = min(curtail - pv, gen)
+                    gen -= over
+                    curtail -= over
         else:
             outage_min += 1
             served_full = load[i]
@@ -322,19 +364,32 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                     soc_now = e / max(plant.e_nom, 1e-9)
                     want = (gen_on and soc_now < min(0.9, plant.gen_soc_on + 0.5)) or soc_now < plant.gen_soc_on or not has_bat
                 elif plant.gen_control == "manual":
+                    # the lights would go out: the battery is at its floor (or there is none) ten minutes into the outage
+                    at_floor = (not has_bat) or e <= e_min + 0.02 * plant.e_nom
+                    lights_out = at_floor and outage_min >= 10
+                    full = has_bat and e >= 0.8 * plant.e_nom
                     if gcmd[i] == 1:
                         want = outage_min >= 5
-                    elif gcmd[i] == 0:
-                        want = gen_on and elapsed < plant.gen_min_run
+                        if gen_on:
+                            rescue = False
+                    elif gcmd[i] == 0:  # no planned run: a planned run's tail stops after its minimum run; a rescue runs until the battery is charged
+                        if gen_on and rescue:
+                            want = not full
+                        elif gen_on:
+                            # past its minimum run with the battery at its floor, the operator keeps it running as a rescue rather than let the lights go out
+                            want = elapsed < plant.gen_min_run or at_floor
+                            rescue = elapsed >= plant.gen_min_run and at_floor
+                        else:
+                            want = lights_out
                     else:  # the native baseline: someone starts it when the lights would go out and stops it once the battery is charged
-                        full = has_bat and e >= 0.8 * plant.e_nom
-                        want = (gen_on and not full) or (has_bat and e <= e_min + 0.02 * plant.e_nom and outage_min >= 10) or (not has_bat and outage_min >= 10)
+                        want = (gen_on and not full) or lights_out
                 if gen_on and not want and elapsed < plant.gen_min_run:
                     want = True
             if want and not gen_on:
                 gen_on, elapsed = True, 0
+                rescue = plant.gen_control == "manual" and gcmd[i] != 1
             elif not want and gen_on:
-                gen_on, elapsed = False, 0
+                gen_on, elapsed, rescue = False, 0, False
             off_grid_site = plant.g_max <= 0
             served = served_full if off_grid_site or (plant.load_mode == 1 and gen_on) else crit[i]
             if gen_on:
@@ -343,7 +398,12 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                 surplus = gen + pv - served
                 if surplus > 0:
                     bat = -min(surplus, plant.p_ch if has_bat else 0.0, ch_room_abs)
-                    curtail = surplus + bat
+                    # what the battery cannot take curtails PV first (the genset keeps its minimum load); only then does the genset itself run below
+                    # its minimum load, which is a breach the KPIs count, never PV curtailment
+                    rest = surplus + bat
+                    pv_cut = min(rest, pv)
+                    gen -= rest - pv_cut
+                    curtail = pv_cut
                 else:
                     bat = min(-surplus, plant.p_dis, dis_room_abs)
                     unserved = -surplus - bat
@@ -374,6 +434,7 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
         out["pv"][i] = max(0.0, pv - max(0.0, curtail))
         out["soc"][i] = e / plant.e_nom if has_bat else 0.0
     out["gen_on_end"], out["gen_elapsed_end"] = gen_on, elapsed
+    out["outage_min_end"], out["gen_rescue_end"] = outage_min, bool(gen_on and rescue)
     return out
 
 

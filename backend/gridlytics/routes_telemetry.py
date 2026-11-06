@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
 from . import alerts, auth, battery, forecast, plans, sites, store, telemetry
 from .routes_common import PKT, bad, full_or_404, now_ts, out, parse_day, parse_ts, site_or_404, today
@@ -55,10 +56,71 @@ def quality(site_id: str, days: int = 14):
     return {"days": [{"day": r["day"], "completeness": r.get("completeness")} for r in rows], "first_data": first, "imports": imports}
 
 
+#: An upload's rows must lie between this day and a day from now, and one file may span at most UPLOAD_MAX_DAYS: the import aggregates every day it covers,
+#: so a row dated 1970 or 9999 (a logger with an unset clock, or a crafted file) would otherwise hold a worker for hours (plan Part 2.8: uploaded CSV is
+#: untrusted input, parsed with size and time caps)
+UPLOAD_EARLIEST = datetime(2015, 1, 1, tzinfo=timezone.utc)
+UPLOAD_MAX_DAYS = 400
+
+
+def _upload_window(content: bytes, tz_offset_h: float) -> None:
+    """Refuses (ValueError, in words) a file with a row before 2015, a row more than a day ahead, or rows spanning more than UPLOAD_MAX_DAYS. Reads only the
+    ts column, as the import reads it; rows whose ts does not parse are left to the import, which skips them."""
+    import csv
+    import io
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.reader(io.StringIO(text))
+    head = next(reader, None) or []
+    if "ts" not in head:
+        return
+    col = head.index("ts")
+    try:
+        tz = timezone(timedelta(hours=tz_offset_h))
+    except (ValueError, OverflowError):
+        raise ValueError("The timezone offset is hours from UTC, between -23 and 23") from None
+    latest = datetime.now(timezone.utc) + timedelta(days=1)
+    first = last = None
+    early = late = 0
+    for row in reader:
+        cell = (row[col] if col < len(row) else "") or ""
+        try:
+            t = datetime.fromisoformat(cell.strip().replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        try:
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=tz)
+            if t < UPLOAD_EARLIEST:
+                early += 1
+                continue
+            if t > latest:
+                late += 1
+                continue
+        except OverflowError:                       # a time at the very edge of the calendar
+            early += 1
+            continue
+        first = t if first is None or t < first else first
+        last = t if last is None or t > last else last
+    if early or late:
+        raise ValueError(f"{early + late} row{'s are' if early + late != 1 else ' is'} dated "
+                         + ("before 2015" if early and not late else "in the future" if late and not early else "before 2015 or in the future")
+                         + ": check the logger's clock (and the timezone) and upload again")
+    if first is not None and (last - first).days > UPLOAD_MAX_DAYS:
+        raise ValueError(f"The file spans {(last - first).days} days; upload at most {UPLOAD_MAX_DAYS} days per file")
+
+
+def _import(site_id: str, body: bytes, tz_offset_h: float) -> dict:
+    _upload_window(body, tz_offset_h)
+    try:
+        return telemetry.import_csv(site_id, body, tz_offset_h)
+    except (OverflowError, OSError) as exc:
+        raise ValueError(f"A row's time cannot be read: {exc}") from None
+
+
 @router.post("/api/sites/{site_id}/telemetry/upload")
 async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0):
     auth.need("upload_data", "Uploading data")
-    site_or_404(site_id)
+    await run_in_threadpool(site_or_404, site_id)
     body = await request.body()
     ctype = request.headers.get("content-type", "")
     if ctype.startswith("multipart/form-data"):
@@ -68,10 +130,11 @@ async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0):
     if not body:
         raise Refusal(422, "Send the CSV file as the request body", "invalid")
     try:
-        res = telemetry.import_csv(site_id, body, tz_offset_h)
+        # parsed and aggregated on a worker thread, never on the event loop that answers every company's requests
+        res = await run_in_threadpool(_import, site_id, body, tz_offset_h)
     except ValueError as exc:
         raise bad(exc) from None
-    store.audit(auth.actor(), "uploaded telemetry", site_id, {"rows": res["rows"], "gaps": res["gaps"]})
+    await run_in_threadpool(store.audit, auth.actor(), "uploaded telemetry", site_id, {"rows": res["rows"], "gaps": res["gaps"]})
     return res
 
 
@@ -84,8 +147,9 @@ def export(site_id: str, start: str | None = None, end: str | None = None):
     t0 = parse_ts(start, t1 - 86400)
     if t1 - t0 > 32 * 86400:
         raise Refusal(422, "Export at most 32 days at a time", "invalid")
-    return PlainTextResponse(telemetry.export_csv(site_id, t0, t1), media_type="text/csv",
-                             headers={"Content-Disposition": f'attachment; filename="{site_id}-telemetry.csv"'})
+    text = telemetry.export_csv(site_id, t0, t1)
+    store.audit(auth.actor(), "exported telemetry", site_id, {"from": t0, "to": t1})
+    return PlainTextResponse(text, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{site_id}-telemetry.csv"'})
 
 
 @router.get("/api/sites/{site_id}/events")

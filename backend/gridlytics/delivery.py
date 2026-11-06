@@ -46,6 +46,17 @@ FALLBACK_HOURS = 3
 
 # ------------------------------------------------------------------------------------------------ the compiler
 
+def grid_charging(s: dict) -> bool:
+    """Whether a step charges the battery from the grid, read from the solved flows (not from the reason, which an operator hold can name):
+    the grid is up and importing, and the charge exceeds what PV and the genset leave over after the load."""
+    if s.get("reason") == "charge_from_grid":
+        return True
+    if s.get("grid_present", 1.0) < 0.5 or s.get("grid_import_kw", 0.0) <= 0.1:
+        return False
+    local = max(0.0, s.get("pv_kw", 0.0) + s.get("genset_kw", 0.0) - s.get("load_kw", 0.0))
+    return s.get("charge_kw", 0.0) > local + 0.1
+
+
 def step_intents(steps: list[dict], battery: dict | None) -> list[dict]:
     """Per 15-minute step: the Mode A intent (mode, floor and target) from the solved flows."""
     out = []
@@ -60,7 +71,7 @@ def step_intents(steps: list[dict], battery: dict | None) -> list[dict]:
             mode = "export"
         elif s["discharge_kw"] > 0.1:
             mode = "discharge"
-        elif s["charge_kw"] > 0.1 and s["reason"] == "charge_from_grid":
+        elif s["charge_kw"] > 0.1 and grid_charging(s):
             mode = "charge_grid"
         elif s["charge_kw"] > 0.1:
             mode = "charge_pv_only"
@@ -179,10 +190,19 @@ def vendor_view(compiled: dict, day_index: int = 0) -> list[dict]:
     return rows
 
 
+def _mode_b_floor(s: dict) -> float | None:
+    """The floor the step may discharge to: the plan's reserve where it holds one, never above the state of charge it plans for the step's end
+    (a floor above the plan's own path would refuse the planned discharge)."""
+    floor, soc = s.get("reserve_pct"), s.get("soc_pct")
+    if floor is None or soc is None:
+        return floor
+    return round(min(float(floor), float(soc)), 1)
+
+
 def mode_b(steps: list[dict]) -> dict:
     return {"refresh": {"heartbeat_s": 60, "revert_after_s": 1800, "residual_band_w": 300},
-            "steps": [{"t": s["t"], "battery_power_w": round((s["discharge_kw"] - s["charge_kw"]) * 1000), "soc_floor_pct": s.get("reserve_pct"),
-                       "grid_charge_allowed": s["reason"] == "charge_from_grid", "genset_request": bool(s["genset_on"])} for s in steps]}
+            "steps": [{"t": s["t"], "battery_power_w": round((s["discharge_kw"] - s["charge_kw"]) * 1000), "soc_floor_pct": _mode_b_floor(s),
+                       "grid_charge_allowed": grid_charging(s), "genset_request": bool(s["genset_on"])} for s in steps]}
 
 
 # ------------------------------------------------------------------------------------------------ signing (Ed25519, one key per site)

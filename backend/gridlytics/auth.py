@@ -141,6 +141,10 @@ def can(permission: str) -> bool:
     user = current.get()
     if user is None:
         return open_mode()
+    if user.get("api_key"):
+        # a machine key carries scopes, not a role (plan Part 10.5): the guard limits it to its scopes and its site, and it holds no role permission, so
+        # no key sees costs or the fee, exports or changes a setting, whatever role it was made with
+        return False
     return user["role"] in PERMISSIONS[permission]
 
 

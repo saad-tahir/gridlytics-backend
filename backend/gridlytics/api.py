@@ -181,21 +181,32 @@ def _leave(markers: tuple) -> None:
     auth.current.reset(current)
 
 
-#: A 60-second cache of an API key's company (plan Part 10.6): a batch a minute per site never re-reads platform.db
+#: A 60-second cache of an API key's company (plan Part 10.6): a batch a minute per site never re-reads platform.db. Only keys that were found are kept (a
+#: made-up key would otherwise grow it by one entry per request), and it is pruned of entries past their minute when it holds _KEY_CACHE_MAX
 _KEY_CACHE: dict[str, tuple[float, dict]] = {}
 _KEY_CACHE_LOCK = threading.Lock()
+_KEY_CACHE_TTL = 60
+_KEY_CACHE_MAX = 10_000
 
 
 def _key_company(digest: str):
     now = time.monotonic()
     with _KEY_CACHE_LOCK:
         hit = _KEY_CACHE.get(digest)
-        if hit and now - hit[0] < 60:
+        if hit and now - hit[0] < _KEY_CACHE_TTL:
             return hit[1]
     held = platformdb.index_find("api_key_index", digest)
     row = (platformdb.company(held) or False) if held is not None else None
     with _KEY_CACHE_LOCK:
-        _KEY_CACHE[digest] = (now, row)
+        if row:
+            if len(_KEY_CACHE) >= _KEY_CACHE_MAX:
+                for old in [d for d, (at, _) in _KEY_CACHE.items() if now - at >= _KEY_CACHE_TTL]:
+                    del _KEY_CACHE[old]
+                if len(_KEY_CACHE) >= _KEY_CACHE_MAX:
+                    _KEY_CACHE.clear()
+            _KEY_CACHE[digest] = (now, row)
+        else:
+            _KEY_CACHE.pop(digest, None)
     return row
 
 
@@ -226,8 +237,14 @@ async def _guarded(request, call_next, rid: str):
     has_bearer = path.startswith("/api/") and not founder and bearer[:7].lower() == "bearer "
     token = bearer[7:].strip() if has_bearer else ""
     keyed = has_bearer and token.startswith(apikeys.PREFIX)
-    if api_call and not (keyed and _INGEST.match(path)) and (wait := auth.rate_wait("address", address)):
+    ingest = bool(_INGEST.match(path))
+    # the ingest paths' budget is per key (DAT-03): a key skips the address limiter there only once it is found (below), never on its shape alone
+    if api_call and not (keyed and ingest) and (wait := auth.rate_wait("address", address)):
         return _too_many(rid, wait, "from this address")
+    if ingest and not keyed:
+        # the edge paths take a site API key, never a person's session (plan Part 7.5 and 10.5): no role may write telemetry, events or capabilities
+        return _refusal(rid, 403 if has_bearer else 401, "The edge paths take the site's API key", "key_required",
+                        None if has_bearer else {"WWW-Authenticate": "Bearer"})
     public = path in PUBLIC_PATHS or (request.method == "POST" and path in PUBLIC_POSTS) or founder
     user = org = company = ident = db_file = None
     if keyed:
@@ -241,12 +258,18 @@ async def _guarded(request, call_next, rid: str):
             with store.use_company(db_file):
                 key = apikeys.by_token(token)
         if key is None:
+            # a key that is not found counts against its address like any other request, so made-up keys cannot skip the limiter
+            if ingest and (wait := auth.rate_wait("address", address)):
+                return _too_many(rid, wait, "from this address")
             return _refusal(rid, 401, "This API key is not known, or it was revoked", "invalid_key", {"WWW-Authenticate": "Bearer"})
         needed = apikeys.scope_needed(request.method, path)
         if needed is None or needed not in key["scopes"]:
             return _refusal(rid, 403, f"This API key may not make this request: it holds {', '.join(key['scopes'])}", "out_of_scope")
         named = _SITE_IN_PATH.match(path)
-        if named and named.group(1) != key.get("site_id"):
+        if named is None:
+            # a key is bound to one site (plan Part 10.5): it reaches only paths that name a site, never a collection of the company's sites
+            return _refusal(rid, 403, "This API key reaches only its own site's paths", "out_of_scope")
+        if named.group(1) != key.get("site_id"):
             return _refusal(rid, 403, "This API key belongs to another site", "wrong_site")
         if (wait := auth.rate_wait("user", f"key:{key['id']}")):
             return _too_many(rid, wait, "for this key")

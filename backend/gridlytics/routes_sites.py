@@ -99,6 +99,23 @@ def fleet():
                 "sites": rows})
 
 
+#: The money settings among a site's and its equipment's fields (plan Part 10.5: battery prices and wear, the genset's rupee costs, the value of lost load):
+#: they price the optimiser's choices and the savings ledger's wear lever, so changing one is edit_money_settings (an administrator's), not edit_sites
+SITE_MONEY_FIELDS = ("voll_rs_per_kwh", "calendar_cost_on")
+ASSET_MONEY_FIELDS = {"battery": ("replacement_cost_per_kwh", "warranted_cycles", "warranted_depth"),
+                      "genset": ("c_start_rs", "c_runhr_rs", "c_om_rs_per_kwh")}
+
+
+def _defaults(model, names) -> dict:
+    return {k: model.model_fields[k].default for k in names if k in model.model_fields}
+
+
+def _need_money_settings(inp: dict, before: dict, names, doing: str) -> None:
+    """Refuse a change of any money setting without edit_money_settings; sending a money setting unchanged (a form sent back whole) is not a change."""
+    if isinstance(inp, dict) and any(k in inp and inp[k] != before.get(k) for k in names):
+        auth.need("edit_money_settings", doing)
+
+
 @router.get("/api/sites")
 def sites_list():
     return out(sites.listing())
@@ -107,6 +124,7 @@ def sites_list():
 @router.post("/api/sites")
 def site_create(inp: dict = Body(...)):
     auth.need("edit_sites", "Adding a site")
+    _need_money_settings(inp, _defaults(sites.SiteFields, SITE_MONEY_FIELDS), SITE_MONEY_FIELDS, "Setting the site's value of lost load or wear costing")
     try:
         s = sites.create(inp, auth.actor())
     except ValueError as exc:
@@ -124,7 +142,9 @@ def site_get(site_id: str):
 @router.put("/api/sites/{site_id}")
 def site_update(site_id: str, inp: dict = Body(...)):
     auth.need("edit_sites", "Editing a site")
-    site_or_404(site_id)
+    s = site_or_404(site_id)
+    _need_money_settings(inp, {**_defaults(sites.SiteFields, SITE_MONEY_FIELDS), **(s.get("data") or {})}, SITE_MONEY_FIELDS,
+                         "Changing the site's value of lost load or wear costing")
     try:
         sites.update(site_id, inp, auth.actor())
     except ValueError as exc:
@@ -177,6 +197,14 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
     auth.need("edit_sites", "Editing the site's equipment")
     site_or_404(site_id)
     inp.pop("id", None)
+    names = ASSET_MONEY_FIELDS.get(role, ())
+    if names:
+        cur = sites.assets(site_id).get(role)
+        before = {**_defaults(sites.ASSET_MODELS[role], names), **(cur or {})}
+        if cur is not None:
+            # a money setting left out keeps its stored value (the asset is saved whole, so it would otherwise fall back to its default)
+            inp.update({k: cur[k] for k in names if k not in inp and k in cur})
+        _need_money_settings(inp, before, names, "Changing the equipment's money settings (prices and wear)")
     try:
         sites.put_asset(site_id, role, inp, auth.actor())
     except ValueError as exc:
@@ -245,8 +273,15 @@ def overrides_post(site_id: str, inp: dict = Body(...)):
 
 @router.delete("/api/sites/{site_id}/overrides/{oid}")
 def overrides_delete(site_id: str, oid: str):
+    """Clearing an override needs the permission that setting its kind needs (plan Part 10.5): resuming after a pause is resume_control and lifting a forced
+    charge pin_genset, both an administrator's, so an operator cannot undo either by deleting it."""
     auth.need("hold_release", "Clearing an override")
     site_or_404(site_id)
+    with store.connect() as con:
+        held = con.execute("SELECT kind FROM overrides WHERE id = ? AND site_id = ? AND cleared IS NULL", (oid, site_id)).fetchone()
+    if held is None:
+        raise HTTPException(status_code=404, detail="No such override")
+    auth.need(sites.OVERRIDE_PERMISSION.get(held["kind"], "hold_release"), "Clearing this override")
     sites.clear_override(site_id, oid, auth.actor())
     return sites.overrides(site_id)
 

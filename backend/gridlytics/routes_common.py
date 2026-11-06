@@ -30,7 +30,8 @@ def bad(exc: Exception, code: str = "invalid") -> Refusal:
 
 
 def out(obj):
-    """Every answer that may carry money goes through the role filter (viewers get no rupees, only administrators and analysts see the fee)."""
+    """Every answer that may carry money goes through the role filter (viewers get no rupees, only administrators and analysts see the fee; an API key gets
+    no money field at all, whatever role it was made with: money.for_reader)."""
     return money.for_reader(obj)
 
 

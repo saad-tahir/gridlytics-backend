@@ -54,8 +54,16 @@ CARDS_279 = {
 #: they repeat SRO 279's and are marked unverified per card
 CARDS_41 = {k: {**v, "floor_share": 0.50 if v["fixed_basis"] == "per_kw_month" else v["floor_share"], "unverified": True} for k, v in CARDS_279.items()}
 CARDS_41["B-2(b)"] = {**CARDS_279["B-2(b)"], "peak": 36.68, "off_peak": 27.41, "floor_share": 0.50}
+#: The FY2025-26 version (from 1 July 2025 until the CY2026 rebasing), the third version a pilot's twelve bills span (plan Part 6.1, TAR-12). R9 did not
+#: read its rates: every card repeats the January 2026 card and is marked unverified, with the 50 percent floor of the 2023 Terms and Conditions. It lets
+#: a 2025 bill or day be priced (and flagged) instead of failing; the owner replaces it with the notified rates from a 2025 bill (task O13)
+CARDS_FY2526 = {k: {**v, "unverified": True} for k, v in CARDS_41.items()}
+SRC_FY2526 = {"kind": "nepra_decision", "ref": "Uniform schedule FY2025-26 from 01-07-2025: rates not read (R9); placeholder repeating SRO 41-52(I)/2026's cards",
+              "url": "https://nepra.org.pk", "retrieved_on": "2026-11-06", "verified": "unverified"}
 
 SHIPPED = [
+    {"kind": "schedule", "key": "national", "effective_from": "2025-07-01", "known_from": "2025-07-01", "status": "active",
+     "body": {"name": "Uniform schedule FY2025-26 (rates not read: repeats January 2026's cards, unverified)", "cards": CARDS_FY2526}, "source": SRC_FY2526},
     {"kind": "schedule", "key": "national", "effective_from": "2026-01-01", "known_from": "2026-01-13", "status": "active",
      "body": {"name": "Uniform schedule, January 2026 (SRO 41-52(I)/2026)", "cards": CARDS_41}, "source": SRO_41},
     {"kind": "schedule", "key": "national", "effective_from": "2026-02-12", "known_from": "2026-02-12", "status": "active",

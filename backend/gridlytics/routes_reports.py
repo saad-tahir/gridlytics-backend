@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body
 from fastapi.responses import FileResponse
 
-from . import auth, reports
+from . import auth, reports, store
 from .routes_common import bad, site_or_404, today
 from .schemas import Refusal
 
@@ -44,4 +44,6 @@ def download(rid: str, which: str):
     p = reports.file_path(rid, which)
     if p is None:
         raise Refusal(404, "The report's file is missing; generate it again", "not_found")
+    # every export is audited (plan Part 2.8 and 10.5)
+    store.audit(auth.actor(), f"downloaded a report ({which})", r["site_id"], {"report": rid, "kind": r["kind"], "period": r["period"]})
     return FileResponse(p, media_type="application/pdf" if which == "pdf" else "text/csv", filename=f"gridlytics-{r['kind']}-{r['period']}.{which}")

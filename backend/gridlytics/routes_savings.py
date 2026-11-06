@@ -50,11 +50,13 @@ def savings_csv(site_id: str, start: str | None = None, end: str | None = None):
     auth.need("export", "Exporting savings")
     site_or_404(site_id)
     t = today()
-    summ = verify.summary(site_id, parse_day(start, t.replace(day=1)).isoformat(), parse_day(end, t).isoformat())
+    d0, d1 = parse_day(start, t.replace(day=1)).isoformat(), parse_day(end, t).isoformat()
+    summ = verify.summary(site_id, d0, d1)
     lines = ["day,saving_native_rs,saving_tuned_rs,fidelity,actual_cost_rs,native_cost_rs,litres_actual,litres_native,peak_kw,peak_import_kwh"]
     for d in summ["days"]:
         lines.append(",".join("" if d.get(k) is None else str(d[k]) for k in ("day", "saving_native_rs", "saving_tuned_rs", "fidelity", "actual_cost_rs",
                                                                                "native_cost_rs", "litres_actual", "litres_native", "peak_kw", "peak_import_kwh")))
+    store.audit(auth.actor(), "exported savings", site_id, {"start": d0, "end": d1})
     return PlainTextResponse("\n".join(lines) + "\n", media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{site_id}-savings.csv"'})
 
 

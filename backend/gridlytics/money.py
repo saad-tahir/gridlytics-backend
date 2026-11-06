@@ -15,13 +15,15 @@ MONEY_KEYS = frozenset({
     "export_credit", "import_price", "export_price", "tariff_body", "bill", "rebuilt", "real", "cost_breakdown", "wear_rs", "v_end", "terminal_value",
     "fee_rs", "gain_share", "price_per_l", "value_rs", "money", "energy_charge", "fixed_charge", "taxes", "adders", "total", "fee_ratio",
     "levers", "mdi_rate", "rs_per_kwh", "c_short", "naepp", "lines", "cards", "fuel_prices",
+    "saving_rs_per_day_unadjusted", "saving_rs_per_day_adjusted",
 })
 FEE_KEYS = frozenset({"fee", "fee_rs", "gain_share", "fee_ratio"})
 SUFFIXES = ("_rs", "_rs_per_kwh", "_rs_per_kw", "_pkr")
 
 
 def is_money(key: str) -> bool:
-    return key in MONEY_KEYS or key.endswith(SUFFIXES)
+    """A money key by name: listed, ending in a rupee suffix, or carrying rupees inside it (`*_rs_per_day`, `*_rs_per_month`, `rs_per_*`)."""
+    return key in MONEY_KEYS or key.endswith(SUFFIXES) or "_rs_" in key or key.startswith("rs_")
 
 
 def _strip(obj, fee_ok: bool, cost_ok: bool):
@@ -41,7 +43,9 @@ def _strip(obj, fee_ok: bool, cost_ok: bool):
 
 
 def for_reader(obj):
-    """The answer as the current reader may see it."""
+    """The answer as the current reader may see it; a machine key gets no money at all (plan Part 10.5: plans served to a key carry no money fields)."""
+    if (auth.current.get() or {}).get("api_key"):
+        return for_key(obj)
     cost_ok, fee_ok = auth.can("see_costs"), auth.can("see_fee")
     if cost_ok and fee_ok:
         return obj

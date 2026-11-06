@@ -97,6 +97,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     K = m.var("K", T, 0, PV, H * EPS_CURTAIL)
     bat, gen = p.get("battery"), p.get("genset")
     lmode = int(p.get("load_mode", 0))
+    W, forced, rm_floor = None, np.zeros(T, dtype=bool), {}
     # ---------------------------------------------------------------- genset
     if gen:
         S = gen["S"]
@@ -111,21 +112,42 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         if gen["control"] == "none":
             u_ub[:] = 0
         UT, DT = (1, 1) if relaxed else (gen["UT"], gen["DT"])
+        day_index = np.asarray(gen.get("day_index", np.zeros(T, dtype=int)))[:T]
         if gen["u_prev"] == 1 and gen["elapsed"] < UT:
-            for t in range(UT - gen["elapsed"]):
-                if t < T and (g[t] < 0.5 or gen["parallel"]):
-                    if hold[t] or u_ub[t] == 0:
-                        notes.append("genset_state_overridden")
-                        break
-                    u_lb[t] = 1
+            # the carried minimum up time: u = 1 for the remaining steps while the grid is down (or parallel is allowed); a grid return ends it
+            fix = []
+            for t in range(min(T, UT - gen["elapsed"])):
+                if not (g[t] < 0.5 or gen["parallel"]):
+                    break
+                if hold[t] or u_ub[t] == 0:
+                    notes.append("genset_state_overridden")
+                    break
+                fix.append(t)
+            # a run-hour cap or a fuel cap that cannot cover the fixing wins and the fixing is dropped (Part 4.3)
+            if fix and not auto:
+                fx = np.asarray(fix)
+                per_day = {int(d): int(np.sum(day_index[fx] == d)) for d in np.unique(day_index[fx])}
+                cap_short = any(n_ * H > max(0.0, gen["cap_hours"] - (gen["hours_today"] if d == 0 else 0.0)) + 1e-9 for d, n_ in per_day.items())
+                fuel_short = gen["fuel_available"] < len(fix) * H * (gen["a"] * gen["f_min"] * S + gen["b"] * S) - 1e-9
+                if cap_short or fuel_short:
+                    notes.append("genset_state_overridden")
+                    fix = []
+            u_lb[fix] = 1
         if gen["u_prev"] == 0 and gen["elapsed"] < DT:
             for t in range(min(T, DT - gen["elapsed"])):
                 if u_lb[t] < 1:
                     u_ub[t] = 0
+        # where the panel or the carried state forces the set on, it runs at least at its minimum load; what the load and the battery cannot
+        # take is dumped (the twin curtails it the same way), so a forced state is never infeasible (Part 4.3)
+        forced = u_lb >= 1
         Pg = m.var("P", T, 0, S, H * gen["c_om"])
         F = m.var("F", T, 0, np.inf, gen["c_fuel"])
-        u = m.var("u", T, u_lb, u_ub, H * gen["c_runhr"], integer=not relaxed)
-        v = m.var("v", T, 0, 1, gen["c_start"], integer=not relaxed)
+        u = m.var("u", T, u_lb, u_ub, H * gen["c_runhr"], integer=True)
+        v = m.var("v", T, 0, 1, gen["c_start"], integer=True)
+        W = m.var("W", T, 0, np.where(forced, gen["f_min"] * S, 0.0), H * 2 * EPS_CURTAIL) if forced.any() else None
+        # at a panel-started site the panel decides u: minimum up and down rows bind only the starts and stops the plan is free to make
+        free_start = ~(auto & (u_lb >= 1))
+        free_stop = ~(auto & (u_ub <= 0))
         for t in range(T):
             m.row([Pg[t], u[t]], [1, -S], ub=0, name=f"gen_max[{t}]")
             m.row([Pg[t], u[t]], [-1, gen["f_min"] * S], ub=0, name=f"gen_min[{t}]")
@@ -137,11 +159,11 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 m.row([u[t], u[t - 1], v[t]], [1, -1, -1], ub=0, name=f"start[{t}]")
                 m.row([v[t], u[t - 1]], [1, 1], ub=1, name=f"start_off[{t}]")
             m.row([v[t], u[t]], [1, -1], ub=0, name=f"start_on[{t}]")
-            if UT > 1:
+            if UT > 1 and free_start[t]:
                 t2 = min(t + UT - 1, T - 1)
                 n_ = t2 - t + 1
                 m.row(list(u[t:t2 + 1]) + [v[t]], [1] * n_ + [-n_], lb=0, name=f"min_up[{t}]")
-            if DT > 1:
+            if DT > 1 and free_stop[t]:
                 t2 = min(t + DT - 1, T - 1)
                 n_ = t2 - t + 1
                 cols = list(u[t:t2 + 1])
@@ -206,10 +228,24 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 r = m.var(f"r{t}", 1, 0, np.inf, p_start[t] * c_short)[0]
                 r_idx[t] = r
                 m.row([E[t + 1], r], [1, 1], lb=Emin + R[t], name=f"reserve[{t}]")
-        if p.get("reserve_manual"):
-            rm = m.var("rm", T, 0, np.inf, voll)
-            for t in range(T):
-                m.row([E[t + 1], rm[t]], [1, 1], lb=min(Emax, p["reserve_manual"]), name=f"manual_reserve[{t}]")
+        # a manual reserve (or a force-charge target) is a floor with its own slack at VoLL, only on the steps inside its window and, like the
+        # regular reserve, only where the grid is up: inside an outage the reserve is there to be used (Part 4.3, 4.8)
+        rm_lb = manual_floor(p, T)
+        for t in range(T):
+            if rm_lb[t] > 0 and g[t] > 0.5:
+                rm = m.var(f"rm{t}", 1, 0, np.inf, voll)[0]
+                rm_floor[t] = min(Emax, float(rm_lb[t]))
+                m.row([E[t + 1], rm], [1, 1], lb=rm_floor[t], name=f"manual_reserve[{t}]")
+        # a soc_threshold controller starts the set whenever the state of charge is under its threshold in an outage (Part 4.1: a row on E);
+        # the slack, at VoLL, only keeps a cap or a hold that forbids the start from making the model infeasible
+        if gen and gen["control"] == "soc_threshold":
+            E_on = min(Emax, float(gen.get("soc_on", 0.25)) * En)
+            big = E_on - min(Emin, E0)
+            thr_t = [t for t in range(1, T) if g[t] < 0.5 and u_ub[t] > 0] if big > 0 else []
+            if thr_t:
+                th = m.var("thr", len(thr_t), 0, np.inf, voll)
+                for k, t in enumerate(thr_t):
+                    m.row([E[t], u[t], th[k]], [1, big, 1], lb=E_on, name=f"soc_threshold[{t}]")
         # terminal value on the energy the next peak can use
         term = p.get("terminal") or {}
         v_end = max(0.0, bat["eta_d"] * term.get("c_next", 0.0) - c_cyc - term.get("c_cal_hold", 0.0))
@@ -225,6 +261,9 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         if gen:
             cols.append(Pg[t])
             vals.append(1)
+            if W is not None and forced[t]:
+                cols.append(W[t])
+                vals.append(-1)
             if u_dep[t]:
                 cols.append(u[t])
                 vals.append(-(L[t] - Lc[t]))
@@ -264,7 +303,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         Mp = p["G_max"] * len(steps) * H + abs(Q - base) + 1.0
         coef = info["rate"] - float(c_imp[steps[0]])
         Z = m.var(f"Z_{per}", 1, 0, np.inf, coef)[0]
-        b = m.var(f"b_{per}", 1, 0, 1, 0.0, integer=not relaxed)[0]
+        b = m.var(f"b_{per}", 1, 0, 1, 0.0, integer=True)[0]
         m.row([Z] + list(G[steps]), [1] + [-H] * len(steps), lb=Q - base, name=f"icp_lo[{per}]")
         m.row([Z, b], [1, -Mp], ub=0, name=f"icp_b[{per}]")
         m.row([Z] + list(G[steps]) + [b], [1] + [-H] * len(steps) + [Mp], ub=Q - base + Mp, name=f"icp_hi[{per}]")
@@ -285,9 +324,15 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     ints = np.array(m.integ, dtype=bool)
     frac = float(np.max(np.abs(x[ints] - np.round(x[ints])))) if ints.any() else 0.0
     imp_out = float(np.max(np.where(g < 0.5, x[G], 0.0))) if T else 0.0
-    if viol > 1e-4 or frac > 1e-5 or imp_out > 1e-6:
+    gv = 0.0
+    if gen and T:
+        # the genset never below its minimum load when on, and silent when off (Part 4.5)
+        on = x[u] > 0.5
+        gv = max(float(np.max(np.where(on, gen["f_min"] * gen["S"] - x[Pg], 0.0))), float(np.max(np.where(~on, x[Pg], 0.0))))
+        gv = gv if gv > 1e-4 + 1e-7 * gen["S"] else 0.0
+    if viol > 1e-4 or frac > 1e-5 or imp_out > 1e-6 or gv > 0.0:
         out["status"] = "not_solved"
-        out["message"] = f"Re-check failed: balance {viol:.2e}, integrality {frac:.2e}, import in outage {imp_out:.2e}"
+        out["message"] = f"Re-check failed: balance {viol:.2e}, integrality {frac:.2e}, import in outage {imp_out:.2e}, genset load {gv:.2e}"
         return out
 
     def get(name, default=None):
@@ -295,11 +340,13 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         return x[idx] if idx is not None else (np.zeros(T) if default is None else default)
 
     sol = {"G": get("G"), "X": get("X"), "K": get("K"), "U": get("U"), "C": get("C"), "D": get("D"), "P": get("P"), "F": get("F"),
-           "u": np.round(get("u")), "v": np.round(get("v")), "E": get("E", np.zeros(T + 1))}
+           "u": np.round(get("u")), "v": np.round(get("v")), "E": get("E", np.zeros(T + 1)), "W": get("W")}
     out["objective_rs"] = round(float(res.fun), 2)
     out["sol"] = sol
+    out["T"] = T
     out["R"] = R if bat else np.zeros(T)
     out["r"] = {t: float(x[i]) for t, i in r_idx.items()} if bat else {}
+    out["manual_floor"] = dict(rm_floor)
     out["M"] = [float(x[i]) for i in M_idx]
     out["v_end"] = v_end if bat else 0.0
     out["breakdown"] = _breakdown(p, sol, out)
@@ -357,6 +404,8 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
             elif D > 0.1:
                 r = "carry_outage"
                 d = {"kw": round(D, 1)}
+            elif C > 0.1:
+                r = "charge_from_pv"
             else:
                 r = "idle"
         elif K > 0.1 and X >= p["X_max"] - 1e-3:
@@ -383,6 +432,10 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
                 r = "genset_on"
             else:
                 r = "charge_from_pv"
+        elif gen and P > 0.1:
+            # a set running with the grid up (parallel) is named for what it does, never "genset_off" (Part 4.7)
+            r = "genset_on"
+            d = {"kw": round(P, 1), "rs_per_kwh": round(_gen_marginal(gen), 1)}
         elif bat and R[t] > 0 and float(p["p_start"][t]) >= 0.01 and E1 <= Emin + R[t] + 0.02 * En and (peak[t] or float(p["p_start"][t]) >= thr):
             r = "hold_for_outage"
             d = {"p": round(float(p["p_start"][t]), 2), "hours": round(int(p["dur_steps"][t]) * H, 2), "kwh": round(float(R[t]), 1)}
@@ -418,16 +471,34 @@ def solve_with_policy(p: dict, time_limit: float = 10.0) -> dict:
     short = shorten(p, 96)
     second = solve(short, time_limit=time_limit, relaxed=True)
     second["retry_of"] = first.get("message", "")
+    second["T"] = short["T"]  # the horizon actually solved: the caller rebuilds its steps on shorten(p, T)
     if second["status"] != "not_solved":
         second["notes"] = second.get("notes", []) + ["relaxed_retry"]
     return second
 
 
+def manual_floor(p: dict, T: int) -> np.ndarray:
+    """The manual reserve per step in kWh (0 where none): `reserve_manual` is a vector (one value per step, as build_problem writes it) or a
+    scalar for every step, optionally limited by `reserve_manual_mask`."""
+    raw = p.get("reserve_manual")
+    if raw is None:
+        return np.zeros(T)
+    a = np.asarray(raw, dtype=float)
+    out = np.full(T, float(a)) if a.ndim == 0 else np.pad(a[:T], (0, max(0, T - len(a))))
+    mask = p.get("reserve_manual_mask")
+    if mask is not None:
+        mk = np.asarray(mask, dtype=bool)[:T]
+        out = np.where(np.pad(mk, (0, max(0, T - len(mk)))), out, 0.0)
+    return np.nan_to_num(out)
+
+
 def shorten(p: dict, T: int) -> dict:
     q = dict(p)
+    T = min(int(T), int(p["T"]))
     q["T"] = T
-    for k in ("L", "Lhi", "Lc", "PV", "PVlo", "g", "c_imp", "c_exp", "p_start", "dur_steps", "peak", "in_month", "ts", "override_mask"):
-        if k in q and q[k] is not None:
+    for k in ("L", "Lhi", "Lc", "PV", "PVlo", "g", "c_imp", "c_exp", "p_start", "dur_steps", "peak", "in_month", "ts", "override_mask",
+              "reserve_manual", "reserve_manual_mask"):
+        if k in q and q[k] is not None and np.ndim(q[k]) > 0:
             q[k] = np.asarray(q[k])[:T]
     if q.get("battery"):
         b = dict(q["battery"])

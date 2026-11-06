@@ -10,6 +10,7 @@ import json
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -24,6 +25,11 @@ KINDS = ("monthly_savings", "energy_only", "daily_operations")
 LEVER_NAMES = {"peak_window": "Peak-window import avoided", "offpeak_energy": "Off-peak energy (charging)", "export": "Export credit",
                "genset": "Genset fuel and running cost", "wear": "Battery wear", "carry_over": "Carry-over (stored energy at day end)",
                "mdi": "Maximum demand (MDI)"}
+
+
+def _text(value) -> str:
+    """A value as plain text inside a ReportLab Paragraph: &, < and > escaped, so it is never read as markup."""
+    return escape(str(value))
 
 
 def rs(x) -> str:
@@ -70,10 +76,12 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     w = csv.writer(buf_csv)
     today = datetime.now(PKT).date()
     title = {"monthly_savings": "Monthly savings report", "energy_only": "Monthly energy report", "daily_operations": "Daily operations sheet"}[kind]
-    story.append(Paragraph(f"{title}: {site['name']}", styles["Title"]))
+    # every text a person typed (the site's name, the connection's fields) is escaped before it reaches a Paragraph, which reads its text as markup: an
+    # <img> tag there would make the server read a local file or fetch a URL into the report (plan Part 2.8: untrusted text is never rendered as markup)
+    story.append(Paragraph(f"{title}: {_text(site['name'])}", styles["Title"]))
     conn = (site.get("connections") or [None])[0]
-    sub = f"{p0:%d %B %Y} to {p1:%d %B %Y}. " + (f"{site['data'].get('disco') or ''} {conn['data']['tariff_category']}, {conn['data']['regime'].replace('_', ' ')}. "
-                                                   if conn else "Off-grid. ")
+    sub = f"{p0:%d %B %Y} to {p1:%d %B %Y}. " + (f"{_text(site['data'].get('disco') or '')} {_text(conn['data']['tariff_category'])}, "
+                                                   f"{_text(conn['data']['regime'].replace('_', ' '))}. " if conn else "Off-grid. ")
     sub += f"Generated {datetime.now(PKT):%d %b %Y %H:%M} PKT by Gridlytics."
     story.append(Paragraph(sub, styles["Normal"]))
     story.append(Spacer(1, 4 * mm))
@@ -102,7 +110,7 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
                 rows.append(["Perfect foresight (not achievable, for reference)", rs(nat["perfect_foresight_rs"])])
             story.append(_table(rows, [110 * mm, 40 * mm]))
             story.append(Spacer(1, 2 * mm))
-            story.append(Paragraph("Method: " + summ["method"] + ".", styles["Normal"]))
+            story.append(Paragraph("Method: " + _text(summ["method"]) + ".", styles["Normal"]))
         story.append(Paragraph("Energy", styles["Heading2"]))
         tot = lambda k: sum((d.get(k) or 0) for d in tdays)
         story.append(_table([["Quantity", "Month"], ["Grid import", f"{tot('import_kwh'):,.0f} kWh"], ["Grid export", f"{tot('export_kwh'):,.0f} kWh"],
@@ -132,7 +140,7 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
         story.append(_table(rows))
         cap = sites.native_latest(site_id)
         story.append(Spacer(1, 3 * mm))
-        story.append(Paragraph(f"Native capture version {cap['version'] if cap else 'none'}; tariff versions as dated in the CSV annex. "
+        story.append(Paragraph(f"Native capture version {_text(cap['version']) if cap else 'none'}; tariff versions as dated in the CSV annex. "
                                "Figures are measured against a replay of the inverter's own settings on the same day's sun, load and outages.", styles["Normal"]))
     else:
         plan = plans.current(site_id)

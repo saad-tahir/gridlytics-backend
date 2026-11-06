@@ -52,6 +52,9 @@ class SiteFields(Strict):
     control_mode: Literal["advisory", "mode_a", "mode_b"] = "advisory"
     enclosure_temp_offset_c: float = Field(7.0, ge=0.0, le=25.0)
     calendar_cost_on: bool = True
+    #: the battery's charge sources (plan Part 4.1, a_grid and a_gen): the grid when it is up, and the genset's output beyond the load
+    grid_charge_allowed: bool = True
+    gen_charge_allowed: bool = True
     notes: str = Field("", max_length=2000)
 
 

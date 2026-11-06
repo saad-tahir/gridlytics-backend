@@ -56,7 +56,8 @@ def month_to_date(site_id: str, conn: dict | None, t0: int) -> dict:
     in_month = g["ts"] >= ms
     mtd = {"peak": float(imp[in_month & pk].sum() / 60), "off_peak": float(imp[in_month & ~pk].sum() / 60)}
     week = g["ts"] >= t0 - 7 * 86400
-    days_w = max(1.0, week.sum() / 1440)
+    # the per-day rate divides by the days the telemetry actually covers (a new site, an upload gap), not by the window's seven
+    days_w = max(1.0, float(np.sum(~np.isnan(g["imp"][week]))) / 1440)
     per_day = {"peak": float(imp[week & pk].sum() / 60 / days_w), "off_peak": float(imp[week & ~pk].sum() / 60 / days_w)}
     interval = int((conn or {"data": {}})["data"].get("mdi_interval_min", 30))
     m0 = 0.0
@@ -76,20 +77,62 @@ def month_to_date(site_id: str, conn: dict | None, t0: int) -> dict:
     return {"mtd": mtd, "per_day": per_day, "M0": m0, "G_elapsed": g_el, "n_elapsed": int(n_el_steps)}
 
 
+GAP_MINUTES = 15  # a gap in the genset signal up to this long continues the run on both sides (5-minute sources, ingest lag)
+
+
 def _carried_genset(site_id: str, t0: int) -> dict:
     g = telemetry.minute_grid(site_id, t0 - 86400, t0)
     on = g["gen_on"]
     known = ~np.isnan(on)
     if not known.any():
         return {"u_prev": 0, "elapsed": 99, "hours_today": 0.0, "unknown": True}
-    last = bool(on[known][-1] > 0.5)
-    k = len(on) - 1
-    while k > 0 and not np.isnan(on[k - 1]) and (on[k - 1] > 0.5) == last:
-        k -= 1
-    elapsed_steps = (len(on) - k) // 15
+    # walk back over the known samples only: the run started at the first sample of the last unbroken stretch in the same state
+    idx = np.where(known)[0]
+    st = on[idx] > 0.5
+    last = bool(st[-1])
+    j = len(idx) - 1
+    while j > 0 and st[j - 1] == last and idx[j] - idx[j - 1] <= GAP_MINUTES:
+        j -= 1
+    elapsed_steps = (len(on) - int(idx[j])) // 15
+    # hours run today: each sample stands for the minutes up to the next one, at most GAP_MINUTES (a 5-minute row is five minutes)
+    n = np.arange(len(on))
+    last_pos = np.maximum.accumulate(np.where(known, n, -1))
+    filled = np.where((last_pos >= 0) & (n - last_pos < GAP_MINUTES), on[np.maximum(last_pos, 0)], np.nan)
     today0 = int(datetime(_local(t0).year, _local(t0).month, _local(t0).day, tzinfo=PKT).timestamp())
-    hours_today = float(np.nansum(on[g["ts"] >= today0]) / 60)
+    hours_today = float(np.nansum(filled[g["ts"] >= today0]) / 60)
     return {"u_prev": int(last), "elapsed": int(elapsed_steps), "hours_today": hours_today, "unknown": False}
+
+
+RELEASE_REASONS = {"pause_control": "control_paused", "force_native": "released_to_native"}
+
+
+def _ts(iso: str | None) -> int | None:
+    if not iso:
+        return None
+    d = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    return int((d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp())
+
+
+def _override_steps(o: dict, ts: np.ndarray) -> np.ndarray:
+    """The 15-minute steps an override covers: those overlapping [from_ts, until_ts)."""
+    until = _ts(o["until_ts"])
+    start = _ts(o.get("from_ts"))
+    sel = np.asarray(ts) < until
+    if start is not None:
+        sel &= np.asarray(ts) + 900 > start
+    return sel
+
+
+def control_release(site_id: str, at: int | None = None) -> dict | None:
+    """The pause (pause_control) or release to native (force_native) in force at `at` (now by default), else None. While one is in force no
+    plan is in force: the tick stores its plan as held and the edge is sent a release instead of the slots (Part 7.3)."""
+    at = int(at if at is not None else datetime.now(timezone.utc).timestamp())
+    ovs = sites.overrides(site_id)
+    for kind in ("pause_control", "force_native"):
+        for o in ovs:
+            if o["kind"] == kind and bool(_override_steps(o, np.array([forecast.align(at)]))[0]):
+                return {"reason": RELEASE_REASONS[kind], "kind": kind, "until": o["until_ts"], "author": o["author"], "override_id": o["id"]}
+    return None
 
 
 def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
@@ -133,20 +176,29 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     # overrides as bounds (Part 4.8)
     ovs = sites.overrides(site["id"])
     mask = {k: np.zeros(steps, dtype=bool) for k in ("genset_hold", "charge_block", "reserve", "pause_control", "force_native", "force_charge")}
-    reserve_pct = None
+    # a manual reserve (hold) and a force-charge target are per-step floors in percent, each inside its own window only
+    floor_pct = np.zeros(steps)
     for o in ovs:
-        until = int(datetime.fromisoformat(o["until_ts"]).timestamp())
-        sel = ts < until
+        if o["kind"] not in mask:
+            continue
+        sel = _override_steps(o, ts)
         mask[o["kind"]] |= sel
         if o["kind"] == "reserve" and o["value"] is not None:
-            reserve_pct = max(reserve_pct or 0.0, float(o["value"]))
-    p["override_mask"] = mask["genset_hold"] | mask["charge_block"] | mask["reserve"] | mask["force_native"]
+            floor_pct[sel] = np.maximum(floor_pct[sel], float(o["value"]))
+        elif o["kind"] == "force_charge":
+            target = float(o["value"]) if o["value"] is not None else 100.0
+            floor_pct[sel] = np.maximum(floor_pct[sel], target)
+    # pause and release to native do not shape the solve (the tick holds the plan and the edge gets a release); the rest are operator holds
+    p["override_mask"] = mask["genset_hold"] | mask["charge_block"] | mask["reserve"] | mask["force_charge"]
     p["overrides"] = [{"kind": o["kind"], "value": o["value"], "until": o["until_ts"], "author": o["author"]} for o in ovs]
     gen = None
     if g_asset and d.get("genset_start_control", "none") != "none":
         kind = g_asset.get("fuel_kind", "hsd")
         price, _src = tariffs.fuel_price(kind, _local(t0).date())
         carried = _carried_genset(site["id"], t0)
+        control = d.get("genset_start_control", "manual")
+        if carried["unknown"] and control == "auto_on_grid_loss" and len(g) and g[0] < 0.5:
+            carried = {**carried, "u_prev": 1, "elapsed": 99}  # in an outage the panel has already started the set; this fixes nothing
         local_days = np.array([(_local(int(x)).date() - _local(t0).date()).days for x in ts])
         c_om = g_asset["c_om_rs_per_kwh"] + (SELFGEN_DUTY_RS_PER_KWH if g_asset["rated_kw"] > 400 and (d.get("lat", 31) > 28) else 0.0)
         gen = {"S": g_asset["rated_kw"], "f_min": g_asset["f_min"], "a": g_asset["a"], "b": g_asset["b"], "c_fuel": price, "c_start": g_asset["c_start_rs"],
@@ -154,7 +206,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                "DT": max(1, int(math.ceil(g_asset["min_down_h"] * 4))), "u_prev": carried["u_prev"], "elapsed": carried["elapsed"],
                "cap_hours": g_asset["cap_hours_per_day"], "hours_today": carried["hours_today"], "day_index": local_days,
                "fuel_available": float(site.get("state", {}).get("fuel_l", g_asset["tank_l"]) or 1e9), "parallel": g_asset["parallel_allowed"],
-               "control": d.get("genset_start_control", "manual"), "hold": mask["genset_hold"], "unknown": carried["unknown"]}
+               "control": control, "hold": mask["genset_hold"], "unknown": carried["unknown"],
+               "soc_on": float((d.get("reserve_policy") or {}).get("min_soc_pct", 20.0)) / 100.0 + 0.05}  # twin.plant_of's start threshold
         p["genset"] = gen
     p["c_short"] = optimise._gen_marginal(gen) if gen else p["voll"]
     bat = None
@@ -166,13 +219,13 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         temp = solar.air_temp(ts, solar.local_month(ts) - 1) + float(d.get("enclosure_temp_offset_c", 7.0))
         bat = {"E_nom": e_nom, "E0": soc * e_nom, "sigma0": min(0.15, (bs.get("sigma_pct") or 5.0) / 100.0), "P_ch": b_asset["p_ch_kw"],
                "P_dis": b_asset["p_dis_kw"], "eta_c": b_asset["eta_c"], "eta_d": b_asset["eta_d"], "soc_min": b_asset["soc_min"],
-               "soc_max": b_asset["soc_max"], "a_grid": bool(d.get("grid_charge_allowed", True)) and not off_grid, "a_gen": bool(d.get("gen_charge_allowed", False)),
+               "soc_max": b_asset["soc_max"], "a_grid": bool(d.get("grid_charge_allowed", True)) and not off_grid, "a_gen": bool(d.get("gen_charge_allowed", True)),
                "c_cyc": optimise.wear_cost(b_asset),
                "b_cal": optimise.calendar_slope(temp, b_asset["replacement_cost_per_kwh"]) if d.get("calendar_cost_on", True) else np.zeros(steps),
                "charge_block": mask["charge_block"]}
         p["battery"] = bat
-        if reserve_pct is not None:
-            p["reserve_manual"] = reserve_pct / 100.0 * e_nom
+        if floor_pct.any():
+            p["reserve_manual"] = floor_pct / 100.0 * e_nom
         c_next = float(np.max(vec["c_imp"][-96:])) if not off_grid else p["c_short"]
         lam = p_out.get("lam_day") or 0.0
         r_next = float(np.mean(Lc)) * 2.0 / b_asset["eta_d"] if (lam > 0.5 or off_grid) else 0.0
@@ -188,6 +241,19 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
     cost_cum = 0.0
     out = []
     gen = p.get("genset")
+    r_rows, man = res.get("r") or {}, res.get("manual_floor") or {}
+    dump = s.get("W") if s.get("W") is not None else np.zeros(T)
+
+    def floor_pct(t: int) -> float | None:
+        """The floor the plan holds at step t: soc_min, raised by the reserve row and the manual floor where those rows exist, never above
+        soc_max (the reserve row's 2-sigma widening can push its target past the band)."""
+        if not En:
+            return None
+        f = bat["soc_min"] * En + (float(res["R"][t]) if t in r_rows else 0.0)
+        if t in man:
+            f = max(f, float(man[t]))
+        return round(min(bat["soc_max"] * En, f) / En * 100, 1)
+
     for t in range(T):
         G, X = float(s["G"][t]), float(s["X"][t])
         cost = H * (float(p["c_imp"][t]) * G - float(p["c_exp"][t]) * X)
@@ -204,8 +270,9 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
                     "grid_import_kw": round(G, 2), "grid_export_kw": round(X, 2), "charge_kw": round(float(s["C"][t]), 2),
                     "discharge_kw": round(float(s["D"][t]), 2), "soc_start_pct": round(float(s["E"][t]) / En * 100, 1) if En else None,
                     "soc_pct": round(float(s["E"][t + 1]) / En * 100, 1) if En else None,
-                    "reserve_pct": round((bat["soc_min"] * En + float(res["R"][t])) / En * 100, 1) if En else None,
+                    "reserve_pct": floor_pct(t),
                     "genset_kw": round(float(s["P"][t]), 2), "genset_on": bool(s["u"][t] > 0.5), "litres": round(float(s["F"][t]), 3),
+                    "genset_dump_kw": round(float(dump[t]), 2),
                     "unserved_kw": round(float(s["U"][t]), 2), "curtail_kw": round(float(s["K"][t]), 2),
                     "p_down": round(float(bundle["outage"]["p_down"][t]), 3), "p_start": round(float(p["p_start"][t]), 3), "grid_present": float(p["g"][t]),
                     "cost_rs": round(cost, 2), "cum_rs": round(cost_cum, 2), "reason": rsn["reason"], "detail": rsn["detail"]})
@@ -225,8 +292,10 @@ def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict]) -> str | 
     slots = [s for d in compiled["days"] for s in d["slots"]]
     pol = twin.slots_policy(slots, ts)
     plant = twin.plant_of(site)
-    sim = twin.simulate(series, pol, plant, bat["E0"] / bat["E_nom"])
-    if float(np.min(sim["soc"])) < bat["soc_min"] - 0.02:
+    soc0 = bat["E0"] / bat["E_nom"]
+    sim = twin.simulate(series, pol, plant, soc0)
+    # a battery that starts below the band is planned towards it, never refused (Part 4.3): the floor is the lower of the band and the start
+    if float(np.min(sim["soc"])) < min(bat["soc_min"], soc0) - 0.02:
         return "replayed_soc_below_floor"
     if float(np.max(np.where(series["grid"] < 0.5, sim["imp"], 0.0))) > 1e-6:
         return "import_in_outage"
@@ -243,6 +312,9 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     bundle = forecast.issue(site, t0, save=save)
     p = build_problem(site, t0, bundle, steps)
     res = optimise.solve_with_policy(p, time_limit=time_limit)
+    if res.get("sol") is not None and len(res["sol"]["G"]) != p["T"]:
+        p = optimise.shorten(p, len(res["sol"]["G"]))  # the relaxed retry solved a shorter horizon: steps, slots and the guard follow it
+    release = control_release(site_id, t0)
     brand = ((site.get("assets") or {}).get("inverter") or {}).get("brand", "deye")
     stage = min(bundle["pv"]["stage"], bundle["load"]["stage"])
     tier = site.get("tier", "monitor")
@@ -253,14 +325,15 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "overrides": p.get("overrides", []), "genset_state_unknown": bool(p.get("genset", {}) and p["genset"].get("unknown")),
                "status_label": {"optimal": "Solved within tolerance", "feasible": "Solved within the time limit"}.get(res["status"], "Not solved"),
                "solver": {"status": res["status"], "variables": res.get("variables"), "rows": res.get("rows"), "binaries": res.get("binaries"),
-                          "relaxed": res.get("relaxed"), "message": res.get("message")}}
+                          "relaxed": res.get("relaxed"), "message": res.get("message")},
+               "horizon_steps": p["T"], "control_release": release}
     if res["status"] in ("not_solved", "refused"):
         reason = res.get("message", "not solved")
         if save:
             with store.connect() as con:
                 pid = store.new_id()
                 con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, reason, solver, summary) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (pid, site_id, store._now(), _iso(t0), _iso(t0), _iso(t0 + steps * 900), "a", "failed", reason,
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (pid, site_id, store._now(), _iso(t0), _iso(t0), _iso(t0 + p["T"] * 900), "a", "failed", reason,
                                                              "highs", json.dumps(summary)))
                 con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, plan_id) VALUES (?,?,?,?,?,?,?)",
                             (site_id, _iso(t0), started, store._now(), "failed", reason, pid))
@@ -272,20 +345,24 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     guard = _guard(site, p, compiled, steps_out)
     summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(res["M"][0], 1) if res.get("M") else None,
                     "v_end": round(res.get("v_end", 0.0), 2), "guard": guard})
-    status = "held" if guard else "active"
+    # a pause or a release to native means no plan is in force: the plan is kept for reading, held, and the previous one stops being active
+    # (so nothing stale is served or keyed in when the pause ends; the next tick publishes a fresh plan)
+    reason = release["reason"] if release else guard
+    status = "held" if reason else "active"
     plan_id = store.new_id()
     if save:
         with store.connect() as con:
-            if status == "active":
+            if status == "active" or release:
                 con.execute("UPDATE plans SET status = 'superseded' WHERE site_id = ? AND status = 'active'", (site_id,))
             con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, reason, solver, solve_seconds, "
                         "objective_rs, config_hash, summary, steps, slots) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (plan_id, site_id, store._now() if at is None else _iso(now), _iso(t0), _iso(t0), _iso(t0 + steps * 900),
-                         "b" if site["data"].get("control_mode") == "mode_b" else "a", status, guard or "", "highs", res["solve_seconds"], res["objective_rs"],
+                        (plan_id, site_id, store._now() if at is None else _iso(now), _iso(t0), _iso(t0), _iso(t0 + p["T"] * 900),
+                         "b" if site["data"].get("control_mode") == "mode_b" else "a", status, reason or "", "highs", res["solve_seconds"], res["objective_rs"],
                          res["config_hash"], json.dumps(summary), json.dumps(steps_out), json.dumps(compiled)))
             con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, solve_s, objective_rs, plan_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (site_id, _iso(t0), started, store._now(), status, guard or res["status"], res["solve_seconds"], res["objective_rs"], plan_id))
-        sites.put_state(site_id, active_plan=plan_id if status == "active" else site.get("state", {}).get("active_plan"), last_tick=_iso(t0))
+                        (site_id, _iso(t0), started, store._now(), status, reason or res["status"], res["solve_seconds"], res["objective_rs"], plan_id))
+        active = plan_id if status == "active" else (None if release else site.get("state", {}).get("active_plan"))
+        sites.put_state(site_id, active_plan=active, last_tick=_iso(t0))
     return {"status": status, "plan_id": plan_id, "objective_rs": res["objective_rs"], "solve_seconds": res["solve_seconds"], "steps": steps_out,
             "slots": compiled, "summary": summary}
 
@@ -379,8 +456,31 @@ def applied_rows(site_id: str, limit: int = 30) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _release_message(site_id: str, rel: dict) -> dict:
+    """A signed release while control is paused or released to native: the same keys as a plan message, no slots and no steps, and a
+    `release` block; the edge runs the inverter's native settings until the override ends and a fresh plan is issued (Part 7.3)."""
+    site = sites.get(site_id) or {"data": {}}
+    floor = float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
+    now = store._now()
+    body = {"contract": delivery.CONTRACT, "type": "release", "plan_id": None, "site_id": site_id, "issued_at": now, "valid_from": now,
+            "valid_until": rel["until"], "timezone": "Asia/Karachi", "mode": "b" if site["data"].get("control_mode") == "mode_b" else "a",
+            "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": floor, "revert_after_hours": delivery.FALLBACK_HOURS},
+            "mode_a": {"days": []}, "mode_b": None,
+            "notes": {"objective_rs": None, "reason": {"control_paused": "Control paused", "released_to_native": "Released to native"}[rel["reason"]]},
+            "release": {"reason": rel["reason"], "until": rel["until"], "by": rel["author"]}}
+    msg = delivery.sign(site_id, body)
+    with store.connect() as con:
+        con.execute("INSERT INTO plan_messages (id, site_id, plan_id, key_id, body, sent_at) VALUES (?,?,?,?,?,?)",
+                    (store.new_id(), site_id, "release", msg["signature"]["key_id"], json.dumps(msg), store._now()))
+    return msg
+
+
 def signed_message(site_id: str) -> dict | None:
-    """The current plan as the ems-edge/1.0 plan message, signed with the site's key."""
+    """The current plan as the ems-edge/1.0 plan message, signed with the site's key; a signed release instead while control is paused or
+    released to native."""
+    rel = control_release(site_id)
+    if rel:
+        return _release_message(site_id, rel)
     plan = current(site_id)
     if plan is None:
         return None

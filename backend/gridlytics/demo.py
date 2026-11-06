@@ -123,15 +123,44 @@ def _policy_for(site: dict, day: date, ts: np.ndarray, plan: dict | None) -> tup
         steps = plan.get("steps") or []
         gmap = {s["t"]: s["genset_on"] for s in steps}
         if site["data"].get("genset_start_control") == "manual":
+            # 1 in a planned run, 0 outside one: "no planned run", under which the twin's operator still rescues a site about to go dark
             pol["genset"] = np.array([1 if gmap.get(int(t) // 900 * 900) else 0 for t in ts]) if gmap else pol["genset"]
     return pol, pol["mode"]
 
 
+def _trailing(site_id: str, t_from: int) -> tuple[int, int]:
+    """The genset's run length and the outage's length (minutes) up to t_from, from the last six hours of telemetry."""
+    d = telemetry.raw(site_id, t_from - 6 * 3600, t_from, ("genset_running", "grid_present"))
+    ts = d["ts"]
+
+    def count(col: str, value: float) -> int:
+        n = 0
+        for k in range(len(ts) - 1, -1, -1):
+            if int(ts[k]) != t_from - 60 * (n + 1) or d[col][k] != value:
+                break
+            n += 1
+        return n
+
+    return count("genset_running", 1.0), count("grid_present", 0.0)
+
+
 def _simulate_span(site: dict, t_from: int, t_to: int, plan: dict | None) -> int:
-    """Run the twin from t_from to t_to (minute marks) following a plan, write the minutes and aggregate the days touched."""
+    """Run the twin from t_from to t_to (minute marks) following a plan, write the minutes and aggregate the days touched.
+
+    The genset's run so far, the outage's minutes so far and whether the run is a rescue carry over from the previous span (the live demo runs a span
+    every 15 minutes), so a minimum run or an outage does not restart at every tick."""
     last = telemetry.latest(site["id"])
     soc0 = (last["battery_soc_est_pct"] / 100.0) if last and last.get("battery_soc_est_pct") is not None else 0.5
     gen0 = bool(last and last.get("genset_running"))
+    key = f"demo_twin:{site['id']}"
+    carried = store.get_setting(key) or {}
+    if carried.get("t") == t_from:
+        elapsed0, outage0, rescue0 = int(carried.get("elapsed", 0)), int(carried.get("outage", 0)), bool(carried.get("rescue", False))
+    else:
+        elapsed0, outage0 = _trailing(site["id"], t_from)
+        rescue0 = False
+    if not gen0:
+        elapsed0, rescue0 = 0, False
     plant = twin.plant_of(site)
     written = 0
     t = t_from
@@ -144,12 +173,15 @@ def _simulate_span(site: dict, t_from: int, t_to: int, plan: dict | None) -> int
         a, b = (t - d0) // 60, (end - d0) // 60
         part = {k: (v[a:b] if isinstance(v, np.ndarray) else v) for k, v in tr.items()}
         pol, modes = _policy_for(site, day, part["ts"], plan)
-        sim = twin.simulate(part, pol, plant, soc0, gen0)
+        sim = twin.simulate(part, pol, plant, soc0, gen0, gen_elapsed0=elapsed0, outage_min0=outage0, gen_rescue0=rescue0)
         written += telemetry.write_rows(twin.telemetry_rows(site["id"], part, sim, rng_seed=int(t // 60), inverter_mode=modes))
         soc0 = float(sim["soc"][-1]) if plant.e_nom else 0.0
         gen0 = bool(sim["gen_on_end"])
+        elapsed0, outage0, rescue0 = int(sim["gen_elapsed_end"]), int(sim["outage_min_end"]), bool(sim["gen_rescue_end"])
         telemetry.aggregate_day(site["id"], day, plans.peak_mask(conn, twin.minutes_of(day)) if conn else None)
         t = end
+    if t_to > t_from:
+        store.set_setting(key, {"t": int(t_to), "elapsed": elapsed0, "outage": outage0, "rescue": rescue0})
     return written
 
 
@@ -240,6 +272,7 @@ def remove(by: str) -> int:
         with store.connect() as con:
             for table in ("plans", "savings_days", "alerts", "notifications", "switchback", "runs", "bills", "applied", "forecast_scores", "telemetry_days"):
                 con.execute(f"DELETE FROM {table} WHERE site_id = ?", (sid,))
+            con.execute("DELETE FROM settings WHERE key = ?", (f"demo_twin:{sid}",))
     store.set_setting("demo_status", {"state": "none"})
     return len(ids)
 

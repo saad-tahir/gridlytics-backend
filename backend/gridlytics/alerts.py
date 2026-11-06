@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timedelta, timezone
 
+import numpy as np
+
 from . import battery as battery_service
 from . import plans, sites, store, telemetry, twin
 
@@ -38,15 +40,68 @@ def _set(cond: bool, site_id: str, rule: str, category: str, severity: str, titl
     (_open(site_id, rule, category, severity, title, detail) if cond else _clear(site_id, rule))
 
 
+#: Staleness by data source (plan Part 2.4), as minutes before a warning and before a critical: an edge, HTTPS batch or twin source must be younger than 30
+#: minutes and an OEM-cloud source younger than 20; a CSV source is fed by uploads, so it is late only after 24 hours without one
+STALE_MINUTES = {"csv": (24 * 60, 48 * 60), "oem_cloud": (20, 60), "oem": (20, 60)}
+STALE_DEFAULT = (30, 120)
+
+
+def _last_upload(site_id: str) -> int | None:
+    with store.connect() as con:
+        r = con.execute("SELECT created FROM imports WHERE site_id = ? ORDER BY created DESC LIMIT 1", (site_id,)).fetchone()
+    try:
+        return int(datetime.fromisoformat(r["created"]).timestamp()) if r else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _stale(site_id: str, last: dict | None, now: int) -> None:
+    source = str((last or {}).get("source_id") or "")
+    warn, crit = STALE_MINUTES.get(source, STALE_DEFAULT)
+    if last is None:
+        age, title = None, ""
+    elif source == "csv":
+        up = _last_upload(site_id)
+        age = (now - max(last["ts"], up or 0)) / 60
+        title = f"No CSV upload for {int(age // 60)} hours"
+    else:
+        age = (now - last["ts"]) / 60
+        title = f"No data for {int(age)} minutes"
+    _set(age is not None and age > warn, site_id, "data_stale", "Data", "critical" if (age or 0) > crit else "warning", title,
+         {"last_ts": last["ts"] if last else None, "source": source or None})
+
+
+def _peak_unconfirmed(site: dict, now: int, today: str) -> bool:
+    """An advisory (tier 2) site whose plan discharged into today's peak, 30 minutes or more after that first peak step, with no 'applied' mark for today.
+    The step is looked up in the plan that was in force at it (the current plan always starts at this quarter, so it never holds a step that old)."""
+    with store.connect() as con:
+        if con.execute("SELECT 1 FROM applied WHERE site_id = ? AND day_local = ?", (site["id"], today)).fetchone() is not None:
+            return False
+    conn = (site.get("connections") or [None])[0]
+    if conn is None:
+        return False
+    d = date.fromisoformat(today)
+    t0 = int(datetime(d.year, d.month, d.day, tzinfo=PKT).timestamp())
+    quarters = np.arange(t0, t0 + 86400, 900, dtype=np.int64)
+    try:
+        peak = np.asarray(plans.peak_mask(conn, quarters), dtype=bool)
+    except (LookupError, ValueError, TypeError):
+        return False
+    for t in quarters[peak & (quarters <= now - 1800)]:
+        p = plans.active_at(site["id"], int(t))
+        st = next((s for s in (p or {}).get("steps", []) if s["t"] <= t < s["t"] + 900), None)
+        if st and st.get("peak") and (st.get("discharge_kw") or 0) > 0.1:
+            return True
+    return False
+
+
 def evaluate(site_id: str, now: int | None = None) -> None:
     site = sites.full(site_id)
     if site is None:
         return
     now = int(now or datetime.now(timezone.utc).timestamp())
     last = telemetry.latest(site_id)
-    age = (now - last["ts"]) / 60 if last else None
-    _set(age is not None and age > 30, site_id, "data_stale", "Data", "critical" if (age or 0) > 120 else "warning",
-         f"No data for {int(age or 0)} minutes", {"last_ts": last["ts"] if last else None})
+    _stale(site_id, last, now)
     plan = plans.current(site_id)
     latest_attempt = (plan or {}).get("latest_attempt")
     _set(bool(latest_attempt), site_id, "plan_failed", "Control", "warning",
@@ -74,10 +129,7 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     today = datetime.fromtimestamp(now, PKT).date().isoformat()
     unconfirmed = False
     if tier == "advisory_writes" and plan and not site.get("demo_link"):
-        first_peak = next((s for s in plan["steps"] if s["peak"] and s["discharge_kw"] > 0.1 and s["date"] == today), None)
-        if first_peak and now > first_peak["t"] + 1800:
-            with store.connect() as con:
-                unconfirmed = con.execute("SELECT 1 FROM applied WHERE site_id = ? AND day_local = ?", (site_id, today)).fetchone() is None
+        unconfirmed = _peak_unconfirmed(site, now, today)
     if site.get("demo_link") and site["data"].get("twin", {}).get("unconfirmed_alert"):
         unconfirmed = True
     _set(unconfirmed, site_id, "apply_unconfirmed", "Control", "warning",
@@ -96,29 +148,78 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     genset_requests(site, plan, now)
 
 
-def genset_requests(site: dict, plan: dict | None, now: int) -> None:
-    """At a manual-start genset site, a request for each planned run starting in the next two hours (one per start)."""
-    if not plan or site["data"].get("genset_start_control") != "manual" or not (site.get("assets") or {}).get("genset"):
-        return
-    steps = plan.get("steps") or []
-    for i, s in enumerate(steps):
-        if s["t"] < now - 900 or s["t"] > now + 7200:
-            continue
-        starts = s["genset_on"] and (i == 0 or not steps[i - 1]["genset_on"])
-        if not starts:
-            continue
-        key = f"genset_request:{s['t']}"
-        with store.connect() as con:
-            if con.execute("SELECT 1 FROM notifications WHERE site_id = ? AND kind = 'genset_request' AND payload LIKE ?", (site["id"], f'%"{key}"%')).fetchone():
-                continue
+def _runs(steps: list[dict]) -> list[tuple[int, int]]:
+    """The plan's genset runs as (first step, step after the last)."""
+    out, i = [], 0
+    while i < len(steps):
+        if steps[i]["genset_on"]:
             j = i
             while j < len(steps) and steps[j]["genset_on"]:
                 j += 1
-            payload = {"key": key, "start": s["t"], "end": steps[j - 1]["t"] + 900 if j > i else s["t"] + 900, "kw": s["genset_kw"],
-                       "reason": s["reason"], "detail": s["detail"], "plan_id": plan["id"]}
+            out.append((i, j))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def _withdraw_requests(site_id: str, spans: list[tuple[int, int]], running: bool, now: int) -> None:
+    """Closes the open genset requests that no longer stand: their run is over, the set is running, or the current plan no longer runs it."""
+    with store.connect() as con:
+        rows = con.execute("SELECT id, detail FROM alerts WHERE site_id = ? AND rule LIKE 'genset_request_%' AND state IN ('open','acknowledged')",
+                           (site_id,)).fetchall()
+        for r in rows:
+            p = json.loads(r["detail"] or "{}")
+            start, end = p.get("start"), p.get("end")
+            if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+                continue
+            lo = max(start, now)
+            if now >= end:
+                note = "The planned run is over"
+            elif running and start <= now:
+                note = "The genset is running"
+            elif not any(a < end and b > lo for a, b in spans):
+                note = "No longer planned"
+            else:
+                continue
+            con.execute("UPDATE alerts SET state = 'resolved', closed_at = ?, note = ? WHERE id = ?", (store._now(), note, r["id"]))
+            if note == "No longer planned":
+                con.execute("UPDATE notifications SET status = 'withdrawn' WHERE site_id = ? AND kind = 'genset_request' AND status = 'pending' AND payload LIKE ?",
+                            (site_id, f'%"genset_request:{start}"%'))
+
+
+def genset_requests(site: dict, plan: dict | None, now: int) -> None:
+    """At a manual-start genset site, one request per planned run starting in the next two hours. The plan is re-solved every quarter, so its first step
+    moves forward each time: a run the set is already doing (telemetry says it runs) or one already asked about (an earlier request's window holds its
+    start) is not asked again, and open requests whose run is over, is running or is no longer planned are closed."""
+    if not plan or site["data"].get("genset_start_control") != "manual" or not (site.get("assets") or {}).get("genset"):
+        return
+    sid = site["id"]
+    steps = plan.get("steps") or []
+    last = telemetry.latest(sid)
+    running = bool(last and now - last["ts"] <= 1800 and (last.get("genset_running") or 0) >= 0.5)
+    runs = _runs(steps)
+    spans = [(steps[i]["t"], steps[j - 1]["t"] + 900) for i, j in runs]
+    _withdraw_requests(sid, spans, running, now)
+    with store.connect() as con:
+        held = [(r["status"], json.loads(r["payload"])) for r in con.execute(
+            "SELECT status, payload FROM notifications WHERE site_id = ? AND kind = 'genset_request' ORDER BY ts DESC LIMIT 100", (sid,)).fetchall()]
+    for (i, j), (start, end) in zip(runs, spans):
+        s = steps[i]
+        if start < now - 900 or start > now + 7200:
+            continue
+        if i == 0 and running:
+            continue                                  # the plan carries on a run the set is already doing: not a start
+        key = f"genset_request:{start}"
+        if any(status != "withdrawn" and (p.get("key") == key or (isinstance(p.get("start"), (int, float)) and isinstance(p.get("end"), (int, float))
+                                                                  and p["start"] <= start < p["end"])) for status, p in held):
+            continue                                  # this run was asked about already
+        payload = {"key": key, "start": start, "end": end, "kw": s["genset_kw"], "reason": s["reason"], "detail": s["detail"], "plan_id": plan["id"]}
+        with store.connect() as con:
             con.execute("INSERT INTO notifications (id, site_id, ts, kind, payload) VALUES (?,?,?,?,?)",
-                        (store.new_id(), site["id"], store._now(), "genset_request", json.dumps(payload)))
-        _open(site["id"], f"genset_request_{s['t']}", "Genset", "info", f"Please start the genset at {s['local']} ({s['genset_kw']:.0f} kW)", payload)
+                        (store.new_id(), sid, store._now(), "genset_request", json.dumps(payload)))
+        held.append(("pending", payload))
+        _open(sid, f"genset_request_{start}", "Genset", "info", f"Please start the genset at {s['local']} ({s['genset_kw']:.0f} kW)", payload)
 
 
 def requests_for(site_id: str, limit: int = 50) -> list[dict]:
@@ -187,7 +288,12 @@ def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "")
         else:
             raise ValueError("The action is acknowledge, assign or close")
     store.audit(by, f"{action}d an alert" if action != "assign" else "assigned an alert", r["site_id"], {"alert": alert_id})
-    return next(a for a in listing() if a["id"] == alert_id) if action != "close" else {"id": alert_id, "state": "closed"}
+    if action == "close":
+        return {"id": alert_id, "state": "closed"}
+    # the alert itself, read by its id (the inbox listing is capped, so an alert outside its first rows would not be found there)
+    with store.connect() as con:
+        r2 = con.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+    return {**dict(r2), "detail": json.loads(r2["detail"] or "{}"), "site_name": (sites.get(r2["site_id"]) or {}).get("name", "")}
 
 
 def rules() -> dict:

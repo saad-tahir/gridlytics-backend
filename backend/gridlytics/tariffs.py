@@ -1,17 +1,22 @@
 """The tariff and regime engine and the 1-minute bill engine (plan Part 6; R9 sections 11 to 13).
 
 * **Versions.** Every tariff object (schedule, TOU calendar, monthly adder, tax rules, the ICP, the prosumer regimes) is an effective-dated, immutable row of
-  `tariff_versions`, resolved by date (adders by billing month), each with its source and a content hash. A new notification is proposed as `pending` and goes
-  live only when an administrator approves it (`approve`), which closes the version before it.
+  `tariff_versions`, resolved by date (adders by billing month, one version per adder key), each with its source and a content hash. A new notification is
+  proposed as `pending` (its body checked per kind) and goes live only when an administrator approves it (`approve`), which closes the version before it, or
+  supersedes it outright when the new one corrects the same start.
 * **The bill engine** (`rebuild`) prices a connection's 1-minute import and export series over a billing period in R9's thirteen steps and returns a line-item
   bill plus the aggregates verification needs. The counterfactual runs the same function on the replayed series; the saving is the difference line by line.
 * **The vectors** (`vectors`) give the optimiser, for 192 steps of 15 minutes, the marginal rupee per kWh the bill engine itself would charge, on the
-  connection's bearable-cost basis (GST and the s.235 advance excluded where the company recovers them; plan Part 4, the marginal-price rule).
+  connection's bearable-cost basis (GST and the s.235 advance excluded where the company recovers them; plan Part 4, the marginal-price rule). Each step is
+  priced with the adders of the bill it will appear on (the billing month from the connection's `reading_day`, the calendar month when that is unset).
 """
 from __future__ import annotations
 
+import calendar as _calendar
 import hashlib
 import json
+import math
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
@@ -21,24 +26,47 @@ from . import store, tariff_data
 PKT = timezone(timedelta(hours=5))
 
 
+class NoTariffVersion(LookupError, ValueError):
+    """No version of a tariff object is in force for the date asked. A LookupError for the callers that already catch one, and a ValueError so a route
+    turns it into a refusal that says so (a 422), not a server error."""
+
+
 def _hash(body: dict) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
 # ------------------------------------------------------------------------------------------------ versions
 
 def ensure_shipped() -> None:
-    """Seed the shipped versions and fuel prices into the company's file the first time it is used."""
+    """Seed the shipped versions and fuel prices into the company's file the first time it is used, and add a shipped version that a newer build ships
+    and the file lacks (matched on kind, key and start; a start the company already holds a version for is never doubled).
+
+    The cheap check runs unlocked; the seeding runs inside an immediate write transaction that checks again, so callers racing on a fresh file (two
+    requests, a request and the scheduler tick) seed it once: the first seeds, the rest find the rows."""
+    wanted = {(v["kind"], v["key"], v["effective_from"]) for v in tariff_data.SHIPPED}
     with store.connect() as con:
-        if con.execute("SELECT COUNT(*) FROM tariff_versions").fetchone()[0] == 0:
-            for v in tariff_data.SHIPPED:
-                con.execute("INSERT INTO tariff_versions (id, kind, key, effective_from, effective_to, known_from, status, supersedes, body, source, hash, "
-                            "created, by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (store.new_id(), v["kind"], v["key"], v["effective_from"], None, v["known_from"], v["status"], None, json.dumps(v["body"]),
-                             json.dumps(v["source"]), _hash(v["body"]), store._now(), "shipped"))
-        if con.execute("SELECT COUNT(*) FROM fuel_prices").fetchone()[0] == 0:
+        have = {(r[0], r[1], r[2]) for r in con.execute("SELECT kind, key, effective_from FROM tariff_versions")}
+        fuel = con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is not None
+    if wanted <= have and fuel:
+        return
+    with store.write_transaction() as con:
+        have = {(r[0], r[1], r[2]) for r in con.execute("SELECT kind, key, effective_from FROM tariff_versions")}
+        for v in tariff_data.SHIPPED:
+            k = (v["kind"], v["key"], v["effective_from"])
+            if k in have:
+                continue
+            have.add(k)
+            con.execute("INSERT INTO tariff_versions (id, kind, key, effective_from, effective_to, known_from, status, supersedes, body, source, hash, "
+                        "created, by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (store.new_id(), v["kind"], v["key"], v["effective_from"], None, v["known_from"], v["status"], None, json.dumps(v["body"]),
+                         json.dumps(v["source"]), _hash(v["body"]), store._now(), "shipped"))
+        if con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is None:
             for kind, day, price in tariff_data.FUEL_PRICES:
-                con.execute("INSERT INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?)",
+                con.execute("INSERT OR IGNORE INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?)",
                             (kind, day, price, json.dumps(tariff_data.FUEL_SOURCE[kind])))
 
 
@@ -59,25 +87,132 @@ def versions(kind: str | None = None) -> list[dict]:
 
 
 def resolve(kind: str, key: str, on: date | str) -> dict | None:
-    """The active version of (kind, key) in force on a date: the latest effective_from not after it."""
+    """The active version of (kind, key) in force on a date: the latest effective_from not after it and not closed before it (of two with the same
+    start, the one created last)."""
     ensure_shipped()
     day = on.isoformat() if isinstance(on, date) else str(on)[:10]
     with store.connect() as con:
         r = con.execute("SELECT * FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' AND effective_from <= ? "
-                        "ORDER BY effective_from DESC LIMIT 1", (kind, key, day)).fetchone()
+                        "AND (effective_to IS NULL OR effective_to >= ?) ORDER BY effective_from DESC, created DESC, rowid DESC LIMIT 1",
+                        (kind, key, day, day)).fetchone()
     return _ver(r) if r else None
+
+
+# The keys the engine resolves for each kind (an adder's key is free: qta, fca, dss, nj, ...)
+_KEYS = {"schedule": ("national",), "tou": ("xwdisco", "ke"), "tax": ("national",), "icp": ("national",), "prosumer": ("net_billing", "net_metering_legacy")}
+_BASES = ("per_kw_month", "sanctioned_kw_month", "per_consumer_month")
+_YM = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _month_bounds(ym: str) -> tuple[str, str]:
+    """The first and last day ("YYYY-MM-DD") of a month "YYYY-MM"."""
+    y, m = int(ym[:4]), int(ym[5:7])
+    return f"{ym}-01", f"{ym}-{_calendar.monthrange(y, m)[1]:02d}"
+
+
+def validate_body(kind: str, key: str, body, effective_from: str | None = None) -> None:
+    """Refuse (ValueError) a version body the engine could not price with: one approved malformed row would otherwise stop every plan, price and bill."""
+    if not isinstance(body, dict):
+        raise ValueError("A version's body is a JSON object")
+    if kind in _KEYS and key not in _KEYS[kind]:
+        raise ValueError(f"A {kind} version's key is one of: {', '.join(_KEYS[kind])}")
+    if "name" in body and not isinstance(body["name"], str):
+        raise ValueError("A version's name is text")
+    if kind == "schedule":
+        cards = body.get("cards")
+        if not isinstance(cards, dict) or not cards:
+            raise ValueError("A schedule needs its rate cards: a non-empty map of category to card")
+        for cat, c in cards.items():
+            if not isinstance(c, dict):
+                raise ValueError(f"The card for {cat} is not an object")
+            if c.get("fixed_basis") not in _BASES:
+                raise ValueError(f"The card for {cat} needs fixed_basis: {', '.join(_BASES)}")
+            if not _num(c.get("fixed")) or c["fixed"] < 0:
+                raise ValueError(f"The card for {cat} needs a fixed charge (a number, 0 or more)")
+            if not _num(c.get("floor_share")) or not 0 <= c["floor_share"] <= 1:
+                raise ValueError(f"The card for {cat} needs floor_share between 0 and 1")
+            for f in ("peak", "off_peak", "flat"):
+                if c.get(f) is not None and (not _num(c[f]) or c[f] < 0):
+                    raise ValueError(f"The card for {cat} has a {f} rate that is not a number of 0 or more")
+            if c.get("tou") and c.get("peak") is not None:
+                if not _num(c.get("off_peak")):
+                    raise ValueError(f"The TOU card for {cat} needs peak and off_peak rates")
+            elif not _num(c.get("flat")):
+                raise ValueError(f"The card for {cat} needs a flat rate, or tou with peak and off_peak rates")
+    elif kind == "adder":
+        if not _num(body.get("rate")) or abs(body["rate"]) > 100:
+            raise ValueError("An adder needs a rate in Rs/kWh (a number)")
+        months = body.get("billing_months")
+        if months != "all":
+            if not isinstance(months, list) or not months or not all(isinstance(m, str) and _YM.match(m) for m in months):
+                raise ValueError('An adder needs billing_months: "all" or a list of billing months as YYYY-MM')
+            if effective_from and effective_from > _month_bounds(min(months))[1]:
+                raise ValueError("An adder's start must fall on or before the end of its first billing month (use the first day of that month); "
+                                 "it is resolved by billing month, so a later start would leave that bill without it")
+        exempt = body.get("exempt", [])
+        if not isinstance(exempt, list) or not all(isinstance(x, str) for x in exempt):
+            raise ValueError("An adder's exempt is a list of exemptions (for example icp_units, lifeline, prepaid)")
+    elif kind == "tou":
+        seasons = body.get("seasons")
+        if not isinstance(seasons, list) or not seasons:
+            raise ValueError("A TOU calendar needs seasons, each with months and a peak window")
+        for s in seasons:
+            months = s.get("months") if isinstance(s, dict) else None
+            peak = s.get("peak") if isinstance(s, dict) else None
+            if not isinstance(months, list) or not months or not all(isinstance(m, int) and not isinstance(m, bool) and 1 <= m <= 12 for m in months):
+                raise ValueError("Each TOU season needs months: a list of month numbers 1 to 12")
+            if not isinstance(peak, (list, tuple)) or len(peak) != 2 or not all(isinstance(x, str) and _HHMM.match(x) for x in peak):
+                raise ValueError('Each TOU season needs a peak window: ["HH:MM", "HH:MM"]')
+    elif kind == "icp":
+        if not _num(body.get("rate")) or body["rate"] < 0:
+            raise ValueError("The ICP needs its rate in Rs/kWh")
+        for f in ("first_month", "last_month"):
+            if not isinstance(body.get(f), str) or not _YM.match(body[f]):
+                raise ValueError(f"The ICP needs {f} as YYYY-MM")
+        if body["first_month"] > body["last_month"]:
+            raise ValueError("The ICP's first month comes before its last")
+        if not isinstance(body.get("categories"), list) or not all(isinstance(x, str) for x in body["categories"]):
+            raise ValueError("The ICP needs the list of categories it covers")
+    elif kind == "prosumer":
+        if key == "net_billing" and (not _num(body.get("naepp")) or body["naepp"] < 0):
+            raise ValueError("Net billing needs the export price naepp in Rs/kWh")
+        if key == "net_metering_legacy":
+            sr = body.get("surplus_rate", "off_peak")
+            if not (sr in ("off_peak", "peak") or (_num(sr) and sr >= 0)):
+                raise ValueError('Legacy net metering\'s surplus_rate is "off_peak", "peak" or a rate in Rs/kWh')
+            if body.get("netting", "by_period") != "by_period":
+                raise ValueError("Legacy net metering is modelled with by-period netting only (netting: by_period)")
+    elif kind == "tax":
+        for f in ("gst", "further_tax_no_strn"):
+            if f in body and (not _num(body[f]) or not 0 <= body[f] < 1):
+                raise ValueError(f"The tax rule {f} is a fraction between 0 and 1")
+        ed = body.get("electricity_duty", {})
+        if not isinstance(ed, dict) or not all(isinstance(v, dict) and all(_num(x) and 0 <= x < 1 for x in v.values()) for v in ed.values()):
+            raise ValueError("Electricity duty is a map of province to a map of class to a fraction")
+        s235 = body.get("s235", {})
+        if not isinstance(s235, dict) or not all(isinstance(v, dict) and all(_num(v.get(f)) for f in ("nil_upto", "mid_rate", "mid_upto", "base_above", "rate_above"))
+                                                 for v in s235.values()):
+            raise ValueError("Each s.235 slab needs nil_upto, mid_rate, mid_upto, base_above and rate_above")
+        if not isinstance(body.get("ptv", {}), dict) or not all(_num(x) for x in body.get("ptv", {}).values()):
+            raise ValueError("The PTV fee is a map of class to rupees")
+        if "muct_ke" in body and not _num(body["muct_ke"]):
+            raise ValueError("The MUCT fee is a number of rupees")
 
 
 def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, by: str) -> dict:
     """A new version from a watcher or a person, pending until an administrator approves it."""
     if kind not in ("schedule", "tou", "adder", "tax", "icp", "prosumer"):
         raise ValueError("Unknown tariff kind")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("A version needs its key")
     try:
         date.fromisoformat(effective_from)
-    except ValueError:
+    except (TypeError, ValueError):
         raise ValueError("The version's start must be a date (YYYY-MM-DD)") from None
     if not isinstance(body, dict) or not isinstance(source, dict) or source.get("verified") not in ("primary", "secondary", "unverified"):
         raise ValueError("A version carries a body and a source with verified: primary, secondary or unverified")
+    validate_body(kind, key, body, effective_from)
     ensure_shipped()
     vid = store.new_id()
     with store.connect() as con:
@@ -88,20 +223,57 @@ def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, 
     return next(v for v in versions(kind) if v["id"] == vid)
 
 
+def _check_schedule_covers_connections(con, cards: dict) -> None:
+    """A dry run of the resolution: every category a grid connection of this company is on keeps a rate card under the new schedule."""
+    used = set()
+    for r in con.execute("SELECT data FROM connections").fetchall():
+        try:
+            d = json.loads(r[0])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("regime") != "off_grid" and d.get("tariff_category"):
+            used.add(str(d["tariff_category"]))
+    missing = sorted(used - set(cards))
+    if missing:
+        raise ValueError(f"The schedule has no rate card for {', '.join(missing)}, which this company's connections are on: add the card(s) before approving")
+
+
 def approve(version_id: str, by: str) -> dict:
-    """Make a pending version active; the active version of the same key it follows is closed the day before (the only mutation allowed, logged)."""
-    with store.connect() as con:
+    """Make a pending version active. The active version of the same key it follows is closed the day before; one with the same start (a correction) is
+    superseded outright, and a placeholder awaiting this notification is superseded. A placeholder itself is never approved: the notified version is
+    drafted and approved in its place. The body is checked again before anything changes (the only mutations allowed, logged)."""
+    with store.write_transaction() as con:
         r = con.execute("SELECT * FROM tariff_versions WHERE id = ?", (version_id,)).fetchone()
         if r is None:
             raise KeyError(version_id)
-        if r["status"] not in ("pending", "awaiting_notification"):
+        if r["status"] == "awaiting_notification":
+            raise ValueError("This version is a placeholder awaiting the notification: draft the notified version and approve that one")
+        if r["status"] != "pending":
             raise ValueError("Only a pending version can be approved")
-        prev = con.execute("SELECT id FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' AND effective_from < ? "
-                           "ORDER BY effective_from DESC LIMIT 1", (r["kind"], r["key"], r["effective_from"])).fetchone()
-        day_before = (date.fromisoformat(r["effective_from"]) - timedelta(days=1)).isoformat()
-        if prev:
-            con.execute("UPDATE tariff_versions SET effective_to = ? WHERE id = ? AND effective_to IS NULL", (day_before, prev["id"]))
-        con.execute("UPDATE tariff_versions SET status = 'active', supersedes = ? WHERE id = ?", (prev["id"] if prev else None, version_id))
+        try:
+            body = json.loads(r["body"])
+        except (TypeError, ValueError):
+            raise ValueError("The version's body is not valid JSON") from None
+        validate_body(r["kind"], r["key"], body, r["effective_from"])
+        if r["kind"] == "schedule":
+            _check_schedule_covers_connections(con, body["cards"])
+        kind, key, start = r["kind"], r["key"], r["effective_from"]
+        day_before = (date.fromisoformat(start) - timedelta(days=1)).isoformat()
+        prev = con.execute("SELECT id, effective_from FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' AND effective_from <= ? AND id != ? "
+                           "ORDER BY effective_from DESC, created DESC, rowid DESC LIMIT 1", (kind, key, start, version_id)).fetchone()
+        if prev and prev["effective_from"] == start:
+            # a corrected notification for the same start: the version it corrects is in force on no day
+            con.execute("UPDATE tariff_versions SET status = 'superseded', effective_to = ? WHERE id = ?", (day_before, prev["id"]))
+        elif prev:
+            con.execute("UPDATE tariff_versions SET effective_to = ? WHERE id = ? AND (effective_to IS NULL OR effective_to > ?)",
+                        (day_before, prev["id"], day_before))
+        nxt = con.execute("SELECT effective_from FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' AND effective_from > ? AND id != ? "
+                          "ORDER BY effective_from LIMIT 1", (kind, key, start, version_id)).fetchone()
+        end = (date.fromisoformat(nxt["effective_from"]) - timedelta(days=1)).isoformat() if nxt else None
+        con.execute("UPDATE tariff_versions SET status = 'superseded' WHERE kind = ? AND key = ? AND status = 'awaiting_notification' AND effective_from <= ?",
+                    (kind, key, start))
+        con.execute("UPDATE tariff_versions SET status = 'active', supersedes = ?, effective_to = ? WHERE id = ?",
+                    (prev["id"] if prev else None, end, version_id))
     store.audit(by, "approved a tariff version", f"{r['kind']}/{r['key']}", {"version_id": version_id, "effective_from": r["effective_from"]})
     return next(v for v in versions(r["kind"]) if v["id"] == version_id)
 
@@ -162,8 +334,8 @@ def calendar_for(conn: dict, on) -> dict:
 def card_for(category: str, on) -> tuple[dict, dict]:
     """The rate card of a category in force on a date, and the schedule version it came from."""
     v = resolve("schedule", "national", on)
-    if v is None or category not in v["body"]["cards"]:
-        raise LookupError(f"No rate card for {category} on {str(on)[:10]}")
+    if v is None or category not in (v["body"].get("cards") or {}):
+        raise NoTariffVersion(f"No rate card for {category} on {str(on)[:10]}: no tariff version in force for that day covers it")
     return v["body"]["cards"][category], v
 
 
@@ -179,16 +351,62 @@ def tax_rules(on) -> dict:
 
 
 def adders_for(billing_month: str) -> list[dict]:
-    """The active adders billed in a billing month ("YYYY-MM"): QTA, FCA and the debt service surcharge."""
+    """The adders billed in a billing month ("YYYY-MM"): QTA, FCA and the debt service surcharge, one version per adder key.
+
+    A version counts when it is active, in force on some day of the billing month (its start on or before the month's last day and not closed before
+    its first) and lists the month (or "all"). Of several versions of one key the latest start wins, and of two with the same start the one created
+    last, so a new or corrected version replaces the one before it instead of stacking on it; two months' FCAs billed together are two keys. A
+    malformed row is skipped rather than failing every bill."""
     ensure_shipped()
-    out = []
-    for v in versions("adder"):
-        if v["status"] != "active":
+    first, last = _month_bounds(billing_month)
+    with store.connect() as con:
+        rows = con.execute("SELECT * FROM tariff_versions WHERE kind = 'adder' AND status = 'active' AND effective_from <= ? "
+                           "AND (effective_to IS NULL OR effective_to >= ?) ORDER BY key, effective_from, created, rowid", (last, first)).fetchall()
+    best: dict[str, dict] = {}
+    for r in rows:
+        try:
+            v = _ver(r)
+        except (TypeError, ValueError):
             continue
-        months = v["body"]["billing_months"]
-        if months == "all" or billing_month in months:
-            out.append({"key": v["key"], "id": v["id"], **v["body"]})
-    return out
+        body = v["body"] if isinstance(v["body"], dict) else {}
+        months = body.get("billing_months", [])
+        if not (months == "all" or (isinstance(months, list) and billing_month in months)) or not _num(body.get("rate")):
+            continue
+        best[v["key"]] = v  # ordered by start, so the last one of a key wins
+    return [{"key": v["key"], "id": v["id"], "name": v["key"], "exempt": [], **v["body"]} for v in best.values()]
+
+
+def _reading_day(conn: dict | None) -> int | None:
+    rd = ((conn or {}).get("data") or {}).get("reading_day")
+    try:
+        rd = int(rd)
+    except (TypeError, ValueError):
+        return None
+    return rd if 1 <= rd <= 31 else None
+
+
+def billing_month_for(conn: dict | None, day: date) -> str:
+    """The billing month ("YYYY-MM", the month of the reading that closes the bill) a consumption day falls in. With the connection's `reading_day`
+    set, a day after the reading belongs to the next month's bill; without it the bill is the calendar month."""
+    rd = _reading_day(conn)
+    if rd is None or day.day <= min(rd, _calendar.monthrange(day.year, day.month)[1]):
+        return f"{day.year:04d}-{day.month:02d}"
+    y, m = (day.year + 1, 1) if day.month == 12 else (day.year, day.month + 1)
+    return f"{y:04d}-{m:02d}"
+
+
+def billing_period_for(conn: dict | None, day: date) -> tuple[date, date]:
+    """The first and last consumption day of the bill a day falls in: the day after the previous reading, and the reading date (the calendar month
+    without a `reading_day`). The month-to-date counters and the MDI month follow these bounds."""
+    bm = billing_month_for(conn, day)
+    y, m = int(bm[:4]), int(bm[5:7])
+    rd = _reading_day(conn)
+    if rd is None:
+        return date(y, m, 1), date(y, m, _calendar.monthrange(y, m)[1])
+    py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
+    reading = date(y, m, min(rd, _calendar.monthrange(y, m)[1]))
+    previous = date(py, pm, min(rd, _calendar.monthrange(py, pm)[1]))
+    return previous + timedelta(days=1), reading
 
 
 def icp_rule(on) -> dict | None:
@@ -231,19 +449,53 @@ def _tax_factor_energy(conn: dict, on) -> dict:
     gst = tax.get("gst", 0.18)
     flags = data.get("tax") or {}
     further = tax.get("further_tax_no_strn", 0.03) if not flags.get("strn", True) and cls in ("industrial", "commercial") else 0.0
-    s235 = tax.get("s235", {}).get("industrial" if cls == "industrial" else "commercial", {}).get("rate_above", 0.05)
+    slab = tax.get("s235", {}).get("industrial" if cls == "industrial" else "commercial")
+    s235 = (slab or {}).get("rate_above", 0.05)
     return {"ed": ed, "gst": gst, "further": further, "s235_marginal": s235, "gst_recoverable": bool(flags.get("gst_recoverable", True)),
-            "s235_adjustable": bool(flags.get("s235_adjustable", True)), "class": cls}
+            "s235_adjustable": bool(flags.get("s235_adjustable", True)), "class": cls,
+            # the bill charges s.235 only to industrial and commercial connections (rebuild step 11)
+            "s235_applies": bool(slab) and cls in ("industrial", "commercial")}
+
+
+def _tax_stack(tf: dict) -> float:
+    """The bearable rupees per rupee of a pre-tax charge, from the bill's own formula: GST and further tax both on the same base (added, not multiplied),
+    and s.235 on the bill amount including them, where the class pays it; GST and s.235 dropped where the company recovers them."""
+    f = 1.0 + tf["further"] + (0.0 if tf["gst_recoverable"] else tf["gst"])
+    if tf["s235_applies"] and not tf["s235_adjustable"]:
+        f += tf["s235_marginal"] * (1.0 + tf["gst"] + tf["further"])
+    return f
+
+
+def _seasonal_factor(data: dict, month: int) -> float:
+    """Tariff F: the fixed charge times the seasonal multiplier in the running season and nothing outside it (R9 section 4); 1 for other connections."""
+    season = [int(m) for m in (data.get("season_months") or [])]
+    if not season:
+        return 1.0
+    return float(data.get("seasonal_multiplier", 1.0)) if int(month) in season else 0.0
+
+
+def _legacy_surplus_rate(card: dict, pro: dict | None) -> float:
+    """The rate a legacy net-metering surplus is credited at, from the prosumer version (the off-peak rate by default; no duty or tax on it)."""
+    sr = (pro or {}).get("surplus_rate", "off_peak")
+    if _num(sr):
+        return float(sr)
+    return _energy_rate(card, sr == "peak")
 
 
 def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, conn: dict, period_start: date, period_end: date,
-            energy_scalar: float = 1.0, mdi_scalar: float = 1.0) -> dict:
-    """The connection's bill over [period_start, period_end] (meter-reading dates, end inclusive) from 1-minute series.
+            energy_scalar: float = 1.0, mdi_scalar: float = 1.0, period_start_exclusive: bool = False) -> dict:
+    """The connection's bill over the consumption days [period_start, period_end], both inclusive, from 1-minute series.
+
+    `period_start` is the first day billed, the day after the previous meter reading, and `period_end` the reading date. A caller holding the two
+    reading dates as printed on the DISCO bill (R9 section 13: start exclusive, end inclusive) passes `period_start_exclusive=True`, so the previous
+    reading day is not billed twice and the proration counts the real reading interval.
 
     `ts_utc` holds epoch seconds of each minute's start (UTC); `import_kw` and `export_kw` the mean power of that minute. Returns the line items, the totals
     (as billed, and as the company bears them) and the aggregates verification reads."""
     data = conn["data"]
     on = period_end
+    if period_start_exclusive:
+        period_start = period_start + timedelta(days=1)
     card, schedule = card_for(data["tariff_category"], on)
     cal = calendar_for(conn, on)
     tf = _tax_factor_energy(conn, on)
@@ -312,8 +564,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     else:
         billing_demand = 0.0
         fixed = card["fixed"] * prorate
-    if period_end.month in (data.get("season_months") or []):
-        fixed *= float(data.get("seasonal_multiplier", 1.0))
+    fixed *= _seasonal_factor(data, period_end.month)
     lines.append({"line": "Fixed charges", "billing_demand_kw": round(billing_demand, 2), "mdi_kw": round(mdi, 2), "rate": card["fixed"],
                   "amount_rs": round(fixed, 2)})
     # 7. adders by billing month, with their exemptions
@@ -325,7 +576,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
             units = total_units - inc_total
         amt = a["rate"] * units
         adders += amt
-        lines.append({"line": a["name"], "units_kwh": round(units, 3), "rate": a["rate"], "amount_rs": round(amt, 2)})
+        lines.append({"line": a.get("name", a["key"]), "units_kwh": round(units, 3), "rate": a["rate"], "amount_rs": round(amt, 2)})
     # 8. electricity duty on the variable subtotal
     duty = tf["ed"] * (energy + adders)
     lines.append({"line": "Electricity duty", "rate": tf["ed"], "amount_rs": round(duty, 2)})
@@ -336,7 +587,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
         pro = prosumer("net_billing", on) or {"naepp": 0.0}
         credit = exported * pro["naepp"]
     elif regime == "net_metering_legacy":
-        credit = surplus_kwh * _energy_rate(card, False)
+        credit = surplus_kwh * _legacy_surplus_rate(card, prosumer("net_metering_legacy", on))
     # 10. GST (the credit is netted after taxes: DISCO practice, R9 section 13 step 10, to confirm on a prosumer bill)
     gst = tf["gst"] * (energy + fixed + adders + duty)
     lines.append({"line": "GST", "rate": tf["gst"], "amount_rs": round(gst, 2)})
@@ -367,44 +618,46 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     return {"lines": lines, "total_rs": round(total, 2), "bearable_rs": round(total - recovered, 2), "recovered_taxes_rs": round(recovered, 2),
             "energy_rs": round(energy + adders, 2), "demand_rs": round(fixed, 2), "credits_rs": round(credit, 2),
             "import_kwh": e_imp, "export_kwh": e_exp, "icp_incremental_kwh": incremental, "mdi_kw": round(mdi, 2),
-            "schedule_version": schedule["id"], "schedule_hash": schedule["hash"], "billing_month": billing_month, "days": days}
+            "schedule_version": schedule["id"], "schedule_hash": schedule["hash"], "billing_month": billing_month, "days": days,
+            "first_day": period_start.isoformat(), "last_day": period_end.isoformat()}
 
 
 # ------------------------------------------------------------------------------------------------ the optimiser's vectors (plan Part 6.4)
 
 def energy_factor(conn: dict, on) -> float:
-    """The multiplier from the base rate to the bearable marginal rupee per kWh of variable charges."""
+    """The multiplier from the base rate to the bearable marginal rupee per kWh of variable charges: the duty, then the bill's tax stack."""
     tf = _tax_factor_energy(conn, on)
-    f = (1.0 + tf["ed"]) * (1.0 + tf["further"])
-    if not tf["gst_recoverable"]:
-        f *= 1.0 + tf["gst"]
-    if not tf["s235_adjustable"]:
-        f *= 1.0 + tf["s235_marginal"]
-    return f
+    return (1.0 + tf["ed"]) * _tax_stack(tf)
 
 
 def fixed_factor(conn: dict, on) -> float:
-    tf = _tax_factor_energy(conn, on)
-    f = 1.0 + tf["further"]
-    if not tf["gst_recoverable"]:
-        f *= 1.0 + tf["gst"]
-    if not tf["s235_adjustable"]:
-        f *= 1.0 + tf["s235_marginal"]
-    return f
+    """The multiplier from a fixed charge to the bearable rupees it costs (no duty on fixed charges)."""
+    return _tax_stack(_tax_factor_energy(conn, on))
 
 
 def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: dict | None = None, rest_net_import: dict | None = None,
-            g_max_kw: float = 1e6) -> dict:
+            g_max_kw: float = 1e6, mtd_export: dict | None = None, rest_net_export: dict | None = None) -> dict:
     """The 15-minute price vectors for the optimiser from `t0_utc`: import and export prices (Rs/kWh, bearable basis), the peak flag, the MDI terms and
-    the ICP case per period. A site with no connection (off-grid) gets zero prices and grid availability 0."""
+    the ICP case per period. A site with no connection (off-grid) gets zero prices and grid availability 0.
+
+    Each step carries the adders of its billing month (`billing_month`, from the connection's `reading_day`); the ICP case, the MDI rate and the legacy
+    netting case are those of the current billing month, whose steps end at `billing_month_end_step`. `mtd_import` and `rest_net_import` are the
+    current billing month's imports per period so far and forecast for the rest; for legacy net metering `mtd_export` and `rest_net_export` are the
+    exports alike (left out, the periods are taken to end the month as net imports)."""
     h = 0.25
     out = {"c_imp": np.zeros(steps), "c_exp": np.zeros(steps), "peak": np.zeros(steps, dtype=bool), "month": np.zeros(steps, dtype=int),
-           "local_hour": np.zeros(steps), "grid": np.ones(steps), "icp": {}, "mdi": None}
+           "local_hour": np.zeros(steps), "grid": np.ones(steps), "icp": {}, "mdi": None, "billing_month": [], "billing_month_end_step": steps}
     times = [t0_utc + timedelta(minutes=15 * i) for i in range(steps)]
-    for i, t in enumerate(times):
-        loc = t.astimezone(PKT)
+    locs = [t.astimezone(PKT) for t in times]
+    for i, loc in enumerate(locs):
         out["month"][i] = loc.month
         out["local_hour"][i] = loc.hour + loc.minute / 60.0
+    bm_by_day: dict[date, str] = {}
+    for loc in locs:
+        if loc.date() not in bm_by_day:
+            bm_by_day[loc.date()] = billing_month_for(conn, loc.date())
+    bms = [bm_by_day[loc.date()] for loc in locs]
+    out["billing_month"] = bms
     if conn is None or conn["data"].get("regime") == "off_grid":
         out["grid"][:] = 0.0
         return out
@@ -413,41 +666,71 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     card, _ = card_for(data["tariff_category"], on)
     cal = calendar_for(conn, on)
     ef = energy_factor(conn, on)
-    billing_month = on.strftime("%Y-%m")
-    add_all = sum(a["rate"] for a in adders_for(billing_month))
-    add_icp = sum(a["rate"] for a in adders_for(billing_month) if a["key"] == "fca" and a["rate"] > 0)
-    icp = icp_rule(on)
+    tou = bool(card.get("tou") and card.get("peak") is not None)
+    bm0 = bms[0] if bms else billing_month_for(conn, on)
+    in_bm0 = [b == bm0 for b in bms]
+    out["billing_month_end_step"] = next((i for i, x in enumerate(in_bm0) if not x), steps)
+    adders = {bm: adders_for(bm) for bm in dict.fromkeys(bms or [bm0])}
+    add_all = {bm: sum(a["rate"] for a in ads) for bm, ads in adders.items()}
+    add_icp = {bm: sum(a["rate"] for a in ads if a["key"] == "fca" and a["rate"] > 0) for bm, ads in adders.items()}
+    bm0_day = date(int(bm0[:4]), int(bm0[5:7]), 1)
+    icp = icp_rule(bm0_day)
     regime = data.get("regime", "none")
-    # ICP case per period (plan Part 4.3): above, below, or the uncertain middle that gets a month-level binary
+    legacy = regime == "net_metering_legacy"
+
+    def q_net(p: str) -> float:
+        """The current billing month's total for a period: imports so far plus the forecast rest, net of exports where the bill nets them."""
+        q = (mtd_import or {}).get(p, 0.0) + (rest_net_import or {}).get(p, 0.0)
+        if legacy:
+            q -= (mtd_export or {}).get(p, 0.0) + (rest_net_export or {}).get(p, 0.0)
+        return q
+
+    # ICP case per period (plan Part 4.3): above, below, or the uncertain middle that gets a month-level binary; the baseline is the billing month's
     for p in ("peak", "off_peak"):
-        base = icp_baseline(conn, on.month, on.year, p) if icp and data["tariff_category"] in icp["categories"] else None
+        base = icp_baseline(conn, bm0_day.month, bm0_day.year, p) if icp and data["tariff_category"] in icp["categories"] else None
         if base is None:
             continue
-        q = (mtd_import or {}).get(p, 0.0) + (rest_net_import or {}).get(p, 0.0)
-        steps_in_p = sum(1 for t in times if is_peak_local(cal, t.astimezone(PKT)) == (p == "peak"))
+        q = q_net(p)
+        steps_in_p = sum(1 for i, loc in enumerate(locs) if in_bm0[i] and is_peak_local(cal, loc) == (p == "peak"))
         swing = g_max_kw * steps_in_p * h
         case = "above" if q - base > swing else "below" if base - q > swing else "uncertain"
         out["icp"][p] = {"case": case, "baseline_kwh": base, "q_rest_kwh": q - (mtd_import or {}).get(p, 0.0) + (mtd_import or {}).get(p, 0.0),
-                         "mtd_kwh": (mtd_import or {}).get(p, 0.0), "q_kwh": q, "rate": (icp["rate"] + add_icp) * ef}
-    for i, t in enumerate(times):
-        loc = t.astimezone(PKT)
-        pk = is_peak_local(cal, loc) if card.get("tou") and card.get("peak") is not None else False
+                         "mtd_kwh": (mtd_import or {}).get(p, 0.0), "q_kwh": q, "rate": (icp["rate"] + add_icp[bm0]) * ef}
+    # legacy net metering nets by period (rebuild step 3): a period that ends the month as a net import prices an exported kWh like an imported one,
+    # with its adders, duty and taxes; one that ends in surplus moves only the credit, at the bare surplus rate (netted after taxes), both ways
+    naepp = (prosumer("net_billing", on) or {"naepp": 0.0})["naepp"] if regime == "net_billing" else 0.0
+    surplus: dict[str, bool] = {}
+    s_rate = 0.0
+    if legacy:
+        s_rate = _legacy_surplus_rate(card, prosumer("net_metering_legacy", on))
+        if tou:
+            surplus = {p: q_net(p) < 0 for p in ("peak", "off_peak")}
+        else:
+            total = q_net("peak") + q_net("off_peak")
+            surplus = {"peak": total < 0, "off_peak": total < 0}
+    for i, loc in enumerate(locs):
+        pk = is_peak_local(cal, loc) if tou else False
         out["peak"][i] = pk
         p = "peak" if pk else "off_peak"
-        rate = _energy_rate(card, pk)
-        icp_case = out["icp"].get(p, {}).get("case")
+        bm = bms[i]
+        icp_case = out["icp"].get(p, {}).get("case") if in_bm0[i] else None
         if icp_case == "above":
-            out["c_imp"][i] = (icp["rate"] + add_icp) * ef
+            c_imp = (icp["rate"] + add_icp[bm]) * ef
         else:
-            out["c_imp"][i] = (rate + add_all) * ef
+            c_imp = (_energy_rate(card, pk) + add_all[bm]) * ef
         if regime == "net_billing":
-            out["c_exp"][i] = (prosumer("net_billing", on) or {"naepp": 0.0})["naepp"]
-        elif regime == "net_metering_legacy":
-            out["c_exp"][i] = _energy_rate(card, False) * ef
+            c_exp = naepp
+        elif legacy:
+            if in_bm0[i] and surplus.get(p):
+                c_imp = c_exp = s_rate
+            else:
+                c_exp = c_imp
         else:
-            out["c_exp"][i] = 0.0
+            c_exp = 0.0
+        out["c_imp"][i], out["c_exp"][i] = c_imp, c_exp
     if card["fixed_basis"] == "per_kw_month":
-        out["mdi"] = {"rate_rs_per_kw": card["fixed"] * fixed_factor(conn, on), "floor_kw": card["floor_share"] * float(data["sanctioned_load_kw"]),
+        out["mdi"] = {"rate_rs_per_kw": card["fixed"] * fixed_factor(conn, on) * _seasonal_factor(data, bm0_day.month),
+                      "floor_kw": card["floor_share"] * float(data["sanctioned_load_kw"]),
                       "interval_steps": max(1, int(data.get("mdi_interval_min", 30)) // 15)}
     return out
 

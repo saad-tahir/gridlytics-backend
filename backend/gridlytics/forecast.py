@@ -89,8 +89,12 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
         if ok.sum() > 20:
             k_now = float(np.clip(np.sum(last[ok]) / np.sum(csl[ok]) / scale, 0.05, 1.1))
             w = np.clip(1 - np.arange(steps) / 8.0, 0, 1)
+            q50_0 = q["q50"].copy()  # every quantile keeps its ratio to the unblended median, so the fan moves as one
             for name in QS:
-                q[name] = np.minimum(cs, q[name] * (1 - w) + cs * scale * k_now * w * (q[name] / np.maximum(q["q50"], 1e-6)))
+                q[name] = np.minimum(cs, q[name] * (1 - w) + cs * scale * k_now * w * (q[name] / np.maximum(q50_0, 1e-6)))
+    # quantiles sorted per step (plan Part 5.1)
+    qa = np.maximum.accumulate(np.vstack([q[name] for name in QS]), axis=0)
+    q = {name: qa[i] for i, name in enumerate(QS)}
     return {"stage": stage, "cs": cs, "q": q, "pr": pr, "days": days_ok}
 
 
@@ -101,12 +105,42 @@ def _day_type(ts: np.ndarray) -> np.ndarray:
     return (dow == 6).astype(int)  # 1 = Sunday (off day)
 
 
+def censored_minutes(site: dict, g: dict) -> np.ndarray:
+    """Minutes of a minute grid whose measured load is not the site's demand (plan Part 5.2): the source's own censored flag and, while the grid is
+    down, unserved load, a battery at its cut-off plus 5 points with the genset not running (an unknown genset counts as not running here, so a doubtful
+    sample leaves the medians), or a load that fell more than 40 percent within two minutes of the grid loss and stayed down (only the backed-up
+    circuits were served)."""
+    lo, grid = g["load"], g["grid"]
+    n = len(lo)
+    down = grid == 0
+    cen = np.asarray(g.get("censored", np.full(n, np.nan))) == 1
+    cen = cen | (down & (np.nan_to_num(g.get("unserved", np.zeros(n))) > 0))
+    bat = (site.get("assets") or {}).get("battery")
+    if bat and "soc" in g:
+        cen |= down & (np.asarray(g.get("gen_on", np.full(n, np.nan))) != 1) & (g["soc"] <= float(bat.get("soc_min", 0.10)) + 0.05)
+    d = np.concatenate([[0], down.astype(np.int8), [0]])
+    starts = np.where(np.diff(d) == 1)[0]
+    ends = np.where(np.diff(d) == -1)[0]
+    up_known = (grid == 1) & ~np.isnan(lo)
+    for s, e in zip(starts, ends):
+        pre = lo[max(0, s - 15):s][up_known[max(0, s - 15):s]]
+        if len(pre) < 3:
+            continue
+        ref = float(np.median(pre))
+        early, body = lo[s:min(s + 3, e)], lo[s:e]
+        if ref <= 0 or np.all(np.isnan(early)):
+            continue
+        if np.nanmin(early) < 0.6 * ref and np.nanmedian(body) < 0.6 * ref:
+            cen[s:e] = True
+    return cen
+
+
 def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     t = step_times(t0, steps)
     tmpl = _mean15(lambda x: twin.load_template(site, x), t)
     h0 = t0 - 21 * 86400
     g = telemetry.minute_grid(site["id"], h0, t0)
-    lo = g["load"]
+    lo = np.where(censored_minutes(site, g), np.nan, g["load"])  # censored samples leave the persistence medians and the ratio (plan Part 5.2)
     have_days = int(np.sum(~np.isnan(lo)) // 1440)
     hours = ((t + 5 * 3600) % 86400) // 3600
     crit = twin.critical_share(site)[hours]
@@ -193,7 +227,24 @@ def _window_mask(windows: list, ts: np.ndarray) -> np.ndarray:
     return m
 
 
-def outage(site: dict, t0: int, steps: int = STEPS) -> dict:
+def _adherence(windows: list, grid: np.ndarray, in_win: np.ndarray) -> float:
+    """The share of past scheduled windows (in known data) that saw the grid down for at least half of the window, on a Beta(8, 2) prior."""
+    known = ~np.isnan(grid)
+    down = (grid == 0) & known
+    a_hit, a_n = 8.0, 10.0
+    if windows and known.sum() / 1440 >= 1:
+        wm = in_win & known
+        day_idx = (np.arange(len(grid)) // 1440)
+        for d in np.unique(day_idx[wm]):
+            sel = wm & (day_idx == d)
+            a_n += 1
+            a_hit += float(np.mean(down[sel]) >= 0.5)
+    return a_hit / a_n
+
+
+def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> dict:
+    """P(down) per step from t0. The hazard and adherence read history before t0 only; the observed grid state reads the telemetry up to `now`
+    (the actual issue time, when later than t0), so a grid loss inside the current quarter is seen by a re-solve or refresh at once."""
     t = step_times(t0, steps)
     conns = site.get("connections") or []
     if not conns or conns[0]["data"].get("regime") == "off_grid":
@@ -219,16 +270,7 @@ def outage(site: dict, t0: int, steps: int = STEPS) -> dict:
         if len(e):
             durs.append(int(e[0] - s))
     med_dur = float(np.median(durs)) if len(durs) >= 3 else 75.0
-    # adherence: the share of past scheduled windows (in known data) that saw the grid down for at least half of the window
-    a_hit, a_n = 8.0, 10.0  # Beta(8, 2)
-    if windows and days_known >= 1:
-        wm = in_win & known
-        day_idx = (np.arange(len(grid)) // 1440)
-        for d in np.unique(day_idx[wm]):
-            sel = wm & (day_idx == d)
-            a_n += 1
-            a_hit += float(np.mean(down[sel]) >= 0.5)
-    adherence = a_hit / a_n
+    adherence = _adherence(windows, grid, in_win)
     # unscheduled start hazard by local hour (starts per hour), shrunk to the DISCO prior with 7 days' weight
     disco = site["data"].get("disco") or "LESCO"
     prior_day = DISCO_TRIPS.get(disco, 0.6)
@@ -264,23 +306,30 @@ def outage(site: dict, t0: int, steps: int = STEPS) -> dict:
     p_start = 1 - (1 - sched_start) * (1 - np.concatenate([p_start_u[1:], [p_start_u[-1]]]))
     dur = np.where(sched_start > p_start_u, dur_s, dur_steps_u).astype(int)
     gvec = np.where(sched_mask & (adherence > 0.9), 0.0, 1.0)
-    # an observed outage now: down for its expected remaining duration (to the window's end when inside one)
+    # an observed outage now: down for its expected remaining duration (to the window's end when inside one). The grid state is read up to the
+    # actual issue time; the last known minute may lag the end by two minutes (a batch still in flight)
+    obs_grid, obs_ts = grid, g["ts"]
+    if now is not None and int(now) // 60 * 60 > t0:
+        g_now = telemetry.minute_grid(site["id"], t0, int(now))
+        obs_grid, obs_ts = np.concatenate([grid, g_now["grid"]]), np.concatenate([g["ts"], g_now["ts"]])
+    obs_known = np.where(~np.isnan(obs_grid))[0]
     observed = None
-    if len(grid) and known[-1] and grid[-1] == 0:
-        k = len(grid) - 1
-        while k > 0 and grid[k - 1] == 0:
+    if len(obs_known) and len(obs_grid) - 1 - obs_known[-1] <= 2 and obs_grid[obs_known[-1]] == 0:
+        k = int(obs_known[-1])
+        while k > 0 and obs_grid[k - 1] == 0:
             k -= 1
-        elapsed = len(grid) - k
-        if sched_mask[0]:
-            j = 0
+        elapsed = len(obs_grid) - k
+        cur = (len(obs_grid) - len(grid)) // 15  # whole steps of the horizon already passed at the issue time
+        if sched_mask[min(cur, steps - 1)]:
+            j = cur
             while j < steps and sched_mask[j]:
                 j += 1
-            remaining = max(1, j)
+            remaining = max(1, j - cur)
         else:
             remaining = max(1, int(np.ceil(max(15.0, med_dur * 1.2 - elapsed) / 15)))
-        gvec[:remaining] = 0.0
-        p_down[:remaining] = 1.0
-        observed = {"since": int(g["ts"][k]), "elapsed_min": int(elapsed), "expected_remaining_min": int(remaining * 15)}
+        gvec[:cur + remaining] = 0.0
+        p_down[:cur + remaining] = 1.0
+        observed = {"since": int(obs_ts[k]), "elapsed_min": int(elapsed), "expected_remaining_min": int(remaining * 15)}
     return {"stage": 1 if days_known >= 7 else 0, "p_down": np.clip(p_down, 0, 1), "p_start": np.clip(p_start, 0, 1), "dur_steps": dur, "g": gvec,
             "observed": observed, "adherence": round(adherence, 3), "median_minutes": med_dur, "windows": windows, "off_grid": False,
             "lam_day": round(float(lam_h.sum()), 3)}
@@ -292,10 +341,12 @@ def _r(a, n=3):
     return [round(float(x), n) for x in a]
 
 
-def issue(site: dict, t0: int, save: bool = True) -> dict:
-    """One forecast bundle for the optimiser; saved per kind for the forecast page and scoring."""
+def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dict:
+    """One forecast bundle for the optimiser; saved per kind for the forecast page and scoring. The belief time is t0 taken down to the quarter;
+    the observed grid state reads telemetry up to `now`, or up to t0 itself when t0 is the actual (unaligned) issue time."""
+    now = int(t0) if now is None else int(now)
     t0 = align(t0)
-    p, l, o = pv(site, t0), load(site, t0), outage(site, t0)
+    p, l, o = pv(site, t0), load(site, t0), outage(site, t0, now=now)
     if save:
         telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION, {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr")})
         telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION, {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"])})
@@ -313,14 +364,15 @@ def page(site: dict, kind: str) -> dict:
     t0 = f["belief_time"]
     t = step_times(t0)
     now = int(datetime.now(timezone.utc).timestamp())
+    t1 = max(t0, min(now // 60 * 60, t0 + STEPS * STEP_S))  # whole minutes only
     actual = None
     if kind in ("pv", "load"):
-        g = telemetry.minute_grid(site["id"], t0, min(now, t0 + STEPS * STEP_S))
+        g = telemetry.minute_grid(site["id"], t0, t1)
         col = g["pv"] if kind == "pv" else g["load"]
         n = len(col) // 15
         actual = [None if np.isnan(x) else round(float(x), 2) for x in np.nanmean(col[: n * 15].reshape(-1, 15), axis=1)] if n else []
     elif kind == "outage":
-        g = telemetry.minute_grid(site["id"], t0, min(now, t0 + STEPS * STEP_S))
+        g = telemetry.minute_grid(site["id"], t0, t1)
         n = len(g["grid"]) // 15
         actual = [None if np.isnan(x) else round(1 - float(x), 2) for x in np.nanmin(g["grid"][: n * 15].reshape(-1, 15), axis=1)] if n else []
     return {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
@@ -328,15 +380,45 @@ def page(site: dict, kind: str) -> dict:
             "preliminary": f["stage"] == 0}
 
 
+def _outage_baselines(site: dict, t0: int) -> dict:
+    """The outage Brier baselines of plan Part 5.5 for the 96 slots of the day from t0, from data before the day only: schedule-only (the announced
+    windows times the adherence; never down without a schedule) and a 28-day climatology of the share of slots down per local hour."""
+    t = step_times(t0, 96)
+    h = telemetry.minute_grid(site["id"], t0 - 28 * 86400, t0)
+    conns = site.get("connections") or []
+    sched = schedule(site["id"])
+    windows = sched["windows"] if sched else []
+    if not conns or conns[0]["data"].get("regime") == "off_grid":
+        p_sched = np.ones(96)
+    elif windows:
+        p_sched = _window_mask(windows, t + 450) * _adherence(windows, h["grid"], _window_mask(windows, h["ts"]))
+    else:
+        p_sched = np.zeros(96)
+    hg = h["grid"].reshape(-1, 15)
+    hk = ~np.all(np.isnan(hg), axis=1)
+    hd = hk & np.any(hg == 0, axis=1)  # a known slot is down when any minute in it was
+    hh = ((h["ts"][::15] + 5 * 3600) % 86400) // 3600
+    p_clim = None
+    if hk.any():
+        overall = float(hd.sum() / hk.sum())
+        by_h = np.array([float(hd[hh == x].sum() / hk[hh == x].sum()) if hk[hh == x].any() else overall for x in range(24)])
+        p_clim = by_h[((t + 5 * 3600) % 86400) // 3600]
+    return {"schedule": p_sched, "climatology": p_clim}
+
+
 def score_day(site: dict, day) -> list[dict]:
-    """Yesterday's scores at the day-ahead issue (the first issue at or before local midnight): PV and load nRMSE, load skill against
-    same-day persistence, outage Brier."""
+    """Yesterday's scores at the day-ahead issue (the first issue at or before local midnight): PV daytime nRMSE by AC nameplate (solar elevation
+    above 5 degrees), load nRMSE by mean load with skill against same-day persistence, and the outage Brier over the slots with a known grid state
+    against the schedule-only baseline (the pre-registered gate; the climatology Brier is returned beside it) (plan Part 5.5)."""
     t0 = twin.day_start_utc(day)
     g = telemetry.minute_grid(site["id"], t0, t0 + 86400)
     if g["completeness"] < 0.5:
         return []
     out = []
+    pv_asset = (site.get("assets") or {}).get("pv")
     for kind in ("pv", "load", "outage"):
+        if kind == "pv" and not pv_asset:
+            continue
         f = telemetry.latest_forecast(site["id"], kind, t0)
         if f is None or t0 - f["belief_time"] > 6 * 3600:
             continue
@@ -348,10 +430,12 @@ def score_day(site: dict, day) -> list[dict]:
             pred = np.array(f["q50"][sl])
             ok = ~np.isnan(act)
             if kind == "pv":
-                ok &= np.array(f["cs"][sl]) > 0.05 * max(1e-6, max(f["cs"][sl]))
+                lat, lon = site["data"].get("lat", 31.5), site["data"].get("lon", 74.3)
+                zen, _ = solar.sun_position(step_times(t0, 96) + STEP_S // 2, lat, lon)
+                ok &= zen < 85.0
             if ok.sum() < 8:
                 continue
-            denom = max(1e-6, float(np.mean(act[ok])))
+            denom = max(1e-6, float(pv_asset["kw_ac"])) if kind == "pv" else max(1e-6, float(np.mean(act[ok])))
             nrmse = float(np.sqrt(np.mean((pred[ok] - act[ok]) ** 2)) / denom)
             row = {"kind": kind, "metric": "nrmse", "value": round(nrmse, 4), "horizon_class": "day_ahead"}
             if kind == "load":
@@ -362,10 +446,19 @@ def score_day(site: dict, day) -> list[dict]:
                     row["baseline_value"] = round(float(np.sqrt(np.mean((pers[okp] - act[okp]) ** 2)) / denom), 4)
             out.append(row)
         else:
-            act = (np.nanmin(g["grid"].reshape(96, 15), axis=1) == 0).astype(float)
-            pred = np.array(f["p_down"][sl])
-            out.append({"kind": kind, "metric": "brier", "value": round(float(np.mean((pred - act) ** 2)), 4), "horizon_class": "day_ahead",
-                        "baseline_value": round(float(np.mean((np.mean(act) - act) ** 2)), 4)})
+            G = g["grid"].reshape(96, 15)
+            known = ~np.all(np.isnan(G), axis=1)  # a slot without data is not scored (a dark logger is often the outage itself)
+            if known.sum() < 8:
+                continue
+            act = (np.nanmin(G[known], axis=1) == 0).astype(float)
+            pred = np.array(f["p_down"][sl])[known]
+            base = _outage_baselines(site, t0)
+            row = {"kind": kind, "metric": "brier", "value": round(float(np.mean((pred - act) ** 2)), 4), "horizon_class": "day_ahead",
+                   "baseline_value": round(float(np.mean((base["schedule"][known] - act) ** 2)), 4), "baseline": "schedule_only",
+                   "slots_scored": int(known.sum())}
+            if base["climatology"] is not None:
+                row["climatology_value"] = round(float(np.mean((base["climatology"][known] - act) ** 2)), 4)
+            out.append(row)
     with store.connect() as con:
         for r in out:
             con.execute("INSERT OR REPLACE INTO forecast_scores (site_id, kind, day_local, horizon_class, metric, value, baseline_value) VALUES (?,?,?,?,?,?,?)",

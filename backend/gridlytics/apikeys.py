@@ -37,9 +37,10 @@ SCOPES = {
     "plans:read": "Read its site's current plan (no money fields)",
     "sites:read": "Read its site's settings (no money fields)",
 }
-#: The paths of each resource, under /api (the guard sees /api/v1/x as /api/x)
-RESOURCES = (("telemetry", re.compile(r"^/api/edge/")), ("plans", re.compile(r"^/api/sites/[^/]+/plans(/|$)")),
-             ("sites", re.compile(r"^/api/sites(/|$)")))
+#: The paths of each resource, under /api (the guard sees /api/v1/x as /api/x). Every one names a site: a key is bound to one site (plan Part 10.5), so the
+#: bare collection /api/sites, which lists every site of the company, is outside every scope
+RESOURCES = (("telemetry", re.compile(r"^/api/edge/[^/]+/")), ("plans", re.compile(r"^/api/sites/[^/]+/plans(/|$)")),
+             ("sites", re.compile(r"^/api/sites/[^/]+(/|$)")))
 #: The words a key starts with, then 43 URL-safe characters (32 random bytes)
 PREFIX = "glk_"
 TOKEN = re.compile(r"glk_[A-Za-z0-9_-]{43}")
@@ -161,6 +162,8 @@ def by_token(token: str) -> dict | None:
 
 
 def acting_user(key: dict) -> dict:
-    """The user a key acts as: its role, named after the key; never an administrator's account, and no user row (so it signs nothing and holds no seat)."""
+    """The user a key acts as: named after the key; never an administrator's account, and no user row (so it signs nothing and holds no seat). The role
+    the key was made with is carried for the record only: a machine key carries scopes, not a role (plan Part 10.5), so `auth.can` grants a key no
+    permission and `money.for_reader` gives it no money field."""
     return {"id": f"key:{key['id']}", "email": "", "name": f"API key '{key['name']}'", "role": key["role"], "created": key["created"], "disabled": False,
             "licence": "", "has_seal": False, "mfa": False, "api_key": key["id"], "scopes": list(key["scopes"]), "site_id": key.get("site_id", "")}

@@ -9,6 +9,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -89,19 +90,34 @@ def write_rows(rows: list[tuple], columns: tuple = COLUMNS) -> int:
     return len(rows)
 
 
+_VOLT = ALL.index("grid_voltage_v")
+
+
+def _num(v) -> tuple[float | None, bool]:
+    """A numeric cell as (value, unreadable): blanks are missing (None); text that is not a number, NaN and infinities are missing too, and
+    counted, so one bad cell neither refuses a file nor stores a value the pages cannot render."""
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return None, False
+    try:
+        x = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None, True
+    return (x, False) if math.isfinite(x) else (None, True)
+
+
 def ingest(site_id: str, records: list[dict], source: str) -> dict:
     """Normalised dict rows (edge batches and CSV) into the minute table; idempotent by (site, minute), the last value wins."""
-    rows, skipped = [], 0
+    rows, skipped, unreadable = [], 0, 0
     for r in records:
         ts = r.get("ts")
         if isinstance(ts, str):
             try:
-                t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                t = datetime.fromisoformat(ts.strip().replace("Z", "+00:00"))
             except ValueError:
                 skipped += 1
                 continue
             ts = int((t if t.tzinfo else t.replace(tzinfo=timezone.utc)).timestamp())
-        if not isinstance(ts, (int, float)):
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts):
             skipped += 1
             continue
         ts = int(ts) // 60 * 60
@@ -111,15 +127,14 @@ def ingest(site_id: str, records: list[dict], source: str) -> dict:
             if c in ("inverter_mode_active", "quality_flags"):
                 row.append(None if v in (None, "") else str(v)[:40])
             else:
-                try:
-                    row.append(None if v in (None, "") else float(v))
-                except (TypeError, ValueError):
-                    row.append(None)
-        if row[3] is None and r.get("grid_voltage_v") not in (None, ""):
-            row[3] = 1.0 if float(r["grid_voltage_v"]) >= 180 else 0.0  # grid present from voltage (plan Part 7.5; 180 V to confirm)
+                x, bad = _num(v)
+                unreadable += bad
+                row.append(x)
+        if row[3] is None and row[_VOLT] is not None:
+            row[3] = 1.0 if row[_VOLT] >= 180 else 0.0  # grid present from voltage (plan Part 7.5; 180 V to confirm); an unreadable voltage stays unknown
         rows.append(tuple(row))
     write_rows(rows, ALL)
-    return {"accepted": len(rows), "skipped": skipped}
+    return {"accepted": len(rows), "skipped": skipped, "unreadable_cells": unreadable}
 
 
 def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None) -> dict:
@@ -139,24 +154,35 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         log.append("No inverter_mode_active column: this source supports monitor (tier 1) only, because the counterfactual needs the inverter's mode")
     if "grid_present" not in names.values() and "grid_voltage_v" not in names.values():
         raise ValueError("The file needs a grid_present column (or grid_voltage_v to derive it): the product cannot see outages without it")
+    if "grid_import_wh" not in names.values() and "grid_export_wh" not in names.values():
+        log.append("No grid_import_wh or grid_export_wh column: import and export are read from grid_power_w (positive is import)"
+                   if "grid_power_w" in names.values() else
+                   "No grid_import_wh, grid_export_wh or grid_power_w column: grid import and export are missing for this file, not zero")
+    bad_ts = 0
     for line in reader:
         rec = {names[k]: v for k, v in line.items() if k in names and names[k] in CSV_COLUMNS}
-        ts = rec.get("ts", "")
+        ts = rec.get("ts") or ""  # a short row leaves its missing trailing cells as None
         try:
-            t = datetime.fromisoformat(ts.strip().replace("Z", "+00:00"))
-        except ValueError:
+            t = datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone(timedelta(hours=tz_offset_h)))
+            rec["ts"] = int(t.timestamp())
+        except (ValueError, TypeError, OverflowError):
+            bad_ts += 1
             continue
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone(timedelta(hours=tz_offset_h)))
-        rec["ts"] = int(t.timestamp())
-        if rec.get("genset_running", "") == "":
+        if str(rec.get("genset_running") or "").strip() == "":
             rec.pop("genset_running", None)
         records.append(rec)
     if not records:
         raise ValueError("No rows with a readable ts were found")
+    if bad_ts:
+        log.append(f"{bad_ts} rows without a readable ts were skipped")
     records.sort(key=lambda r: r["ts"])
     gaps = sum(1 for a, b in zip(records, records[1:]) if b["ts"] - a["ts"] > 300)
     res = ingest(site_id, records, "csv")
+    res["skipped"] += bad_ts
+    if res.get("unreadable_cells"):
+        log.append(f"{res['unreadable_cells']} cells were not finite numbers (text such as N/A, NaN or inf) and were stored as missing")
     digest = hashlib.sha256(content).hexdigest()[:16]
     first, last = records[0]["ts"], records[-1]["ts"]
     with store.connect() as con:
@@ -177,10 +203,15 @@ def _days_between(t0: int, t1: int) -> list[date]:
 
 # ------------------------------------------------------------------------------------------------ reading
 
+def _finite(v):
+    """A stored value for a JSON page: a non-finite float (written before ingest refused them) reads as missing."""
+    return None if isinstance(v, float) and not math.isfinite(v) else v
+
+
 def latest(site_id: str) -> dict | None:
     with connect() as con:
         r = con.execute("SELECT * FROM minute WHERE site_id = ? ORDER BY ts DESC LIMIT 1", (site_id,)).fetchone()
-    return dict(r) if r else None
+    return {k: _finite(v) for k, v in dict(r).items()} if r else None
 
 
 def first_ts(site_id: str) -> int | None:
@@ -198,31 +229,49 @@ def raw(site_id: str, t0: int, t1: int, columns: tuple = COLUMNS[3:]) -> dict:
         if c in ("inverter_mode_active", "quality_flags"):
             out[c] = [r[i + 1] for r in rows]
         else:
-            out[c] = np.array([np.nan if r[i + 1] is None else r[i + 1] for r in rows], dtype=float)
+            a = np.array([np.nan if r[i + 1] is None else r[i + 1] for r in rows], dtype=float)
+            a[~np.isfinite(a)] = np.nan  # a non-finite value stored before ingest refused them is missing
+            out[c] = a
     return out
 
 
 def minute_grid(site_id: str, t0: int, t1: int) -> dict:
-    """Arrays on a complete 1-minute grid [t0, t1) in kW, with missing minutes as NaN; what the bill engine and the replay read."""
-    d = raw(site_id, t0, t1)
-    n = (int(t1) - int(t0)) // 60
-    ts = np.arange(int(t0), int(t1), 60, dtype=np.int64)
-    idx = ((d["ts"] - int(t0)) // 60).astype(int)
+    """Arrays on a complete 1-minute grid [t0, t1) in kW, with missing minutes as NaN; what the bill engine and the replay read.
+
+    t1 is taken down to the last whole minute after t0, so a bound part-way through a minute (a page's "now") never places a row past the arrays.
+    Grid import and export fall back to grid_power_w where a minute has neither energy column (a power-only logger), and the state of charge falls
+    back to the BMS reading where the estimate is missing (a CSV source never carries the estimate); `soc_est` keeps the estimate alone."""
+    t0 = int(t0)
+    t1 = t0 + max(0, (int(t1) - t0) // 60) * 60
+    d = raw(site_id, t0, t1, COLUMNS[3:] + ("censored",))
+    n = (t1 - t0) // 60
+    ts = np.arange(t0, t1, 60, dtype=np.int64)
+    idx = ((d["ts"] - t0) // 60).astype(int)
+    keep = (idx >= 0) & (idx < n)
+    idx = idx[keep]
     out = {"ts": ts, "present": np.zeros(n, dtype=bool)}
     out["present"][idx] = True
     conv = {"imp": ("grid_import_wh", 60 / 1000), "exp": ("grid_export_wh", 60 / 1000), "pv": ("pv_power_w", 1 / 1000), "load": ("load_power_w", 1 / 1000),
             "bat": ("battery_power_w", 1 / 1000), "soc": ("battery_soc_est_pct", 1 / 100), "soc_bms": ("battery_soc_bms_pct", 1 / 100),
             "grid": ("grid_present", 1.0), "gen": ("genset_power_w", 1 / 1000), "gen_on": ("genset_running", 1.0), "fuel": ("genset_fuel_l", 1.0),
-            "unserved": ("unserved_w", 1 / 1000), "temp": ("battery_temp_c", 1.0), "curtail": ("curtail_w", 1 / 1000)}
+            "unserved": ("unserved_w", 1 / 1000), "temp": ("battery_temp_c", 1.0), "curtail": ("curtail_w", 1 / 1000),
+            "gp": ("grid_power_w", 1 / 1000), "censored": ("censored", 1.0)}
     for k, (col, f) in conv.items():
         a = np.full(n, np.nan)
-        a[idx] = d[col] * f
+        a[idx] = d[col][keep] * f
         out[k] = a
+    # a minute with neither energy column but a grid power reading: import and export from the power (positive is import)
+    derive = np.isnan(out["imp"]) & np.isnan(out["exp"]) & ~np.isnan(out["gp"])
+    out["imp"] = np.where(derive, np.maximum(out["gp"], 0.0), out["imp"])
+    out["exp"] = np.where(derive, np.maximum(-out["gp"], 0.0), out["exp"])
+    out["soc_est"] = out["soc"]
+    out["soc"] = np.where(np.isnan(out["soc_est"]), out["soc_bms"], out["soc_est"])
     modes = [None] * n
-    for j, m in zip(idx, d["inverter_mode_active"]):
+    for j, m in zip(idx, [m for m, k in zip(d["inverter_mode_active"], keep) if k]):
         modes[j] = m
     out["mode"] = modes
     out["completeness"] = float(out["present"].mean()) if n else 0.0
+    out["imp_completeness"] = float(np.mean(~np.isnan(out["imp"]))) if n else 0.0
     return out
 
 
@@ -263,7 +312,8 @@ def series(site_id: str, t0: int, t1: int, names: list[str], res: str = "auto") 
     with connect() as con:
         rows = con.execute(sql, (site_id, int(t0), int(t1))).fetchall()
     return {"resolution": res, "ts": [r[0] for r in rows],
-            "series": {n: [None if r[i + 1] is None else round(float(r[i + 1]), 3) for r in rows] for i, n in enumerate(names)}}
+            "series": {n: [None if r[i + 1] is None or not math.isfinite(float(r[i + 1])) else round(float(r[i + 1]), 3) for r in rows]
+                       for i, n in enumerate(names)}}
 
 
 def heatmap(site_id: str, name: str, days: int = 28) -> dict:
@@ -277,20 +327,21 @@ def heatmap(site_id: str, name: str, days: int = 28) -> dict:
     grid = [[None] * 24 for _ in range(7)]
     with connect() as con:
         for dow, h, v in con.execute(sql, (site_id, t0)).fetchall():
-            grid[int(dow)][int(h)] = None if v is None else round(v, 2)
-    # rows Monday..Sunday (1970-01-01 was a Thursday: dow 0 = Thursday)
-    order = [4, 5, 6, 0, 1, 2, 3]
-    return {"series": name, "days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "values": [grid[i] for i in order]}
+            grid[int(dow)][int(h)] = None if v is None or not math.isfinite(float(v)) else round(v, 2)
+    # rows Monday..Sunday: 1970-01-01 was a Thursday, so (days since the epoch + 3) % 7 already gives 0 = Monday and 6 = Sunday, as in
+    # twin.load_template and forecast._day_type
+    return {"series": name, "days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "values": grid}
 
 
 def outages(site_id: str, t0: int, t1: int) -> list[dict]:
     """Outage intervals from the grid-present flag (a gap in data is not an outage)."""
-    d = raw(site_id, t0, t1, ("grid_present", "battery_soc_est_pct", "genset_running", "unserved_w"))
+    d = raw(site_id, t0, t1, ("grid_present", "battery_soc_est_pct", "battery_soc_bms_pct", "genset_running", "unserved_w"))
+    soc = np.where(np.isnan(d["battery_soc_est_pct"]), d["battery_soc_bms_pct"], d["battery_soc_est_pct"])  # the BMS where there is no estimate
     out, cur = [], None
     for i, t in enumerate(d["ts"]):
         down = d["grid_present"][i] == 0
         if down and cur is None:
-            cur = {"start": int(t), "soc_start_pct": None if np.isnan(d["battery_soc_est_pct"][i]) else round(float(d["battery_soc_est_pct"][i]), 1),
+            cur = {"start": int(t), "soc_start_pct": None if np.isnan(soc[i]) else round(float(soc[i]), 1),
                    "genset_minutes": 0, "unserved_kwh": 0.0}
         if down and cur is not None:
             cur["end"] = int(t) + 60
@@ -326,7 +377,7 @@ def aggregate_day(site_id: str, day: date, peak_flags: np.ndarray | None = None)
             "throughput_kwh": round(float(np.nansum(np.abs(np.minimum(g["bat"], 0))) / 60), 2),
             "discharge_kwh": round(float(np.nansum(np.maximum(g["bat"], 0)) / 60), 2),
             "outage_minutes": int(np.sum(g["grid"] == 0)), "unserved_kwh": round(float(f["unserved"].sum() / 60), 2),
-            "completeness": round(g["completeness"], 4)}
+            "completeness": round(g["completeness"], 4), "import_completeness": round(g["imp_completeness"], 4)}
     if peak_flags is not None:
         data["peak_import_kwh"] = round(float(imp[peak_flags].sum() / 60), 2)
     with store.connect() as con:
@@ -339,7 +390,19 @@ def days(site_id: str, d0: str, d1: str) -> list[dict]:
     with store.connect() as con:
         rows = con.execute("SELECT day_local, data FROM telemetry_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? ORDER BY day_local",
                            (site_id, d0, d1)).fetchall()
-    return [{"day": r["day_local"], **json.loads(r["data"])} for r in rows]
+    return [{"day": r["day_local"], **{k: _finite(v) for k, v in json.loads(r["data"]).items()}} for r in rows]
+
+
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(v):
+    """An exported cell: blank for missing, and a text cell that a spreadsheet would read as a formula quote-prefixed (plan Part 2.8)."""
+    if v is None:
+        return ""
+    if isinstance(v, str) and v.startswith(_FORMULA_START):
+        return "'" + v
+    return v
 
 
 def export_csv(site_id: str, t0: int, t1: int) -> str:
@@ -349,7 +412,7 @@ def export_csv(site_id: str, t0: int, t1: int) -> str:
     with connect() as con:
         for r in con.execute(f"SELECT ts, {', '.join(COLUMNS[3:])} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
                              (site_id, int(t0), int(t1))):
-            w.writerow([datetime.fromtimestamp(r[0], timezone.utc).isoformat().replace("+00:00", "Z")] + ["" if v is None else v for v in r[1:]])
+            w.writerow([datetime.fromtimestamp(r[0], timezone.utc).isoformat().replace("+00:00", "Z")] + [_csv_cell(_finite(v)) for v in r[1:]])
     return buf.getvalue()
 
 
