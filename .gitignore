@@ -1,0 +1,8 @@
+data/
+.scratch/
+__pycache__/
+*.pyc
+.pytest_cache/
+demo/DEMO_ACCOUNTS.local.md
+release/
+*.egg-info/

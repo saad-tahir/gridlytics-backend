@@ -1,0 +1,13 @@
+# Runtime pins, read on 6 November 2026 (plan Part 10.7). The solver pair stays at the measured scipy 1.17.1 / numpy 2.4.3.
+fastapi==0.141.1
+starlette==1.6.0
+pydantic==2.13.4
+uvicorn==0.52.3
+numpy==2.4.3
+scipy==1.17.1
+pandas==3.0.2
+PyJWT==2.10.1
+cryptography==46.0.3
+APScheduler==3.11.0
+reportlab==4.4.4
+httpx==0.28.1
