@@ -285,12 +285,17 @@ def write_transaction():
         con.close()
 
 
-def audit(actor: str, action: str, target: str = "", detail: dict | None = None) -> None:
-    """One line in the audit trail: who did what to what, when. The id and email of who acts come from the context (`set_actor`)."""
+def audit(actor: str, action: str, target: str = "", detail: dict | None = None, con: sqlite3.Connection | None = None) -> None:
+    """One line in the audit trail: who did what to what, when. The id and email of who acts come from the context (`set_actor`). Given `con` (an open
+    transaction on the workspace file), the line is written in that transaction, so it stands or falls with the change it records."""
     who = _ACTOR.get() or {}
-    with connect() as con:
-        con.execute("INSERT INTO audit (org_id, at, actor, actor_id, actor_email, action, target, detail) VALUES (?,?,?,?,?,?,?,?)",
-                    (_org(), _now(), actor, who.get("id", ""), who.get("email", ""), action, target, json.dumps(detail or {}, default=str)))
+    args = (_org(), _now(), actor, who.get("id", ""), who.get("email", ""), action, target, json.dumps(detail or {}, default=str))
+    sql = "INSERT INTO audit (org_id, at, actor, actor_id, actor_email, action, target, detail) VALUES (?,?,?,?,?,?,?,?)"
+    if con is not None:
+        con.execute(sql, args)
+        return
+    with connect() as c:
+        c.execute(sql, args)
 
 
 def list_audit(limit: int = 300, offset: int = 0) -> list[dict]:

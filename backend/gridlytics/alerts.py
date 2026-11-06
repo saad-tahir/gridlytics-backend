@@ -15,6 +15,7 @@ from . import battery as battery_service
 from . import plans, sites, store, telemetry, twin
 
 PKT = timezone(timedelta(hours=5))
+STEP_S = 900  # a plan step
 CATEGORIES = ("Data", "Control", "Reserve", "Battery", "Genset", "Forecast", "Tariff", "Savings", "Product")
 SEVERITIES = ("info", "warning", "critical")
 DEFAULT_RULES = {c: {"channels": ["in_app"], "quiet_hours": None, "escalate_after_min": None} for c in CATEGORIES}
@@ -163,8 +164,9 @@ def _runs(steps: list[dict]) -> list[tuple[int, int]]:
     return out
 
 
-def _withdraw_requests(site_id: str, spans: list[tuple[int, int]], running: bool, now: int) -> None:
-    """Closes the open genset requests that no longer stand: their run is over, the set is running, or the current plan no longer runs it."""
+def _withdraw_requests(site_id: str, spans: list[tuple[int, int]], running: bool, now: int, unplanned: str = "No longer planned") -> None:
+    """Closes the open genset requests that no longer stand: their run is over, the set is running, or the current plan no longer runs it (then the
+    request is withdrawn, with `unplanned` as the note: no plan, or control paused or released, runs nothing)."""
     with store.connect() as con:
         rows = con.execute("SELECT id, detail FROM alerts WHERE site_id = ? AND rule LIKE 'genset_request_%' AND state IN ('open','acknowledged')",
                            (site_id,)).fetchall()
@@ -174,30 +176,45 @@ def _withdraw_requests(site_id: str, spans: list[tuple[int, int]], running: bool
             if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
                 continue
             lo = max(start, now)
+            withdraw = False
             if now >= end:
                 note = "The planned run is over"
             elif running and start <= now:
                 note = "The genset is running"
             elif not any(a < end and b > lo for a, b in spans):
-                note = "No longer planned"
+                note, withdraw = unplanned, True
             else:
                 continue
             con.execute("UPDATE alerts SET state = 'resolved', closed_at = ?, note = ? WHERE id = ?", (store._now(), note, r["id"]))
-            if note == "No longer planned":
+            if withdraw:
                 con.execute("UPDATE notifications SET status = 'withdrawn' WHERE site_id = ? AND kind = 'genset_request' AND status = 'pending' AND payload LIKE ?",
                             (site_id, f'%"genset_request:{start}"%'))
 
 
+def _overlaps(p: dict, start: int, end: int) -> bool:
+    """True when a held request's planned window [start, end) overlaps the run [start, end)."""
+    a, b = p.get("start"), p.get("end")
+    return isinstance(a, (int, float)) and isinstance(b, (int, float)) and a < end and start < b
+
+
 def genset_requests(site: dict, plan: dict | None, now: int) -> None:
-    """At a manual-start genset site, one request per planned run starting in the next two hours. The plan is re-solved every quarter, so its first step
-    moves forward each time: a run the set is already doing (telemetry says it runs) or one already asked about (an earlier request's window holds its
-    start) is not asked again, and open requests whose run is over, is running or is no longer planned are closed."""
-    if not plan or site["data"].get("genset_start_control") != "manual" or not (site.get("assets") or {}).get("genset"):
+    """At a manual-start genset site, one request per planned run starting in the next two hours. The plan is re-solved every quarter, so a run's start
+    moves (forward as time passes, or earlier or later as the forecast changes): a run the set is already doing (telemetry says it runs) or one already
+    asked about (a held request that was not withdrawn overlaps it) is not asked again, so one run never holds two pending requests. When the run's start
+    moves a step or more earlier than its pending request's, the request would have the set started late: it is withdrawn ("Moved earlier to HH:MM")
+    and the run asked for at its new start. Open requests whose run is over, is running or is no longer planned are closed; with no plan in force (none
+    yet, or control paused or released to native) every open request is withdrawn."""
+    if site["data"].get("genset_start_control") != "manual" or not (site.get("assets") or {}).get("genset"):
         return
     sid = site["id"]
-    steps = plan.get("steps") or []
     last = telemetry.latest(sid)
     running = bool(last and now - last["ts"] <= 1800 and (last.get("genset_running") or 0) >= 0.5)
+    released = plans.control_release(sid, now)
+    if not plan or released:
+        why = {"control_paused": "Control is paused", "released_to_native": "Released to native"}.get((released or {}).get("reason"), "No plan in force")
+        _withdraw_requests(sid, [], running, now, why)
+        return
+    steps = plan.get("steps") or []
     runs = _runs(steps)
     spans = [(steps[i]["t"], steps[j - 1]["t"] + 900) for i, j in runs]
     _withdraw_requests(sid, spans, running, now)
@@ -211,9 +228,24 @@ def genset_requests(site: dict, plan: dict | None, now: int) -> None:
         if i == 0 and running:
             continue                                  # the plan carries on a run the set is already doing: not a start
         key = f"genset_request:{start}"
-        if any(status != "withdrawn" and (p.get("key") == key or (isinstance(p.get("start"), (int, float)) and isinstance(p.get("end"), (int, float))
-                                                                  and p["start"] <= start < p["end"])) for status, p in held):
-            continue                                  # this run was asked about already
+        asked = [(status, p) for status, p in held if status != "withdrawn" and (p.get("key") == key or _overlaps(p, start, end))]
+        # a pending request whose start is a step or more later than the run's start now would have the set started late (at a manual-start site the
+        # operator starts it when asked): it is withdrawn and the run asked for again at its new start. Otherwise a run asked about already (pending at
+        # this start or within a step of it, or answered) is not asked again, so one run still holds one pending request.
+        later = [p for status, p in asked if status == "pending" and isinstance(p.get("start"), (int, float)) and p["start"] - start >= STEP_S]
+        if len(later) < len(asked):
+            continue
+        if later:
+            note = f"Moved earlier to {s['local']}"
+            with store.connect() as con:
+                for p in later:
+                    old = int(p["start"])
+                    old_key = p.get("key") or f"genset_request:{old}"
+                    con.execute("UPDATE notifications SET status = 'withdrawn' WHERE site_id = ? AND kind = 'genset_request' AND status = 'pending' "
+                                "AND payload LIKE ?", (sid, f'%"{old_key}"%'))
+                    con.execute("UPDATE alerts SET state = 'resolved', closed_at = ?, note = ? WHERE site_id = ? AND rule = ? AND state IN ('open','acknowledged')",
+                                (store._now(), note, sid, f"genset_request_{old}"))
+            held = [("withdrawn", p) if any(p is q for q in later) else (status, p) for status, p in held]
         payload = {"key": key, "start": start, "end": end, "kw": s["genset_kw"], "reason": s["reason"], "detail": s["detail"], "plan_id": plan["id"]}
         with store.connect() as con:
             con.execute("INSERT INTO notifications (id, site_id, ts, kind, payload) VALUES (?,?,?,?,?)",

@@ -38,6 +38,19 @@ def rs(x) -> str:
     return ("-" if x < 0 else "") + "Rs " + f"{abs(x):,.0f}"
 
 
+def num(x, fmt: str = ",.0f", unit: str = "", scale: float = 1.0) -> str:
+    """A quantity as text, or a dash when it is missing (a day row may hold None: a value that was not finite, or never measured)."""
+    if x is None or isinstance(x, bool):
+        return "-"
+    try:
+        v = float(x) / scale
+    except (TypeError, ValueError):
+        return "-"
+    if v != v or v in (float("inf"), float("-inf")):
+        return "-"
+    return f"{v:{fmt}}{unit}"
+
+
 def _dir() -> Path:
     d = platformdb.data_dir() / "reports" / store.db_path().stem
     d.mkdir(parents=True, exist_ok=True)
@@ -100,9 +113,9 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
             story.append(Paragraph("Headline", styles["Heading2"]))
             story.append(_table([["Against", "Saving", "Claimed (applied days)", "Diesel saved", "Verified days"],
                                  ["The inverter's own settings (native capture)", rs(nat.get("saving_rs")), rs(nat.get("claimed_rs")),
-                                  f"{nat.get('litres_saved', 0):,.0f} L", str(nat.get("verified_days", 0))],
+                                  num(nat.get("litres_saved", 0), unit=" L"), str(nat.get("verified_days", 0))],
                                  ["The best static table (tuned baseline)", rs(tun.get("saving_rs")), rs(tun.get("claimed_rs")),
-                                  f"{tun.get('litres_saved', 0):,.0f} L", str(tun.get("verified_days", 0))]], [70 * mm, 25 * mm, 35 * mm, 25 * mm, 22 * mm]))
+                                  num(tun.get("litres_saved", 0), unit=" L"), str(tun.get("verified_days", 0))]], [70 * mm, 25 * mm, 35 * mm, 25 * mm, 22 * mm]))
             story.append(Spacer(1, 3 * mm))
             story.append(Paragraph("Ledger by lever, against the native capture", styles["Heading2"]))
             rows = [["Lever", "Rupees"]] + [[LEVER_NAMES.get(k, k), rs(v)] for k, v in (nat.get("levers") or {}).items()]
@@ -112,12 +125,13 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
             story.append(Spacer(1, 2 * mm))
             story.append(Paragraph("Method: " + _text(summ["method"]) + ".", styles["Normal"]))
         story.append(Paragraph("Energy", styles["Heading2"]))
-        tot = lambda k: sum((d.get(k) or 0) for d in tdays)
+        tot = lambda k: sum(float(d.get(k) or 0) for d in tdays if num(d.get(k)) != "-")
         story.append(_table([["Quantity", "Month"], ["Grid import", f"{tot('import_kwh'):,.0f} kWh"], ["Grid export", f"{tot('export_kwh'):,.0f} kWh"],
                              ["Solar", f"{tot('pv_kwh'):,.0f} kWh"], ["Load", f"{tot('load_kwh'):,.0f} kWh"], ["Genset", f"{tot('genset_kwh'):,.0f} kWh, "
                                                                                                                   f"{tot('genset_hours'):,.1f} h"],
                              ["Outage time", f"{tot('outage_minutes') / 60:,.1f} h"], ["Unserved critical load", f"{tot('unserved_kwh'):,.1f} kWh"],
-                             ["Peak 30-minute import", f"{max([d.get('peak_kw') or 0 for d in tdays] or [0]):,.1f} kW"]], [80 * mm, 50 * mm]))
+                             ["Peak 30-minute import", f"{max([float(d.get('peak_kw') or 0) for d in tdays if num(d.get('peak_kw')) != '-'] or [0]):,.1f} kW"]],
+                            [80 * mm, 50 * mm]))
         story.append(Spacer(1, 3 * mm))
         story.append(Paragraph("Daily rows", styles["Heading2"]))
         money = kind == "monthly_savings"
@@ -128,14 +142,15 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
                    (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids"] if money else []))
         for d in tdays:
             s = by_day.get(d["day"], {})
-            rows.append([d["day"], f"{d['import_kwh']:,.0f}", f"{d['pv_kwh']:,.0f}", f"{d['outage_minutes'] / 60:.1f}", f"{d['genset_hours']:.1f}"] +
+            rows.append([d["day"], num(d.get("import_kwh")), num(d.get("pv_kwh")), num(d.get("outage_minutes"), ".1f", scale=60),
+                         num(d.get("genset_hours"), ".1f")] +
                         ([rs(s.get("saving_native_rs")), s.get("fidelity") or "-"] if money else []))
             ids = ""
             if money:
                 with store.connect() as con:
                     ids = ";".join(r[0] for r in con.execute("SELECT id FROM plans WHERE site_id = ? AND substr(belief_time,1,10) = ? AND status != 'failed'",
                                                               (site_id, d["day"])).fetchall()[:4])
-            w.writerow([d["day"], d["import_kwh"], d["export_kwh"], d["pv_kwh"], d["load_kwh"], d["genset_hours"], d["litres"], d["outage_minutes"], d["peak_kw"]]
+            w.writerow([d["day"]] + [d.get(k) for k in ("import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes", "peak_kw")]
                        + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids] if money else []))
         story.append(_table(rows))
         cap = sites.native_latest(site_id)
@@ -159,7 +174,7 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     csv_path = _dir() / f"{rid}.csv"
     SimpleDocTemplate(str(pdf_path), pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
                       title=title, author="Gridlytics").build(story)
-    csv_path.write_text(buf_csv.getvalue(), encoding="utf-8")
+    csv_path.write_text(buf_csv.getvalue(), encoding="utf-8", newline="")  # the csv writer ends rows with CRLF already: no blank line between rows
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()[:16]
     with store.connect() as con:
         con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status) VALUES (?,?,?,?,?,?,?,?,?)",

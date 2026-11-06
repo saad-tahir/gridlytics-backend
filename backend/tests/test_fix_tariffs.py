@@ -142,10 +142,11 @@ def test_legacy_export_is_worth_the_import_it_nets_when_the_period_ends_as_an_im
     d0 = date(2026, 11, 2)
     ts, imp, exp = _flat_day(d0)
     vec = tariffs.vectors(conn, _t0(ts), 96)
+    tie = tariffs.LEGACY_EXPORT_TIE_BREAK  # the optimiser's export price sits a hair below the import (tariffs-legacy-degenerate-lp)
     for minute in (PEAK_NOV, OFF):
         step = minute // 15
-        assert vec["c_exp"][step] == pytest.approx(vec["c_imp"][step])
-        assert -_bump(conn, ts, imp, exp, d0, d0, minute, "exp") == pytest.approx(vec["c_exp"][step], rel=1e-3, abs=0.02)
+        assert vec["c_exp"][step] == pytest.approx(vec["c_imp"][step] - tie)
+        assert -_bump(conn, ts, imp, exp, d0, d0, minute, "exp") == pytest.approx(vec["c_exp"][step] + tie, rel=1e-3, abs=0.02)
 
 
 @pytest.mark.parametrize("tax", [{}, {"strn": False, "gst_recoverable": False}])
@@ -160,11 +161,12 @@ def test_legacy_surplus_period_moves_only_the_bare_credit(company, tax):
     mtd_exp = {"peak": float(exp[peak].sum() / 60), "off_peak": float(exp[~peak].sum() / 60)}
     vec = tariffs.vectors(conn, _t0(ts), 96, mtd_imp, None, 1e9, mtd_exp, None)
     s = OFF // 15
-    assert vec["c_imp"][s] == pytest.approx(35.15) and vec["c_exp"][s] == pytest.approx(35.15)
+    tie = tariffs.LEGACY_EXPORT_TIE_BREAK  # the optimiser's export price sits a hair below the import (tariffs-legacy-degenerate-lp)
+    assert vec["c_imp"][s] == pytest.approx(35.15) and vec["c_exp"][s] == pytest.approx(35.15 - tie)
     assert -_bump(conn, ts, imp, exp, d0, d0, OFF, "exp") == pytest.approx(35.15, abs=0.02)
     assert _bump(conn, ts, imp, exp, d0, d0, OFF, "imp") == pytest.approx(35.15, abs=0.02)
     p = PEAK_NOV // 15  # the peak period still nets to an import
-    assert -_bump(conn, ts, imp, exp, d0, d0, PEAK_NOV, "exp") == pytest.approx(vec["c_exp"][p], rel=1e-3, abs=0.02)
+    assert -_bump(conn, ts, imp, exp, d0, d0, PEAK_NOV, "exp") == pytest.approx(vec["c_exp"][p] + tie, rel=1e-3, abs=0.02)
 
 
 # ------------------------------------------------------------------------------------------------ tariffs-vectors-billing-month

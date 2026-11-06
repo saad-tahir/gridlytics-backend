@@ -64,13 +64,18 @@ UPLOAD_MAX_DAYS = 400
 
 
 def _upload_window(content: bytes, tz_offset_h: float) -> None:
-    """Refuses (ValueError, in words) a file with a row before 2015, a row more than a day ahead, or rows spanning more than UPLOAD_MAX_DAYS. Reads only the
-    ts column, as the import reads it; rows whose ts does not parse are left to the import, which skips them."""
+    """Refuses (ValueError, in words) a file whose header names a column twice, a file with a row before 2015, a row more than a day ahead, or rows
+    spanning more than UPLOAD_MAX_DAYS. Reads only the ts column, as the import reads it; rows whose ts does not parse are left to the import, which skips
+    them. The import reads rows by column name and keeps the last of two columns with one name, so a repeated name is refused outright: this check and
+    the import then always read the same ts column."""
     import csv
     import io
     text = content.decode("utf-8-sig", errors="replace")
     reader = csv.reader(io.StringIO(text))
     head = next(reader, None) or []
+    twice = sorted({h for h in head if h.strip() and head.count(h) > 1})
+    if twice:
+        raise ValueError(f"The header names {', '.join(twice[:5])} more than once: give each column once and upload again")
     if "ts" not in head:
         return
     col = head.index("ts")

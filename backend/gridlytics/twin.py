@@ -159,8 +159,11 @@ def native_policy(site: dict, ts: np.ndarray) -> dict:
     * Slots apply whenever the capture has them (a Deye-style TOU program is captured under the default work mode too), each with its floor, target and
       grid-charge flag; the twin charges from the grid towards the slot's target where the flag is set.
     * `backup` holds the battery while the grid is present (no discharge), charges it from the grid to the backup state of charge when grid charging is
-      allowed, and discharges only in outages.
-    * `feed_in_first` exports surplus PV first (up to the export cap) and charges the battery from what is left."""
+      allowed, and discharges only in outages. Surplus PV still charges it to its maximum, as a backup-mode inverter does: the backup level is the
+      grid-charge level (`grid_target`), not a ceiling.
+    * `feed_in_first` exports surplus PV first (up to the export cap) and charges the battery from what is left.
+
+    `grid_target` is the level a grid-charge flag charges to (the slot's target, except in `backup`); `target` caps every other charging."""
     cap = (site.get("native") or {}).get("body") or {"work_mode": "self_use", "backup_soc_pct": 20.0, "slots": []}
     n = len(ts)
     work = cap.get("work_mode") or "self_use"
@@ -168,12 +171,13 @@ def native_policy(site: dict, ts: np.ndarray) -> dict:
     mode = np.full(n, MODE_CODE["self_use"])
     floor = np.full(n, backup)
     target = np.full(n, 1.0)
+    grid_target = None
     gch = np.zeros(n, dtype=bool)
     export_first = np.full(n, work == "feed_in_first")
     slots = sorted(cap.get("slots") or [], key=lambda s: s["start"])
     if work == "backup":
         mode[:] = MODE_CODE["hold"]
-        target[:] = backup
+        grid_target = np.full(n, backup)
         gch[:] = bool(cap.get("grid_charge_allowed", False))
     elif slots:
         minute = ((np.asarray(ts) + 5 * 3600) % 86400) // 60
@@ -186,7 +190,7 @@ def native_policy(site: dict, ts: np.ndarray) -> dict:
             target[i] = s["soc_target_pct"] / 100.0
             gch[i] = bool(s.get("grid_charge", False))
     return {"mode": mode, "floor": floor, "target": target, "max_dis": np.full(n, np.inf), "max_ch": np.full(n, np.inf), "grid_charge": gch,
-            "genset": np.full(n, -1), "export_first": export_first}
+            "genset": np.full(n, -1), "export_first": export_first, "grid_target": target.copy() if grid_target is None else grid_target}
 
 
 def slots_policy(slots: list[dict], ts: np.ndarray) -> dict:
@@ -285,6 +289,9 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
     rescue = bool(gen_on0 and gen_rescue0)
     outage_min = int(outage_min0)
     mode, floor, target = policy["mode"], policy["floor"], policy["target"]
+    grid_target = policy.get("grid_target")
+    if grid_target is None:
+        grid_target = target
     max_dis, max_ch, gch, gcmd = policy["max_dis"], policy["max_ch"], policy["grid_charge"], policy["genset"]
     gcap = policy.get("grid_cap", np.full(n, np.inf))
     export_first = policy.get("export_first")
@@ -315,13 +322,18 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                     rescue = False
             elif plant.parallel and plant.gen_kw > 0 and plant.gen_control != "none" and gcmd[i] == 1:
                 gen_on, elapsed, rescue = True, 0, False
-            # a grid-charge flag in a self-use or hold slot charges from the grid towards the slot's target, and the battery then holds at that target
+            # a grid-charge flag in a self-use or hold slot charges from the grid towards its grid target (the slot's target; the backup level in backup
+            # mode), and the battery then holds at that level; surplus PV still charges it up to the target
             grid_ch = has_bat and bool(gch[i]) and m in (0, 2)
             dis_room_m = dis_room
+            ch_room_g = ch_room
             if grid_ch:
-                dis_room_m = max(0.0, (e - max(e_min, max(floor[i], target[i]) * plant.e_nom))) * plant.eta_d / dt
-            if m == 3 or (grid_ch and ch_room > 1e-9):  # charge_grid, never above the slot's grid import cap (the peak-shaving setting)
-                bat = -max(0.0, min(pch, ch_room, gcap[i] - net if net > 0 else gcap[i] + (-net)))
+                dis_room_m = max(0.0, (e - max(e_min, max(floor[i], grid_target[i]) * plant.e_nom))) * plant.eta_d / dt
+                ch_room_g = max(0.0, (min(e_max, grid_target[i] * plant.e_nom) - e)) / plant.eta_c / dt
+            if m == 3 or (grid_ch and ch_room_g > 1e-9):  # charge_grid, never above the slot's grid import cap (the peak-shaving setting)
+                bat = -max(0.0, min(pch, ch_room if m == 3 else ch_room_g, gcap[i] - net if net > 0 else gcap[i] + (-net)))
+                if m != 3 and net < 0:  # surplus PV beyond the grid-charge level still charges, up to the target
+                    bat = -max(-bat, min(-net, pch, ch_room))
             elif m == 5:  # export: discharge at the cap
                 bat = min(pdis, dis_room)
             elif net > 0:

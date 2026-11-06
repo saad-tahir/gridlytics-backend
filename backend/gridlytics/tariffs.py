@@ -102,7 +102,22 @@ def resolve(kind: str, key: str, on: date | str) -> dict | None:
 _KEYS = {"schedule": ("national",), "tou": ("xwdisco", "ke"), "tax": ("national",), "icp": ("national",), "prosumer": ("net_billing", "net_metering_legacy")}
 _BASES = ("per_kw_month", "sanctioned_kw_month", "per_consumer_month")
 _YM = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_YMD = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+#: Rs/kWh a legacy net-metering export is priced below the import it nets: the bill is indifferent, but equal prices let the optimiser plan
+#: circulating import and export in the same step at no cost (a degenerate plan with impossible flows and an inflated grid cap)
+LEGACY_EXPORT_TIE_BREAK = 0.01
+
+
+def _canonical_day(value, what: str = "The version's start") -> str:
+    """A day as the canonical "YYYY-MM-DD". Every stored date is compared as a string, so a form Python also parses ("20261101", "2026-W45-1")
+    would sort as another day: it is refused, never stored."""
+    if not isinstance(value, str) or not _YMD.match(value):
+        raise ValueError(f"{what} must be a date written YYYY-MM-DD")
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise ValueError(f"{what} must be a real date written YYYY-MM-DD") from None
 
 
 def _month_bounds(ym: str) -> tuple[str, str]:
@@ -206,10 +221,7 @@ def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, 
         raise ValueError("Unknown tariff kind")
     if not isinstance(key, str) or not key.strip():
         raise ValueError("A version needs its key")
-    try:
-        date.fromisoformat(effective_from)
-    except (TypeError, ValueError):
-        raise ValueError("The version's start must be a date (YYYY-MM-DD)") from None
+    effective_from = _canonical_day(effective_from)
     if not isinstance(body, dict) or not isinstance(source, dict) or source.get("verified") not in ("primary", "secondary", "unverified"):
         raise ValueError("A version carries a body and a source with verified: primary, secondary or unverified")
     validate_body(kind, key, body, effective_from)
@@ -250,6 +262,8 @@ def approve(version_id: str, by: str) -> dict:
             raise ValueError("This version is a placeholder awaiting the notification: draft the notified version and approve that one")
         if r["status"] != "pending":
             raise ValueError("Only a pending version can be approved")
+        # a draft stored before starts were checked: a non-canonical start would close the previous version on one day and sort as another
+        _canonical_day(r["effective_from"])
         try:
             body = json.loads(r["body"])
         except (TypeError, ValueError):
@@ -291,7 +305,7 @@ def fuel_price(kind: str, on: date | str) -> tuple[float, dict]:
 def add_fuel_price(kind: str, valid_from: str, price: float, by: str) -> None:
     if kind not in ("hsd", "gas_captive", "lng_captive") or not (0 < price < 100000):
         raise ValueError("A fuel price needs a kind (hsd, gas_captive, lng_captive) and a positive price")
-    date.fromisoformat(valid_from)
+    valid_from = _canonical_day(valid_from, "A fuel price's start")
     with store.connect() as con:
         con.execute("INSERT INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?) ON CONFLICT(kind, valid_from) DO UPDATE SET "
                     "price = excluded.price, source = excluded.source", (kind, valid_from, price, json.dumps({"kind": "manual", "ref": by, "verified": "primary"})))
@@ -353,15 +367,17 @@ def tax_rules(on) -> dict:
 def adders_for(billing_month: str) -> list[dict]:
     """The adders billed in a billing month ("YYYY-MM"): QTA, FCA and the debt service surcharge, one version per adder key.
 
-    A version counts when it is active, in force on some day of the billing month (its start on or before the month's last day and not closed before
-    its first) and lists the month (or "all"). Of several versions of one key the latest start wins, and of two with the same start the one created
-    last, so a new or corrected version replaces the one before it instead of stacking on it; two months' FCAs billed together are two keys. A
-    malformed row is skipped rather than failing every bill."""
+    A version counts when it is active, starts on or before the month's last day, and covers the month: a version that lists its billing months covers
+    exactly those (its `effective_to` is ignored: approving the next version with an early start closes it before its last listed month, which must
+    not drop it from that bill), and an "all" version covers the months it is in force (not closed before the month's first day). Of several versions
+    of one key that cover the month the latest start wins, and of two with the same start the one created last, so a new or corrected version
+    replaces the one before it instead of stacking on it (a same-start correction also marks the old one superseded); two months' FCAs billed together
+    are two keys. A malformed row is skipped rather than failing every bill."""
     ensure_shipped()
     first, last = _month_bounds(billing_month)
     with store.connect() as con:
         rows = con.execute("SELECT * FROM tariff_versions WHERE kind = 'adder' AND status = 'active' AND effective_from <= ? "
-                           "AND (effective_to IS NULL OR effective_to >= ?) ORDER BY key, effective_from, created, rowid", (last, first)).fetchall()
+                           "ORDER BY key, effective_from, created, rowid", (last,)).fetchall()
     best: dict[str, dict] = {}
     for r in rows:
         try:
@@ -370,7 +386,12 @@ def adders_for(billing_month: str) -> list[dict]:
             continue
         body = v["body"] if isinstance(v["body"], dict) else {}
         months = body.get("billing_months", [])
-        if not (months == "all" or (isinstance(months, list) and billing_month in months)) or not _num(body.get("rate")):
+        if months == "all":
+            if v.get("effective_to") is not None and str(v["effective_to"]) < first:
+                continue
+        elif not (isinstance(months, list) and billing_month in months):
+            continue
+        if not _num(body.get("rate")):
             continue
         best[v["key"]] = v  # ordered by start, so the last one of a key wins
     return [{"key": v["key"], "id": v["id"], "name": v["key"], "exempt": [], **v["body"]} for v in best.values()]
@@ -643,7 +664,8 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     Each step carries the adders of its billing month (`billing_month`, from the connection's `reading_day`); the ICP case, the MDI rate and the legacy
     netting case are those of the current billing month, whose steps end at `billing_month_end_step`. `mtd_import` and `rest_net_import` are the
     current billing month's imports per period so far and forecast for the rest; for legacy net metering `mtd_export` and `rest_net_export` are the
-    exports alike (left out, the periods are taken to end the month as net imports)."""
+    exports alike (left out, the periods are taken to end the month as net imports). A legacy export is priced LEGACY_EXPORT_TIE_BREAK below the
+    import price of its step (the bill prices both alike), so equal prices never make circulating import and export free."""
     h = 0.25
     out = {"c_imp": np.zeros(steps), "c_exp": np.zeros(steps), "peak": np.zeros(steps, dtype=bool), "month": np.zeros(steps, dtype=int),
            "local_hour": np.zeros(steps), "grid": np.ones(steps), "icp": {}, "mdi": None, "billing_month": [], "billing_month_end_step": steps}
@@ -721,10 +743,10 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
         if regime == "net_billing":
             c_exp = naepp
         elif legacy:
+            # the bill prices both ways alike; the export side sits LEGACY_EXPORT_TIE_BREAK below so the optimiser never plans import and export at once
             if in_bm0[i] and surplus.get(p):
-                c_imp = c_exp = s_rate
-            else:
-                c_exp = c_imp
+                c_imp = s_rate
+            c_exp = c_imp - LEGACY_EXPORT_TIE_BREAK
         else:
             c_exp = 0.0
         out["c_imp"][i], out["c_exp"][i] = c_imp, c_exp

@@ -37,8 +37,11 @@ def state(site: dict, now: int | None = None) -> dict | None:
         anchor_ts = int(g["ts"][a])
     else:
         sigma, anchor_ts = 15.0, None
-    both = known & ~np.isnan(g["soc_bms"]) & ~np.isnan(g["soc"])
-    gap = float(np.mean(np.abs(g["soc_bms"][both] - g["soc"][both])) * 100) if both.any() else 0.0
+    # the estimate against the BMS only where both were measured: g["soc"] falls back to the BMS where the estimate is missing (a CSV history, an edge
+    # that sends the estimate part of the time), and comparing the BMS with itself there would dilute the gap and hide a low trust
+    soc_est = g.get("soc_est", g["soc"])
+    both = known & ~np.isnan(g["soc_bms"]) & ~np.isnan(soc_est)
+    gap = float(np.mean(np.abs(g["soc_bms"][both] - soc_est[both])) * 100) if both.any() else 0.0
     anchor_cov = min(1.0, len(np.unique(g["ts"][anchors] // 86400)) / 30.0) if len(anchors) else 0.0
     trust = round(0.4 * max(0.0, 1 - gap / 10.0) + 0.3 * max(0.0, 1 - sigma / 25.0) + 0.2 * (1.0 if gap < 5 else 0.5) + 0.1 * anchor_cov, 3)
     usable = e_nom * max(0.0, soc - 2 * sigma / 100.0 - b["soc_min"]) * b["eta_d"]

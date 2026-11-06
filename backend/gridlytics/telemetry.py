@@ -91,36 +91,67 @@ def write_rows(rows: list[tuple], columns: tuple = COLUMNS) -> int:
 
 
 _VOLT = ALL.index("grid_voltage_v")
+#: the largest magnitude a minute cell may hold: a billion (a gigawatt, a gigawatt-hour in one minute, a billion volts or litres) is far past any
+#: site this product serves, and a finite but absurd reading (1e308 from a crafted batch) would otherwise overflow a day's sums to Infinity
+CELL_MAX = 1e9
 
 
 def _num(v) -> tuple[float | None, bool]:
-    """A numeric cell as (value, unreadable): blanks are missing (None); text that is not a number, NaN and infinities are missing too, and
-    counted, so one bad cell neither refuses a file nor stores a value the pages cannot render."""
+    """A numeric cell as (value, unreadable): blanks are missing (None); text that is not a number, NaN, infinities and magnitudes over CELL_MAX
+    are missing too, and counted, so one bad cell neither refuses a file nor stores a value the pages cannot render."""
     if v is None or (isinstance(v, str) and v.strip() == ""):
         return None, False
     try:
         x = float(v)
     except (TypeError, ValueError, OverflowError):
         return None, True
-    return (x, False) if math.isfinite(x) else (None, True)
+    return (x, False) if math.isfinite(x) and abs(x) <= CELL_MAX else (None, True)
 
 
-def ingest(site_id: str, records: list[dict], source: str) -> dict:
-    """Normalised dict rows (edge batches and CSV) into the minute table; idempotent by (site, minute), the last value wins."""
-    rows, skipped, unreadable = [], 0, 0
+#: a stored row's time lies between EARLIEST_TS and a day after now: a row dated 1970 or 9999 is a logger with an unset clock (or a crafted batch), and a
+#: number past SQLite's 64-bit integer would raise on the write (plan Part 2.8: telemetry is untrusted input, read with size and time caps)
+EARLIEST_TS = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
+AHEAD_S = 86400
+#: one CSV upload spans at most this many days: the import aggregates every day it fills
+UPLOAD_MAX_DAYS = 400
+
+
+def _now_ts() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def _epoch(v) -> int | None:
+    """A row's ts as whole epoch seconds, or None when it is not a time: ISO text (UTC when it names no zone) or a finite number."""
+    if isinstance(v, str):
+        try:
+            t = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+            return int((t if t.tzinfo else t.replace(tzinfo=timezone.utc)).timestamp())
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    return int(v)
+
+
+def ingest(site_id: str, records: list[dict], source: str, now: int | None = None) -> dict:
+    """Normalised dict rows (edge batches and CSV) into the minute table; idempotent by (site, minute), the last value wins.
+
+    A row whose ts is not a time, or lies before 2015 or more than a day after `now`, is skipped and counted (`skipped`, and `out_of_range` for the
+    dated ones), never raised: one bad row must not fail the batch on every retry."""
+    rows, skipped, unreadable, out_of_range = [], 0, 0, 0
+    latest_ok = (_now_ts() if now is None else int(now)) + AHEAD_S
     for r in records:
-        ts = r.get("ts")
-        if isinstance(ts, str):
-            try:
-                t = datetime.fromisoformat(ts.strip().replace("Z", "+00:00"))
-            except ValueError:
-                skipped += 1
-                continue
-            ts = int((t if t.tzinfo else t.replace(tzinfo=timezone.utc)).timestamp())
-        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts):
+        ts = _epoch(r.get("ts"))
+        if ts is None:
             skipped += 1
             continue
-        ts = int(ts) // 60 * 60
+        if not EARLIEST_TS <= ts <= latest_ok:
+            skipped += 1
+            out_of_range += 1
+            continue
+        ts = ts // 60 * 60
         row = [site_id, ts, source]
         for c in ALL[3:]:
             v = r.get(c)
@@ -134,11 +165,36 @@ def ingest(site_id: str, records: list[dict], source: str) -> dict:
             row[3] = 1.0 if row[_VOLT] >= 180 else 0.0  # grid present from voltage (plan Part 7.5; 180 V to confirm); an unreadable voltage stays unknown
         rows.append(tuple(row))
     write_rows(rows, ALL)
-    return {"accepted": len(rows), "skipped": skipped, "unreadable_cells": unreadable}
+    return {"accepted": len(rows), "skipped": skipped, "unreadable_cells": unreadable, "out_of_range": out_of_range}
 
 
-def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None) -> dict:
-    """A CSV upload: one row per minute; blanks are missing; duplicates keep the last; gaps over 5 minutes are reported."""
+def _check_window(stamps: list[int], now: int | None = None) -> None:
+    """Refuses (ValueError, in words) parsed upload times with a row before 2015, a row more than a day ahead, or a span over UPLOAD_MAX_DAYS."""
+    latest_ok = (_now_ts() if now is None else int(now)) + AHEAD_S
+    early = sum(1 for t in stamps if t < EARLIEST_TS)
+    late = sum(1 for t in stamps if t > latest_ok)
+    if early or late:
+        raise ValueError(f"{early + late} row{'s are' if early + late != 1 else ' is'} dated "
+                         + ("before 2015" if early and not late else "in the future" if late and not early else "before 2015 or in the future")
+                         + ": check the logger's clock (and the timezone) and upload again")
+    span = (max(stamps) - min(stamps)) // 86400 if stamps else 0
+    if span > UPLOAD_MAX_DAYS:
+        raise ValueError(f"The file spans {span} days; upload at most {UPLOAD_MAX_DAYS} days per file")
+
+
+def _local_days(stamps) -> list[date]:
+    """The local (PKT) days that hold at least one of the times, in order."""
+    ks = sorted({(int(t) + 5 * 3600) // 86400 for t in stamps})
+    epoch = date(1970, 1, 1)
+    return [epoch + timedelta(days=k) for k in ks]
+
+
+def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None) -> dict:
+    """A CSV upload: one row per minute; blanks are missing; duplicates keep the last; gaps over 5 minutes are reported.
+
+    The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
+    nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
+    rows are aggregated."""
     if len(content) > 30_000_000:
         raise ValueError("The file is larger than 30 MB; split it by month")
     text = content.decode("utf-8-sig", errors="replace")
@@ -175,30 +231,27 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         records.append(rec)
     if not records:
         raise ValueError("No rows with a readable ts were found")
+    now = _now_ts() if now is None else int(now)
+    _check_window([r["ts"] for r in records], now)  # before anything is written
     if bad_ts:
         log.append(f"{bad_ts} rows without a readable ts were skipped")
     records.sort(key=lambda r: r["ts"])
     gaps = sum(1 for a, b in zip(records, records[1:]) if b["ts"] - a["ts"] > 300)
-    res = ingest(site_id, records, "csv")
+    res = ingest(site_id, records, "csv", now=now)
     res["skipped"] += bad_ts
     if res.get("unreadable_cells"):
-        log.append(f"{res['unreadable_cells']} cells were not finite numbers (text such as N/A, NaN or inf) and were stored as missing")
+        log.append(f"{res['unreadable_cells']} cells were not finite numbers (text such as N/A, NaN or inf) or were beyond any meter's range "
+                   f"(over a billion), and were stored as missing")
     digest = hashlib.sha256(content).hexdigest()[:16]
     first, last = records[0]["ts"], records[-1]["ts"]
     with store.connect() as con:
         iid = store.new_id()
         con.execute("INSERT INTO imports (id, site_id, source, file_hash, rows, gaps, status, log, created) VALUES (?,?,?,?,?,?,?,?,?)",
                     (iid, site_id, "csv", digest, res["accepted"], gaps, "done", json.dumps(log), store._now()))
-    for day in _days_between(first, last):
+    for day in _local_days(r["ts"] for r in records):  # only the days that received rows, not every day between the first and the last
         aggregate_day(site_id, day)
     return {"id": iid, "rows": res["accepted"], "skipped": res["skipped"], "gaps": gaps, "log": log,
             "from": datetime.fromtimestamp(first, timezone.utc).isoformat(), "to": datetime.fromtimestamp(last, timezone.utc).isoformat()}
-
-
-def _days_between(t0: int, t1: int) -> list[date]:
-    d0 = datetime.fromtimestamp(t0, PKT).date()
-    d1 = datetime.fromtimestamp(t1, PKT).date()
-    return [d0 + timedelta(days=i) for i in range((d1 - d0).days + 1)]
 
 
 # ------------------------------------------------------------------------------------------------ reading
@@ -359,8 +412,11 @@ def outages(site_id: str, t0: int, t1: int) -> list[dict]:
     return out
 
 
-def aggregate_day(site_id: str, day: date, peak_flags: np.ndarray | None = None) -> dict:
-    """The day's totals into telemetry_days (plan Part 3.3)."""
+def aggregate_day(site_id: str, day: date, peak_flags: np.ndarray | None = None, keep: dict | None = None) -> dict:
+    """The day's totals into telemetry_days (plan Part 3.3). `keep` carries a stored row's fields this call does not compute (peak_import_kwh without
+    the peak flags), so re-aggregating a day does not drop them; non-finite kept values are dropped. A total that is not finite (minutes stored
+    before ingest capped magnitudes can overflow a sum) is stored and returned as missing (None), so no day row is ever written non-finite and
+    days() never finds one to heal again."""
     t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
     g = minute_grid(site_id, t0, t0 + 86400)
     if not g["present"].any():
@@ -380,17 +436,50 @@ def aggregate_day(site_id: str, day: date, peak_flags: np.ndarray | None = None)
             "completeness": round(g["completeness"], 4), "import_completeness": round(g["imp_completeness"], 4)}
     if peak_flags is not None:
         data["peak_import_kwh"] = round(float(imp[peak_flags].sum() / 60), 2)
+    if keep:
+        data = {**{k: v for k, v in keep.items() if k != "day" and k not in data and _finite(v) is not None}, **data}
+    data = {k: _finite(v) for k, v in data.items()}
     with store.connect() as con:
         con.execute("INSERT INTO telemetry_days (site_id, day_local, data) VALUES (?,?,?) ON CONFLICT(site_id, day_local) DO UPDATE SET data = excluded.data",
                     (site_id, day.isoformat(), json.dumps(data)))
     return data
 
 
+def _heal_day(site_id: str, day_local: str, stored: dict) -> dict:
+    """A stored day row holding a non-finite number (written before ingest refused them): re-aggregated from the minutes, which now read such values as
+    missing, and written back, keeping the fields the aggregation does not compute; a total that still overflows is written as missing (null), as
+    aggregate_day stores every non-finite total. Without minutes to re-read, the non-finite values are stored as missing (null). Either way the row is
+    healed once, not on every read."""
+    try:
+        day = date.fromisoformat(day_local)
+    except ValueError:
+        day = None
+    fresh = aggregate_day(site_id, day, keep=stored) if day is not None else {}
+    if fresh:
+        return fresh
+    clean = {k: _finite(v) for k, v in stored.items()}
+    with store.connect() as con:
+        con.execute("UPDATE telemetry_days SET data = ? WHERE site_id = ? AND day_local = ?", (json.dumps(clean), site_id, day_local))
+    return clean
+
+
+def _non_finite(data: dict) -> bool:
+    return any(isinstance(v, float) and not math.isfinite(v) for v in data.values())
+
+
 def days(site_id: str, d0: str, d1: str) -> list[dict]:
+    """The stored day rows from d0 to d1 (local days, inclusive). A row holding Infinity or NaN is healed on the way out (see _heal_day), so every number
+    returned is finite."""
     with store.connect() as con:
         rows = con.execute("SELECT day_local, data FROM telemetry_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? ORDER BY day_local",
                            (site_id, d0, d1)).fetchall()
-    return [{"day": r["day_local"], **{k: _finite(v) for k, v in json.loads(r["data"]).items()}} for r in rows]
+    out = []
+    for r in rows:
+        data = json.loads(r["data"])
+        if _non_finite(data):
+            data = _heal_day(site_id, r["day_local"], data)
+        out.append({"day": r["day_local"], **{k: _finite(v) for k, v in data.items()}})
+    return out
 
 
 _FORMULA_START = ("=", "+", "-", "@", "\t", "\r")

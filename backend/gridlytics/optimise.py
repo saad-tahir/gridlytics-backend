@@ -98,6 +98,10 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     bat, gen = p.get("battery"), p.get("genset")
     lmode = int(p.get("load_mode", 0))
     W, forced, rm_floor = None, np.zeros(T, dtype=bool), {}
+    dump_ok = forced
+    thr_t: list[int] = []
+    thr_w: dict[int, int] = {}
+    thr_z: dict[int, int] = {}
     # ---------------------------------------------------------------- genset
     if gen:
         S = gen["S"]
@@ -137,14 +141,32 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             for t in range(min(T, DT - gen["elapsed"])):
                 if u_lb[t] < 1:
                     u_ub[t] = 0
+        # a soc_threshold controller starts the set whenever the state of charge is under its threshold in an outage (Part 4.1: a row on E), and
+        # only then. A start it forces is not the plan's to refuse: like a panel start at an auto_on_grid_loss site, the run-hour cap and the
+        # minimum up and down rows do not bind it (w[t] = 1 marks a step run because the threshold forces it: the set is on and E[t] is under the
+        # threshold), and the row is not written where the set cannot run at all (a hold, a carried down time, a tank that cannot cover one step
+        # at minimum load)
+        E_on = thr_big = min_burn = 0.0
+        if gen["control"] == "soc_threshold" and bat:
+            En_ = bat["E_nom"]
+            E_on = min(bat["soc_max"] * En_, float(gen.get("soc_on", 0.25)) * En_)
+            thr_big = E_on - min(bat["soc_min"] * En_, bat["E0"])
+            min_burn = H * (gen["a"] * gen["f_min"] * S + gen["b"] * S)
+            if thr_big > 0 and gen["fuel_available"] >= min_burn - 1e-9:
+                thr_t = [t for t in range(1, T) if g[t] < 0.5 and u_ub[t] > 0]
+        if thr_t:
+            wv = m.var("w_thr", len(thr_t), 0, 1, 0.0, integer=True)
+            thr_w = {t: int(wv[k]) for k, t in enumerate(thr_t)}
         # where the panel or the carried state forces the set on, it runs at least at its minimum load; what the load and the battery cannot
-        # take is dumped (the twin curtails it the same way), so a forced state is never infeasible (Part 4.3)
+        # take is dumped (the twin curtails it the same way), so a forced state is never infeasible (Part 4.3); a threshold start likewise
         forced = u_lb >= 1
+        dump_ok = forced.copy()
+        dump_ok[thr_t] = True
         Pg = m.var("P", T, 0, S, H * gen["c_om"])
         F = m.var("F", T, 0, np.inf, gen["c_fuel"])
         u = m.var("u", T, u_lb, u_ub, H * gen["c_runhr"], integer=True)
         v = m.var("v", T, 0, 1, gen["c_start"], integer=True)
-        W = m.var("W", T, 0, np.where(forced, gen["f_min"] * S, 0.0), H * 2 * EPS_CURTAIL) if forced.any() else None
+        W = m.var("W", T, 0, np.where(dump_ok, gen["f_min"] * S, 0.0), H * 2 * EPS_CURTAIL) if dump_ok.any() else None
         # at a panel-started site the panel decides u: minimum up and down rows bind only the starts and stops the plan is free to make
         free_start = ~(auto & (u_lb >= 1))
         free_stop = ~(auto & (u_ub <= 0))
@@ -159,28 +181,53 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 m.row([u[t], u[t - 1], v[t]], [1, -1, -1], ub=0, name=f"start[{t}]")
                 m.row([v[t], u[t - 1]], [1, 1], ub=1, name=f"start_off[{t}]")
             m.row([v[t], u[t]], [1, -1], ub=0, name=f"start_on[{t}]")
+            if t in thr_w:
+                # in an outage the controller, not the plan, starts the set: only when the state of charge is under the threshold
+                m.row([thr_w[t], u[t]], [1, -1], ub=0, name=f"thr_on[{t}]")
+                m.row([v[t], thr_w[t]], [1, -1], ub=0, name=f"thr_start[{t}]")
             if UT > 1 and free_start[t]:
                 t2 = min(t + UT - 1, T - 1)
                 n_ = t2 - t + 1
-                m.row(list(u[t:t2 + 1]) + [v[t]], [1] * n_ + [-n_], lb=0, name=f"min_up[{t}]")
+                cols, vals = list(u[t:t2 + 1]) + [v[t]], [1] * n_ + [-n_]
+                if t in thr_w:  # a threshold start runs for as long as the controller keeps it on, not the plan's minimum
+                    cols.append(thr_w[t])
+                    vals.append(n_)
+                m.row(cols, vals, lb=0, name=f"min_up[{t}]")
             if DT > 1 and free_stop[t]:
                 t2 = min(t + DT - 1, T - 1)
                 n_ = t2 - t + 1
                 cols = list(u[t:t2 + 1])
                 vals = [-1.0] * n_
                 vals[0] += n_
+                # the threshold restarts a set it needs, however recently it stopped
+                restart = [thr_w[k] for k in range(t + 1, t2 + 1) if k in thr_w]
                 if t == 0:
-                    m.row(cols, vals, lb=-n_ + n_ * gen["u_prev"], name="min_down[0]")
+                    m.row(cols + restart, vals + [n_] * len(restart), lb=-n_ + n_ * gen["u_prev"], name="min_down[0]")
                 else:
-                    m.row(cols + [u[t - 1]], vals + [-n_], lb=-n_, name=f"min_down[{t}]")
+                    m.row(cols + [u[t - 1]] + restart, vals + [-n_] + [n_] * len(restart), lb=-n_, name=f"min_down[{t}]")
         if not auto:
             for d in np.unique(gen["day_index"]):
                 steps = np.where(gen["day_index"] == d)[0]
                 cap = gen["cap_hours"] - (gen["hours_today"] if d == 0 else 0.0)
                 if cap < len(steps) * H:
-                    m.row(u[steps], [H] * len(steps), ub=max(0.0, cap), name=f"run_cap[{d}]")
+                    exempt = [thr_w[int(s)] for s in steps if int(s) in thr_w]  # threshold runs do not count against the cap
+                    m.row(list(u[steps]) + exempt, [H] * len(steps) + [-H] * len(exempt), ub=max(0.0, cap), name=f"run_cap[{d}]")
             if gen["fuel_available"] < 1e8:
                 m.row(F, [1] * T, ub=max(0.0, gen["fuel_available"]), name="fuel_cap")
+        # the fuel cap stays physical: z[t] = 1 (the threshold row lapses) only once the fuel burnt before t leaves less than one step at minimum load
+        thr_z: dict[int, int] = {}
+        if thr_t and gen["fuel_available"] < 1e8:
+            zv = m.var("z_thr", len(thr_t), 0, 1, 0.0, integer=True)
+            need = max(0.0, gen["fuel_available"] - min_burn)
+            # the fuel burnt before each step as a running sum: one short row per step, not a row of t entries per threshold step (the
+            # dense form slowed a two-day off-grid solve by about half)
+            Fb = m.var("F_before", T, 0, np.inf, 0.0)
+            m.row([Fb[0]], [1], 0, 0, "fuel_before[0]")
+            for t in range(1, T):
+                m.row([Fb[t], Fb[t - 1], F[t - 1]], [1, -1, -1], 0, 0, f"fuel_before[{t}]")
+            for k, t in enumerate(thr_t):
+                thr_z[t] = int(zv[k])
+                m.row([Fb[t], thr_z[t]], [1, -need], lb=0, name=f"fuel_out[{t}]")
     # ---------------------------------------------------------------- served load and unserved
     if off_grid:
         served_g0 = L
@@ -188,7 +235,8 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         served_g0 = Lc
     base_served = np.where(g > 0.5, L, served_g0)
     u_dep = (g < 0.5) & (lmode == 1) & bool(gen) & (not off_grid)
-    U = m.var("U", T, 0, np.where(u_dep, L, base_served), H * voll)
+    U_ub = np.where(u_dep, L, base_served)
+    U = m.var("U", T, 0, U_ub, H * voll)
     # ---------------------------------------------------------------- battery
     if bat:
         En, E0 = bat["E_nom"], bat["E0"]
@@ -214,6 +262,14 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 cols.append(Pg[t])
                 vals.append(-1)
             m.row(cols, vals, ub=PV[t], name=f"charge_src[{t}]")
+            if not bat["a_grid"] and g[t] > 0.5:
+                # no grid charging: with the grid up the load takes PV first, so the battery charges only from the PV beyond the load (and the
+                # genset where allowed); otherwise PV would charge while the grid served the load, which is grid charging in net terms
+                cols, vals = [C[t], K[t]], [1, 1]
+                if gen and bat["a_gen"]:
+                    cols.append(Pg[t])
+                    vals.append(-1)
+                m.row(cols, vals, ub=max(0.0, float(PV[t] - L[t])), name=f"charge_surplus[{t}]")
         # reserve (soft, expected value): rows only where the grid is up and an outage may start next
         sig = bat.get("sigma0", 0.0)
         R = np.zeros(T)
@@ -228,24 +284,66 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 r = m.var(f"r{t}", 1, 0, np.inf, p_start[t] * c_short)[0]
                 r_idx[t] = r
                 m.row([E[t + 1], r], [1, 1], lb=Emin + R[t], name=f"reserve[{t}]")
-        # a manual reserve (or a force-charge target) is a floor with its own slack at VoLL, only on the steps inside its window and, like the
-        # regular reserve, only where the grid is up: inside an outage the reserve is there to be used (Part 4.3, 4.8)
+        # A battery-inverter sheds load only once the battery is at its cut-off, so where a row on E stands for an operator's floor during an
+        # outage, load shed in that outage counts as if the battery had carried it (`shed_kwh`): shedding never keeps a floor, which it would
+        # otherwise do whenever VoLL times the shortfall is cheaper than the alternative (the soc_threshold rows below use a per-step rule instead)
+        def shed_kwh(k0: int, k1: int) -> tuple[list, list]:
+            ks = [k for k in range(k0, k1) if g[k] < 0.5]
+            return [U[k] for k in ks], [-H / bat["eta_d"]] * len(ks)
+
+        # a manual reserve (or a force-charge target) is a floor with its own slack at VoLL (Part 4.3), only on the steps inside its window. At a
+        # grid-connected site it binds while the grid is up and only before the window's first outage step: the reserve is held for that outage
+        # and is there to be used in it, and refilling it afterwards is never worth lost load or a genset run. At an off-grid site there is no
+        # outage to hold for, so it binds on every step of its window
         rm_lb = manual_floor(p, T)
+        rm_on = manual_floor_steps(rm_lb, g, off_grid)
+        run0 = None
         for t in range(T):
-            if rm_lb[t] > 0 and g[t] > 0.5:
-                rm = m.var(f"rm{t}", 1, 0, np.inf, voll)[0]
-                rm_floor[t] = min(Emax, float(rm_lb[t]))
-                m.row([E[t + 1], rm], [1, 1], lb=rm_floor[t], name=f"manual_reserve[{t}]")
-        # a soc_threshold controller starts the set whenever the state of charge is under its threshold in an outage (Part 4.1: a row on E);
-        # the slack, at VoLL, only keeps a cap or a hold that forbids the start from making the model infeasible
-        if gen and gen["control"] == "soc_threshold":
-            E_on = min(Emax, float(gen.get("soc_on", 0.25)) * En)
-            big = E_on - min(Emin, E0)
-            thr_t = [t for t in range(1, T) if g[t] < 0.5 and u_ub[t] > 0] if big > 0 else []
-            if thr_t:
-                th = m.var("thr", len(thr_t), 0, np.inf, voll)
-                for k, t in enumerate(thr_t):
-                    m.row([E[t], u[t], th[k]], [1, big, 1], lb=E_on, name=f"soc_threshold[{t}]")
+            if not rm_on[t]:
+                run0 = None
+                continue
+            run0 = t if run0 is None else run0
+            rm = m.var(f"rm{t}", 1, 0, np.inf, voll)[0]
+            rm_floor[t] = min(Emax, float(rm_lb[t]))
+            sc, sv = shed_kwh(run0, t + 1)
+            m.row([E[t + 1], rm] + sc, [1, 1] + sv, lb=rm_floor[t], name=f"manual_reserve[{t}]")
+        # the soc_threshold rows (see the genset block): under the threshold the set runs, unless the tank is empty (z); the per-step slack at
+        # VoLL is only a guard against infeasibility, since every start the controller would make is allowed. The rows read E alone, so their
+        # big-M stays the threshold's depth below the start (a tight relaxation however long the outage), and a shed the plan cannot avoid (the
+        # set too small, a hold, an overload) is never carried into later steps: it never keeps the set running once the battery is back above
+        # its threshold.
+        # In a grid outage shedding cannot dodge them either (`thr_shed`): the battery-inverter sheds only at its cut-off, so on a step k where
+        # the set could run and the set is off, load is shed only for what the battery's power cannot carry (`cut`), when the tank is empty
+        # (z[k]), or when the battery runs out inside step k. The last is y[k]: it needs the controller's start at k + 1 (w) and shrinks to
+        # nothing as E[k + 1] rises from the cut-off to the threshold, so a shed never lands the battery on the threshold to spare a start. An
+        # off-grid site has no such rows: coupled to the set's binaries on every step of the horizon they slow its solve past the tick's limit,
+        # and with no grid return to reach, a shed there only defers a crossing the next night brings anyway
+        if thr_t:
+            th = m.var("thr", len(thr_t), 0, np.inf, voll)
+            E_hi = max(Emax, E0)
+            for k, t in enumerate(thr_t):
+                cols, vals = [E[t], u[t], th[k]], [1, thr_big, 1]
+                if t in thr_z:
+                    cols.append(thr_z[t])
+                    vals.append(thr_big)
+                m.row(cols, vals, lb=E_on, name=f"soc_threshold[{t}]")
+                m.row([E[t], thr_w[t]], [1, E_hi - E_on], ub=E_hi, name=f"thr_forced[{t}]")
+            thr_set = set(thr_t)
+            shed_k = [] if off_grid else [k for k in range(T - 1) if k + 1 in thr_set and (k in thr_set or (k == 0 and g[0] < 0.5 and u_ub[0] > 0))]
+            if shed_k:
+                yv = m.var("thr_out", len(shed_k), 0, 1, 0.0)
+                # a guard only: every shed the rule allows is reachable without it, and at ten times VoLL it is never the cheap way round it
+                sv = m.var("thr_shed", len(shed_k), 0, np.inf, H * 10 * voll)
+                for i, k in enumerate(shed_k):
+                    cut = max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"])
+                    cols, vals = [U[k], u[k], yv[i], sv[i]], [1, -U_ub[k], -U_ub[k], -1]
+                    if k in thr_z:
+                        cols.append(thr_z[k])
+                        vals.append(-U_ub[k])
+                    m.row(cols, vals, ub=cut, name=f"thr_shed[{k}]")
+                    w1 = thr_w[k + 1]
+                    m.row([yv[i], w1], [1, -1], ub=0, name=f"thr_out_w[{k}]")
+                    m.row([yv[i], E[k + 1], w1], [thr_big, 1, E_hi - E_on], ub=E_hi, name=f"thr_out_e[{k}]")
         # terminal value on the energy the next peak can use
         term = p.get("terminal") or {}
         v_end = max(0.0, bat["eta_d"] * term.get("c_next", 0.0) - c_cyc - term.get("c_cal_hold", 0.0))
@@ -261,7 +359,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         if gen:
             cols.append(Pg[t])
             vals.append(1)
-            if W is not None and forced[t]:
+            if W is not None and dump_ok[t]:
                 cols.append(W[t])
                 vals.append(-1)
             if u_dep[t]:
@@ -424,8 +522,9 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
             else:
                 r = "self_consumption"
         elif C > 0.1:
-            surplus = max(0.0, PV[t] - K - L[t])
-            if C - surplus > 0.1 and G > 0.1:
+            # what PV and the genset leave over after the load, as delivery.grid_charging reads it; a site without grid charging never names it
+            surplus = max(0.0, PV[t] - K + (P if gen else 0.0) - L[t])
+            if C - surplus > 0.1 and G > 0.1 and (not bat or bat.get("a_grid", True)):
                 r = "charge_from_grid"
                 d = {"rs_per_kwh": round(float(p["c_imp"][t]), 2)}
             elif gen and P > 0.1:
@@ -490,6 +589,24 @@ def manual_floor(p: dict, T: int) -> np.ndarray:
         mk = np.asarray(mask, dtype=bool)[:T]
         out = np.where(np.pad(mk, (0, max(0, T - len(mk)))), out, 0.0)
     return np.nan_to_num(out)
+
+
+def manual_floor_steps(floor: np.ndarray, g: np.ndarray, off_grid: bool = False) -> np.ndarray:
+    """The steps on which a manual floor binds (Part 4.3, 4.8): inside its window (a run of steps with a floor) while the grid is up and before the
+    window's first outage step, since the reserve is held for that outage and is used in it; at an off-grid site every step of the window."""
+    on = np.asarray(floor, dtype=float) > 0
+    if off_grid:
+        return on
+    g = np.asarray(g, dtype=float)
+    out = np.zeros(len(on), dtype=bool)
+    lapsed = False
+    for t in range(len(on)):
+        if not on[t]:
+            lapsed = False
+            continue
+        lapsed = lapsed or g[t] < 0.5
+        out[t] = not lapsed
+    return out
 
 
 def shorten(p: dict, T: int) -> dict:

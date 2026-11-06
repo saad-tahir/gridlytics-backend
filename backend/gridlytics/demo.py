@@ -113,6 +113,34 @@ def create_sites(by: str) -> list[str]:
     return ids
 
 
+def _released(site_id: str, ts: np.ndarray) -> np.ndarray:
+    """The minutes a pause or a release to native (plans.control_release) covers: no plan is in force then, and the inverter runs its own settings,
+    whatever plan the caller holds (the pre-pause plan stays current when the paused tick has not run or has failed)."""
+    ts = np.asarray(ts, dtype=np.int64)
+    out = np.zeros(len(ts), dtype=bool)
+    if not len(ts) or not any(o.get("kind") in ("pause_control", "force_native") for o in sites.overrides(site_id)):
+        return out
+    quarters = ts // 900 * 900
+    for q in np.unique(quarters):
+        if plans.control_release(site_id, int(q)):
+            out[quarters == q] = True
+    return out
+
+
+def _merge_policy(plan_pol: dict, native_pol: dict, native_minutes: np.ndarray) -> dict:
+    """A per-minute policy that follows the native one on `native_minutes` and the plan's elsewhere."""
+    n = len(native_minutes)
+    defaults = {"grid_cap": np.full(n, np.inf), "export_first": np.zeros(n, dtype=bool)}
+    out = {}
+    for k in set(plan_pol) | set(native_pol):
+        a = plan_pol.get(k, plan_pol["target"] if k == "grid_target" else defaults.get(k))
+        b = native_pol.get(k, native_pol["target"] if k == "grid_target" else defaults.get(k))
+        if a is None or b is None:
+            continue
+        out[k] = np.where(native_minutes, b, a)
+    return out
+
+
 def _policy_for(site: dict, day: date, ts: np.ndarray, plan: dict | None) -> tuple[dict, np.ndarray]:
     arm = verify.arm_on(site["id"], day)
     if plan is None or arm == "native" or site.get("tier") == "monitor":  # monitor recommends; the inverter keeps its own settings
@@ -125,6 +153,11 @@ def _policy_for(site: dict, day: date, ts: np.ndarray, plan: dict | None) -> tup
         if site["data"].get("genset_start_control") == "manual":
             # 1 in a planned run, 0 outside one: "no planned run", under which the twin's operator still rescues a site about to go dark
             pol["genset"] = np.array([1 if gmap.get(int(t) // 900 * 900) else 0 for t in ts]) if gmap else pol["genset"]
+        released = _released(site["id"], ts)
+        if released.all():
+            pol = twin.native_policy(site, ts)
+        elif released.any():
+            pol = _merge_policy(pol, twin.native_policy(site, ts), released)
     return pol, pol["mode"]
 
 
@@ -278,7 +311,9 @@ def remove(by: str) -> int:
 
 
 def advance(site_id: str, now: int | None = None) -> int:
-    """Keep a demo site live: run the twin from its last minute to now under the active plan."""
+    """Keep a demo site live: run the twin from its last minute to now under the active plan. Minutes a pause or a release to native covers run
+    the inverter's native settings (twin.native_policy), even while the pre-pause plan is still the current one (a paused tick that has not run yet
+    or has failed)."""
     site = sites.full(site_id)
     if site is None or site.get("demo_link") != DEMO_LINK:
         return 0
@@ -288,4 +323,4 @@ def advance(site_id: str, now: int | None = None) -> int:
     start = max(start, now - 3 * 86400)
     if start >= now:
         return 0
-    return _simulate_span(site, start, now, plans.current(site_id))
+    return _simulate_span(site, start, now, plans.current(site_id))  # _policy_for runs the released minutes on the native settings

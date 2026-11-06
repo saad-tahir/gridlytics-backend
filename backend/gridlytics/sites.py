@@ -87,6 +87,9 @@ class ConnectionFields(Strict):
     tax: TaxFlags = TaxFlags()
     seasonal_multiplier: float = Field(1.0, ge=1.0, le=1.5)
     season_months: list[int] = Field(default_factory=list)
+    #: the meter's reading day of the month (from the onboarding bill): a day after it belongs to the next month's bill (tariffs.billing_period_for);
+    #: unset, the bill is the calendar month. 29 to 31 read as the month's last day in a shorter month
+    reading_day: int | None = Field(None, ge=1, le=31)
 
 
 class PvFields(Strict):

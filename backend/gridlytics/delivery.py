@@ -48,7 +48,11 @@ FALLBACK_HOURS = 3
 
 def grid_charging(s: dict) -> bool:
     """Whether a step charges the battery from the grid, read from the solved flows (not from the reason, which an operator hold can name):
-    the grid is up and importing, and the charge exceeds what PV and the genset leave over after the load."""
+    the grid is up and importing, and the charge exceeds what PV and the genset leave over after the load. A step of a site whose battery may not
+    charge from the grid (`grid_charge_permitted` False on the step, the site's grid_charge_allowed) is never grid charging: the plan charges it
+    from the surplus only."""
+    if s.get("grid_charge_permitted") is False:
+        return False
     if s.get("reason") == "charge_from_grid":
         return True
     if s.get("grid_present", 1.0) < 0.5 or s.get("grid_import_kw", 0.0) <= 0.1:
@@ -71,7 +75,7 @@ def step_intents(steps: list[dict], battery: dict | None) -> list[dict]:
             mode = "export"
         elif s["discharge_kw"] > 0.1:
             mode = "discharge"
-        elif s["charge_kw"] > 0.1 and grid_charging(s):
+        elif s["charge_kw"] > 0.1 and grid_charging(s) and battery.get("a_grid", True):
             mode = "charge_grid"
         elif s["charge_kw"] > 0.1:
             mode = "charge_pv_only"

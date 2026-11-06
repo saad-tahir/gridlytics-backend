@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 from fastapi import APIRouter, Body, HTTPException
@@ -12,6 +12,10 @@ from .routes_common import PKT, bad, full_or_404, now_ts, out, site_or_404, toda
 from .schemas import Refusal
 
 router = APIRouter()
+
+#: The prices page's days: from the earliest telemetry and rate cards the product reads to a year from today
+PRICES_EARLIEST = date(2015, 1, 1)
+PRICES_AHEAD_DAYS = 366
 
 
 @router.get("/api/meta")
@@ -51,8 +55,10 @@ def _snapshot(last: dict | None) -> dict | None:
     if not last:
         return None
     w = lambda k: None if last.get(k) is None else round(last[k] / 1000, 2)
+    # the estimate where the source sends one, else the BMS's own reading (a CSV history or an OEM cloud often carries only the BMS)
+    soc = last.get("battery_soc_est_pct") if last.get("battery_soc_est_pct") is not None else last.get("battery_soc_bms_pct")
     return {"ts": last["ts"], "pv_kw": w("pv_power_w"), "load_kw": w("load_power_w"), "grid_kw": w("grid_power_w"), "battery_kw": w("battery_power_w"),
-            "genset_kw": w("genset_power_w"), "soc_pct": last.get("battery_soc_est_pct"), "grid_present": last.get("grid_present"),
+            "genset_kw": w("genset_power_w"), "soc_pct": soc, "grid_present": last.get("grid_present"),
             "genset_running": last.get("genset_running"), "mode": last.get("inverter_mode_active")}
 
 
@@ -212,10 +218,23 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
     return out(sites.full(site_id))
 
 
+def _money_set(role: str, cur: dict | None) -> bool:
+    """True when a stored battery or genset carries a money setting other than its default (one an administrator set)."""
+    names = ASSET_MONEY_FIELDS.get(role, ())
+    if not names or not cur:
+        return False
+    defaults = _defaults(sites.ASSET_MODELS[role], names)
+    return any(k in cur and cur[k] != defaults.get(k) for k in names)
+
+
 @router.delete("/api/sites/{site_id}/assets/{role}")
 def asset_delete(site_id: str, role: str):
+    """Removing a battery or genset whose money settings an administrator set is edit_money_settings too: re-adding it would take the defaults, so an
+    operator could otherwise reset the prices and wear by deleting and re-creating it (plan Part 10.5)."""
     auth.need("edit_sites", "Removing equipment")
     site_or_404(site_id)
+    if _money_set(role, sites.assets(site_id).get(role)):
+        auth.need("edit_money_settings", "Removing equipment whose money settings (prices and wear) an administrator set")
     sites.remove_asset(site_id, role, auth.actor())
     return out(sites.full(site_id))
 
@@ -322,7 +341,12 @@ def overview_chart(site_id: str, hours: int = 24):
     now = now_ts()
     hours = max(6, min(int(hours), 72))
     actual = telemetry.series(site_id, now - hours * 3600, now, ["pv_power_w", "load_power_w", "grid_power_w", "battery_power_w", "battery_soc_est_pct",
-                                                                   "genset_power_w", "grid_present"], "15m")
+                                                                   "genset_power_w", "grid_present", "battery_soc_bms_pct"], "15m")
+    # the chart's SoC line is the estimate, and the BMS's reading where no estimate was sent (BMS-only sources would otherwise show no SoC)
+    ser = actual.get("series") or {}
+    est, bms = ser.get("battery_soc_est_pct"), ser.get("battery_soc_bms_pct")
+    if est is not None and bms is not None:
+        ser["battery_soc_est_pct"] = [e if e is not None else b for e, b in zip(est, bms)]
     plan = plans.current(site_id)
     steps = [st for st in (plan or {}).get("steps", []) if st["t"] < now + hours * 3600]
     return out({"actual": actual, "plan": steps, "now": now})
@@ -343,18 +367,36 @@ def draft_put(draft_id: str, inp: dict = Body(...)):
 
 @router.get("/api/sites/{site_id}/prices")
 def site_prices(site_id: str, day: str | None = None):
-    """The day's 15-minute price vector on the site's bearable-cost basis, as the optimiser sees it (the wizard and tariff pages draw it)."""
+    """The day's 15-minute price vector on the site's bearable-cost basis, as the optimiser sees it (the wizard and tariff pages draw it).
+    At an ICP site the billing month's imports per period settle each period's case, as the savings ledger prices them (verify.month_totals, the
+    metered minutes scaled up to the whole month, with no swing): an above-baseline period shows the ICP rate, not the TOU rate. At a legacy
+    net-metered site the month's exports per period are netted first, as the ledger does."""
     auth.need("see_costs", "Seeing prices")
     s = full_or_404(site_id)
     from .routes_common import parse_day
     d = parse_day(day, today())
+    # the day lies between 2015 (the earliest telemetry and rate cards) and a year from today: a day outside has no prices, and one before 1970 or past
+    # about the year 3000 has no local time on Windows (datetime.fromtimestamp raises OSError there)
+    if not PRICES_EARLIEST <= d <= today() + timedelta(days=PRICES_AHEAD_DAYS):
+        raise Refusal(422, f"Prices are shown for days from {PRICES_EARLIEST.isoformat()} to a year from today", "invalid")
     conn = (s.get("connections") or [None])[0]
     t0 = datetime(d.year, d.month, d.day, tzinfo=PKT)
+    month_q = month_x = None
     try:
-        v = tariffs.vectors(conn, t0.astimezone(timezone.utc), 96, None, None, 1e9)
-    except LookupError as exc:
+        if conn is not None and conn["data"].get("regime") != "off_grid":
+            from . import verify
+            tot = verify.month_totals(site_id, conn, d)
+            month_q = tot["import"]
+            if conn["data"].get("regime") == "net_metering_legacy":
+                month_x = tot["export"]
+        v = tariffs.vectors(conn, t0.astimezone(timezone.utc), 96, month_q, None, 0.0 if month_q is not None else 1e9, month_x, None)
+    except (LookupError, ValueError) as exc:
         raise bad(exc) from None
+    except (OSError, OverflowError):
+        raise Refusal(422, "That day has no prices", "invalid") from None
     return {"day": d.isoformat(), "t": [int(t0.timestamp()) + 900 * i for i in range(96)], "c_imp": [round(float(x), 2) for x in v["c_imp"]],
             "c_exp": [round(float(x), 2) for x in v["c_exp"]], "peak": [bool(x) for x in v["peak"]], "mdi": v["mdi"],
             "icp": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in val.items()} for k, val in v["icp"].items()},
-            "energy_factor": round(tariffs.energy_factor(conn, d), 4) if conn else None}
+            "energy_factor": round(tariffs.energy_factor(conn, d), 4) if conn else None,
+            "month_import_kwh": {k: round(float(x), 1) for k, x in month_q.items()} if month_q is not None else None,
+            "month_export_kwh": {k: round(float(x), 1) for k, x in month_x.items()} if month_x is not None else None}

@@ -1,6 +1,7 @@
 """The plan (UI-09) and the control plane (UI-15): the current plan with its reasons, versions, re-solve, apply, compare, hold and release."""
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -13,6 +14,7 @@ from .schemas import Refusal
 from .routes_common import bad
 
 router = APIRouter()
+log = logging.getLogger("gridlytics.plans")
 _last_solve: dict[str, float] = {}
 
 
@@ -134,12 +136,35 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
         sites.add_override(site_id, {"kind": "pause_control", "until": until, "reason": str(inp.get("reason", "Paused"))[:300]}, who)
     elif action == "resume":
         auth.need("resume_control", "Resuming control")
+        cleared = 0
         for o in sites.overrides(site_id):
             if o["kind"] in ("pause_control", "force_native", "reserve"):
                 sites.clear_override(site_id, o["id"], who)
+                cleared += 1
+        if cleared:
+            # while paused or released no plan is in force, so the plan and the edge's signed message come back at once, not at the next quarter
+            resolve = _resolve_after_resume(site_id)
+            res = control(site_id)
+            res["resolve"] = resolve
+            return res
     else:
         raise Refusal(404, "The control actions are hold, release, pause and resume", "not_found")
     return control(site_id)
+
+
+def _resolve_after_resume(site_id: str) -> dict:
+    """The tick after a resume. A failed tick is reported, not raised: the resume itself stands (the next scheduled tick tries again)."""
+    _last_solve[site_id] = time.monotonic()
+    try:
+        if (sites.get(site_id) or {}).get("demo_link"):    # as the manual re-solve: a demo site's twin first catches up to now
+            from . import demo
+            demo.advance(site_id)
+        r = plans.tick(site_id)
+    except Exception as exc:
+        log.exception("the re-solve after resuming failed for site %s", site_id)
+        return {"status": "failed", "plan_id": None, "reason": f"The re-solve after resuming failed ({type(exc).__name__}); the next scheduled tick tries again"}
+    store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"], "after": "resume"})
+    return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": r.get("reason")}
 
 
 _ = verify

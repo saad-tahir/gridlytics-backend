@@ -105,12 +105,40 @@ def _day_type(ts: np.ndarray) -> np.ndarray:
     return (dow == 6).astype(int)  # 1 = Sunday (off day)
 
 
+#: the drop rule's outage runs are formed over the known samples of the minute grid (plan Part 5.2): minutes without a grid reading (a lost row, a 5- or
+#: 15-minute source) between two grid-down samples continue the outage up to OUTAGE_GAP_MINUTES apart, and a grid-up blip of at most FLICKER_MINUTES
+#: samples between them does too (the flicker's own minutes are censored with the run: doubtful samples leave the medians)
+OUTAGE_GAP_MINUTES = 15
+FLICKER_MINUTES = 2
+#: the reference load before a grid loss: the median of the last REF_SAMPLES known grid-up samples within REF_MINUTES before the run (at least 2)
+REF_MINUTES = 60
+REF_SAMPLES = 15
+
+
+def _outage_runs(grid: np.ndarray) -> list[tuple[int, int]]:
+    """(first, last) minute index of each outage over the known grid samples, bridging unknown minutes and short grid-up flickers (see above)."""
+    known = ~np.isnan(grid)
+    down_idx = np.where(known & (grid == 0))[0]
+    if not len(down_idx):
+        return []
+    ups = np.cumsum(known & (grid == 1))  # grid-up samples up to and including each minute
+    brk = (np.diff(down_idx) > OUTAGE_GAP_MINUTES) | ((ups[down_idx[1:]] - ups[down_idx[:-1]]) > FLICKER_MINUTES)
+    starts = down_idx[np.concatenate([[True], brk])]
+    ends = down_idx[np.concatenate([brk, [True]])]
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
 def censored_minutes(site: dict, g: dict) -> np.ndarray:
     """Minutes of a minute grid whose measured load is not the site's demand (plan Part 5.2): the source's own censored flag and, while the grid is
     down, unserved load, a battery at its cut-off plus 5 points with the genset not running (an unknown genset counts as not running here, so a doubtful
     sample leaves the medians), or a load that fell more than 40 percent within two minutes of the grid loss and stayed down (only the backed-up
-    circuits were served)."""
-    lo, grid = g["load"], g["grid"]
+    circuits were served).
+
+    The drop rule reads the known samples, not consecutive minutes, so a lost row, a one- or two-minute grid flicker or a 5-minute source does not
+    split an outage: the reference is the median of the last known grid-up samples before the loss (up to 15 within an hour), the drop is tested on the
+    first known samples after it (within two minutes, or within the source's own sample interval when that is longer), and "stayed down" is the median
+    of the outage's grid-down samples. The whole run, from its first to its last grid-down sample, is censored."""
+    lo, grid = np.asarray(g["load"], dtype=float), np.asarray(g["grid"], dtype=float)
     n = len(lo)
     down = grid == 0
     cen = np.asarray(g.get("censored", np.full(n, np.nan))) == 1
@@ -118,20 +146,29 @@ def censored_minutes(site: dict, g: dict) -> np.ndarray:
     bat = (site.get("assets") or {}).get("battery")
     if bat and "soc" in g:
         cen |= down & (np.asarray(g.get("gen_on", np.full(n, np.nan))) != 1) & (g["soc"] <= float(bat.get("soc_min", 0.10)) + 0.05)
-    d = np.concatenate([[0], down.astype(np.int8), [0]])
-    starts = np.where(np.diff(d) == 1)[0]
-    ends = np.where(np.diff(d) == -1)[0]
-    up_known = (grid == 1) & ~np.isnan(lo)
-    for s, e in zip(starts, ends):
-        pre = lo[max(0, s - 15):s][up_known[max(0, s - 15):s]]
-        if len(pre) < 3:
-            continue
+    runs = _outage_runs(grid)
+    if not runs:
+        return cen
+    known_idx = np.where(~np.isnan(grid))[0]
+    up_idx = np.where((grid == 1) & ~np.isnan(lo))[0]  # grid-up samples with a load reading: the reference
+    down_load_idx = np.where(down & ~np.isnan(lo))[0]  # grid-down samples with a load reading: the drop and the body
+    for s, e in runs:
+        hi = int(np.searchsorted(up_idx, s))
+        lo_ = max(int(np.searchsorted(up_idx, s - REF_MINUTES)), hi - REF_SAMPLES)
+        pre = lo[up_idx[lo_:hi]]
+        if len(pre) < 2:
+            continue  # no reference before the loss: the drop cannot be judged
         ref = float(np.median(pre))
-        early, body = lo[s:min(s + 3, e)], lo[s:e]
-        if ref <= 0 or np.all(np.isnan(early)):
+        if ref <= 0:
             continue
-        if np.nanmin(early) < 0.6 * ref and np.nanmedian(body) < 0.6 * ref:
-            cen[s:e] = True
+        p = int(np.searchsorted(known_idx, s)) - 1
+        interval = s - int(known_idx[p]) if p >= 0 else 1  # the source's sample interval at the loss
+        body = down_load_idx[(down_load_idx >= s) & (down_load_idx <= e)]
+        early = body[body <= s + max(2, interval)][:3]
+        if not len(early):
+            continue
+        if float(np.min(lo[early])) < 0.6 * ref and float(np.median(lo[body])) < 0.6 * ref:
+            cen[s:e + 1] = True
     return cen
 
 
