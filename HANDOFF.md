@@ -292,4 +292,5 @@ If you were given only the repositories, ask the owner for these. They are usefu
 
 | Date | What | Commits |
 |---|---|---|
-| 2026-11-07 | Handoff written | — |
+| 2026-11-07 | Handoff written | `eb74527` |
+| 2026-11-07 | Round 4 started on section 8: A.1 (farm carry-over), A.2 (blank grid and genset columns), A.3 (threshold genset repair), A.4 (charge-slot rate), A.5 (time-limited plans made visible), a public-data check of the PV model (PVGIS and NASA POWER fixtures), and the web app wiring of section 8.B. Each group is verified. If you find uncommitted changes in `verify.py`, `optimise.py`, `plans.py`, `delivery.py`, `solar.py`, `forecast.py` or the web app's `src`, they are this round's unfinished work: read `git diff` and finish or discard it against these items | in progress |
