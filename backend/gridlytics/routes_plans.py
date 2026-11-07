@@ -20,12 +20,44 @@ _last_solve: dict[str, float] = {}
 
 @router.get("/api/sites/{site_id}/plan")
 def plan_current(site_id: str):
+    """The plan in force, or `{plan: null, held}` when none is: `held` says why ({reason, until, plan_id}: control paused or released to native until
+    a time, or the latest plan held by its guard), and is null when no plan was made yet (or the last solve failed).
+    A pause or a release to native in force answers `{plan: null, held}` even while the plan of before it is still stored as active: no plan is in force
+    under one (plans.active_at), and the tick stores its plan as held only at the next quarter."""
     site_or_404(site_id)
+    rel = plans.control_release(site_id, now_ts())
+    if rel is not None:
+        held = _held(site_id) or {"reason": rel.get("reason"), "until": rel.get("until"), "plan_id": None}
+        return {"plan": None, "held": held}
     p = plans.current(site_id)
     if p is None:
-        return {"plan": None}
+        return {"plan": None, "held": _held(site_id)}
     p["now_next"] = plans.now_and_next(p)
     return out({"plan": p})
+
+
+def _held(site_id: str) -> dict | None:
+    """Why no plan is in force: plans.held_info where the optimiser provides it, else derived here from the pause or release in force (its reason and
+    end) and the latest plan row (held: its id, and its guard's reason when no pause or release is in force)."""
+    now = now_ts()
+    info = getattr(plans, "held_info", None)
+    if callable(info):
+        try:
+            try:
+                h = info(site_id, now)
+            except TypeError:
+                h = info(site_id)
+            return None if h is None else {"reason": h.get("reason"), "until": h.get("until"), "plan_id": h.get("plan_id")}
+        except Exception:
+            log.exception("plans.held_info failed for site %s; the held answer is derived here", site_id)
+    rel = plans.control_release(site_id, now)
+    last = (plans.history(site_id, 1) or [None])[0]
+    held_id = last["id"] if last and last.get("status") == "held" else None
+    if rel:
+        return {"reason": rel["reason"], "until": rel.get("until"), "plan_id": held_id if held_id and last.get("reason") == rel["reason"] else None}
+    if held_id:
+        return {"reason": last.get("reason") or "held", "until": None, "plan_id": held_id}
+    return None
 
 
 @router.get("/api/sites/{site_id}/plans")

@@ -190,7 +190,7 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
          "p_start": p_start, "dur_steps": dur, "c_imp": vec["c_imp"], "c_exp": vec["c_exp"], "peak": vec["peak"], "in_month": in_month,
          "G_max": G_max, "X_max": X_max, "off_grid": off_grid, "load_mode": int(d.get("outage_load_mode", 0)),
          "voll": float(d.get("voll_rs_per_kwh", 500)), "reserve_threshold": float((d.get("reserve_policy") or {}).get("p_threshold", 0.2)),
-         "icp": vec["icp"]}
+         "icp": vec["icp"], "regime": regime}
     if vec["mdi"] and mtd:
         month_end = int(vec["billing_month_end_step"]) if "billing_month_end_step" in vec else (int(np.argmin(in_month)) if not in_month.all() else steps)
         p["mdi"] = {"rate": vec["mdi"]["rate_rs_per_kw"], "M0": mtd["M0"], "floor": vec["mdi"]["floor_kw"], "n_mdi": vec["mdi"]["interval_steps"],
@@ -198,18 +198,20 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     # overrides as bounds (Part 4.8)
     ovs = sites.overrides(site["id"])
     mask = {k: np.zeros(steps, dtype=bool) for k in ("genset_hold", "charge_block", "reserve", "pause_control", "force_native", "force_charge")}
-    # a manual reserve (hold) and a force-charge target are per-step floors in percent, each inside its own window only
-    floor_pct = np.zeros(steps)
+    # a manual reserve (hold) and a force-charge target are per-step floors in percent, each inside its own window only; they are kept apart since
+    # they bind differently around an outage (optimise.manual_floor_parts)
+    hold_pct, force_pct = np.zeros(steps), np.zeros(steps)
     for o in ovs:
         if o["kind"] not in mask:
             continue
         sel = _override_steps(o, ts)
         mask[o["kind"]] |= sel
         if o["kind"] == "reserve" and o["value"] is not None:
-            floor_pct[sel] = np.maximum(floor_pct[sel], float(o["value"]))
+            hold_pct[sel] = np.maximum(hold_pct[sel], float(o["value"]))
         elif o["kind"] == "force_charge":
             target = float(o["value"]) if o["value"] is not None else 100.0
-            floor_pct[sel] = np.maximum(floor_pct[sel], target)
+            force_pct[sel] = np.maximum(force_pct[sel], target)
+    floor_pct = np.maximum(hold_pct, force_pct)
     # pause and release to native do not shape the solve (the tick holds the plan and the edge gets a release); the rest are operator holds
     p["override_mask"] = mask["genset_hold"] | mask["charge_block"] | mask["reserve"] | mask["force_charge"]
     p["overrides"] = [{"kind": o["kind"], "value": o["value"], "until": o["until_ts"], "author": o["author"]} for o in ovs]
@@ -247,7 +249,10 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                "charge_block": mask["charge_block"]}
         p["battery"] = bat
         if floor_pct.any():
+            # every manual floor (a caller that drops the overrides drops this key), and its two parts
             p["reserve_manual"] = floor_pct / 100.0 * e_nom
+            p["reserve_manual_hold"] = hold_pct / 100.0 * e_nom
+            p["reserve_manual_force"] = force_pct / 100.0 * e_nom
         c_next = float(np.max(vec["c_imp"][-96:])) if not off_grid else p["c_short"]
         lam = p_out.get("lam_day") or 0.0
         r_next = float(np.mean(Lc)) * 2.0 / b_asset["eta_d"] if (lam > 0.5 or off_grid) else 0.0
@@ -393,7 +398,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "overrides": p.get("overrides", []), "genset_state_unknown": bool(p.get("genset", {}) and p["genset"].get("unknown")),
                "status_label": {"optimal": "Solved within tolerance", "feasible": "Solved within the time limit"}.get(res["status"], "Not solved"),
                "solver": {"status": res["status"], "variables": res.get("variables"), "rows": res.get("rows"), "binaries": res.get("binaries"),
-                          "relaxed": res.get("relaxed"), "message": res.get("message")},
+                          "relaxed": res.get("relaxed"), "message": res.get("message"), "shed_rule_resolve": res.get("shed_rule_resolve")},
                "horizon_steps": p["T"], "control_release": release}
     if res["status"] in ("not_solved", "refused"):
         reason = res.get("message", "not solved")
@@ -468,6 +473,28 @@ def current(site_id: str) -> dict | None:
     if last and last["status"] in ("failed", "held") and last["id"] != out["id"]:
         out["latest_attempt"] = dict(last)
     return out
+
+
+def held_info(site_id: str, now: int | None = None) -> dict | None:
+    """Why no plan is in force, for GET /plan's `held` ({reason, until, plan_id}), else None.
+    - A pause or a release to native in force at `now`: its reason (control_paused or released_to_native), its end (`until`, the override's ISO
+      until_ts) and the plan the tick held under it (`plan_id`; None before the first tick of the pause, or when that tick's solve failed). Also
+      `kind`, `author` and `override_id` of the override.
+    - Otherwise, with no plan active, the latest plan when its guard held it: the guard's reason, `until` None and its id. After a pause has ended
+      and before the next tick, this is the pause's held plan under the pause's reason.
+    - Otherwise None: a plan is in force, none was made yet, or the latest solve failed."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    rel = control_release(site_id, now)
+    with store.connect() as con:
+        last = con.execute("SELECT id, status, reason FROM plans WHERE site_id = ? ORDER BY generated_at DESC, rowid DESC LIMIT 1", (site_id,)).fetchone()
+        active = con.execute("SELECT 1 FROM plans WHERE site_id = ? AND status = 'active' LIMIT 1", (site_id,)).fetchone()
+    held = last is not None and last["status"] == "held"
+    if rel:
+        return {"reason": rel["reason"], "until": rel["until"], "plan_id": last["id"] if held and last["reason"] == rel["reason"] else None,
+                "kind": rel["kind"], "author": rel["author"], "override_id": rel["override_id"]}
+    if active is None and held:
+        return {"reason": last["reason"] or "held", "until": None, "plan_id": last["id"]}
+    return None
 
 
 def get(site_id: str, plan_id: str) -> dict | None:

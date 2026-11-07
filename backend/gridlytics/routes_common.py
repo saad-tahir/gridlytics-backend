@@ -1,14 +1,37 @@
-"""Small helpers the feature routes share: the site guard, one-sentence refusals, the money filter and time ranges."""
+"""Small helpers the feature routes share: the site guard, one-sentence refusals, the money filter, time ranges and the site's carried state changed in
+one write transaction."""
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import HTTPException
 
-from . import money, sites
+from . import money, sites, store
 from .schemas import Refusal
 
 PKT = timezone(timedelta(hours=5))
+
+
+def state_change(site_id: str, change) -> tuple[dict, object]:
+    """Reads the site's carried state, applies `change` to it and writes what it changes, in one write transaction on the workspace file (BEGIN
+    IMMEDIATE): `change(state)` answers (the fields to change, or None for none; a result). sites.put_state reads and then writes with no lock, so two
+    requests changing the state at once (an outage event's pending re-solve, a tier sign-off) could each write over the other's; here the read, the
+    comparison and the write are one step. The state as it then stands, and the result."""
+    with store.write_transaction() as con:
+        r = con.execute("SELECT data FROM site_state WHERE site_id = ?", (site_id,)).fetchone()
+        cur = json.loads(r["data"]) if r else {}
+        changes, result = change(dict(cur))
+        if changes:
+            cur.update(changes)
+            con.execute("INSERT INTO site_state (site_id, data, updated) VALUES (?,?,?) ON CONFLICT(site_id) DO UPDATE SET data = excluded.data, "
+                        "updated = excluded.updated", (site_id, json.dumps(cur, default=str), store._now()))
+    return cur, result
+
+
+def put_state(site_id: str, **changes) -> dict:
+    """sites.put_state's change, made in one write transaction (`state_change`); the state as it now stands."""
+    return state_change(site_id, lambda cur: (changes, None))[0]
 
 
 def site_or_404(site_id: str) -> dict:

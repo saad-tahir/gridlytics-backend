@@ -536,7 +536,8 @@ def test_the_companies_list_carries_the_files_figures_and_the_plan(fdb):
     assert not platformdb.company_file(quiet["company"]["id"]).exists()          # the list made no file
     members = _ok(c.get(f"/api/founder/companies/{cid}/members"))["members"]
     assert members == [{"user_id": owner["id"], "email": OWNER["email"], "name": OWNER["name"], "company_role": "owner", "status": "active",
-                        "disabled": False, "gridlytics_role": "admin", "seated": True, "last_seen": members[0]["last_seen"]}] and members[0]["last_seen"]
+                        "disabled": False, "gridlytics_role": "admin", "solarlytics_role": "admin", "seated": True,
+                        "last_seen": members[0]["last_seen"]}] and members[0]["last_seen"]
     assert _ok(c.get(f"/api/founder/companies/{quiet['company']['id']}/members"))["members"][0]["gridlytics_role"] is None
     assert c.get(f"/api/founder/companies/{uuid.uuid4()}/members").status_code == 404
 

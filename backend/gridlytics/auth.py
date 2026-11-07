@@ -39,6 +39,8 @@ PERMISSIONS = {
     "see_fee": {"admin", "analyst"},
     "start_pilot": {"admin"},
     "run_jobs": {"admin", "operator", "analyst"},
+    #: the energy-only report carries no money (plan Part 8.5: the viewer-safe report), so every member may generate it, a viewer included
+    "energy_report": {"admin", "operator", "analyst", "viewer"},
 }
 #: A session of local sign-in (its refresh tokens, platform.py) ends this many hours unused, and however active, this many days after sign-in (review of batch
 #: 1, for the cookie sessions of before)

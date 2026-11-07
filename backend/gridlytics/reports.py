@@ -100,10 +100,11 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     story.append(Spacer(1, 4 * mm))
     tdays = telemetry.days(site_id, p0.isoformat(), p1.isoformat())
     inputs = {"kind": kind, "site": site_id, "period": period}
+    prelim = None
     if kind in ("monthly_savings", "energy_only"):
         summ = verify.summary(site_id, p0.isoformat(), p1.isoformat(), see_fee=False)
         inputs["computed"] = summ.get("computed")
-        prelim = summ["preliminary"] or (p1 >= today)
+        prelim = bool(summ["preliminary"] or (p1 >= today))
         if prelim:
             story.append(Paragraph("<b>Preliminary.</b> Fewer than 28 verified days, the month is not over, or a fuel adjustment of the period is not yet billed.",
                                    styles["Normal"]))
@@ -177,10 +178,30 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     csv_path.write_text(buf_csv.getvalue(), encoding="utf-8", newline="")  # the csv writer ends rows with CRLF already: no blank line between rows
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()[:16]
     with store.connect() as con:
-        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (rid, site_id, kind, period, store._now(), h, str(pdf_path), str(csv_path), "done"))
+        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)", (rid, site_id, kind, period, store._now(), h, str(pdf_path), str(csv_path), "done",
+                                                     None if prelim is None else int(prelim)))
     store.audit(by, f"generated a {kind.replace('_', ' ')} report", site_id, {"period": period})
     return get(rid)
+
+
+def _row_out(r) -> dict:
+    """A report row as the API answers it (never its files' paths). `preliminary` is what the PDF said: true or false for a monthly report, null for the
+    daily operations sheet; a monthly report made before it was kept (schema version 2) reads true when its month was not over when it was made, else
+    null (not known)."""
+    d = {k: v for k, v in dict(r).items() if k not in ("pdf_path", "csv_path")}
+    p = d.get("preliminary")
+    if p is not None:
+        d["preliminary"] = bool(p)
+    elif d.get("kind") in ("monthly_savings", "energy_only"):
+        try:
+            made = datetime.fromisoformat(d["generated_at"]).astimezone(PKT).date()
+            d["preliminary"] = True if _period(d["period"])[1] >= made else None
+        except (KeyError, TypeError, ValueError, IndexError):
+            d["preliminary"] = None
+    else:
+        d["preliminary"] = None
+    return d
 
 
 def listing(site_id: str | None = None) -> list[dict]:
@@ -188,13 +209,13 @@ def listing(site_id: str | None = None) -> list[dict]:
         rows = con.execute("SELECT * FROM reports" + (" WHERE site_id = ?" if site_id else "") + " ORDER BY generated_at DESC LIMIT 200",
                            ((site_id,) if site_id else ())).fetchall()
     names = {s["id"]: s["name"] for s in sites.listing()}
-    return [{k: v for k, v in {**dict(r), "site_name": names.get(r["site_id"], "")}.items() if k not in ("pdf_path", "csv_path")} for r in rows]
+    return [{**_row_out(r), "site_name": names.get(r["site_id"], "")} for r in rows]
 
 
 def get(rid: str) -> dict | None:
     with store.connect() as con:
         r = con.execute("SELECT * FROM reports WHERE id = ?", (rid,)).fetchone()
-    return {k: v for k, v in dict(r).items() if k not in ("pdf_path", "csv_path")} if r else None
+    return _row_out(r) if r else None
 
 
 def file_path(rid: str, which: str) -> Path | None:

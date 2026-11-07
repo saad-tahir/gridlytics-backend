@@ -19,8 +19,8 @@ import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException
 from pydantic import ValidationError
 
-from . import auth, delivery, money, plans, sites, store, telemetry
-from .routes_common import full_or_404, now_ts, out, site_or_404
+from . import auth, delivery, forecast, money, plans, sites, store, telemetry
+from .routes_common import full_or_404, now_ts, out, put_state, site_or_404, state_change
 from .schemas import Refusal
 
 router = APIRouter()
@@ -39,17 +39,22 @@ PAUSE_EVENTS = ("readback_mismatch", "local_override", "template_change")
 PAUSE_REASON = "Edge reported an unknown device state"
 
 #: Event re-solves (plan Part 2.4, OPT-15: an outage event re-solves within a minute). The tick reads the grid state from telemetry, and only the whole
-#: minutes before its own time (forecast.issue, minute_grid), so the re-solve waits (at most RESOLVE_WAIT_S) until the event's minute has ended and the
-#: telemetry from that minute on shows what the event says (`_shown`), and a site re-solves on events at most once every RESOLVE_GAP_S, as the manual
-#: re-solve; a re-solve not yet due stays pending in the site's state and the next telemetry batch runs it. It runs after the answer is sent, and a
-#: failed tick is logged, never answered to the edge.
+#: minutes before its own time (forecast.issue, minute_grid), so the re-solve waits until the event's minute has ended and the telemetry from that minute
+#: on shows what the event says (`_shown`), and a site re-solves on events at most once every RESOLVE_GAP_S, as the manual re-solve; a re-solve not yet
+#: due stays pending in the site's state and the next telemetry batch runs it. Only a telemetry batch, once stored, runs it without `_shown`, after
+#: RESOLVE_WAIT_S from the event that decides it (`since` restarts when a newer event changes what telemetry must show) and only once the stored
+#: telemetry holds a reading from a minute after the event's (`_caught_up`: a backlog sent oldest first after a stall does not run it on its chunks
+#: from before the event), so a re-solve never runs on telemetry older than its event. The pending re-solve is read, merged and cleared in one write
+#: transaction on the site's state (`_state_change`):
+#: a batch clears only the pending re-solve it ran, never one an event stored meanwhile. It runs after the answer is sent, and a failed tick is
+#: logged, never answered to the edge.
 RESOLVE_EVENTS = ("outage_start", "outage_end")
 RESOLVE_GAP_S = 30
 RESOLVE_WAIT_S = 120
 RESOLVE_STALE_S = 900
 #: A tick takes the grid as down now when the last minute with a grid reading before it reads 0 and is at most this many minutes before the last whole
-#: minute (forecast.outage's observed state: the newest batch may still be in flight)
-OBSERVED_LAG_MIN = 2
+#: minute (forecast.outage's observed state: the newest batch may still be in flight); forecast's own constant where it names one
+OBSERVED_LAG_MIN = int(getattr(forecast, "OBSERVED_LAG_MIN", 2))
 #: How far back `_shown` reads: a re-solve is pending for at most RESOLVE_STALE_S, and only the newest grid reading decides
 SHOWN_WINDOW_S = 3600
 _last_event_solve: dict[str, float] = {}
@@ -87,9 +92,29 @@ def _seq_check(site_id: str, stream: str, seq: int) -> bool:
     return seq > _seq_last(site_id, stream)
 
 
+def _state_change(site_id: str, change) -> tuple[dict, object]:
+    """routes_common.state_change: the site's carried state read, changed and written in one write transaction (sites.put_state takes no lock)."""
+    return state_change(site_id, change)
+
+
+def _put_state(site_id: str, **changes) -> dict:
+    """sites.put_state's change, made in one write transaction (`state_change`); the state as it now stands."""
+    return put_state(site_id, **changes)
+
+
+def _clear_pending(site_id: str, pend: dict) -> tuple[dict, bool]:
+    """Clears the site's pending re-solve only when the stored one is still `pend` (read, compared and cleared in one transaction): an event stored
+    meanwhile replaced it, and that newer re-solve stays pending. The state as it now stands, and whether it was cleared."""
+    def change(cur):
+        if cur.get("resolve_pending") == pend:
+            return {"resolve_pending": None}, True
+        return None, False
+    return _state_change(site_id, change)
+
+
 def _seen(site_id: str) -> dict:
     """Records that the edge was heard from now; the site's carried state, as it now stands."""
-    return sites.put_state(site_id, edge_last_seen=now_ts())
+    return _put_state(site_id, edge_last_seen=now_ts())
 
 
 def _row_time(v) -> float | None:
@@ -153,12 +178,10 @@ def _shown(site_id: str, pend: dict, now: int) -> bool:
     minute must have ended; and the last minute with a grid reading, from the event's minute on, must read the grid down after outage_start (recent
     enough for the tick to take it as the state now) or present after outage_end. A row that still reads the grid present in the minute it was lost (lost
     50 seconds in, the minute's reading taken before) does not show the outage: the next minute's row does."""
-    minute = int(pend.get("minute", 0))
-    cut = now // 60 * 60
-    if cut <= minute:
+    got = _readings(site_id, pend, now)
+    if got is None:
         return False                                  # the event's minute has not ended: a tick now would not read it
-    grid = telemetry.minute_grid(site_id, max(minute, cut - SHOWN_WINDOW_S), cut)["grid"]
-    known = np.flatnonzero(~np.isnan(grid))
+    grid, known, _ = got
     if not len(known):
         return False
     down = float(grid[known[-1]]) == 0.0
@@ -167,27 +190,70 @@ def _shown(site_id: str, pend: dict, now: int) -> bool:
     return not down
 
 
-def _resolve_pending(site_id: str, state: dict | None, background: BackgroundTasks, active: bool = True) -> str | None:
+def _readings(site_id: str, pend: dict, now: int) -> tuple[np.ndarray, np.ndarray, bool] | None:
+    """The minute grid a tick at `now` reads from the pending event's minute on (at most SHOWN_WINDOW_S of it), the indexes of its minutes with a grid
+    reading, and whether the first of those minutes comes after the event's own minute; None while the event's minute has not ended."""
+    minute = int(pend.get("minute", 0))
+    cut = now // 60 * 60
+    if cut <= minute:
+        return None
+    start = max(minute, cut - SHOWN_WINDOW_S)
+    grid = telemetry.minute_grid(site_id, start, cut)["grid"]
+    return grid, np.flatnonzero(~np.isnan(grid)), start > minute
+
+
+def _caught_up(site_id: str, pend: dict, now: int) -> bool:
+    """True when the stored telemetry a tick at `now` reads holds a grid reading from a minute after the event's own minute: telemetry has reached past
+    the event (a reading in the event's minute may have been taken before it). Only then does the RESOLVE_WAIT_S fallback run a re-solve that telemetry
+    does not show: a backlog chunk that ends before the event, stored after a stall, never runs it."""
+    got = _readings(site_id, pend, now)
+    if got is None:
+        return False
+    _, known, after = got
+    return bool(len(known)) and (after or int(known[-1]) >= 1)
+
+
+def _resolve_pending(site_id: str, state: dict | None, background: BackgroundTasks, active: bool = True, wait_over: bool = False) -> str | None:
     """Runs the site's pending event re-solve when it is due: 'scheduled' (it runs once the answer is sent), 'waiting_for_telemetry' (the telemetry a
-    tick reads does not show the event yet, for up to RESOLVE_WAIT_S: see `_shown`), 'rate_limited' (the site re-solved on an event less than
-    RESOLVE_GAP_S ago), or None. A pending re-solve is dropped when the site is no longer active (the scheduler does not tick it either) or once
-    RESOLVE_STALE_S have passed (a scheduled tick has re-solved since)."""
-    pend = (state or {}).get("resolve_pending")
-    if not isinstance(pend, dict):
-        return None
-    now = now_ts()
-    if not active or now - int(pend.get("since", now)) > RESOLVE_STALE_S:
-        sites.put_state(site_id, resolve_pending=None)
-        return None
-    if now - int(pend.get("since", now)) < RESOLVE_WAIT_S and not _shown(site_id, pend, now):
-        return "waiting_for_telemetry"
-    with _solve_lock:
-        if time.monotonic() - _last_event_solve.get(site_id, -1e9) < RESOLVE_GAP_S:
-            return "rate_limited"
-        _last_event_solve[site_id] = time.monotonic()
-    sites.put_state(site_id, resolve_pending=None)
-    background.add_task(_event_resolve, site_id)
-    return "scheduled"
+    tick reads does not show the event yet: see `_shown`), 'rate_limited' (the site re-solved on an event less than RESOLVE_GAP_S ago), or None.
+    `wait_over` (a telemetry batch, once stored) also runs it when RESOLVE_WAIT_S have passed since its event without telemetry showing it, once the
+    stored telemetry reaches past the event's minute (`_caught_up`: a backlog chunk older than the event does not); an events batch never does, so a
+    re-solve never runs on telemetry older than the event that decides it. A pending re-solve is dropped when the site is no
+    longer active (the scheduler does not tick it either) or once RESOLVE_STALE_S have passed (a scheduled tick has re-solved since). It is cleared
+    only while the stored one is still the one decided on here (`_clear_pending`); one an event replaced meanwhile is decided on in its turn."""
+    for _ in range(3):
+        pend = (state or {}).get("resolve_pending")
+        if not isinstance(pend, dict):
+            return None
+        now = now_ts()
+        since = int(pend.get("since", now))
+        if not active or now - since > RESOLVE_STALE_S:
+            state, cleared = _clear_pending(site_id, pend)
+            if cleared:
+                return None
+            continue                                  # a newer event replaced it: decide on that one
+        if not _shown(site_id, pend, now) and not (wait_over and now - since >= RESOLVE_WAIT_S and _caught_up(site_id, pend, now)):
+            return "waiting_for_telemetry"
+        with _solve_lock:
+            before = _last_event_solve.get(site_id)
+            if before is not None and time.monotonic() - before < RESOLVE_GAP_S:
+                return "rate_limited"
+            stamp = _last_event_solve[site_id] = time.monotonic()
+        cleared = False
+        try:
+            state, cleared = _clear_pending(site_id, pend)
+        finally:
+            if not cleared:                           # nothing runs: the gap is not taken
+                with _solve_lock:
+                    if _last_event_solve.get(site_id) == stamp:
+                        if before is None:
+                            _last_event_solve.pop(site_id, None)
+                        else:
+                            _last_event_solve[site_id] = before
+        if cleared:
+            background.add_task(_event_resolve, site_id)
+            return "scheduled"
+    return "waiting_for_telemetry"
 
 
 @router.post("/api/edge/{site_id}/telemetry")
@@ -195,7 +261,7 @@ def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(.
     _key_only()
     site = site_or_404(site_id)
     msg = _check(delivery.TelemetryBatch, inp)
-    state = _seen(site_id)
+    _seen(site_id)
     # the batch is checked before its sequence is looked at, and the sequence is recorded only after the rows are written: a refused or failed batch is
     # answered as such every time it is sent, never acknowledged later as a duplicate (the minute table is idempotent by site and minute, so a batch
     # written twice by two concurrent sends stores the same rows)
@@ -214,9 +280,10 @@ def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(.
     res = telemetry.ingest(site_id, records, "edge")
     telemetry.next_seq(site_id, "telemetry", msg.seq)
     answer = {"ack": msg.seq, **res}
-    # an outage event waiting for this batch (the minute that shows the grid lost or back) re-solves now; the batch is stored either way
+    # an outage event waiting for this batch (the minute that shows the grid lost or back) re-solves now; the batch is stored either way. The pending
+    # re-solve is read now, after the batch is stored, not from the state at the request's start: an event stored meanwhile is the one that decides
     try:
-        resolve = _resolve_pending(site_id, state, background, site.get("status") == "active")
+        resolve = _resolve_pending(site_id, sites.state(site_id), background, site.get("status") == "active", wait_over=True)
     except Exception:
         log.exception("could not start the event re-solve for site %s", site_id)
         resolve = "failed"
@@ -230,7 +297,7 @@ def edge_heartbeat(site_id: str, inp: dict = Body(...)):
     _key_only()
     site_or_404(site_id)
     msg = _check(delivery.Heartbeat, inp)
-    sites.put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump())
+    _put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump())
     warn = None
     if abs(msg.clock_offset_s) >= 900:
         warn = "clock_offset_900s: control demoted until the clock is set"
@@ -256,7 +323,7 @@ def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Body(...)
     _key_only()
     site = site_or_404(site_id)
     msg = _check(delivery.EventBatch, inp)
-    state = _seen(site_id)
+    _seen(site_id)
     floor = _seq_last(site_id, "events")      # the sequence the telemetry file recorded before the claim moved into the workspace file
     claim = f"edge_seq:{site_id}:events"
     with store.write_transaction() as con:
@@ -277,23 +344,32 @@ def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Body(...)
     resolve = None
     outs = [e for e in msg.events if e.type in RESOLVE_EVENTS]
     if outs and site.get("status") == "active":
-        now = now_ts()
-        held = (state or {}).get("resolve_pending") if isinstance((state or {}).get("resolve_pending"), dict) else {}
-        if held and now - int(held.get("since", now)) > RESOLVE_STALE_S:
-            held = {}                                 # a leftover (the edge's telemetry stopped): this event starts a fresh re-solve, not a stale one
-        # the newest event decides what telemetry must show (an outage that started and ended reads the grid present); a tie goes to the later one sent
         cands = [(_event_minute(e), n, e.type) for n, e in enumerate(outs)]
-        if held:
-            cands.append((int(held.get("minute", 0)), -1, held.get("event")))
-        minute, _, event = max(cands)
-        pend = {"minute": minute, "event": event, "since": min(int(held.get("since", now)), now)}
-        state = sites.put_state(site_id, resolve_pending=pend)
+        # the events are stored and acknowledged already: a failure to merge or start the re-solve is logged and answered as 'failed', never a 500 the
+        # edge would retry (its retry is acknowledged as a duplicate, and the re-solve would be lost without a word)
         try:
+            state, _ = _state_change(site_id, lambda cur: ({"resolve_pending": _merge_pending(cur.get("resolve_pending"), cands, now_ts())}, None))
             resolve = _resolve_pending(site_id, state, background)
         except Exception:
             log.exception("could not start the event re-solve for site %s", site_id)
             resolve = "failed"
     return {"ack": msg.seq, "stored": len(msg.events), "resolve": resolve}
+
+
+def _merge_pending(held, cands: list[tuple[int, int, str]], now: int) -> dict:
+    """The pending re-solve after an events batch, from the one held (read in the same write transaction) and the batch's outage events as (minute,
+    order, type). The newest event decides what telemetry must show (an outage that started and ended reads the grid present); a tie goes to the later
+    one sent, and the held one loses a tie. `since` (from which RESOLVE_WAIT_S counts) is kept while the deciding minute and event are the held ones,
+    and restarts when a newer event changes what telemetry must show: a re-solve held while telemetry stalled is not run at once on the next event, before any telemetry
+    shows it. A held one older than RESOLVE_STALE_S is a leftover (the edge's telemetry stopped): the batch starts a fresh re-solve."""
+    held = held if isinstance(held, dict) else {}
+    if held and now - int(held.get("since", now)) > RESOLVE_STALE_S:
+        held = {}
+    if held:
+        cands = [*cands, (int(held.get("minute", 0)), -1, held.get("event"))]
+    minute, _, event = max(cands)
+    same = bool(held) and (minute, event) == (int(held.get("minute", 0)), held.get("event"))
+    return {"minute": minute, "event": event, "since": min(int(held.get("since", now)), now) if same else now}
 
 
 @router.post("/api/edge/{site_id}/ack")

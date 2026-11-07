@@ -2,6 +2,141 @@
 
 Newest first. Each entry says what was decided, why, and where the plan (`EMS_BUILD_PLAN.md`) says otherwise.
 
+## 2026-11-07 Review fixes, round 3, and the web app's backend asks
+
+### Optimiser
+
+- **Hold against force_charge around an outage:** a Hold (reserve) binds only on grid-up window steps before the window's first outage step. A
+  force_charge binds on every grid-up step of its window, including after the grid returns, so one set during an outage charges once the grid is back.
+  Off-grid, both bind on every window step. The shed sum for both starts at the window's first step, so load shed in an outage inside the window counts
+  against the rows that follow. Without that, rows after the outage, priced at VoLL per step, made the plan shed the outage's critical load to keep the
+  battery full.
+- **Off-grid soc_threshold sites:** the first solve has no shed rule, for solve time. A time-limited plan that sheds with the set off, the tank not
+  empty and fuel left at the horizon's end is solved once more with a shed rule, and the summary says so (`solver.shed_rule_resolve`).
+- **Known limit, accepted for v1:** a 10 s plan whose time-limited incumbent burns the whole tank (300 to 310 L of the 400 L farm) can still shed with
+  the set off while fuel remains. Solved to optimality, those plans shed nothing, but that takes 75 to 90 s. Off-grid soc_threshold control is not the
+  default and no demo site uses it. A tick there can take up to three solver limits (about 30 s): a first solve, the relaxed retry and the shed-rule
+  re-solve. Repairing this by replaying the threshold controller over the plan is a later item.
+- **Legacy net metering at ICP sites:** the ICP uncertain-case rows count net import (G - X), as the bill nets exports per period.
+
+### Telemetry, sites and forecasts
+
+- Forecast stage rules count minutes of data, not 1-minute rows: samples times the source's median interval (at most 15 minutes). This applies to load,
+  PV and outage.
+- `SiteFields` carries `load_peak_kw`, `off_grid` and `data_source`. A demo site's stored `twin` is kept unchanged on update and cannot be changed
+  through the API. The server, not the client, records who confirmed the grid signal and when.
+- Imports carry `from_ts`, `to_ts` and `file_name`. The columns are added by `telemetry._imports_columns` outside the schema version, so only columns are
+  added and no rows change.
+- A new telemetry file is set up under a process lock, and the WAL switch is retried on locked or busy.
+- `sites.put_state` reads and writes in one write transaction, as `routes_common.state_change` does, so a tick, an outage event and a tier sign-off never
+  write over each other's fields.
+
+### API
+
+- **OPT-15 re-solve:** the pending re-solve is read, merged and cleared in one transaction. The wait fallback runs only for a stored telemetry batch
+  that has a reading from a minute after the event's minute. `since` restarts when the deciding event changes.
+- **GET /plan** answers `{plan: null, held: {reason, until, plan_id}}` as soon as a pause or release is in force, before the next tick.
+- **Drafts** are owned by the member's id. A draft id another member holds answers 409 `draft_taken`.
+- **Connections:** a save is idempotent on the client's key, or else on regime, tariff category and meter reference. The last connection of an active,
+  grid-connected site cannot be removed (409).
+- **Alerts:** Control and Savings alerts (plan 9.3), `plan_failed` included, wait for an active plan and 7 days of telemetry.
+- **Reports:** `preliminary` is stored when a report is made (workspace schema version 2, with a backup before the migration). The energy-only report
+  has its own permission, held by all four roles.
+- The tier sign-off is kept in `site_state.tier_signoff`, with the audit line as the fallback for earlier changes.
+- The savings answer names its litres' source (`energy.litres_source`: meter, curve or null) for ranges up to about two months.
+
+### Savings: blank columns
+
+- **Unresolved minutes** are only those whose balance cannot be closed: load unread, genset unknown, or no state of charge on either side. A battery
+  flow taken from two states of charge more than 30 minutes apart is rebuilt on the balance for every arm, but those minutes count toward the 5 %
+  unresolved cap, so a long gap is withheld rather than smeared.
+- **Blank battery power:** the actual arm's flow comes from the balance (metered grid with known load and genset), else from the change in state of
+  charge left over. That change may span any number of masked minutes but at most 30 others. Where the flow stays unknown, no arm's masked charge is
+  priced and the day claims nothing (`claim_withheld: battery_flow_unknown`). Withholding only the wear lever would credit the baseline's whole wear on
+  a day the actual arm cycled more.
+- **Known limit:** with the grid and genset columns blank for up to 5 % of a day (the genset unknown), the masked minutes price no arm's load. On a site
+  whose baseline discharges in that gap while the actual holds, the day can still over-claim (a reproduced case: +3,839 against a metered +560). It
+  needs both columns blank at once, and it predates round 3. A tighter cap or symmetric discharge pricing on masked minutes is a later item.
+
+### Demo
+
+- The twin writes only minutes before the clock's current minute. The next advance deletes twin minutes left at or after the clock.
+
+## 2026-11-07 Review fixes, rounds 1 and 2
+
+An adversarial review of v1 confirmed 69 findings, 13 of them high (`.scratch/review/*.json`). Rounds 1 (`507a4db`) and 2 (`32eafe5`) fixed them in
+file-disjoint groups, each change checked by a separate verifier. The rules those rounds settle:
+
+### Optimiser and plan
+
+- **Manual floor (Hold, force_charge):** at a grid-connected site a Hold binds only on grid-up window steps before the window's first outage step. The
+  reserve is used in that outage and is not refilled inside the window. At an off-grid site it binds on every window step. Shed load never counts
+  towards keeping a floor.
+- **grid_charge_allowed = False:** the battery charges only from the forecast PV beyond the load on grid-up steps (plus the genset where
+  `gen_charge_allowed`). Plan steps carry `grid_charge_permitted`, so delivery never compiles grid charging there. The compiler has no charge-from-genset
+  mode: genset charging with the grid up compiles as `charge_pv_only`, which is the safe direction.
+- **soc_threshold genset control:** the controller's starts are treated like AMF panel starts. They are exempt from the run-hour cap and from min up/down,
+  and happen in an outage only at or under the threshold. The fuel cap stays physical, and threshold rows lapse where the set cannot run. In grid
+  outages a per-step shed rule stops shedding being used to dodge a start. Off-grid sites have no such rows, to keep solve time down (they tripled the
+  farm solve time). Fuel burnt before step t is a running-sum variable.
+- **Pause and release to native:** while either is in force, no plan is in force, even when the solve fails. A tick stores its plan as `held` (reason
+  `control_paused` or `released_to_native`), the previous plan is superseded, and the edge gets a signed `release` message with no slots. `active_at`
+  answers None for any instant inside a pause.
+- **Observed grid state:** a tick reads it up to its actual time. A same-quarter re-solve never replaces an issue that observed an outage with a blind
+  one, unless telemetry shows the grid back.
+- **Billing month:** connections carry an optional `reading_day` (1-31; null means the calendar month). The month-to-date counters, M0, rest of month,
+  `in_month` and the MDI month end follow the bill's period. Legacy net metering passes its per-period exports. Its export is priced 0.01 Rs/kWh below
+  the import it nets, so equal prices cannot give circulating flows (the ledger adds the 0.01 back).
+- **Signed messages** carry no money in the signed, stored or served body. A `plan_messages` row is written only by the edge's key-only pull.
+
+### Tariffs and bills
+
+- Adders that list their billing months ignore `effective_to`. A correction with the same start supersedes the old version. Tariff and fuel starts must
+  be canonical `YYYY-MM-DD`.
+- Bills can be entered with the printed reading dates (`previous_reading_date`) and are stored as the first day billed (`rebuild(...,
+  period_start_exclusive=True)`).
+- ICP sites: the ledger and the prices page price from the billing month's scaled period totals, not a 1e9 placeholder.
+
+### Telemetry and forecasts
+
+- **Untrusted input (plan Part 2.8):** times must lie between 2015-01-01 and a day after now. `ingest` skips and counts rows outside that range
+  (`out_of_range`). The edge route refuses such a batch with 422 so the stream never stalls. A numeric cell above `CELL_MAX` (1e9) or a non-finite value
+  is stored as missing and counted. A CSV upload refuses repeated header names, any out-of-range time and a span over 400 days, stores nothing on a
+  refusal, and aggregates only the days that received rows. CSV exports quote text cells that start with `=`, `+`, `-` or `@`.
+- **Missing columns:** where a minute has neither energy column, import and export come from `grid_power_w`. `g["soc"]` falls back to the BMS reading,
+  while `g["soc_est"]` keeps the estimate alone. Battery trust compares the estimate with the BMS only where both were measured.
+- **Load censoring (plan 5.2):** outages are read over known samples. A gap of up to 15 minutes, or a grid-up blip of at most 2 samples, does not end
+  an outage. The reference is the median of the last 15 or fewer known grid-up samples within 60 minutes. The 40 % drop is tested on the first known
+  samples after the loss, and the whole outage is censored.
+- A stored non-finite day row is healed on read. Where its minutes are gone, it becomes null, never zero.
+- `forecast_scores` has one `baseline_value` column, so the climatology Brier is returned but not stored.
+
+### Savings
+
+- **Advisory confirmation needs evidence:** without battery power, or with no scorable test and a table that cannot be told apart from native, the day
+  stays `pending` and claims nothing. `not_applied` (closer to native, with a 2 % of battery margin) is decided before `confirmed`. This is a
+  simplified form of Part 7.6.
+- **Import completeness:** blank grid minutes in the actual arm are rebuilt from the balance. Where that is impossible, the minute is priced on neither
+  arm. A day whose metered import share is under 0.5, or with more than 5 % unresolved, is withheld from the claim, the verified days, the MDI months and
+  the switchback regression.
+- **Unmetered genset fuel** is unknown (`genset_unknown`, litres null), never zero.
+- **Native replay:** `backup` mode fills the battery from PV to soc_max, and `backup_soc_pct` is only the grid-charge level. `feed_in_first` is modelled
+  too. CSV and BMS-only sites start their replays from the measured state of charge, not 50 %.
+- "Preliminary" waits for the switchback weeks and the FCA, so every demo site shows it today.
+
+### API and security
+
+- `/api/edge/*` and the signed plan message take a site API key only. A person's session gets 403 `key_required`. A key holds no role permission and
+  never gets money fields, whatever role it was made with.
+- **Edge events are stored once:** the sequence claim and the events are written in one company-file transaction.
+- **OPT-15:** an outage event re-solves an active site once telemetry shows the event's minute, or after 120 s. It runs at most once per 30 s, and a
+  pending re-solve is dropped after 15 minutes. Resume re-solves at once.
+- **Money settings:** changing voll, the battery's replacement cost or warranty, or the genset's start, run-hour and O&M costs needs
+  `edit_money_settings`. So does deleting a battery or genset whose money settings an administrator changed.
+- **Genset requests:** one run holds one pending request. A start that moves at least a step earlier withdraws the request ("Moved earlier to HH:MM")
+  and asks again. While no plan is in force, every open request is withdrawn.
+- The CSV upload parses on a worker thread, so the event loop stays free.
+
 ## 2026-11-06 v1 build: what was built and where it differs from the plan
 
 ### The lift (Part 10.4)

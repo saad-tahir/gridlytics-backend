@@ -11,6 +11,8 @@ import io
 import json
 import math
 import sqlite3
+import threading
+import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
@@ -48,19 +50,51 @@ _DDL = [
 ]
 
 
+#: a new file's first set-up (WAL and the tables) runs under this process lock, as store._connect does: two first opens at once would otherwise race on
+#: 'PRAGMA journal_mode = WAL', which SQLite answers 'database is locked' without waiting on the busy timeout
+_open_lock = threading.Lock()
+#: the WAL switch is retried for up to this long when another process holds the new file (SQLITE_BUSY is not waited on for a journal-mode change)
+_WAL_RETRY_S = 10.0
+
+
+def _set_wal(con: sqlite3.Connection) -> None:
+    deadline = time.monotonic() + _WAL_RETRY_S
+    while True:
+        try:
+            con.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) and "busy" not in str(exc):
+                raise
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+
+
 def _open() -> sqlite3.Connection:
     path = store.telemetry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path, timeout=30, isolation_level=None)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA busy_timeout = 30000")
-    if con.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
-        con.execute("PRAGMA journal_mode = WAL")
-        con.execute("BEGIN IMMEDIATE")
-        for ddl in _DDL:
-            con.execute(ddl)
-        con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        con.execute("COMMIT")
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA busy_timeout = 30000")
+        if con.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            with _open_lock:
+                if con.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:  # another thread may have set the file up meanwhile
+                    _set_wal(con)
+                    con.execute("BEGIN IMMEDIATE")
+                    try:
+                        for ddl in _DDL:
+                            con.execute(ddl)
+                        con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                        con.execute("COMMIT")
+                    except BaseException:
+                        if con.in_transaction:
+                            con.execute("ROLLBACK")
+                        raise
+    except BaseException:
+        con.close()
+        raise
     return con
 
 
@@ -189,12 +223,60 @@ def _local_days(stamps) -> list[date]:
     return [epoch + timedelta(days=k) for k in ks]
 
 
-def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None) -> dict:
+#: the columns an imports row gains beyond the workspace schema's: the uploaded range (epoch seconds UTC of the file's first and last row) and the
+#: uploaded file's name, each null when not known (an import from before they were kept, or an upload without a file name)
+IMPORT_EXTRA = (("from_ts", "INTEGER"), ("to_ts", "INTEGER"), ("file_name", "TEXT"))
+FILE_NAME_MAX = 200
+
+
+def _imports_columns(con: sqlite3.Connection) -> None:
+    """Adds IMPORT_EXTRA to the workspace file's imports table where it lacks them: an additive change that keeps every row, checked on each use (a
+    cheap read of the table's columns) so a file restored from an older backup is brought up too."""
+    have = {r[1] for r in con.execute("PRAGMA table_info(imports)").fetchall()}
+    for name, kind in IMPORT_EXTRA:
+        if have and name not in have:
+            try:
+                con.execute(f"ALTER TABLE imports ADD COLUMN {name} {kind}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):  # another connection added it first
+                    raise
+
+
+def _file_name(name) -> str | None:
+    """An uploaded file's name as shown back: its last path part, without control characters, at most FILE_NAME_MAX characters; None when blank."""
+    if name is None:
+        return None
+    text = str(name).replace("\\", "/").rsplit("/", 1)[-1]
+    text = "".join(ch for ch in text if ch.isprintable()).strip()[:FILE_NAME_MAX]
+    return text or None
+
+
+def imports(site_id: str, limit: int = 20) -> list[dict]:
+    """The site's latest CSV imports, newest first, as the telemetry quality page shows them: id, source, rows, gaps, status, log (a list), created, and
+    the uploaded range `from_ts` and `to_ts` (epoch seconds UTC) and `file_name`, each null when not known."""
+    with store.connect() as con:
+        _imports_columns(con)
+        rows = con.execute("SELECT id, source, rows, gaps, status, log, created, from_ts, to_ts, file_name FROM imports WHERE site_id = ? "
+                           "ORDER BY created DESC, rowid DESC LIMIT ?", (site_id, max(1, int(limit)))).fetchall()  # two in one second: the later first
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            log = json.loads(d["log"] or "[]")
+        except (TypeError, ValueError):
+            log = []
+        d["log"] = log if isinstance(log, list) else []  # the page lists it: a stored null or object is shown as no lines
+        out.append(d)
+    return out
+
+
+def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
+               file_name: str | None = None) -> dict:
     """A CSV upload: one row per minute; blanks are missing; duplicates keep the last; gaps over 5 minutes are reported.
 
     The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
     nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
-    rows are aggregated."""
+    rows are aggregated. The imports row keeps the uploaded range (`from_ts`, `to_ts`) and the file's name when given (`file_name`, see _file_name)."""
     if len(content) > 30_000_000:
         raise ValueError("The file is larger than 30 MB; split it by month")
     text = content.decode("utf-8-sig", errors="replace")
@@ -244,14 +326,18 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
                    f"(over a billion), and were stored as missing")
     digest = hashlib.sha256(content).hexdigest()[:16]
     first, last = records[0]["ts"], records[-1]["ts"]
+    name = _file_name(file_name)
     with store.connect() as con:
+        _imports_columns(con)
         iid = store.new_id()
-        con.execute("INSERT INTO imports (id, site_id, source, file_hash, rows, gaps, status, log, created) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (iid, site_id, "csv", digest, res["accepted"], gaps, "done", json.dumps(log), store._now()))
+        con.execute("INSERT INTO imports (id, site_id, source, file_hash, rows, gaps, status, log, created, from_ts, to_ts, file_name) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (iid, site_id, "csv", digest, res["accepted"], gaps, "done", json.dumps(log), store._now(), first, last, name))
     for day in _local_days(r["ts"] for r in records):  # only the days that received rows, not every day between the first and the last
         aggregate_day(site_id, day)
     return {"id": iid, "rows": res["accepted"], "skipped": res["skipped"], "gaps": gaps, "log": log,
-            "from": datetime.fromtimestamp(first, timezone.utc).isoformat(), "to": datetime.fromtimestamp(last, timezone.utc).isoformat()}
+            "from": datetime.fromtimestamp(first, timezone.utc).isoformat(), "to": datetime.fromtimestamp(last, timezone.utc).isoformat(),
+            "from_ts": first, "to_ts": last, "file_name": name}
 
 
 # ------------------------------------------------------------------------------------------------ reading

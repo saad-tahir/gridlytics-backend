@@ -81,7 +81,7 @@ def validate(p: dict) -> str | None:
     return None
 
 
-def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = False) -> dict:
+def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = False, shed_rule: bool = False) -> dict:
     T = p["T"]
     L, Lhi, Lc, PV, PVlo = (np.asarray(p[k], dtype=float) for k in ("L", "Lhi", "Lc", "PV", "PVlo"))
     g = np.asarray(p["g"], dtype=float)
@@ -291,18 +291,26 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             ks = [k for k in range(k0, k1) if g[k] < 0.5]
             return [U[k] for k in ks], [-H / bat["eta_d"]] * len(ks)
 
-        # a manual reserve (or a force-charge target) is a floor with its own slack at VoLL (Part 4.3), only on the steps inside its window. At a
-        # grid-connected site it binds while the grid is up and only before the window's first outage step: the reserve is held for that outage
-        # and is there to be used in it, and refilling it afterwards is never worth lost load or a genset run. At an off-grid site there is no
-        # outage to hold for, so it binds on every step of its window
-        rm_lb = manual_floor(p, T)
-        rm_on = manual_floor_steps(rm_lb, g, off_grid)
+        # a manual reserve (Hold) or a force-charge target is a floor with its own slack at VoLL (Part 4.3), only on the steps inside its window.
+        # At a grid-connected site a Hold binds while the grid is up and only before the window's first outage step: the reserve is held for that
+        # outage and is there to be used in it, and refilling it afterwards is never worth lost load or a genset run. A force-charge target is the
+        # operator asking for a charge, not a reserve for an outage, so it binds on every grid-up step of its window, also once the grid returns
+        # from an outage the window started in. At an off-grid site there is no outage to hold for, so both bind on every step of their window
+        hold_lb, force_lb = manual_floor_parts(p, T)
+        hold_on = manual_floor_steps(hold_lb, g, off_grid)
+        force_on = (force_lb > 0) & ((g > 0.5) | bool(off_grid))
+        rm_on = hold_on | force_on
+        rm_lb = np.maximum(np.where(hold_on, hold_lb, 0.0), np.where(force_on, force_lb, 0.0))
         run0 = None
+        win_on = (hold_lb > 0) | (force_lb > 0)
         for t in range(T):
             if not rm_on[t]:
                 run0 = None
                 continue
-            run0 = t if run0 is None else run0
+            if run0 is None:
+                run0 = t
+                while run0 > 0 and win_on[run0 - 1]:
+                    run0 -= 1
             rm = m.var(f"rm{t}", 1, 0, np.inf, voll)[0]
             rm_floor[t] = min(Emax, float(rm_lb[t]))
             sc, sv = shed_kwh(run0, t + 1)
@@ -315,9 +323,11 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         # In a grid outage shedding cannot dodge them either (`thr_shed`): the battery-inverter sheds only at its cut-off, so on a step k where
         # the set could run and the set is off, load is shed only for what the battery's power cannot carry (`cut`), when the tank is empty
         # (z[k]), or when the battery runs out inside step k. The last is y[k]: it needs the controller's start at k + 1 (w) and shrinks to
-        # nothing as E[k + 1] rises from the cut-off to the threshold, so a shed never lands the battery on the threshold to spare a start. An
-        # off-grid site has no such rows: coupled to the set's binaries on every step of the horizon they slow its solve past the tick's limit,
-        # and with no grid return to reach, a shed there only defers a crossing the next night brings anyway
+        # nothing as E[k + 1] rises from the cut-off to the threshold, so a shed never lands the battery on the threshold to spare a start.
+        # An off-grid site has no such rows in its first solve: coupled to the set's binaries on every step of the horizon they slow the solve of
+        # a tank that runs dry past the tick's limit, and there a shed only moves the shortfall the tank leaves to another hour. A solve that stops
+        # at its limit with a plan that sheds while the tank has fuel left over is solved once more with a lighter rule (`shed_rule`, the
+        # `thr_offgrid_shed` rows: see the end of solve)
         if thr_t:
             th = m.var("thr", len(thr_t), 0, np.inf, voll)
             E_hi = max(Emax, E0)
@@ -329,7 +339,22 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 m.row(cols, vals, lb=E_on, name=f"soc_threshold[{t}]")
                 m.row([E[t], thr_w[t]], [1, E_hi - E_on], ub=E_hi, name=f"thr_forced[{t}]")
             thr_set = set(thr_t)
-            shed_k = [] if off_grid else [k for k in range(T - 1) if k + 1 in thr_set and (k in thr_set or (k == 0 and g[0] < 0.5 and u_ub[0] > 0))]
+            shed_steps = [k for k in range(T - 1) if k + 1 in thr_set and (k in thr_set or (k == 0 and g[0] < 0.5 and u_ub[0] > 0))]
+            shed_k = [] if off_grid else shed_steps
+            if off_grid and shed_rule:
+                # with the set off at k and at k + 1 and fuel in the tank, load is shed only for what the battery's power cannot carry: a battery
+                # that reaches its cut-off is under the threshold, so the controller starts the set (u[k + 1]) unless the tank is empty (z[k]). It
+                # adds no variables; on the farm's full tank (seven start hours, 10 s) every plan shed nothing, at objectives within 3 % of the
+                # first solve's. On a tank that runs dry it slows the solve past the limit, hence only in this re-solve
+                for k in shed_steps:
+                    cut = max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"])
+                    if U_ub[k] <= cut:
+                        continue
+                    cols, vals = [U[k], u[k], u[k + 1]], [1, -(U_ub[k] - cut), -(U_ub[k] - cut)]
+                    if k in thr_z:
+                        cols.append(thr_z[k])
+                        vals.append(-(U_ub[k] - cut))
+                    m.row(cols, vals, ub=cut, name=f"thr_offgrid_shed[{k}]")
             if shed_k:
                 yv = m.var("thr_out", len(shed_k), 0, 1, 0.0)
                 # a guard only: every shed the rule allows is reachable without it, and at ten times VoLL it is never the cheap way round it
@@ -391,6 +416,10 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             m.row(list(G[steps]) + [target], [1.0] * len(steps) + [-n_blk], ub=-elapsed - float(extra[steps].sum()), name=f"mdi_hi[{bid}]")
     # ---------------------------------------------------------------- ICP, the uncertain middle case
     icp = p.get("icp") or {}
+    # legacy net metering nets each period's exports against its imports before the ICP case is decided (tariffs.vectors decides it on the net), so
+    # the rows read net import per step: on gross import, an import above the baseline earned the ICP rate while the export it fed was credited at
+    # the full import price, and the plan circulated energy through the meter both ways at once
+    icp_net = p.get("regime") == "net_metering_legacy"
     for per, info in icp.items():
         if info.get("case") != "uncertain":
             continue
@@ -398,13 +427,17 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         if not len(steps):
             continue
         Q, base = info["q_kwh"], info["baseline_kwh"]
-        Mp = p["G_max"] * len(steps) * H + abs(Q - base) + 1.0
+        Mp = (p["G_max"] + (p["X_max"] if icp_net else 0.0)) * len(steps) * H + abs(Q - base) + 1.0
         coef = info["rate"] - float(c_imp[steps[0]])
         Z = m.var(f"Z_{per}", 1, 0, np.inf, coef)[0]
         b = m.var(f"b_{per}", 1, 0, 1, 0.0, integer=True)[0]
-        m.row([Z] + list(G[steps]), [1] + [-H] * len(steps), lb=Q - base, name=f"icp_lo[{per}]")
+        q_cols, q_vals = list(G[steps]), [-H] * len(steps)
+        if icp_net:
+            q_cols += list(X[steps])
+            q_vals += [H] * len(steps)
+        m.row([Z] + q_cols, [1] + q_vals, lb=Q - base, name=f"icp_lo[{per}]")
         m.row([Z, b], [1, -Mp], ub=0, name=f"icp_b[{per}]")
-        m.row([Z] + list(G[steps]) + [b], [1] + [-H] * len(steps) + [Mp], ub=Q - base + Mp, name=f"icp_hi[{per}]")
+        m.row([Z] + q_cols + [b], [1] + q_vals + [Mp], ub=Q - base + Mp, name=f"icp_hi[{per}]")
     # ---------------------------------------------------------------- solve
     t_start = time.perf_counter()
     res, A = m.solve(time_limit, gap)
@@ -449,6 +482,23 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     out["v_end"] = v_end if bat else 0.0
     out["breakdown"] = _breakdown(p, sol, out)
     out["reasons"] = explain(p, sol, out)
+    if off_grid and thr_t and status == "feasible" and not shed_rule:
+        # An off-grid threshold site's first solve has no shed rule (see the threshold rows). One that stops at its limit can return a plan that
+        # sheds with the set off now and next, the battery above its cut-off and fuel in the tank (at a full farm tank: 51.6 kWh over a night at
+        # 25 %): a plan the site would never run, since its battery-inverter sheds only at its cut-off and the controller then starts the set.
+        # Where such a plan leaves fuel in the tank at the horizon's end, the shed was not rationing a short tank, and the problem is solved once
+        # more with the rule (the tick then takes up to twice its limit); a re-solve that finds no plan leaves the first one
+        dodges = [k for k in shed_steps
+                  if x[U[k]] > max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"]) + 1e-3 and x[u[k]] < 0.5 and x[u[k + 1]] < 0.5
+                  and not (k in thr_z and x[thr_z[k]] > 0.5)]
+        left = float(gen["fuel_available"]) - float(np.sum(x[F]))
+        if dodges and left >= min_burn - 1e-6:
+            again = solve(p, time_limit=time_limit, gap=gap, relaxed=relaxed, shed_rule=True)
+            if again["status"] != "not_solved":
+                again["solve_seconds"] = round(secs + again["solve_seconds"], 3)
+                again["shed_rule_resolve"] = {"shed_steps": len(dodges), "shed_kwh": round(float(np.sum(x[U[dodges]])) * H, 2),
+                                              "first_objective_rs": out["objective_rs"], "first_solve_seconds": out["solve_seconds"]}
+                return again
     return out
 
 
@@ -591,6 +641,25 @@ def manual_floor(p: dict, T: int) -> np.ndarray:
     return np.nan_to_num(out)
 
 
+def manual_floor_parts(p: dict, T: int) -> tuple[np.ndarray, np.ndarray]:
+    """The manual floor split into its Hold part and its force-charge part, in kWh per step. `reserve_manual_hold` and `reserve_manual_force`
+    (build_problem writes both) are read only under `reserve_manual`, so a caller that drops that key drops every manual floor; a problem without
+    the parts treats the whole floor as a Hold."""
+    total = manual_floor(p, T)
+    if p.get("reserve_manual_hold") is None and p.get("reserve_manual_force") is None:
+        return total, np.zeros(T)
+
+    def part(key: str) -> np.ndarray:
+        raw = p.get(key)
+        if raw is None:
+            return np.zeros(T)
+        a = np.asarray(raw, dtype=float)
+        a = np.full(T, float(a)) if a.ndim == 0 else np.pad(a[:T], (0, max(0, T - len(a))))
+        return np.minimum(np.nan_to_num(a), total)
+
+    return part("reserve_manual_hold"), part("reserve_manual_force")
+
+
 def manual_floor_steps(floor: np.ndarray, g: np.ndarray, off_grid: bool = False) -> np.ndarray:
     """The steps on which a manual floor binds (Part 4.3, 4.8): inside its window (a run of steps with a floor) while the grid is up and before the
     window's first outage step, since the reserve is held for that outage and is used in it; at an off-grid site every step of the window."""
@@ -614,7 +683,7 @@ def shorten(p: dict, T: int) -> dict:
     T = min(int(T), int(p["T"]))
     q["T"] = T
     for k in ("L", "Lhi", "Lc", "PV", "PVlo", "g", "c_imp", "c_exp", "p_start", "dur_steps", "peak", "in_month", "ts", "override_mask",
-              "reserve_manual", "reserve_manual_mask"):
+              "reserve_manual", "reserve_manual_mask", "reserve_manual_hold", "reserve_manual_force"):
         if k in q and q[k] is not None and np.ndim(q[k]) > 0:
             q[k] = np.asarray(q[k])[:T]
     if q.get("battery"):

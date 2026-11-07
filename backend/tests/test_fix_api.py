@@ -410,6 +410,8 @@ def test_the_unconfirmed_apply_alert_reads_the_plan_in_force_at_the_peak(world, 
     monkeypatch.setattr(plans, "active_at", lambda site_id, ts: plan_from(int(ts) // 900 * 900))
     monkeypatch.setattr(plans, "peak_mask", lambda conn, ts: (np.asarray(ts) >= day0 + 18 * 3600) & (np.asarray(ts) < day0 + 22 * 3600))
     with world.use():
+        # since round 3 a Control alert waits for a plan and 7 days of data (plan 9.3): the site's data starts 8 days back
+        telemetry.ingest(sid, [{"ts": now // 60 * 60 - 8 * 86400, "grid_present": 1}], "edge")
         alerts.evaluate(sid, now)
         assert [a["rule"] for a in alerts.listing("active", sid)].count("apply_unconfirmed") == 1
         with store.connect() as con:

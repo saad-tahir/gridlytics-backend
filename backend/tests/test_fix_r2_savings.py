@@ -252,11 +252,14 @@ def test_a_blank_grid_meter_still_prices_the_grid_charging_done_under_it(company
     _, _, rows = twin_day(sid, D, float(sp["soc"][-1]), seed=2, policy=pol)
     metered = verify.compute_day(sid, D, with_bound=False)["native"]["claimed_rs"]
     soc = ("battery_soc_est_pct", "battery_soc_bms_pct")
-    for frac, cols in ((0.3, GRID_COLS), (0.1, GRID_COLS + ("battery_power_w",)), (0.3, GRID_COLS + ("battery_power_w",)),
-                       (0.1, GRID_COLS + ("battery_power_w",) + soc)):
+    for frac, cols in ((0.3, GRID_COLS), (0.1, GRID_COLS + ("battery_power_w",)), (0.3, GRID_COLS + ("battery_power_w",))):
         r = _rescore(sid, rows_p, rows, frac, cols)
         assert r["import_unknown"] is False and r["import_unresolved_share"] == 0.0, cols
         assert r["claimed_rs"] == pytest.approx(metered, abs=max(30.0, 0.02 * abs(metered))), (frac, cols)
+    # round 3: with the state of charge blank too, the states either side are 144 minutes apart, too far to spread the flow over (verify.SOC_SPAN_MAX_MIN):
+    # the minutes stay unresolved and the day is withheld rather than claimed on an even smear
+    r = _rescore(sid, rows_p, rows, 0.1, GRID_COLS + ("battery_power_w",) + soc)
+    assert r["import_unknown"] is True and r["claimed_rs"] == 0.0 and r["import_unresolved_share"] == pytest.approx(0.1, abs=0.005)
 
 
 def test_minutes_whose_grid_flow_cannot_be_rebuilt_price_neither_arm_and_too_many_withhold_the_day(company):

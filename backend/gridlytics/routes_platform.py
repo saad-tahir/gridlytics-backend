@@ -6,7 +6,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, HTTPException
 
-from . import apikeys, auth, store
+from . import apikeys, auth, store, store_members
+from . import platform as platformdb
 from .schemas import Refusal
 
 router = APIRouter()
@@ -14,8 +15,15 @@ router = APIRouter()
 
 @router.get("/api/platform/org")
 def org_mine():
+    """Who the company is, the caller's role, and its seats: `seats` (the registry's limit) and `seats_used` (members not switched off, the owner
+    included), both null when the request works in no company of the registry."""
     company = auth.company.get()
-    return {"company": company, "role": (auth.current.get() or {}).get("role")}
+    seats = used = None
+    if company and company.get("id"):
+        row = platformdb.company(company["id"])
+        if row is not None and row.get("seats") is not None:
+            seats, used = int(row["seats"]), store_members.count_members()
+    return {"company": company, "role": (auth.current.get() or {}).get("role"), "seats": seats, "seats_used": used}
 
 
 @router.get("/api/platform/keys")

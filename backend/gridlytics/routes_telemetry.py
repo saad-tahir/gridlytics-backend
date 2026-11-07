@@ -1,7 +1,10 @@
 """Telemetry, outages, battery and genset pages (UI-05, 06, 07, 10, 11), the CSV import and export, and the event log."""
 from __future__ import annotations
 
+import inspect
 import json
+import math
+import re
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -48,11 +51,8 @@ def quality(site_id: str, days: int = 14):
     t = today()
     rows = telemetry.days(site_id, (t - timedelta(days=days)).isoformat(), t.isoformat())
     first = telemetry.first_ts(site_id)
-    with store.connect() as con:
-        imports = [dict(r) for r in con.execute("SELECT id, source, rows, gaps, status, log, created FROM imports WHERE site_id = ? ORDER BY created DESC LIMIT 20",
-                                                 (site_id,)).fetchall()]
-    for i in imports:
-        i["log"] = json.loads(i["log"])
+    # telemetry.imports adds the range and file-name columns to an older workspace file before reading them, and always gives log as a list
+    imports = telemetry.imports(site_id)
     return {"days": [{"day": r["day"], "completeness": r.get("completeness")} for r in rows], "first_data": first, "imports": imports}
 
 
@@ -114,16 +114,38 @@ def _upload_window(content: bytes, tz_offset_h: float) -> None:
         raise ValueError(f"The file spans {(last - first).days} days; upload at most {UPLOAD_MAX_DAYS} days per file")
 
 
-def _import(site_id: str, body: bytes, tz_offset_h: float) -> dict:
+def _takes_file_name() -> bool:
+    try:
+        return "file_name" in inspect.signature(telemetry.import_csv).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _import(site_id: str, body: bytes, tz_offset_h: float, file_name: str | None = None) -> dict:
     _upload_window(body, tz_offset_h)
     try:
+        # the uploaded file's name goes with the import (the quality page's imports rows) where telemetry.import_csv takes it
+        if file_name and _takes_file_name():
+            return telemetry.import_csv(site_id, body, tz_offset_h, file_name=file_name)
         return telemetry.import_csv(site_id, body, tz_offset_h)
     except (OverflowError, OSError) as exc:
         raise ValueError(f"A row's time cannot be read: {exc}") from None
 
 
+#: An uploaded file's name as kept: its last path part, without control characters, at most this long
+FILE_NAME_MAX = 200
+
+
+def _clean_file_name(name) -> str | None:
+    if not isinstance(name, str):
+        return None
+    name = "".join(ch for ch in name.replace("\\", "/").rsplit("/", 1)[-1] if ch.isprintable()).strip()
+    return name[:FILE_NAME_MAX] or None
+
+
 @router.post("/api/sites/{site_id}/telemetry/upload")
-async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0):
+async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0, file_name: str | None = None):
+    """A CSV upload: the file as the request body (its name in `file_name`), or as the file part of a multipart form (its name from the part)."""
     auth.need("upload_data", "Uploading data")
     await run_in_threadpool(site_or_404, site_id)
     body = await request.body()
@@ -131,15 +153,20 @@ async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0):
     if ctype.startswith("multipart/form-data"):
         boundary = ctype.split("boundary=")[-1].strip().strip('"').encode()
         parts = body.split(b"--" + boundary)
-        body = next((p.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n", 1)[0] for p in parts if b"\r\n\r\n" in p and b"filename=" in p.split(b"\r\n\r\n", 1)[0]), b"")
+        part = next((p.split(b"\r\n\r\n", 1) for p in parts if b"\r\n\r\n" in p and b"filename=" in p.split(b"\r\n\r\n", 1)[0]), None)
+        body = part[1].rsplit(b"\r\n", 1)[0] if part else b""
+        if part and not file_name:
+            m = re.search(rb'filename="([^"]*)"', part[0])
+            file_name = m.group(1).decode("utf-8", errors="replace") if m else None
     if not body:
         raise Refusal(422, "Send the CSV file as the request body", "invalid")
+    file_name = _clean_file_name(file_name)
     try:
         # parsed and aggregated on a worker thread, never on the event loop that answers every company's requests
-        res = await run_in_threadpool(_import, site_id, body, tz_offset_h)
+        res = await run_in_threadpool(_import, site_id, body, tz_offset_h, file_name)
     except ValueError as exc:
         raise bad(exc) from None
-    await run_in_threadpool(store.audit, auth.actor(), "uploaded telemetry", site_id, {"rows": res["rows"], "gaps": res["gaps"]})
+    await run_in_threadpool(store.audit, auth.actor(), "uploaded telemetry", site_id, {"rows": res["rows"], "gaps": res["gaps"], "file_name": file_name})
     return res
 
 
@@ -166,6 +193,20 @@ def events(site_id: str, limit: int = 200):
 
 
 # ------------------------------------------------------------------------------------------------ outages (UI-07)
+
+#: How far back the outages page looks for the source's latest grid reading (`signal`)
+SIGNAL_WINDOW_S = 7 * 86400
+
+
+def _grid_signal(site_id: str, now: int) -> dict:
+    """The source's grid signal: the latest grid-present reading of the last SIGNAL_WINDOW_S, {grid_present: bool, last_seen: its ts}, or
+    {grid_present: null, last_seen: null} when the source sent none (the page's blocking notice: a source without a grid signal)."""
+    with telemetry.connect() as con:
+        r = con.execute("SELECT ts, grid_present FROM minute WHERE site_id = ? AND ts >= ? AND grid_present IS NOT NULL ORDER BY ts DESC LIMIT 1",
+                        (site_id, now - SIGNAL_WINDOW_S)).fetchone()
+    if r is None or not isinstance(r["grid_present"], (int, float)) or not math.isfinite(r["grid_present"]):
+        return {"grid_present": None, "last_seen": None}
+    return {"grid_present": bool(r["grid_present"] >= 0.5), "last_seen": int(r["ts"])}
 
 @router.get("/api/sites/{site_id}/outages")
 def outages(site_id: str, days: int = 30):
@@ -203,7 +244,7 @@ def outages(site_id: str, days: int = 30):
             "unserved_kwh": round(sum(o["unserved_kwh"] for o in log), 1), "with_genset": sum(1 for o in log if o["genset_minutes"] > 0),
             "adherence": (fc.get("issue") or {}).get("adherence")}
     off_grid = not s.get("connections") or s["connections"][0]["data"].get("regime") == "off_grid"
-    return {"off_grid": off_grid, "kpis": kpis, "log": list(reversed(log)), "heatmap": {"days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "minutes": heat},
+    return {"off_grid": off_grid, "signal": _grid_signal(site_id, now), "kpis": kpis, "log": list(reversed(log)), "heatmap": {"days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "minutes": heat},
             "schedule": sch, "forecast": fc, "reserve": [{"t": st["t"], "reserve_pct": st["reserve_pct"], "soc_pct": st["soc_pct"], "p_down": st["p_down"]}
                                                         for st in (plan or {}).get("steps", [])], "feeder": s["data"].get("outage_unit")}
 
@@ -311,8 +352,27 @@ def genset_answer(site_id: str, nid: str, inp: dict = Body(...)):
         raise bad(exc) from None
 
 
+@router.get("/api/sites/{site_id}/genset/fuel")
+def fuel_logs(site_id: str, limit: int = 200):
+    """The fuel log, newest first: {id, ts (when it was logged), day, litres, cost_rs (when given; money, so a viewer does not see it), note, by}."""
+    site_or_404(site_id)
+    with store.connect() as con:
+        rows = con.execute("SELECT id, ts, source, detail FROM events WHERE site_id = ? AND type = 'fuel_log' ORDER BY ts DESC, id DESC LIMIT ?",
+                           (site_id, max(1, min(int(limit), 1000)))).fetchall()
+    logs = []
+    for r in rows:
+        try:
+            d = json.loads(r["detail"] or "{}")
+        except ValueError:
+            d = {}
+        logs.append({"id": r["id"], "ts": r["ts"], "day": d.get("day"), "litres": d.get("litres"), "cost_rs": d.get("cost_rs"), "note": d.get("note", ""),
+                     "by": r["source"]})
+    return out({"logs": logs})
+
+
 @router.post("/api/sites/{site_id}/genset/fuel")
 def fuel_log(site_id: str, inp: dict = Body(...)):
+    """Logs fuel put in the genset: litres, the day (today by default), an optional cost_rs (what it cost, as billed) and a note."""
     auth.need("upload_data", "Logging fuel")
     site_or_404(site_id)
     try:
@@ -320,11 +380,19 @@ def fuel_log(site_id: str, inp: dict = Body(...)):
         if not (0 < litres < 100000):
             raise ValueError("Litres must be a positive number")
         day = parse_day(inp.get("day"), today())
+        cost = inp.get("cost_rs")
+        if cost is not None:
+            cost = float(cost)
+            if not (0 <= cost < 1e9) or isinstance(inp.get("cost_rs"), bool):
+                raise ValueError("The cost is a number of rupees from 0")
     except (TypeError, ValueError) as exc:
         raise bad(exc) from None
+    detail = {"day": day.isoformat(), "litres": litres, "note": str(inp.get("note", ""))[:200]}
+    if cost is not None:
+        detail["cost_rs"] = round(cost, 2)
     with store.connect() as con:
         con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
-                    (site_id, store._now(), "fuel_log", auth.actor(), json.dumps({"day": day.isoformat(), "litres": litres, "note": str(inp.get("note", ""))[:200]})))
+                    (site_id, store._now(), "fuel_log", auth.actor(), json.dumps(detail)))
     return {"logged": litres, "day": day.isoformat()}
 
 

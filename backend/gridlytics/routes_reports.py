@@ -1,4 +1,8 @@
-"""Reports (UI-14): generate, list and download; a viewer may generate and read the energy-only report only."""
+"""Reports (UI-14): generate, list and download; a viewer may generate and read the energy-only report only.
+
+Who generates what (auth.PERMISSIONS): the monthly savings report is `export` (it carries money), the energy-only report `energy_report` (every member, a
+viewer included: it carries no money), the daily operations sheet `run_jobs`. Each listed row says whether its figures were `preliminary`.
+"""
 from __future__ import annotations
 
 from fastapi import APIRouter, Body
@@ -9,6 +13,9 @@ from .routes_common import bad, site_or_404, today
 from .schemas import Refusal
 
 router = APIRouter()
+
+#: The permission that generates each kind of report; another kind is refused by reports.generate after `run_jobs`
+REPORT_PERMISSION = {"monthly_savings": "export", "energy_only": "energy_report", "daily_operations": "run_jobs"}
 
 
 @router.get("/api/reports")
@@ -22,7 +29,7 @@ def listing(site_id: str | None = None):
 @router.post("/api/reports")
 def generate(inp: dict = Body(...)):
     kind = str(inp.get("kind", "monthly_savings"))
-    auth.need("run_jobs" if kind != "monthly_savings" else "export", "Generating this report")
+    auth.need(REPORT_PERMISSION.get(kind, "run_jobs"), "Generating this report")
     site_id = str(inp.get("site_id", ""))
     site_or_404(site_id)
     period = str(inp.get("period") or today().strftime("%Y-%m"))

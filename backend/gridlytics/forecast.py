@@ -29,10 +29,23 @@ K_PRIOR = np.array([0.30, 0.45, 0.70, 0.86, 0.95, 1.00, 1.02])
 MONTH_K = {1: .80, 2: .85, 3: .9, 4: .94, 5: .94, 6: .88, 7: .74, 8: .76, 9: .88, 10: .94, 11: .9, 12: .8}
 DISCO_TRIPS = {"QESCO": 1.6, "PESCO": 1.4, "SEPCO": 1.5, "HESCO": 1.2, "TESCO": 1.5, "MEPCO": 0.8, "GEPCO": 0.6, "FESCO": 0.7, "HAZECO": 0.8,
                "LESCO": 0.35, "IESCO": 0.3, "K-Electric": 0.5}
+#: the observed grid state (outage): the last minute with a grid reading may lag the last whole minute by at most this many minutes and still be taken as
+#: the state now (the newest batch may still be in flight); routes_edge's event re-solve waits on the same rule
+OBSERVED_LAG_MIN = 2
 
 
 def align(ts: float) -> int:
     return int(ts) // STEP_S * STEP_S
+
+
+def sample_minutes(known) -> int:
+    """The minutes one sample of a source stands for: the median gap between its known samples on a minute grid (1 for a 1-minute source, 5 for a
+    5-minute one), at most one 15-minute step. The stage rules multiply sample counts by it, so a coarse source reaches them on days of data, not on
+    rows (plan Part 5.2)."""
+    idx = np.flatnonzero(np.asarray(known, dtype=bool))
+    if len(idx) < 2:
+        return 1
+    return int(min(STEP_S // 60, max(1, round(float(np.median(np.diff(idx)))))))
 
 
 def step_times(t0: int, steps: int = STEPS) -> np.ndarray:
@@ -59,13 +72,14 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
     h0 = t0 - 14 * 86400
     g = telemetry.minute_grid(site["id"], h0, t0)
     days_ok, k_days, pr = 0, [], None
-    if g["present"].sum() > 3 * 600:
+    iv = sample_minutes(g["present"])  # sample counts in minutes of data, so a 5- or 15-minute source qualifies as a 1-minute one does
+    if g["present"].sum() * iv > 3 * 600:
         csm = solar.pv_power(g["ts"], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"]))
         pvm = g["pv"]
         for d in range(14):
             sl = slice(d * 1440, (d + 1) * 1440)
             ok = ~np.isnan(pvm[sl]) & (csm[sl] > 0.2 * pv_asset["kw_ac"])
-            if ok.sum() > 240:
+            if ok.sum() * iv > 240:
                 days_ok += 1
                 k_days.append(float(np.sum(pvm[sl][ok]) / max(1e-6, np.sum(csm[sl][ok]))))
     stage = 1 if days_ok >= 3 else 0
@@ -82,11 +96,11 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
         scale = 1.0
     q = {name: np.minimum(cs, cs * scale * kq[i]) for i, name in enumerate(QS)}
     # smart persistence for the first 2 hours: blend the q50 towards the last hour's observed clearness
-    if stage == 1 and g["present"][-60:].sum() > 30:
+    if stage == 1 and g["present"][-60:].sum() * iv > 30:
         last = g["pv"][-60:]
         csl = solar.pv_power(g["ts"][-60:], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"][-60:]))
         ok = ~np.isnan(last) & (csl > 0.1 * pv_asset["kw_ac"])
-        if ok.sum() > 20:
+        if ok.sum() * iv > 20:
             k_now = float(np.clip(np.sum(last[ok]) / np.sum(csl[ok]) / scale, 0.05, 1.1))
             w = np.clip(1 - np.arange(steps) / 8.0, 0, 1)
             q50_0 = q["q50"].copy()  # every quantile keeps its ratio to the unblended median, so the fan moves as one
@@ -178,7 +192,10 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     h0 = t0 - 21 * 86400
     g = telemetry.minute_grid(site["id"], h0, t0)
     lo = np.where(censored_minutes(site, g), np.nan, g["load"])  # censored samples leave the persistence medians and the ratio (plan Part 5.2)
-    have_days = int(np.sum(~np.isnan(lo)) // 1440)
+    # days of uncensored data, not of 1-minute rows: each sample stands for the source's own interval, so a 5- or 15-minute source with daily shedding
+    # reaches stage 1 as a 1-minute one does; a slot with no uncensored history still falls to the template below
+    iv = sample_minutes(~np.isnan(g["load"]))
+    have_days = int(np.sum(~np.isnan(lo)) * iv // 1440)
     hours = ((t + 5 * 3600) % 86400) // 3600
     crit = twin.critical_share(site)[hours]
     if have_days < 3:
@@ -204,7 +221,7 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     qarr = np.maximum(qarr, 0)
     # scale by the last two hours' ratio with a decaying weight
     recent = lo[-120:]
-    if np.sum(~np.isnan(recent)) > 60:
+    if np.sum(~np.isnan(recent)) * iv > 60:
         rt = t0 - 7200 + 60 * np.arange(120)
         ref = []
         for x in rt:
@@ -213,7 +230,7 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
             ref.append(np.median(lo15[m][-7:]) if m.any() else np.nan)
         ref = np.array(ref)
         ok = ~np.isnan(recent) & ~np.isnan(ref) & (ref > 0)
-        if ok.sum() > 30:
+        if ok.sum() * iv > 30:
             ratio = float(np.clip(np.sum(recent[ok]) / np.sum(ref[ok]), 0.6, 1.5))
             w = np.exp(-np.arange(steps) / 8.0)
             qarr = qarr * (1 + (ratio - 1) * w)
@@ -264,12 +281,24 @@ def _window_mask(windows: list, ts: np.ndarray) -> np.ndarray:
     return m
 
 
+def _hold(a: np.ndarray, n: int) -> np.ndarray:
+    """A minute series with each known value carried over at most the next n unknown minutes."""
+    if n <= 0 or not len(a):
+        return a
+    pos = np.arange(len(a))
+    last = np.maximum.accumulate(np.where(~np.isnan(a), pos, -1))
+    fill = np.isnan(a) & (last >= 0) & (pos - last <= n)
+    out = a.copy()
+    out[fill] = a[last[fill]]
+    return out
+
+
 def _adherence(windows: list, grid: np.ndarray, in_win: np.ndarray) -> float:
     """The share of past scheduled windows (in known data) that saw the grid down for at least half of the window, on a Beta(8, 2) prior."""
     known = ~np.isnan(grid)
     down = (grid == 0) & known
     a_hit, a_n = 8.0, 10.0
-    if windows and known.sum() / 1440 >= 1:
+    if windows and known.sum() * sample_minutes(known) / 1440 >= 1:
         wm = in_win & known
         day_idx = (np.arange(len(grid)) // 1440)
         for d in np.unique(day_idx[wm]):
@@ -294,9 +323,11 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     g = telemetry.minute_grid(site["id"], h0, t0)
     grid = g["grid"]
     known = ~np.isnan(grid)
-    days_known = known.sum() / 1440
-    # events in history
-    down = (grid == 0) & known
+    iv = sample_minutes(known)
+    days_known = known.sum() * iv / 1440  # days of grid readings, not of 1-minute rows (the hazard divides by it)
+    # events in history: each reading holds for the source's own interval, so a 5- or 15-minute source's outage is one event of its full length, not
+    # one start per sample
+    down = _hold(grid, iv - 1) == 0
     starts = np.where(down[1:] & ~down[:-1])[0] + 1
     ends = np.where(~down[1:] & down[:-1])[0] + 1
     in_win = _window_mask(windows, g["ts"]) if windows else np.zeros(len(grid), dtype=bool)
@@ -344,14 +375,14 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     dur = np.where(sched_start > p_start_u, dur_s, dur_steps_u).astype(int)
     gvec = np.where(sched_mask & (adherence > 0.9), 0.0, 1.0)
     # an observed outage now: down for its expected remaining duration (to the window's end when inside one). The grid state is read up to the
-    # actual issue time; the last known minute may lag the end by two minutes (a batch still in flight)
+    # actual issue time; the last known minute may lag the end by OBSERVED_LAG_MIN minutes (a batch still in flight)
     obs_grid, obs_ts = grid, g["ts"]
     if now is not None and int(now) // 60 * 60 > t0:
         g_now = telemetry.minute_grid(site["id"], t0, int(now))
         obs_grid, obs_ts = np.concatenate([grid, g_now["grid"]]), np.concatenate([g["ts"], g_now["ts"]])
     obs_known = np.where(~np.isnan(obs_grid))[0]
     observed = None
-    if len(obs_known) and len(obs_grid) - 1 - obs_known[-1] <= 2 and obs_grid[obs_known[-1]] == 0:
+    if len(obs_known) and len(obs_grid) - 1 - obs_known[-1] <= OBSERVED_LAG_MIN and obs_grid[obs_known[-1]] == 0:
         k = int(obs_known[-1])
         while k > 0 and obs_grid[k - 1] == 0:
             k -= 1

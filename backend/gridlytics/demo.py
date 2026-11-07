@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import traceback
 from datetime import date, datetime, timedelta, timezone
 
@@ -18,6 +19,14 @@ from . import alerts, forecast, plans, sites, store, telemetry, twin, verify
 PKT = timezone(timedelta(hours=5))
 DEMO_LINK = "demo"
 OBSERVE_DAYS = 3
+#: the wall clock the twin is held behind (the tests move it)
+_clock = time.time
+
+
+def _clock_minute() -> int:
+    """The current minute's start (UTC epoch seconds): the twin writes only the minutes before it, so no reading is stamped after now."""
+    return int(_clock()) // 60 * 60
+
 
 DEMO_SITES = [
     {"key": "textile",
@@ -181,7 +190,11 @@ def _simulate_span(site: dict, t_from: int, t_to: int, plan: dict | None) -> int
     """Run the twin from t_from to t_to (minute marks) following a plan, write the minutes and aggregate the days touched.
 
     The genset's run so far, the outage's minutes so far and whether the run is a rescue carry over from the previous span (the live demo runs a span
-    every 15 minutes), so a minimum run or an outage does not restart at every tick."""
+    every 15 minutes), so a minimum run or an outage does not restart at every tick. The span ends at the current minute at the latest: a twin reading
+    is never stamped after now."""
+    t_to = min(int(t_to), _clock_minute())
+    if t_to <= t_from:
+        return 0
     last = telemetry.latest(site["id"])
     soc0 = (last["battery_soc_est_pct"] / 100.0) if last and last.get("battery_soc_est_pct") is not None else 0.5
     gen0 = bool(last and last.get("genset_running"))
@@ -220,7 +233,7 @@ def _simulate_span(site: dict, t_from: int, t_to: int, plan: dict | None) -> int
 
 def build_history(site_id: str, days: int, progress=None) -> None:
     site = sites.full(site_id)
-    today = datetime.now(PKT).date()
+    today = datetime.fromtimestamp(_clock_minute(), PKT).date()
     start = today - timedelta(days=days)
     spec = next((s for s in DEMO_SITES if s["site"]["name"] == site["name"]), {})
     if spec.get("switchback"):
@@ -237,7 +250,7 @@ def build_history(site_id: str, days: int, progress=None) -> None:
         if progress:
             progress(i + 1, days)
     # today: the morning plan, the minutes so far, then a full 48-hour plan from now
-    now = int(datetime.now(timezone.utc).timestamp()) // 60 * 60
+    now = _clock_minute()
     t0 = twin.day_start_utc(today)
     r = plans.tick(site_id, at=t0, steps=96, time_limit=5.0)
     _simulate_span(sites.full(site_id), t0, now, plans.get(site_id, r["plan_id"]) if r.get("plan_id") else None)
@@ -310,14 +323,33 @@ def remove(by: str) -> int:
     return len(ids)
 
 
+def _drop_ahead(site_id: str, clock: int) -> int:
+    """Remove a demo site's twin minutes stamped at or after `clock` (the current minute), and the day totals of the local days after the clock's own:
+    they were written under a clock that has since moved back. The clock's day is re-aggregated from the minutes left. Returns the minutes removed."""
+    with telemetry.connect() as con:
+        n = con.execute("DELETE FROM minute WHERE site_id = ? AND ts >= ? AND source_id = 'twin'", (site_id, int(clock))).rowcount
+    if n > 0:
+        today = datetime.fromtimestamp(clock, PKT).date()
+        with store.connect() as con:
+            con.execute("DELETE FROM telemetry_days WHERE site_id = ? AND day_local > ?", (site_id, today.isoformat()))
+        conn = (sites.connections(site_id) or [None])[0]
+        telemetry.aggregate_day(site_id, today, plans.peak_mask(conn, twin.minutes_of(today)) if conn else None)
+        with store.connect() as con:  # the carried genset and outage state belongs to the removed span: rebuilt from the minutes left
+            con.execute("DELETE FROM settings WHERE key = ?", (f"demo_twin:{site_id}",))
+    return max(0, int(n or 0))
+
+
 def advance(site_id: str, now: int | None = None) -> int:
     """Keep a demo site live: run the twin from its last minute to now under the active plan. Minutes a pause or a release to native covers run
     the inverter's native settings (twin.native_policy), even while the pre-pause plan is still the current one (a paused tick that has not run yet
-    or has failed)."""
+    or has failed). The twin never runs past the clock's current minute, whatever `now` says, and readings it stamped after that minute (written
+    while the clock was ahead) are dropped first, so the site's last reading is never in the future."""
     site = sites.full(site_id)
     if site is None or site.get("demo_link") != DEMO_LINK:
         return 0
-    now = int(now or datetime.now(timezone.utc).timestamp()) // 60 * 60
+    clock = _clock_minute()
+    now = min(int(now or clock) // 60 * 60, clock)
+    _drop_ahead(site_id, clock)
     last = telemetry.latest(site_id)
     start = (last["ts"] + 60) if last else now - 3600
     start = max(start, now - 3 * 86400)

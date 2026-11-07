@@ -1,11 +1,13 @@
 """The tariff library (UI-03): versions with sources and status, the rate cards in force, approvals, fuel prices, and the bill engine on demand."""
 from __future__ import annotations
 
+import json
+import re
 from datetime import date
 
 from fastapi import APIRouter, Body
 
-from . import auth, tariff_data, tariffs
+from . import auth, store, tariff_data, tariffs
 from .routes_common import bad, out, parse_day, today
 
 router = APIRouter()
@@ -29,7 +31,8 @@ def tariffs_index(on: str | None = None):
             "adders": [{"key": a["key"], "name": a["name"], "rate": a["rate"], "billing_months": a["billing_months"]} for a in adders],
             "tax": (tariffs.resolve("tax", "national", d) or {}).get("body"), "icp": (tariffs.resolve("icp", "national", d) or {}).get("body"),
             "prosumer": {k: (tariffs.resolve("prosumer", k, d) or {}).get("body") for k in ("net_billing", "net_metering_legacy")},
-            "versions": tariffs.provenance(), "pending": sum(1 for v in tariffs.versions() if v["status"] in ("pending", "awaiting_notification"))}
+            # pending counts the versions an administrator can approve: a placeholder awaiting its notification is not one (approving it is a 422)
+            "versions": tariffs.provenance(), "pending": sum(1 for v in tariffs.versions() if v["status"] == "pending")}
 
 
 @router.get("/api/tariffs/versions")
@@ -64,13 +67,45 @@ def fuel(kind: str | None = None):
     return {"prices": tariffs.fuel_prices(kind)}
 
 
+FUEL_REF_MAX = 200
+FUEL_URL_MAX = 500
+_URL = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+
+
+def _fuel_source(src, by: str) -> dict | None:
+    """A typed fuel price's optional `source: {ref, url}` (the notification or price list it was read from) as the row keeps it: {kind manual, ref (the
+    reference, or the person when none is given), url, by (the person), verified}; None when neither is given. Raises ValueError, in words."""
+    if src is None:
+        return None
+    if not isinstance(src, dict) or set(src) - {"ref", "url"}:
+        raise ValueError("A fuel price's source is {ref, url}: the reference it was read from and its web address")
+    ref, url = src.get("ref"), src.get("url")
+    if ref is not None and (not isinstance(ref, str) or len(ref.strip()) > FUEL_REF_MAX):
+        raise ValueError(f"A fuel price's source reference is text of at most {FUEL_REF_MAX} characters")
+    if url is not None and (not isinstance(url, str) or (url.strip() and (len(url.strip()) > FUEL_URL_MAX or not _URL.fullmatch(url.strip())))):
+        raise ValueError(f"A fuel price's source url is an http or https address of at most {FUEL_URL_MAX} characters")
+    ref, url = (ref or "").strip(), (url or "").strip()
+    if not ref and not url:
+        return None
+    return {"kind": "manual", "ref": ref or by, "url": url or None, "by": by, "verified": "primary"}
+
+
 @router.post("/api/tariffs/fuel")
 def fuel_add(inp: dict = Body(...)):
+    """Sets a fuel price from a day on; an optional `source: {ref, url}` records where it was read (the row's source then carries ref, url and by)."""
     auth.need("edit_money_settings", "Setting a fuel price")
     try:
-        tariffs.add_fuel_price(str(inp.get("kind", "")), str(inp.get("valid_from", "")), float(inp.get("price", 0)), auth.actor())
+        source = _fuel_source(inp.get("source"), auth.actor())
+        kind, valid_from = str(inp.get("kind", "")), str(inp.get("valid_from", ""))
+        tariffs.add_fuel_price(kind, valid_from, float(inp.get("price", 0)), auth.actor())
     except (ValueError, TypeError) as exc:
         raise bad(exc) from None
+    if source is not None:
+        canonical = getattr(tariffs, "_canonical_day", None)
+        day = canonical(valid_from, "A fuel price's start") if callable(canonical) else valid_from[:10]
+        with store.connect() as con:
+            con.execute("UPDATE fuel_prices SET source = ? WHERE kind = ? AND valid_from = ?", (json.dumps(source), kind, day))
+        store.audit(auth.actor(), "recorded a fuel price's source", kind, {"valid_from": day, "ref": source["ref"], "url": source["url"]})
     return {"prices": tariffs.fuel_prices(inp.get("kind"))}
 
 

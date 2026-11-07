@@ -45,6 +45,8 @@ RESOURCES = (("telemetry", re.compile(r"^/api/edge/[^/]+/")), ("plans", re.compi
 PREFIX = "glk_"
 TOKEN = re.compile(r"glk_[A-Za-z0-9_-]{43}")
 NAME_MAX = 80
+#: The role a key records when none is given (for the record only: a key holds no role permission)
+DEFAULT_ROLE = "operator"
 #: Keys one organisation may hold, revoked ones included (a list that is read whole)
 MAX_KEYS = 200
 
@@ -83,7 +85,7 @@ def scope_needed(method: str, path: str) -> str | None:
 
 
 def fields(inp) -> dict:
-    """A new key's fields, checked: a name, a role of auth.ROLES and one or more scopes. Raises ValueError, in words."""
+    """A new key's fields, checked: a name, a role of auth.ROLES (optional: DEFAULT_ROLE) and one or more scopes. Raises ValueError, in words."""
     if not isinstance(inp, dict):
         raise ValueError("The key is sent as a set of named values")
     extra = sorted(set(inp) - {"name", "role", "scopes", "site_id", "kind"})
@@ -98,7 +100,10 @@ def fields(inp) -> dict:
     name = inp.get("name")
     if not isinstance(name, str) or not 1 <= len(name.strip()) <= NAME_MAX:
         raise ValueError(f"Give the key a name of 1 to {NAME_MAX} characters, to know it by")
+    # the role is carried for the record only (acting_user: a key holds no role permission), so it may be left out: a key then records DEFAULT_ROLE
     role = inp.get("role")
+    if role is None or role == "":
+        role = DEFAULT_ROLE
     if not isinstance(role, str) or role not in auth.ROLES:
         raise ValueError("The key acts with the rights of a role: " + ", ".join(auth.ROLES))
     scopes = inp.get("scopes")

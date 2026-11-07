@@ -186,6 +186,8 @@ def test_two_identical_event_batches_sent_at_once_are_stored_once(world, monkeyp
 
     monkeypatch.setattr(store, "audit", slow)
     body = _events(9, [{"ts": "2026-11-06T10:00:00Z", "type": "readback_mismatch", "detail": {"device": "inv"}}])
+    with world.use():
+        telemetry.latest(sid)                                  # the company's telemetry file is made before the threads (two first opens at once)
     answers = []
 
     def send():
@@ -426,13 +428,19 @@ def test_an_outage_event_after_a_stale_leftover_starts_a_fresh_re_solve(world, m
     assert r.status_code == 200 and r.json()["resolve"] == "scheduled" and ticks == [sid], r.text
     with world.use():
         assert sites.state(sid).get("resolve_pending") is None
-        # a held re-solve that is not stale keeps its 'since': the RESOLVE_WAIT_S fallback counts from the first event
+        # a held re-solve that is not stale is merged; since round 3 its 'since' restarts when a newer event changes what telemetry must show (the
+        # RESOLVE_WAIT_S fallback counts from the event that decides), and is kept when the deciding event is the held one
         clock["now"] = minute + 600
         sites.put_state(sid, resolve_pending={"minute": minute + 480, "event": "outage_start", "since": clock["now"] - 30})
     r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_events(2, [{"ts": _iso(minute + 545), "type": "outage_end"}]))
     assert r.json()["resolve"] == "waiting_for_telemetry" and ticks == [sid], r.text
     with world.use():
-        assert sites.state(sid)["resolve_pending"] == {"minute": minute + 540, "event": "outage_end", "since": clock["now"] - 30}
+        assert sites.state(sid)["resolve_pending"] == {"minute": minute + 540, "event": "outage_end", "since": clock["now"]}
+    clock["now"] += 10
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_events(3, [{"ts": _iso(minute + 500), "type": "outage_start"}]))
+    assert r.json()["resolve"] == "waiting_for_telemetry" and ticks == [sid], r.text
+    with world.use():
+        assert sites.state(sid)["resolve_pending"] == {"minute": minute + 540, "event": "outage_end", "since": clock["now"] - 10}
 
 
 def test_a_pending_event_re_solve_is_dropped_when_the_site_is_no_longer_active_or_it_is_stale(world, monkeypatch):

@@ -209,15 +209,66 @@ def _actual_sim(f: dict, g: dict, plant: twin.Plant | None = None) -> dict:
             "unserved": f["unserved"], "soc": np.nan_to_num(_soc(g))}
 
 
+def litres_used(site_id: str, d0: str, d1: str) -> dict:
+    """The genset's litres over the local days d0..d1 (YYYY-MM-DD, both included) as the actual arm reads them (plan 8.3: metered litres where a
+    sensor exists, else the fitted fuel curve), and where they came from: `litres_source` is "meter" when the period has fuel readings and every
+    running minute has one, "curve" when any running minute's litres come from the curve (the figure is then estimated, wholly or in part), and None
+    when there is nothing to name (no genset, no genset signal at all in the period, or neither a fuel reading nor a run)."""
+    out = {"litres": 0.0, "litres_source": None, "litres_metered": 0.0, "litres_curve": 0.0}
+    site = sites.full(site_id)
+    try:
+        t0, t1 = twin.day_start_utc(date.fromisoformat(d0[:10])), twin.day_start_utc(date.fromisoformat(d1[:10])) + 86400
+    except (TypeError, ValueError):
+        return out
+    if site is None or t1 <= t0:
+        return out
+    plant = twin.plant_of(site)
+    has_gen = bool((site.get("assets") or {}).get("genset")) and plant.gen_kw > 0
+    metered = curve = 0.0
+    signal = read = from_curve_any = False
+    for a in range(t0, t1, 31 * 86400):  # a month of minutes at a time
+        b = min(t1, a + 31 * 86400)
+        d = telemetry.raw(site_id, a, b, ("genset_running", "genset_power_w", "genset_fuel_l"))  # the genset's columns alone: cheap
+        flag, p_meas, fuel_meas = d["genset_running"], d["genset_power_w"] / 1000.0, d["genset_fuel_l"]
+        metered += float(np.nansum(fuel_meas))
+        read = read or bool((~np.isnan(fuel_meas)).any())
+        if not has_gen or bool(np.all(np.isnan(flag)) and np.all(np.isnan(p_meas)) and np.all(np.isnan(fuel_meas))):
+            continue
+        signal = True
+        # running as the actual arm reads it: the flag, else the power, else the litres
+        on = np.where(~np.isnan(flag), flag > 0.5, np.where(~np.isnan(p_meas), p_meas > 0.0, np.nan_to_num(fuel_meas) > 0.0))
+        from_curve = on & np.isnan(fuel_meas)
+        if not from_curve.any():
+            continue
+        from_curve_any = True
+        powered = from_curve & ~np.isnan(p_meas)
+        curve += float(np.sum((plant.gen_a * p_meas[powered] + plant.gen_b * plant.gen_kw) / 60.0))
+        if (from_curve & np.isnan(p_meas)).any():  # running with no power read: its power from the site's balance, as the actual arm takes it
+            g = telemetry.minute_grid(site_id, a, b)
+            sim = _actual_sim(telemetry.filled(g), g, plant)
+            blind = np.asarray(sim["gen_on"], dtype=bool) & np.isnan(g["fuel"]) & np.isnan(g["gen"])
+            curve += float(np.sum(np.asarray(sim["fuel"], dtype=float)[blind]))
+    out.update(litres=round(metered + curve, 1), litres_metered=round(metered, 1), litres_curve=round(curve, 1))
+    if has_gen and signal:
+        out["litres_source"] = "curve" if from_curve_any else "meter" if read else None
+    return out
+
+
 #: the most of a day whose grid flow is unresolved (not metered, not an outage, not rebuilt from the balance) while the load or PV is read, before the
-#: day claims nothing: those minutes price neither arm, and battery energy moved across them would go unpriced
+#: day claims nothing: those minutes price neither arm's load (only each arm's battery charge that PV does not cover), and battery energy moved
+#: across them would go largely unpriced
 GRID_UNRESOLVED_MAX = 0.05
+#: the most minutes of unread battery flow between two known states of charge that the change between them is spread over: over a longer span a
+#: round trip inside it (a charge then a discharge) is lost and the even spread moves energy between tariff periods, so it stays unresolved
+SOC_SPAN_MAX_MIN = 30
 
 
-def _bat_from_soc(g: dict, plant: twin.Plant | None, need: np.ndarray, soc0: float | None = None) -> np.ndarray:
+def _bat_from_soc(g: dict, plant: twin.Plant | None, need: np.ndarray, soc0: float | None = None,
+                  max_span: int | None = SOC_SPAN_MAX_MIN, free: np.ndarray | None = None) -> np.ndarray:
     """The battery flow (kW, discharge positive) over runs of `need` minutes from the state of charge: a reading is the state after its minute's flow
     (`soc0` the state at 00:00), the state either side of a run comes from the nearest reading with the read flows between carried over, and the change
-    between two states is spread evenly over the minutes between them, within the battery's power. NaN on the minutes no state brackets."""
+    between two states is spread evenly over the minutes between them, within the battery's power, when they are at most `max_span` minutes apart
+    (None: any span; minutes in `free` are not counted). NaN on the minutes no state brackets, or none brackets closely enough."""
     soc = _soc(g)
     bat = np.asarray(g["bat"], dtype=float)
     n = len(soc)
@@ -246,6 +297,8 @@ def _bat_from_soc(g: dict, plant: twin.Plant | None, need: np.ndarray, soc0: flo
         return float(soc[r]) * plant.e_nom + _drawn_kwh(bat[j:r + 1], plant)
 
     def spread(a: int, b: int, de: float) -> None:
+        if max_span is not None and (b - a if free is None else int(np.count_nonzero(~free[a:b]))) > max_span:
+            return
         h = (b - a) / 60.0
         p = -de / plant.eta_c / h if de > 0 else -de * plant.eta_d / h
         out[a:b] = min(max(p, -plant.p_ch), plant.p_dis)
@@ -273,45 +326,109 @@ def _bat_from_soc(g: dict, plant: twin.Plant | None, need: np.ndarray, soc0: flo
     return out
 
 
+def _gen_known(g: dict, has_gen: bool) -> np.ndarray:
+    """The minutes whose genset flow is known: its power read, or a running flag (else its litres) that says it is off, as the actual arm reads its
+    state; every minute on a site with no genset."""
+    gen_p = np.asarray(g["gen"], dtype=float)
+    if not has_gen:
+        return np.ones(len(gen_p), dtype=bool)
+    flag, fuel = np.asarray(g["gen_on"], dtype=float), np.asarray(g["fuel"], dtype=float)
+    off = np.where(~np.isnan(flag), flag <= 0.5, ~np.isnan(fuel) & (np.nan_to_num(fuel) <= 0.0))
+    return ~np.isnan(gen_p) | off
+
+
+def _bat_balance(g: dict, f: dict, has_gen: bool) -> np.ndarray:
+    """The battery flow (kW, discharge positive) from the balance the twin keeps (battery = load - PV - genset - import + export) on the minutes whose
+    grid flow is known (metered, or an outage: none) and whose load and genset flow are read; NaN elsewhere."""
+    metered = ~np.isnan(np.asarray(g["imp"], dtype=float)) | ~np.isnan(np.asarray(g["exp"], dtype=float))
+    ok = (metered | (np.asarray(f["grid"], dtype=float) < 0.5)) & ~np.isnan(np.asarray(g["load"], dtype=float)) & _gen_known(g, has_gen)
+    bal = f["load"] - f["pv"] - np.nan_to_num(np.asarray(g["gen"], dtype=float)) - np.where(metered, f["imp"] - f["exp"], 0.0)
+    return np.where(ok, bal, np.nan)
+
+
 def _grid_flows(g: dict, f: dict, has_bat: bool, has_gen: bool, plant: twin.Plant | None = None,
-                soc0: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """The actual arm's grid import and export and battery flow (kW) per minute, the minutes rebuilt from the balance, and the minutes left unresolved.
+                soc0: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The actual arm's grid import and export and battery flow (kW) per minute, the minutes rebuilt from the balance, the minutes left unresolved,
+    and the rebuilt minutes whose battery flow is spread over a long span (`spanned`).
 
     A metered minute (either energy column, or the grid power the minute grid derives them from) keeps its reading and an outage minute neither imports
     nor exports. Any other minute whose load is read is rebuilt from the replay's own inputs as the twin balances the baseline (import - export = load -
     PV - battery - genset), where the genset's flow is known (or the site has none) and the battery's is read, or taken from the state of charge around
-    a stretch with no battery power (given the plant): read as zero, a blank import priced the actual arm at no grid cost while the baseline imported
-    the minute's whole load. What is left is unresolved, and the caller prices neither arm's grid flow over it."""
+    a stretch with no battery power (given the plant; the flows on the stretch's metered minutes from their balance, _bat_balance): read as zero, a
+    blank import priced the actual arm at no grid cost while the baseline imported the minute's whole load. Where the states either side are more than
+    SOC_SPAN_MAX_MIN minutes apart the minute is still rebuilt with the even spread, so every arm's load is priced over it, but it is `spanned`: a round
+    trip inside the span is lost, so the caller counts it toward GRID_UNRESOLVED_MAX. What is left is unresolved (the load unread, the genset unknown,
+    or no state brackets the battery's flow), and the caller prices neither arm's grid flow over it beyond its battery charge (_grid_masked)."""
     imp_m, exp_m = np.asarray(g["imp"], dtype=float), np.asarray(g["exp"], dtype=float)
     metered = ~np.isnan(imp_m) | ~np.isnan(exp_m)
     outage = np.asarray(f["grid"], dtype=float) < 0.5
     n = len(imp_m)
     gen_p = np.asarray(g["gen"], dtype=float)
-    if has_gen:  # the genset's power, or a running flag (else its litres) that says it is off, as the actual arm reads its state
-        flag, fuel = np.asarray(g["gen_on"], dtype=float), np.asarray(g["fuel"], dtype=float)
-        off = np.where(~np.isnan(flag), flag <= 0.5, ~np.isnan(fuel) & (np.nan_to_num(fuel) <= 0.0))
-        gen_ok = ~np.isnan(gen_p) | off
-    else:
-        gen_ok = np.ones(n, dtype=bool)
     # an unread load is not a zero load: rebuilt as one, a battery serving it would read as an export
-    open_ = ~metered & ~outage & gen_ok & ~np.isnan(np.asarray(g["load"], dtype=float))
+    open_ = ~metered & ~outage & _gen_known(g, has_gen) & ~np.isnan(np.asarray(g["load"], dtype=float))
     bat = np.asarray(f["bat"], dtype=float)
+    spanned = np.zeros(n, dtype=bool)
     if has_bat:
         read = ~np.isnan(np.asarray(g["bat"], dtype=float))
-        bat = np.where(read, bat, _bat_from_soc(g, plant, open_ & ~read, soc0))
+        need = open_ & ~read
+        if need.any():
+            gc = {**g, "bat": np.where(read, np.asarray(g["bat"], dtype=float), _bat_balance(g, f, has_gen))}
+            near = _bat_from_soc(gc, plant, need, soc0)
+            far = _bat_from_soc(gc, plant, need, soc0, max_span=None) if np.isnan(near[need]).any() else near
+            spanned = need & np.isnan(near) & ~np.isnan(far)
+            bat = np.where(read, bat, np.where(np.isnan(near), far, near))
     rebuilt = open_ & ~np.isnan(bat)
     net = f["load"] - f["pv"] - np.nan_to_num(bat) - np.nan_to_num(gen_p)
     imp = np.where(rebuilt, np.maximum(net, 0.0), f["imp"])
     exp = np.where(rebuilt, np.maximum(-net, 0.0), f["exp"])
     bat = np.where(rebuilt, np.nan_to_num(bat), f["bat"])
-    return imp, exp, bat, rebuilt, ~metered & ~outage & ~rebuilt
+    return imp, exp, bat, rebuilt, ~metered & ~outage & ~rebuilt, spanned
 
 
-def _grid_masked(sim: dict, mask: np.ndarray) -> dict:
-    """An arm with its grid flows taken out over the masked minutes (whose actual grid flow is unknown): neither arm is priced on them."""
+def _grid_masked(sim: dict, mask: np.ndarray, pv: np.ndarray | None = None, bat: np.ndarray | None = None,
+                 known: np.ndarray | None = None) -> dict:
+    """An arm with its grid flows taken out over the masked minutes (whose actual grid flow is unknown): neither arm's load is priced on them. Given
+    the PV available (`pv`, kW), each arm's battery charge that the PV does not cover is still priced as import there: with it taken out too, an arm
+    that charges from the grid under a blank meter and spends the energy later is credited for energy it was never charged for.
+
+    `bat` (kW, discharge positive) stands in for the arm's own battery flow on the masked minutes, for that charge and for its wear (the actual arm's,
+    taken from its state of charge where its power is blank: read as zero, its charge went unbilled and its discharge unworn while each baseline's was
+    priced), and `known` limits both to the minutes where the actual arm's battery flow is known: elsewhere no arm's charge or wear is priced, as no
+    arm's load is, since pricing a baseline's alone bills the baseline for what the actual arm may equally have done."""
     if not mask.any():
         return sim
-    return {**sim, "imp": np.where(mask, 0.0, sim["imp"]), "exp": np.where(mask, 0.0, sim["exp"])}
+    flow = np.nan_to_num(np.asarray(sim["bat"] if bat is None else bat, dtype=float))
+    ok = np.ones(len(mask), dtype=bool) if known is None else np.asarray(known, dtype=bool)
+    imp = 0.0 if pv is None else np.where(ok, np.maximum(-flow - np.asarray(pv, dtype=float), 0.0), 0.0)
+    out = {**sim, "imp": np.where(mask, imp, sim["imp"]), "exp": np.where(mask, 0.0, sim["exp"])}
+    if bat is not None or known is not None:
+        out["bat"] = np.where(mask, np.where(ok, flow, 0.0), sim["bat"])
+    return out
+
+
+def _masked_charge(g: dict, f: dict, bat: np.ndarray, rebuilt: np.ndarray, unresolved: np.ndarray, has_bat: bool, has_gen: bool,
+                   plant: twin.Plant | None, soc0: float | None) -> tuple[np.ndarray | None, np.ndarray]:
+    """The actual arm's battery flow (kW, discharge positive) on every minute, and the minutes where it is known (None and every minute when its
+    power is read throughout, or the site has no battery): read; else from the balance where the grid flow, load and genset are known (_bat_balance);
+    else the flow a rebuilt minute (`rebuilt`, `bat` from _grid_flows) was rebuilt with; else spread from the state of charge with those flows carried
+    across, so that what the states either side leave over lands on the minutes nothing else settles. The spread counts only where the states are at
+    most SOC_SPAN_MAX_MIN minutes apart not counting the unresolved minutes: there only the energy the battery took in or gave out is priced
+    (_grid_masked), which the states settle once the other minutes' flows are known, while over a long span of other minutes the even spread moves
+    that energy off the unresolved run. Elsewhere the flow is unknown: on an unresolved minute no arm's charge or wear is priced, and elsewhere the
+    actual arm's wear is unknown (compute_day withholds the lever)."""
+    n = len(unresolved)
+    ones = np.ones(n, dtype=bool)
+    if not has_bat:
+        return None, ones
+    raw = np.asarray(g["bat"], dtype=float)
+    read = ~np.isnan(raw)
+    if read.all():
+        return None, ones
+    flow = np.where(read, raw, np.where(rebuilt, np.asarray(bat, dtype=float), _bat_balance(g, f, has_gen)))
+    need = np.isnan(flow)
+    if need.any():
+        flow = np.where(need, _bat_from_soc({**g, "bat": flow}, plant, need, soc0, free=np.asarray(unresolved, dtype=bool)), flow)
+    return flow, ~np.isnan(flow)
 
 
 def native_for_day(site_id: str, day: date) -> dict | None:
@@ -424,14 +541,15 @@ def compute_day(site_id: str, day: date, with_bound: bool = True) -> dict | None
     gen_unknown = bool(gen_asset) and _genset_unknown(act["g"])
     # a blank grid meter read as zero import would let the actual arm claim the baseline's energy bill over the blank minutes: they are rebuilt from the
     # balance where the load is read and the battery's flow (read, or from its state of charge) and the genset's are known, and the rest price neither
-    # arm. A grid connection whose import is unmetered for most of the day (a source with no grid columns), or unresolved for more than
-    # GRID_UNRESOLVED_MAX of it, withholds the grid levers and claims nothing
+    # arm's load (each arm's battery charge that PV does not cover is still import there). A grid connection whose import is unmetered for most of the
+    # day (a source with no grid columns), or unresolved for more than GRID_UNRESOLVED_MAX of it (counting the minutes rebuilt with a battery flow
+    # spread over more than SOC_SPAN_MAX_MIN), withholds the grid levers and claims nothing
     on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
-    g_imp, g_exp, g_bat, rebuilt, unresolved = _grid_flows(act["g"], act["f"], bool(b), bool(gen_asset), plant, soc0 if b else None)
+    g_imp, g_exp, g_bat, rebuilt, unresolved, spanned = _grid_flows(act["g"], act["f"], bool(b), bool(gen_asset), plant, soc0 if b else None)
     if not on_grid:
-        rebuilt, unresolved = np.zeros_like(rebuilt), np.zeros_like(unresolved)
+        rebuilt, unresolved, spanned = np.zeros_like(rebuilt), np.zeros_like(unresolved), np.zeros_like(spanned)
     seen = ~np.isnan(np.asarray(act["g"]["load"], dtype=float)) | ~np.isnan(np.asarray(act["g"]["pv"], dtype=float))
-    unresolved_share = float(np.mean(unresolved & seen)) if len(seen) else 0.0
+    unresolved_share = float(np.mean((unresolved | spanned) & seen)) if len(seen) else 0.0
     imp_unknown = on_grid and (float(act["g"].get("imp_completeness", 1.0)) < 0.5 or unresolved_share > GRID_UNRESOLVED_MAX)
     f_act = {**act["f"], "imp": g_imp, "exp": g_exp, "bat": g_bat} if on_grid else act["f"]
     actual = _actual_sim(f_act, act["g"], plant if gen_asset else None)
@@ -441,11 +559,20 @@ def compute_day(site_id: str, day: date, with_bound: bool = True) -> dict | None
         c_next = optimise._gen_marginal({"S": gen_asset["rated_kw"], "a": gen_asset["a"], "b": gen_asset["b"], "c_fuel": price,
                                          "c_om": gen_asset["c_om_rs_per_kwh"], "c_runhr": gen_asset["c_runhr_rs"]})
     v_end = max(0.0, (b["eta_d"] * c_next - optimise.wear_cost(b)) if b else 0.0)
-    arms = {"actual": price_arm(site, _grid_masked(actual, unresolved), pr, day, e_end_actual, v_end)}
+    # the actual arm's battery flow where its power is blank (_masked_charge): read as zero, its discharge went unworn while each baseline's was worn,
+    # and on the masked minutes its charge went unbilled while each baseline's was billed. On the masked minutes each arm's charge beyond PV, and its
+    # wear, is priced only where that flow is known; elsewhere it stands in for the actual arm's discharge and wear, and where it is unknown the wear
+    # lever is withheld, as the genset lever is
+    a_bat, charge_known = _masked_charge(act["g"], act["f"], g_bat, rebuilt, unresolved, bool(b), bool(gen_asset), plant, soc0 if b else None)
+    wear_unknown = bool((~unresolved & ~charge_known).any())
+    if a_bat is not None:
+        actual = {**actual, "bat": np.where(~unresolved & charge_known, a_bat, actual["bat"])}
+    arms = {"actual": price_arm(site, _grid_masked(actual, unresolved, series["pv"], a_bat, charge_known), pr, day, e_end_actual, v_end)}
     sims = {"native": twin.simulate(series, twin.native_policy(site, series["ts"]), plant, soc0, gen0),
             "tuned": twin.simulate(series, twin.table_policy(fit_tuned(site, day), series["ts"]), plant, soc0, gen0)}
     for k, sim in sims.items():
-        arms[k] = price_arm(site, _grid_masked(sim, unresolved), pr, day, float(sim["soc"][-1]) * plant.e_nom, v_end)
+        arms[k] = price_arm(site, _grid_masked(sim, unresolved, series["pv"], known=charge_known), pr, day, float(sim["soc"][-1]) * plant.e_nom,
+                            v_end)
     # fidelity gates the claim (plan 8.4): a monitor site only recommends, even in the demo; the twin and closed loop follow the plan by construction;
     # in tier advisory a day counts only once telemetry confirms the keyed table (plan 7.6), never on the mark alone
     tier = site.get("tier", "monitor")
@@ -481,12 +608,15 @@ def compute_day(site_id: str, day: date, with_bound: bool = True) -> dict | None
         levers = {"peak_window": grid_lever(n["peak_energy_rs"] - a["peak_energy_rs"]), "offpeak_energy": grid_lever(n["offpeak_energy_rs"] - a["offpeak_energy_rs"]),
                   "export": grid_lever(a["export_credit_rs"] - n["export_credit_rs"]),
                   "genset": None if gen_unknown else round(n["genset_rs"] - a["genset_rs"], 2),
-                  "wear": round(n["wear_rs"] - a["wear_rs"], 2), "carry_over": round(carry, 2)}
+                  "wear": None if wear_unknown else round(n["wear_rs"] - a["wear_rs"], 2), "carry_over": round(carry, 2)}
         saving = round(sum(v for v in levers.values() if v is not None), 2)
-        claim = saving if fidelity in CLAIMING and not imp_unknown else 0.0
+        # a day whose import or whose actual battery flow is unknown claims nothing: withholding only its wear lever would credit the baseline's whole
+        # wear when the actual cycled more (the "never over-claim" rule of plan 8.4)
+        withheld = "import_unknown" if imp_unknown else ("battery_flow_unknown" if wear_unknown else None)
+        claim = saving if fidelity in CLAIMING and not withheld else 0.0
         rows[base] = {"saving_rs": saving, "claimed_rs": claim, "levers": levers, "actual": a, "baseline": n, "fidelity": fidelity,
                       "fidelity_score": fidelity_score, "litres_saved": None if gen_unknown else round(n["litres"] - a["litres"], 2),
-                      "genset_unknown": gen_unknown, "import_unknown": imp_unknown, "claim_withheld": "import_unknown" if imp_unknown else None,
+                      "genset_unknown": gen_unknown, "import_unknown": imp_unknown, "claim_withheld": withheld,
                       "import_completeness": round(float(act["g"].get("imp_completeness", 1.0)), 4),
                       "import_rebuilt_share": round(float(np.mean(rebuilt)), 4) if len(rebuilt) else 0.0,
                       "import_unresolved_share": round(unresolved_share, 4),
@@ -795,7 +925,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             gen_unknown_days += int(bool(d.get("genset_unknown")))
             imp_unknown = bool(d.get("import_unknown"))
             imp_unknown_days += int(imp_unknown)
-            verified += int(d["fidelity"] == "confirmed" and not imp_unknown)
+            verified += int(d["fidelity"] == "confirmed" and not imp_unknown and not d.get("claim_withheld"))
             bound += d.get("perfect_foresight_rs") or 0.0
             m = months.setdefault(bill_month(day), [0.0, 0.0, 0.0, 0, 0.0, 0])
             if not imp_unknown:  # an unmetered day's actual peak reads zero: it says nothing about the month's MDI on either arm
@@ -804,7 +934,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             m[2] = max(m[2], float(d.get("mdi_floor_kw") or 0.0))
             m[3] += int(d["fidelity"] in CLAIMING and not imp_unknown)
             m[4] += d["claimed_rs"]
-            m[5] += int(not imp_unknown)  # an unknown saving is not a zero saving: the fee's rate is over the days that could claim
+            m[5] += int(not imp_unknown and not d.get("claim_withheld"))  # an unknown saving is not a zero saving: the fee's rate is over the days that could claim
             rate = d.get("mdi_rate") or rate
             unserved_a += d["unserved_kwh_actual"]
             unserved_b += d["unserved_kwh_baseline"]
@@ -827,7 +957,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "native_cost_rs": (n.get("baseline") or {}).get("cost_rs"), "litres_actual": (n.get("actual") or {}).get("litres"),
                             "litres_native": (n.get("baseline") or {}).get("litres"), "peak_kw": (n.get("actual") or {}).get("peak_kw"),
                             "peak_import_kwh": (n.get("actual") or {}).get("peak_import_kwh"), "levers": n.get("levers"),
-                            "import_unknown": bool(n.get("import_unknown"))})
+                            "import_unknown": bool(n.get("import_unknown")), "claim_withheld": n.get("claim_withheld")})
     verified = out["baselines"].get("native", {}).get("verified_days", 0)
     # plan 8.5: "Preliminary" until 8 weeks of switchback have run and the FCA of every month in the period has been billed
     today_l = datetime.now(PKT).date()
@@ -1008,7 +1138,10 @@ def add_bill(site_id: str, fields: dict, by: str) -> dict:
         con.execute("INSERT INTO bills (id, site_id, connection_id, period_start, period_end, real, rebuilt, difference_pct, created) VALUES (?,?,?,?,?,?,?,?,?)",
                     (bid, site_id, conns[0]["id"], first.isoformat(), p1.isoformat(), json.dumps(real), json.dumps(rebuilt), diff, store._now()))
     store.audit(by, "entered a DISCO bill", site_id, {"period": f"{first}..{p1}", "difference_pct": diff})
-    return {"id": bid, "real": real, "rebuilt": rebuilt, "difference_pct": diff}
+    with store.connect() as con:
+        row = con.execute("SELECT * FROM bills WHERE id = ?", (bid,)).fetchone()
+    # the stored row as bills() lists it, with the fields this call answered before
+    return {**(_bill_row(row) if row else {}), "id": bid, "real": real, "rebuilt": rebuilt, "difference_pct": diff}
 
 
 def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_exclusive: bool = False) -> dict:
@@ -1024,7 +1157,11 @@ def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_excl
     return out
 
 
+def _bill_row(r) -> dict:
+    return {**dict(r), "real": json.loads(r["real"]), "rebuilt": json.loads(r["rebuilt"])}
+
+
 def bills(site_id: str) -> list[dict]:
     with store.connect() as con:
         rows = con.execute("SELECT * FROM bills WHERE site_id = ? ORDER BY period_start DESC", (site_id,)).fetchall()
-    return [{**dict(r), "real": json.loads(r["real"]), "rebuilt": json.loads(r["rebuilt"])} for r in rows]
+    return [_bill_row(r) for r in rows]

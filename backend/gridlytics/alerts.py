@@ -96,7 +96,23 @@ def _peak_unconfirmed(site: dict, now: int, today: str) -> bool:
     return False
 
 
+#: Control and Savings alerts wait until the site has an active plan and this many days of data (plan Part 9.3, UI-16): a new site's first days would
+#: otherwise raise them on day one (an advisory site's unconfirmed apply before anyone was told to apply a table)
+SETTLED_CATEGORIES = ("Control", "Savings")
+SETTLED_DAYS = 7
+
+
+def settled(site_id: str, plan: dict | None, now: int) -> bool:
+    """True once Control and Savings alerts may be raised for the site: it has an active plan and its data reaches back SETTLED_DAYS days."""
+    if not plan:
+        return False
+    first = telemetry.first_ts(site_id)
+    return first is not None and now - int(first) >= SETTLED_DAYS * 86400
+
+
 def evaluate(site_id: str, now: int | None = None) -> None:
+    """Raises and clears the site's alerts. A Control or Savings condition counts only once the site is `settled`: before, it is not raised and an open
+    one is closed."""
     site = sites.full(site_id)
     if site is None:
         return
@@ -104,8 +120,9 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     last = telemetry.latest(site_id)
     _stale(site_id, last, now)
     plan = plans.current(site_id)
+    ready = settled(site_id, plan, now)
     latest_attempt = (plan or {}).get("latest_attempt")
-    _set(bool(latest_attempt), site_id, "plan_failed", "Control", "warning",
+    _set(ready and bool(latest_attempt), site_id, "plan_failed", "Control", "warning",
          "The last solve did not produce a plan; the previous plan stays active", {"reason": (latest_attempt or {}).get("reason")})
     # reserve: outages in the last day entered below the reserve the plan asked for, and unserved critical load
     outs = telemetry.outages(site_id, now - 86400, now)
@@ -133,7 +150,7 @@ def evaluate(site_id: str, now: int | None = None) -> None:
         unconfirmed = _peak_unconfirmed(site, now, today)
     if site.get("demo_link") and site["data"].get("twin", {}).get("unconfirmed_alert"):
         unconfirmed = True
-    _set(unconfirmed, site_id, "apply_unconfirmed", "Control", "warning",
+    _set(ready and unconfirmed, site_id, "apply_unconfirmed", "Control", "warning",
          "Today's slot table is not marked as applied: tier 2 has no read-back, so the saving is not claimed until it is")
     # tariff: a regime ending within 60 days
     for c in site.get("connections") or []:

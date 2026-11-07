@@ -33,6 +33,18 @@ class ReservePolicy(Strict):
     min_soc_pct: float = Field(20.0, ge=0.0, le=100.0)
 
 
+DATA_SOURCE_KINDS = ("edge", "csv", "oem_cloud")
+
+
+class DataSource(Strict):
+    """Where the site's data comes from and whether its grid-present signal was confirmed (plan Part 9.3 tab A). `confirmed_by` and `at` are stamped by
+    the server when a confirmation is saved (see _stamp_source); what a request sends for them is not kept."""
+    kind: Literal[DATA_SOURCE_KINDS]
+    grid_signal_confirmed: bool = False
+    confirmed_by: str = Field("", max_length=120)
+    at: str | None = Field(None, max_length=40)
+
+
 class SiteFields(Strict):
     name: str = Field(min_length=1, max_length=120)
     address: str = Field("", max_length=300)
@@ -56,6 +68,28 @@ class SiteFields(Strict):
     grid_charge_allowed: bool = True
     gen_charge_allowed: bool = True
     notes: str = Field("", max_length=2000)
+    #: the site's typical peak load (kW) from onboarding, which the stage-0 load template scales (twin.peak_load_kw); unset, it is derived from the
+    #: connection or the PV
+    load_peak_kw: float | None = Field(None, gt=0, le=100000)
+    #: a site without any grid connection (plan Part 9.3), stored for activation and settings
+    off_grid: bool = False
+    data_source: DataSource | None = None
+
+
+def _stamp_source(data: dict, before: dict | None, by: str) -> None:
+    """Who confirmed the data source's grid-present signal, and when, from the save itself: a new confirmation (or one for another kind of source) is
+    stamped with the person saving and the time now; a confirmation saved before keeps its stamp; an unconfirmed source carries none."""
+    src = data.get("data_source")
+    if not src:
+        return
+    if not src.get("grid_signal_confirmed"):
+        src["confirmed_by"], src["at"] = "", None
+        return
+    old = (before or {}).get("data_source") or {}
+    if isinstance(old, dict) and old.get("grid_signal_confirmed") and old.get("kind") == src["kind"] and old.get("at"):
+        src["confirmed_by"], src["at"] = str(old.get("confirmed_by") or "")[:120], str(old["at"])[:40]
+    else:
+        src["confirmed_by"], src["at"] = str(by or "")[:120], _now()
 
 
 class IcpBaseline(Strict):
@@ -180,6 +214,7 @@ def get(site_id: str) -> dict | None:
 
 def create(fields: dict, by: str, site_id: str | None = None, demo_link: str | None = None) -> dict:
     data = check(SiteFields, fields).model_dump()
+    _stamp_source(data, None, by)
     sid = site_id or store.new_id()
     now = _now()
     with store.connect() as con:
@@ -190,10 +225,21 @@ def create(fields: dict, by: str, site_id: str | None = None, demo_link: str | N
 
 
 def update(site_id: str, fields: dict, by: str) -> dict:
+    """The site's fields changed by `fields` (a partial set, or the form sent back whole). A stored key SiteFields does not know (a demo site's `twin`,
+    which the demo writes) is carried through unvalidated and unchanged: the request may send it back as stored, never change or add it."""
     site = get(site_id)
     if site is None:
         raise KeyError(site_id)
-    data = check(SiteFields, {**site["data"], **fields}).model_dump()
+    stored = dict(site.get("data") or {})
+    carried = {k: stored.pop(k) for k in list(stored) if k not in SiteFields.model_fields}
+    incoming = dict(fields)
+    for k in [k for k in incoming if k in carried]:
+        if incoming[k] != carried[k]:
+            raise ValueError(f"The site's {k.replace('_', ' ')} is kept as stored and cannot be changed here")
+        incoming.pop(k)
+    data = check(SiteFields, {**stored, **incoming}).model_dump()
+    _stamp_source(data, site.get("data"), by)
+    data = {**data, **carried}
     with store.connect() as con:
         con.execute("UPDATE sites SET name = ?, data = ?, updated = ? WHERE id = ?", (data["name"], json.dumps(data), _now(), site_id))
     store.audit(by, "changed a site", data["name"], {"site_id": site_id, "fields": sorted(fields)})
@@ -298,8 +344,10 @@ def state(site_id: str) -> dict:
 
 
 def put_state(site_id: str, **changes) -> dict:
+    """Merges `changes` into the site's carried state. The read and the write are one write transaction (BEGIN IMMEDIATE), so two writers at once
+    (a tick's last_tick, an outage event's pending re-solve, a tier sign-off) never write over each other's fields."""
     now = _now()
-    with store.connect() as con:
+    with store.write_transaction() as con:
         r = con.execute("SELECT data FROM site_state WHERE site_id = ?", (site_id,)).fetchone()
         cur = json.loads(r["data"]) if r else {}
         cur.update(changes)
