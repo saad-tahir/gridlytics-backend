@@ -1,5 +1,7 @@
 # gridlytics-backend
 
+**New here? Read [HANDOFF.md](HANDOFF.md) first:** setup, running, tests, rules, open work and traps for both repositories.
+
 The API and engine of Gridlytics (working name), OnyxLeaf's TOU-aware, outage-aware and genset-aware energy dispatch optimiser for Pakistani commercial
 and industrial sites. The plan is `C:\Users\SaadTahir\Videos\solarytics\EMS_BUILD_PLAN.md`; the web app is the sibling repository `gridlytics-frontend`.
 
@@ -51,7 +53,7 @@ sites' twins advance to the current minute on every tick.
 cd backend && ../.scratch/venv/Scripts/python.exe -m pytest tests -q -n 4
 ```
 
-158 passed and 7 skipped on 6 November 2026. The skipped seven are lifted Solarlytics tests that still assert Solarlytics' own data (`docs/DESIGN_LOG.md`).
+423 passed and 7 skipped on 7 November 2026. The skipped seven are lifted Solarlytics tests that still assert Solarlytics' own data (`docs/DESIGN_LOG.md`).
 `test_engine.py` holds the marginal-price check (the bill engine and the optimiser agree on a kWh's price), the optimiser's invariants and goldens, signing
 and the compiler's grammar; `test_api_walk.py` walks every page's endpoints as owner, operator, analyst and viewer on the demo company, checks the viewer
 gets no rupees, and that a site-bound edge key reaches only its own site.

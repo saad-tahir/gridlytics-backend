@@ -1,0 +1,295 @@
+# Gridlytics: developer handoff
+
+Read this first. It is written for a developer who has the two repositories and nothing else: no chat history, no earlier notes. Everything you
+need to set up, run, test and continue the work is here or in a file this page names. Last updated 7 November 2026.
+
+## 1. What the product is
+
+Gridlytics (working name) is OnyxLeaf's energy-dispatch optimiser for commercial and industrial sites in Pakistan. A site has some of: solar PV, a
+battery, a diesel or gas genset, and a grid connection with time-of-use (TOU) tariffs, monthly maximum-demand (MDI) charges and load-shedding
+outages. Every 15 minutes the backend does five things:
+
+1. It forecasts PV, load and the chance of an outage for the next 48 hours.
+2. It solves a mixed-integer linear programme for the cheapest schedule for the battery and genset, priced by a 1-minute bill engine.
+3. It compiles that schedule into the slot table a given inverter brand accepts ("Mode A"), or into per-step setpoints ("Mode B").
+4. It signs the result for an on-site edge device.
+5. It measures the saving against a replay of the inverter's own native settings.
+
+The web app shows a fleet of sites, each site's plan, telemetry, forecasts, outages, battery, genset, savings, tariffs and alerts. It also has
+onboarding, pilot set-up (a switchback calendar), reports and a founder console.
+
+The full specification is `EMS_BUILD_PLAN.md` in the planning folder (see section 11). It is long; section numbers like "Part 4.5" in code comments
+refer to it. You can work without it: the code, `docs/DESIGN_LOG.md` and this page are enough to continue.
+
+## 2. Repositories and state
+
+| Repository | Path on the build machine | Branch | Head | Contents |
+|---|---|---|---|---|
+| `gridlytics-backend` | `C:\Users\SaadTahir\Videos\gridlytics-backend` | `v1-build` (from a baseline on `main`) | `fc49e3a` | Python 3.12 API and engine |
+| `gridlytics-frontend` | `C:\Users\SaadTahir\Videos\gridlytics-frontend` | `v1-build` (from a baseline on `main`) | `3282a14` | React 19 web app |
+
+- Both repositories are local only: no remote, never pushed. The owner creates the GitHub pair and pushes. Commit to `v1-build`, never merge, never
+  push, and leave pull requests to the owner.
+- The two repositories must sit side by side in one folder: the launcher and tests find each other as `../gridlytics-backend` and
+  `../gridlytics-frontend`.
+- Tests at the last update: backend 423 passed and 7 skipped; web app 222 passed, typecheck and build clean. A scripted browser check visited 405
+  pages across four roles, a phone width (375 px) and the founder console, with 0 failures.
+
+## 3. Set up a machine
+
+The build machine is Windows 11 using Git Bash. Linux or macOS work the same, with `bin/` in place of `Scripts\`.
+
+### Backend
+
+1. Install Python 3.12 (3.12.11 was used). Any CPython 3.12 works; on the build machine it was the conda env `ops`.
+2. Make the repository's own venv in `.scratch\venv`. The launcher looks for it there.
+
+   ```bash
+   cd gridlytics-backend
+   python3.12 -m venv .scratch/venv          # on Windows: py -3.12 -m venv .scratch/venv
+   .scratch/venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+   ```
+
+   The pins are in `requirements.txt`: fastapi 0.141.1, pydantic 2.13.4, numpy 2.4.3, scipy 1.17.1 (the MILP runs on its HiGHS), pandas 3.0.2,
+   APScheduler 3.11.0, reportlab 4.4.4, cryptography 46.0.3. Dev adds pytest 8.4.2 and pytest-xdist.
+3. Run the tests: `cd backend && ../.scratch/venv/Scripts/python.exe -m pytest tests -q -n 4`. They take about 2 minutes.
+
+### Web app
+
+1. Install Node 22 (`.nvmrc` says 22.13.0).
+2. Install and check:
+
+   ```bash
+   cd gridlytics-frontend/frontend
+   npm ci
+   npm run typecheck && npm test -- --run && npm run build
+   ```
+
+   `npm run gates` runs all three.
+
+### Seed the data folder and run the app
+
+The app keeps each company in SQLite files under a data folder. There are two:
+
+| Folder | Ports (API / web) | Use |
+|---|---|---|
+| `gridlytics-backend/data` | 8051 / 5195 | The owner's folder. Never delete or reseed it once it is in use. |
+| `gridlytics-backend/.scratch/data` | 8151 / 5295 | Scratch, for you. Reseed it freely. |
+
+Seed a scratch folder with the demo accounts and four demo sites (14 days of history; it takes a few minutes, so run it on an otherwise idle
+machine, see trap 1 in section 9):
+
+```bash
+cd gridlytics-backend/backend
+DATA="$(cd ..; pwd -W 2>/dev/null || pwd)/.scratch/data"    # pwd -W gives a Windows path (C:/...) in Git Bash; Python cannot read /c/...
+mkdir -p "$DATA"
+GRIDLYTICS_DATA_DIR="$DATA" ../.scratch/venv/Scripts/python.exe -m gridlytics.seed_demo --demo-days 14 --out "$DATA/DEMO_ACCOUNTS.local.md"
+```
+
+The seed writes:
+- the account passwords to `DEMO_ACCOUNTS.local.md` (git-ignored; never paste them anywhere);
+- the founder console's login settings to `.env.founder`, in the data folder.
+
+Start the API and the web app together, from the frontend repository:
+
+```bash
+cd gridlytics-frontend
+../gridlytics-backend/.scratch/venv/Scripts/python.exe scripts/start_local.py --scratch
+```
+
+Open `http://127.0.0.1:5295` and sign in as `owner@onyxleaf.demo` (or operator, analyst or viewer `@onyxleaf.demo`) with the password from the
+accounts file. The founder console is at `/admin`. Without `--scratch` the launcher uses the owner's folder and ports.
+
+The launcher:
+- runs the scheduler (the 15-minute tick and the nightly jobs);
+- starts its children without console windows;
+- refuses a second server on the same data folder.
+
+### The browser check
+
+With the scratch app running:
+
+```bash
+cd gridlytics-frontend
+node scripts/e2e/pages.mjs --web 5295 --roles owner,operator,analyst,viewer --phone --founder --accounts ../gridlytics-backend/.scratch/data/DEMO_ACCOUNTS.local.md
+```
+
+It signs in through the real page, opens every page in every role, and reports page errors, 5xx answers and any 4xx refusals. A viewer's 403s on
+money routes are by design. It refuses the owner's ports.
+
+## 4. How the backend is built
+
+The package is flat: `backend/gridlytics/*.py`. The README's table names every module. The ones you will touch most:
+
+| Module | Role |
+|---|---|
+| `api.py` | FastAPI app and request guard: allowed hosts and origins, JSON only, body limit, rate limits, site-bound API keys (`glk_...`). A key on another site's path gets 403 `wrong_site`. Every route also answers under `/api/v1`. |
+| `store.py` | One SQLite workspace file per company (WAL), selected per request by a ContextVar (`store.use_company(path)`), and migrations with a copy taken first. |
+| `telemetry.py` | A second SQLite file per company (`<stem>-telemetry.db`): 1-minute rows (`minute`), forecast issues as JSON, sequence numbers for edge idempotency. |
+| `sites.py` | Sites, connections, assets, carried state (`put_state` is one write transaction), overrides (hold, pause, force charge...) and native-settings captures. |
+| `tariffs.py`, `tariff_data.py` | Versioned tariffs, the 13-step 1-minute bill (`rebuild`), and the optimiser's price vectors (`vectors`). |
+| `forecast.py` | PV (clear sky with a fitted performance ratio), load (equivalent-day persistence with censoring of shed minutes) and outage (schedule adherence and an hourly hazard). |
+| `optimise.py` | The MILP on `scipy.optimize.milp` (HiGHS) at T = 192 steps of 15 minutes: reserve as an expected value, genset unit commitment, MDI blocks, ICP cases, wear and calendar cost, terminal value. `explain()` gives a reason per step. |
+| `plans.py` | The tick: build the problem, solve, store the plan, supersede the last one, and produce the signed message. |
+| `delivery.py` | The Mode A compiler per brand grammar (deye, huawei, growatt, sungrow, voltronic, solis, other), Mode B, Ed25519 signing, and the ems-edge/1.0 message models. |
+| `twin.py` | The digital twin: a plant model with the inverter's native logic, outages and genset, simulated per minute. It drives the demo and the savings replays. |
+| `verify.py` | Savings. The actual arm is priced per minute against a native replay and a tuned static table, giving a ledger by lever (peak window, off-peak, export, genset, wear, carry-over, MDI), switchback and bill rebuild. |
+| `alerts.py`, `reports.py`, `demo.py`, `scheduler.py` | Alerts and genset requests; ReportLab PDF and CSV reports; the four demo sites; the APScheduler jobs. |
+| `routes_*.py` | One file per area. `routes_common.py` holds the helpers, and `out()` applies the money filter. |
+
+Conventions:
+- **Time:** UTC epoch seconds everywhere. The UI shows Pakistan time (UTC+5, no daylight saving).
+- **Roles:** admin, operator, analyst, viewer. Checks go through `auth.need(perm, doing)`, `auth.can`, `auth.actor()`; `GET /api/meta` gives the
+  permission map to the web app.
+- **Money:** `money.for_reader` strips every money field (keys in `MONEY_KEYS`, suffixes `_rs`, `_rs_per_kwh`, `_rs_per_kw`, `_pkr`) for a viewer,
+  and for every API key.
+- **Strict models:** request models forbid unknown fields. A refusal is a `Refusal(status, sentence, code)` with a one-sentence message the page shows.
+- **Deviations from the plan** go in `docs/DESIGN_LOG.md`, newest first. Read it before changing the engine: it records every rule settled so far and
+  the accepted limits.
+- **Tests:** `test_engine.py` checks the engine's invariants (the bill engine and optimiser agree on a kWh's price, solver invariants, signing,
+  compiler grammar). `test_api_walk.py` walks every page's routes in four roles. `test_fix_*.py`, `test_fix_r2_*.py` and `test_fix_r3_*.py` hold one
+  regression test per review finding, so read them to see how a past defect was reproduced. Tests that need a company use `tmp_path`, set
+  `GRIDLYTICS_DATA_DIR` and use `store.use_company(...)`.
+
+## 5. How the web app is built
+
+React 19, TypeScript, Vite, Tailwind 4, TanStack Query, zustand, Radix, ECharts. Code is in `frontend/src`:
+- `features/<area>` holds the pages.
+- `lib/api` holds the typed client and query keys.
+- `lib/format.ts` holds the number rules ("Rs 1,234,567", kW with one decimal under 100).
+- `lib/time.ts` holds Pakistan time.
+
+Docs:
+- `docs/API_CONTRACT.md` maps each screen to the routes and fields it uses.
+- `docs/BACKEND_ASKS.md` lists what the web app still wants from the API.
+- `docs/BUILD_NOTES.md` is the build log, with its traps.
+
+Rules the pages keep:
+- Never write "optimal", "guaranteed" or "maximum savings".
+- Every site page carries a last-data stamp.
+- Role differences are said in words ("Hidden for your role").
+- The server is the authority: a page hides what `GET /api/meta` says a role cannot do.
+
+## 6. How the work was done, and where the history is
+
+1. A planning run wrote the plan, a handoff and the tracker (section 11).
+2. The backend was built first, then the web app.
+3. An adversarial review then found 69 defects in the backend, 13 of them high severity. They were fixed in three rounds (commits `507a4db`,
+   `32eafe5`, `7cf7861`), each fix checked by a separate verifier. The rules settled in those rounds are in `docs/DESIGN_LOG.md`.
+4. A review of the web app found 20 bugs, fixed in `3e6465b`.
+5. An end-to-end walk on a fresh demo then showed the fleet losing money. The cause was three plans the slot table could not carry out, fixed in
+   `fc49e3a` (see DESIGN_LOG, "The demo's negative savings").
+
+The review's raw finding lists and verifier notes are in `.scratch/`, which git ignores, so you may not have them. You do not need them: the open
+items are all below.
+
+## 7. Rules for anyone continuing
+
+- Never delete, reseed or write test data into `gridlytics-backend/data` (the owner's folder). Use `.scratch/data` or a temporary folder.
+- Commit to `v1-build` only. Never merge, never push, never add a remote. End commit messages with the attribution line the owner asks for (the
+  history uses `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` for agent commits).
+- **Clean-room code:** no AGPL or GPL code (Predbat and the AGPL Huawei library were deliberately not used). The constructions taken from MIT or
+  Apache projects (evcc-io/optimizer, EMHASS, REopt.jl) are named in `THIRD_PARTY_NOTICES.md`. Code lifted from the owner's own Solarlytics
+  repositories is marked there too.
+- **Secrets:** never print or commit a password, token or key. The accounts file and `.env.founder` are git-ignored.
+- **Test data:** use the demo twin's generated data, or free public data saved as fixtures with their source and licence (for example PVGIS, NASA
+  POWER or the Open-Meteo archive). Do not wait for real site data.
+
+## 8. Open work, in priority order
+
+Each item says where to start and how to know it is done. Section 12 lists what was done after this page was first written.
+
+### A. Engine and savings defects (known, measured)
+
+1. **Off-grid farm demo still loses a little.** About -Rs 5,700 over 11 days, down from -16,900. The plan burns slightly less diesel than native
+   every day, but on outage-heavy days it ends the day with the battery emptier than native, and the carry-over lever charges for that.
+   - Start in `verify.compute_day` (`carry_over`, `v_end`) and `plans.build_problem` (`terminal`).
+   - The demo plans are 24-hour (96-step) solves (`demo.build_history`), while live ticks plan 48 hours. Check whether the terminal value at
+     midnight is right for a site whose next-day energy comes from free PV.
+   - Done when the farm's 14-day rebuild is not negative without hiding a real loss.
+2. **Savings can over-claim when the grid and genset columns are both blank** for up to 5 % of a day. The masked minutes price no arm's load.
+   - `verify._grid_flows` / `_grid_masked`. One option is to price each arm's own battery discharge on masked minutes as well as its charge;
+     another is a tighter cap.
+   - A reproduced case (mixed site, grid and genset blank 06:00-07:10) claims +3,839 against a metered +560.
+3. **Off-grid soc_threshold genset with a nearly full tank** (300-310 L of a 400 L tank): a 10 s solve can still publish a plan that sheds load with
+   the set off and fuel in the tank.
+   - `optimise.solve` (shed-rule re-solve) and `plans.tick`. One option is to replay the threshold controller over the plan before publishing.
+   - Not the default control mode; no demo site uses it.
+4. **The 2-slot compile, properly.** The plan asks for boundaries ranked by a twin-priced value; v1 ranks by energy moved, with a rule that a
+   non-discharging run folds into a non-discharging neighbour (`delivery.compile_mode_a`). Also, a merged charge slot charges at its mean rate up to
+   the end of its span, which can charge in the peak hour before a discharge.
+5. **Plan quality depends on CPU load:** the solve limits are wall-clock time (5 s in the demo build, 10 s per tick).
+   - A deterministic work limit, or a check that marks a plan "time-limited" and re-solves it when the machine is idle, would remove the dependence.
+
+### B. Features the API has but the pages do not use yet
+
+- "Resume a draft" on Add a site (`GET /api/drafts`).
+- Removing a connection (`DELETE /api/sites/:id/connection/:cid`), and the idempotency key on `PUT /connection`.
+- Showing the tier sign-off (`tier_signoff` on `GET /api/sites/:id`).
+- `previous_reading_date` in the bill dialog (enter the printed reading dates).
+- A fuel price's `source.{ref, url}` in the fuel price form.
+
+### C. Features not built (tracker items `[ ]` or `[~]`)
+
+- **Tariff editor (UI-03):** versions are drafted as raw JSON. The plan wants a lettered-tab editor with a heatmap preview and "simulate on a site".
+  The backend needs per-kind body schemas or a validate endpoint, reject or withdraw of a pending version, and a diff.
+- **Report schedules (UI-14);** **alert delivery** by email, SMS or WhatsApp (channels are stored, nothing sends; PLT-11 is a later item).
+- **Forecasting:**
+  - Weather feed (FOR-02): Open-Meteo, which the owner has to license for commercial use.
+  - Stage 2 models (FOR-05, FOR-07).
+- **Verification:**
+  - Backtest and verification harnesses (VER-05, VER-06, VER-07).
+  - The real-data check (VER-14), using public data until a partner site's month exists.
+  - The metering factor (VER-13).
+- **Deployment:** CI (DEP-01), performance gates (DEP-02), security review (DEP-03), release build (DEP-04), observability (DEP-05), Docker
+  (DEP-06), backups (DEP-07).
+- **Data and docs:** the Parquet export (DAT-07), and the documentation set (DOC-02, DOC-04 to DOC-07).
+- The full list, with acceptance tests, is the tracker `EMS_BUILD_PROGRESS.md` (section 11): `[ ]` not started, `[~]` built in a v1 form short of
+  its full acceptance.
+
+### D. Owner tasks (not code)
+
+- **GitHub:** create the repositories, push `v1-build`, set up CI tokens and a Linux host.
+- **Data and agreements:** inverter brands and native settings per partner site; a month of real 1-minute data with its bill; the fee and VoLL per
+  site; the lawyer's wording for savings claims.
+- **Owner's data folder:** `gridlytics-backend/data` still holds the demo built on 6 November by the code from before the review, so its savings
+  figures are wrong. The demo can be reloaded from the web app (Fleet, demo sites), or by an agent once the owner agrees.
+
+## 9. Traps already met
+
+1. **Wall-clock solve limits:** a demo seeded while the test suite ran in parallel made visibly worse plans. Seed and benchmark on an idle machine.
+2. **Git Bash path conversion:** Git Bash rewrites arguments that start with `/`. Set `MSYS_NO_PATHCONV=1` when passing such paths to scripts.
+3. **Line endings:** files must be LF (`.gitattributes` says `* text=auto eol=lf`). Windows tools may write CRLF; git normalises it on commit.
+4. **No console windows on Windows:** start background servers without a console (the launcher uses CREATE_NO_WINDOW; for Python use `pythonw`).
+5. **SQLite concurrency:** WAL, and every read-modify-write of site state goes through one `BEGIN IMMEDIATE` transaction (`sites.put_state`,
+   `routes_common.state_change`). A new company's telemetry file is created under a process lock.
+6. **Timing-sensitive tests:** a few optimiser tests time a farm solve. They pass on an idle machine and under `-n 4`, but can flake on a slow one.
+   Re-run before chasing them.
+7. **Password parsing:** the accounts file is a Markdown table; read the cell after the email, not a fixed column.
+8. **Preview tools:** the build machine had a preview launch configuration in `C:\Users\SaadTahir\Videos\.claude\launch.json` (the scratch launcher).
+   It is machine-local, not part of either repository.
+
+## 10. A first hour for a new developer
+
+1. Set up both repositories (section 3) and run both test suites.
+2. Seed `.scratch/data` and start the scratch app. Sign in as the owner and look at Fleet, then one site's Overview, Plan and Savings.
+3. Read `docs/DESIGN_LOG.md`, the newest three entries.
+4. Pick an item from section 8. Add a regression test that fails first, fix it, run both suites, commit on `v1-build`, and add a line to the
+   DESIGN_LOG if you settled a rule.
+
+## 11. Files outside the repositories (on the build machine)
+
+| File | What |
+|---|---|
+| `C:\Users\SaadTahir\Videos\solarytics\EMS_BUILD_PLAN.md` | The full specification (Parts 1-14). |
+| `C:\Users\SaadTahir\Videos\solarytics\EMS_BUILD_PROGRESS.md` | The tracker: every item with its acceptance test and status, plus a dated session log. |
+| `C:\Users\SaadTahir\Videos\solarytics\EMS_BUILD_HANDOFF.md` | The planning run's handoff (rules and the original prompt for the building agent). |
+| `C:\Users\SaadTahir\Videos\solarytics\plan-work\` | Research notes the plan cites, and `STATUS.md`. |
+
+If you were given only the repositories, ask the owner for these. They are useful, but you can continue without them.
+
+## 12. Log of work after this page was written
+
+| Date | What | Commits |
+|---|---|---|
+| 2026-11-07 | Handoff written | — |
