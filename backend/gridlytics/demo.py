@@ -23,6 +23,10 @@ OBSERVE_DAYS = 3
 #: battery at midnight by its terminal price alone and drains what a 48-hour plan keeps for the next night; in eight paired 14-day rebuilds of the demo
 #: farm the 48-hour history beat the 24-hour one in the continuous replay every time (round 4)
 HISTORY_STEPS = 192
+#: how often the demo history re-plans within a day, in hours. Live ticks re-plan every 15 minutes; a plan made at midnight and run all day with no
+#: re-plan carried every forecast miss to the evening (round 5: the farm burnt 91 L on a day native burnt 47 L). Re-planning every 3 hours
+#: was measured closest to the live behaviour at a seed time the demo can afford (GRIDLYTICS_DEMO_REPLAN_HOURS changes it; 24 is the old daily plan)
+REPLAN_HOURS = 3
 #: the wall clock the twin is held behind (the tests move it)
 _clock = time.time
 
@@ -235,6 +239,26 @@ def _simulate_span(site: dict, t_from: int, t_to: int, plan: dict | None) -> int
     return written
 
 
+def _replan_seconds() -> int:
+    try:
+        h = float(os.environ.get("GRIDLYTICS_DEMO_REPLAN_HOURS", REPLAN_HOURS))
+    except ValueError:
+        h = REPLAN_HOURS
+    return int(min(24.0, max(0.25, h)) * 3600) // 900 * 900
+
+
+def _replanned_span(site_id: str, t_from: int, t_to: int, every: int) -> None:
+    """Runs the twin from t_from to t_to under plans made every `every` seconds, each from the state the twin left (the history's stand-in for
+    the live 15-minute tick)."""
+    t = t_from
+    while t < t_to:
+        r = plans.tick(site_id, at=t, steps=HISTORY_STEPS, time_limit=5.0)
+        plan = plans.get(site_id, r["plan_id"]) if r.get("plan_id") else None
+        end = min(t_to, t + every)
+        _simulate_span(sites.full(site_id), t, end, plan)
+        t = end
+
+
 def build_history(site_id: str, days: int, progress=None) -> None:
     site = sites.full(site_id)
     today = datetime.fromtimestamp(_clock_minute(), PKT).date()
@@ -242,22 +266,19 @@ def build_history(site_id: str, days: int, progress=None) -> None:
     spec = next((s for s in DEMO_SITES if s["site"]["name"] == site["name"]), {})
     if spec.get("switchback"):
         verify.plan_switchback(site_id, start + timedelta(days=OBSERVE_DAYS + 4), 4, 7, "demo", seed=7)
+    every = _replan_seconds()
     for i in range(days):
         day = start + timedelta(days=i)
         t0 = twin.day_start_utc(day)
-        plan = None
-        if i >= OBSERVE_DAYS:
-            r = plans.tick(site_id, at=t0, steps=HISTORY_STEPS, time_limit=5.0)
-            plan = plans.get(site_id, r["plan_id"]) if r.get("plan_id") else None
-        site = sites.full(site_id)
-        _simulate_span(site, t0, t0 + 86400, plan)
+        if i < OBSERVE_DAYS:
+            _simulate_span(sites.full(site_id), t0, t0 + 86400, None)
+        else:
+            _replanned_span(site_id, t0, t0 + 86400, every)
         if progress:
             progress(i + 1, days)
-    # today: the morning plan, the minutes so far, then a full 48-hour plan from now
+    # today: re-planned up to now, then a full 48-hour plan from now
     now = _clock_minute()
-    t0 = twin.day_start_utc(today)
-    r = plans.tick(site_id, at=t0, steps=HISTORY_STEPS, time_limit=5.0)
-    _simulate_span(sites.full(site_id), t0, now, plans.get(site_id, r["plan_id"]) if r.get("plan_id") else None)
+    _replanned_span(site_id, twin.day_start_utc(today), now, every)
     plans.tick(site_id, at=now)
     for i in range(OBSERVE_DAYS, days):
         day = start + timedelta(days=i)

@@ -250,4 +250,7 @@ def test_the_demo_history_plans_48_hours_as_the_live_ticks_do(company, monkeypat
     monkeypatch.setattr(alerts, "evaluate", lambda *a, **k: None)
     sid = next(i for i in demo.create_sites("t") if "farm" in sites.full(i)["name"].lower())
     demo.build_history(sid, 5)
-    assert len(seen) == 4 and set(seen) == {192}  # before: 96-step (24-hour) plans for the history days and this morning's plan
+    assert set(seen) == {192}  # before round 4: 96-step (24-hour) plans for the history days and this morning's plan
+    # and re-planned every REPLAN_HOURS within each planned day, as live ticks re-plan (before round 5: once at midnight)
+    per_day = 24 // demo.REPLAN_HOURS
+    assert len(seen) >= (5 - demo.OBSERVE_DAYS) * per_day + 1

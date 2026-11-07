@@ -2,6 +2,33 @@
 
 Newest first. Each entry says what was decided, why, and where the plan (`EMS_BUILD_PLAN.md`) says otherwise.
 
+## 2026-11-07 Round 5: the genset's minimum-load surplus, and a re-planned demo history
+
+- **Surplus charging with the grid down.** In an outage, and at every off-grid step, the set's output follows the load as it does on site: it is
+  capped at max(f_min × S, served load − PV), and its minimum-load surplus charges the battery (`battery.a_gen_surplus`,
+  `optimise.genset_surplus_steps`, `genset_follow_cap`). So a night below the set's minimum runs the set instead of shedding. At the demo farm,
+  planned shed fell from 230-340 kWh to about 0 and rescue starts by about half, in every paired rebuild. Grid-up steps keep no genset charging, and
+  full-power charging (`a_gen`) stays off while `delivery.GEN_CHARGE_SUPPORTED` is False. This also closes the "PV charges while the set carries
+  the load" loophole that round 4's dropped row aimed at, without its solve cost. The threshold replay counts the same surplus.
+- **Solve time.** Two rows the balance implies when the set is fully on or off (`surplus_charge`, `off_discharge`) tighten the relaxation without
+  removing any plan; the tests check this on six cases. On the second day, grid-down runs keep clock hour marks (about Rs 37 per two-day plan). Farm
+  solves are back near their old times (3-hour-mark states: 2.1 s mean, 4.7 s worst). Neither applies at a soc_threshold site that starts the set in
+  the horizon, because there they slowed the solve.
+- **Known limit:** the 120 L soc_threshold farm's first solve now stops at its 10 s limit, within 0.5 % of the best plan. This is recorded in the r2
+  test.
+- **Off-grid terminal value:** the plan uses the ledger's rule (`plans.offgrid_c_next`: the genset's marginal cost at `verify.night_load_ratio`),
+  so the plan and the ledger value stored energy the same way.
+- **The demo history re-plans every 3 hours** (`demo.REPLAN_HOURS`, `GRIDLYTICS_DEMO_REPLAN_HOURS`), as live ticks re-plan every 15 minutes. A plan
+  made at midnight and run all day carried every forecast miss to the evening: on one seed the farm burnt 91 L on a day native burnt 47 L. In the
+  3-hourly paired rebuild, the change gained Rs 7.4k in the continuous replay.
+- **Open: the per-day carry-over at off-grid sites is noisy.** The per-day ledger minus the continuous 11-day replay ranged from -6.2k to +7.9k
+  across seeds. The carry-over lever swings by tens of thousands of rupees and largely offsets the genset lever. Possible fixes:
+  - price carry-over at what the native arm actually saves the next day: replay that day natively from both end states, holding the day as
+    provisional until then;
+  - or score off-grid days in multi-day blocks.
+
+  Customers see the per-day ledger, so this matters before a pilot at an off-grid site.
+
 ## 2026-11-07 Round 4: the handoff's open work, checked on public data
 
 ### The PV model against public data
