@@ -2,6 +2,45 @@
 
 Newest first. Each entry says what was decided, why, and where the plan (`EMS_BUILD_PLAN.md`) says otherwise.
 
+## 2026-11-07 Round 4: the handoff's open work, checked on public data
+
+### The PV model against public data
+
+`backend/tests/fixtures/public` holds one year (2020) of hourly PVGIS 5.2 and NASA POWER data for the four demo cities, with each source and
+licence in its `SOURCE.md`. `public_data.py` fetches the data by hand; tests never call the network.
+
+- **Clear sky:** Haurwitz times a monthly haze factor. Each month's factor is the highest ratio of measured GHI to Haurwitz on the clearest fifth of
+  that month's days, across the four sites and both providers. It replaces the single 0.88, which put clear winter days 15-20 % above "clear sky".
+- **Glass reflection loss** (Martin and Ruiz, 0.16) is modelled: 2.4-2.6 % against PVGIS's 2.6 %.
+- **Fit to PVGIS:** driven by PVGIS's GHI, the model is within 2.2 % of PVGIS's annual output at all four sites.
+- **`MONTH_K`** is each month's mean clearness against the new clear sky. It is fitted to PVGIS's 2005-2020 monthly output, with the GHI averaged
+  with NASA POWER's climatology, because NASA sees Punjab's winter fog and ERA5 does not. Stage 0's annual error went from -6..-12 % to within
+  ±5.2 %.
+- **PV quantiles** are capped at `min(cs × max(1, pr), kw_ac)`: a plant fitted above the nominal clear sky keeps its clear days, but is never
+  forecast above its inverter's AC rating.
+- **Later item, not done:** blending yesterday's clearness 50/50 with the 14-day median beats the median alone by 4-9 points on this data. It was not
+  done because the twin's daily clearness is drawn independently each day, so the blend would make the demo's forecasts worse.
+
+### Savings
+
+- **Masked minutes with a read load** price each arm on its own battery and genset flows against that load. This replaces round 3's known limit
+  (grid and genset columns blank together could over-claim). Minutes with no load reading keep the charge-only rule.
+- **A blank genset** is read from the balance where the grid flow is known. Where the balance cannot be closed and the set could have run (an outage,
+  a parallel set with the grid up, or the set running at the edge of the stretch), the day is withheld: `claim_withheld: genset_unknown`.
+- **A state-of-charge spread** across an import-price edge is priced at its least value: discharge on the cheapest minutes, charge on the dearest.
+- **Off-grid end-of-day energy** is valued at the genset's cost at its after-dark load ratio (`verify.night_load_ratio`), not at 75 % load.
+- **The demo history plans 48 hours** (192 steps), as live ticks do. In paired continuous replays the 48-hour plans beat 24-hour ones every time.
+
+### Optimiser and delivery
+
+- **Off-grid soc_threshold sites:** every first plan is checked for dodged starts, whether optimal or time-limited. A plan with fuel left over gets the
+  shed-rule re-solve. Otherwise it is repaired: the site's controller is replayed over it, respecting the daily run-hour cap, and the problem is
+  solved again with the genset fixed. The label says "Repaired to the site's controller". This retires round 3's known limit and its
+  "a plan that burns the whole tank is kept" rule.
+- **Charge slots** charge at their mean planned rate only up to their last planned charge step, recorded as `charge_end_ts`.
+- **Time limits:** every plan records `time_limited`, `mip_gap` and `time_limit_s`. A relaxed retry after a timed-out first solve is flagged too.
+  `plans.time_limited_recent(site_id, hours)` counts them. The limits themselves are unchanged.
+
 ## 2026-11-07 The demo's negative savings: plan and delivery out of step
 
 The end-to-end walk on a freshly seeded demo showed the fleet losing money: Rs -13,409 for the month, from the Karachi feed mill and the off-grid
@@ -49,7 +88,7 @@ seeded while the test suite ran in parallel made visibly worse plans. Seed the d
   battery full.
 - **Off-grid soc_threshold sites:** the first solve has no shed rule, for solve time. A time-limited plan that sheds with the set off, the tank not
   empty and fuel left at the horizon's end is solved once more with a shed rule, and the summary says so (`solver.shed_rule_resolve`).
-- **Known limit, accepted for v1:** a 10 s plan whose time-limited incumbent burns the whole tank (300 to 310 L of the 400 L farm) can still shed with
+- **Known limit, accepted for v1 (superseded by round 4: every such plan is now repaired to the controller):** a 10 s plan whose time-limited incumbent burns the whole tank (300 to 310 L of the 400 L farm) can still shed with
   the set off while fuel remains. Solved to optimality, those plans shed nothing, but that takes 75 to 90 s. Off-grid soc_threshold control is not the
   default and no demo site uses it. A tick there can take up to three solver limits (about 30 s): a first solve, the relaxed retry and the shed-rule
   re-solve. Repairing this by replaying the threshold controller over the plan is a later item.
@@ -90,7 +129,7 @@ seeded while the test suite ran in parallel made visibly worse plans. Seed the d
   charge left over. That change may span any number of masked minutes but at most 30 others. Where the flow stays unknown, no arm's masked charge is
   priced and the day claims nothing (`claim_withheld: battery_flow_unknown`). Withholding only the wear lever would credit the baseline's whole wear on
   a day the actual arm cycled more.
-- **Known limit:** with the grid and genset columns blank for up to 5 % of a day (the genset unknown), the masked minutes price no arm's load. On a site
+- **Known limit (superseded by round 4: masked minutes now price each arm's own flows against the read load):** with the grid and genset columns blank for up to 5 % of a day (the genset unknown), the masked minutes price no arm's load. On a site
   whose baseline discharges in that gap while the actual holds, the day can still over-claim (a reproduced case: +3,839 against a metered +560). It
   needs both columns blank at once, and it predates round 3. A tighter cap or symmetric discharge pricing on masked minutes is a later item.
 

@@ -229,33 +229,33 @@ Each item says where to start and how to know it is done. Section 12 lists what 
 
 ### A. Engine and savings defects (known, measured)
 
-1. **Off-grid farm demo still loses a little.** About -Rs 5,700 over 11 days, down from -16,900. The plan burns slightly less diesel than native
-   every day, but on outage-heavy days it ends the day with the battery emptier than native, and the carry-over lever charges for that.
-   - Start in `verify.compute_day` (`carry_over`, `v_end`) and `plans.build_problem` (`terminal`).
-   - The demo plans are 24-hour (96-step) solves (`demo.build_history`), while live ticks plan 48 hours. Check whether the terminal value at
-     midnight is right for a site whose next-day energy comes from free PV.
-   - Done when the farm's 14-day rebuild is not negative without hiding a real loss.
-2. **Savings can over-claim when the grid and genset columns are both blank** for up to 5 % of a day. The masked minutes price no arm's load.
-   - `verify._grid_flows` / `_grid_masked`. One option is to price each arm's own battery discharge on masked minutes as well as its charge;
-     another is a tighter cap.
-   - A reproduced case (mixed site, grid and genset blank 06:00-07:10) claims +3,839 against a metered +560.
-3. **Off-grid soc_threshold genset with a nearly full tank** (300-310 L of a 400 L tank): a 10 s solve can still publish a plan that sheds load with
-   the set off and fuel in the tank.
-   - `optimise.solve` (shed-rule re-solve) and `plans.tick`. One option is to replay the threshold controller over the plan before publishing.
-   - Not the default control mode; no demo site uses it.
-4. **The 2-slot compile, properly.** The plan asks for boundaries ranked by a twin-priced value; v1 ranks by energy moved, with a rule that a
-   non-discharging run folds into a non-discharging neighbour (`delivery.compile_mode_a`). Also, a merged charge slot charges at its mean rate up to
-   the end of its span, which can charge in the peak hour before a discharge.
-5. **Plan quality depends on CPU load:** the solve limits are wall-clock time (5 s in the demo build, 10 s per tick).
-   - A deterministic work limit, or a check that marks a plan "time-limited" and re-solves it when the machine is idle, would remove the dependence.
+Round 4 (7 Nov, `2b0fce1`) closed the earlier items 2 and 3, the charge-slot half of 4, and made 5 visible; see DESIGN_LOG "Round 4". What is left:
+
+1. **Off-grid farm, genset below its minimum load (round 5, in progress).** Plans do not count on charging from the genset (no slot table can
+   ask for it), so at night, with the load under the set's minimum output, the plan cannot run the set: it sheds instead, and the operator makes
+   rescue starts. On site the set's minimum-load surplus does charge the battery (`twin.simulate`: output = max(f_min x S, load - PV)).
+   - The fix is to model exactly that in `optimise.solve`: on grid-down steps the battery may take only the minimum-load surplus.
+   - Make the plan's off-grid terminal value use the ledger's rule (`verify.night_load_ratio`).
+   - Evidence: paired 14-day farm rebuilds, plus one Karachi rebuild to show no harm.
+2. **The 2-slot compile, properly.** The plan asks for boundaries ranked by a twin-priced value. v1 ranks them by energy moved, with a rule that a
+   non-discharging run folds into a non-discharging neighbour (`delivery.compile_mode_a`).
+3. **Plan quality still depends on CPU load:** the limits are wall-clock time. Plans now record `time_limited` and `mip_gap`, and
+   `plans.time_limited_recent` counts them. A deterministic work limit, or a re-solve when the machine is idle, would remove the dependence.
+4. **Forecast blend (later):** on the public data, blending yesterday's clearness 50/50 with the 14-day median beats the median by 4-9 points. Do it
+   once the twin's clearness has day-to-day memory, or on real data only.
 
 ### B. Features the API has but the pages do not use yet
 
-- "Resume a draft" on Add a site (`GET /api/drafts`).
-- Removing a connection (`DELETE /api/sites/:id/connection/:cid`), and the idempotency key on `PUT /connection`.
-- Showing the tier sign-off (`tier_signoff` on `GET /api/sites/:id`).
-- `previous_reading_date` in the bill dialog (enter the printed reading dates).
-- A fuel price's `source.{ref, url}` in the fuel price form.
+Round 4 wired all five earlier items: resume a draft, remove a connection, the connection idempotency key, the tier sign-off and the bill's
+printed reading dates, plus a fuel price's source.
+
+Round 5 (in progress) shows the newer fields:
+- the "genset data missing" withheld claim;
+- the plan's time-limit and controller-repair notes;
+- a charge slot's end time;
+- discarding a draft.
+
+One ask has no route: an active site cannot be set back to observing.
 
 ### C. Features not built (tracker items `[ ]` or `[~]`)
 
@@ -322,4 +322,7 @@ If you were given only the repositories, ask the owner for these. They are usefu
 | Date | What | Commits |
 |---|---|---|
 | 2026-11-07 | Handoff written | `eb74527` |
-| 2026-11-07 | Round 4 started on section 8: A.1 (farm carry-over), A.2 (blank grid and genset columns), A.3 (threshold genset repair), A.4 (charge-slot rate), A.5 (time-limited plans made visible), a public-data check of the PV model (PVGIS and NASA POWER fixtures), and the web app wiring of section 8.B. Each group is verified. If you find uncommitted changes in `verify.py`, `optimise.py`, `plans.py`, `delivery.py`, `solar.py`, `forecast.py` or the web app's `src`, they are this round's unfinished work: read `git diff` and finish or discard it against these items | in progress |
+| 2026-11-07 | Handoff checked by a fresh agent from a clean clone; ten gaps closed | `a90ea58` |
+| 2026-11-07 | Round 4 done: the PV model checked on PVGIS and NASA POWER data; savings over blank genset columns; threshold-genset repair; charge-slot end; time-limited plans recorded; web app wiring of 8.B. Backend 474 tests, web app 247 | `2b0fce1`, `d7396fd` |
+| 2026-11-07 | Small API asks met: DELETE /api/drafts/:id, tier_signoff on POST and PUT site answers, Idempotency-Key allowed by CORS | `57b3d10` |
+| 2026-11-07 | Round 5 started: the genset's minimum-load surplus in the plan, and the off-grid terminal value (8.A.1); the web app shows round 4's new fields (8.B). Uncommitted changes in `optimise.py`, `plans.py` or the web app's `src` are this round's unfinished work | in progress |
