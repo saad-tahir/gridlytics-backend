@@ -86,7 +86,8 @@ def _cors_origins(raw: str) -> list[str]:
 CORS_ORIGINS = _cors_origins(os.environ.get("GRIDLYTICS_CORS_ORIGINS", ""))
 _regex = os.environ.get("GRIDLYTICS_CORS_ORIGIN_REGEX", "").strip()
 CORS_ORIGIN_REGEX = _regex or None
-CORS_ALLOW_HEADERS = ["Authorization", "Content-Type", "X-Gridlytics-Company", "X-Request-ID", "x-founder-session"]
+# Idempotency-Key: a client may send a first save's key as a header as well as in the body (the web app sends it in the body)
+CORS_ALLOW_HEADERS = ["Authorization", "Content-Type", "X-Gridlytics-Company", "X-Request-ID", "x-founder-session", "Idempotency-Key"]
 CORS_EXPOSE_HEADERS = ["X-Request-ID", "X-Total-Count", "X-Gridlytics-Engine", "X-Gridlytics-Role", "X-API-Version", "Content-Disposition", "Retry-After"]
 _HOST_HEADER = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?")
 

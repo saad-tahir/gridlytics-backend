@@ -137,7 +137,7 @@ def site_create(inp: dict = Body(...)):
         s = sites.create(inp, auth.actor())
     except ValueError as exc:
         raise bad(exc) from None
-    return out(sites.full(s["id"]))
+    return _site_answer(s["id"])  # every site answer carries tier_signoff, as GET does
 
 
 @router.get("/api/sites/{site_id}")
@@ -157,7 +157,7 @@ def site_update(site_id: str, inp: dict = Body(...)):
         sites.update(site_id, inp, auth.actor())
     except ValueError as exc:
         raise bad(exc) from None
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 @router.delete("/api/sites/{site_id}")
@@ -511,6 +511,19 @@ def draft_put(draft_id: str, inp: dict = Body(...), site_id: str | None = None):
                     "body = excluded.body, updated = excluded.updated, site_id = COALESCE(excluded.site_id, site_drafts.site_id)",
                     (draft_id, link, owner, json.dumps(inp), store._now()))
     return sites.draft_get(owner, draft_id)
+
+
+@router.delete("/api/drafts/{draft_id}")
+def draft_delete(draft_id: str):
+    """Discards the caller's own draft ("Add a site" offers it next to Resume). Another member's draft, or none, answers 404: a draft is private to
+    the person who started it."""
+    auth.need("edit_sites", "Discarding a draft")
+    owner = _draft_owner()
+    with store.write_transaction() as con:
+        n = con.execute("DELETE FROM site_drafts WHERE draft_id = ? AND person = ?", (draft_id, owner)).rowcount
+    if not n:
+        raise Refusal(404, "You have no draft with this id", "not_found")
+    return {"deleted": draft_id}
 
 
 @router.get("/api/sites/{site_id}/prices")
