@@ -46,7 +46,8 @@ def test_a_force_charge_set_in_an_outage_charges_to_its_target_once_the_grid_ret
     assert sorted(r["manual_floor"]) == [int(t) for t in window if t >= 8]
     E, En = r["sol"]["E"], p["battery"]["E_nom"]
     assert E[window[-1] + 1] >= 0.9 * En - 1e-3                               # at its target by the window's end
-    assert r["sol"]["C"][8:12].sum() * 0.25 > 0.5 * En * 0.25                  # charging as soon as the grid returns
+    # (no assertion on when it charges: the test runs at the wall-clock hour, and in daylight PV fills the battery in the outage itself; the rows
+    #  on every grid-up step and the target by the window's end are the rule)
 
 
 def test_a_hold_set_in_an_outage_still_lapses_and_a_force_charge_beside_it_does_not():
@@ -146,7 +147,9 @@ def test_a_limited_off_grid_plan_that_sheds_with_fuel_left_over_is_solved_again_
     # with VoLL under the set's cost the cheapest plan sheds to keep the battery on its threshold, which the site cannot do: the inverter sheds
     # only at its cut-off, and under the threshold the controller starts the set
     first = optimise.solve(_offgrid_threshold(1e9, 50.0))
-    assert first["status"] in ("optimal", "feasible") and _dodges(_offgrid_threshold(1e9, 50.0), first)
+    # since round 4 (HANDOFF 8.A.3) an optimal first plan is checked as well: the first problem's optimum dodges here, so it is solved again
+    assert first["status"] in ("optimal", "feasible") and first["shed_rule_resolve"]["shed_steps"] > 0
+    assert _dodges(_offgrid_threshold(1e9, 50.0), first) == []
     seen = _as_if_time_limited(monkeypatch)
     p = _offgrid_threshold(1e9, 50.0)
     r = optimise.solve(p)
@@ -155,13 +158,15 @@ def test_a_limited_off_grid_plan_that_sheds_with_fuel_left_over_is_solved_again_
     assert r["status"] in ("optimal", "feasible") and _dodges(p, r) == [] and r["sol"]["u"].sum() > 0
 
 
-def test_a_limited_off_grid_plan_that_burns_its_whole_tank_is_kept(monkeypatch):
-    # a plan that burns the whole tank chooses when to shed (round 2's rule for part-full tanks): no second solve
+def test_a_limited_off_grid_plan_that_burns_its_whole_tank_is_repaired(monkeypatch):
+    # a plan that burns the whole tank is not solved again with the shed rule (round 2's rule for part-full tanks). Since round 4 (HANDOFF 8.A.3)
+    # its dodges are repaired instead: the threshold controller is replayed over it and one fast solve with the genset fixed follows, so the
+    # shortfall the tank leaves is shed where the site would shed it, after the tank, never with the set off and fuel in the tank
     p = _offgrid_threshold(6.0, 500.0)
     seen = _as_if_time_limited(monkeypatch)
     r = optimise.solve(p)
-    assert r["status"] == "feasible" and len(seen) == 1 and "shed_rule_resolve" not in r
-    assert float(r["sol"]["F"].sum()) == pytest.approx(6.0, abs=0.01) and r["sol"]["U"].sum() > 0
+    assert r["status"] == "feasible" and len(seen) == 2 and "shed_rule_resolve" not in r and r["threshold_repair"]["status"] == "optimal"
+    assert float(r["sol"]["F"].sum()) == pytest.approx(6.0, abs=0.01) and r["sol"]["U"].sum() > 0 and _dodges(p, r) == []
 
 
 # ------------------------------------------------------------------------------------------------ tariffs-legacy-degenerate-lp

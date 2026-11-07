@@ -81,7 +81,10 @@ def validate(p: dict) -> str | None:
     return None
 
 
-def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = False, shed_rule: bool = False) -> dict:
+def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = False, shed_rule: bool = False,
+          fix_u: np.ndarray | None = None) -> dict:
+    """One solve. `fix_u` (0/1 per step) fixes the genset's on/off schedule, as the threshold repair does (see the end of solve); every other row
+    and variable is as without it."""
     T = p["T"]
     L, Lhi, Lc, PV, PVlo = (np.asarray(p[k], dtype=float) for k in ("L", "Lhi", "Lc", "PV", "PVlo"))
     g = np.asarray(p["g"], dtype=float)
@@ -164,7 +167,13 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         dump_ok[thr_t] = True
         Pg = m.var("P", T, 0, S, H * gen["c_om"])
         F = m.var("F", T, 0, np.inf, gen["c_fuel"])
-        u = m.var("u", T, u_lb, u_ub, H * gen["c_runhr"], integer=True)
+        if fix_u is not None:
+            # the threshold repair's schedule, fixed only here: the threshold steps, the forced dumps and the panel's free starts above are read
+            # from the site's own bounds, so every row is the unfixed problem's
+            fx_u = np.clip(np.round(np.asarray(fix_u, dtype=float)[:T]), u_lb, u_ub)
+            u = m.var("u", T, fx_u, fx_u, H * gen["c_runhr"], integer=True)
+        else:
+            u = m.var("u", T, u_lb, u_ub, H * gen["c_runhr"], integer=True)
         v = m.var("v", T, 0, 1, gen["c_start"], integer=True)
         W = m.var("W", T, 0, np.where(dump_ok, gen["f_min"] * S, 0.0), H * 2 * EPS_CURTAIL) if dump_ok.any() else None
         # at a panel-started site the panel decides u: minimum up and down rows bind only the starts and stops the plan is free to make
@@ -236,7 +245,11 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     base_served = np.where(g > 0.5, L, served_g0)
     u_dep = (g < 0.5) & (lmode == 1) & bool(gen) & (not off_grid)
     U_ub = np.where(u_dep, L, base_served)
-    U = m.var("U", T, 0, U_ub, H * voll)
+    # in the threshold repair (the genset fixed, off-grid) a shortfall the tank leaves costs the same VoLL whenever it is shed, so a tie-break
+    # (a ten-thousandth of VoLL, falling over the horizon) sheds it as late as it can be: after the battery has carried what it can, as the
+    # battery-inverter does on site, not earlier with the battery above its cut-off
+    late = (1.0 + 1e-4 * (T - np.arange(T)) / max(T, 1)) if (fix_u is not None and off_grid) else 1.0
+    U = m.var("U", T, 0, U_ub, H * voll * late)
     # ---------------------------------------------------------------- battery
     if bat:
         En, E0 = bat["E_nom"], bat["E0"]
@@ -325,9 +338,9 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         # (z[k]), or when the battery runs out inside step k. The last is y[k]: it needs the controller's start at k + 1 (w) and shrinks to
         # nothing as E[k + 1] rises from the cut-off to the threshold, so a shed never lands the battery on the threshold to spare a start.
         # An off-grid site has no such rows in its first solve: coupled to the set's binaries on every step of the horizon they slow the solve of
-        # a tank that runs dry past the tick's limit, and there a shed only moves the shortfall the tank leaves to another hour. A solve that stops
-        # at its limit with a plan that sheds while the tank has fuel left over is solved once more with a lighter rule (`shed_rule`, the
-        # `thr_offgrid_shed` rows: see the end of solve)
+        # a tank that runs dry past the tick's limit, and there a shed only moves the shortfall the tank leaves to another hour. A first plan,
+        # optimal or stopped at its limit, that sheds while the tank has fuel left over is solved once more with a lighter rule (`shed_rule`, the
+        # `thr_offgrid_shed` rows), and one that burns its tank is repaired (see the end of solve)
         if thr_t:
             th = m.var("thr", len(thr_t), 0, np.inf, voll)
             E_hi = max(Emax, E0)
@@ -444,7 +457,11 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     secs = time.perf_counter() - t_start
     status = "optimal" if res.status == 0 else "feasible" if (res.status == 1 and res.x is not None) else "not_solved"
     out = {"status": status, "solver_status": int(res.status), "message": str(res.message), "solve_seconds": round(secs, 3), "relaxed": relaxed,
-           "variables": len(m.lb), "rows": len(m.rlb), "binaries": int(sum(m.integ)), "notes": notes, "config_hash": config_hash(p)}
+           "variables": len(m.lb), "rows": len(m.rlb), "binaries": int(sum(m.integ)), "notes": notes, "config_hash": config_hash(p),
+           # the limits are wall-clock time, so a plan's quality depends on the machine's load: say when the solve stopped at its limit, and the
+           # relative gap to the solver's bound it reached (Part 4.5; HANDOFF 8.A.5)
+           "time_limited": bool(res.status == 1), "time_limit_s": float(time_limit), "mip_gap": _gap_of(res),
+           "dual_bound_rs": _finite(getattr(res, "mip_dual_bound", None))}
     if status == "not_solved":
         return out
     x = res.x
@@ -482,24 +499,190 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     out["v_end"] = v_end if bat else 0.0
     out["breakdown"] = _breakdown(p, sol, out)
     out["reasons"] = explain(p, sol, out)
-    if off_grid and thr_t and status == "feasible" and not shed_rule:
-        # An off-grid threshold site's first solve has no shed rule (see the threshold rows). One that stops at its limit can return a plan that
-        # sheds with the set off now and next, the battery above its cut-off and fuel in the tank (at a full farm tank: 51.6 kWh over a night at
+    if off_grid and thr_t and not shed_rule and fix_u is None:
+        # An off-grid threshold site's first solve has no shed rule (see the threshold rows), so its plan, optimal or stopped at its limit, can
+        # shed with the set off now and next, the battery above its cut-off and fuel in the tank (at a full farm tank: 51.6 kWh over a night at
         # 25 %): a plan the site would never run, since its battery-inverter sheds only at its cut-off and the controller then starts the set.
+        # The check reads every first plan, not only one that stopped at its limit (round 4, HANDOFF 8.A.3): the first problem's own optimum can
+        # dodge (the 400 L farm at 300 L, optimal in 14.7 s, shed 4.6 kWh at steps 99 and 100 with 149 L left; at 250 L optimal in 9.55 s), so
+        # what the tick publishes no longer depends on whether the solve finished inside its limit. A step is a dodge where the rule's row would
+        # be broken: the tank can still cover a step there (the fuel burnt before it leaves at least one step at minimum load, so z cannot be 1).
         # Where such a plan leaves fuel in the tank at the horizon's end, the shed was not rationing a short tank, and the problem is solved once
-        # more with the rule (the tick then takes up to twice its limit); a re-solve that finds no plan leaves the first one
+        # more with the rule (the tick then takes up to twice its limit).
+        tank_need = max(0.0, float(gen["fuel_available"]) - min_burn)
+        burnt = np.concatenate([[0.0], np.cumsum(x[F])])
         dodges = [k for k in shed_steps
                   if x[U[k]] > max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"]) + 1e-3 and x[u[k]] < 0.5 and x[u[k + 1]] < 0.5
-                  and not (k in thr_z and x[thr_z[k]] > 0.5)]
+                  and not (k in thr_z and burnt[k] >= tank_need - 1e-6)]
         left = float(gen["fuel_available"]) - float(np.sum(x[F]))
+        resolved, resolve_limited = False, False
         if dodges and left >= min_burn - 1e-6:
+            resolved = True
             again = solve(p, time_limit=time_limit, gap=gap, relaxed=relaxed, shed_rule=True)
             if again["status"] != "not_solved":
                 again["solve_seconds"] = round(secs + again["solve_seconds"], 3)
                 again["shed_rule_resolve"] = {"shed_steps": len(dodges), "shed_kwh": round(float(np.sum(x[U[dodges]])) * H, 2),
-                                              "first_objective_rs": out["objective_rs"], "first_solve_seconds": out["solve_seconds"]}
+                                              "first_objective_rs": out["objective_rs"], "first_solve_seconds": out["solve_seconds"],
+                                              "first_status": status, "first_time_limited": out["time_limited"]}
                 return again
+            secs += again["solve_seconds"]
+            resolve_limited = bool(again.get("time_limited"))
+        # The threshold repair (HANDOFF 8.A.3): a plan that still dodges, because it burns the whole tank (the 400 L farm at 300 to 310 L: 10 s
+        # plans shed 4.6 kWh with the set off and fuel in the tank, while the optimum, 75 to 90 s away, sheds nothing) or because the re-solve
+        # found no plan, is never published as it stands. The controller is replayed over the plan (`threshold_replay`: the set starts under its
+        # threshold whenever the tank can cover a step, and the plan's own runs stand where the controller allows them), and the problem is solved
+        # with the genset fixed to that schedule and the shed rule on. With the binaries fixed it is close to a linear programme (0.05 to 0.11 s
+        # on the farm against 10 s for the first solve), so the repair does not depend on the limit. A repair that finds no plan leaves the first
+        # one, with `threshold_repair.status` not_solved. A tick stays within three limits: the repair is skipped after a failed re-solve in the
+        # relaxed retry, which already spent two
+        if dodges and not (resolved and relaxed):
+            rep_u = threshold_replay(p, sol, u_lb, u_ub, thr_t, E_on, dump_ok, relaxed=relaxed)
+            rep = solve(p, time_limit=time_limit, gap=gap, relaxed=relaxed, shed_rule=True, fix_u=rep_u["u"])
+            info = {"shed_steps": len(dodges), "shed_kwh": round(float(np.sum(x[U[dodges]])) * H, 2), "first_objective_rs": out["objective_rs"],
+                    "first_solve_seconds": out["solve_seconds"], "first_mip_gap": out["mip_gap"], "repair_seconds": rep["solve_seconds"],
+                    "shed_rule_resolve_failed": resolved, "first_status": status, "first_time_limited": out["time_limited"]}
+            if rep["status"] != "not_solved":
+                rep["solve_seconds"] = round(secs + rep["solve_seconds"], 3)
+                # the schedule is the controller's, not the solver's: the plan is "feasible" (never proven optimal), it counts as time-limited
+                # where a solve on its way stopped at its limit (the first, the re-solve or the repair itself), and its gap is read against the
+                # first solve's bound (a valid bound: the repaired problem only adds rows to it)
+                limited = bool(out["time_limited"] or resolve_limited or rep.get("time_limited"))
+                rep["time_limited"] = limited
+                rep["mip_gap"] = _gap(rep["objective_rs"], out["dual_bound_rs"])
+                rep["dual_bound_rs"] = out["dual_bound_rs"]
+                info.update({"status": rep["status"], "starts": int(np.sum(rep["sol"]["v"])), "litres": round(float(np.sum(rep["sol"]["F"])), 2),
+                             "unserved_kwh": round(float(np.sum(rep["sol"]["U"])) * H, 2)})
+                rep["status"] = "feasible"  # not to the full problem's tolerance: the genset follows the replayed controller
+                rep["message"] = ("Threshold repair of a time-limited plan: " if limited else "Threshold repair of a plan that shed with the set off: ") \
+                    + str(out.get("message", ""))
+                rep["threshold_repair"] = info
+                rep["notes"] = list(rep.get("notes", [])) + ["threshold_repair"]
+                return rep
+            info.update({"status": "not_solved", "message": rep.get("message", "")})
+            out["threshold_repair"] = info
+            out["solve_seconds"] = round(secs + rep["solve_seconds"], 3)
     return out
+
+
+def _finite(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _gap(objective: float | None, bound: float | None) -> float | None:
+    """The relative gap of an objective to a lower bound, as HiGHS reports it: (objective - bound) / |objective|."""
+    if objective is None or bound is None:
+        return None
+    return round(max(0.0, (objective - bound) / max(abs(objective), 1e-9)), 6)
+
+
+def _gap_of(res) -> float | None:
+    if getattr(res, "x", None) is None:
+        return None
+    g = _finite(getattr(res, "mip_gap", None))
+    if g is None:
+        g = _gap(_finite(getattr(res, "fun", None)), _finite(getattr(res, "mip_dual_bound", None)))
+    return round(max(0.0, g), 6) if g is not None else None
+
+
+def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr_steps, e_on: float, dump_ok: np.ndarray | None = None,
+                     relaxed: bool = False) -> dict:
+    """The soc_threshold controller replayed over an off-grid plan (`sol`), on the MILP's own 15-minute physics (HANDOFF 8.A.3).
+
+    The plan's genset schedule and output stand where the controller allows them, and the controller overrides them where the site would:
+    - under its threshold, with the tank able to cover a step at minimum load, the set runs (a start the plan dodged by shedding);
+    - a start runs at least its minimum up time (as the twin's operator does), and then as long as the plan keeps it on or the battery is
+      under its threshold;
+    - above its threshold the plan cannot start the set (only the controller starts it), and with the tank unable to cover a step it stops;
+    - where a day's run-hour cap binds, the hours the threshold does not force count against it (as in the run_cap rows), and once it is used
+      a run above the threshold stops, unless it is the plan's own start inside its minimum up time.
+    A run the plan did not make follows the load (at least its minimum load). What the load leaves of PV and the set's output charges the
+    battery (from PV only, unless the genset may charge it), the rest is curtailed, then dumped; with the set off the battery carries the load,
+    and load is shed only for what its power or its energy above the cut-off cannot carry. The last of the tank is burnt at the output it can
+    still cover. A hold and a carried minimum up or down time are kept (`u_lb`, `u_ub`). Returns the schedule `u` and the replayed `E`, `U`,
+    `F` and `P`: a feasible point of the problem with the shed rule and that schedule."""
+    T = int(p["T"])
+    bat, gen = p["battery"], p["genset"]
+    L, PV = np.asarray(p["L"], dtype=float), np.asarray(p["PV"], dtype=float)
+    u_plan, P_plan = np.asarray(sol["u"], dtype=float), np.asarray(sol["P"], dtype=float)
+    En = float(bat["E_nom"])
+    Emin, Emax = bat["soc_min"] * En, bat["soc_max"] * En
+    eta_c, eta_d = float(bat["eta_c"]), float(bat["eta_d"])
+    ch_ub = np.full(T, float(bat["P_ch"]))
+    ch_ub[np.asarray(bat.get("charge_block", np.zeros(T, dtype=bool)), dtype=bool)[:T]] = 0.0
+    S, f_min, a, b = float(gen["S"]), float(gen["f_min"]), float(gen["a"]), float(gen["b"])
+    UT = 1 if relaxed else int(gen["UT"])
+    min_burn = H * (a * f_min * S + b * S)
+    fuel = float(gen["fuel_available"])
+    thr = {int(t) for t in thr_steps}
+    dump = np.zeros(T, dtype=bool) if dump_ok is None else np.asarray(dump_ok, dtype=bool)
+    E = float(bat["E0"])
+    u, Es, Us, Fs, Ps = np.zeros(T), np.zeros(T + 1), np.zeros(T), np.zeros(T), np.zeros(T)
+    Es[0] = E
+    # the day's run-hour cap, as the run_cap rows read it: hours the threshold does not force count against it, and where the cap binds a run
+    # the threshold no longer forces stops once the cap is used, unless it is the plan's own start, which its minimum up time still binds
+    day = np.asarray(gen.get("day_index", np.zeros(T, dtype=int)))[:T]
+    cap_left: dict[int, float] = {}
+    if gen.get("control") != "auto_on_grid_loss":
+        for d in np.unique(day):
+            c = float(gen.get("cap_hours", np.inf)) - (float(gen.get("hours_today", 0.0)) if d == 0 else 0.0)
+            if c < int(np.sum(day == d)) * H:
+                cap_left[int(d)] = max(0.0, c)
+    on_prev, keep, own_start = gen["u_prev"] == 1, 0, False
+    for t in range(T):
+        plan_on = u_plan[t] > 0.5
+        forced_thr = False
+        if u_lb[t] >= 1:
+            on = True
+        elif u_ub[t] <= 0 or fuel < min_burn - 1e-9:
+            on = False
+        elif t not in thr:
+            on = plan_on  # step 0: no threshold row, the plan decides
+        elif E < e_on - 1e-6:
+            on = forced_thr = True
+        else:
+            on = on_prev and (keep > 0 or plan_on)
+            d = int(day[t])
+            if on and d in cap_left and cap_left[d] < H - 1e-9 and not (own_start and keep > 0):
+                on = False
+        if on and not on_prev:
+            keep = UT
+            own_start = not forced_thr
+        if on and not forced_thr and int(day[t]) in cap_left:
+            cap_left[int(day[t])] -= H
+        net = float(L[t] - PV[t])
+        P = burn = 0.0
+        if on:
+            if not dump[t]:
+                # step 0 without a forced run: the plan's own output, which its flows carry from the same start
+                P = float(P_plan[t]) if plan_on else max(f_min * S, net)
+            else:
+                # never more than the load PV leaves plus what the battery can take (the PV the set frees for it, or the set's own output
+                # where the genset may charge it), and at least the minimum load: no fuel is burnt only to be dumped above that minimum
+                room_c = max(0.0, Emax - E) / (H * eta_c)
+                useful = net + min(ch_ub[t], room_c, np.inf if bat.get("a_gen") else float(PV[t]))
+                P = min(S, max(f_min * S, min(float(P_plan[t]) if plan_on else net, useful)))
+            burn = H * (a * P + b * S)
+            if burn > fuel:
+                P = max(f_min * S, (fuel / H - b * S) / a)
+                burn = min(fuel, H * (a * P + b * S))
+        rest = net - P
+        C = D = 0.0
+        if rest > 0:
+            D = min(float(bat["P_dis"]), max(0.0, E - Emin) * eta_d / H, rest)
+            Us[t] = rest - D
+        else:
+            src = -rest if bat.get("a_gen") else min(-rest, float(PV[t]))
+            C = min(ch_ub[t], max(0.0, Emax - E) / (H * eta_c), src)
+        E += H * (eta_c * C - D / eta_d)
+        fuel -= burn
+        u[t], Es[t + 1], Fs[t], Ps[t] = 1.0 if on else 0.0, E, burn, P
+        keep = max(0, keep - 1) if on else 0
+        on_prev = on
+    return {"u": u, "E": Es, "U": Us, "F": Fs, "P": Ps}
 
 
 def _breakdown(p: dict, s: dict, out: dict) -> dict:
@@ -621,6 +804,13 @@ def solve_with_policy(p: dict, time_limit: float = 10.0) -> dict:
     second = solve(short, time_limit=time_limit, relaxed=True)
     second["retry_of"] = first.get("message", "")
     second["T"] = short["T"]  # the horizon actually solved: the caller rebuilds its steps on shorten(p, T)
+    # a first solve that stopped at its limit without a plan is what put the relaxed 24-hour plan in its place, so the plan says so (HANDOFF
+    # 8.A.5): it counts as time-limited, and its solve time is both solves'
+    second["first_time_limited"] = bool(first.get("time_limited"))
+    second["first_solve_seconds"] = first.get("solve_seconds")
+    second["solve_seconds"] = round(float(first.get("solve_seconds") or 0.0) + float(second.get("solve_seconds") or 0.0), 3)
+    if second["first_time_limited"]:
+        second["time_limited"] = True
     if second["status"] != "not_solved":
         second["notes"] = second.get("notes", []) + ["relaxed_retry"]
     return second

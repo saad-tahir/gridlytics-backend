@@ -272,7 +272,12 @@ def test_an_off_grid_threshold_site_with_a_part_full_tank_solves_to_optimal_insi
     p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 192)
     assert p["off_grid"] and p["genset"]["control"] == "soc_threshold" and p["T"] == 192
     r = optimise.solve(p, time_limit=10.0)
-    assert r["status"] == "optimal"                                     # (it stopped at the limit with VoLL threshold slack in the plan)
+    # (it stopped at the limit with VoLL threshold slack in the plan.) Since round 4 (HANDOFF 8.A.3) an optimum that sheds with the set off
+    # while the tank still covers a step (here it rations the tank: 102 such steps at 120 L) is repaired to the threshold controller: the
+    # first solve still finishes inside the limit, and the published plan is the repair's, never time-limited
+    first = (r.get("threshold_repair") or {}).get("first_status", r["status"])
+    assert first == "optimal" and r["time_limited"] is False and r["status"] in ("optimal", "feasible")
+    assert (r.get("threshold_repair") or {}).get("status", "optimal") != "not_solved"
     sol, gen = r["sol"], p["genset"]
     thr = gen["soc_on"] * p["battery"]["E_nom"]
     under_off = [t for t in range(1, 192) if sol["E"][t] < thr - 1e-3 and sol["u"][t] < 0.5]

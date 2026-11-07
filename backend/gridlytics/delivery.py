@@ -168,13 +168,26 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                 floor = float(np.clip(s0.get("soc_start_pct", r["floor"]), lo, 100.0))
             span = steps[r["start"]:r["end"]]
             max_dis = max(st["discharge_kw"] for st in span)
-            # charge at the slot's mean planned rate (energy kept, no faster than planned), and never import above the plan's MDI cap
-            max_ch = sum(st["charge_kw"] for st in span) / len(span)
+            # charge at the slot's mean planned rate (energy kept, no faster than planned), and never import above the plan's MDI cap. A charge
+            # slot that absorbed a later hold or idle run (Sungrow's 2 slots) takes that mean only up to its last planned charge step and ends
+            # the charge there (HANDOFF 8.A.4): spread over the whole span, the charge ran on to the span's end, into the peak hours the plan
+            # kept free before its discharge
+            charge_end = None
+            if mode.startswith("charge"):
+                last = max((j for j, st in enumerate(span) if st["charge_kw"] > 0.1), default=len(span) - 1)
+                charge_end = int(span[last]["t"] + 900)
+                max_ch = sum(st["charge_kw"] for st in span[:last + 1]) / (last + 1)
+            else:
+                max_ch = sum(st["charge_kw"] for st in span) / len(span)
             grid_cap = max((st["grid_import_kw"] for st in span), default=0.0)
             slots.append({"start": datetime.fromtimestamp(s0["t"], PKT).strftime("%H:%M"), "end": datetime.fromtimestamp(s1["t"] + 900, PKT).strftime("%H:%M"),
                           "start_ts": int(s0["t"]), "end_ts": int(s1["t"] + 900), "mode": mode, "soc_floor_pct": round(floor, 1),
                           "soc_target_pct": round(target, 1), "max_discharge_w": round(max_dis * 1000) if mode in ("discharge", "export") else None,
                           "max_charge_w": round(max_ch * 1000) if mode.startswith("charge") else None, "grid_charge": mode == "charge_grid",
+                          # where a charge slot's charging ends (its last planned charge step); the slot then holds what it charged, with no
+                          # discharge, to its end. Null on other slots
+                          "charge_end_ts": charge_end,
+                          "charge_end": datetime.fromtimestamp(charge_end, PKT).strftime("%H:%M") if charge_end else None,
                           # a charging slot never imports above the plan's MDI cap: its mean rate runs through the morning peak that sets the month's
                           # maximum demand, which the plan's own night-only charging never touched; other slots shave to the higher of the two
                           "grid_cap_w": (round((mdi_cap_kw if mode.startswith("charge") else max(grid_cap, mdi_cap_kw)) * 1000) if mdi_cap_kw

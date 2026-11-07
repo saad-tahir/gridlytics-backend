@@ -26,7 +26,10 @@ QV = np.array([0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95])
 VERSION = "v1.0"
 #: stage-0 prior on the daily clearness index by quantile (scaled by the month's climatology)
 K_PRIOR = np.array([0.30, 0.45, 0.70, 0.86, 0.95, 1.00, 1.02])
-MONTH_K = {1: .80, 2: .85, 3: .9, 4: .94, 5: .94, 6: .88, 7: .74, 8: .76, 9: .88, 10: .94, 11: .9, 12: .8}
+#: the month's clearness against solar.pv_power's clear sky (the stage-0 median): the four demo locations' mean monthly PV output over 2005-2020
+#: (PVGIS), its GHI averaged with NASA POWER's climatology (2001-2025), over the clear-sky output of the same 100 kWp system (tests/test_public_data.py).
+#: v1's table, set by hand against the old single haze factor, put stage 0's annual output 6-12 % and its winter months 20-28 % below PVGIS.
+MONTH_K = {1: .85, 2: .87, 3: .88, 4: .90, 5: .90, 6: .88, 7: .81, 8: .80, 9: .87, 10: .88, 11: .89, 12: .88}
 DISCO_TRIPS = {"QESCO": 1.6, "PESCO": 1.4, "SEPCO": 1.5, "HESCO": 1.2, "TESCO": 1.5, "MEPCO": 0.8, "GEPCO": 0.6, "FESCO": 0.7, "HAZECO": 0.8,
                "LESCO": 0.35, "IESCO": 0.3, "K-Electric": 0.5}
 #: the observed grid state (outage): the last minute with a grid reading may lag the last whole minute by at most this many minutes and still be taken as
@@ -94,7 +97,11 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
     else:
         kq = np.clip(K_PRIOR * month_k / 0.86, 0.05, 1.05)
         scale = 1.0
-    q = {name: np.minimum(cs, cs * scale * kq[i]) for i, name in enumerate(QS)}
+    # no quantile above the plant's clear-sky output: the model's, or the site's own where its fitted ratio is above 1 (a plant the nominal model
+    # under-rates would otherwise have its clear days cut to the nominal clear sky), and never above the inverter's AC rating (cs is clipped there,
+    # but a ratio above 1 times a clipped cs is not, so a clipping plant with pr > 1 would otherwise be forecast PV its inverter cannot deliver)
+    cap = np.minimum(cs * max(1.0, scale), float(pv_asset["kw_ac"]))
+    q = {name: np.minimum(cap, cs * scale * kq[i]) for i, name in enumerate(QS)}
     # smart persistence for the first 2 hours: blend the q50 towards the last hour's observed clearness
     if stage == 1 and g["present"][-60:].sum() * iv > 30:
         last = g["pv"][-60:]
@@ -105,7 +112,7 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
             w = np.clip(1 - np.arange(steps) / 8.0, 0, 1)
             q50_0 = q["q50"].copy()  # every quantile keeps its ratio to the unblended median, so the fan moves as one
             for name in QS:
-                q[name] = np.minimum(cs, q[name] * (1 - w) + cs * scale * k_now * w * (q[name] / np.maximum(q50_0, 1e-6)))
+                q[name] = np.minimum(cap, q[name] * (1 - w) + cs * scale * k_now * w * (q[name] / np.maximum(q50_0, 1e-6)))
     # quantiles sorted per step (plan Part 5.1)
     qa = np.maximum.accumulate(np.vstack([q[name] for name in QS]), axis=0)
     q = {name: qa[i] for i, name in enumerate(QS)}

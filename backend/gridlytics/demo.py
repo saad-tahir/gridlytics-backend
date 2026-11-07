@@ -19,6 +19,10 @@ from . import alerts, forecast, plans, sites, store, telemetry, twin, verify
 PKT = timezone(timedelta(hours=5))
 DEMO_LINK = "demo"
 OBSERVE_DAYS = 3
+#: the steps of each day's plan in the demo history: 48 hours at 15 minutes, as the live ticks plan (plans.tick's default). A 24-hour plan values the
+#: battery at midnight by its terminal price alone and drains what a 48-hour plan keeps for the next night; in eight paired 14-day rebuilds of the demo
+#: farm the 48-hour history beat the 24-hour one in the continuous replay every time (round 4)
+HISTORY_STEPS = 192
 #: the wall clock the twin is held behind (the tests move it)
 _clock = time.time
 
@@ -243,7 +247,7 @@ def build_history(site_id: str, days: int, progress=None) -> None:
         t0 = twin.day_start_utc(day)
         plan = None
         if i >= OBSERVE_DAYS:
-            r = plans.tick(site_id, at=t0, steps=96, time_limit=5.0)
+            r = plans.tick(site_id, at=t0, steps=HISTORY_STEPS, time_limit=5.0)
             plan = plans.get(site_id, r["plan_id"]) if r.get("plan_id") else None
         site = sites.full(site_id)
         _simulate_span(site, t0, t0 + 86400, plan)
@@ -252,7 +256,7 @@ def build_history(site_id: str, days: int, progress=None) -> None:
     # today: the morning plan, the minutes so far, then a full 48-hour plan from now
     now = _clock_minute()
     t0 = twin.day_start_utc(today)
-    r = plans.tick(site_id, at=t0, steps=96, time_limit=5.0)
+    r = plans.tick(site_id, at=t0, steps=HISTORY_STEPS, time_limit=5.0)
     _simulate_span(sites.full(site_id), t0, now, plans.get(site_id, r["plan_id"]) if r.get("plan_id") else None)
     plans.tick(site_id, at=now)
     for i in range(OBSERVE_DAYS, days):

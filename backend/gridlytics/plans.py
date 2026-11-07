@@ -396,9 +396,18 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "outage_now": bundle["outage"].get("observed"), "adherence": bundle["outage"].get("adherence"),
                "icp": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in (p.get("icp") or {}).items()},
                "overrides": p.get("overrides", []), "genset_state_unknown": bool(p.get("genset", {}) and p["genset"].get("unknown")),
-               "status_label": {"optimal": "Solved within tolerance", "feasible": "Solved within the time limit"}.get(res["status"], "Not solved"),
+               "status_label": _status_label(res),
                "solver": {"status": res["status"], "variables": res.get("variables"), "rows": res.get("rows"), "binaries": res.get("binaries"),
-                          "relaxed": res.get("relaxed"), "message": res.get("message"), "shed_rule_resolve": res.get("shed_rule_resolve")},
+                          "relaxed": res.get("relaxed"), "message": res.get("message"), "shed_rule_resolve": res.get("shed_rule_resolve"),
+                          # the limits are wall-clock time (HANDOFF 8.A.5): whether the published solve stopped at its limit, the gap it reached
+                          # and the limit itself, so a time-limited plan is visible (time_limited_recent) and can be solved again when idle
+                          "time_limited": bool(res.get("time_limited", res["status"] == "feasible")), "mip_gap": res.get("mip_gap"),
+                          "time_limit_s": float(time_limit), "solve_seconds": res.get("solve_seconds"),
+                          "threshold_repair": res.get("threshold_repair"),
+                          # a relaxed 24-hour retry: why the first solve failed, and whether it stopped at its limit (it then counts as
+                          # time-limited too); null where no retry ran
+                          "retry_of": res.get("retry_of"), "first_time_limited": res.get("first_time_limited"),
+                          "first_solve_seconds": res.get("first_solve_seconds")},
                "horizon_steps": p["T"], "control_release": release}
     if res["status"] in ("not_solved", "refused"):
         reason = res.get("message", "not solved")
@@ -501,6 +510,56 @@ def get(site_id: str, plan_id: str) -> dict | None:
     with store.connect() as con:
         r = con.execute("SELECT * FROM plans WHERE site_id = ? AND id = ?", (site_id, plan_id)).fetchone()
     return _plan_out(r) if r else None
+
+
+def _plan_time_limited(summary: dict) -> bool:
+    """Whether a stored plan came from a solve that stopped at its time limit: `solver.time_limited` where the tick stored it, else (a plan from
+    before it was stored) its solver status, since a solve is "feasible" only when it stopped at its limit with a plan."""
+    sv = (summary or {}).get("solver") or {}
+    if sv.get("first_time_limited"):
+        return True  # a relaxed retry put in place of a first solve that stopped at its limit without a plan
+    if "time_limited" in sv:
+        return bool(sv["time_limited"])
+    return sv.get("status") == "feasible"
+
+
+def _status_label(res: dict) -> str:
+    """The plan's solver status in words. A plan from a solve that stopped at its limit, or a relaxed retry after one, is "within the time
+    limit"; a threshold repair of a plan that finished inside its limit is named as such (the genset follows the site's controller replayed over
+    the plan, so it is feasible, never proven to the tolerance)."""
+    status = res.get("status")
+    if status not in ("optimal", "feasible"):
+        return "Not solved"
+    if res.get("time_limited", status == "feasible") or res.get("first_time_limited"):
+        return "Solved within the time limit"
+    if status == "feasible" and (res.get("threshold_repair") or {}).get("status") not in (None, "not_solved"):
+        return "Repaired to the site's controller"
+    return "Solved within tolerance" if status == "optimal" else "Solved within the time limit"
+
+
+def time_limited_recent(site_id: str, hours: float = 24.0, now: int | None = None) -> dict:
+    """The site's plans generated in the `hours` before `now` (epoch seconds; default the clock) and those whose solve stopped at its wall-clock
+    limit (HANDOFF 8.A.5), for a check that marks plan quality or solves again when the machine is idle. Returns `{site_id, hours, since, plans,
+    time_limited, share, items}`: `items` lists the time-limited plans, newest first, with `id`, `generated_at`, `belief_time`, `status`,
+    `solve_seconds`, `mip_gap`, `time_limit_s` and `relaxed_retry` (a relaxed 24-hour retry after a first solve that stopped at its limit without
+    a plan, which counts as time-limited). A failed solve (no plan) is counted in `plans` only."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    since = _iso(now - int(round(float(hours) * 3600)))
+    with store.connect() as con:
+        rows = con.execute("SELECT id, generated_at, belief_time, status, solve_seconds, summary FROM plans WHERE site_id = ? AND generated_at >= ? "
+                           "AND generated_at <= ? ORDER BY generated_at DESC, rowid DESC", (site_id, since, _iso(now))).fetchall()
+    items = []
+    for r in rows:
+        summary = json.loads(r["summary"] or "{}")
+        if r["status"] == "failed" or not _plan_time_limited(summary):
+            continue
+        sv = summary.get("solver") or {}
+        items.append({"id": r["id"], "generated_at": r["generated_at"], "belief_time": r["belief_time"], "status": r["status"],
+                      "solve_seconds": r["solve_seconds"], "mip_gap": sv.get("mip_gap"), "time_limit_s": sv.get("time_limit_s"),
+                      "relaxed_retry": bool(sv.get("first_time_limited"))})
+    n = len(rows)
+    return {"site_id": site_id, "hours": float(hours), "since": since, "plans": n, "time_limited": len(items),
+            "share": round(len(items) / n, 3) if n else 0.0, "items": items}
 
 
 def history(site_id: str, limit: int = 50) -> list[dict]:
