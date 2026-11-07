@@ -34,8 +34,8 @@ refer to it. You can work without it: the code, `docs/DESIGN_LOG.md` and this pa
   push, and leave pull requests to the owner.
 - The two repositories must sit side by side in one folder: the launcher and tests find each other as `../gridlytics-backend` and
   `../gridlytics-frontend`.
-- Tests at the last update: backend 423 passed and 7 skipped; web app 222 passed, typecheck and build clean. A scripted browser check visited 405
-  pages across four roles, a phone width (375 px) and the founder console, with 0 failures.
+- Tests at the last update (7 Nov, after round 5): backend 495 passed and 7 skipped; web app 257 passed, typecheck and build clean. A scripted
+  browser check visited 405 pages across four roles, a phone width (375 px) and the founder console, with 0 failures.
 
 ## 3. Set up a machine
 
@@ -229,14 +229,17 @@ Each item says where to start and how to know it is done. Section 12 lists what 
 
 ### A. Engine and savings defects (known, measured)
 
-Round 4 (7 Nov, `2b0fce1`) closed the earlier items 2 and 3, the charge-slot half of 4, and made 5 visible; see DESIGN_LOG "Round 4". What is left:
+Round 4 (`2b0fce1`) closed the earlier items 2 and 3, the charge-slot half of 4, and made 5 visible; round 5 (`012cb4f`, `f973b3b`) closed the
+farm's genset item. See DESIGN_LOG "Round 4" and "Round 5". What is left:
 
-1. **Off-grid farm, genset below its minimum load (round 5, in progress).** Plans do not count on charging from the genset (no slot table can
-   ask for it), so at night, with the load under the set's minimum output, the plan cannot run the set: it sheds instead, and the operator makes
-   rescue starts. On site the set's minimum-load surplus does charge the battery (`twin.simulate`: output = max(f_min x S, load - PV)).
-   - The fix is to model exactly that in `optimise.solve`: on grid-down steps the battery may take only the minimum-load surplus.
-   - Make the plan's off-grid terminal value use the ledger's rule (`verify.night_load_ratio`).
-   - Evidence: paired 14-day farm rebuilds, plus one Karachi rebuild to show no harm.
+1. **Off-grid per-day savings are noisy (round 5 finding).** At the off-grid demo farm, the per-day ledger differs from a continuous 11-day
+   replay by -6.2k to +7.9k Rs across seeds. The carry-over lever swings by tens of thousands of rupees and largely offsets the genset lever.
+   - Start in `verify.compute_day` (`carry_over`, `v_end`).
+   - Option: price carry-over at what the native arm actually saves the next day. Replay that day natively from both end states, holding the
+     day as provisional until then.
+   - Option: score off-grid days in multi-day blocks.
+   - Done when the per-day ledger tracks the continuous replay within about Rs 1k over 11 days on paired farm rebuilds, for several seeds.
+     Customers see the per-day ledger, so this comes before a pilot at an off-grid site.
 2. **The 2-slot compile, properly.** The plan asks for boundaries ranked by a twin-priced value. v1 ranks them by energy moved, with a rule that a
    non-discharging run folds into a non-discharging neighbour (`delivery.compile_mode_a`).
 3. **Plan quality still depends on CPU load:** the limits are wall-clock time. Plans now record `time_limited` and `mip_gap`, and
@@ -249,7 +252,7 @@ Round 4 (7 Nov, `2b0fce1`) closed the earlier items 2 and 3, the charge-slot hal
 Round 4 wired all five earlier items: resume a draft, remove a connection, the connection idempotency key, the tier sign-off and the bill's
 printed reading dates, plus a fuel price's source.
 
-Round 5 (in progress) shows the newer fields:
+Round 5 shows the newer fields:
 - the "genset data missing" withheld claim;
 - the plan's time-limit and controller-repair notes;
 - a charge slot's end time;
@@ -286,6 +289,8 @@ One ask has no route: an active site cannot be set back to observing.
 ## 9. Traps already met
 
 1. **Wall-clock solve limits:** a demo seeded while the test suite ran in parallel made visibly worse plans. Seed and benchmark on an idle machine.
+   The demo history re-plans every 3 hours, so a 14-day seed takes about 10 minutes on the build machine; the web app's default 21 days takes
+   about 15. `GRIDLYTICS_DEMO_REPLAN_HOURS=6` (or 24) is faster, but makes plans worse.
 2. **Git Bash path conversion:** Git Bash rewrites arguments that start with `/`. Set `MSYS_NO_PATHCONV=1` when passing such paths to scripts.
 3. **Line endings:** files must be LF (`.gitattributes` says `* text=auto eol=lf`). Windows tools may write CRLF; git normalises it on commit.
 4. **No console windows on Windows:** start background servers without a console (the launcher uses CREATE_NO_WINDOW; for Python use `pythonw`).
@@ -325,4 +330,4 @@ If you were given only the repositories, ask the owner for these. They are usefu
 | 2026-11-07 | Handoff checked by a fresh agent from a clean clone; ten gaps closed | `a90ea58` |
 | 2026-11-07 | Round 4 done: the PV model checked on PVGIS and NASA POWER data; savings over blank genset columns; threshold-genset repair; charge-slot end; time-limited plans recorded; web app wiring of 8.B. Backend 474 tests, web app 247 | `2b0fce1`, `d7396fd` |
 | 2026-11-07 | Small API asks met: DELETE /api/drafts/:id, tier_signoff on POST and PUT site answers, Idempotency-Key allowed by CORS | `57b3d10` |
-| 2026-11-07 | Round 5 started: the genset's minimum-load surplus in the plan, and the off-grid terminal value (8.A.1); the web app shows round 4's new fields (8.B). Uncommitted changes in `optimise.py`, `plans.py` or the web app's `src` are this round's unfinished work | in progress |
+| 2026-11-07 | Round 5 done: the genset's minimum-load surplus charges the battery in the plan (planned shed at the farm about 0, rescue starts about halved, solve times back near their old level); the off-grid terminal value uses the ledger's rule; the demo re-plans every 3 hours; the web app shows round 4's new fields. Backend 495 tests, web app 257, browser check 405 visits with 0 failures. Scratch demo month: Rs 18,739 | `012cb4f`, `f973b3b`, `54a00d8` |
