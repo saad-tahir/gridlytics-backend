@@ -21,6 +21,7 @@ from scipy.sparse import coo_matrix
 H = 0.25
 EPS_CURTAIL = 0.05     # Rs/kWh: keep PV unless export is capped and the battery is full
 EPS_CHARGE = 0.001     # Rs/kWh: a tie-break against charging and discharging at once
+SURPLUS_ROWS = True    # solve's grid-down rows on the set's surplus and the battery; a switch only for the tests that check they cut no plan off
 REASONS = ("hold_for_outage", "charge_from_pv", "charge_from_grid", "discharge_peak_window", "mdi_cap", "genset_on", "genset_off", "icp_flat_price",
            "terminal_value", "export_capped", "wear_margin_too_small", "forecast_guard", "operator_hold", "carry_outage", "self_consumption", "idle",
            "unserved")
@@ -105,6 +106,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     thr_t: list[int] = []
     thr_w: dict[int, int] = {}
     thr_z: dict[int, int] = {}
+    gen_surplus = genset_surplus_steps(p)
     # ---------------------------------------------------------------- genset
     if gen:
         S = gen["S"]
@@ -165,7 +167,11 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         forced = u_lb >= 1
         dump_ok = forced.copy()
         dump_ok[thr_t] = True
-        Pg = m.var("P", T, 0, S, H * gen["c_om"])
+        # with the grid down the set's output follows the load, never under its minimum (twin.simulate's outage branch): where the battery may take
+        # the minimum-load surplus (`genset_surplus_steps`), the output is capped at max(f_min S, served load - PV), so the battery takes the set's
+        # output only up to that surplus, never at full power (HANDOFF 8.A.1, round 5)
+        P_on = np.where(gen_surplus, genset_follow_cap(p), S)
+        Pg = m.var("P", T, 0, P_on, H * gen["c_om"])
         F = m.var("F", T, 0, np.inf, gen["c_fuel"])
         if fix_u is not None:
             # the threshold repair's schedule, fixed only here: the threshold steps, the forced dumps and the panel's free starts above are read
@@ -179,8 +185,19 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         # at a panel-started site the panel decides u: minimum up and down rows bind only the starts and stops the plan is free to make
         free_start = ~(auto & (u_lb >= 1))
         free_stop = ~(auto & (u_ub <= 0))
+        if fix_u is None:
+            # on the horizon's second day (re-planned long before it runs) a run with the grid down, where the set may run under a load below
+            # its minimum and store its surplus (`genset_surplus_steps`), starts and stops on the clock's hour marks, for solve time: its quarters
+            # are near-ties the solver otherwise has to tell apart. Grid-up steps keep their quarters, and so does the first day (held to hours
+            # there, a short outage shed a kWh rather than run another hour). Never on a soc_threshold controller's steps (thr_w), which start
+            # the set at any step. Timings with the surplus rows below: see there
+            quarter = np.asarray(p["ts"], dtype=np.int64)[:T] // 900 % 4
+            for t in range(96, T):
+                if (gen_surplus[t] and gen_surplus[t - 1] and quarter[t] and u_lb[t] == u_lb[t - 1] and u_ub[t] == u_ub[t - 1]
+                        and t not in thr_w and t - 1 not in thr_w):
+                    m.row([u[t], u[t - 1]], [1, -1], 0, 0, name=f"second_day_hour[{t}]")
         for t in range(T):
-            m.row([Pg[t], u[t]], [1, -S], ub=0, name=f"gen_max[{t}]")
+            m.row([Pg[t], u[t]], [1, -float(P_on[t])], ub=0, name=f"gen_max[{t}]")  # the cap times u: a tighter relaxation
             m.row([Pg[t], u[t]], [-1, gen["f_min"] * S], ub=0, name=f"gen_min[{t}]")
             m.row([F[t], Pg[t], u[t]], [1, -H * gen["a"], -H * gen["b"] * S], 0, 0, f"fuel[{t}]")
             if t == 0:
@@ -266,12 +283,13 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         E = m.var("E", T + 1, e_lb, e_ub, cal)
         for t in range(T):
             m.row([E[t + 1], E[t], C[t], D[t]], [1, -1, -H * bat["eta_c"], H / bat["eta_d"]], 0, 0, f"soc[{t}]")
-            # charge sources: PV, and the grid or the genset only where allowed
+            # charge sources: PV, and the grid or the genset only where allowed (the genset's minimum-load surplus with the grid down: its
+            # output is capped there, see the genset block)
             cols, vals = [C[t], K[t]], [1, 1]
             if bat["a_grid"]:
                 cols.append(G[t])
                 vals.append(-1)
-            if gen and bat["a_gen"]:
+            if gen and (bat["a_gen"] or gen_surplus[t]):
                 cols.append(Pg[t])
                 vals.append(-1)
             m.row(cols, vals, ub=PV[t], name=f"charge_src[{t}]")
@@ -387,6 +405,29 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         v_end = max(0.0, bat["eta_d"] * term.get("c_next", 0.0) - c_cyc - term.get("c_cal_hold", 0.0))
         E_use = m.var("E_use", 1, 0, bat["P_dis"] * term.get("H_peak", 4.0) + term.get("R_next", 0.0), -v_end)[0]
         m.row([E_use, E[T]], [1, -1], ub=-Emin, name="terminal")
+    # ---------------------------------------------------------------- the set's surplus and the battery, with the grid down
+    if gen and bat and SURPLUS_ROWS and gen_surplus.any() and not thr_t:
+        # Two rows the balance implies on a grid-down step (no import, no export) once the set's state is 0 or 1, written out because the
+        # relaxation does not see them: with the set on, the battery takes what of its output the load less PV leaves (C >= P - n_on u - K - W),
+        # and with it off, the battery carries the load less PV (D >= n_off (1 - u) - U). Without them the relaxation runs the set at the
+        # fraction of its minimum load that just meets a night's load, storing nothing and losing no round trip, and the solver spent seconds
+        # closing that gap. They cut no plan off (tests/test_fix_r5_genset.py checks the optimum with and without them). Not where a
+        # soc_threshold controller starts the set in the horizon: its rows bind the set to the state of charge, and these only slowed those
+        # solves (the 400 L threshold farm: optimal in 5.4 s without them, 8.5 s to time-limited with them; 60 L: 0.3 s against 1.1 s).
+        # Timings (round 5; the demo farm's manual-start 192-step problems; an idle machine on mains power; 30 s limit; each problem solved by
+        # every version in turn), mean and worst, without these rows and the second day's hour marks / with them / HEAD (no surplus: its
+        # plans shed): 32 states from 3-hour marks of four days 4.5 s, 7.8 s / 2.1 s, 4.7 s / 1.9 s, 5.7 s; 26 midnight states of two daily
+        # rebuilds 3.8 s, 7.5 s / 1.8 s, 4.7 s / 1.9 s, 5.1 s; 48 states of a fresh farm 2.9 s, 8.5 s / 1.7 s, 4.6 s / 1.1 s, 3.2 s
+        served_on = L if (off_grid or lmode == 1) else Lc
+        for t in np.flatnonzero(gen_surplus):
+            n_on, n_off = float(served_on[t] - PV[t]), float(base_served[t] - PV[t])
+            cols, vals = [C[t], K[t], Pg[t], u[t]], [1, 1, -1, n_on]
+            if W is not None and dump_ok[t]:
+                cols.append(W[t])
+                vals.append(1)
+            m.row(cols, vals, lb=0, name=f"surplus_charge[{t}]")
+            if n_off > 1e-9:
+                m.row([D[t], U[t], u[t]], [1, 1, n_off], lb=n_off, name=f"off_discharge[{t}]")
     # ---------------------------------------------------------------- balance
     for t in range(T):
         cols, vals = [K[t], G[t], X[t], U[t]], [-1, 1, -1, 1]
@@ -600,10 +641,11 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
     - where a day's run-hour cap binds, the hours the threshold does not force count against it (as in the run_cap rows), and once it is used
       a run above the threshold stops, unless it is the plan's own start inside its minimum up time.
     A run the plan did not make follows the load (at least its minimum load). What the load leaves of PV and the set's output charges the
-    battery (from PV only, unless the genset may charge it), the rest is curtailed, then dumped; with the set off the battery carries the load,
-    and load is shed only for what its power or its energy above the cut-off cannot carry. The last of the tank is burnt at the output it can
-    still cover. A hold and a carried minimum up or down time are kept (`u_lb`, `u_ub`). Returns the schedule `u` and the replayed `E`, `U`,
-    `F` and `P`: a feasible point of the problem with the shed rule and that schedule."""
+    battery (from PV only, unless the genset may charge it: at full power, or its minimum-load surplus with the grid down), the rest is
+    curtailed, then dumped; with the set off the battery carries the load, and load is shed only for what its power or its energy above the
+    cut-off cannot carry. The last of the tank is burnt at the output it can still cover. A hold and a carried minimum up or down time are kept
+    (`u_lb`, `u_ub`). Returns the schedule `u` and the replayed `E`, `U`, `F` and `P`: a feasible point of the problem with the shed rule and
+    that schedule."""
     T = int(p["T"])
     bat, gen = p["battery"], p["genset"]
     L, PV = np.asarray(p["L"], dtype=float), np.asarray(p["PV"], dtype=float)
@@ -619,6 +661,9 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
     fuel = float(gen["fuel_available"])
     thr = {int(t) for t in thr_steps}
     dump = np.zeros(T, dtype=bool) if dump_ok is None else np.asarray(dump_ok, dtype=bool)
+    # the set's output may charge the battery at full power (a_gen), or only its minimum-load surplus with the grid down (a_gen_surplus): the
+    # replay's outputs never exceed max(f_min S, load - PV) where they are not the plan's own, so what the battery takes is that surplus
+    gen_ch = np.full(T, bool(bat.get("a_gen"))) | genset_surplus_steps(p)
     E = float(bat["E0"])
     u, Es, Us, Fs, Ps = np.zeros(T), np.zeros(T + 1), np.zeros(T), np.zeros(T), np.zeros(T)
     Es[0] = E
@@ -663,7 +708,7 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
                 # never more than the load PV leaves plus what the battery can take (the PV the set frees for it, or the set's own output
                 # where the genset may charge it), and at least the minimum load: no fuel is burnt only to be dumped above that minimum
                 room_c = max(0.0, Emax - E) / (H * eta_c)
-                useful = net + min(ch_ub[t], room_c, np.inf if bat.get("a_gen") else float(PV[t]))
+                useful = net + min(ch_ub[t], room_c, np.inf if gen_ch[t] else float(PV[t]))
                 P = min(S, max(f_min * S, min(float(P_plan[t]) if plan_on else net, useful)))
             burn = H * (a * P + b * S)
             if burn > fuel:
@@ -675,7 +720,7 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
             D = min(float(bat["P_dis"]), max(0.0, E - Emin) * eta_d / H, rest)
             Us[t] = rest - D
         else:
-            src = -rest if bat.get("a_gen") else min(-rest, float(PV[t]))
+            src = -rest if gen_ch[t] else min(-rest, float(PV[t]))
             C = min(ch_ub[t], max(0.0, Emax - E) / (H * eta_c), src)
         E += H * (eta_c * C - D / eta_d)
         fuel -= burn
@@ -866,6 +911,30 @@ def manual_floor_steps(floor: np.ndarray, g: np.ndarray, off_grid: bool = False)
         lapsed = lapsed or g[t] < 0.5
         out[t] = not lapsed
     return out
+
+
+def genset_surplus_steps(p: dict) -> np.ndarray:
+    """The steps on which the battery takes the genset's minimum-load surplus (`battery.a_gen_surplus`): every step with the grid down (an
+    outage, and every step off-grid), where the set's output follows the load and what its minimum load leaves over charges the battery on its
+    own (twin.simulate's outage branch), with no slot asking for it. Never with the grid up, and not where the plan may already charge from the
+    genset at full power (`a_gen`, a brand that supports it)."""
+    T = int(p["T"])
+    bat, gen = p.get("battery"), p.get("genset")
+    if not (bat and gen and bat.get("a_gen_surplus") and not bat.get("a_gen")):
+        return np.zeros(T, dtype=bool)
+    return np.asarray(p["g"], dtype=float)[:T] < 0.5
+
+
+def genset_follow_cap(p: dict) -> np.ndarray:
+    """The genset's output per step where it follows the load with the grid down: the load it serves less PV, never under its minimum load nor
+    over its rating (twin.simulate: gen = min(S, max(f_min S, served - PV))). The load served is the forecast load off-grid or where the set
+    carries the whole site in an outage (load_mode 1), else the critical load."""
+    T = int(p["T"])
+    gen = p["genset"]
+    S, f_min = float(gen["S"]), float(gen["f_min"])
+    L, Lc, PV = (np.asarray(p[k], dtype=float)[:T] for k in ("L", "Lc", "PV"))
+    served = L if (p.get("off_grid", False) or int(p.get("load_mode", 0)) == 1) else Lc
+    return np.minimum(S, np.maximum(f_min * S, served - PV))
 
 
 def shorten(p: dict, T: int) -> dict:

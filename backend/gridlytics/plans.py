@@ -149,6 +149,18 @@ def control_release(site_id: str, at: int | None = None) -> dict | None:
     return None
 
 
+def offgrid_c_next(g_asset: dict, fuel_price: float, load: np.ndarray, pv: np.ndarray) -> float:
+    """The off-grid terminal value's price of a kWh left in the battery at the horizon's end: the ledger's rule (verify.compute_day's v_end), the
+    genset's all-in cost per kWh at its after-dark load ratio (verify.night_load_ratio), here on the forecast load and PV of the horizon's last
+    day. Not at 75 % load: after dark the set carries a small load near its minimum, where its no-load burn and run-hour cost weigh on every kWh,
+    so the plan and the savings ledger value stored energy alike."""
+    from . import verify  # verify imports plans at module load
+
+    ratio = verify.night_load_ratio(g_asset, {"pv": np.asarray(pv, dtype=float), "load": np.asarray(load, dtype=float)})
+    return optimise._gen_marginal({"S": g_asset["rated_kw"], "a": g_asset["a"], "b": g_asset["b"], "c_fuel": float(fuel_price),
+                                   "c_om": g_asset["c_om_rs_per_kwh"], "c_runhr": g_asset["c_runhr_rs"]}, ratio)
+
+
 def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     conn = (site.get("connections") or [None])[0]
     a = site.get("assets") or {}
@@ -244,6 +256,9 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         bat = {"E_nom": e_nom, "E0": soc * e_nom, "sigma0": min(0.15, (bs.get("sigma_pct") or 5.0) / 100.0), "P_ch": b_asset["p_ch_kw"],
                "P_dis": b_asset["p_dis_kw"], "eta_c": b_asset["eta_c"], "eta_d": b_asset["eta_d"], "soc_min": b_asset["soc_min"],
                "soc_max": b_asset["soc_max"], "a_grid": bool(d.get("grid_charge_allowed", True)) and not off_grid, "a_gen": bool(d.get("gen_charge_allowed", True)) and delivery.GEN_CHARGE_SUPPORTED,
+               # with the grid down the set's output follows the load and its minimum-load surplus charges the battery on its own, with no slot
+               # asking for it (twin.simulate's outage branch), so the plan counts on that much and no more (optimise.genset_surplus_steps)
+               "a_gen_surplus": bool(d.get("gen_charge_allowed", True)),
                "c_cyc": optimise.wear_cost(b_asset),
                "b_cal": optimise.calendar_slope(temp, b_asset["replacement_cost_per_kwh"]) if d.get("calendar_cost_on", True) else np.zeros(steps),
                "charge_block": mask["charge_block"]}
@@ -254,6 +269,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
             p["reserve_manual_hold"] = hold_pct / 100.0 * e_nom
             p["reserve_manual_force"] = force_pct / 100.0 * e_nom
         c_next = float(np.max(vec["c_imp"][-96:])) if not off_grid else p["c_short"]
+        if off_grid and gen:
+            c_next = offgrid_c_next(g_asset, gen["c_fuel"], L[-96:], PV[-96:])
         lam = p_out.get("lam_day") or 0.0
         r_next = float(np.mean(Lc)) * 2.0 / b_asset["eta_d"] if (lam > 0.5 or off_grid) else 0.0
         p["terminal"] = {"c_next": c_next, "H_peak": 4.0, "R_next": r_next, "c_cal_hold": float(np.mean(bat["b_cal"][:32])) if steps else 0.0}
