@@ -212,3 +212,44 @@ def test_held_info_names_a_release_to_native_and_a_guard_hold(company, monkeypat
     r = plans.tick(other)
     assert r["status"] == "held"
     assert plans.held_info(other) == {"reason": "guard_test", "until": None, "plan_id": r["plan_id"]}
+
+
+# ------------------------------------------------------------------------------------------------ demo-savings diagnosis (lead, after round 3)
+
+def _steps_for(modes_kw: list[tuple[str, float, float]], t0: int = 1794000000 // 86400 * 86400 - 5 * 3600) -> list[dict]:
+    """Plan steps for one local day from (reason, charge_kw, discharge_kw) per quarter, 96 of them."""
+    out = []
+    for i, (reason, ch, dis) in enumerate(modes_kw):
+        out.append({"t": t0 + 900 * i, "charge_kw": ch, "discharge_kw": dis, "grid_import_kw": 900.0 if ch > 0 else 400.0, "grid_export_kw": 0.0,
+                    "soc_start_pct": 50.0, "soc_pct": 50.0, "reserve_pct": 20.0, "genset_on": False, "reason": reason, "grid_present": 1,
+                    "pv_kw": 0.0, "load_kw": 400.0, "grid_charge_permitted": True})
+    return out
+
+
+def test_a_hold_before_the_evening_discharge_folds_into_the_charge_not_the_discharge():
+    """Sungrow allows 2 slots a day. A plan of night charging, an afternoon hold and a peak discharge used to compile as charge then a discharge slot
+    starting at the hold (16:00): the device emptied the battery off-peak. The hold now folds into the charge slot and the discharge keeps its start."""
+    from gridlytics import delivery
+    day = [("charge_from_grid", 100.0, 0.0)] * 24 + [("hold_for_outage", 0.0, 0.0)] * 59 + [("discharge_peak_window", 0.0, 250.0)] * 13
+    steps = _steps_for(day)
+    for i, st in enumerate(steps):  # the battery state the intents read
+        st["soc_pct"] = st["soc_start_pct"] = min(90.0, 20.0 + i * 3) if i < 24 else (90.0 if i < 83 else 90.0 - (i - 82) * 5)
+    out = delivery.compile_mode_a(steps, "sungrow", {"E_nom": 1000.0, "soc_min": 0.1, "soc_max": 0.95}, 20.0, 10.0, 900.0)
+    slots = out["days"][0]["slots"]
+    assert len(slots) <= 2
+    dis = [s for s in slots if s["mode"] in delivery.DISCHARGING]
+    assert dis and dis[0]["start_ts"] == steps[83]["t"], slots           # the discharge starts where the plan's does (20:45 local), not at the hold
+    charge = [s for s in slots if s["mode"].startswith("charge")]
+    assert charge and charge[0]["grid_cap_w"] == 900_000                  # a charging slot is capped at the plan's MDI cap, not its largest import
+
+
+def test_plans_never_count_on_charging_from_the_genset_which_no_brand_can_be_told_to_do(company):
+    from gridlytics import delivery
+    assert delivery.GEN_CHARGE_SUPPORTED is False
+    sid = _site()
+    full = sites.full(sid)
+    assert full["data"].get("gen_charge_allowed", True) is True
+    t0 = _now_t0()
+    p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 96)
+    assert p["battery"]["a_gen"] is False                                    # the flag is kept, but the plan does not count on it
+    # (the off-grid "charge only from PV beyond the load" row was tried and dropped: it made the 120 L farm solve 23 s against 6 s)

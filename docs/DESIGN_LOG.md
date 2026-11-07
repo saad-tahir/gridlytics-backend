@@ -2,6 +2,42 @@
 
 Newest first. Each entry says what was decided, why, and where the plan (`EMS_BUILD_PLAN.md`) says otherwise.
 
+## 2026-11-07 The demo's negative savings: plan and delivery out of step
+
+The end-to-end walk on a freshly seeded demo showed the fleet losing money: Rs -13,409 for the month, from the Karachi feed mill and the off-grid
+farm. Two read-only investigators traced it to three product defects. In each, the plan asked for something the compiled slot table cannot make a device
+do. The ledger was pricing fairly: the per-day ledger landed within about Rs 1,000 of an 11-day continuous replay.
+
+- **Charging from the genset:** the optimiser planned short full-power genset runs that charged the battery. No brand grammar has a
+  charge-from-genset slot, and on site the genset input only follows the load. At the farm the plan expected 1,675 kWh of genset charging and the twin
+  delivered 66 kWh. The battery sat near its floor after each run, and 30 of 42 starts were rescues (native made 22). The plan now never counts on it:
+  `a_gen` is `gen_charge_allowed` and `delivery.GEN_CHARGE_SUPPORTED`, which is False. The site flag stays stored for the day a brand supports it.
+  A second row was tried and dropped: "off-grid, charge only from PV beyond the load". It closes a small loophole (PV charging while the genset
+  carries the load), worth about Rs 2,400 over 11 days at the farm. But it made the 120 L farm solve take 23 s against 6 s, and a tick has 10 s.
+- **The 2-slot compile:** to fit Sungrow's 2 slots, `compile_mode_a` dropped the run that moved the least energy. A hold run moves none, so it always
+  folded into its neighbour with more energy: the evening discharge. That discharge then started at 15:00-17:00 instead of the plan's 20:45, emptied the
+  battery off-peak, and had nothing left for the 18:30-22:30 peak. A run that does not discharge now folds into a neighbour that does not discharge,
+  where there is one. (Part 7.1 asks for boundaries ranked by a twin-priced value; this rule fixes the case at hand, and the full ranking stays a
+  later item.)
+- **The charge slot's demand cap:** a merged charge slot charges at its mean planned rate across its whole span, including the morning block that sets
+  the month's maximum demand. Its `grid_cap_w` was the larger of the largest planned import and the MDI cap, so it never stopped the charge, and the
+  monthly MDI rose by 16-19 kW. A charging slot is now capped at the plan's MDI cap alone.
+
+Replays from the investigators: the farm goes from about -17,900 to +7,400 to +8,300 Rs over 11 days, and the Karachi period from -42,200 to about
++54,300 (daily levers plus MDI). Days without an outage stay honestly negative, about -1,100 to -1,250 each. That is the premium for holding the
+outage reserve, which the outage days repay.
+
+Karachi rebuilt from scratch for 14 days, one configuration at a time:
+
+| Configuration | Total | MDI lever |
+|---|---|---|
+| Old compiler | +21.1k | +5.6k |
+| Compiler fixes with genset charging planned | +35.8k | -24.1k |
+| Both fixes | +39.3k | +3.4k |
+
+**Wall-clock limits:** plan quality depends on CPU load, because the solve limits (5 s in the demo build, 10 s per tick) are wall-clock time. A demo
+seeded while the test suite ran in parallel made visibly worse plans. Seed the demo on an otherwise idle machine.
+
 ## 2026-11-07 Review fixes, round 3, and the web app's backend asks
 
 ### Optimiser

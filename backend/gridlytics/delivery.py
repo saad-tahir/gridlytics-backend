@@ -87,6 +87,15 @@ def step_intents(steps: list[dict], battery: dict | None) -> list[dict]:
     return out
 
 
+#: No brand grammar has a charge-from-genset slot yet ("gen_charge" is always False), so the plan must not count on one: on site the genset input
+#: only follows the load. A plan that charged from the genset left the battery near its floor after every run and forced rescue starts
+#: (the off-grid demo farm: 42 starts against native's 22). Set True only with a compiled mode and a twin that executes it.
+GEN_CHARGE_SUPPORTED = False
+
+#: The slot modes in which the battery may discharge (the compiler never folds a hold or charge run into one of these when it can avoid it)
+DISCHARGING = ("discharge", "export", "self_use")
+
+
 def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback_floor_pct: float, bms_low_pct: float = 10.0,
                    mdi_cap_kw: float | None = None) -> dict:
     """Slots per local day: merge equal intents, fold runs shorter than the brand's minimum into a neighbour, then drop the least valuable
@@ -121,13 +130,23 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
             runs[min(k, into)] = merged
             del runs[max(k, into)]
 
+        def neighbour(k: int) -> int:
+            # a run that does not discharge folds into a neighbour that does not discharge where there is one: a hold or idle run moves no energy,
+            # so the energy rule alone always folded it into the next discharge run, which then started hours early and emptied the battery
+            # off-peak before the peak it was planned for (the 2-slot Sungrow grammar did this on 9 of 11 demo days)
+            cands = [j for j in (k - 1, k + 1) if 0 <= j < len(runs)]
+            if runs[k]["mode"] not in DISCHARGING:
+                cands = [j for j in cands if runs[j]["mode"] not in DISCHARGING] or cands
+            if len(cands) == 1:
+                return cands[0]
+            return k - 1 if runs[k - 1]["energy"] >= runs[k + 1]["energy"] else k + 1
+
         changed = True
         while changed and len(runs) > 1:
             changed = False
             for k, r in enumerate(runs):
                 if r["end"] - r["start"] < min_steps:
-                    nb = k - 1 if k > 0 and (k == len(runs) - 1 or runs[k - 1]["energy"] >= runs[k + 1]["energy"]) else k + 1
-                    merge(k, nb)
+                    merge(k, neighbour(k))
                     changed = True
                     break
         k = 1
@@ -138,8 +157,7 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                 k += 1
         while len(runs) > gram["max_slots"]:
             k = min(range(len(runs)), key=lambda j: runs[j]["energy"])
-            nb = k - 1 if k > 0 and (k == len(runs) - 1 or runs[k - 1]["energy"] >= runs[k + 1]["energy"]) else k + 1
-            merge(k, nb)
+            merge(k, neighbour(k))
         slots = []
         for r in runs:
             s0, s1 = steps[r["start"]], steps[r["end"] - 1]
@@ -157,7 +175,10 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                           "start_ts": int(s0["t"]), "end_ts": int(s1["t"] + 900), "mode": mode, "soc_floor_pct": round(floor, 1),
                           "soc_target_pct": round(target, 1), "max_discharge_w": round(max_dis * 1000) if mode in ("discharge", "export") else None,
                           "max_charge_w": round(max_ch * 1000) if mode.startswith("charge") else None, "grid_charge": mode == "charge_grid",
-                          "grid_cap_w": round(max(grid_cap, mdi_cap_kw) * 1000) if mdi_cap_kw else (round(grid_cap * 1000) if mode == "charge_grid" else None),
+                          # a charging slot never imports above the plan's MDI cap: its mean rate runs through the morning peak that sets the month's
+                          # maximum demand, which the plan's own night-only charging never touched; other slots shave to the higher of the two
+                          "grid_cap_w": (round((mdi_cap_kw if mode.startswith("charge") else max(grid_cap, mdi_cap_kw)) * 1000) if mdi_cap_kw
+                                         else (round(grid_cap * 1000) if mode == "charge_grid" else None)),
                           "gen_charge": False, "export_allowed": mode == "export",
                           "genset": any(st["genset_on"] for st in steps[r["start"]:r["end"]]) or None,
                           "intent": _intent_words(mode, floor, target)})

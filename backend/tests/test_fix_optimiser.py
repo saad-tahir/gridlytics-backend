@@ -319,7 +319,8 @@ def test_the_charge_source_flags_are_site_fields_and_reach_the_battery(company):
     sid2 = _site()
     full2 = sites.full(sid2)
     p2 = plans.build_problem(full2, t0, forecast.issue(full2, t0, save=False), 96)
-    assert p2["battery"]["a_gen"] is True  # the twin charges from genset surplus; so does the plan unless the site says not
+    # the flag is stored, but no brand can be told to charge from the genset (delivery.GEN_CHARGE_SUPPORTED), so the plan never counts on it
+    assert full2["data"].get("gen_charge_allowed", True) is True and p2["battery"]["a_gen"] is False
 
 
 # ------------------------------------------------------------------------------------------------ optimiser-soc-threshold-unmodelled
