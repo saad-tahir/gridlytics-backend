@@ -25,8 +25,10 @@ refer to it. You can work without it: the code, `docs/DESIGN_LOG.md` and this pa
 
 | Repository | Path on the build machine | Branch | Head | Contents |
 |---|---|---|---|---|
-| `gridlytics-backend` | `C:\Users\SaadTahir\Videos\gridlytics-backend` | `v1-build` (from a baseline on `main`) | `fc49e3a` | Python 3.12 API and engine |
-| `gridlytics-frontend` | `C:\Users\SaadTahir\Videos\gridlytics-frontend` | `v1-build` (from a baseline on `main`) | `3282a14` | React 19 web app |
+| `gridlytics-backend` | `C:\Users\SaadTahir\Videos\gridlytics-backend` | `v1-build` (from a baseline on `main`) | at or after `fc49e3a` (last code fix before this page) | Python 3.12 API and engine |
+| `gridlytics-frontend` | `C:\Users\SaadTahir\Videos\gridlytics-frontend` | `v1-build` (from a baseline on `main`) | at or after `3282a14` | React 19 web app |
+
+`git log` on `v1-build` is the authority on what is in; section 12 below logs the work after this page was written.
 
 - Both repositories are local only: no remote, never pushed. The owner creates the GitHub pair and pushes. Commit to `v1-build`, never merge, never
   push, and leave pull requests to the owner.
@@ -37,22 +39,27 @@ refer to it. You can work without it: the code, `docs/DESIGN_LOG.md` and this pa
 
 ## 3. Set up a machine
 
-The build machine is Windows 11 using Git Bash. Linux or macOS work the same, with `bin/` in place of `Scripts\`.
+The build machine is Windows 11 using Git Bash, and every command on this page is a Git Bash command. Linux or macOS work the same, with `bin/` in
+place of `Scripts\`. **Each command block starts in the folder that holds both repositories.**
 
 ### Backend
 
-1. Install Python 3.12 (3.12.11 was used). Any CPython 3.12 works; on the build machine it was the conda env `ops`.
-2. Make the repository's own venv in `.scratch\venv`. The launcher looks for it there.
+1. Install Python 3.12 (3.12.11 was used). Any CPython 3.12 works. If `python3.12` and `py -3.12` do not exist, use the interpreter's full path.
+   On the build machine that is `C:\Users\SaadTahir\anaconda3\envs\ops\python.exe`. Its PATH `python` is the Microsoft Store alias, which does not
+   work.
+2. Make the repository's own venv in `.scratch\venv`. The launcher looks for it there. The install needs internet (PyPI).
 
    ```bash
    cd gridlytics-backend
-   python3.12 -m venv .scratch/venv          # on Windows: py -3.12 -m venv .scratch/venv
+   python3.12 -m venv .scratch/venv          # on Windows: py -3.12 -m venv .scratch/venv, or <full path to python 3.12> -m venv .scratch/venv
    .scratch/venv/Scripts/python.exe -m pip install -r requirements-dev.txt
    ```
 
    The pins are in `requirements.txt`: fastapi 0.141.1, pydantic 2.13.4, numpy 2.4.3, scipy 1.17.1 (the MILP runs on its HiGHS), pandas 3.0.2,
    APScheduler 3.11.0, reportlab 4.4.4, cryptography 46.0.3. Dev adds pytest 8.4.2 and pytest-xdist.
-3. Run the tests: `cd backend && ../.scratch/venv/Scripts/python.exe -m pytest tests -q -n 4`. They take about 2 minutes.
+3. Run the tests: `cd gridlytics-backend/backend && ../.scratch/venv/Scripts/python.exe -m pytest tests -q -n 4`. They take about 2 minutes.
+   - 7 tests are skipped on purpose: they were lifted from Solarlytics and assert its own data (the list is in `tests/conftest.py`).
+   - About 20 "Mean of empty slice" warnings are expected (numpy on days without data).
 
 ### Web app
 
@@ -62,10 +69,10 @@ The build machine is Windows 11 using Git Bash. Linux or macOS work the same, wi
    ```bash
    cd gridlytics-frontend/frontend
    npm ci
-   npm run typecheck && npm test -- --run && npm run build
+   npm run gates          # typecheck, tests (vitest run) and build
    ```
 
-   `npm run gates` runs all three.
+   `npm test` runs vitest once (it is already `vitest run`); `npm run build` type-checks again.
 
 ### Seed the data folder and run the app
 
@@ -86,9 +93,10 @@ mkdir -p "$DATA"
 GRIDLYTICS_DATA_DIR="$DATA" ../.scratch/venv/Scripts/python.exe -m gridlytics.seed_demo --demo-days 14 --out "$DATA/DEMO_ACCOUNTS.local.md"
 ```
 
-The seed writes:
-- the account passwords to `DEMO_ACCOUNTS.local.md` (git-ignored; never paste them anywhere);
-- the founder console's login settings to `.env.founder`, in the data folder.
+The seed writes to the data folder (all git-ignored; never paste their contents anywhere):
+- the account passwords, and the founder console's login and code secret, to `DEMO_ACCOUNTS.local.md`;
+- the founder console's settings to `.env.founder`;
+- the platform's signing secret to `platform.secret`.
 
 Start the API and the web app together, from the frontend repository:
 
@@ -103,7 +111,25 @@ accounts file. The founder console is at `/admin`. Without `--scratch` the launc
 The launcher:
 - runs the scheduler (the 15-minute tick and the nightly jobs);
 - starts its children without console windows;
-- refuses a second server on the same data folder.
+- refuses a second server on the same data folder, using a lock file `gridlytics-data-<hash>.lock` in the system temp folder;
+- runs in the foreground until Ctrl+C, which stops both servers. If you start it in the background, stop the whole process tree (on Windows
+  `taskkill /T /F /PID <launcher pid>`), or uvicorn and Vite keep running;
+- takes other ports from `GRIDLYTICS_API_PORT` and `GRIDLYTICS_WEB_PORT`. It refuses a busy port, and with `--scratch` it refuses the owner's 8051
+  and 5195. The browser check's `--web` must then match.
+
+### Calling the API from a script
+
+`POST /api/local/session` with `{"email": ..., "password": ...}` answers an `access_token`. Send it as `Authorization: Bearer <token>`. For
+example, with httpx:
+
+```python
+import httpx
+c = httpx.Client(base_url="http://127.0.0.1:8151")
+tok = c.post("/api/local/session", json={"email": "owner@onyxleaf.demo", "password": PASSWORD}).json()["access_token"]
+print(c.get("/api/fleet", headers={"Authorization": f"Bearer {tok}"}).json())
+```
+
+`GET /api/health` needs no sign-in.
 
 ### The browser check
 
@@ -159,10 +185,12 @@ React 19, TypeScript, Vite, Tailwind 4, TanStack Query, zustand, Radix, ECharts.
 - `lib/format.ts` holds the number rules ("Rs 1,234,567", kW with one decimal under 100).
 - `lib/time.ts` holds Pakistan time.
 
-Docs:
-- `docs/API_CONTRACT.md` maps each screen to the routes and fields it uses.
-- `docs/BACKEND_ASKS.md` lists what the web app still wants from the API.
-- `docs/BUILD_NOTES.md` is the build log, with its traps.
+Docs (in `gridlytics-frontend/docs`):
+- `HANDOFF.md`: the web app's state and next work.
+- `API_CONTRACT.md`: each screen's routes and fields.
+- `BACKEND_ASKS.md`: what the web app still wants from the API.
+- `GATES.md`: the checks and their last results.
+- `BUILD_NOTES.md`: the build log, with its traps.
 
 Rules the pages keep:
 - Never write "optimal", "guaranteed" or "maximum savings".
@@ -266,8 +294,9 @@ Each item says where to start and how to know it is done. Section 12 lists what 
 6. **Timing-sensitive tests:** a few optimiser tests time a farm solve. They pass on an idle machine and under `-n 4`, but can flake on a slow one.
    Re-run before chasing them.
 7. **Password parsing:** the accounts file is a Markdown table; read the cell after the email, not a fixed column.
-8. **Preview tools:** the build machine had a preview launch configuration in `C:\Users\SaadTahir\Videos\.claude\launch.json` (the scratch launcher).
-   It is machine-local, not part of either repository.
+8. **Preview tools:** `gridlytics-frontend/.claude/launch.json` (tracked) starts the scratch launcher for Claude Code's preview pane. The build
+   machine also has `C:\Users\SaadTahir\Videos\.claude\launch.json` with absolute paths, which is machine-local and in neither repository.
+9. **The accounts file holds the founder's secrets too.** Printing the file to look at its layout prints them. Read only the cell you need.
 
 ## 10. A first hour for a new developer
 

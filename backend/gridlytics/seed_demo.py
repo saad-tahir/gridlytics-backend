@@ -1,6 +1,6 @@
 """The demo companies, people and passwords (the owner's decisions of 24 October 2026, section 6; stage D1 of the sign-in and split).
 
-    python -m solarlytics.seed_demo [--reset-passwords] [--from companies.csv users.csv] [--out <file>]
+    python -m gridlytics.seed_demo [--reset-passwords] [--from companies.csv users.csv] [--out <file>]
 
 Local mode only: in supabase mode the accounts are the Gridlytics project's, and the founder console makes them there. The seed does what the founder
 console and the companies' owners would do, with their own functions, so that the founder's audit and each company's audit read as theirs:
@@ -290,7 +290,7 @@ def _founder_login(reset: bool, earlier: str | None) -> dict:
               "GRIDLYTICS_FOUNDER_TOTP_SECRET": secret or mfa.new_secret(),
               "GRIDLYTICS_FOUNDER_SESSION_SECRET": session if session and not reset else secrets.token_urlsafe(48)}
     # Quoted: the PBKDF2 hash holds $ signs, which a shell or docker compose would read as variables
-    _write_private(path, f"# The founder console's login, made by python -m solarlytics.seed_demo on {datetime.now():%Y-%m-%d %H:%M} for a demonstration "
+    _write_private(path, f"# The founder console's login, made by python -m gridlytics.seed_demo on {datetime.now():%Y-%m-%d %H:%M} for a demonstration "
                          "in local mode.\n# The API reads these four settings from its environment only: load this file into the environment of the process "
                          "that starts it.\n# Git ignores this file (.env.*): never commit it. The password itself is in the demo's accounts list.\n"
                          + "".join(f"{k}='{v}'\n" for k, v in values.items()))
@@ -449,12 +449,12 @@ def _accounts_text(companies: list, people: list, passwords: dict, login: dict |
     lines = [
         "# Demo accounts",
         "",
-        f"Made by `python -m solarlytics.seed_demo` on {datetime.now():%Y-%m-%d %H:%M} for the data folder `{platformdb.data_dir()}` (local mode).",
+        f"Made by `python -m gridlytics.seed_demo` on {datetime.now():%Y-%m-%d %H:%M} for the data folder `{platformdb.data_dir()}` (local mode).",
         "Git ignores this file: never commit it, and never paste a password from it into a chat, a ticket or an email.",
         "",
         "## Gridlytics",
         "",
-        "Start the app (`python scripts/start_local.py` in the web repository, `solarlytics-web`, beside this one, on this data folder) and sign in with an",
+        "Start the app (`python scripts/start_local.py` in the web repository, `gridlytics-frontend`, beside this one, on this data folder) and sign in with an",
         "address and its password. The company's owner chooses the others' roles under Settings, Users and audit.",
         "",
         "| Company | Name | Email | Password | Company role | Gridlytics role |",
@@ -469,7 +469,7 @@ def _accounts_text(companies: list, people: list, passwords: dict, login: dict |
             "",
             "## The founder console",
             "",
-            "The console is the web app's `/admin` page (with the launcher, `http://127.0.0.1:5192/admin`). It signs in with the username, the password and the",
+            "The console is the web app's `/admin` page (with the launcher, `http://127.0.0.1:5195/admin`, or port 5295 with `--scratch`). It signs in with the username, the password and the",
             "six-digit code of an authenticator app.",
             "",
             f"- **Username:** `{login['username']}`",
@@ -487,7 +487,7 @@ def _accounts_text(companies: list, people: list, passwords: dict, login: dict |
             "",
             "Until the four are set, the console says it is not set up on this server.",
             "",
-            "**The current code without an app:** with the settings loaded as above, in `backend/`: `python -m solarlytics.founder code`. It reads the code",
+            "**The current code without an app:** with the settings loaded as above, in `backend/`: `python -m gridlytics.founder code`. It reads the code",
             "secret from the environment; never type the secret itself on a command line, which the shell's history keeps.",
         ]
     return "\n".join(lines) + "\n"
