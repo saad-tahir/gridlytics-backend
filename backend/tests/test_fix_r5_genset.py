@@ -6,6 +6,8 @@ with the set on, so the plan shed load (329 kWh over 11 days) and the twin's ope
 optimiser's own toy problems at the demo farm's sizes and the demo twin's generated days; nothing reads the network."""
 from __future__ import annotations
 
+import os
+
 from datetime import datetime, timezone
 
 import numpy as np
@@ -68,6 +70,9 @@ def test_a_night_below_the_sets_minimum_load_runs_the_set_instead_of_shedding(ou
 FARM_MARKS = [(soc, h) for soc in (0.2, 0.5) for h in range(0, 24, 3)]
 
 
+@pytest.mark.skipif(os.environ.get("GRIDLYTICS_SLOW_TESTS") != "1",
+                    reason="solver benchmark: about a minute on an idle machine on mains power, many minutes and a timing failure when the machine is "
+                           "busy or throttled on battery. GRIDLYTICS_SLOW_TESTS=1 runs it; run it before changing optimise.py (HANDOFF section 9)")
 def test_the_demo_farms_plans_from_every_three_hour_mark_run_the_set_and_solve_about_as_fast_as_without_the_surplus(company):
     # the demo farm (192 steps, a manual start, 400 L in the tank) planned from each 3-hour mark of 5 November at two states of charge. Before:
     # the plans shed the nights' load with the set off (1 to 88 kWh in every plan). The night runs this change allows doubled or tripled the

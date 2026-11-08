@@ -316,6 +316,9 @@ One ask has no route: an active site cannot be set back to observing.
    `routes_common.state_change`). A new company's telemetry file is created under a process lock.
 6. **Timing-sensitive tests:** a few optimiser tests time a farm solve. They pass on an idle machine and under `-n 4`, but can flake on a slow one.
    Re-run before chasing them.
+   - A laptop on battery throttles enough to make solves hit their limits. Run the suite on mains power.
+   - One solver benchmark (`test_fix_r5_genset.py`, every 3-hour mark of the farm) is skipped unless `GRIDLYTICS_SLOW_TESTS=1`. When throttled, it
+     ran for over 20 minutes and failed. Run it on an idle machine before you change `optimise.py`.
 7. **Password parsing:** the accounts file is a Markdown table; read the cell after the email, not a fixed column.
 8. **Preview tools:** `gridlytics-frontend/.claude/launch.json` (tracked) starts the scratch launcher for Claude Code's preview pane. The build
    machine also has `C:\Users\SaadTahir\Videos\.claude\launch.json` with absolute paths, which is machine-local and in neither repository.
