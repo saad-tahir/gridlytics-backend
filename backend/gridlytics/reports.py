@@ -23,7 +23,7 @@ from . import plans, platform as platformdb, sites, store, telemetry, verify
 PKT = timezone(timedelta(hours=5))
 KINDS = ("monthly_savings", "energy_only", "daily_operations")
 LEVER_NAMES = {"peak_window": "Peak-window import avoided", "offpeak_energy": "Off-peak energy (charging)", "export": "Export credit",
-               "genset": "Genset fuel and running cost", "wear": "Battery wear", "carry_over": "Carry-over (stored energy at day end)",
+               "genset": "Genset fuel and running cost", "wear": "Battery wear", "carry_over": "Carry-over (change in stored energy)",
                "mdi": "Maximum demand (MDI)"}
 
 

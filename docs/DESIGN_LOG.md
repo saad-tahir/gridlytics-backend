@@ -2,6 +2,73 @@
 
 Newest first. Each entry says what was decided, why, and where the plan (`EMS_BUILD_PLAN.md`) says otherwise.
 
+## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
+
+Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in
+stored energy at v_end. At the off-grid farm the per-day ledger summed over 11 days missed a continuous replay by -6.2k to +7.9k Rs, and the
+carry-over lever swung by tens of thousands of rupees against the genset lever.
+
+- **Chained replays.** Each baseline's replay of a day starts from that baseline's own end state of the day before, as the twin carries it: state
+  of charge, genset on, minutes run, minutes into an outage, a rescue run (the twin keeps no tank). The state is stored with the day's row
+  (`chain.start`, `chain.end`).
+- **Carry-over is the change over the day in the valued gap:** v_end x (actual - baseline end energy), less the day before's v_end x (actual -
+  baseline start energy). Summed over a chain, this leaves one end-of-period energy term, as a continuous replay has. A genset run across midnight
+  is one start on each arm (`_genset_cost(on_before)`). The perfect-foresight bound subtracts the same start term.
+- **Where the chain restarts** from the actual arm's measured state (`verify._chain_starts`):
+  - the first scored day, after a day with no row (`gap`), and after a row stored before chaining;
+  - the first day of a switchback block that changes arm (plan 8.2, below);
+  - after a day that claims nothing **and** whose replay ran over unread minutes (`unread_inputs`): load or PV blank, or grid presence blank on a
+    grid connection (`chain.end.unread_min`).
+- **Why that last restart (verifier finding R6-withheld-day-replay-leak).** Chained through, a withheld day's replay ran on filled inputs (an
+  unread load counts as zero). It handed the next day, whose data was complete, a native state that was too full. On farm s7 a 19:00-23:00
+  dropout raised the next two days' claims by Rs 1,140. With the restart, the next day's claim rests on nothing the dropout hid: it is the claim
+  that day makes when the withheld day is not scored at all.
+  - A day that claims nothing on fully read inputs keeps the chain: a monitor site, a table not applied, or a day withheld for its grid meter,
+    battery or genset alone. Native's replay of such a day is valid, so the days around it claim exactly their complete-data claims (0 change on
+    3 seeds with the battery and genset blank for an evening).
+  - **Known limit:** after an unread dropout, native's true state at the next midnight is unknown, including its genset run, which dominates at
+    the farm. With the restart, the next day's claim moved by -802, +1,405 and +1,590 against its complete-data claim on three fresh farm seeds,
+    and by -685 on the verifier's s7. Chained through, the moves were +2,879, +1,378, +1,640 and +1,140. Other start states were probed (the
+    battery's floor or full, the actual's charge less the last valid gap, native's last genset run). None did better on every seed: s32 ranged
+    from +0.35k to +3.9k. Filling an unread load with the load forecast's equivalent day for the replay would be the real fix; it is a later item.
+- **Recompute.** `compute_day` reads the stored row of the day before. With `forward` (the default), it re-scores the later stored days whose
+  start no longer matches, up to 62 days or the first day with no row. `compute_range` (POST /savings/recompute) scores its days in order, then
+  walks forward once. `summary` lists `chain_stale_days`: days out of step because a day before them was re-scored on its own, or lies beyond the
+  62-day walk. The web app shows "Recompute needed". Each day row in the summary carries `baseline_start` (`actual` or `previous_day`).
+- **Chained at every site, grid-connected too.** On fresh paired rebuilds, HEAD's per-day sum missed the continuous replay by +18.2k at the
+  Karachi feed mill (s31; the verifier's s5: +20.8k). The chained ledger missed it by -1 Rs.
+- **A switchback site is held to the segmented replay (plan 8.2).** Each block's baseline is native from the block's measured start. The plan
+  block's last day credits the energy it hands to the native block at v_end, and the report shows that credit beside the saving.
+  - That hand-over credit can exceed what native makes of the energy in a replay straight through both blocks: Faisalabad s5 3,263 credited
+    against 1,771 realised; s31 4,276 against about 2,320. So the ledger sits above the pure continuous replay (s5 +1,492, s31 +1,955) and on
+    the segmented one (+0.02, -1).
+  - HEAD was -85 (s5) and +6,737 (s31) against the pure replay, and -1,577 and +4,782 against the segmented one. Its -85 at s5 came from daily
+    errors that happened to offset; HEAD already credited the hand-over at v_end.
+  - Valuing the hand-over at what the native block realises would leave the plan block's last day provisional until the native block ends.
+    That is a later item if pilots show it matters.
+  - The native block's days chain within the block from its measured start. The inverter ran native there, so they score about 0 and claim
+    nothing. Chaining through the plan-to-native boundary would show the unrealised part of the hand-over as a loss on days that claim nothing,
+    and change no claim, so it was not done.
+- **Lever label:** "Carry-over (change in stored energy)", in reports.py and in the web app (it was "stored energy at day end").
+- **Evidence.** Fresh paired 14-day rebuilds on 8 Nov, on an idle machine, with the default 3-hourly re-plans. Each site was built once with the
+  change (the ledger does not feed the build) and scored by HEAD's ledger and by the change's on two copies of the same telemetry. Native
+  baseline, Rs, over the 11 scored days 28 Oct to 7 Nov:
+
+  | Site, seed | HEAD ledger | Change | Continuous (end carry) | HEAD minus cont. | Change minus cont. |
+  |---|---|---|---|---|---|
+  | Farm s31 | 16,030 | 24,716 | 24,716 (7,138) | -8,686 | 0 |
+  | Farm s32 | 21,952 | 23,290 | 23,290 (4,767) | -1,338 | 0 |
+  | Farm s33 | 23,620 | 18,691 | 18,691 (5,016) | +4,929 | 0 |
+  | Karachi feed mill s31 | 16,648 | -1,570 | -1,568 (9,853) | +18,216 | -1 |
+  | Faisalabad mill s31 (switchback) | 37,200 | 32,417 | 30,462 pure; 32,418 segmented | +6,737; +4,782 | +1,955; -1 |
+
+  - Farm levers, change against HEAD: genset 14,109 / 15,204 / 10,317 against -3,976 / -18,366 / -37,018, and carry-over 7,138 / 4,767 / 5,016
+    against 16,361 / 36,061 / 53,282.
+  - The MDI lever is the same on both sides: Karachi 37,537.5, Faisalabad 23,412.5.
+  - `backend/tests/test_fix_r6_savings.py`: 9 tests. They cover a three-day farm and a grid site whose daily sums equal the continuous replay,
+    recomputing one day, the first day of a period, the switchback block, a dropout on a withheld day, a day withheld on read inputs, and a
+    non-claiming day found to have a dropout later.
+
 ## 2026-11-07 Round 5: the genset's minimum-load surplus, and a re-planned demo history
 
 - **Surplus charging with the grid down.** In an outage, and at every off-grid step, the set's output follows the load as it does on site: it is
@@ -21,7 +88,7 @@ Newest first. Each entry says what was decided, why, and where the plan (`EMS_BU
 - **The demo history re-plans every 3 hours** (`demo.REPLAN_HOURS`, `GRIDLYTICS_DEMO_REPLAN_HOURS`), as live ticks re-plan every 15 minutes. A plan
   made at midnight and run all day carried every forecast miss to the evening: on one seed the farm burnt 91 L on a day native burnt 47 L. In the
   3-hourly paired rebuild, the change gained Rs 7.4k in the continuous replay.
-- **Open: the per-day carry-over at off-grid sites is noisy.** The per-day ledger minus the continuous 11-day replay ranged from -6.2k to +7.9k
+- **Open, closed by round 6 (chained replays): the per-day carry-over at off-grid sites is noisy.** The per-day ledger minus the continuous 11-day replay ranged from -6.2k to +7.9k
   across seeds. The carry-over lever swings by tens of thousands of rupees and largely offsets the genset lever. Possible fixes:
   - price carry-over at what the native arm actually saves the next day: replay that day natively from both end states, holding the day as
     provisional until then;

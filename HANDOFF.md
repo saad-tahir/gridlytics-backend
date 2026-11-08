@@ -1,7 +1,7 @@
 # Gridlytics: developer handoff
 
 Read this first. It is written for a developer who has the two repositories and nothing else: no chat history, no earlier notes. Everything you
-need to set up, run, test and continue the work is here or in a file this page names. Last updated 7 November 2026.
+need to set up, run, test and continue the work is here or in a file this page names. Last updated 8 November 2026.
 
 ## 1. What the product is
 
@@ -51,8 +51,10 @@ Then follow section 3 from inside the `gridlytics` folder.
 - Push your branch, and open a pull request into `v1-build`.
 - The owner reviews and merges. Nobody pushes to `main` or `v1-build` directly, and nobody merges their own pull request.
 - `main` gets `v1-build` when the owner decides v1 is ready.
-- Tests at the last update (7 Nov, after round 5): backend 495 passed and 7 skipped; web app 257 passed, typecheck and build clean. A scripted
-  browser check visited 405 pages across four roles, a phone width (375 px) and the founder console, with 0 failures.
+- Tests at the last update (8 Nov, after round 6): backend 504 passed and 7 skipped; web app 259 passed, typecheck and build clean. A scripted
+  browser check (7 Nov, after round 5) visited 405 pages across four roles, a phone width (375 px) and the founder console, with 0 failures.
+- Round 6 is on branch `fix/offgrid-carry-over` in both repositories, waiting for its pull requests into `v1-build`. To review it, check out that
+  branch in both, run both suites (section 3), and read DESIGN_LOG "Round 6".
 
 ## 3. Set up a machine
 
@@ -176,7 +178,7 @@ The package is flat: `backend/gridlytics/*.py`. The README's table names every m
 | `plans.py` | The tick: build the problem, solve, store the plan, supersede the last one, and produce the signed message. |
 | `delivery.py` | The Mode A compiler per brand grammar (deye, huawei, growatt, sungrow, voltronic, solis, other), Mode B, Ed25519 signing, and the ems-edge/1.0 message models. |
 | `twin.py` | The digital twin: a plant model with the inverter's native logic, outages and genset, simulated per minute. It drives the demo and the savings replays. |
-| `verify.py` | Savings. The actual arm is priced per minute against a native replay and a tuned static table, giving a ledger by lever (peak window, off-peak, export, genset, wear, carry-over, MDI), switchback and bill rebuild. |
+| `verify.py` | Savings. The actual arm is priced per minute against a native replay and a tuned static table, giving a ledger by lever (peak window, off-peak, export, genset, wear, carry-over, MDI), switchback and bill rebuild. Each baseline's replay is chained from one day to the next (`_chain_starts`), so a period's days add up to one continuous replay. |
 | `alerts.py`, `reports.py`, `demo.py`, `scheduler.py` | Alerts and genset requests; ReportLab PDF and CSV reports; the four demo sites; the APScheduler jobs. |
 | `routes_*.py` | One file per area. `routes_common.py` holds the helpers, and `out()` applies the money filter. |
 
@@ -247,16 +249,15 @@ Each item says where to start and how to know it is done. Section 12 lists what 
 ### A. Engine and savings defects (known, measured)
 
 Round 4 (`2b0fce1`) closed the earlier items 2 and 3, the charge-slot half of 4, and made 5 visible; round 5 (`012cb4f`, `f973b3b`) closed the
-farm's genset item. See DESIGN_LOG "Round 4" and "Round 5". What is left:
+farm's genset item. Round 6 (branch `fix/offgrid-carry-over`) closed the noisy off-grid per-day savings: each baseline's replay is chained from
+one day to the next, and on fresh paired rebuilds the per-day ledger equals the continuous 11-day replay within Rs 1 at the farm (3 seeds) and the
+Karachi feed mill. See DESIGN_LOG "Round 4", "Round 5" and "Round 6". What is left:
 
-1. **Off-grid per-day savings are noisy (round 5 finding).** At the off-grid demo farm, the per-day ledger differs from a continuous 11-day
-   replay by -6.2k to +7.9k Rs across seeds. The carry-over lever swings by tens of thousands of rupees and largely offsets the genset lever.
-   - Start in `verify.compute_day` (`carry_over`, `v_end`).
-   - Option: price carry-over at what the native arm actually saves the next day. Replay that day natively from both end states, holding the
-     day as provisional until then.
-   - Option: score off-grid days in multi-day blocks.
-   - Done when the per-day ledger tracks the continuous replay within about Rs 1k over 11 days on paired farm rebuilds, for several seeds.
-     Customers see the per-day ledger, so this comes before a pilot at an off-grid site.
+1. **Savings limits recorded in round 6** (DESIGN_LOG "Round 6"). Neither blocks a pilot; both are worth a look once real data comes in.
+   - After a dropout of load or PV on a day that claims nothing, the next day restarts from the measured state. Its claim then moved by -0.8k
+     to +1.6k against its complete-data claim on three farm seeds. Filling the unread load from the load forecast for the replay would remove it.
+   - At a switchback site the plan block's hand-over is credited at v_end (plan 8.2), which can exceed what the native block makes of it
+     (Faisalabad: 3,263 credited against 1,771 realised). Valuing it at the realised figure would hold the plan block's last day provisional.
 2. **The 2-slot compile, properly.** The plan asks for boundaries ranked by a twin-priced value. v1 ranks them by energy moved, with a rule that a
    non-discharging run folds into a non-discharging neighbour (`delivery.compile_mode_a`).
 3. **Plan quality still depends on CPU load:** the limits are wall-clock time. Plans now record `time_limited` and `mip_gap`, and
@@ -348,3 +349,4 @@ If you were given only the repositories, ask the owner for these. They are usefu
 | 2026-11-07 | Round 4 done: the PV model checked on PVGIS and NASA POWER data; savings over blank genset columns; threshold-genset repair; charge-slot end; time-limited plans recorded; web app wiring of 8.B. Backend 474 tests, web app 247 | `2b0fce1`, `d7396fd` |
 | 2026-11-07 | Small API asks met: DELETE /api/drafts/:id, tier_signoff on POST and PUT site answers, Idempotency-Key allowed by CORS | `57b3d10` |
 | 2026-11-07 | Round 5 done: the genset's minimum-load surplus charges the battery in the plan (planned shed at the farm about 0, rescue starts about halved, solve times back near their old level); the off-grid terminal value uses the ledger's rule; the demo re-plans every 3 hours; the web app shows round 4's new fields. Backend 495 tests, web app 257, browser check 405 visits with 0 failures. Scratch demo month: Rs 18,739 | `012cb4f`, `f973b3b`, `54a00d8` |
+| 2026-11-08 | Round 6: chained savings replays (HANDOFF 8.A.1), the restart after a non-claiming day with unread inputs, switchback sites held to the segmented replay (plan 8.2), `chain_stale_days` and `baseline_start` in the savings answer, the carry-over lever relabelled; the web app shows "Recompute needed". Backend 504 tests, web app 259 | branch `fix/offgrid-carry-over` (both repositories) |
