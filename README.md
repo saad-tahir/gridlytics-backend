@@ -60,6 +60,7 @@ gets no rupees, and that a site-bound edge key reaches only its own site.
 
 ## Rules this repository keeps
 
-- Never merge; work on `v1-build`; the owner opens pull requests and pushes. No remote is added by the building agent.
+- The code is on GitHub (private): https://github.com/saad-tahir/gridlytics-backend and https://github.com/saad-tahir/gridlytics-frontend. Work on a
+  branch off `v1-build` and open a pull request into it; the owner merges. See HANDOFF.md section 2.
 - Never delete or reseed `data\` once it is in use; the tests and scratch runs use their own folders.
 - Clean-room: constructions named in `THIRD_PARTY_NOTICES.md`; no AGPL or GPL code (Predbat and the AGPL Huawei library are not used).

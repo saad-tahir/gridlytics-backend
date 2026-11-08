@@ -23,17 +23,34 @@ refer to it. You can work without it: the code, `docs/DESIGN_LOG.md` and this pa
 
 ## 2. Repositories and state
 
-| Repository | Path on the build machine | Branch | Head | Contents |
-|---|---|---|---|---|
-| `gridlytics-backend` | `C:\Users\SaadTahir\Videos\gridlytics-backend` | `v1-build` (from a baseline on `main`) | at or after `fc49e3a` (last code fix before this page) | Python 3.12 API and engine |
-| `gridlytics-frontend` | `C:\Users\SaadTahir\Videos\gridlytics-frontend` | `v1-build` (from a baseline on `main`) | at or after `3282a14` | React 19 web app |
+| Repository | GitHub (private; ask the owner for access) | Branches | Contents |
+|---|---|---|---|
+| `gridlytics-backend` | https://github.com/saad-tahir/gridlytics-backend | `main` (a baseline commit), `v1-build` (all the work) | Python 3.12 API and engine |
+| `gridlytics-frontend` | https://github.com/saad-tahir/gridlytics-frontend | `main` (a baseline commit), `v1-build` (all the work) | React 19 web app |
 
-`git log` on `v1-build` is the authority on what is in; section 12 below logs the work after this page was written.
+`git log` on `v1-build` is the authority on what is in; section 12 below logs the work after this page was written. On the build machine the
+repositories live in `C:\Users\SaadTahir\Videos\`.
 
-- Both repositories are local only: no remote, never pushed. The owner creates the GitHub pair and pushes. Commit to `v1-build`, never merge, never
-  push, and leave pull requests to the owner.
-- The two repositories must sit side by side in one folder: the launcher and tests find each other as `../gridlytics-backend` and
-  `../gridlytics-frontend`.
+### Get the code
+
+The two repositories must sit side by side in one folder: the launcher and the tests find each other as `../gridlytics-backend` and
+`../gridlytics-frontend`.
+
+```bash
+mkdir gridlytics && cd gridlytics
+git clone -b v1-build https://github.com/saad-tahir/gridlytics-backend.git
+git clone -b v1-build https://github.com/saad-tahir/gridlytics-frontend.git
+```
+
+Then follow section 3 from inside the `gridlytics` folder.
+
+### How changes come in
+
+- Branch from `v1-build`: one branch per piece of work, e.g. `fix/offgrid-carry-over`.
+- Commit with tests. Run both suites (section 3) before you push.
+- Push your branch, and open a pull request into `v1-build`.
+- The owner reviews and merges. Nobody pushes to `main` or `v1-build` directly, and nobody merges their own pull request.
+- `main` gets `v1-build` when the owner decides v1 is ready.
 - Tests at the last update (7 Nov, after round 5): backend 495 passed and 7 skipped; web app 257 passed, typecheck and build clean. A scripted
   browser check visited 405 pages across four roles, a phone width (375 px) and the founder console, with 0 failures.
 
@@ -214,8 +231,8 @@ items are all below.
 ## 7. Rules for anyone continuing
 
 - Never delete, reseed or write test data into `gridlytics-backend/data` (the owner's folder). Use `.scratch/data` or a temporary folder.
-- Commit to `v1-build` only. Never merge, never push, never add a remote. End commit messages with the attribution line the owner asks for (the
-  history uses `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` for agent commits).
+- Work on your own branch off `v1-build` and open a pull request (section 2, "How changes come in"). Never push to `main` or `v1-build`, and
+  never merge your own pull request. Agent commits in the history end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - **Clean-room code:** no AGPL or GPL code (Predbat and the AGPL Huawei library were deliberately not used). The constructions taken from MIT or
   Apache projects (evcc-io/optimizer, EMHASS, REopt.jl) are named in `THIRD_PARTY_NOTICES.md`. Code lifted from the owner's own Solarlytics
   repositories is marked there too.
