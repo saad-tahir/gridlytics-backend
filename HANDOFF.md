@@ -18,8 +18,13 @@ outages. Every 15 minutes the backend does five things:
 The web app shows a fleet of sites, each site's plan, telemetry, forecasts, outages, battery, genset, savings, tariffs and alerts. It also has
 onboarding, pilot set-up (a switchback calendar), reports and a founder console.
 
-The full specification is `EMS_BUILD_PLAN.md` in the planning folder (see section 11). It is long; section numbers like "Part 4.5" in code comments
-refer to it. You can work without it: the code, `docs/DESIGN_LOG.md` and this page are enough to continue.
+The original requirements and the full specification are in this repository under `docs/plan/` (see section 11 and `docs/plan/README.md`):
+- the Product 1 brief and its deep review;
+- `EMS_BUILD_PLAN.md`, the full specification;
+- the tracker;
+- the research the plan cites.
+
+The plan is long. Section numbers like "Part 4.5" in code comments refer to it.
 
 ## 2. Repositories and state
 
@@ -328,16 +333,18 @@ One ask has no route: an active site cannot be set back to observing.
 4. Pick an item from section 8. Add a regression test that fails first, fix it, run both suites, commit on `v1-build`, and add a line to the
    DESIGN_LOG if you settled a rule.
 
-## 11. Files outside the repositories (on the build machine)
+## 11. The requirements and the plan (`docs/plan/`)
 
-| File | What |
+Copied into the repository on 8 November 2026. `docs/plan/README.md` says what each file is and the order to read them in.
+
+| Folder | What |
 |---|---|
-| `C:\Users\SaadTahir\Videos\solarytics\EMS_BUILD_PLAN.md` | The full specification (Parts 1-14). |
-| `C:\Users\SaadTahir\Videos\solarytics\EMS_BUILD_PROGRESS.md` | The tracker: every item with its acceptance test and status, plus a dated session log. |
-| `C:\Users\SaadTahir\Videos\solarytics\EMS_BUILD_HANDOFF.md` | The planning run's handoff (rules and the original prompt for the building agent). |
-| `C:\Users\SaadTahir\Videos\solarytics\plan-work\` | Research notes the plan cites, and `STATUS.md`. |
+| `docs/plan/requirements/` | The original requirements: the Product 1 brief (TOU-aware energy management and dispatch) and its deep review, as `.md`, `.pdf` and `.docx`, plus the Product 2 brief (the on-site edge controller) and its review. |
+| `docs/plan/build-plan/` | `EMS_BUILD_PLAN.md` (the full specification), `EMS_BUILD_PROGRESS.md` (the tracker: every item, its acceptance test and status, and a dated session log), the planning run's handoff and status. |
+| `docs/plan/research/`, `docs/plan/review/` | The research the plan cites (R1-R9, U1-U3) and the four reviews the plan passed. |
 
-If you were given only the repositories, ask the owner for these. They are useful, but you can continue without them.
+The owner's planning folder `C:\Users\SaadTahir\Videos\solarytics\` holds the originals, and the tracker there is the live copy. Where the plan and
+`docs/DESIGN_LOG.md` disagree, the DESIGN_LOG is current.
 
 ## 12. Log of work after this page was written
 
