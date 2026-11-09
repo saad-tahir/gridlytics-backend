@@ -7,6 +7,7 @@ Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company
 from __future__ import annotations
 
 import json
+import re
 import types
 from datetime import datetime, timedelta, timezone
 
@@ -546,3 +547,111 @@ def test_report_downloads_are_named_after_the_site_kind_and_month(world):
     rep = a.post("/api/reports", json={"kind": "energy_only", "site_id": sid, "period": month}).json()
     r = a.get(f"/api/reports/{rep['id']}/pdf")
     assert f'filename="gridlytics-{sid}-energy-only-{month}.pdf"' in r.headers["content-disposition"], r.headers
+
+
+# ------------------------------------------------------------------------------------------------ reports: the monthly report's content
+
+def _story(monkeypatch) -> list[str]:
+    """Each PDF built from here on, as its text: a paragraph per line and a table row per line with its cells joined by " | " (the PDF itself is still
+    built, so a story ReportLab cannot lay out still fails)."""
+    from reportlab.platypus import Paragraph, Table
+    from gridlytics import reports
+
+    def text(f) -> str:
+        if isinstance(f, Paragraph):
+            return f.getPlainText()
+        if isinstance(f, Table):
+            return "\n".join(" | ".join(text(c) if not isinstance(c, (str, int, float)) else str(c) for c in row) for row in f._cellvalues)
+        if isinstance(f, (list, tuple)):
+            return "\n".join(text(x) for x in f)
+        inner = getattr(f, "_content", None) or getattr(f, "_flowables", None)
+        return text(inner) if inner else ""
+
+    built: list[str] = []
+    real = reports.SimpleDocTemplate
+
+    class Capture(real):
+        def build(self, flowables, *a, **k):
+            built.append("\n".join(t for t in (text(f) for f in flowables) if t))
+            return super().build(flowables, *a, **k)
+
+    monkeypatch.setattr(reports, "SimpleDocTemplate", Capture)
+    return built
+
+
+def _baseline(**over) -> dict:
+    b = {"saving_rs": 1900.5, "claimed_rs": 1901.13, "levers": {"peak_window": 1500.0, "genset": 250.0, "mdi": 150.5}, "litres_saved": 72.4,
+         "verified_days": 2, "perfect_foresight_rs": 4000.0, "mdi_months": {}, "unserved_kwh_actual": 0.0, "unserved_kwh_baseline": 2.0,
+         "genset_unknown_days": 0, "import_unknown_days": 0}
+    return {**b, **over}
+
+
+def _day_row(day: str, **over) -> dict:
+    d = {"day": day, "saving_native_rs": 950.25, "saving_tuned_rs": 400.0, "fidelity": "confirmed", "actual_cost_rs": 50000.0, "native_cost_rs": 50950.25,
+         "litres_actual": None, "litres_native": None, "peak_kw": 300.0, "peak_import_kwh": 100.0, "levers": {"genset": 125.0},
+         "import_unknown": False, "claim_withheld": None, "baseline_start": "chain"}
+    return {**d, **over}
+
+
+def _fake_summary(month: str, days: list[dict], native: dict | None = None, tuned: dict | None = None, **over) -> dict:
+    out = {"from": f"{month}-01", "to": f"{month}-28", "computed": "2026-11-01T00:00:00+00:00", "days": days,
+           "baselines": {"native": native or _baseline(), "tuned": tuned or _baseline(saving_rs=800.0, claimed_rs=780.0, perfect_foresight_rs=None)},
+           "chain_stale_days": [], "preliminary": False,
+           "final_conditions": {"verified_days": 30, "verified_days_needed": 28, "native_capture": True, "switchback_weeks": 8.0,
+                                "switchback_weeks_needed": 8, "fca_billed": True},
+           "blocked": None, "method": "Counterfactual replay at 1-minute resolution against the native capture and a tuned table"}
+    return {**out, **over}
+
+
+def _with_summary(monkeypatch, summ: dict, tdays: list[dict] | None = None) -> None:
+    from gridlytics import verify
+    monkeypatch.setattr(verify, "summary", lambda site_id, d0, d1, see_fee=False: summ)
+    if tdays is not None:
+        monkeypatch.setattr(telemetry, "days", lambda site_id, d0, d1: [dict(d) for d in tdays])
+
+
+def _tday(day: str, **over) -> dict:
+    return {"day": day, "import_kwh": 1200.0, "export_kwh": 0.0, "pv_kwh": 800.0, "load_kwh": 2100.0, "genset_kwh": 100.0, "genset_hours": 1.5,
+            "litres": None, "outage_minutes": 120, "unserved_kwh": 0.0, "peak_kw": 310.0, **over}
+
+
+def test_the_monthly_report_says_not_metered_for_an_unmetered_genset_and_marks_withheld_days(world, monkeypatch):
+    """pages-D-08: verify.summary sums litres_saved `or 0`, so a month whose genset was never metered read "Diesel saved 0 L"; the page says "not
+    metered". A day whose claim is withheld printed its saving beside "confirmed" with no mark, and the CSV had no column for it."""
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    d1, d2 = f"{month}-03", f"{month}-04"
+    days = [_day_row(d1, levers={"genset": None}, claim_withheld="genset_unknown"),
+            _day_row(d2, levers={"genset": None}, claim_withheld="import_unknown", import_unknown=True)]
+    unmetered = _baseline(litres_saved=0.0, genset_unknown_days=2, levers={"peak_window": 1500.0, "mdi": 0.0})
+    _with_summary(monkeypatch, _fake_summary(month, days, native=unmetered, tuned=_baseline(litres_saved=0.0, genset_unknown_days=2)),
+                  [_tday(d1), _tday(d2)])
+    built = _story(monkeypatch)
+    with world.use():
+        rep = reports.generate("monthly_savings", sid, month, "test")
+        csv_text = reports.file_path(rep["id"], "csv").read_text(encoding="utf-8")
+    text = built[-1]
+    assert "0 L" not in text and "not metered" in text, text
+    # each withheld day is marked in the daily rows, with its reason in words, and the rows say such a day claims nothing
+    rows = [ln for ln in text.splitlines() if "Rs 950" in ln]
+    assert len(rows) == 2 and all("claim withheld" in ln.lower() for ln in rows), rows
+    assert "genset data missing" in rows[0].lower() and "grid import unknown" in rows[1].lower(), rows
+    assert "claims nothing" in text
+    head = csv_text.splitlines()[0].split(",")
+    assert "claim_withheld" in head, head
+    lines = [ln.split(",") for ln in csv_text.splitlines()[1:]]
+    assert [ln[head.index("claim_withheld")] for ln in lines] == ["genset_unknown", "import_unknown"]
+
+
+def test_the_monthly_reports_litres_are_marked_estimated_and_never_minus_zero(world, monkeypatch):
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    day = f"{month}-05"
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(day)], native=_baseline(litres_saved=-0.04), tuned=_baseline(litres_saved=72.44)),
+                  [_tday(day)])
+    built = _story(monkeypatch)
+    with world.use():
+        reports.generate("monthly_savings", sid, month, "test")
+    text = built[-1]
+    assert not re.search(r"-0(\.0)? L", text), text
+    assert "0.0 L" in text and "72.4 L" in text and "Estimated" in text, text

@@ -27,6 +27,11 @@ KINDS = ("monthly_savings", "energy_only", "daily_operations")
 LEVER_NAMES = {"peak_window": "Peak-window import avoided", "offpeak_energy": "Off-peak energy (charging)", "export": "Export credit",
                "genset": "Genset fuel and running cost", "wear": "Battery wear", "carry_over": "Carry-over (change in stored energy)",
                "mdi": "Maximum demand (MDI)"}
+#: A day's fidelity class in words, as the Savings page's badges say it (savings-days-table.tsx FIDELITY)
+FIDELITY_WORDS = {"confirmed": "Confirmed", "partial": "Partly followed", "pending": "Awaiting confirmation", "not_applied": "Not applied",
+                  "native_block": "Native block", "recommendation_only": "Recommendation only"}
+#: Why a priced day claims nothing (verify.compute_day's `claim_withheld`), in the page's words (savings-days-table.tsx WITHHELD)
+WITHHELD_WORDS = {"import_unknown": "grid import unknown", "battery_flow_unknown": "battery data missing", "genset_unknown": "genset data missing"}
 
 
 def _text(value) -> str:
@@ -62,6 +67,37 @@ def rs(x) -> str:
         return "-"
     r = int(_round(v)) or 0
     return ("-" if r < 0 else "") + "Rs " + f"{abs(r):,}"
+
+
+def smart(x, unit: str = "") -> str:
+    """One decimal under 100, whole figures from 100, as the page's smart() (lib/format.ts): rounded half away from zero, and a figure that rounds to
+    zero reads "0.0", never "-0"; a dash when missing."""
+    v = _finite(x)
+    if v is None:
+        return "-"
+    one = _round(abs(v), 1)
+    text = f"{one:,.1f}" if one < 100 else f"{_round(abs(v)):,.0f}"
+    return ("-" if v < 0 and text.strip("0.,") else "") + text + unit
+
+
+def _day_fidelity(s: dict) -> str:
+    """A day's fidelity in words, and its claim marked when it is withheld: the saving beside it is not in the claimed total."""
+    words = FIDELITY_WORDS.get(s.get("fidelity") or "", "-") if s.get("fidelity") else "-"
+    why = s.get("claim_withheld") or ("import_unknown" if s.get("import_unknown") else None)
+    if why:
+        words += f"; claim withheld ({WITHHELD_WORDS.get(why, str(why).replace('_', ' '))})"
+    return words
+
+
+def _litres_saved(b: dict, scored: int, has_genset: bool) -> str:
+    """The diesel a baseline's ledger saved, as the page's ledger says it (savings-ledger.tsx): "not metered" when the genset's fuel was unknown on
+    every scored day (verify.summary sums such days as nothing, so its 0.0 is no figure), else the litres; "no genset" at a site without one."""
+    if not has_genset:
+        return "no genset"
+    unmetered = int(b.get("genset_unknown_days") or 0)
+    if b.get("litres_saved") is None or (scored > 0 and unmetered >= scored):
+        return "not metered"
+    return smart(b.get("litres_saved"), " L")
 
 
 def num(x, fmt: str = ",.0f", unit: str = "", scale: float = 1.0) -> str:
@@ -145,12 +181,17 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
             story.append(Spacer(1, 3 * mm))
         if kind == "monthly_savings":
             nat, tun = summ["baselines"].get("native", {}), summ["baselines"].get("tuned", {})
+            scored, has_genset = len(summ.get("days") or []), bool((site.get("assets") or {}).get("genset"))
             story.append(Paragraph("Headline", styles["Heading2"]))
-            story.append(_table([["Against", "Saving", "Claimed (applied days)", "Diesel saved", "Verified days"],
+            story.append(_table([["Against", "Saving", "Claimed (applied days)", "Diesel saved (Estimated)", "Verified days"],
                                  ["The inverter's own settings (native capture)", rs(nat.get("saving_rs")), rs(nat.get("claimed_rs")),
-                                  num(nat.get("litres_saved", 0), unit=" L"), str(nat.get("verified_days", 0))],
+                                  _litres_saved(nat, scored, has_genset), str(nat.get("verified_days", 0))],
                                  ["The best static table (tuned baseline)", rs(tun.get("saving_rs")), rs(tun.get("claimed_rs")),
-                                  num(tun.get("litres_saved", 0), unit=" L"), str(tun.get("verified_days", 0))]], [70 * mm, 25 * mm, 35 * mm, 25 * mm, 22 * mm]))
+                                  _litres_saved(tun, scored, has_genset), str(tun.get("verified_days", 0))]], [70 * mm, 25 * mm, 35 * mm, 25 * mm, 22 * mm]))
+            unmetered = max(int(nat.get("genset_unknown_days") or 0), int(tun.get("genset_unknown_days") or 0))
+            if has_genset and 0 < unmetered:
+                story.append(Paragraph(f"The genset's fuel was not metered on {unmetered} of {scored} days: those days add nothing to the litres or the "
+                                       "genset lever.", styles["Normal"]))
             story.append(Spacer(1, 3 * mm))
             story.append(Paragraph("Ledger by lever, against the native capture", styles["Heading2"]))
             rows = [["Lever", "Rupees"]] + [[LEVER_NAMES.get(k, k), rs(v)] for k, v in (nat.get("levers") or {}).items()]
@@ -174,20 +215,24 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
         by_day = {d["day"]: d for d in summ["days"]}
         rows = [head]
         w.writerow(["day", "import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes", "peak_kw"] +
-                   (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids"] if money else []))
+                   (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld"] if money else []))
         for d in tdays:
             s = by_day.get(d["day"], {})
             rows.append([d["day"], num(d.get("import_kwh")), num(d.get("pv_kwh")), num(d.get("outage_minutes"), ".1f", scale=60),
                          num(d.get("genset_hours"), ".1f")] +
-                        ([rs(s.get("saving_native_rs")), s.get("fidelity") or "-"] if money else []))
+                        ([rs(s.get("saving_native_rs")), _day_fidelity(s)] if money else []))
             ids = ""
             if money:
                 with store.connect() as con:
                     ids = ";".join(r[0] for r in con.execute("SELECT id FROM plans WHERE site_id = ? AND substr(belief_time,1,10) = ? AND status != 'failed'",
                                                               (site_id, d["day"])).fetchall()[:4])
             w.writerow([d["day"]] + [d.get(k) for k in ("import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes", "peak_kw")]
-                       + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids] if money else []))
+                       + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids,
+                           s.get("claim_withheld") or ("import_unknown" if s.get("import_unknown") else None)] if money else []))
         story.append(_table(rows))
+        if money and any(s.get("claim_withheld") or s.get("import_unknown") for s in summ["days"]):
+            story.append(Paragraph("A day marked \u201cclaim withheld\u201d claims nothing: its saving is shown for reference and is not in the claimed "
+                                   "total, nor is it a verified day.", styles["Normal"]))
         cap = sites.native_latest(site_id)
         story.append(Spacer(1, 3 * mm))
         story.append(Paragraph(f"Native capture version {_text(cap['version']) if cap else 'none'}; tariff versions as dated in the CSV annex. "
