@@ -254,6 +254,11 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
     elif kind == "prosumer":
         if key == "net_billing" and (not _num(body.get("naepp")) or body["naepp"] < 0):
             raise ValueError("Net billing needs the export price naepp in Rs/kWh")
+        sched = body.get("tou_export_schedule")
+        if sched is not None and not (isinstance(sched, dict) and all(_num(sched.get(p)) and sched[p] >= 0 for p in ("peak", "off_peak"))):
+            raise ValueError("A TOU export schedule gives the peak and off_peak export prices in Rs/kWh")
+        if not isinstance(body.get("credit_before_tax", False), bool):
+            raise ValueError("credit_before_tax is true (the export credit comes off the bill before GST) or false (after taxes)")
         if key == "net_metering_legacy":
             if "nappp" in body and (not _num(body["nappp"]) or body["nappp"] < 0):
                 raise ValueError("Legacy net metering's nappp is the notified national average power purchase price in Rs/kWh")
@@ -280,6 +285,14 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
             raise ValueError("The PTV fee is a map of class to rupees")
         if "muct_ke" in body and not _num(body["muct_ke"]):
             raise ValueError("The MUCT fee is a number of rupees")
+        if "punjab_selfgen_per_kwh" in body and (not _num(body["punjab_selfgen_per_kwh"]) or not 0 <= body["punjab_selfgen_per_kwh"] < 1):
+            raise ValueError("Punjab's per-unit duty is in Rs/kWh (4 paisa is 0.04)")
+        slabs = body.get("extra_tax_non_atl", [])
+        ok = isinstance(slabs, list) and all(isinstance(x, dict) and _num(x.get("rate")) and 0 <= x["rate"] < 1
+                                             and (x.get("upto") is None or (_num(x["upto"]) and x["upto"] > 0)) for x in slabs)
+        bounds = [x["upto"] for x in slabs if isinstance(x, dict) and x.get("upto") is not None] if ok else []
+        if not ok or bounds != sorted(bounds) or any(x.get("upto") is None for x in slabs[:-1]):
+            raise ValueError("The extra tax slabs are a list of {upto (rupees, rising; none on the last), rate (a fraction between 0 and 1)}")
 
 
 def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, by: str) -> dict:
@@ -461,7 +474,7 @@ def adders_for(billing_month: str) -> list[dict]:
         if not _num(body.get("rate")):
             continue
         best[v["key"]] = v  # ordered by start, so the last one of a key wins
-    return [{"key": v["key"], "id": v["id"], "name": v["key"], "exempt": [], **v["body"]} for v in best.values()]
+    return [{"key": v["key"], "id": v["id"], "name": v["key"], "exempt": [], **v["body"], "hash": v["hash"]} for v in best.values()]
 
 
 def is_fca(adder: dict) -> bool:
@@ -629,10 +642,9 @@ def icp_baseline(conn: dict, month: int, year: int, period: str) -> float | None
 
 # ------------------------------------------------------------------------------------------------ the bill engine (R9 section 13)
 
-def _tax_factor_energy(conn: dict, on) -> dict:
-    """The multipliers the bill applies to variable charges, split into what the company bears and what it recovers."""
+def _tax_factor(conn: dict, tax: dict) -> dict:
+    """The multipliers a tax version applies to variable charges, split into what the company bears and what it recovers."""
     data = conn["data"]
-    tax = tax_rules(on)
     cls = tariff_data.category_class(data["tariff_category"])
     prov = (data.get("tax") or {}).get("province", "punjab")
     ed = tax.get("electricity_duty", {}).get(prov, {}).get(cls, 0.015)
@@ -644,16 +656,55 @@ def _tax_factor_energy(conn: dict, on) -> dict:
     return {"ed": ed, "gst": gst, "further": further, "s235_marginal": s235, "gst_recoverable": bool(flags.get("gst_recoverable", True)),
             "s235_adjustable": bool(flags.get("s235_adjustable", True)), "class": cls,
             # the bill charges s.235 only to industrial and commercial connections (rebuild step 11)
-            "s235_applies": bool(slab) and cls in ("industrial", "commercial")}
+            "s235_applies": bool(slab) and cls in ("industrial", "commercial"),
+            # extra tax off the Active Taxpayer List at the top slab (a C&I bill is above every bound); None when the version has no slabs
+            "extra": _extra_tax_rate(conn, tax, math.inf)}
+
+
+def _tax_factor_energy(conn: dict, on) -> dict:
+    """The multipliers the bill applies to variable charges on a day, split into what the company bears and what it recovers."""
+    return _tax_factor(conn, tax_rules(on))
 
 
 def _tax_stack(tf: dict) -> float:
-    """The bearable rupees per rupee of a pre-tax charge, from the bill's own formula: GST and further tax both on the same base (added, not multiplied),
-    and s.235 on the bill amount including them, where the class pays it; GST and s.235 dropped where the company recovers them."""
-    f = 1.0 + tf["further"] + (0.0 if tf["gst_recoverable"] else tf["gst"])
+    """The bearable rupees per rupee of a pre-tax charge, from the bill's own formula: GST, further and extra tax all on the same base (added, not
+    multiplied), and s.235 on the bill amount including them, where the class pays it; GST and s.235 dropped where the company recovers them."""
+    extra = tf.get("extra") or 0.0
+    f = 1.0 + tf["further"] + extra + (0.0 if tf["gst_recoverable"] else tf["gst"])
     if tf["s235_applies"] and not tf["s235_adjustable"]:
-        f += tf["s235_marginal"] * (1.0 + tf["gst"] + tf["further"])
+        f += tf["s235_marginal"] * (1.0 + tf["gst"] + tf["further"] + extra)
     return f
+
+
+def _unit_duty(conn: dict, tax: dict) -> float:
+    """Punjab's additional electricity duty on heavy consumers, Rs per kWh of grid import (R9 section 7: 4 paisa a unit for industrial and commercial
+    connections above 500 kVA, collected on the DISCO bill; Electricity Duty Rules 2026). The sanctioned load stands for the kVA where no
+    `sanctioned_kva` is entered. 0 elsewhere. The same rate on self-generated units is collected by the electric inspector, not on this bill."""
+    data = conn["data"]
+    rate = tax.get("punjab_selfgen_per_kwh")
+    if not _num(rate) or rate <= 0 or (data.get("tax") or {}).get("province", "punjab") != "punjab":
+        return 0.0
+    if tariff_data.category_class(data["tariff_category"]) not in ("industrial", "commercial"):
+        return 0.0
+    kva = data.get("sanctioned_kva") if _num(data.get("sanctioned_kva")) else data.get("sanctioned_load_kw")
+    return float(rate) if _num(kva) and float(kva) > 500 else 0.0
+
+
+def _extra_tax_rate(conn: dict, tax: dict, amount: float) -> float | None:
+    """Extra tax for an industrial or commercial connection not on the FBR's Active Taxpayer List (R9 section 7: 5 to 17 percent by bill-amount slab):
+    the rate of the slab the amount falls in, from the tax version's `extra_tax_non_atl` ([{"upto": rupees or null, "rate": fraction}], ascending
+    bounds, the last open). 0 where it does not apply; None where it applies and the version has no slabs (their bounds are not verified), so the
+    bill says it is not priced rather than guess."""
+    data = conn["data"]
+    if (data.get("tax") or {}).get("atl", True) or tariff_data.category_class(data["tariff_category"]) not in ("industrial", "commercial"):
+        return 0.0
+    slabs = tax.get("extra_tax_non_atl") or []
+    if not slabs:
+        return None
+    for s in slabs:
+        if s.get("upto") is None or amount <= s["upto"]:
+            return float(s["rate"])
+    return float(slabs[-1]["rate"])
 
 
 def _seasonal_factor(data: dict, month: int) -> float:
@@ -677,36 +728,146 @@ def _legacy_surplus_rate(card: dict, pro: dict | None) -> float:
     return _energy_rate(card, sr == "peak")
 
 
+def _export_rate(nb: dict | None, peak: bool) -> float:
+    """The Rs/kWh net billing credits an export at: the flat NAEPP, or by period where the version gives a `tou_export_schedule` (R9 13 step 9)."""
+    nb = nb or {}
+    sched = nb.get("tou_export_schedule")
+    if isinstance(sched, dict):
+        return float(sched["peak" if peak else "off_peak"])
+    return float(nb.get("naepp", 0.0) or 0.0)
+
+
+def _tou(card: dict) -> bool:
+    return bool(card.get("tou") and card.get("peak") is not None)
+
+
+def _resolve_days(kind: str, key: str, days: list[date]) -> list[dict | None]:
+    """The active version of (kind, key) in force on each day, picked as `resolve` picks it, from one read of the versions."""
+    ensure_shipped()
+    with store.connect() as con:
+        rows = con.execute("SELECT * FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' "
+                           "ORDER BY effective_from DESC, created DESC, rowid DESC", (kind, key)).fetchall()
+    vs = [_ver(r) for r in rows]
+    out: list[dict | None] = []
+    for d in days:
+        s = d.isoformat()
+        out.append(next((v for v in vs if v["effective_from"] <= s and (v["effective_to"] is None or v["effective_to"] >= s)), None))
+    return out
+
+
+def _day_span(first: date, last: date) -> str:
+    """A run of days in words for a line's name: "1 Feb to 11 Feb 2026" (Pakistan days)."""
+    a = f"{first.day} {first:%b}" + ("" if first.year == last.year else f" {first.year}")
+    return f"{a} to {last.day} {last:%b} {last.year}" if first != last else f"{last.day} {last:%b} {last.year}"
+
+
+def day_versions(conn: dict, days: list[date]) -> list[dict]:
+    """The days of a period in runs priced alike (plan Part 4, the marginal-price rule; plan 6.1): each day takes the schedule card, TOU calendar, tax
+    rules and prosumer versions in force that day, as the optimiser's vectors and the ledger price it, and a DISCO bills an interval across a new
+    schedule pro rata by days. A run is consecutive days whose card, calendar, taxes and (for a connection with an export regime) prosumer bodies are
+    the same, so two versions that repeat a card make one run. Raises NoTariffVersion for a day no schedule covers."""
+    data = conn["data"]
+    cat = data["tariff_category"]
+    exporter = data.get("regime") in EXPORT_REGIMES
+    found = {"schedule": _resolve_days("schedule", "national", days),
+             "tou": _resolve_days("tou", "ke" if data.get("disco_group") == "ke" else "xwdisco", days),
+             "tax": _resolve_days("tax", "national", days),
+             "net_billing": _resolve_days("prosumer", "net_billing", days) if exporter else [None] * len(days),
+             "net_metering_legacy": _resolve_days("prosumer", "net_metering_legacy", days) if exporter else [None] * len(days)}
+    runs: list[dict] = []
+    for i, d in enumerate(days):
+        s = found["schedule"][i]
+        if s is None or cat not in (s["body"].get("cards") or {}):
+            raise NoTariffVersion(f"No rate card for {cat} on {d.isoformat()}: no tariff version in force for that day covers it")
+        bodies = {"card": s["body"]["cards"][cat], **{k: (found[k][i] or {}).get("body") for k in ("tou", "tax", "net_billing", "net_metering_legacy")}}
+        key = json.dumps(bodies, sort_keys=True)
+        used = [v for v in (s, *(found[k][i] for k in ("tou", "tax", "net_billing", "net_metering_legacy"))) if v is not None]
+        if runs and runs[-1]["key"] == key:
+            runs[-1]["last"], runs[-1]["days"] = d, runs[-1]["days"] + 1
+            runs[-1]["versions"].update({v["id"]: v for v in used})
+            continue
+        runs.append({"key": key, "first": d, "last": d, "days": 1, "schedule": s, "card": bodies["card"],
+                     "cal": bodies["tou"] or {"seasons": []}, "tax": bodies["tax"] or {}, "nb": bodies["net_billing"],
+                     "lg": bodies["net_metering_legacy"], "versions": {v["id"]: v for v in used}})
+    return runs
+
+
+#: The two lines step 9 adds when a credit is carried between bills
+CREDIT_BROUGHT = "Credit brought forward"
+CREDIT_CARRIED = "Credit carried to the next bill"
+
+
+def settle(lines: list[dict], charges: float, credit_after_tax: float, brought: float) -> tuple[list[dict], float, float]:
+    """Step 9's settlement: the export credit not netted before tax, plus a credit brought forward from the bill before, pays the charges; the bill
+    never goes below zero and what is left is carried to the next bill (R9 13 step 9; under net billing, or paid out quarterly, Prosumer reg. 14(2)).
+    Returns the lines with the brought-forward and carried lines (any old ones replaced), the total and the carried credit; the lines add up to it."""
+    brought = max(0.0, float(brought or 0.0))
+    avail = max(0.0, credit_after_tax) + brought
+    applied = min(avail, max(0.0, charges))
+    carried = avail - applied
+    out = [ln for ln in lines if ln.get("line") not in (CREDIT_BROUGHT, CREDIT_CARRIED)]
+    if brought > 0:
+        out.append({"line": CREDIT_BROUGHT, "amount_rs": round(-brought, 2)})
+    if carried >= 0.005:
+        out.append({"line": CREDIT_CARRIED, "amount_rs": round(carried, 2)})
+    return out, max(0.0, charges) - applied, carried
+
+
 def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, conn: dict, period_start: date, period_end: date,
-            energy_scalar: float = 1.0, mdi_scalar: float = 1.0, period_start_exclusive: bool = False) -> dict:
+            energy_scalar: float = 1.0, mdi_scalar: float = 1.0, period_start_exclusive: bool = False, power_factor_pct: float | None = None,
+            credit_brought_forward_rs: float = 0.0) -> dict:
     """The connection's bill over the consumption days [period_start, period_end], both inclusive, from 1-minute series.
 
     `period_start` is the first day billed, the day after the previous meter reading, and `period_end` the reading date. A caller holding the two
     reading dates as printed on the DISCO bill (R9 section 13: start exclusive, end inclusive) passes `period_start_exclusive=True`, so the previous
     reading day is not billed twice and the proration counts the real reading interval.
 
+    Each day is priced with the versions in force that day (`day_versions`; a reading interval across a new schedule bills its days pro rata, in
+    lines named by their days); the adders, the ICP rule, s.235 and the flat fees are the billing month's (the reading date's). `power_factor_pct`
+    (the bill's printed power factor) adds the PF penalty to a fixed charge set by maximum demand; `credit_brought_forward_rs` is the export credit
+    the bill before carried (`credit_carried_rs` of its result).
+
     `ts_utc` holds epoch seconds of each minute's start (UTC); `import_kw` and `export_kw` the mean power of that minute. Returns the line items, the totals
-    (as billed, and as the company bears them) and the aggregates verification reads."""
+    (as billed, and as the company bears them), the aggregates verification reads, and every version's hash with the series' (plan 6.3 step 13)."""
     data = conn["data"]
-    on = period_end
     if period_start_exclusive:
         period_start = period_start + timedelta(days=1)
-    card, schedule = card_for(data["tariff_category"], on)
-    cal = calendar_for(conn, on)
-    tf = _tax_factor_energy(conn, on)
+    n_days = (period_end - period_start).days + 1
+    if n_days < 1:
+        raise ValueError("A billing period runs forwards")
+    days = [period_start + timedelta(days=i) for i in range(n_days)]
+    runs = day_versions(conn, days)
+    last = runs[-1]
+    tax_end = last["tax"]
+    tf_end = _tax_factor(conn, tax_end)
     billing_month = period_end.strftime("%Y-%m")
     t0 = datetime(period_start.year, period_start.month, period_start.day, tzinfo=PKT).timestamp()
     t1 = (datetime(period_end.year, period_end.month, period_end.day, tzinfo=PKT) + timedelta(days=1)).timestamp()
     mask = (ts_utc >= t0) & (ts_utc < t1)
     ts, imp, exp = ts_utc[mask], np.nan_to_num(import_kw[mask]) * energy_scalar, np.nan_to_num(export_kw[mask]) * energy_scalar
-    # 1. period tagging, by the calendar month of each minute in Pakistan time
-    peak = np.zeros(len(ts), dtype=bool)
-    if card.get("tou") and card.get("peak") is not None:
-        for i, t in enumerate(ts):
-            peak[i] = is_peak_local(cal, datetime.fromtimestamp(float(t), PKT))
-    # 2. energy by period
-    e_imp = {"peak": float(imp[peak].sum() / 60.0), "off_peak": float(imp[~peak].sum() / 60.0)}
-    e_exp = {"peak": float(exp[peak].sum() / 60.0), "off_peak": float(exp[~peak].sum() / 60.0)}
+    series_hash = hashlib.sha256(np.ascontiguousarray(ts, dtype=np.int64).tobytes() + np.ascontiguousarray(imp, dtype=np.float64).tobytes()
+                                 + np.ascontiguousarray(exp, dtype=np.float64).tobytes()).hexdigest()[:16]
+    # 1. period tagging, by the calendar month of each minute in Pakistan time and the calendar of its day; each minute's run
+    epoch0 = (period_start - date(1970, 1, 1)).days
+    local = np.asarray(ts, dtype=np.int64) + 5 * 3600
+    day_idx = (local // 86400 - epoch0).astype(np.int64)
+    run_of_day = np.repeat(np.arange(len(runs)), [r["days"] for r in runs])
+    run = run_of_day[day_idx] if len(ts) else np.zeros(0, dtype=np.int64)
+    mod = (local % 86400) // 60
+    cal_peak = np.zeros(len(ts), dtype=bool)
+    for k in np.unique(day_idx):
+        st, en = peak_window(runs[run_of_day[k]]["cal"], days[k].month)
+        sel = day_idx == k
+        m = mod[sel]
+        cal_peak[sel] = ((st <= m) & (m < en)) if st <= en else ((m >= st) | (m < en))
+    tou_run = np.array([_tou(r["card"]) for r in runs], dtype=bool)
+    peak = cal_peak & tou_run[run] if len(ts) else cal_peak
+    periods = (("peak", peak), ("off_peak", ~peak))
+    # 2. energy by period, in total and by run
+    e_imp = {p: float(imp[sel].sum() / 60.0) for p, sel in periods}
+    e_exp = {p: float(exp[sel].sum() / 60.0) for p, sel in periods}
+    e_gross = dict(e_imp)
+    e_run = [{p: float(imp[sel & (run == i)].sum() / 60.0) for p, sel in periods} for i in range(len(runs))]
     # the regime each day is billed under (regime_on): legacy netting takes the imports and exports of days inside a legacy agreement, net billing
     # credits the exports of days under net billing (a legacy agreement's days after it ends among them), and an export on any other day earns nothing
     reg = _regime_minutes(conn, ts)
@@ -725,52 +886,104 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     # legacy net metering nets by period first (R9 section 8.3; marked unverified), over the days inside the agreement only: an import on a day
     # after it ends is billed in full, as under net billing
     surplus_kwh = 0.0
-    if bool(in_legacy.any()):
-        for p, sel in (("peak", peak), ("off_peak", ~peak)):
-            l_imp, l_exp = float(imp[sel & in_legacy].sum() / 60.0), float(exp[sel & in_legacy].sum() / 60.0)
-            surplus_kwh += max(0.0, l_exp - l_imp)
-            e_imp[p] = max(0.0, e_imp[p] - min(l_imp, l_exp))
-    # 4. the ICP split per period by monthly totals
-    icp = icp_rule(on)
+    l_imp, l_exp = {"peak": 0.0, "off_peak": 0.0}, {"peak": 0.0, "off_peak": 0.0}
+    legacy_any = bool(in_legacy.any())
+    if legacy_any:
+        for p, sel in periods:
+            l_imp[p], l_exp[p] = float(imp[sel & in_legacy].sum() / 60.0), float(exp[sel & in_legacy].sum() / 60.0)
+            surplus_kwh += max(0.0, l_exp[p] - l_imp[p])
+            e_imp[p] = max(0.0, e_imp[p] - min(l_imp[p], l_exp[p]))
+    # 4. the ICP split per period by monthly totals (the billing month's rule and baseline). At a legacy net-metering site the reference is imported
+    # units: a period is eligible only with a net import in it, its increment is its imports over the baseline, and the increments are capped at
+    # the month's imports less exports and split pro rata (SRO 2409(I)/2025, R9 section 5; plan 6.3 step 4); never more than the period's billed units
+    icp = icp_rule(period_end)
     incremental = {"peak": 0.0, "off_peak": 0.0}
     if icp and data["tariff_category"] in icp["categories"]:
-        for p in ("peak", "off_peak"):
+        for p, _ in periods:
             base = icp_baseline(conn, period_end.month, period_end.year, p)
-            if base is not None:
+            if base is None:
+                continue
+            if legacy_any:
+                incremental[p] = max(0.0, e_gross[p] - base) if e_gross[p] - l_exp[p] > 0 else 0.0
+            else:
                 incremental[p] = max(0.0, e_imp[p] - base)
+        if legacy_any:
+            cap = max(0.0, sum(e_gross.values()) - sum(l_exp.values()))
+            inc = sum(incremental.values())
+            if inc > cap:
+                incremental = {p: v * cap / inc for p, v in incremental.items()}
+            incremental = {p: min(v, e_imp[p]) for p, v in incremental.items()}
     inc_total = incremental["peak"] + incremental["off_peak"]
-    # 5. energy charges
+
+    def share(i: int, p: str) -> float:
+        """Run i's part of the period's billed units: its share of the period's imports (of the days when nothing was imported)."""
+        g = e_gross[p]
+        return e_run[i][p] / g if g > 0 else runs[i]["days"] / n_days
+
+    multi = len(runs) > 1
+
+    def named(name: str, r: dict) -> str:
+        return f"{name} ({_day_span(r['first'], r['last'])})" if multi else name
+
+    # 5. energy charges: each run's part of the period's base units at its own rate; the ICP units at the billing month's ICP rate
     lines = []
-    energy = 0.0
-    for p in ("peak", "off_peak") if card.get("tou") and card.get("peak") is not None else ("off_peak",):
-        units = e_imp[p] if card.get("tou") and card.get("peak") is not None else e_imp["peak"] + e_imp["off_peak"]
-        inc = incremental[p] if card.get("tou") and card.get("peak") is not None else inc_total
-        base_units = units - inc
-        rate = _energy_rate(card, p == "peak")
-        energy += base_units * rate + inc * (icp["rate"] if icp else 0.0)
-        lines.append({"line": f"Energy {p.replace('_', '-')}" if card.get("tou") and card.get("peak") is not None else "Energy", "units_kwh": round(base_units, 3),
-                      "rate": rate, "amount_rs": round(base_units * rate, 2)})
-        if inc > 0:
-            lines.append({"line": f"ICP incremental {p.replace('_', '-')}", "units_kwh": round(inc, 3), "rate": icp["rate"], "amount_rs": round(inc * icp["rate"], 2)})
-    # 6. fixed charges by basis, with Tariff F's seasonal multiplier
-    days = (period_end - period_start).days + 1
-    prorate = days / 30.0 if abs(days - 30) > 4 else 1.0
-    if card["fixed_basis"] == "per_kw_month":
-        billing_demand = max(card["floor_share"] * sl, mdi)
-        fixed = card["fixed"] * billing_demand * prorate
-    elif card["fixed_basis"] == "sanctioned_kw_month":
-        billing_demand = sl
-        fixed = card["fixed"] * sl * prorate
-    else:
-        billing_demand = 0.0
-        fixed = card["fixed"] * prorate
-    fixed *= _seasonal_factor(data, period_end.month)
-    lines.append({"line": "Fixed charges", "billing_demand_kw": round(billing_demand, 2), "mdi_kw": round(mdi, 2), "rate": card["fixed"],
-                  "amount_rs": round(fixed, 2)})
+    energy, icp_energy = 0.0, 0.0
+    energy_run = [0.0] * len(runs)
+    for p, _ in periods:
+        base_units = e_imp[p] - incremental[p]
+        for i, r in enumerate(runs):
+            tou = _tou(r["card"])
+            if not tou and p == "peak":
+                continue  # a flat card has no peak units: its minutes are all in the one bucket
+            units = base_units * share(i, p)
+            rate = _energy_rate(r["card"], p == "peak")
+            energy += units * rate
+            energy_run[i] += units * rate
+            lines.append({"line": named(f"Energy {p.replace('_', '-')}" if tou else "Energy", r), "units_kwh": round(units, 3), "rate": rate,
+                          "amount_rs": round(units * rate, 2)})
+        if incremental[p] > 0:
+            icp_energy += incremental[p] * icp["rate"]
+            lines.append({"line": f"ICP incremental {p.replace('_', '-')}", "units_kwh": round(incremental[p], 3), "rate": icp["rate"],
+                          "amount_rs": round(incremental[p] * icp["rate"], 2)})
+    energy += icp_energy
+    # 6. fixed charges by basis, pro rata by days over the runs, with Tariff F's seasonal multiplier and the power-factor penalty (2 percent of a
+    # fixed charge set by maximum demand per point of PF below 90 percent, R9 section 3); `days` of `of_days` is the proration the line shows
+    prorate = n_days / 30.0 if abs(n_days - 30) > 4 else 1.0
+    of_days = 30 if prorate != 1.0 else n_days
+    seasonal = _seasonal_factor(data, period_end.month)
+    pf_factor = 1.0 + 0.02 * (90.0 - float(power_factor_pct)) if _num(power_factor_pct) and power_factor_pct < 90 else 1.0
+    fixed = 0.0
+    fixed_run = [0.0] * len(runs)
+    for i, r in enumerate(runs):
+        card = r["card"]
+        part = prorate * r["days"] / n_days
+        pf = 1.0
+        if card["fixed_basis"] == "per_kw_month":
+            billing_demand = max(card["floor_share"] * sl, mdi)
+            pf = pf_factor
+            f = card["fixed"] * billing_demand * part
+        elif card["fixed_basis"] == "sanctioned_kw_month":
+            billing_demand = sl
+            f = card["fixed"] * sl * part
+        else:
+            billing_demand = 0.0
+            f = card["fixed"] * part
+        f *= seasonal * pf
+        fixed += f
+        fixed_run[i] = f
+        line = {"line": named("Fixed charges", r), "billing_demand_kw": round(billing_demand, 2), "mdi_kw": round(mdi, 2), "rate": card["fixed"],
+                "days": r["days"], "of_days": of_days, "amount_rs": round(f, 2)}
+        if seasonal != 1.0:
+            line["seasonal_factor"] = seasonal
+        if pf != 1.0:
+            line["power_factor_pct"], line["pf_factor"] = float(power_factor_pct), round(pf, 4)
+        lines.append(line)
     # 7. adders by billing month, with their exemptions
     total_units = e_imp["peak"] + e_imp["off_peak"]
     adders = 0.0
+    adder_versions = []
     for a in adders_for(billing_month):
+        adder_versions.append({"kind": "adder", "key": a["key"], "id": a["id"], "hash": a.get("hash")})
         rate = adder_rate(a, conn)
         if rate is None:  # the adder exempts the connection's category or class
             continue
@@ -778,52 +991,102 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
         amt = rate * units
         adders += amt
         lines.append({"line": a.get("name", a["key"]), "units_kwh": round(units, 3), "rate": rate, "amount_rs": round(amt, 2)})
-    # 8. electricity duty on the variable subtotal
-    duty = tf["ed"] * (energy + adders)
-    lines.append({"line": "Electricity duty", "rate": tf["ed"], "amount_rs": round(duty, 2)})
-    # 9. export credit: the legacy surplus at its rate, and the exports of days under net billing at the NAEPP
-    credits: list[tuple[str, float, float]] = []  # (line, units, rate)
+    # each run's part of the variable charges: its own energy, and of the ICP energy and the adders its share of the billed units
+    w_run = [(sum(e_imp[p] * share(i, p) for p, _ in periods) / total_units) if total_units > 0 else runs[i]["days"] / n_days for i in range(len(runs))]
+    var_run = [energy_run[i] + w_run[i] * (icp_energy + adders) for i in range(len(runs))]
+    tf_run = [_tax_factor(conn, r["tax"]) for r in runs]
+    # 8. electricity duty on the variable subtotal, and Punjab's per-unit duty above 500 kVA on the billed grid units
+    duty_run = [tf_run[i]["ed"] * var_run[i] for i in range(len(runs))]
+    duty = sum(duty_run)
+    ed_rates = {tf["ed"] for tf in tf_run}
+    lines.append({"line": "Electricity duty", **({"rate": tf_end["ed"]} if len(ed_rates) == 1 else {}), "amount_rs": round(duty, 2)})
+    unit_rates = [_unit_duty(conn, r["tax"]) for r in runs]
+    unit_duty_run = [unit_rates[i] * total_units * w_run[i] for i in range(len(runs))]
+    unit_duty = sum(unit_duty_run)
+    if unit_duty > 0:
+        lines.append({"line": "Punjab electricity duty (per unit, above 500 kVA)", "units_kwh": round(total_units, 3),
+                      **({"rate": unit_rates[-1]} if len(set(unit_rates)) == 1 else {}), "amount_rs": round(unit_duty, 2)})
+    # 9. export credit: the legacy surplus at its rate, and the exports of days under net billing at the NAEPP (or by period where the version gives
+    # a TOU export schedule), each day at its own version's rate; netted after taxes unless the regime's version says `credit_before_tax`
+    credits: list[tuple[str, float, float, bool]] = []  # (kind, units, rupees, netted before tax)
     if surplus_kwh > 0:
-        credits.append(("legacy", surplus_kwh, _legacy_surplus_rate(card, prosumer("net_metering_legacy", on))))
+        lx = [float(exp[in_legacy & (run == i)].sum() / 60.0) for i in range(len(runs))]
+        tot = sum(lx)
+        rate = sum((lx[i] / tot if tot > 0 else runs[i]["days"] / n_days) * _legacy_surplus_rate(r["card"], r["lg"]) for i, r in enumerate(runs))
+        credits.append(("legacy", surplus_kwh, surplus_kwh * rate, bool((last["lg"] or {}).get("credit_before_tax"))))
     exported_nb = float(exp_nb.sum() / 60.0)
     if exported_nb > 0:
-        credits.append(("net_billing", exported_nb, (prosumer("net_billing", on) or {"naepp": 0.0})["naepp"]))
-    credit = sum(u * r for _, u, r in credits)
-    # 10. GST (the credit is netted after taxes: DISCO practice, R9 section 13 step 10, to confirm on a prosumer bill)
-    gst = tf["gst"] * (energy + fixed + adders + duty)
-    lines.append({"line": "GST", "rate": tf["gst"], "amount_rs": round(gst, 2)})
-    further = tf["further"] * (energy + fixed + adders + duty)
+        rupees = sum(float(exp_nb[(run == i) & sel].sum() / 60.0) * _export_rate(r["nb"], p == "peak")
+                     for i, r in enumerate(runs) for p, sel in (("peak", cal_peak), ("off_peak", ~cal_peak)))
+        credits.append(("net_billing", exported_nb, rupees, bool((last["nb"] or {}).get("credit_before_tax"))))
+    credit = sum(c[2] for c in credits)
+    # 10. GST, further and extra tax on energy, fixed charges, adders and duty, each run at its own rates (a credit netted before tax off that base)
+    base_run = [var_run[i] + fixed_run[i] + duty_run[i] + unit_duty_run[i] for i in range(len(runs))]
+    base_total = sum(base_run)
+    pre_tax = min(sum(c[2] for c in credits if c[3]), max(0.0, base_total))
+    keep = 1.0 - pre_tax / base_total if base_total > 0 else 1.0
+    taxable = base_total - pre_tax
+    gst = sum(tf_run[i]["gst"] * base_run[i] * keep for i in range(len(runs)))
+    lines.append({"line": "GST", "rate": tf_end["gst"], "amount_rs": round(gst, 2)})
+    further = sum(tf_run[i]["further"] * base_run[i] * keep for i in range(len(runs)))
     if further:
-        lines.append({"line": "Further tax", "rate": tf["further"], "amount_rs": round(further, 2)})
-    # 11. income tax s.235 on the bill amount
-    tax = tax_rules(on)
-    slab = tax.get("s235", {}).get("industrial" if tf["class"] == "industrial" else "commercial")
-    bill_amount = energy + fixed + adders + duty + gst + further
+        lines.append({"line": "Further tax", "rate": tf_end["further"], "amount_rs": round(further, 2)})
+    unpriced: list[str] = []
+    extra_rates = [_extra_tax_rate(conn, r["tax"], taxable) for r in runs]
+    if any(x is None for x in extra_rates):
+        unpriced.append("Extra tax for a connection not on the Active Taxpayer List: the tax version has no slabs for it, so the rebuilt bill leaves "
+                        "it out")
+    extra = sum((extra_rates[i] or 0.0) * base_run[i] * keep for i in range(len(runs)))
+    if extra:
+        lines.append({"line": "Extra tax (not on the Active Taxpayer List)", **({"rate": extra_rates[-1]} if len(set(extra_rates)) == 1 else {}),
+                      "amount_rs": round(extra, 2)})
+    # 11. income tax s.235 on the bill amount (the billing month's slabs)
+    slab = tax_end.get("s235", {}).get("industrial" if tf_end["class"] == "industrial" else "commercial")
+    bill_amount = taxable + gst + further + extra
     s235 = 0.0
-    if slab and tf["class"] in ("industrial", "commercial"):
+    if slab and tf_end["class"] in ("industrial", "commercial"):
         if bill_amount > slab["mid_upto"]:
             s235 = slab["base_above"] + slab["rate_above"] * (bill_amount - slab["mid_upto"])
         elif bill_amount > slab["nil_upto"]:
             s235 = slab["mid_rate"] * bill_amount
     lines.append({"line": "Income tax (s.235)", "amount_rs": round(s235, 2)})
     # 12. flat items
-    flat = float(tax.get("ptv", {}).get(tf["class"], 0))
-    if data.get("disco_group") == "ke" and tf["class"] in ("industrial", "commercial"):
-        flat += float(tax.get("muct_ke", 0))
+    flat = float(tax_end.get("ptv", {}).get(tf_end["class"], 0))
+    if data.get("disco_group") == "ke" and tf_end["class"] in ("industrial", "commercial"):
+        flat += float(tax_end.get("muct_ke", 0))
     if flat:
         lines.append({"line": "Flat fees (PTV, MUCT)", "amount_rs": round(flat, 2)})
-    for kind, units, rate in credits:
-        if units * rate:
+    for kind, units, rupees, _ in credits:
+        if rupees:
             # one regime in the period: "Export credit"; a legacy agreement that ends inside it bills its surplus and the net-billing exports apart
             name = "Export credit" if len(credits) == 1 else ("Export credit (legacy net metering)" if kind == "legacy" else "Export credit (net billing)")
-            lines.append({"line": name, "units_kwh": round(units, 3), "rate": rate, "amount_rs": round(-units * rate, 2)})
-    total = max(0.0, bill_amount + s235 + flat - credit)
-    recovered = (gst if tf["gst_recoverable"] else 0.0) + (s235 if tf["s235_adjustable"] else 0.0)
-    return {"lines": lines, "total_rs": round(total, 2), "bearable_rs": round(total - recovered, 2), "recovered_taxes_rs": round(recovered, 2),
-            "energy_rs": round(energy + adders, 2), "demand_rs": round(fixed, 2), "credits_rs": round(credit, 2),
-            "import_kwh": e_imp, "export_kwh": e_exp, "icp_incremental_kwh": incremental, "mdi_kw": round(mdi, 2),
-            "schedule_version": schedule["id"], "schedule_hash": schedule["hash"], "billing_month": billing_month, "days": days,
-            "first_day": period_start.isoformat(), "last_day": period_end.isoformat()}
+            lines.append({"line": name, "units_kwh": round(units, 3), "rate": round(rupees / units, 4), "amount_rs": round(-rupees, 2)})
+    charges = bill_amount + s235 + flat
+    lines, total, carried = settle(lines, charges, credit - pre_tax, credit_brought_forward_rs)
+    recovered = (gst if tf_end["gst_recoverable"] else 0.0) + (s235 if tf_end["s235_adjustable"] else 0.0)
+    # what the company bears for the month: its charges less the taxes it recovers and this month's credit (used now or carried, it is worth the same;
+    # a credit brought forward was the month before's)
+    bearable = charges - recovered - (credit - pre_tax)
+    versions = {v["id"]: v for r in runs for v in r["versions"].values()}
+    icp_v = resolve("icp", "national", period_end) if icp else None
+    if icp_v:
+        versions[icp_v["id"]] = icp_v
+    out = {"lines": lines, "total_rs": round(total, 2), "bearable_rs": round(bearable, 2), "recovered_taxes_rs": round(recovered, 2),
+           "energy_rs": round(energy + adders, 2), "demand_rs": round(fixed, 2), "credits_rs": round(credit, 2),
+           "charges_rs": round(charges, 2), "credit_before_tax_rs": round(pre_tax, 2), "credit_brought_forward_rs": round(max(0.0, credit_brought_forward_rs or 0.0), 2),
+           "credit_carried_rs": round(carried, 2),
+           "import_kwh": e_imp, "import_gross_kwh": e_gross, "export_kwh": e_exp, "icp_incremental_kwh": incremental, "mdi_kw": round(mdi, 2),
+           "schedule_version": last["schedule"]["id"], "schedule_hash": last["schedule"]["hash"], "billing_month": billing_month, "days": n_days,
+           "first_day": period_start.isoformat(), "last_day": period_end.isoformat(),
+           "versions": [{"kind": v["kind"], "key": v["key"], "id": v["id"], "hash": v["hash"], "effective_from": v["effective_from"]}
+                        for v in sorted(versions.values(), key=lambda v: (v["kind"], v["key"], v["effective_from"]))] + adder_versions,
+           "series_hash": series_hash, "unpriced": unpriced}
+    if _num(power_factor_pct):
+        out["power_factor_pct"] = float(power_factor_pct)
+    if multi:
+        out["runs"] = [{"first_day": r["first"].isoformat(), "last_day": r["last"].isoformat(), "days": r["days"], "schedule_version": r["schedule"]["id"]}
+                       for r in runs]
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ the optimiser's vectors (plan Part 6.4)
@@ -875,10 +1138,21 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
         return out
     data = conn["data"]
     on = t0_utc.astimezone(PKT).date()
-    card, _ = card_for(data["tariff_category"], on)
-    cal = calendar_for(conn, on)
-    ef = energy_factor(conn, on)
-    tou = bool(card.get("tou") and card.get("peak") is not None)
+    # each day priced with the versions in force that day, as the bill engine prices it (day_versions): a horizon across a new schedule changes card
+    # at midnight; the per-unit duty is a rupee figure on every imported kWh
+    run_of: dict[date, dict] = {}
+    for r in day_versions(conn, sorted(set(bm_by_day) | {on})):
+        d = r["first"]
+        while d <= r["last"]:
+            run_of[d] = r
+            d += timedelta(days=1)
+    day_price: dict[date, tuple[float, float]] = {}
+    for d, r in run_of.items():
+        tf = _tax_factor(conn, r["tax"])
+        day_price[d] = ((1.0 + tf["ed"]) * _tax_stack(tf), _unit_duty(conn, r["tax"]) * _tax_stack(tf))
+    card = run_of[on]["card"]
+    ef, unit = day_price[on]
+    tou = _tou(card)
     bm0 = bms[0] if bms else billing_month_for(conn, on)
     in_bm0 = [b == bm0 for b in bms]
     out["billing_month_end_step"] = next((i for i, x in enumerate(in_bm0) if not x), steps)
@@ -905,14 +1179,13 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
         if base is None:
             continue
         q = q_net(p)
-        steps_in_p = sum(1 for i, loc in enumerate(locs) if in_bm0[i] and is_peak_local(cal, loc) == (p == "peak"))
+        steps_in_p = sum(1 for i, loc in enumerate(locs) if in_bm0[i] and is_peak_local(run_of[loc.date()]["cal"], loc) == (p == "peak"))
         swing = g_max_kw * steps_in_p * h
         case = "above" if q - base > swing else "below" if base - q > swing else "uncertain"
         out["icp"][p] = {"case": case, "baseline_kwh": base, "q_rest_kwh": q - (mtd_import or {}).get(p, 0.0) + (mtd_import or {}).get(p, 0.0),
-                         "mtd_kwh": (mtd_import or {}).get(p, 0.0), "q_kwh": q, "rate": (icp["rate"] + add_icp[bm0]) * ef}
+                         "mtd_kwh": (mtd_import or {}).get(p, 0.0), "q_kwh": q, "rate": (icp["rate"] + add_icp[bm0]) * ef + unit}
     # legacy net metering nets by period (rebuild step 3): a period that ends the month as a net import prices an exported kWh like an imported one,
     # with its adders, duty and taxes; one that ends in surplus moves only the credit, at the bare surplus rate (netted after taxes), both ways
-    naepp = (prosumer("net_billing", on) or {"naepp": 0.0})["naepp"] if "net_billing" in reg_day.values() else 0.0
     surplus: dict[str, bool] = {}
     s_rate = 0.0
     if legacy:
@@ -923,18 +1196,21 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
             total = q_net("peak") + q_net("off_peak")
             surplus = {"peak": total < 0, "off_peak": total < 0}
     for i, loc in enumerate(locs):
-        pk = is_peak_local(cal, loc) if tou else False
+        r = run_of[loc.date()]
+        ef_d, unit_d = day_price[loc.date()]
+        cal_pk = is_peak_local(r["cal"], loc)
+        pk = cal_pk if _tou(r["card"]) else False
         out["peak"][i] = pk
         p = "peak" if pk else "off_peak"
         bm = bms[i]
         icp_case = out["icp"].get(p, {}).get("case") if in_bm0[i] else None
         if icp_case == "above":
-            c_imp = (icp["rate"] + add_icp[bm]) * ef
+            c_imp = (icp["rate"] + add_icp[bm]) * ef_d + unit_d
         else:
-            c_imp = (_energy_rate(card, pk) + add_all[bm]) * ef
+            c_imp = (_energy_rate(r["card"], pk) + add_all[bm]) * ef_d + unit_d
         regime = reg_day[loc.date()]
         if regime == "net_billing":
-            c_exp = naepp
+            c_exp = _export_rate(r["nb"], cal_pk)  # the NAEPP, or the version's TOU export schedule
         elif regime != "net_metering_legacy":
             c_exp = 0.0  # no export regime, or no agreement in force that day
         else:

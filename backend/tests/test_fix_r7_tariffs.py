@@ -9,6 +9,16 @@ Batch 1, price vector correctness:
 - engine-tariffs-11: the debt-service surcharge is 43 paisa for agricultural tube wells (R9 section 7), and an adder's exemptions name categories;
 - engine-tariffs-12: a TOU calendar must cover each month exactly once with a non-empty peak window.
 
+Batch 2, bill rebuild and bill comparison:
+- engine-tariffs-01: a bill across a new schedule prices each day with the versions in force that day (pro rata by days), as the vectors do;
+- engine-tariffs-02: an export credit beyond the bill is carried to the next bill, and the cost borne counts the month's own credit;
+- engine-tariffs-08: the power-factor penalty, Punjab's per-unit duty above 500 kVA, extra tax off the Active Taxpayer List (or "not priced"),
+  a credit netted before tax and a TOU export schedule, every version's hash and the series hash;
+- engine-tariffs-10: ICP at a legacy net-metering site caps the increments on imported units at the month's net import, pro rata;
+- pages-D-10 (with flow-savings-pilot-bill-07): the printed units and MDI are compared line by line, and a line off by more than 2 % fails;
+- flow-savings-pilot-bill-08 (with engine-money-live-08): gaps are filled from the profile, and the verdict is withheld below 90 % data;
+- flow-savings-pilot-bill-23: an overlapping bill is refused, a bill can be corrected or deleted, and the fixed charge shows its proration.
+
 Each test fails on the code before its fix."""
 from __future__ import annotations
 
@@ -384,3 +394,212 @@ def test_a_tou_calendar_must_cover_each_month_once_with_a_peak_window(company):
     for v in tariff_data.SHIPPED:
         if v["kind"] == "tou":
             tariffs.validate_body("tou", v["key"], v["body"], v["effective_from"])
+
+
+# ================================================================================================ batch 2: bill rebuild and bill comparison
+
+FEB_DSS = 3.23  # the only adder billed in February 2026
+
+
+def _month_series(d0: date, days: int, kw: float = 100.0, mdi_day: int = 19):
+    """A flat import over whole days with one 150 % block (the bill's MDI) at 10:00 on day `mdi_day`, so a bumped kWh elsewhere moves no fixed charge."""
+    ts = _minutes(d0, days)
+    imp = np.full(len(ts), kw)
+    imp[mdi_day * 1440 + 600:mdi_day * 1440 + 630] = kw * 1.5
+    return ts, imp, np.zeros(len(ts))
+
+
+def _minute_of(ts, day: date, hhmm: int) -> int:
+    t = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp()) + hhmm * 60
+    return int(np.searchsorted(ts, t))
+
+
+def _lines(bill, prefix):
+    return [ln for ln in bill["lines"] if ln["line"].startswith(prefix)]
+
+
+# ------------------------------------------------------------------------------------------------ engine-tariffs-01: each day priced by its own versions
+
+def test_a_bill_across_a_schedule_change_prices_each_day_with_the_version_in_force_that_day(company):
+    conn = _conn("B-2(b)", sanctioned=400.0)
+    d0, d1 = date(2026, 2, 1), date(2026, 2, 28)  # SRO 279(I)/2026 from 12 Feb; the January cards before it
+    ts, imp, exp = _month_series(d0, 28)
+    jan, cy = (27.41 + FEB_DSS) * 1.015, (22.83 + FEB_DSS) * 1.015
+    for day, want in ((date(2026, 2, 5), jan), (date(2026, 2, 20), cy)):
+        got = _bump(conn, ts, imp, exp, d0, d1, _minute_of(ts, day, 185))  # 03:05, off-peak
+        assert got == pytest.approx(want, abs=0.01)                          # before: 26.45 on 5 Feb (SRO 279 for every day)
+        vec = tariffs.vectors(conn, datetime(day.year, day.month, day.day, tzinfo=PKT).astimezone(timezone.utc), 96)
+        assert vec["c_imp"][12] == pytest.approx(got, abs=0.01)            # the optimiser and the ledger price the same kWh alike
+    bill = tariffs.rebuild(ts, imp, exp, conn, d0, d1)
+    # fixed charges pro rata by days: 11 days on the January card (floor 50 % of 400 kW) and 17 on SRO 279's (floor 25 %, so the 150 kW MDI)
+    fixed = _lines(bill, "Fixed charges")
+    assert [(f["days"], f["of_days"], f["billing_demand_kw"]) for f in fixed] == [(11, 28, 200.0), (17, 28, 150.0)]
+    assert sum(f["amount_rs"] for f in fixed) == pytest.approx(1250 * 200 * 11 / 28 + 1250 * 150 * 17 / 28, abs=0.02)  # before: 187,500
+    off = _lines(bill, "Energy off-peak")
+    assert [ln["rate"] for ln in off] == [27.41, 22.83] and "1 Feb to 11 Feb 2026" in off[0]["line"] and "12 Feb to 28 Feb 2026" in off[1]["line"]
+    assert sum(ln["units_kwh"] for ln in off) == pytest.approx(bill["import_kwh"]["off_peak"], abs=0.01)
+    # one schedule version over the whole interval: one line per period, as before
+    one = tariffs.rebuild(*_month_series(date(2026, 11, 1), 30), conn, date(2026, 11, 1), date(2026, 11, 30))
+    assert [ln["line"] for ln in one["lines"] if ln["line"].startswith(("Energy", "Fixed"))] == ["Energy peak", "Energy off-peak", "Fixed charges"]
+
+
+def test_a_horizon_across_a_schedule_change_prices_the_second_day_with_its_own_card(company):
+    conn = _conn("B-2(b)")
+    vec = tariffs.vectors(conn, datetime(2026, 2, 11, tzinfo=PKT).astimezone(timezone.utc), 192)
+    assert vec["c_imp"][12] == pytest.approx((27.41 + FEB_DSS) * 1.015, abs=0.01)
+    assert vec["c_imp"][96 + 12] == pytest.approx((22.83 + FEB_DSS) * 1.015, abs=0.01)  # before: 12 Feb priced on 11 Feb's card
+
+
+# ------------------------------------------------------------------------------------------------ engine-tariffs-02: excess credit carried forward
+
+def _surplus_month():
+    """A legacy A-2(c) month whose off-peak period ends in surplus: 20 kW imported all day, 300 kW exported 09:00 to 15:00."""
+    conn = _conn("A-2(c)", "net_metering_legacy", extra={"agreement_start": "2019-07-01"})
+    d0 = date(2026, 10, 1)
+    ts = _minutes(d0, 31)
+    imp, exp = np.full(len(ts), 20.0), np.zeros(len(ts))
+    mod = ((ts + 5 * 3600) % 86400) // 60
+    exp[(mod >= 9 * 60) & (mod < 15 * 60)] = 300.0
+    return conn, ts, imp, exp, d0, date(2026, 10, 31)
+
+
+def test_an_export_credit_beyond_the_bill_is_carried_to_the_next_bill(company):
+    conn, ts, imp, exp, d0, d1 = _surplus_month()
+    bill = tariffs.rebuild(ts, imp, exp, conn, d0, d1)
+    charges, credit = bill["charges_rs"], bill["credits_rs"]
+    assert credit > charges > 0 and bill["total_rs"] == 0.0
+    assert bill["credit_carried_rs"] == pytest.approx(credit - charges, abs=0.01)                    # before: dropped
+    assert bill["bearable_rs"] == pytest.approx(charges - bill["recovered_taxes_rs"] - credit, abs=0.02)  # the month's exports are worth their credit
+    assert sum(ln["amount_rs"] for ln in bill["lines"]) == pytest.approx(bill["total_rs"], abs=0.05)  # the lines add up to the total
+    assert _lines(bill, "Credit carried to the next bill")[0]["amount_rs"] == pytest.approx(bill["credit_carried_rs"], abs=0.01)
+    # the next month imports only: the carried credit pays its bill first
+    ts2 = _minutes(date(2026, 11, 1), 30)
+    nxt = tariffs.rebuild(ts2, np.full(len(ts2), 20.0), np.zeros(len(ts2)), conn, date(2026, 11, 1), date(2026, 11, 30),
+                          credit_brought_forward_rs=bill["credit_carried_rs"])
+    assert nxt["total_rs"] == pytest.approx(max(0.0, nxt["charges_rs"] - bill["credit_carried_rs"]), abs=0.01)
+    assert _lines(nxt, "Credit brought forward")[0]["amount_rs"] == pytest.approx(-bill["credit_carried_rs"], abs=0.01)
+    assert nxt["credit_carried_rs"] == pytest.approx(max(0.0, bill["credit_carried_rs"] - nxt["charges_rs"]), abs=0.01)
+    # what the company bears is its own month's: a credit earned before is not counted twice
+    alone = tariffs.rebuild(ts2, np.full(len(ts2), 20.0), np.zeros(len(ts2)), conn, date(2026, 11, 1), date(2026, 11, 30))
+    assert nxt["bearable_rs"] == pytest.approx(alone["bearable_rs"], abs=0.01)
+
+
+# ------------------------------------------------------------------------------------------------ engine-tariffs-08: the missing bill steps
+
+def test_a_power_factor_below_90_percent_raises_the_fixed_charge(company):
+    conn = _conn("B-2(b)", sanctioned=400.0)
+    d0 = date(2026, 11, 1)
+    ts, imp, exp = _month_series(d0, 30)
+    base = _lines(tariffs.rebuild(ts, imp, exp, conn, d0, date(2026, 11, 30)), "Fixed charges")[0]
+    low = tariffs.rebuild(ts, imp, exp, conn, d0, date(2026, 11, 30), power_factor_pct=85.0)
+    fixed = _lines(low, "Fixed charges")[0]
+    assert fixed["amount_rs"] == pytest.approx(base["amount_rs"] * 1.10, abs=0.02)  # 2 % of the fixed charge per point below 90 (R9 3; T&C)
+    assert fixed["power_factor_pct"] == 85.0 and fixed["pf_factor"] == pytest.approx(1.10)
+    assert _lines(tariffs.rebuild(ts, imp, exp, conn, d0, date(2026, 11, 30), power_factor_pct=93.0), "Fixed charges")[0]["amount_rs"] == base["amount_rs"]
+    flat = _conn("A-3", sanctioned=40.0)  # a fixed charge per consumer is not set by maximum demand: no penalty
+    a = _lines(tariffs.rebuild(ts, imp, exp, flat, d0, date(2026, 11, 30)), "Fixed charges")[0]["amount_rs"]
+    assert _lines(tariffs.rebuild(ts, imp, exp, flat, d0, date(2026, 11, 30), power_factor_pct=80.0), "Fixed charges")[0]["amount_rs"] == a
+
+
+def test_a_large_punjab_connection_pays_4_paisa_a_unit_of_grid_duty(company):
+    d0 = date(2026, 11, 2)
+    ts, imp, exp = _flat_day(d0)
+    big = _conn("B-3", sanctioned=1000.0)
+    bill = tariffs.rebuild(ts, imp, exp, big, d0, d0)
+    line = _lines(bill, "Punjab electricity duty")[0]
+    units = sum(bill["import_kwh"].values())
+    assert line["rate"] == 0.04 and line["units_kwh"] == pytest.approx(units, abs=0.01) and line["amount_rs"] == pytest.approx(0.04 * units, abs=0.01)
+    for other in (_conn("B-3", sanctioned=400.0), _conn("B-3", sanctioned=1000.0, province="sindh")):
+        assert not _lines(tariffs.rebuild(ts, imp, exp, other, d0, d0), "Punjab electricity duty")
+    vec = tariffs.vectors(big, _t0(ts), 96)
+    assert vec["c_imp"][12] == pytest.approx(_bump(big, ts, imp, exp, d0, d0, OFF), abs=0.01)  # the price carries the duty too
+
+
+def test_extra_tax_for_a_connection_off_the_active_taxpayer_list(company):
+    d0 = date(2026, 11, 2)
+    ts, imp, exp = _flat_day(d0)
+    non_atl = _conn("B-2(b)", atl=False)
+    bill = tariffs.rebuild(ts, imp, exp, non_atl, d0, d0)
+    assert not _lines(bill, "Extra tax") and any("Extra tax" in u for u in bill["unpriced"])  # the slabs are not notified in the shipped version
+    assert not tariffs.rebuild(ts, imp, exp, _conn("B-2(b)"), d0, d0)["unpriced"]
+    tax = next(v for v in tariff_data.SHIPPED if v["kind"] == "tax")["body"]
+    _approve("tax", "national", "2026-11-01", {**tax, "extra_tax_non_atl": [{"upto": 20000, "rate": 0.05}, {"upto": None, "rate": 0.17}]})
+    bill = tariffs.rebuild(ts, imp, exp, non_atl, d0, d0)
+    gst = _lines(bill, "GST")[0]
+    extra = _lines(bill, "Extra tax")[0]
+    assert extra["rate"] == 0.17 and extra["amount_rs"] == pytest.approx(gst["amount_rs"] / 0.18 * 0.17, abs=0.02) and not bill["unpriced"]
+    assert tariffs.rebuild(ts, imp, exp, _conn("B-2(b)"), d0, d0)["total_rs"] < bill["total_rs"]
+    assert tariffs.vectors(non_atl, _t0(ts), 96)["c_imp"][12] == pytest.approx(_bump(non_atl, ts, imp, exp, d0, d0, OFF), abs=0.01)
+    with pytest.raises(ValueError, match="extra tax"):
+        tariffs.propose("tax", "national", "2026-12-01", {**tax, "extra_tax_non_atl": [{"upto": 20000, "rate": 5}]}, SRC, "t")
+
+
+def test_a_net_billing_version_can_credit_before_tax_and_price_exports_by_period(company):
+    d0 = date(2026, 11, 2)
+    ts, imp, exp = _flat_day(d0)
+    exp[12 * 60:13 * 60] = 100.0          # 100 kWh off-peak
+    exp[19 * 60:19 * 60 + 30] = 100.0     # 50 kWh in the peak window
+    conn = _conn("B-2(b)", "net_billing")
+    after = tariffs.rebuild(ts, imp, exp, conn, d0, d0)
+    nb = tariffs.prosumer("net_billing", d0)
+    _approve("prosumer", "net_billing", "2026-11-01", {**nb, "credit_before_tax": True, "tou_export_schedule": {"peak": 12.0, "off_peak": 6.0}})
+    before = tariffs.rebuild(ts, imp, exp, conn, d0, d0)
+    assert before["credits_rs"] == pytest.approx(50 * 12.0 + 100 * 6.0, abs=0.01)
+    gst_after, gst_before = _lines(after, "GST")[0]["amount_rs"], _lines(before, "GST")[0]["amount_rs"]
+    assert gst_after - gst_before == pytest.approx(0.18 * before["credits_rs"], abs=0.02)  # the credit came off the GST base
+    vec = tariffs.vectors(conn, _t0(ts), 96)
+    assert vec["c_exp"][12] == pytest.approx(6.0) and vec["c_exp"][19 * 4 + 1] == pytest.approx(12.0)
+    with pytest.raises(ValueError, match="TOU export"):
+        tariffs.propose("prosumer", "net_billing", "2026-12-01", {**nb, "tou_export_schedule": {"peak": "high"}}, SRC, "t")
+
+
+def test_a_rebuilt_bill_carries_every_versions_hash_and_the_series_hash(company):
+    d0 = date(2026, 11, 2)
+    ts, imp, exp = _flat_day(d0)
+    conn = _conn("B-2(b)", "net_billing", extra={"icp": {"eligible": True, "peak": {"11": 10.0}, "off_peak": {"11": 100.0}}})
+    bill = tariffs.rebuild(ts, imp, exp, conn, d0, d0)
+    kinds = {(v["kind"], v["key"]) for v in bill["versions"]}
+    assert {("schedule", "national"), ("tou", "xwdisco"), ("tax", "national"), ("icp", "national"), ("prosumer", "net_billing"),
+            ("adder", "dss"), ("adder", "qta")} <= kinds
+    assert all(len(v["hash"]) == 16 and v["id"] for v in bill["versions"])
+    imp2 = imp.copy()
+    imp2[OFF] += 1.0
+    assert tariffs.rebuild(ts, imp2, exp, conn, d0, d0)["series_hash"] != bill["series_hash"]
+    assert tariffs.rebuild(ts, imp, exp, conn, d0, d0)["series_hash"] == bill["series_hash"]
+
+
+# ------------------------------------------------------------------------------------------------ engine-tariffs-10: ICP at legacy net-metering sites
+
+def test_icp_at_a_legacy_site_caps_gross_import_increments_at_net_imports_pro_rata(company):
+    esc = 1.028  # package year 1
+    conn = _conn("B-2(b)", "net_metering_legacy", extra={"agreement_start": "2019-07-01",
+                                                          "icp": {"eligible": True, "peak": {"11": 200.0 / esc}, "off_peak": {"11": 1000.0 / esc}}})
+    d0 = date(2026, 11, 2)
+    ts = _minutes(d0, 1)
+    mod = ((ts + 5 * 3600) % 86400) // 60
+    pk = (mod >= 18 * 60) & (mod < 22 * 60)  # November's peak window, 240 minutes
+
+    def bill(p_imp, p_exp, o_imp, o_exp):
+        imp, exp = np.where(pk, p_imp * 60 / 240, o_imp * 60 / 1200), np.where(pk, p_exp * 60 / 240, o_exp * 60 / 1200)
+        return tariffs.rebuild(ts, imp, exp, conn, d0, d0)
+
+    # increments over the baseline on imported units (800 + 1,000), capped at the month's net import (3,000 - 2,100 = 900) and split pro rata
+    b = bill(1000, 600, 2000, 1500)
+    assert b["icp_incremental_kwh"]["peak"] == pytest.approx(900 * 800 / 1800, abs=0.01)     # before: 200 (the period's net import less baseline)
+    assert b["icp_incremental_kwh"]["off_peak"] == pytest.approx(900 * 1000 / 1800, abs=0.01)  # before: 0
+    # pro rata, but never more ICP units in a period than it bills (800 net off-peak units here)
+    b = bill(1000, 300, 2000, 1200)
+    assert b["icp_incremental_kwh"] == {"peak": pytest.approx(1500 * 800 / 1800, abs=0.01), "off_peak": pytest.approx(800.0, abs=0.01)}
+    assert all(ln["units_kwh"] >= 0 for ln in b["lines"] if ln["line"].startswith("Energy"))
+    # a period that ends the month in net export is not eligible (SRO 2409(I)/2025): no increment there
+    b = bill(1000, 0, 2000, 2500)
+    assert b["icp_incremental_kwh"] == {"peak": pytest.approx(500.0, abs=0.01), "off_peak": 0.0}
+
+
+def test_the_fixed_charge_line_shows_its_proration(company):
+    d0 = date(2026, 10, 25)
+    ts, imp, exp = _month_series(d0, 15, mdi_day=3)
+    bill = tariffs.rebuild(ts, imp, exp, _conn("B-2(b)", sanctioned=400.0), d0, date(2026, 11, 8))
+    f = _lines(bill, "Fixed charges")[0]
+    assert (f["days"], f["of_days"]) == (15, 30)
+    assert f["amount_rs"] == pytest.approx(f["rate"] * f["billing_demand_kw"] * 15 / 30, abs=0.01)  # 150 kW x Rs 1,250 x 15/30
