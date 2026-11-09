@@ -108,7 +108,13 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
         k = np.array(k_days)
         pr = float(np.clip(np.quantile(k, 0.9), 0.5, 1.15))  # the performance ratio on the clearest days
         kn = np.clip(k / pr, 0.05, 1.1)
-        kq = np.quantile(kn, QV) if len(kn) >= 7 else np.clip(K_PRIOR * month_k / 0.86 * np.median(kn) / max(1e-6, np.median(kn)), 0, 1.1)
+        if len(kn) >= 7:
+            kq = np.quantile(kn, QV)
+        else:
+            # 3 to 6 fitted days: the prior's shape, its median moved from the month's climatology towards the site's own median clearness with
+            # weight days / 7, so the step to the empirical quantiles at 7 days is small and the first week reads the site's own days
+            med = month_k + (float(np.median(kn)) - month_k) * len(kn) / 7.0
+            kq = np.clip(K_PRIOR * med / K_PRIOR[3], 0.05, 1.1)
         kq = np.maximum.accumulate(kq)
         scale = pr
     else:

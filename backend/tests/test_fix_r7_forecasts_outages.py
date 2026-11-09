@@ -75,6 +75,26 @@ def test_the_pv_fit_reads_whole_local_days_so_every_tick_of_a_day_fits_the_same_
         assert (q05, q25, q50, q95) == pytest.approx((0.45, 0.45, 0.725, 1.0), abs=0.02), seen
 
 
+# ------------------------------------------------------------------------------------------------ engine-forecast-03
+
+def test_with_three_to_six_fitted_days_the_clearness_quantiles_move_with_the_site_s_days(company):
+    """With 3 to 6 fitted days the quantiles are the climatological prior scaled towards the site's own median clearness (weight: days / 7). v1 scaled
+    the prior by median(kn) / median(kn), which is 1, so a site's first week ran on the prior whatever its days looked like."""
+    t0 = _midnight(date(2026, 11, 9))
+    prior_median = float(forecast.K_PRIOR[3] * forecast.MONTH_K[11] / 0.86)
+    shares = {}
+    for sid, scales in (("pv-overcast", (1.0, 0.45, 0.45, 0.45)), ("pv-clear", (1.0, 1.0, 1.0, 1.0))):
+        ts = np.arange(t0 - 4 * 86400, t0, 300, dtype=np.int64)
+        day = (ts - (t0 - 4 * 86400)) // 86400
+        _write_pv(sid, ts, _clear(ts) * np.asarray(scales)[day])
+        f = forecast.pv(_pv_site(sid), t0)
+        assert f["stage"] == 1 and f["days"] == 4
+        i = 36 * 4  # tomorrow's noon, past the smart-persistence blend
+        shares[sid] = float(f["q"]["q50"][i] / (f["cs"][i] * f["pr"]))
+    assert shares["pv-overcast"] < prior_median - 0.1, (shares, prior_median)
+    assert shares["pv-clear"] > prior_median + 0.03, (shares, prior_median)
+
+
 # ------------------------------------------------------------------------------------------------ engine-forecast-04
 
 def test_the_pv_fit_and_score_read_available_power_not_curtailed_output(company):
