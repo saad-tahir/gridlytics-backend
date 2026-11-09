@@ -6,11 +6,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-import numpy as np
 import pytest
 from test_fix_r2_savings import NIGHT_CHARGER, D, P
 from test_fix_r6_savings import DAYS, LEAD, _blank_evening, _farm, _night_runs, _run
-from test_fix_savings import company, make_site, twin_day  # noqa: F401 (company is a fixture)
+from test_fix_savings import _put_rows, company, make_site, twin_day  # noqa: F401 (company is a fixture)
 
 from gridlytics import sites, store, telemetry, twin, verify
 
@@ -214,3 +213,80 @@ def test_a_closed_loop_edge_not_heard_for_two_hours_is_partial_and_its_claim_wit
     assert r["control"]["edge_unheard_min"] == 120 and r["fidelity"] == "partial"
     # two hours with neither load nor PV read: the grid's own rule does not count such minutes, so before nothing capped them and the day claimed
     assert r["import_unknown"] is False and r["claim_withheld"] == "inputs_unread" and r["claimed_rs"] == 0.0 and r["inputs_unread_min"] == 120
+
+
+# ------------------------------------------------------------------------------------------------ engine-savings-06, role-owner-02: what the headline sums
+
+def _day(levers: dict, fidelity: str = "confirmed", withheld: str | None = None, start_carry: float = 0.0, end_carry: float = 0.0) -> dict:
+    """A stored day row as compute_day writes it, with hand-made levers and chain (golden figures)."""
+    saving = round(sum(v for v in levers.values() if v is not None), 2)
+    claimed = saving if fidelity in verify.CLAIMING and not withheld else 0.0
+    st = {"soc": 0.5, "gen_on": False, "gen_elapsed": 0, "outage_min": 0, "gen_rescue": False}
+    return {"saving_rs": saving, "claimed_rs": claimed, "levers": levers, "fidelity": fidelity, "claim_withheld": withheld,
+            "import_unknown": withheld == "import_unknown", "litres_saved": 0.0, "actual": {"cost_rs": 10000.0}, "baseline": {"cost_rs": 10000.0 + saving},
+            "peak_kw_actual": 0.0, "peak_kw_baseline": 0.0, "mdi_rate": 0.0, "unserved_kwh_actual": 0.0, "unserved_kwh_baseline": 0.0,
+            "inputs_unread_min": 0, "control": {"in_force_share": 1.0},
+            "chain": {"from": "previous_day" if start_carry else "actual", "start": {"state": st, "carry_rs": start_carry, "v_rs_per_kwh": 50.0},
+                      "end": {"state": st, "carry_rs": end_carry, "v_rs_per_kwh": 50.0, "unread_min": 0}}}
+
+
+L0 = {"peak_window": 0.0, "offpeak_energy": 0.0, "export": 0.0, "genset": 0.0, "wear": 0.0, "carry_over": 0.0}
+
+
+def _lv(**kw) -> dict:
+    return {**L0, **kw}
+
+
+GOLDEN = {
+    # confirmed: claims 1,100, of which 500 carry-over (its end gap, used by the next day)
+    "2026-10-01": _day(_lv(peak_window=1000.0, offpeak_energy=-300.0, wear=-100.0, carry_over=500.0), end_carry=500.0),
+    # withheld for its battery's data: the wear lever unknown, so the day's saving is unknown (800 is a part of it)
+    "2026-10-02": _day(_lv(peak_window=800.0, offpeak_energy=-200.0, wear=None, carry_over=200.0), withheld="battery_flow_unknown",
+                       start_carry=500.0, end_carry=700.0),
+    # the plan not in control: read data, claims nothing
+    "2026-10-03": _day(_lv(peak_window=50.0, wear=10.0, carry_over=-40.0), fidelity="not_applied", start_carry=700.0, end_carry=660.0),
+    # confirmed, restarted (arm change): claims 900, of which 300 carry-over that no later day has used yet
+    "2026-10-04": _day(_lv(peak_window=900.0, offpeak_energy=-250.0, wear=-50.0, carry_over=300.0), end_carry=300.0),
+}
+
+
+def test_the_headline_is_the_claim_and_a_withheld_days_partial_levers_add_to_no_total(company):
+    sid = make_site(name="Golden r7 headline")
+    _put_rows(sid, {d: {"native": r, "tuned": r} for d, r in GOLDEN.items()})
+    store.set_setting(f"fee:{sid}", 1000)
+    s = verify.summary(sid, "2026-10-01", "2026-10-04", see_fee=True)
+    n = s["baselines"]["native"]
+    # every scored day whose saving is known: 1,100 + 20 + 900. Before: 2,820, with the withheld day's partial 800 (its carry-over credited without
+    # its wear)
+    assert n["saving_rs"] == 2020.0
+    assert n["levers"] == {"peak_window": 1950.0, "offpeak_energy": -550.0, "export": 0.0, "genset": 0.0, "wear": -140.0, "carry_over": 760.0, "mdi": 0.0}
+    # the claim: the claiming days less the carry-over still provisional (the last day's 300). Before: 2,000
+    assert n["claimed_rs"] == 1700.0 and n["carry_over_provisional_rs"] == 300.0
+    assert n["levers_claimed_rs"] == {"peak_window": 1900.0, "offpeak_energy": -550.0, "export": 0.0, "genset": 0.0, "wear": -150.0, "carry_over": 500.0,
+                                      "mdi": 0.0}
+    assert sum(n["levers_claimed_rs"].values()) == pytest.approx(n["claimed_rs"], abs=0.01)
+    assert (n["claiming_days"], n["withheld_days"], n["unclaimed_days"], n["verified_days"]) == (2, 1, 1, 2)
+    # the fee check is built on the same claim: 1,700 over the 3 days whose saving is known, a 31-day month. Before: 20,667
+    assert s["fee"]["verified_saving_rs_per_month"] == 17567
+    days = {d["day"]: d for d in s["days"]}
+    w = days["2026-10-02"]
+    assert w["saving_native_rs"] is None and w["saving_tuned_rs"] is None and w["claims"] is False and w["claimed_native_rs"] == 0.0
+    assert w["not_claimed_reason"] == "battery_flow_unknown" and w["levers_kept"] == ["peak_window", "offpeak_energy", "export", "genset", "carry_over"]
+    assert days["2026-10-03"]["not_claimed_reason"] == "not_applied" and days["2026-10-03"]["saving_native_rs"] == 20.0
+    assert days["2026-10-03"]["levers_kept"] is None
+    assert days["2026-10-01"]["claims"] is True and days["2026-10-01"]["not_claimed_reason"] is None
+    assert days["2026-10-01"]["carry_over_provisional"] is False and days["2026-10-01"]["carry_over_provisional_native_rs"] is None
+    assert days["2026-10-04"]["carry_over_provisional"] is True and days["2026-10-04"]["carry_over_provisional_native_rs"] == 300.0
+    assert days["2026-10-04"]["claimed_native_rs"] == 900.0 and days["2026-10-04"]["control_share"] == 1.0
+
+
+def test_a_carry_over_credit_is_claimed_once_a_later_day_has_used_the_stored_energy(company):
+    sid = make_site(name="Golden r7 carry")
+    _put_rows(sid, {d: {"native": r, "tuned": r} for d, r in GOLDEN.items()})
+    # the next day is scored, chained from the last: it debits the 300 the day before credited, and its own levers carry what the energy did
+    _put_rows(sid, {"2026-10-05": {b: _day(_lv(peak_window=600.0, carry_over=-200.0), start_carry=300.0, end_carry=100.0) for b in ("native", "tuned")}})
+    n = verify.summary(sid, "2026-10-01", "2026-10-04")["baselines"]["native"]
+    assert n["claimed_rs"] == 2000.0 and n["carry_over_provisional_rs"] == 0.0
+    n = verify.summary(sid, "2026-10-01", "2026-10-05")["baselines"]["native"]
+    assert n["claimed_rs"] == 2300.0 and n["carry_over_provisional_rs"] == 100.0  # 1,100 + 900 + 400, less the new last day's 100
+    assert n["levers_claimed_rs"]["carry_over"] == 500.0  # 500 + 300 - 200, less the 100 still provisional

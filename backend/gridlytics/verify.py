@@ -1451,7 +1451,23 @@ def _chain_stale(site_id: str, days: dict[str, dict]) -> list[str]:
     return stale
 
 
+def _day_withheld(d: dict) -> bool:
+    """A priced day whose claim is withheld for missing data (`claim_withheld`, or a row from before it with its import unknown): its saving is not
+    known, only some of its levers."""
+    return bool(d.get("claim_withheld")) or bool(d.get("import_unknown"))
+
+
+def _day_claims(d: dict) -> bool:
+    """A stored day that claims its saving: a claiming fidelity and nothing withheld (_claims, and a row from before `claim_withheld` with its
+    import unknown claims nothing)."""
+    return _claims(d) and not d.get("import_unknown")
+
+
 def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
+    """The period's ledger per baseline and its days (plan 8.5). Per baseline: `claimed_rs`, the headline (the claiming days' savings, less the
+    carry-over still provisional, plus the claimed MDI lever), with `levers_claimed_rs` its split by lever; `saving_rs` and `levers`, the replay over
+    every scored day whose saving is known (a day withheld for missing data adds to neither); `carry_over_provisional_rs`, the claiming days'
+    carry-over no later scored day has used yet; and the days that claim, are withheld or claim nothing on read data."""
     site = sites.get(site_id)
     with store.connect() as con:
         rows = con.execute("SELECT day_local, baseline, data, computed FROM savings_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? ORDER BY day_local",
@@ -1475,11 +1491,34 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         except ValueError:
             return day[:7]
 
+    # a claiming day's carry-over is its end gap valued at v_end: what the stored energy it leaves will be worth. Until a later day is scored, nothing
+    # has used that energy, so the credit is provisional (round 7, audit role-owner-02): left out of the claim and shown apart. A later day's row
+    # settles it (its replay starts where this day's ended, or restarts at a switchback block, plan 8.2's hand-over at v_end)
+    after = (date.fromisoformat(max(days)[:10]) + timedelta(days=1)).isoformat() if days else None
+    with store.connect() as con:
+        next_stored = {r["baseline"] for r in con.execute("SELECT baseline FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, after))} \
+            if after else set()
+
+    def provisional(day: str, base: str, d: dict) -> float:
+        """The day's carry-over credit no later scored day has used yet (0 when one has, or when the day does not claim)."""
+        if not _day_claims(d):
+            return 0.0
+        nxt = (date.fromisoformat(day[:10]) + timedelta(days=1)).isoformat()
+        if base in days.get(nxt, {}) or (nxt == after and base in next_stored):
+            return 0.0
+        end = (d.get("chain") or {}).get("end") or {}
+        # a row stored before chaining valued its whole end gap as its carry-over lever
+        return float(end["carry_rs"]) if "carry_rs" in end else float((d.get("levers") or {}).get("carry_over") or 0.0)
+
     #: per baseline and month: (claimed rupees of the days, days scored, the month's claimed MDI lever), for the fee check
     per_month: dict[str, dict[str, tuple[float, int, float]]] = {}
+    #: per baseline and day: the provisional carry-over left out of the claim
+    prov_by_day: dict[str, dict[str, float]] = {}
     for base in ("native", "tuned"):
         levers: dict[str, float] = {}
-        total = claimed = litres = 0.0
+        levers_claimed: dict[str, float] = {}
+        total = claimed = litres = prov_total = 0.0
+        claiming_days = withheld_days = unclaimed_days = 0
         verified = 0
         gen_unknown_days = imp_unknown_days = 0
         bound = 0.0
@@ -1491,11 +1530,28 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             d = by.get(base)
             if not d:
                 continue
-            for k, v in d["levers"].items():
-                if v is not None:  # a lever withheld (an unmetered genset) adds nothing
-                    levers[k] = levers.get(k, 0.0) + v
-            total += d["saving_rs"]
-            claimed += d["claimed_rs"]
+            # a day whose claim is withheld for missing data has an unknown saving: its partial levers add to no total (before, its carry-over was
+            # credited without, say, its unknown grid levers); a day that claims nothing on read data (the plan not in control, a recommendation, a
+            # native block) adds to every scored day's total, not to the claim (round 7, audit engine-savings-06)
+            withheld = _day_withheld(d)
+            claims = _day_claims(d)
+            prov = provisional(day, base, d)
+            prov_by_day.setdefault(base, {})[day] = prov
+            if not withheld:
+                for k, v in d["levers"].items():
+                    if v is not None:  # a lever withheld (an unmetered genset) adds nothing
+                        levers[k] = levers.get(k, 0.0) + v
+                total += d["saving_rs"]
+            if claims:
+                for k, v in d["levers"].items():
+                    if v is not None:
+                        levers_claimed[k] = levers_claimed.get(k, 0.0) + v
+                levers_claimed["carry_over"] = levers_claimed.get("carry_over", 0.0) - prov
+                claimed += d["claimed_rs"] - prov
+                prov_total += prov
+            claiming_days += int(claims)
+            withheld_days += int(withheld)
+            unclaimed_days += int(not claims and not withheld)
             litres += d.get("litres_saved") or 0.0
             gen_unknown_days += int(bool(d.get("genset_unknown")))
             imp_unknown = bool(d.get("import_unknown"))
@@ -1508,7 +1564,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                 m[1] = max(m[1], d["peak_kw_baseline"])
             m[2] = max(m[2], float(d.get("mdi_floor_kw") or 0.0))
             m[3] += int(d["fidelity"] in CLAIMING and not imp_unknown)
-            m[4] += d["claimed_rs"]
+            m[4] += d["claimed_rs"] - prov
             m[5] += int(not imp_unknown and not d.get("claim_withheld"))  # an unknown saving is not a zero saving: the fee's rate is over the days that could claim
             rate = d.get("mdi_rate") or rate
             unserved_a += d["unserved_kwh_actual"]
@@ -1519,15 +1575,32 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         mdi_claimed = sum(x for k, x in mdi_by_month.items() if months[k][3])
         per_month[base] = {k: (v[4], v[5], mdi_by_month[k] if v[3] else 0.0) for k, v in months.items()}
         levers["mdi"] = round(mdi, 2)
+        levers_claimed = {k: levers_claimed.get(k, 0.0) for k in levers if k != "mdi"} | {k: v for k, v in levers_claimed.items() if k not in levers}
+        levers_claimed["mdi"] = round(mdi_claimed, 2)
         out["baselines"][base] = {"saving_rs": round(total + mdi, 2), "claimed_rs": round(claimed + mdi_claimed, 2),
-                                  "levers": {k: round(v, 2) for k, v in levers.items()}, "litres_saved": round(litres, 1), "verified_days": verified,
+                                  "levers": {k: round(v, 2) for k, v in levers.items()},
+                                  "levers_claimed_rs": {k: round(v, 2) for k, v in levers_claimed.items()},
+                                  "carry_over_provisional_rs": round(prov_total, 2), "claiming_days": claiming_days, "withheld_days": withheld_days,
+                                  "unclaimed_days": unclaimed_days, "litres_saved": round(litres, 1), "verified_days": verified,
                                   "perfect_foresight_rs": round(bound, 2) if base == "native" else None,
                                   "mdi_months": {k: {"actual_kw": v[0], "baseline_kw": v[1], "floor_kw": v[2]} for k, v in months.items()},
                                   "unserved_kwh_actual": round(unserved_a, 1), "unserved_kwh_baseline": round(unserved_b, 1),
                                   "genset_unknown_days": gen_unknown_days, "import_unknown_days": imp_unknown_days}
     for day, by in sorted(days.items()):
         n = by.get("native", {})
-        out["days"].append({"day": day, "saving_native_rs": n.get("saving_rs"), "saving_tuned_rs": (by.get("tuned") or {}).get("saving_rs"),
+        t = by.get("tuned") or {}
+        withheld = _day_withheld(n)
+        prov = (prov_by_day.get("native") or {}).get(day, 0.0)
+        reason = None if _day_claims(n) else (n.get("claim_withheld") or ("import_unknown" if n.get("import_unknown") else n.get("fidelity")))
+        # round 7 (audit engine-savings-06): a withheld day's saving is unknown (null), with the levers it still priced; every day says what it
+        # claims, why it claims nothing, and whether its carry-over is still provisional
+        out["days"].append({"day": day, "saving_native_rs": None if withheld else n.get("saving_rs"),
+                            "saving_tuned_rs": None if _day_withheld(t) else t.get("saving_rs"),
+                            "claimed_native_rs": n.get("claimed_rs"), "claimed_tuned_rs": t.get("claimed_rs"), "claims": _day_claims(n),
+                            "not_claimed_reason": reason,
+                            "levers_kept": [k for k, v in (n.get("levers") or {}).items() if v is not None] if withheld else None,
+                            "carry_over_provisional": bool(prov), "carry_over_provisional_native_rs": round(prov, 2) if prov else None,
+                            "control_share": (n.get("control") or {}).get("in_force_share"), "inputs_unread_min": n.get("inputs_unread_min"),
                             "fidelity": n.get("fidelity"), "actual_cost_rs": (n.get("actual") or {}).get("cost_rs"),
                             "native_cost_rs": (n.get("baseline") or {}).get("cost_rs"), "litres_actual": (n.get("actual") or {}).get("litres"),
                             "litres_native": (n.get("baseline") or {}).get("litres"), "peak_kw": (n.get("actual") or {}).get("peak_kw"),
