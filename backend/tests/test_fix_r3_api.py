@@ -182,9 +182,11 @@ def test_an_events_batch_whose_re_solve_cannot_be_held_is_answered_failed_with_i
 # ------------------------------------------------------------------------------------------------ plan held
 
 def _plan_row(w, sid, pid, status, reason, generated):
+    # valid for the 48 hours a tick's plan is (a plan past its valid_until is not in force: round 7, engine-delivery-24)
+    until = (datetime.fromisoformat(generated) + timedelta(hours=48)).isoformat(timespec="seconds")
     with w.use(), store.connect() as con:
         con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, reason) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (pid, sid, generated, generated, generated, generated, "a", status, reason))
+                    (pid, sid, generated, generated, generated, until, "a", status, reason))
 
 
 def test_the_plan_answer_says_why_no_plan_is_in_force(world, monkeypatch):

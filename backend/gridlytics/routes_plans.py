@@ -21,7 +21,8 @@ _last_solve: dict[str, float] = {}
 @router.get("/api/sites/{site_id}/plan")
 def plan_current(site_id: str):
     """The plan in force, or `{plan: null, held}` when none is: `held` says why ({reason, until, plan_id}: control paused or released to native until
-    a time, or the latest plan held by its guard), and is null when no plan was made yet (or the last solve failed).
+    a time, the latest plan held by its guard, or the last plan past its valid_until, with `since` its end), and is null when no plan was made yet
+    (or the last solve failed).
     A pause or a release to native in force answers `{plan: null, held}` even while the plan of before it is still stored as active: no plan is in force
     under one (plans.active_at), and the tick stores its plan as held only at the next quarter."""
     site_or_404(site_id)
@@ -47,7 +48,12 @@ def _held(site_id: str) -> dict | None:
                 h = info(site_id, now)
             except TypeError:
                 h = info(site_id)
-            return None if h is None else {"reason": h.get("reason"), "until": h.get("until"), "plan_id": h.get("plan_id")}
+            if h is None:
+                return None
+            out_h = {"reason": h.get("reason"), "until": h.get("until"), "plan_id": h.get("plan_id")}
+            if h.get("since"):
+                out_h["since"] = h["since"]                 # an expired plan: when it ran out
+            return out_h
         except Exception:
             log.exception("plans.held_info failed for site %s; the held answer is derived here", site_id)
     rel = plans.control_release(site_id, now)

@@ -183,5 +183,6 @@ def test_a_tick_writes_an_active_plan_from_telemetry_alone(company):
     r = plans.tick(sid, at=twin.day_start_utc(d) + 86400)
     assert r["status"] == "active"
     assert len(r["steps"]) == 192 and r["slots"]["days"]
-    assert plans.current(sid)["id"] == r["plan_id"]
+    # in force at the tick's own time (by today's clock its 48 hours have run out: round 7, a plan past its valid_until is not in force)
+    assert plans.current(sid, now=twin.day_start_utc(d) + 86400)["id"] == r["plan_id"]
     assert forecast.page(full, "pv")["issue"] is not None

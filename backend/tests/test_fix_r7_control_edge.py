@@ -4,7 +4,8 @@ Batch 1, what reaches the device:
 - a site below closed loop gets no plan at its edge (audit flow-telemetry-plan-control-03, engine-plans-live-11);
 - the wrong-plan guard can refuse a plan: the fallback floor, unserved critical load in a forecast outage, the plan's own MDI cap, load shed with the
   grid up, a genset slot with the grid present, an export slot where nothing may be exported, a slot floor under the fallback (audit
-  engine-delivery-01, engine-plans-live-05).
+  engine-delivery-01, engine-plans-live-05);
+- a plan past its valid_until is not in force, not served and not keyed in (audit engine-delivery-24).
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -227,3 +228,50 @@ def test_a_tick_passes_the_solves_mdi_cap_to_the_guard(company, monkeypatch):
     r = plans.tick(sid)
     assert r["status"] == "active" and r["summary"]["guard"] is None
     assert seen["res"] is not None and "M" in seen["res"]
+
+
+# ------------------------------------------------------------------------------------------------ engine-delivery-24
+
+def _expired_plan(sid: str, hours_ago: float = 1.0) -> str:
+    """An active plan of two days whose valid_until passed `hours_ago` hours ago (the ticks stopped)."""
+    t0 = (_now() - int((48 + hours_ago) * 3600)) // 900 * 900
+    steps = [{"t": t0 + 900 * i, "local": "00:00", "reason": "idle", "detail": "", "genset_on": False, "peak": False, "discharge_kw": 0.0,
+              "charge_kw": 0.0} for i in range(192)]
+    pid = "expired-" + sid[:6]
+    with store.connect() as con:
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, summary, steps, slots) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (pid, sid, _iso(t0), _iso(t0), _iso(t0), _iso(t0 + 192 * 900), "a", "active",
+                                                       json.dumps({"status_label": "Solved within tolerance"}), json.dumps(steps),
+                                                       json.dumps({"days": [{"date": "2026-11-07", "slots": []}], "fallback": None})))
+    return pid
+
+
+def test_a_plan_past_its_valid_until_is_not_in_force_nor_served(company):
+    sid = _site(genset=False)
+    _closed_loop(sid)
+    pid = _expired_plan(sid)
+    assert plans.current(sid) is None
+    vu = plans._ts(plans.get(sid, pid)["valid_until"])
+    h = plans.held_info(sid)
+    assert h == {"reason": "plan_expired", "until": None, "plan_id": pid, "since": plans.get(sid, pid)["valid_until"]}
+    assert plans.signed_message(sid) is None and _messages(sid) == 0
+    assert plans.active_at(sid, vu - 60)["id"] == pid                # in force up to its end
+    assert plans.active_at(sid, vu + 60) is None                     # and not after it
+    # the next good tick puts a plan in force again
+    assert plans.tick(sid)["status"] == "active" and plans.current(sid)["id"] != pid and plans.held_info(sid) is None
+
+
+def test_the_plan_and_control_pages_and_the_edge_see_an_expired_plan_as_no_plan(world):
+    sid = world.site
+    with world.use():
+        _closed_loop(sid)
+        pid = _expired_plan(sid)
+    a = world.c["admin"]
+    body = a.get(f"/api/sites/{sid}/plan").json()
+    assert body["plan"] is None and body["held"]["reason"] == "plan_expired" and body["held"]["plan_id"] == pid
+    assert body["held"]["until"] is None and plans._ts(body["held"]["since"]) < _now()        # when it ran out
+    ctl = a.get(f"/api/sites/{sid}/control").json()
+    assert ctl["compiled"] is None and ctl["plan_id"] is None        # no expired table offered for keying in
+    kh = world.key(["plans:read"], role="viewer")
+    r = world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=kh)
+    assert r.status_code == 404 and r.json()["code"] == "plan_expired", r.text

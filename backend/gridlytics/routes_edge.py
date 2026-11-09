@@ -408,7 +408,8 @@ def _without_money(site_id: str, msg: dict) -> dict:
 @router.get("/api/sites/{site_id}/plans/current/message")
 def plan_message(site_id: str):
     """The signed plan message: what an edge (a plans:read key) pulls. Only a key pulls it, so each pull recorded in plan_messages is a real send (a
-    person reads the plan at /plan). 409 `not_closed_loop` below the closed-loop tier (nothing is sent to the edge of a monitor or advisory site)."""
+    person reads the plan at /plan). 409 `not_closed_loop` below the closed-loop tier (nothing is sent to the edge of a monitor or advisory site);
+    404 `plan_expired` when the last plan is past its valid_until, `no_plan` before the first plan."""
     _key_only("The signed plan message is pulled by the site's edge with its API key; the plan itself is at /plan")
     site_or_404(site_id)
     try:
@@ -417,6 +418,9 @@ def plan_message(site_id: str):
         # only a closed-loop site's edge applies plans: below it the edge gets no table to write (and no send is counted)
         raise Refusal(409, str(exc), "not_closed_loop") from None
     if msg is None:
+        held = plans.held_info(site_id) or {}
+        if held.get("reason") == plans.EXPIRED_REASON:
+            raise Refusal(404, "The last plan has run out and no newer plan is in force, so the edge runs its fallback", "plan_expired")
         raise Refusal(404, "No active plan yet", "no_plan")
     return _without_money(site_id, msg)
 

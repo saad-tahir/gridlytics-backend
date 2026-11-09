@@ -545,11 +545,15 @@ def _plan_out(r, with_steps: bool = True) -> dict:
     return d
 
 
-def current(site_id: str) -> dict | None:
+def current(site_id: str, now: int | None = None) -> dict | None:
+    """The plan in force: the latest active plan, while `now` (the clock by default) is before its valid_until. A plan past its valid_until is
+    not in force (Part 2.4: a failed tick keeps the previous plan only until then), so it is neither served to the edge nor keyed in; held_info
+    names it (plan_expired)."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
     with store.connect() as con:
         r = con.execute("SELECT * FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
         last = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
-    if r is None:
+    if r is None or _past_valid_until(r["valid_until"], now):
         return None
     out = _plan_out(r)
     if last and last["status"] in ("failed", "held") and last["id"] != out["id"]:
@@ -564,18 +568,23 @@ def held_info(site_id: str, now: int | None = None) -> dict | None:
       `kind`, `author` and `override_id` of the override.
     - Otherwise, with no plan active, the latest plan when its guard held it: the guard's reason, `until` None and its id. After a pause has ended
       and before the next tick, this is the pause's held plan under the pause's reason.
+    - Otherwise, when the active plan has passed its valid_until (the ticks stopped or every solve since failed): `plan_expired`, `until` None,
+      the expired plan's id and `since`, its valid_until. The edge then runs its fallback (the inverter's native settings).
     - Otherwise None: a plan is in force, none was made yet, or the latest solve failed."""
     now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
     rel = control_release(site_id, now)
     with store.connect() as con:
         last = con.execute("SELECT id, status, reason FROM plans WHERE site_id = ? ORDER BY generated_at DESC, rowid DESC LIMIT 1", (site_id,)).fetchone()
-        active = con.execute("SELECT 1 FROM plans WHERE site_id = ? AND status = 'active' LIMIT 1", (site_id,)).fetchone()
+        active = con.execute("SELECT id, valid_until FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1",
+                             (site_id,)).fetchone()
     held = last is not None and last["status"] == "held"
     if rel:
         return {"reason": rel["reason"], "until": rel["until"], "plan_id": last["id"] if held and last["reason"] == rel["reason"] else None,
                 "kind": rel["kind"], "author": rel["author"], "override_id": rel["override_id"]}
     if active is None and held:
         return {"reason": last["reason"] or "held", "until": None, "plan_id": last["id"]}
+    if active is not None and _past_valid_until(active["valid_until"], now):
+        return {"reason": EXPIRED_REASON, "until": None, "plan_id": active["id"], "since": active["valid_until"]}
     return None
 
 
@@ -659,15 +668,17 @@ def _released_at(site_id: str, ts: int) -> bool:
 def active_at(site_id: str, ts: int) -> dict | None:
     """The plan that was in force at an instant: the latest generated at or before it (belief time not after it). None while a pause or a release
     to native was in force: the tick then stores its plan as held (or, when the solve failed, a failed row noting the release), and no plan is in
-    force; a guard hold or a failed tick otherwise leaves the previous plan in force."""
+    force; a guard hold or a failed tick otherwise leaves the previous plan in force, up to its valid_until (after it, None)."""
     if _released_at(site_id, ts):
         return None
     with store.connect() as con:
         # the latest rows first (the light columns only): a held or failed row of a pause ends the search with no plan in force
-        rows = con.execute("SELECT id, status, reason, summary FROM plans WHERE site_id = ? AND belief_time <= ? "
+        rows = con.execute("SELECT id, status, reason, summary, valid_until FROM plans WHERE site_id = ? AND belief_time <= ? "
                            "ORDER BY belief_time DESC, generated_at DESC, rowid DESC LIMIT 200", (site_id, _iso(ts))).fetchall()
         for r in rows:
             if r["status"] in ("active", "superseded"):
+                if _past_valid_until(r["valid_until"], ts):
+                    return None
                 return _plan_out(con.execute("SELECT * FROM plans WHERE id = ?", (r["id"],)).fetchone())
             if r["status"] == "held" and r["reason"] in RELEASE_REASONS.values():
                 return None
@@ -675,7 +686,7 @@ def active_at(site_id: str, ts: int) -> dict | None:
                 return None
         r = con.execute("SELECT * FROM plans WHERE site_id = ? AND status IN ('active','superseded') AND belief_time <= ? ORDER BY belief_time DESC LIMIT 1",
                         (site_id, _iso(ts))).fetchone()
-    return _plan_out(r) if r else None
+    return _plan_out(r) if r and not _past_valid_until(r["valid_until"], ts) else None
 
 
 def now_and_next(plan: dict | None, now: int | None = None) -> dict | None:
@@ -751,6 +762,7 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
     """The current plan as the ems-edge/1.0 plan message, signed with the site's key; a signed release instead while control is paused or
     released to native. The body carries no money field (the plan's rupees stay on the plan page). `record` writes the plan_messages row that
     the edge page lists as a send: the edge's own pull (the key-only route) records it; any other caller passes record=False.
+    None when no plan is in force (none yet, or the last one is past its valid_until).
     Only a closed-loop site's edge applies plans (plan Part 2.3): below it (the effective tier, monitor or advisory_writes) nothing is signed or
     sent and NotClosedLoop is raised, so a plans:read key at a monitor site gets no actionable table and no send is counted."""
     tier = (sites.get(site_id) or {}).get("tier", "monitor")
@@ -777,6 +789,10 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
 
 # ------------------------------------------------------------------------------------------------ round 7 (audit): what reaches the device
 
+#: the held reason when the plan in force has passed its valid_until and no newer plan replaced it (Part 2.4)
+EXPIRED_REASON = "plan_expired"
+
+
 class NotClosedLoop(Exception):
     """A signed plan message asked for at a site whose effective control tier is below closed loop: nothing is sent to its edge (plan Part 2.3,
     monitor: recommendations only; advisory_writes: a person keys the table in)."""
@@ -786,3 +802,9 @@ class NotClosedLoop(Exception):
         words = {"monitor": "monitor", "advisory_writes": "advisory writes"}.get(tier, str(tier).replace("_", " "))
         how = ("the plan is a recommendation" if tier == "monitor" else "a person keys the table in")
         super().__init__(f"The site's control tier is {words}, so no plan is sent to its edge: {how}")
+
+
+def _past_valid_until(valid_until: str | None, ts: int) -> bool:
+    """Whether the instant `ts` is at or after a plan's valid_until (a plan with none never expires)."""
+    end = _ts(valid_until)
+    return end is not None and int(ts) >= end
