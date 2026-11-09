@@ -1038,3 +1038,30 @@ def test_a_daily_sheet_is_asked_for_a_day_today_or_before_and_says_when_no_plan_
     assert r.status_code == 200, r.text
     assert "No plan was in force" in built[-1] and "Start | End" not in built[-1], built[-1]
 
+
+# ------------------------------------------------------------------------------------------------ role-operator-20 (and flow-reports-alerts-members-keys-18)
+
+def test_a_report_is_listed_and_downloaded_by_the_roles_that_may_generate_its_kind(world):
+    """The monthly savings CSV was a savings export the operator was refused on the Savings page (export: an administrator or an analyst), but its
+    download checked only see_costs. One rule now: who may generate a kind lists and downloads it."""
+    sid, month = world.site, _past_month()
+    today = datetime.now(PKT).date().isoformat()
+    a = world.c["admin"]
+    made = {}
+    for kind, body in (("monthly_savings", {"site_id": sid, "period": month}), ("company_rollup", {"period": month}),
+                       ("daily_operations", {"site_id": sid, "period": today}), ("energy_only", {"site_id": sid, "period": month}),
+                       ("pilot", {"site_id": sid, "period": month})):
+        r = a.post("/api/reports", json={"kind": kind, **body})
+        assert r.status_code == 200, (kind, r.text)
+        made[kind] = r.json()["id"]
+    may = {"admin": set(made), "analyst": set(made), "operator": {"daily_operations", "energy_only"}, "viewer": {"energy_only"}}
+    for role, kinds in may.items():
+        c = world.c[role]
+        assert {r["kind"] for r in c.get("/api/reports").json()} == kinds, role
+        for kind, rid in made.items():
+            for which in ("pdf", "csv"):
+                got = c.get(f"/api/reports/{rid}/{which}")
+                assert got.status_code == (200 if kind in kinds else 403), (role, kind, which, got.status_code)
+    refused = world.c["operator"].get(f"/api/reports/{made['monthly_savings']}/csv").json()["detail"]
+    assert refused == "The monthly savings report is for an administrator or an analyst", refused
+

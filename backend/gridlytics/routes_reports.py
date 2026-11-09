@@ -1,6 +1,7 @@
 """Reports (UI-14): generate, list and download; a viewer may generate and read the energy-only report only.
 
-Who generates what (auth.PERMISSIONS): the monthly savings report is `export` (it carries money), the energy-only report `energy_report` (every member, a
+Who generates a kind lists and downloads it (audit role-operator-20), so an operator neither lists nor downloads the monthly savings report or the
+company roll-up, which are savings exports. Who generates what (auth.PERMISSIONS): the monthly savings report is `export` (it carries money), the energy-only report `energy_report` (every member, a
 viewer included: it carries no money), the daily operations sheet `run_jobs` (its period is a day, YYYY-MM-DD, today's by default; every other kind's a
 month), the company roll-up and the pilot report `export`. Each listed row says
 whether its figures were `preliminary`. The company roll-up covers every site (no site_id; its row keeps an empty one). The pilot report carries the
@@ -24,14 +25,16 @@ REPORT_PERMISSION = {"monthly_savings": "export", "energy_only": "energy_report"
 FEE_KINDS = ("pilot",)
 
 
+def _may_read(kind: str) -> bool:
+    """Whether the signed-in role lists and downloads reports of this kind: the permission that generates it (audit role-operator-20: the monthly
+    savings CSV is a savings export, refused to an operator on the Savings page, yet its download checked only see_costs), and see_fee for a kind
+    that carries the fee."""
+    return auth.can(REPORT_PERMISSION.get(kind, "export")) and (kind not in FEE_KINDS or auth.can("see_fee"))
+
+
 @router.get("/api/reports")
 def listing(site_id: str | None = None):
-    rows = reports.listing(site_id)
-    if not auth.can("see_costs"):
-        rows = [r for r in rows if r["kind"] == "energy_only"]
-    if not auth.can("see_fee"):
-        rows = [r for r in rows if r["kind"] not in FEE_KINDS]
-    return rows
+    return [r for r in reports.listing(site_id) if _may_read(r["kind"])]
 
 
 @router.post("/api/reports")
@@ -57,8 +60,9 @@ def download(rid: str, which: str):
     r = reports.get(rid)
     if r is None:
         raise Refusal(404, "No such report", "not_found")
-    if r["kind"] != "energy_only" and not auth.can("see_costs"):
-        raise Refusal(403, "This report carries money figures; your role sees the energy-only report", "role")
+    if not auth.can(REPORT_PERMISSION.get(r["kind"], "export")):
+        raise Refusal(403, f"The {reports.TITLES.get(r['kind'], 'report').lower()} is for {auth.roles_words(REPORT_PERMISSION.get(r['kind'], 'export'))}",
+                      "role")
     if r["kind"] in FEE_KINDS and not auth.can("see_fee"):
         raise Refusal(403, "The pilot report carries the fee, which your role does not see", "role")
     p = reports.file_path(rid, which)
