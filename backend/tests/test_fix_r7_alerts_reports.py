@@ -269,3 +269,166 @@ def test_an_ordinary_day_raises_no_bust(world):
         assert alerts.forecast_bust(sites.full(sid), day)["hours"] == 0
         alerts.nightly(sid, day)
         assert "forecast_bust" not in _rules_of(alerts.listing("active", sid))
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-14
+
+def _minutes(t0: int, t1: int, **cols) -> list[dict]:
+    return [{"ts": t, "grid_present": 1, **cols} for t in range(t0 // 60 * 60, t1 // 60 * 60, 60)]
+
+
+def _iso(ts: int) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _ready(monkeypatch):
+    """The site counts as settled (an active plan and 7 days of data), so Control, Savings and Product rules may raise."""
+    monkeypatch.setattr(alerts, "settled", lambda site_id, plan, now: True)
+
+
+def test_a_gap_in_the_data_of_more_than_an_hour_raises_a_data_alert(world):
+    sid = world.site
+    now = _now() // 60 * 60
+    with world.use():
+        telemetry.ingest(sid, _minutes(now - 6 * 3600, now - 4 * 3600) + _minutes(now - 90 * 60, now), "edge", now=now)
+        alerts.evaluate(sid, now)
+        gap = [a for a in alerts.listing("active", sid) if a["rule"] == "data_gap"]
+        assert len(gap) == 1 and gap[0]["category"] == "Data" and gap[0]["detail"]["hours"] == 2.5, gap
+        assert gap[0]["detail"]["gap_from"] == now - 4 * 3600 - 60 + 60 and gap[0]["detail"]["gap_to"] == now - 90 * 60, gap[0]["detail"]
+        # a site whose rule allows three hours keeps quiet
+        store.set_setting(f"alert_rules:site:{sid}", {"Data": {"thresholds": {"gap_hours": 3}}})
+        alerts.evaluate(sid, now)
+        assert "data_gap" not in _rules_of(alerts.listing("active", sid))
+
+
+def test_the_edges_events_raise_control_and_data_alerts(world, monkeypatch):
+    sid = world.site
+    now = _now()
+    _ready(monkeypatch)
+    with world.use():
+        telemetry.ingest(sid, _minutes(now - 600, now), "edge", now=now)
+        with store.connect() as con:
+            for ts, kind in ((now - 3600, "readback_mismatch"), (now - 3000, "clock_unsynced"), (now - 2400, "fallback_engaged"),
+                             (now - 1800, "fallback_cleared"), (now - 2 * 86400, "budget_exhausted")):
+                con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)", (sid, _iso(ts), kind, "edge", "{}"))
+        alerts.evaluate(sid, now)
+        got = {a["rule"]: a for a in alerts.listing("active", sid)}
+        assert got["edge_readback_mismatch"]["category"] == "Control" and got["edge_clock_unsynced"]["category"] == "Data", got.keys()
+        assert "edge_fallback_engaged" not in got                   # cleared by the later fallback_cleared
+        assert "edge_budget_exhausted" not in got                   # two days ago: outside the last day
+        with store.connect() as con:
+            con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)", (sid, _iso(now - 60), "fallback_engaged", "edge", "{}"))
+        alerts.evaluate(sid, now)
+        assert [a["severity"] for a in alerts.listing("active", sid) if a["rule"] == "edge_fallback_engaged"] == ["critical"]
+
+
+def test_an_expired_plan_and_a_silent_edge_raise_control_alerts(world, monkeypatch):
+    sid = world.site
+    now = _now()
+    _ready(monkeypatch)
+    plan = {"id": "p-old", "valid_until": _iso(now - 600).replace("Z", "+00:00"), "steps": [], "summary": {}}
+    monkeypatch.setattr(alerts.plans, "current", lambda site_id: plan)
+    with world.use():
+        telemetry.ingest(sid, _minutes(now - 600, now), "edge", now=now)
+        sites.set_tier_capable(sid, "closed_loop")
+        sites.set_tier_allowed(sid, "closed_loop", "test")
+        sites.put_state(sid, edge_last_seen=now - 40 * 60)
+        alerts.evaluate(sid, now)
+        got = {a["rule"]: a for a in alerts.listing("active", sid)}
+        assert got["plan_expired"]["category"] == "Control" and got["plan_expired"]["severity"] == "critical", got.keys()
+        assert got["edge_offline"]["category"] == "Control" and "40 minutes" in got["edge_offline"]["title"], got.get("edge_offline")
+        sites.put_state(sid, edge_last_seen=now - 60)
+        plan["valid_until"] = _iso(now + 86400).replace("Z", "+00:00")
+        alerts.evaluate(sid, now)
+        assert not {"plan_expired", "edge_offline"} & _rules_of(alerts.listing("active", sid))
+
+
+def test_the_genset_rules_unrequested_low_load_and_a_request_nobody_answered(world, monkeypatch):
+    sid = world.site
+    now = _now() // 60 * 60
+    t0 = now - 3 * 3600
+    steps = [{"t": t0 + 900 * i, "genset_on": False, "genset_kw": 0.0, "reason": "idle", "detail": {}, "local": ""} for i in range(16)]
+    plan = {"id": "p1", "steps": steps, "summary": {}, "valid_until": _iso(now + 86400).replace("Z", "+00:00")}
+    monkeypatch.setattr(alerts.plans, "current", lambda site_id: plan)
+    monkeypatch.setattr(alerts.plans, "active_at", lambda site_id, ts: plan)
+    with world.use():
+        # the grid is up and the plan runs no genset, yet the set ran the last 16 minutes at 20 kW (its minimum load is 30 % of 150 kW)
+        telemetry.ingest(sid, _minutes(now - 3 * 3600, now - 16 * 60, genset_running=0)
+                         + _minutes(now - 16 * 60, now, genset_running=1, genset_power_w=20000.0), "edge", now=now)
+        # a request to start it an hour ago was neither answered nor followed
+        start = now - 3600
+        with store.connect() as con:
+            con.execute("INSERT INTO notifications (id, site_id, ts, kind, payload) VALUES (?,?,?,?,?)",
+                        ("n1", sid, store._now(), "genset_request", json.dumps({"key": f"genset_request:{start}", "start": start, "end": start + 3600,
+                                                                               "kw": 90.0, "reason": "genset_on", "detail": {}, "plan_id": "p0"})))
+        alerts.evaluate(sid, now)
+        got = {a["rule"]: a for a in alerts.listing("active", sid)}
+        assert got["genset_unrequested"]["category"] == "Genset", got.keys()
+        assert got["genset_low_load"]["category"] == "Genset" and "45 kW" in got["genset_low_load"]["title"], got["genset_low_load"]["title"]
+        missed = got["genset_request_missed"]
+        assert missed["category"] == "Genset" and missed["detail"]["requested_start"] == start, missed
+        # answered: no longer missed
+        alerts.answer_request(sid, "n1", "not_now", "operator@r7.test")
+        alerts.evaluate(sid, now)
+        assert "genset_request_missed" not in _rules_of(alerts.listing("active", sid))
+
+
+def test_a_bill_the_rebuild_misses_by_more_than_the_threshold_raises_a_tariff_alert(world):
+    sid = world.site
+    now = _now()
+    with world.use():
+        cid = sites.connections(sid)[0]["id"]
+        with store.connect() as con:
+            con.execute("INSERT INTO bills (id, site_id, connection_id, period_start, period_end, real, rebuilt, difference_pct, created) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", ("b1", sid, cid, "2026-09-01", "2026-09-30", "{}", "{}", -3.4, store._now()))
+        alerts.evaluate(sid, now)
+        got = [a for a in alerts.listing("active", sid) if a["rule"] == "bill_residual"]
+        assert len(got) == 1 and got[0]["category"] == "Tariff" and "3.4 %" in got[0]["title"], got
+        with store.connect() as con:
+            con.execute("INSERT INTO bills (id, site_id, connection_id, period_start, period_end, real, rebuilt, difference_pct, created) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", ("b2", sid, cid, "2026-10-01", "2026-10-31", "{}", "{}", 1.1, store._now()))
+        alerts.evaluate(sid, now)                          # the latest bill is within 2 %
+        assert "bill_residual" not in _rules_of(alerts.listing("active", sid))
+
+
+def test_a_forecast_stage_change_is_said(world):
+    sid = world.site
+    now = _now() // 900 * 900
+    with world.use():
+        telemetry.ingest(sid, _minutes(now - 600, now), "edge", now=now)
+        telemetry.save_forecast(sid, "load", now - 30 * 3600, 0, "test", {"q50": [1.0]})
+        telemetry.save_forecast(sid, "load", now - 900, 1, "test", {"q50": [1.0]})
+        alerts.evaluate(sid, now)
+        got = [a for a in alerts.listing("active", sid) if a["rule"] == "forecast_stage_load"]
+        assert len(got) == 1 and got[0]["category"] == "Forecast" and "stage 0 to stage 1" in got[0]["title"], got
+
+
+def _savings_row(sid: str, day: str, **data) -> None:
+    row = {"saving_rs": 0.0, "claimed_rs": 0.0, "fidelity": "confirmed", "claim_withheld": None, **data}
+    with store.connect() as con:
+        con.execute("INSERT OR REPLACE INTO savings_days (site_id, day_local, baseline, data, computed) VALUES (?,?,?,?,?)",
+                    (sid, day, "native", json.dumps(row), store._now()))
+
+
+def test_the_savings_and_product_rules_after_the_nightly_jobs(world, monkeypatch):
+    sid = world.site
+    day = datetime.now(PKT).date() - timedelta(days=1)
+    _ready(monkeypatch)
+    from gridlytics import verify
+    monkeypatch.setattr(verify, "summary", lambda site_id, d0, d1, see_fee=False: {"fee": {"within_one_third": False}})
+    with world.use():
+        store.set_setting(f"fee:{sid}", 50000.0)
+        _savings_row(sid, day.isoformat(), saving_rs=-850.0, claimed_rs=-850.0)
+        alerts.nightly(sid, day)
+        got = {a["rule"]: a for a in alerts.listing("active", sid)}
+        assert got["savings_negative"]["category"] == "Savings" and "Rs" not in got["savings_negative"]["title"], got.keys()
+        assert f"{day.day} {day:%B}" in got["savings_negative"]["title"]
+        assert got["fee_above_third"]["category"] == "Product" and "Rs" not in got["fee_above_third"]["title"]
+        _savings_row(sid, day.isoformat(), saving_rs=1200.0, claimed_rs=0.0, claim_withheld="import_unknown")
+        monkeypatch.setattr(verify, "summary", lambda site_id, d0, d1, see_fee=False: {"fee": {"within_one_third": True}})
+        alerts.nightly(sid, day)
+        got = {a["rule"]: a for a in alerts.listing("active", sid)}
+        assert "savings_negative" not in got and "fee_above_third" not in got, got.keys()
+        assert got["savings_withheld"]["category"] == "Savings" and "not metered" in got["savings_withheld"]["title"], got["savings_withheld"]
+    # the viewer sees none of them; the analyst sees the Product one (the fee is theirs to read)
+    assert not [a for a in world.c["viewer"].get("/api/alerts").json() if a["category"] in ("Savings", "Product")]

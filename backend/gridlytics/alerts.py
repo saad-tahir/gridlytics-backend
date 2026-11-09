@@ -1,4 +1,5 @@
-"""Alerts and genset requests (plan Part 9.3 UI-16 and UI-11): one list of what needs a human, raised and cleared by rules each tick.
+"""Alerts and genset requests (plan Part 9.3 UI-16 and UI-11): one list of what needs a human, raised and cleared by rules each tick (`evaluate`) and
+after the nightly jobs (`nightly`), with each category's thresholds from the company's rules and a site's overrides (`site_rules`).
 
 Categories: Data, Control, Reserve, Battery, Genset, Forecast, Tariff, Savings, Product. An alert is raised once per (site, rule) while its condition
 holds and closed automatically when it clears; people acknowledge, assign and close them. Advice to start a genset is a request with a reason; the
@@ -138,8 +139,9 @@ def _peak_unconfirmed(site: dict, now: int, today: str) -> bool:
 
 
 #: Control and Savings alerts wait until the site has an active plan and this many days of data (plan Part 9.3, UI-16): a new site's first days would
-#: otherwise raise them on day one (an advisory site's unconfirmed apply before anyone was told to apply a table)
-SETTLED_CATEGORIES = ("Control", "Savings")
+#: otherwise raise them on day one (an advisory site's unconfirmed apply before anyone was told to apply a table). The Product fee check reads the
+#: verified saving, so it waits too.
+SETTLED_CATEGORIES = ("Control", "Savings", "Product")
 SETTLED_DAYS = 7
 
 
@@ -149,6 +151,168 @@ def settled(site_id: str, plan: dict | None, now: int) -> bool:
         return False
     first = telemetry.first_ts(site_id)
     return first is not None and now - int(first) >= SETTLED_DAYS * 86400
+
+
+def _when(ts: int) -> str:
+    """A time in Karachi for an alert's title: "8 Nov 14:30"."""
+    t = datetime.fromtimestamp(int(ts), PKT)
+    return f"{t.day} {t:%b %H:%M}"
+
+
+def _gap(site_id: str, now: int, gap_hours: float) -> None:
+    """Data: the longest gap between two readings in the last day, once data came back after it, above the rules' hours (R8 2.16, "gap above 1
+    hour"); a gap still going on is the staleness rule's."""
+    t0 = now - 86400
+    with telemetry.connect() as con:
+        before = con.execute("SELECT MAX(ts) FROM minute WHERE site_id = ? AND ts < ?", (site_id, t0)).fetchone()[0]
+        ts = [r[0] for r in con.execute("SELECT ts FROM minute WHERE site_id = ? AND ts >= ? AND ts <= ? ORDER BY ts", (site_id, t0, now))]
+    if before is not None:
+        ts.insert(0, before)
+    best = None
+    for a, b in zip(ts, ts[1:]):
+        hours = (b - a - 60) / 3600                      # a reading covers its minute: the gap is the time no minute was read
+        if hours > gap_hours and (best is None or hours > best[2]):
+            best = (a + 60, b, hours)
+    _set(best is not None, site_id, "data_gap", "Data", "warning",
+         f"The data stopped for {best[2]:.1f} hours in the last day, from {_when(best[0])} to {_when(best[1])}" if best else "",
+         {"gap_from": best[0], "gap_to": best[1], "hours": round(best[2], 1)} if best else {})
+
+
+#: The edge's events (ems-edge/1.0) that need a person, with the category, severity and words of their alert; each holds for a day after the event,
+#: and a later `fallback_cleared` ends a `fallback_engaged` (R8 2.16: read-back mismatch, write budget exhausted, local override detected, fallback
+#: entered; clock drift)
+EDGE_EVENTS = {
+    "readback_mismatch": ("Control", "warning", "The edge read back inverter settings that differ from the plan's: control is paused until a person resumes it"),
+    "local_override": ("Control", "warning", "Someone changed the inverter's settings on site: control is paused until a person resumes it"),
+    "budget_exhausted": ("Control", "warning", "The edge used up its writes to the inverter for the day"),
+    "write_failed": ("Control", "warning", "The edge could not write the plan to the inverter"),
+    "plan_rejected": ("Control", "warning", "The edge refused a plan"),
+    "fallback_engaged": ("Control", "critical", "The edge fell back to the inverter's own settings"),
+    "clock_unsynced": ("Data", "warning", "The edge's clock is not set: its readings may carry the wrong times"),
+}
+
+
+def _event_ts(v) -> int | None:
+    try:
+        return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def _edge_events(site_id: str, now: int, ready: bool) -> None:
+    kinds = tuple(EDGE_EVENTS) + ("fallback_cleared",)
+    with store.connect() as con:
+        rows = con.execute(f"SELECT type, ts, detail FROM events WHERE site_id = ? AND source = 'edge' AND type IN ({','.join('?' * len(kinds))}) "
+                           "ORDER BY id DESC LIMIT 500", (site_id, *kinds)).fetchall()
+    latest: dict[str, int] = {}
+    for r in rows:
+        t = _event_ts(r["ts"])
+        if t is not None and now - 86400 <= t <= now + 300 and t > latest.get(r["type"], -1):
+            latest[r["type"]] = t
+    if latest.get("fallback_cleared", -1) >= latest.get("fallback_engaged", 0):
+        latest.pop("fallback_engaged", None)
+    for kind, (cat, sev, words) in EDGE_EVENTS.items():
+        on = kind in latest and (cat != "Control" or ready)
+        _set(on, site_id, f"edge_{kind}", cat, sev, f"{words} ({_when(latest[kind])})" if on else "", {"at": latest.get(kind)})
+
+
+def _plan_expired(site_id: str, plan: dict | None, now: int, ready: bool) -> None:
+    """Control: the plan in force ran past its end and nothing replaced it (R8 2.16, "plan expired without replacement")."""
+    until = _event_ts((plan or {}).get("valid_until"))
+    _set(ready and until is not None and until <= now, site_id, "plan_expired", "Control", "critical",
+         f"The plan in force ended at {_when(until)} and no new plan replaced it" if until else "", {"plan_id": (plan or {}).get("id")})
+
+
+def _edge_offline(site: dict, now: int, ready: bool, minutes: float) -> None:
+    """Control: a closed-loop site whose edge has not been heard from for the rules' minutes (critical after four times as long)."""
+    seen = (site.get("state") or {}).get("edge_last_seen")
+    closed = site.get("tier") == "closed_loop" and not site.get("demo_link")
+    age = (now - int(seen)) / 60 if closed and isinstance(seen, (int, float)) else None
+    on = ready and age is not None and age > minutes
+    _set(on, site["id"], "edge_offline", "Control", "critical" if on and age > 4 * minutes else "warning",
+         f"The edge has not been heard from for {int(age)} minutes" if on else "", {"last_seen": seen})
+
+
+def _bill_residual(site_id: str, pct: float) -> None:
+    """Tariff: the latest bill entered, rebuilt from telemetry, differs from the printed total by more than the rules' percent (R8 2.16)."""
+    with store.connect() as con:
+        r = con.execute("SELECT id, period_start, period_end, difference_pct FROM bills WHERE site_id = ? ORDER BY period_end DESC, created DESC LIMIT 1",
+                        (site_id,)).fetchone()
+    diff = r["difference_pct"] if r else None
+    on = isinstance(diff, (int, float)) and abs(diff) > pct
+    title = ""
+    if on:
+        a, b = date.fromisoformat(r["period_start"][:10]), date.fromisoformat(r["period_end"][:10])
+        title = f"The bill for {a.day} {a:%b} to {b.day} {b:%b %Y}, rebuilt from the data, differs from the printed bill by {abs(diff):.1f} %"
+    _set(on, site_id, "bill_residual", "Tariff", "warning", title,
+         {"bill": r["id"], "period_start": r["period_start"], "period_end": r["period_end"], "difference_pct": diff} if on else {})
+
+
+def _forecast_stages(site_id: str, now: int) -> None:
+    """Forecast: a forecast's stage changed in the last day (R8 2.16, "stage change"): the latest issue against the latest a day before."""
+    for kind, words in (("pv", "PV"), ("load", "load")):
+        cur = telemetry.latest_forecast(site_id, kind, now)
+        before = telemetry.latest_forecast(site_id, kind, now - 86400)
+        changed = bool(cur and before and cur.get("stage") != before.get("stage"))
+        _set(changed, site_id, f"forecast_stage_{kind}", "Forecast", "info",
+             f"The {words} forecast moved from stage {before['stage']} to stage {cur['stage']} in the last day" if changed else "",
+             {"from_stage": before["stage"], "to_stage": cur["stage"]} if changed else {})
+
+
+GENSET_RULES = ("genset_unrequested", "genset_low_load", "genset_request_missed")
+
+
+def _genset_condition(site: dict, now: int, rules_: dict) -> None:
+    """Genset (R8 2.16): a run the plan in force did not ask for while the grid was up (or at an off-grid site), a run below the set's minimum load,
+    and a start request nobody answered and the set did not follow within the rules' minutes. A start on grid loss is the set's own (an AMF panel)."""
+    sid = site["id"]
+    g_asset = (site.get("assets") or {}).get("genset")
+    if not g_asset:
+        for rule in GENSET_RULES:
+            _clear(sid, rule)
+        return
+    rated = float(g_asset.get("rated_kw") or 0.0)
+    min_kw = float(g_asset.get("f_min", 0.3)) * rated
+    window = float(_th(rules_, "Genset", "request_window_minutes"))
+    d = telemetry.raw(sid, now - 3600, now + 1, ("grid_present", "genset_running", "genset_power_w"))
+    run, pw = d["genset_running"], d["genset_power_w"]
+    on = np.where(np.isnan(run), np.nan_to_num(pw) > 0.05 * rated * 1000, run >= 0.5)
+    off_grid = all((c.get("data") or {}).get("regime") == "off_grid" for c in site.get("connections") or []) or bool(site["data"].get("off_grid"))
+    grid_up = np.ones(len(on), dtype=bool) if off_grid else (np.nan_to_num(d["grid_present"], nan=0.0) >= 0.5)
+    # unrequested: the step of the plan in force at each such minute did not run the set
+    steps_on: dict[int, bool] = {}
+    unasked = 0
+    for t in d["ts"][on & grid_up]:
+        q = int(t) // STEP_S * STEP_S
+        if q not in steps_on:
+            p = plans.active_at(sid, q)
+            st = next((x for x in (p or {}).get("steps", []) if x["t"] <= q < x["t"] + STEP_S), None)
+            steps_on[q] = p is None or st is None or bool(st.get("genset_on"))   # no plan in force at it: nothing to hold the run against
+        unasked += int(not steps_on[q])
+    on_unasked = unasked >= _th(rules_, "Genset", "unrequested_minutes")
+    _set(on_unasked, sid, "genset_unrequested", "Genset", "warning",
+         f"The genset ran for {unasked} minutes in the last hour that the plan did not ask for" if on_unasked else "", {"minutes": unasked})
+    low = int(np.sum(on & ~np.isnan(pw) & (pw < min_kw * 1000)))
+    on_low = rated > 0 and low >= _th(rules_, "Genset", "low_load_minutes")
+    _set(on_low, sid, "genset_low_load", "Genset", "warning",
+         f"The genset ran below its minimum load of {min_kw:.0f} kW for {low} minutes in the last hour" if on_low else "",
+         {"minutes": low, "min_kw": round(min_kw, 1)})
+    # a request nobody answered and the set did not follow: pending (not answered, not withdrawn), its start past by the window, in the last day
+    with store.connect() as con:
+        pend = [json.loads(r["payload"]) for r in con.execute(
+            "SELECT payload FROM notifications WHERE site_id = ? AND kind = 'genset_request' AND status = 'pending' ORDER BY ts DESC LIMIT 50", (sid,))]
+    missed = None
+    for pl in pend:
+        start = pl.get("start")
+        if not isinstance(start, (int, float)) or not (now - 86400 <= start <= now - window * 60):
+            continue
+        r = telemetry.raw(sid, int(start) - STEP_S, int(start + window * 60) + 1, ("genset_running", "genset_power_w"))
+        ran = np.any(np.where(np.isnan(r["genset_running"]), np.nan_to_num(r["genset_power_w"]) > 0.05 * rated * 1000, r["genset_running"] >= 0.5))
+        if not ran and (missed is None or start > missed["start"]):
+            missed = pl
+    _set(missed is not None, sid, "genset_request_missed", "Genset", "warning",
+         f"Nobody answered the request to start the genset at {_when(missed['start'])}, and it did not start within {window:g} minutes" if missed else "",
+         {"requested_start": missed["start"], "kw": missed.get("kw")} if missed else {})
 
 
 def evaluate(site_id: str, now: int | None = None) -> None:
@@ -166,6 +330,10 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     latest_attempt = (plan or {}).get("latest_attempt")
     _set(ready and bool(latest_attempt), site_id, "plan_failed", "Control", "warning",
          "The last solve did not produce a plan; the previous plan stays active", {"reason": (latest_attempt or {}).get("reason")})
+    _gap(site_id, now, float(_th(rules_, "Data", "gap_hours")))
+    _edge_events(site_id, now, ready)
+    _plan_expired(site_id, plan, now, ready)
+    _edge_offline(site, now, ready, float(_th(rules_, "Control", "edge_offline_minutes")))
     # reserve: outages in the last day entered below the reserve the plan asked for, and unserved critical load
     outs = telemetry.outages(site_id, now - 86400, now)
     margin = float(_th(rules_, "Reserve", "reserve_margin_pct"))
@@ -206,6 +374,9 @@ def evaluate(site_id: str, now: int | None = None) -> None:
                 soon = False
         _set(soon, site_id, f"regime_expiring_{c['id']}", "Tariff", "warning", f"The {c['data']['regime'].replace('_', ' ')} agreement ends on {end}",
              {"connection": c["id"]})
+    _bill_residual(site_id, float(_th(rules_, "Tariff", "bill_difference_pct")))
+    _forecast_stages(site_id, now)
+    _genset_condition(site, now, rules_)
     genset_requests(site, plan, now)
 
 
@@ -403,9 +574,11 @@ CHANNELS = ("in_app", "email", "sms", "whatsapp")
 #: Each category's thresholds as name: (default, lowest, highest). The company sets them in the rule editor and a site may override them; the evaluator
 #: reads the site's (`site_rules`). A default of None means "by the data source" (Data's staleness: plan Part 2.4's limits per kind of source).
 THRESHOLDS: dict[str, dict[str, tuple]] = {
-    "Data": {"stale_minutes": (None, 5, 2880)},
+    "Data": {"stale_minutes": (None, 5, 2880), "gap_hours": (1.0, 0.25, 24)},
+    "Control": {"edge_offline_minutes": (15, 5, 1440)},
     "Reserve": {"reserve_margin_pct": (2.0, 0, 20), "unserved_kwh": (0.5, 0, 10000)},
-    "Tariff": {"agreement_days": (60, 1, 365)},
+    "Genset": {"unrequested_minutes": (10, 1, 120), "low_load_minutes": (15, 5, 240), "request_window_minutes": (30, 5, 240)},
+    "Tariff": {"agreement_days": (60, 1, 365), "bill_difference_pct": (2.0, 0.5, 50)},
     "Forecast": {"bust_pct": (30, 5, 100), "bust_hours": (2.0, 0.5, 12)},
 }
 _QUIET = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
@@ -633,3 +806,42 @@ def nightly(site_id: str, day: date) -> None:
     _set(bool(bust and bust["hours"] >= hours), site_id, "forecast_bust", "Forecast", "info",
          f"The day-ahead PV forecast for {day.day} {day:%B} was off by more than {pct:g} % of the clear-sky output for "
          f"{bust['hours']:g} hours" if bust else "", bust)
+    ready = settled(site_id, plans.current(site_id), int(datetime.now(timezone.utc).timestamp()))
+    _savings_day(site_id, day, ready)
+    _fee_check(site_id, day, ready)
+
+
+#: Why a day claims nothing, in words (verify.compute_day's `claim_withheld`)
+WITHHELD_WORDS = {"import_unknown": "the grid import was not metered for part of the day", "battery_flow_unknown": "the battery's flow could not be read",
+                  "genset_unknown": "the genset may have run without being seen"}
+
+
+def _savings_day(site_id: str, day: date, ready: bool) -> None:
+    """Savings (R8 2.16): a scored day that claims a negative saving against the native baseline, and a day whose claim is withheld. The titles carry
+    no rupees (an alert's title is not filtered for a reader); the detail's money keys are."""
+    with store.connect() as con:
+        r = con.execute("SELECT data FROM savings_days WHERE site_id = ? AND day_local = ? AND baseline = 'native'", (site_id, day.isoformat())).fetchone()
+    d = json.loads(r["data"]) if r else {}
+    from .verify import CLAIMING
+    when = f"{day.day} {day:%B}"
+    negative = ready and d.get("fidelity") in CLAIMING and not d.get("claim_withheld") and (d.get("saving_rs") or 0.0) < -1.0
+    _set(negative, site_id, "savings_negative", "Savings", "warning",
+         f"On {when} the site did worse than the inverter's own settings would have" if negative else "",
+         {"day": day.isoformat(), "saving_rs": d.get("saving_rs")} if negative else {})
+    why = d.get("claim_withheld")
+    withheld = ready and bool(why)
+    _set(withheld, site_id, "savings_withheld", "Savings", "info",
+         f"No saving is claimed for {when}: {WITHHELD_WORDS.get(why, str(why).replace('_', ' '))}" if withheld else "",
+         {"day": day.isoformat(), "reason": why} if withheld else {})
+
+
+def _fee_check(site_id: str, day: date, ready: bool) -> None:
+    """Product (R8 2.16, fee notices for the owner): the month's verified saving is under three times the fee (plan 8.1: the fee at most a third of
+    the verified saving), from verify.summary's fee check of the month to `day`."""
+    on = False
+    if ready and float(store.get_setting(f"fee:{site_id}", 0) or 0) > 0:
+        from . import verify
+        fee = (verify.summary(site_id, day.replace(day=1).isoformat(), day.isoformat(), see_fee=True) or {}).get("fee") or {}
+        on = fee.get("within_one_third") is False
+    _set(on, site_id, "fee_above_third", "Product", "warning",
+         f"The verified saving of {day:%B %Y} so far is under three times the fee" if on else "", {"month": day.strftime("%Y-%m")} if on else {})
