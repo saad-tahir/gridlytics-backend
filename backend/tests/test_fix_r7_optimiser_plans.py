@@ -872,7 +872,7 @@ def _battery_site(soc_max=0.95, **extra):
     return sid
 
 
-def _daily_cycles(sid, start, days, top, bottom=30.0, est=True, bms_off=0.0):
+def _daily_cycles(sid, start, days, top, bottom=30.0, est=True, bms_off=0.0, until=None):
     """Minute rows of a pack that charges from `bottom` to `top` percent over 08:00-12:00 local, holds there to 14:00, and discharges back to
     `bottom` by midnight, every day (the estimate column, or the BMS alone with est=False)."""
     rows = []
@@ -886,7 +886,8 @@ def _daily_cycles(sid, start, days, top, bottom=30.0, est=True, bms_off=0.0):
             soc, kw = top, 0.0
         else:
             soc, kw = top - (top - bottom) * (m - 840) / 600, (top - bottom) * 2.0 / 10
-        rows.append((sid, start + 60 * i, "edge", 1.0, soc if est else None, soc + bms_off, kw * 1000))
+        if until is None or start + 60 * i < until:
+            rows.append((sid, start + 60 * i, "edge", 1.0, soc if est else None, soc + bms_off, kw * 1000))
     telemetry.write_rows(rows, SOC_COLS)
 
 
@@ -916,3 +917,38 @@ def test_a_top_of_charge_under_the_upper_knee_is_no_anchor(company):
     _daily_cycles(sid, start, 3, top=90.0)
     st = battery.state(sites.full(sid), start + 2 * 86400 + 18 * 3600)
     assert st["waiting_for_anchor"] is True and st["anchor"] is None
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-07
+
+def test_a_stale_reading_widens_sigma_by_the_time_since_it_and_flags_the_plan(company):
+    """battery.state took the last reading up to 30 days old and froze sigma at it (hours from the anchor to the last reading, not to now), so
+    a plan started from a 6-hour-old state of charge with the reserve margin it had when the data stopped. Sigma now grows to now, with R6
+    5.3's gap term (1 point per 10 minutes past one control period), and the plan says it started from a stale reading."""
+    from gridlytics import battery
+    sid = _battery_site()
+    start = twin.day_start_utc(date(2026, 11, 3))
+    fresh = start + 2 * 86400 + 18 * 3600
+    _daily_cycles(sid, start, 3, top=95.0, until=fresh)                 # the readings stop at 18:00 on the third day
+    st = battery.state(sites.full(sid), fresh)
+    assert st["reading_age_min"] == pytest.approx(1.0) and st["stale"] is False
+    sigma_fresh = st["sigma_pct"]
+    assert sigma_fresh < 4.0
+    late = fresh + 6 * 3600                                            # six hours later, no reading since
+    st = battery.state(sites.full(sid), late)
+    assert st["reading_age_min"] == pytest.approx(361.0) and st["stale"] is True
+    assert st["sigma_pct"] >= 15.0                                     # the state could have moved by the pack's power for six hours
+    assert st["soc_pct"] == pytest.approx(battery.state(sites.full(sid), fresh)["soc_pct"])
+    out = plans.tick(sid, at=late, save=False)
+    bs = out["summary"]["battery_state"]
+    assert bs["stale"] is True and bs["age_min"] == pytest.approx(361.0)
+    assert bs["sigma_pct"] == pytest.approx(st["sigma_pct"])
+    # a fresh reading leaves sigma as it was, and the plan unflagged
+    bs = plans.tick(sid, at=fresh, save=False)["summary"]["battery_state"]
+    assert bs["stale"] is False and bs["sigma_pct"] == pytest.approx(sigma_fresh)
+
+
+def test_a_plan_with_no_battery_reading_says_it_starts_from_an_assumed_state(company):
+    sid = _battery_site()
+    bs = plans.tick(sid, at=twin.day_start_utc(date(2026, 11, 3)) + 12 * 3600, save=False)["summary"]["battery_state"]
+    assert bs["soc_pct"] == pytest.approx(50.0) and bs["age_min"] is None and bs["stale"] is True

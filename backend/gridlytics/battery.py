@@ -16,6 +16,9 @@ from . import optimise, telemetry
 FULL_CHARGE = 0.98
 #: the upper knee of an LFP pack (R6 5.2: about 3.40 V per cell under low current, SoC 95 to 100), where the voltage reads the state of charge
 UPPER_KNEE = 0.95
+#: a reading older than one control period (the tick's 15 minutes; R6 5.9: the optimiser's soc_est and sigma are never older than that) is
+#: stale: from then on sigma grows by R6 5.3's gap term, 1 point per 10 minutes, as well as by the hours since the anchor
+STALE_MINUTES = 15.0
 
 
 def full_charge_level(b: dict) -> float:
@@ -40,18 +43,23 @@ def state(site: dict, now: int | None = None) -> dict | None:
     out = {"e_nom_kwh": round(e_nom, 1), "c_cyc": round(optimise.wear_cost(b), 2), "soh_pct": round(b.get("soh", 1.0) * 100, 1),
            "p_ch_kw": b["p_ch_kw"], "p_dis_kw": b["p_dis_kw"], "soc_min_pct": b["soc_min"] * 100, "soc_max_pct": b["soc_max"] * 100}
     if not known.any():
-        return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "usable_kwh": None, "anchor": None, "alerts": [], "waiting_for_anchor": True}
+        return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "usable_kwh": None, "anchor": None, "alerts": [], "waiting_for_anchor": True,
+                "reading_age_min": None, "stale": True}
     last = int(np.where(known)[0][-1])
     soc = float(est[last])
+    # sigma at now, not at the last reading (round 7, engine-optimiser-07): it froze where the data stopped, so a plan started from a reading
+    # hours old with the margin it had then. The hours since the anchor run to now, and a reading older than one control period adds the gap term
+    age_min = max(0.0, (now - int(g["ts"][last])) / 60.0)
+    gap_pts = max(0.0, age_min - STALE_MINUTES) / 10.0
     anchors = np.where(known & ((est >= full_charge_level(b) - 1e-9) | (est <= b["soc_min"] + 0.02)))[0]
     if len(anchors):
         a = int(anchors[-1])
-        hours = (last - a) / 60.0
+        hours = (now - int(g["ts"][a])) / 3600.0
         thr = float(np.nansum(np.abs(g["bat"][a:last + 1])) / 60.0)
-        sigma = min(25.0, 1.0 + 0.19 * hours + 2.0 * thr / max(e_nom, 1e-6))
+        sigma = min(25.0, 1.0 + 0.19 * hours + 2.0 * thr / max(e_nom, 1e-6) + gap_pts)
         anchor_ts = int(g["ts"][a])
     else:
-        sigma, anchor_ts = 15.0, None
+        sigma, anchor_ts = min(25.0, 15.0 + gap_pts), None
     # the estimate against the BMS only where both were measured: g["soc"] falls back to the BMS where the estimate is missing (a CSV history, an edge
     # that sends the estimate part of the time), and comparing the BMS with itself there would dilute the gap and hide a low trust
     soc_est = g.get("soc_est", g["soc"])
@@ -79,4 +87,4 @@ def state(site: dict, now: int | None = None) -> dict | None:
             "sigma_pct": round(sigma, 1), "trust": trust, "usable_kwh": round(usable, 1), "anchor": anchor_ts, "alerts": alerts,
             "throughput_30d_kwh": round(float(disch), 1), "cycles_30d": round(cycles, 2), "cycles_per_day": round(cycles / days_seen, 2),
             "hot_full_hours_24h": round(float(hot), 1), "wear_30d_rs": round(float(disch * optimise.wear_cost(b)), 0), "last_ts": int(g["ts"][last]),
-            "waiting_for_anchor": anchor_ts is None}
+            "waiting_for_anchor": anchor_ts is None, "reading_age_min": round(age_min, 1), "stale": bool(age_min > STALE_MINUTES)}

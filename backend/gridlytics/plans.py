@@ -288,6 +288,11 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                # the floor the delivered table and the fallback hold with the grid up (round 7, engine-delivery-02); never above soc_max
                "soc_floor_grid": min(float(b_asset["soc_max"]), delivered_floor_pct(site) / 100.0)}
         p["battery"] = bat
+        # what the plan starts from, for the plan's summary (round 7, engine-optimiser-07): the state service's estimate, its uncertainty and the
+        # age of the reading it read; a reading older than one control period, or none (the plan then starts from an assumed state), is stale
+        age = bs.get("reading_age_min")
+        p["battery_state"] = {"soc_pct": round(soc * 100, 1), "sigma_pct": bs.get("sigma_pct"), "age_min": age,
+                              "stale": bool(bs.get("stale", True)) if bs.get("soc_pct") is not None else True}
         if floor_pct.any():
             # every manual floor (a caller that drops the overrides drops this key), and its two parts
             p["reserve_manual"] = floor_pct / 100.0 * e_nom
@@ -459,6 +464,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "outage_now": bundle["outage"].get("observed"), "adherence": bundle["outage"].get("adherence"),
                "icp": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in (p.get("icp") or {}).items()},
                "overrides": p.get("overrides", []), "genset_state_unknown": bool(p.get("genset", {}) and p["genset"].get("unknown")),
+               "battery_state": p.get("battery_state"),
                "status_label": _status_label(res),
                "solver": {"status": res["status"], "variables": res.get("variables"), "rows": res.get("rows"), "binaries": res.get("binaries"),
                           "relaxed": res.get("relaxed"), "message": res.get("message"), "shed_rule_resolve": res.get("shed_rule_resolve"),
