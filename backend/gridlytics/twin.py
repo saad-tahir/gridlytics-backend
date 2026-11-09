@@ -225,6 +225,86 @@ def slots_policy(slots: list[dict], ts: np.ndarray) -> dict:
     return pol
 
 
+def repeated_slots(slots: list[dict], t_from: int, t_to: int) -> list[dict]:
+    """One day's compiled slots repeated by clock time over [t_from, t_to), as a keyed table runs with no new plan (Part 7.1 step 6): the same
+    slots every day, and the clock minutes a part-day table leaves uncovered run its last slot, as a ring's last program wraps round. A keyed
+    table holds no genset runs, so the operator's own rule runs the set."""
+    keep = {"genset": None, "genset_runs": None}
+    out = [{**slots[-1], **keep, "start_ts": int(t_from), "end_ts": int(t_to)}]
+    first = int(slots[0]["start_ts"])
+    for k in range((int(t_from) - first) // 86400 - 1, (int(t_to) - first) // 86400 + 2):
+        out += [{**s, **keep, "start_ts": int(s["start_ts"]) + k * 86400, "end_ts": int(s["end_ts"]) + k * 86400} for s in slots]
+    return out
+
+
+#: what a site runs, minute by minute, when a plan's messages stop (fallback_policy): the plan; the cached plan while an edge has lost its link
+#: (the site is flagged unattended); the inverter's native settings (a plan expired at an edge, or Mode B's setpoints reverted); a keyed table
+#: repeating its day with no new plan
+FALLBACK_STATES = ("plan", "unattended", "native", "repeat")
+
+
+def _merged(a: dict, b: dict, use_b: np.ndarray) -> dict:
+    """Policy `b` where `use_b`, else `a`, over the keys of both (a key one side lacks takes its neutral value)."""
+    n = len(use_b)
+    neutral = {"grid_cap": np.full(n, np.inf), "export_first": np.zeros(n, dtype=bool), "export_cap": np.full(n, np.inf)}
+    pick = lambda pol, k: pol.get(k, pol["target"] if k == "grid_target" else neutral.get(k))
+    return {k: np.where(use_b, pick(b, k), pick(a, k)) for k in set(a) | set(b) if pick(a, k) is not None and pick(b, k) is not None}
+
+
+def _whole_day(days: list[dict]) -> dict:
+    """The last day table that covers a whole local day (a keyed table's day), else the last one."""
+    for d in reversed(days):
+        t0 = day_start_utc(date.fromisoformat(d["date"]))
+        if d["slots"] and int(d["slots"][0]["start_ts"]) == t0 and int(d["slots"][-1]["end_ts"]) == t0 + 86400:
+            return d
+    return days[-1]
+
+
+def fallback_policy(site: dict, compiled: dict, ts: np.ndarray, *, valid_until: int, executor: str = "edge", mode: str = "a",
+                    link_lost_at: int | None = None, revert_after_s: int = 1800, keyed_day: int | None = None) -> tuple[dict, np.ndarray]:
+    """The per-minute policy a site runs when a plan's messages stop, and its state (an index into FALLBACK_STATES), so the twin can replay an
+    expiry or a lost link (plan Part 7.1 step 6 and 7.2, U3 3.3 and 3.4, R6 I2, I3, I5 and I6; tracker DLV-04):
+
+    * An edge with a Mode A plan (`executor` "edge"): `fallback.on_link_loss_after_s` after the link drops it flags the site unattended and keeps
+      executing the cached plan to `valid_until`; from then on it runs `fallback.on_expiry`, the inverter's native settings, with the block's
+      `min_soc_floor_pct` as the floor everywhere and `max_export_w_floor` as the export cap (`export_cap`, kW).
+    * Mode B (`mode` "b"): the volatile setpoints revert `revert_after_s` (mode_b's refresh) after the link drops, to the same native fallback,
+      or at `valid_until` if that comes first. The minutes before run the compiled slots (the twin has no Mode B executor yet).
+    * A table a person keyed (`executor` "keyed", the advisory tier): no edge, so nothing expires; from `valid_until` the keyed day's table
+      (`keyed_day`, by default the last whole day) repeats by clock time, the case delivery.table_safety checks."""
+    fb = compiled.get("fallback") or {}
+    days = [d for d in compiled.get("days") or [] if d.get("slots")]
+    n = len(ts)
+    pol = slots_policy([s for d in days for s in d["slots"]], ts)
+    state = np.zeros(n, dtype=int)
+    if executor == "keyed":
+        rep = ts >= int(valid_until)
+        if rep.any() and days:
+            day = days[keyed_day] if keyed_day is not None else _whole_day(days)
+            pol = _merged(pol, slots_policy(repeated_slots(day["slots"], int(valid_until), int(ts[-1]) + 60), ts), rep)
+            state[rep] = FALLBACK_STATES.index("repeat")
+        return pol, state
+    end = int(valid_until)
+    if link_lost_at is not None:
+        if mode == "b":
+            end = min(end, int(link_lost_at) + int(revert_after_s))
+        state[(ts >= int(link_lost_at) + int(fb.get("on_link_loss_after_s", 300))) & (ts < end)] = FALLBACK_STATES.index("unattended")
+    native = ts >= end
+    if native.any():
+        nat = native_policy(site, ts)
+        nat["floor"] = np.maximum(nat["floor"], float(fb.get("min_soc_floor_pct") or 0.0) / 100.0)
+        cap = fb.get("max_export_w_floor")
+        nat["export_cap"] = np.full(n, np.inf if cap is None else float(cap) / 1000.0)
+        pol = _merged(pol, nat, native)
+        state[native] = FALLBACK_STATES.index("native")
+    return pol, state
+
+
+def state_changes(ts: np.ndarray, state: np.ndarray) -> list[dict]:
+    """The minutes a fallback_policy state begins, as {t, state}: the fallback events a replay counts."""
+    return [{"t": int(ts[i]), "state": FALLBACK_STATES[int(state[i])]} for i in range(len(state)) if i == 0 or state[i] != state[i - 1]]
+
+
 def table_policy(table: list[dict], ts: np.ndarray) -> dict:
     """A static daily table (start "HH:MM", mode, floor, target, grid_charge) repeated every day: the tuned baseline's shape."""
     cap = {"work_mode": "tou", "backup_soc_pct": 20.0, "slots": table}
@@ -302,6 +382,7 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
         grid_target = target
     max_dis, max_ch, gch, gcmd = policy["max_dis"], policy["max_ch"], policy["grid_charge"], policy["genset"]
     gcap = policy.get("grid_cap", np.full(n, np.inf))
+    xcap = policy.get("export_cap", np.full(n, np.inf))  # a fallback block's export floor (R6 I3), where a policy carries one
     export_first = policy.get("export_first")
     if export_first is None:
         export_first = np.zeros(n, dtype=bool)
@@ -365,7 +446,7 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                 unserved = flow - imp
                 out["imp"][i] = imp
             else:
-                exp = min(-flow, plant.x_max)
+                exp = min(-flow, plant.x_max, xcap[i])
                 curtail = -flow - exp
                 out["exp"][i] = exp
                 if curtail > pv and gen > 0:  # genset output nobody takes is not PV curtailment: the genset runs below its minimum load instead

@@ -553,3 +553,74 @@ def test_a_table_for_part_of_a_day_says_what_runs_round_midnight_until_the_next_
     assert not any("starts at" in n for n in _table("deye", limits=LIMITS)["notes"])         # a whole day says nothing
     end = _table("other", [_slot("00:00", "06:00", "charge_grid", 30, 80, ch=50000), _slot("06:00", "12:15", "hold", 80, 80)])["notes"]
     assert any("ends at 12:15" in n for n in end), end
+
+
+# ------------------------------------------------------------------------------------------------ expiry and link loss in the twin (brief-vs-build-07)
+
+def _fallback_case(backup_soc: float = 5.0):
+    """A whole day's Deye plan (night grid charge, hold, evening discharge, hold), a 1 MWh battery and a site whose native capture is self-use
+    with a backup of 5 %, below the plan's 20 % fallback floor; 400 kW of load and no PV, the grid always up."""
+    import numpy as np
+    steps = _day_of([("charge_from_grid", 24, 100.0, 0.0), ("hold_for_outage", 48, 0.0, 0.0), ("discharge_peak_window", 16, 0.0, 120.0),
+                     ("hold_for_outage", 8, 0.0, 0.0)], soc0=30.0)
+    site = {**_grid_site("closed_loop"), "native": {"version": 3, "body": {"work_mode": "self_use", "backup_soc_pct": backup_soc, "slots": []}}}
+    comp = delivery.compile_mode_a(steps, "deye", {**SMALL, "E0": 300.0}, 20.0, 10.0, None, site=site)
+    ts = np.arange(T0, T0 + 2 * 86400, 60)
+    n = len(ts)
+    series = {"ts": ts, "pv": np.zeros(n), "load": np.full(n, 400.0), "crit": np.full(n, 100.0), "grid": np.ones(n), "temp": np.full(n, 30.0)}
+    return site, comp, ts, series
+
+
+def test_an_edge_keeps_the_cached_plan_through_a_lost_link_to_its_end_then_restores_native_never_below_the_fallback_floor():
+    """The fallback block was JSON nobody executed: the twin never expired a plan or lost the link (DLV-04). Mode A at an edge: after
+    on_link_loss_after_s the site is unattended and the cached plan runs on to valid_until (R6 I6); then on_expiry restores the native capture,
+    with the block's floor and export floor enforced (I2, I3)."""
+    import numpy as np
+
+    from gridlytics import twin
+    site, comp, ts, series = _fallback_case()
+    lost, until = T0 + 10 * 3600, T0 + 20 * 3600
+    pol, state = twin.fallback_policy(site, comp, ts, valid_until=until, link_lost_at=lost)
+    names = np.array(twin.FALLBACK_STATES)[state]
+    assert (names[ts < lost + 300] == "plan").all() and (names[(ts >= lost + 300) & (ts < until)] == "unattended").all()
+    assert (names[ts >= until] == "native").all()
+    plan_pol = twin.slots_policy([s for d in comp["days"] for s in d["slots"]], ts)
+    before = ts < until
+    assert all(np.array_equal(pol[k][before], plan_pol[k][before]) for k in ("mode", "floor", "target", "grid_charge"))   # the cached plan runs on
+    assert np.allclose(pol["floor"][ts >= until], 0.20)                          # the native backup of 5 % is raised to the block's 20 % floor
+    assert np.allclose(pol["export_cap"][ts >= until], comp["fallback"]["max_export_w_floor"] / 1000.0)
+    assert twin.state_changes(ts, state) == [{"t": int(ts[0]), "state": "plan"}, {"t": lost + 300, "state": "unattended"},
+                                             {"t": until, "state": "native"}]
+    sim = twin.simulate(series, pol, twin.plant_of(site), 0.30)
+    assert float(sim["soc"][ts >= until].min()) >= 0.20 - 1e-6                    # 5 % without the floor: native self-use empties it to its backup
+    raw = twin.simulate(series, twin.native_policy(site, ts), twin.plant_of(site), float(sim["soc"][ts < until][-1]))
+    assert float(raw["soc"].min()) < 0.15                                        # down to the BMS cap at 10 %
+
+
+def test_mode_b_setpoints_revert_to_native_two_control_periods_after_the_link_drops():
+    """Mode B's volatile setpoints revert after refresh.revert_after_s (1,800 s) without a fresh plan, whatever the plan's valid_until."""
+    import numpy as np
+
+    from gridlytics import twin
+    site, comp, ts, _ = _fallback_case()
+    lost = T0 + 10 * 3600
+    _, state = twin.fallback_policy(site, comp, ts, valid_until=T0 + 40 * 3600, link_lost_at=lost, mode="b",
+                                    revert_after_s=delivery.mode_b([])["refresh"]["revert_after_s"])
+    names = np.array(twin.FALLBACK_STATES)[state]
+    assert (names[ts < lost + 1800] != "native").all() and (names[ts >= lost + 1800] == "native").all()
+
+
+def test_a_keyed_table_has_no_expiry_it_repeats_its_day_by_clock_time():
+    """At the advisory tier a person keyed the table: there is no edge to expire it, so past valid_until the inverter repeats the keyed day's table
+    every day (Part 7.1 step 6), which table_safety checks."""
+    import numpy as np
+
+    from gridlytics import twin
+    site, comp, ts, _ = _fallback_case()
+    until = T0 + 86400
+    pol, state = twin.fallback_policy({**site, "tier": "advisory_writes"}, comp, ts, valid_until=until, executor="keyed")
+    names = np.array(twin.FALLBACK_STATES)[state]
+    assert (names[ts < until] == "plan").all() and (names[ts >= until] == "repeat").all()
+    day1 = ts >= until
+    for k in ("mode", "floor", "target", "grid_charge"):
+        assert np.array_equal(pol[k][day1], pol[k][~day1]), k                  # tomorrow runs today's table, minute for minute

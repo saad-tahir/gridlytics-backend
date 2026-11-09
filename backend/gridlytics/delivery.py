@@ -370,8 +370,7 @@ def _repeat_short(slots: list[dict], by_t: dict[int, dict], plant: "twin.Plant",
             return None
         src.append(st)
     ts = np.arange(w0, w0 + 86400, 60)
-    # what a person keyed runs again by clock time; the plan's genset runs are not in a keyed table, so the operator's own rule runs the set
-    rep = [{**s, "start_ts": int(s["start_ts"]) + 86400, "end_ts": int(s["end_ts"]) + 86400, "genset": None, "genset_runs": None} for s in slots]
+    rep = twin.repeated_slots(slots, w0, w0 + 86400)  # what a person keyed runs again by clock time
 
     def col(key: str, alt: str | None = None, default: float = 0.0) -> np.ndarray:
         return np.repeat([float(st[key] if st.get(key) is not None else st.get(alt) if alt and st.get(alt) is not None else default)
