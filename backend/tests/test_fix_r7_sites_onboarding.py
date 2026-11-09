@@ -6,6 +6,9 @@ stored, the save is refused with 409 `site_changed` instead of writing over the 
 
 flow-onboarding-07: an empty tariff category was stored (200), after which the active site never planned and raised no alert. ConnectionFields now refuses an
 empty or unknown category in the web app's sentence, and activation asks for one when a connection stored before the check has none.
+
+flow-onboarding-18: the agreement's dates were any text, in any order, and the genset's money figures and tank had no upper bound. They are now days written
+YYYY-MM-DD, the end not before the start, and Rs 1,000,000 a start or a running hour, Rs 10,000 a kWh of upkeep and a 1,000,000 L tank at most.
 """
 from __future__ import annotations
 
@@ -141,3 +144,36 @@ def test_an_empty_or_unknown_tariff_category_is_refused_and_activation_asks_for_
     assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
     assert "the tariff category of each grid connection (tab C)" in r.json()["detail"]
     assert _site(a, sid)["status"] != "active"
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-18
+
+def test_agreement_dates_are_days_in_order_and_the_gensets_money_and_tank_are_bounded(world):
+    a, sid = world.c["admin"], world.site
+    conn = _site(a, sid)["connections"][0]
+
+    def put_conn(**dates):
+        return a.put(f"/api/sites/{sid}/connection", json={"id": conn["id"], "tariff_category": "B-2(b)", **dates})
+
+    for dates, sentence in (({"agreement_start": "banana", "agreement_end": "2020-01-01"}, "The agreement start is a date (YYYY-MM-DD)"),
+                            ({"agreement_start": "2026-02-30"}, "The agreement start is a date (YYYY-MM-DD)"),
+                            ({"agreement_end": "20330101"}, "The agreement end is a date (YYYY-MM-DD)"),
+                            ({"agreement_start": "2030-01-01", "agreement_end": "2020-01-01"}, "The agreement must end after it starts")):
+        r = put_conn(**dates)
+        assert r.status_code == 422 and r.json() == {**r.json(), "detail": sentence, "code": "invalid"}, (dates, r.text)
+    assert _site(a, sid)["connections"][0]["data"]["agreement_start"] is None
+    r = put_conn(agreement_start="2026-01-01", agreement_end="2033-12-31")
+    assert r.status_code == 200, r.text
+    assert {k: r.json()["connections"][0]["data"][k] for k in ("agreement_start", "agreement_end")} == {"agreement_start": "2026-01-01",
+                                                                                                        "agreement_end": "2033-12-31"}
+    # a blank day (the web app sends null; an empty text is blank too) is no agreement date
+    r = put_conn(agreement_start="", agreement_end=None)
+    assert r.status_code == 200 and r.json()["connections"][0]["data"]["agreement_start"] is None, r.text
+    # the genset's money figures and tank had no upper bound: Rs 1e12 a start and a 1e12 L tank were stored
+    for field, sentence in (("c_start_rs", "The cost per start is at most Rs 1,000,000"), ("c_runhr_rs", "The cost per running hour is at most Rs 1,000,000"),
+                            ("c_om_rs_per_kwh", "The upkeep per kWh is at most Rs 10,000"), ("tank_l", "The tank holds at most 1,000,000 L")):
+        r = a.put(f"/api/sites/{sid}/assets/genset", json={"rated_kw": 150, field: 1e12})
+        assert r.status_code == 422 and r.json()["detail"] == sentence, (field, r.text)
+    r = a.put(f"/api/sites/{sid}/assets/genset", json={"rated_kw": 150, "c_start_rs": 1_000_000, "c_runhr_rs": 1_000_000, "c_om_rs_per_kwh": 10_000,
+                                                         "tank_l": 1_000_000})
+    assert r.status_code == 200 and r.json()["assets"]["genset"]["tank_l"] == 1_000_000, r.text

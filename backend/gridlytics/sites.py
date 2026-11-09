@@ -7,7 +7,7 @@ in one sentence. The control tier is two facts (plan Part 2.3): `tier_capable`, 
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -112,8 +112,9 @@ class ConnectionFields(Strict):
     disco_group: Literal[DISCO_GROUPS] = "xwdisco"
     tariff_category: str = Field("B-2(b)", max_length=20)
     regime: Literal["net_billing", "net_metering_legacy", "none", "flat", "off_grid"] = "none"
-    agreement_start: str | None = None
-    agreement_end: str | None = None
+    #: the net-metering or net-billing agreement's first and last day, YYYY-MM-DD (audit flow-onboarding-18: any text was stored, and an end before the start)
+    agreement_start: str | None = Field(None, max_length=10)
+    agreement_end: str | None = Field(None, max_length=10)
     sanctioned_load_kw: float = Field(400.0, gt=0, le=100000)
     export_cap_kw: float = Field(0.0, ge=0, le=100000)
     mdi_interval_min: Literal[15, 30] = 30
@@ -124,6 +125,28 @@ class ConnectionFields(Strict):
     #: the meter's reading day of the month (from the onboarding bill): a day after it belongs to the next month's bill (tariffs.billing_period_for);
     #: unset, the bill is the calendar month. 29 to 31 read as the month's last day in a shorter month
     reading_day: int | None = Field(None, ge=1, le=31)
+
+    @field_validator("agreement_start", "agreement_end", mode="before")
+    @classmethod
+    def _agreement_day(cls, v, info):
+        """A calendar day written YYYY-MM-DD, or blank (None; an empty text is blank too)."""
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        which = "start" if info.field_name == "agreement_start" else "end"
+        day = v.strip() if isinstance(v, str) else ""
+        try:
+            if len(day) != 10 or day[4] != "-" or day[7] != "-":
+                raise ValueError
+            date.fromisoformat(day)
+        except ValueError:
+            raise ValueError(f"The agreement {which} is a date (YYYY-MM-DD)") from None
+        return day
+
+    @model_validator(mode="after")
+    def _agreement_order(self):
+        if self.agreement_start and self.agreement_end and self.agreement_end < self.agreement_start:
+            raise ValueError("The agreement must end after it starts")
+        return self
 
     @field_validator("tariff_category")
     @classmethod
@@ -172,6 +195,13 @@ class BatteryFields(Strict):
         return self
 
 
+#: The upper bound of the genset's money figures and tank, with the sentence a larger one is refused in (the web app's site-form.ts has the same bounds)
+GENSET_UPPER = {"c_start_rs": (1_000_000, "The cost per start is at most Rs 1,000,000"),
+                "c_runhr_rs": (1_000_000, "The cost per running hour is at most Rs 1,000,000"),
+                "c_om_rs_per_kwh": (10_000, "The upkeep per kWh is at most Rs 10,000"),
+                "tank_l": (1_000_000, "The tank holds at most 1,000,000 L")}
+
+
 class GensetFields(Strict):
     rated_kw: float = Field(gt=0, le=50000)
     f_min: float = Field(0.3, ge=0.0, le=1.0)
@@ -187,6 +217,16 @@ class GensetFields(Strict):
     cap_hours_per_day: float = Field(24.0, ge=0, le=24)
     tank_l: float = Field(2000.0, ge=0)
     parallel_allowed: bool = False
+
+    @field_validator("c_start_rs", "c_runhr_rs", "c_om_rs_per_kwh", "tank_l")
+    @classmethod
+    def _upper(cls, v: float, info) -> float:
+        """The money figures and the tank are bounded, as the other fields are (audit flow-onboarding-18: Rs 1e12 a start and a 1e12 L tank were
+        stored)."""
+        hi, words = GENSET_UPPER[info.field_name]
+        if v > hi:
+            raise ValueError(words)
+        return v
 
 
 ASSET_MODELS = {"pv": PvFields, "inverter": InverterFields, "battery": BatteryFields, "genset": GensetFields}
