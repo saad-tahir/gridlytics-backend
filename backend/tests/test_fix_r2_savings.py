@@ -366,10 +366,17 @@ def test_a_bill_entered_with_its_printed_reading_dates_bills_the_reading_interva
     assert by_reading["rebuilt"]["days"] == 30 and by_reading["rebuilt"]["first_day"] == "2026-10-21"  # before: refused (no period_start)
     assert sum(by_reading["rebuilt"]["import_kwh"].values()) == pytest.approx(72_000.0)
     assert by_reading["real"]["previous_reading_date"] == "2026-10-20"
+    # one bill per period (round 7, audit flow-savings-pilot-bill-23: an overlapping bill is refused), so each form is entered after the one before
+    # is deleted
+    stored = {b["period_start"] for b in verify.bills(sid)}
+    verify.delete_bill(sid, by_reading["id"], "t")
     flagged = verify.add_bill(sid, {"period_start": "2026-10-20", "period_start_is_reading": True, "period_end": "2026-11-19", "total_rs": 2_000_000}, "t")
+    stored |= {b["period_start"] for b in verify.bills(sid)}
+    verify.delete_bill(sid, flagged["id"], "t")
     first_day = verify.add_bill(sid, {"period_start": "2026-10-21", "period_end": "2026-11-19", "total_rs": 2_000_000}, "t")  # the old call shape
+    stored |= {b["period_start"] for b in verify.bills(sid)}
     assert flagged["rebuilt"]["total_rs"] == first_day["rebuilt"]["total_rs"] == by_reading["rebuilt"]["total_rs"]
-    assert {b["period_start"] for b in verify.bills(sid)} == {"2026-10-21"}
+    assert stored == {"2026-10-21"}
     assert verify.rebuild_bill(sid, sites.connections(sid)[0], date(2026, 10, 20), date(2026, 11, 19))["days"] == 31  # positional calls unchanged
     with pytest.raises(ValueError):
         verify.add_bill(sid, {"previous_reading_date": "2026-11-19", "period_end": "2026-11-19", "total_rs": 1}, "t")

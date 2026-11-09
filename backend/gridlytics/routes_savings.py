@@ -98,7 +98,7 @@ def switchback_paint(site_id: str, inp: dict = Body(...)):
 def bills(site_id: str):
     auth.need("see_costs", "Seeing bills")
     site_or_404(site_id)
-    return verify.bills(site_id)
+    return out(verify.bills(site_id))
 
 
 @router.post("/api/sites/{site_id}/bills")
@@ -106,9 +106,33 @@ def bill_add(site_id: str, inp: dict = Body(...)):
     auth.need("upload_data", "Entering a bill")
     site_or_404(site_id)
     try:
-        return verify.add_bill(site_id, inp, auth.actor())
+        return out(verify.add_bill(site_id, inp, auth.actor()))
     except ValueError as exc:
         raise bad(exc) from None
+
+
+@router.put("/api/sites/{site_id}/bills/{bill_id}")
+def bill_correct(site_id: str, bill_id: str, inp: dict = Body(...)):
+    """Correct a bill entered with a mistake (the fields of entering one); who may enter a bill may correct it, with an audit line."""
+    auth.need("upload_data", "Correcting a bill")
+    site_or_404(site_id)
+    try:
+        return out(verify.correct_bill(site_id, bill_id, inp, auth.actor()))
+    except LookupError:
+        raise Refusal(404, "No such bill", "not_found") from None
+    except ValueError as exc:
+        raise bad(exc) from None
+
+
+@router.delete("/api/sites/{site_id}/bills/{bill_id}")
+def bill_delete(site_id: str, bill_id: str):
+    """Withdraw a bill entered by mistake, with an audit line."""
+    auth.need("upload_data", "Deleting a bill")
+    site_or_404(site_id)
+    try:
+        return verify.delete_bill(site_id, bill_id, auth.actor())
+    except LookupError:
+        raise Refusal(404, "No such bill", "not_found") from None
 
 
 @router.put("/api/sites/{site_id}/fee")

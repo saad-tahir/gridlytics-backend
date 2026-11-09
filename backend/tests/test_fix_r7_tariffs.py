@@ -484,6 +484,30 @@ def test_an_export_credit_beyond_the_bill_is_carried_to_the_next_bill(company):
     assert nxt["bearable_rs"] == pytest.approx(alone["bearable_rs"], abs=0.01)
 
 
+def _surplus_rows(sid, d0: date, days: int, export_kw: float):
+    from test_fix_r2_savings import _flat_rows
+    # a 15-minute row carries one minute's energy in this fixture: 15 times the power gives the export_kw mean over its quarter hour
+    _flat_rows(sid, d0, days, 10.0, step_min=15, export_kw=lambda m: 15 * export_kw if 9 * 60 <= m < 17 * 60 else 0.0)
+
+
+def test_entering_bills_in_turn_carries_a_net_billing_surplus_forward(company):
+    sid = make_site(name="Surplus Mill", conn={"tariff_category": "B-2(b)", "sanctioned_load_kw": 500, "regime": "net_billing"})
+    _surplus_rows(sid, date(2026, 9, 1), 61, 1000.0)
+    sep = verify.add_bill(sid, {"period_start": "2026-09-01", "period_end": "2026-09-30", "total_rs": 1.0}, "t")
+    carried = sep["rebuilt"]["credit_carried_rs"]
+    assert carried > 0 and sep["rebuilt"]["total_rs"] == 0.0
+    octo = verify.add_bill(sid, {"period_start": "2026-10-01", "period_end": "2026-10-31", "total_rs": 1.0}, "t")
+    assert octo["rebuilt"]["credit_brought_forward_rs"] == pytest.approx(carried, abs=0.01)
+    assert octo["rebuilt"]["credit_carried_rs"] == pytest.approx(carried + octo["rebuilt"]["credits_rs"] - octo["rebuilt"]["charges_rs"], abs=0.02)
+    # a bill entered after its successor is rebuilt first, and the successor takes its carried credit then
+    later = make_site(name="Surplus Mill Two", conn={"tariff_category": "B-2(b)", "sanctioned_load_kw": 500, "regime": "net_billing"})
+    _surplus_rows(later, date(2026, 9, 1), 61, 1000.0)
+    verify.add_bill(later, {"period_start": "2026-10-01", "period_end": "2026-10-31", "total_rs": 1.0}, "t")
+    verify.add_bill(later, {"period_start": "2026-09-01", "period_end": "2026-09-30", "total_rs": 1.0}, "t")
+    oct2 = next(b for b in verify.bills(later) if b["period_start"] == "2026-10-01")
+    assert oct2["rebuilt"]["credit_brought_forward_rs"] == pytest.approx(carried, abs=0.01)
+
+
 # ------------------------------------------------------------------------------------------------ engine-tariffs-08: the missing bill steps
 
 def test_a_power_factor_below_90_percent_raises_the_fixed_charge(company):
@@ -568,6 +592,52 @@ def test_a_rebuilt_bill_carries_every_versions_hash_and_the_series_hash(company)
     assert tariffs.rebuild(ts, imp, exp, conn, d0, d0)["series_hash"] == bill["series_hash"]
 
 
+# ------------------------------------------------------------------------------------------------ pages-D-10 (flow-savings-pilot-bill-07): line by line
+
+def test_the_printed_units_and_mdi_are_compared_line_by_line(company):
+    from test_fix_r2_savings import _flat_rows
+    sid = make_site(name="Printed Lines")
+    _flat_rows(sid, date(2026, 10, 1), 31, 100.0, step_min=15)
+    rebuilt = verify.rebuild_bill(sid, sites.connections(sid)[0], date(2026, 10, 1), date(2026, 10, 31))
+    pk, off = rebuilt["import_kwh"]["peak"], rebuilt["import_kwh"]["off_peak"]
+    b = verify.add_bill(sid, {"period_start": "2026-10-01", "period_end": "2026-10-31", "total_rs": rebuilt["total_rs"], "units_peak": round(pk * 0.67),
+                              "units_off_peak": round(off), "mdi_kw": round(rebuilt["mdi_kw"] * 1.004, 2)}, "t")
+    rows = {r["line"]: r for r in b["reconciliation"]}
+    assert set(rows) == {"units_peak", "units_off_peak", "mdi_kw"}
+    assert rows["units_peak"]["rebuilt"] == pytest.approx(pk, abs=0.01) and not rows["units_peak"]["within"]
+    assert rows["units_peak"]["difference_pct"] == pytest.approx((pk - round(pk * 0.67)) / round(pk * 0.67) * 100, abs=0.01)
+    assert rows["units_off_peak"]["within"] and rows["mdi_kw"]["within"]
+    assert b["difference_pct"] == 0.0 and b["check"]["verdict"] == "outside" and b["check"]["outside"] == ["units_peak"]  # before: 'within', on the total
+    assert verify.bills(sid)[0]["check"] == b["check"]
+    logged = next(a["detail"] for a in store.list_audit() if a["action"] == "entered a DISCO bill")
+    assert {r["line"] for r in logged["residuals"]} == {"units_peak", "units_off_peak", "mdi_kw"}
+
+
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-08: gaps are not zero import
+
+def test_a_bill_over_a_gap_fills_it_from_the_profile_and_withholds_the_verdict_when_mostly_missing(company):
+    from test_fix_r2_savings import _flat_rows
+    sid = make_site(name="Gappy Mill")
+    _flat_rows(sid, date(2026, 10, 25), 15, 100.0, step_min=15)  # 25 Oct to 8 Nov
+    conn = sites.connections(sid)[0]
+    full = verify.rebuild_bill(sid, conn, date(2026, 10, 25), date(2026, 11, 8))
+    gap = verify.rebuild_bill(sid, conn, date(2026, 10, 24), date(2026, 11, 8))  # a day before the first data
+    assert gap["completeness"] == pytest.approx(15 / 16, abs=1e-3)
+    assert sum(gap["import_kwh"].values()) == pytest.approx(sum(full["import_kwh"].values()) * 16 / 15, rel=1e-3)  # before: equal to the 15 days'
+    assert gap["filled_kwh"]["import"] == pytest.approx(sum(full["import_kwh"].values()) / 15, rel=1e-3)
+    assert full["completeness"] == 1.0  # a 15-minute source's samples cover their 15 minutes
+    b = verify.add_bill(sid, {"period_start": "2026-10-24", "period_end": "2026-11-08", "total_rs": gap["total_rs"]}, "t")
+    assert b["check"]["verdict"] == "within"
+    two = verify.rebuild_bill(sid, conn, date(2026, 10, 23), date(2026, 11, 8))  # two days missing of 17: 88 %, below the 90 % for a verdict
+    assert verify._check(two, 0.0, [])["verdict"] == "not_comparable"
+    mostly = verify.add_bill(sid, {"period_start": "2026-10-01", "period_end": "2026-10-23", "total_rs": 5_000_000}, "t")
+    assert mostly["rebuilt"]["completeness"] == 0.0 and mostly["check"]["verdict"] == "not_comparable"  # before: 'outside the 2 % check'
+    other = make_site(name="Partly Mill")
+    _flat_rows(other, date(2026, 10, 25), 7, 100.0, step_min=15)
+    part = verify.add_bill(other, {"period_start": "2026-10-01", "period_end": "2026-10-31", "total_rs": 17_500_000}, "t")
+    assert part["rebuilt"]["completeness"] == pytest.approx(7 / 31, abs=1e-3) and part["check"]["verdict"] == "not_comparable"
+
+
 # ------------------------------------------------------------------------------------------------ engine-tariffs-10: ICP at legacy net-metering sites
 
 def test_icp_at_a_legacy_site_caps_gross_import_increments_at_net_imports_pro_rata(company):
@@ -596,6 +666,28 @@ def test_icp_at_a_legacy_site_caps_gross_import_increments_at_net_imports_pro_ra
     assert b["icp_incremental_kwh"] == {"peak": pytest.approx(500.0, abs=0.01), "off_peak": 0.0}
 
 
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-23: overlaps, correct, delete
+
+def test_an_overlapping_bill_is_refused_and_a_bill_can_be_corrected_or_deleted(company):
+    from test_fix_r2_savings import _flat_rows
+    sid = make_site(name="Two Bills")
+    _flat_rows(sid, date(2026, 10, 20), 20, 100.0, step_min=15)
+    first = verify.add_bill(sid, {"period_start": "2026-10-25", "period_end": "2026-11-08", "total_rs": 2_000_000, "reference": "A-1"}, "t")
+    with pytest.raises(ValueError, match="overlaps the bill for 25 Oct to 8 Nov 2026"):
+        verify.add_bill(sid, {"period_start": "2026-10-23", "period_end": "2026-11-08", "total_rs": 2_100_000}, "t")
+    assert len(verify.bills(sid)) == 1
+    fixed = verify.correct_bill(sid, first["id"], {"period_start": "2026-10-23", "period_end": "2026-11-08", "total_rs": 2_100_000}, "op")
+    assert fixed["id"] == first["id"] and fixed["period_start"] == "2026-10-23" and fixed["real"]["total_rs"] == 2_100_000
+    assert fixed["difference_pct"] == pytest.approx((fixed["rebuilt"]["total_rs"] - 2_100_000) / 2_100_000 * 100, abs=0.01)
+    assert [b["id"] for b in verify.bills(sid)] == [first["id"]]
+    verify.delete_bill(sid, first["id"], "op")
+    assert verify.bills(sid) == []
+    actions = [a["action"] for a in store.list_audit()]
+    assert "corrected a DISCO bill" in actions and "deleted a DISCO bill" in actions
+    with pytest.raises(LookupError):
+        verify.delete_bill(sid, first["id"], "op")
+
+
 def test_the_fixed_charge_line_shows_its_proration(company):
     d0 = date(2026, 10, 25)
     ts, imp, exp = _month_series(d0, 15, mdi_day=3)
@@ -603,3 +695,28 @@ def test_the_fixed_charge_line_shows_its_proration(company):
     f = _lines(bill, "Fixed charges")[0]
     assert (f["days"], f["of_days"]) == (15, 30)
     assert f["amount_rs"] == pytest.approx(f["rate"] * f["billing_demand_kw"] * 15 / 30, abs=0.01)  # 150 kW x Rs 1,250 x 15/30
+
+
+def test_bills_can_be_corrected_and_deleted_through_the_api_by_who_enters_them(world):
+    from test_fix_r2_savings import _flat_rows
+    with world.use():
+        _flat_rows(world.site, date(2026, 10, 1), 31, 100.0, step_min=30)
+    op = world.c["operator"]
+    r = op.post(f"/api/sites/{world.site}/bills", json={"period_start": "2026-10-01", "period_end": "2026-10-31", "total_rs": 3_000_000})
+    assert r.status_code == 200, r.text
+    bid = r.json()["id"]
+    again = op.post(f"/api/sites/{world.site}/bills", json={"period_start": "2026-10-15", "period_end": "2026-11-05", "total_rs": 1})
+    assert again.status_code == 422 and "overlaps" in again.json()["detail"]
+    for role in ("analyst", "viewer"):
+        assert world.c[role].put(f"/api/sites/{world.site}/bills/{bid}", json={"period_start": "2026-10-01", "period_end": "2026-10-31",
+                                                                               "total_rs": 1}).status_code == 403
+        assert world.c[role].delete(f"/api/sites/{world.site}/bills/{bid}").status_code == 403
+    r = op.put(f"/api/sites/{world.site}/bills/{bid}", json={"period_start": "2026-10-01", "period_end": "2026-10-31", "total_rs": 3_100_000,
+                                                               "power_factor_pct": 88})
+    assert r.status_code == 200 and r.json()["real"]["total_rs"] == 3_100_000 and r.json()["real"]["power_factor_pct"] == 88
+    assert op.put(f"/api/sites/{world.site}/bills/nope", json={"period_start": "2026-10-01", "period_end": "2026-10-31", "total_rs": 1}).status_code == 404
+    assert op.put(f"/api/sites/{world.other}/bills/{bid}", json={"period_start": "2026-10-01", "period_end": "2026-10-31",
+                                                                   "total_rs": 1}).status_code in (404, 422)
+    assert op.delete(f"/api/sites/{world.site}/bills/{bid}").status_code == 200
+    assert op.get(f"/api/sites/{world.site}/bills").json() == []
+    assert op.delete(f"/api/sites/{world.site}/bills/{bid}").status_code == 404
