@@ -323,19 +323,44 @@ def _hold(a: np.ndarray, n: int) -> np.ndarray:
     return out
 
 
-def _adherence(windows: list, grid: np.ndarray, in_win: np.ndarray) -> float:
-    """The share of past scheduled windows (in known data) that saw the grid down for at least half of the window, on a Beta(8, 2) prior."""
+#: the schedule adherence's prior, Beta(8, 2) (plan Part 5.3): 8 kept windows in 10
+ADHERENCE_PRIOR = (8.0, 10.0)
+#: a window occurrence is a trial only when its known grid samples cover at least this share of its minutes (a logger that was off says nothing)
+ADHERENCE_COVERAGE = 0.5
+
+
+def _adherence_trials(windows: list, grid: np.ndarray, ts: np.ndarray) -> tuple[float, int]:
+    """(kept, trials) over the announced windows' occurrences in a minute grid: each occurrence (one window on one local day, a window across midnight
+    with the day it starts on) seen whole in the grid is one Bernoulli trial (plan Part 5.3, FOR-08 "adherence updates per observed slot"), kept when
+    the grid was down for at least half of its known samples. An occurrence cut by either end of the grid (the history's start, or a window still
+    running at the tick) and one whose known samples cover less than ADHERENCE_COVERAGE of it are not trials, so the posterior does not depend on the
+    time of day of the tick."""
+    if not windows or not len(grid):
+        return 0.0, 0
+    ts = np.asarray(ts, dtype=np.int64)
+    m = _window_mask(windows, np.concatenate([[ts[0] - 60], ts, [ts[-1] + 60]]))  # a minute either side: a run touching an end is cut
+    edge = np.diff(m.astype(np.int8))
+    starts, ends = np.where(edge == 1)[0], np.where(edge == -1)[0]  # grid indices: first minute in, first minute out
     known = ~np.isnan(grid)
-    down = (grid == 0) & known
-    a_hit, a_n = 8.0, 10.0
-    if windows and known.sum() * sample_minutes(known) / 1440 >= 1:
-        wm = in_win & known
-        day_idx = (np.arange(len(grid)) // 1440)
-        for d in np.unique(day_idx[wm]):
-            sel = wm & (day_idx == d)
-            a_n += 1
-            a_hit += float(np.mean(down[sel]) >= 0.5)
-    return a_hit / a_n
+    iv = sample_minutes(known)
+    kept, n = 0.0, 0
+    for s in starts:
+        e = ends[ends > s]
+        if not len(e):
+            break  # still running at the end of the grid
+        e = int(e[0])
+        k = known[s:e]
+        if k.sum() * iv < ADHERENCE_COVERAGE * (e - s):
+            continue
+        n += 1
+        kept += float(np.mean(grid[s:e][k] == 0) >= 0.5)
+    return kept, n
+
+
+def _adherence(windows: list, grid: np.ndarray, ts: np.ndarray) -> float:
+    """The posterior mean share of announced windows the feeder keeps: the Beta(8, 2) prior updated by each whole window occurrence in the grid."""
+    kept, n = _adherence_trials(windows, grid, ts)
+    return (ADHERENCE_PRIOR[0] + kept) / (ADHERENCE_PRIOR[1] + n)
 
 
 def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> dict:
@@ -368,7 +393,8 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
         if len(e):
             durs.append(int(e[0] - s))
     med_dur = float(np.median(durs)) if len(durs) >= 3 else 75.0
-    adherence = _adherence(windows, grid, in_win)
+    kept, trials = _adherence_trials(windows, grid, g["ts"])
+    adherence = (ADHERENCE_PRIOR[0] + kept) / (ADHERENCE_PRIOR[1] + trials)
     # unscheduled start hazard by local hour (starts per hour), shrunk to the DISCO prior with 7 days' weight
     disco = site["data"].get("disco") or "LESCO"
     prior_day = DISCO_TRIPS.get(disco, 0.6)
@@ -429,7 +455,7 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
         p_down[:cur + remaining] = 1.0
         observed = {"since": int(obs_ts[k]), "elapsed_min": int(elapsed), "expected_remaining_min": int(remaining * 15)}
     return {"stage": 1 if days_known >= 7 else 0, "p_down": np.clip(p_down, 0, 1), "p_start": np.clip(p_start, 0, 1), "dur_steps": dur, "g": gvec,
-            "observed": observed, "adherence": round(adherence, 3), "median_minutes": med_dur, "windows": windows, "off_grid": False,
+            "observed": observed, "adherence": round(adherence, 3), "adherence_windows": trials, "median_minutes": med_dur, "windows": windows, "off_grid": False,
             "lam_day": round(float(lam_h.sum()), 3)}
 
 
@@ -520,7 +546,7 @@ def _outage_baselines(site: dict, t0: int) -> dict:
     if not conns or conns[0]["data"].get("regime") == "off_grid":
         p_sched = np.ones(96)
     elif windows:
-        p_sched = _window_mask(windows, t + 450) * _adherence(windows, h["grid"], _window_mask(windows, h["ts"]))
+        p_sched = _window_mask(windows, t + 450) * _adherence(windows, h["grid"], h["ts"])
     else:
         p_sched = np.zeros(96)
     hg = h["grid"].reshape(-1, 15)

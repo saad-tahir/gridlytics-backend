@@ -236,3 +236,73 @@ def test_the_past_of_a_site_without_an_older_issue_still_has_its_actuals(company
     past = forecast.page({"id": sid}, "load")["past"]
     assert past["belief_time"] is None and "q50" not in past
     assert past["actual"][-8:] == [1.5] * 8 and past["actual"][0] is None
+
+
+# ------------------------------------------------------------------------------------------------ outages: helpers
+
+def _grid_site(sid: str, disco: str = "LESCO", unit: dict | None = None) -> dict:
+    data = {"disco": disco, "lat": LAT, "lon": LON}
+    if unit is not None:
+        data["outage_unit"] = unit
+    return {"id": sid, "data": data, "connections": [{"id": "c1", "data": {"regime": "none"}}], "assets": {}}
+
+
+def _write_grid(sid: str, ts, grid) -> None:
+    """1-minute grid-present rows; a NaN in `grid` is a minute without a row (a lost reading)."""
+    rows = [(sid, int(t), "edge", float(g)) for t, g in zip(ts, grid) if not np.isnan(g)]
+    telemetry.write_rows(rows, ("site_id", "ts", "source_id", "grid_present"))
+
+
+def _local(ts) -> tuple[np.ndarray, np.ndarray]:
+    """(local day number, minute of the local day) of epoch seconds."""
+    loc = np.asarray(ts, dtype=np.int64) + 5 * 3600
+    return loc // 86400, (loc % 86400) // 60
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-02
+
+def test_schedule_adherence_counts_each_window_on_its_own_local_day_whatever_the_tick_time(company):
+    """A daily 14:00-16:00 window kept (grid down throughout) on one local day in four. Each whole window occurrence in the 28 days before the tick is
+    one trial on the Beta(8, 2) prior, so ticks at 00:00, 09:00, 15:00 (inside today's window) and 16:30 give the posterior of the windows they can
+    see in full. v1 split the history into 24-hour blocks from the tick: at 15:00 each block held the end of one day's window and the start of the
+    next day's, and a hit on either half counted, so the posterior rose from 0.39 to 0.55."""
+    sid = "adh-days"
+    site = _grid_site(sid)
+    forecast.set_schedule(sid, [["14:00", "16:00", "daily"]], "manual", "t")
+    day0 = datetime(2026, 11, 9, tzinfo=PKT)
+    ts = np.arange(int((day0 - timedelta(days=31)).timestamp()), int((day0 + timedelta(hours=17)).timestamp()), 60, dtype=np.int64)
+    dayn, minute = _local(ts)
+    kept = dayn % 4 == 0
+    grid = np.where(kept & (minute >= 14 * 60) & (minute < 16 * 60), 0.0, 1.0)
+    _write_grid(sid, ts, grid)
+    seen, want = {}, {}
+    for hour in (0, 9, 15, 16.5):
+        t0 = int((day0 + timedelta(hours=hour)).timestamp())
+        h0 = t0 - 28 * 86400
+        days = range((h0 + 5 * 3600) // 86400 - 1, (t0 + 5 * 3600) // 86400 + 1)
+        whole = [d for d in days if d * 86400 - 5 * 3600 + 14 * 3600 >= h0 and d * 86400 - 5 * 3600 + 16 * 3600 <= t0]
+        hits = sum(1 for d in whole if d % 4 == 0)
+        o = forecast.outage(site, t0)
+        seen[hour] = (o["adherence"], o.get("adherence_windows"))
+        want[hour] = (pytest.approx((8 + hits) / (10 + len(whole)), abs=1e-3), len(whole))
+    assert seen == want
+    assert all(a < 0.45 for a, _ in seen.values()), seen
+
+
+def test_a_window_with_too_few_readings_is_not_a_trial(company):
+    """Windows whose minutes are mostly unread (the logger was off) say nothing about the feeder: they are not counted. 28 days of readings with the
+    window's own minutes lost on 20 days leave 8 trials, all kept."""
+    sid = "adh-gaps"
+    site = _grid_site(sid)
+    forecast.set_schedule(sid, [["14:00", "16:00", "daily"]], "manual", "t")
+    t0 = int(datetime(2026, 11, 9, tzinfo=PKT).timestamp())
+    ts = np.arange(t0 - 28 * 86400, t0, 60, dtype=np.int64)
+    dayn, minute = _local(ts)
+    inside = (minute >= 14 * 60) & (minute < 16 * 60)
+    lost = inside & (dayn % 28 < 20) & (minute >= 14 * 60 + 30)  # 90 of the window's 120 minutes lost on 20 days
+    grid = np.where(inside, 0.0, 1.0)
+    grid[lost] = np.nan
+    _write_grid(sid, ts, grid)
+    o = forecast.outage(site, t0)
+    assert o["adherence"] == pytest.approx(16 / 18, abs=1e-3)
+    assert o["adherence_windows"] == 8
