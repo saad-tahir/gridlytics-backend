@@ -11,6 +11,7 @@ its end-of-period energy term (carry-over priced, not removed). The perfect-fore
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date, datetime, timedelta, timezone
 
@@ -981,7 +982,19 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
     load forecast is a later item). Its carry-over lever is the change of the valued gap in stored energy over the day: v_end x (actual - baseline end
     energy) less the day before's v_end x (actual - baseline start energy), which is zero where the chain restarts from the actual arm's state. A
     run of the genset across midnight is one start on each arm. The row stores the chain's start and end (`chain`), and with `forward` the stored
-    later days whose chain started from this day's old end are re-scored (_recompute_forward)."""
+    later days whose chain started from this day's old end are re-scored (_recompute_forward), and the day's billing month, once over, and the month
+    before it are settled: their days re-scored where their prices, native capture or data changed since (_settle_months; the nightly job scores
+    yesterday this way, so a month is re-scored at its end and after an FCA or late data)."""
+    rows = _score_day(site_id, day, with_bound)
+    if forward:
+        if rows is not None:
+            _recompute_forward(site_id, day)
+        _settle_months(site_id, day)
+    return rows
+
+
+def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
+    """compute_day's scoring of the one day: its rows per baseline, stored (None when the day cannot be scored)."""
     site = sites.full(site_id)
     if site is None:
         return None
@@ -1093,6 +1106,8 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
     # native and telemetry heard), so the day's class is its share of minutes under the plan; in tier advisory a day counts only once telemetry
     # confirms the keyed table (plan 7.6), never on the mark alone
     tier = site.get("tier", "monitor")
+    projected = on_grid and int(datetime.now(timezone.utc).timestamp()) < _billing_bounds(conn, day)[1]
+    basis = _price_basis(pr, _fuel_rs_per_l(gen_asset, day))
     with store.connect() as con:
         applied = con.execute("SELECT * FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1",
                               (site_id, day.isoformat())).fetchone()
@@ -1153,7 +1168,11 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
                       "mdi_floor_kw": pr["mdi_floor"], "mdi_interval_min": pr["mdi_interval"], "icp_case": pr["icp"], "tariff_version": pr["tariff_version"],
                       "native_capture_version": (site.get("native") or {}).get("version"),
                       "unserved_kwh_actual": a["unserved_kwh"], "unserved_kwh_baseline": n["unserved_kwh"], "chain": chains[base],
-                      "control": control}
+                      "control": control,
+                      # what the day was priced and replayed on, to find it again when its month is settled (round 7, audit engine-savings-10):
+                      # whether the month's totals were projected (the month not over: its ICP case can still flip), its prices' digest and how
+                      # complete its telemetry was
+                      "month_totals_projected": projected, "price_basis": basis, "inputs_completeness": round(float(act["g"]["completeness"]), 4)}
     if with_bound and b:
         # the hindsight solve prices every minute: it is held against the native arm priced the same way
         native_cost = (price_arm(site, sims["native"], pr, day, 0.0, 0.0, gen_before=befores["native"])["cost_rs"] if unresolved.any()
@@ -1166,9 +1185,100 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
         for base, data in rows.items():
             con.execute("INSERT INTO savings_days (site_id, day_local, baseline, data, computed) VALUES (?,?,?,?,?) ON CONFLICT(site_id, day_local, baseline) "
                         "DO UPDATE SET data = excluded.data, computed = excluded.computed", (site_id, day.isoformat(), base, json.dumps(data), now))
-    if forward:
-        _recompute_forward(site_id, day)
     return rows
+
+
+def _fuel_rs_per_l(gen_asset: dict | None, day: date) -> float | None:
+    """The genset's dated fuel price on a day (None without a genset)."""
+    return tariffs.fuel_price(gen_asset.get("fuel_kind", "hsd"), day)[0] if gen_asset else None
+
+
+def _price_basis(pr: dict, fuel: float | None) -> str:
+    """A digest of what a day is priced on: its minute prices (import, export, peak flags), its MDI terms, its ICP case and the genset's fuel price.
+    Two days' digests agree when re-pricing one would give the other's rupees."""
+    h = hashlib.sha1()
+    for k in ("c_imp", "c_exp"):
+        h.update(np.round(np.asarray(pr[k], dtype=float), 6).tobytes())
+    h.update(np.asarray(pr["peak"], dtype=bool).tobytes())
+    h.update(json.dumps([round(float(pr["mdi_rate"]), 6), round(float(pr["mdi_floor"]), 6), int(pr["mdi_interval"]), pr["icp"],
+                         None if fuel is None else round(float(fuel), 6)], sort_keys=True).encode())
+    return h.hexdigest()[:20]
+
+
+def _month_fingerprint(site_id: str, conn: dict | None, p0: date, p1: date) -> str:
+    """What a billing month's stored days were priced and replayed on, short of reading its minutes: every tariff version (rates, calendars, taxes,
+    the ICP rule, the adders, such as an FCA approved after the month), the dated fuel prices, the connection's settings, the native captures and
+    the month's telemetry day totals (late data re-aggregates them). While it is unchanged, a settled month needs no re-scoring."""
+    with store.connect() as con:
+        tv = [list(r) for r in con.execute("SELECT id, status, effective_from, effective_to FROM tariff_versions ORDER BY id")]
+        fuel = [list(r) for r in con.execute("SELECT kind, valid_from, price FROM fuel_prices ORDER BY kind, valid_from")]
+        nv = [list(r) for r in con.execute("SELECT version, captured_at FROM native_settings WHERE site_id = ? ORDER BY version", (site_id,))]
+    td = [[d["day"], d.get("import_kwh"), d.get("completeness"), d.get("import_completeness")]
+          for d in telemetry.days(site_id, p0.isoformat(), p1.isoformat())]
+    body = {"tariffs": tv, "fuel": fuel, "conn": (conn or {}).get("data"), "native": nv, "telemetry": td}
+    return hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _settle_month(site_id: str, conn: dict | None, p0: date, p1: date) -> list[dict]:
+    """Re-score the stored days of a closed billing month [p0, p1] whose inputs changed since they were scored (plan 8.2: the ICP lever comes from the
+    full month; 8.4: every day re-scorable with its own inputs; round 7, audit engine-savings-10): a day scored while the month was open was priced
+    on month totals projected from the days so far, so its ICP case can flip once the month ends; an FCA, a tariff version or a fuel price can be
+    approved after it (its price digest changes); a native capture can come to stand for it; late telemetry can fill its gaps. A row from before
+    the digest is re-scored where its ICP case or MDI rate differs. The days are walked in order, so a day whose chain an earlier re-score moved is
+    re-scored too, then the stored days after the month (_recompute_forward). Each re-scored day is audited with its claim before and after."""
+    with store.connect() as con:
+        rows: dict[str, dict] = {}
+        for r in con.execute("SELECT day_local, baseline, data FROM savings_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? "
+                             "ORDER BY day_local", (site_id, p0.isoformat(), p1.isoformat())):
+            rows.setdefault(r["day_local"], {})[r["baseline"]] = json.loads(r["data"])
+    if not rows:
+        return []
+    on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
+    tot = month_totals(site_id, conn, p0) if on_grid else {"import": None, "export": None}
+    gen_asset = (sites.assets(site_id) or {}).get("genset")
+    tdays = {d["day"]: d for d in telemetry.days(site_id, p0.isoformat(), p1.isoformat())}
+    done: list[dict] = []
+    for day in sorted(rows):
+        d, by = date.fromisoformat(day[:10]), rows[day]
+        row = by.get("native") or next(iter(by.values()))
+        pr = _minute_prices(conn if on_grid else None, d, site_id, tot["import"], tot["export"])
+        if "price_basis" in row:
+            priced = row["price_basis"] != _price_basis(pr, _fuel_rs_per_l(gen_asset, d))
+        else:
+            priced = (row.get("icp_case") or {}) != pr["icp"] or abs(float(row.get("mdi_rate") or 0.0) - float(pr["mdi_rate"])) > 1e-6
+        cap = native_for_day(site_id, d)
+        td = tdays.get(day) or {}
+        late = any(td.get(k) is not None and row.get(rk) is not None and float(td[k]) > float(row[rk]) + 1e-4
+                   for k, rk in (("completeness", "inputs_completeness"), ("import_completeness", "import_completeness")))
+        expect = _chain_starts(site_id, d) if done else {}
+        moved = any(not _start_matches(by[b].get("chain"), expect[b]) for b in by if b in expect)
+        why = ("prices" if priced else "native_capture" if cap is not None and cap.get("version") != row.get("native_capture_version")
+               else "late_data" if late else "chain" if moved else None)
+        if why is None:
+            continue
+        new = _score_day(site_id, d, with_bound="perfect_foresight_rs" in (by.get("native") or {}))
+        if new is not None:
+            done.append({"day": day, "why": why, "claimed_rs_before": row.get("claimed_rs"), "claimed_rs_after": new["native"]["claimed_rs"]})
+    if done:
+        _recompute_forward(site_id, p1)
+        store.audit("system", "re-scored a closed month's savings days", site_id, {"billing_period": [p0.isoformat(), p1.isoformat()], "days": done})
+    return done
+
+
+def _settle_months(site_id: str, day: date) -> None:
+    """Settle the day's billing month once it is over, and the month before it (an FCA approved or data arriving after it closed): each only when
+    its fingerprint changed since it was last settled (_month_fingerprint), so a quiet night reads a few small tables and re-scores nothing."""
+    conn = (sites.connections(site_id) or [None])[0]
+    p0, p1 = tariffs.billing_period_for(conn, day)
+    today = _today()
+    for a, b in (tariffs.billing_period_for(conn, p0 - timedelta(days=1)), (p0, p1)):
+        if b >= today:
+            continue
+        key = f"savings_month_settled:{site_id}:{a.isoformat()}"
+        if store.get_setting(key) == _month_fingerprint(site_id, conn, a, b):
+            continue
+        _settle_month(site_id, conn, a, b)
+        store.set_setting(key, _month_fingerprint(site_id, conn, a, b))
 
 
 def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, native_cost: float, e_end_native: float | None = None,
@@ -1688,7 +1798,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             # round 7: the day's share of its billing month's MDI lever (in its saving where the day's saving counts), and whether
                             # the month is still open
                             "mdi_month": bill_month(day), "mdi_share_native_rs": round(mdi_share(day, "native"), 2) if n else None,
-                            "mdi_provisional": not mdi_info[bill_month(day)]["closed"]})
+                            "mdi_provisional": not mdi_info[bill_month(day)]["closed"],
+                            # scored while its billing month was open: its ICP case rests on projected month totals until the month is settled
+                            "month_totals_projected": bool(n.get("month_totals_projected"))})
     verified = out["baselines"].get("native", {}).get("verified_days", 0)
     # plan 8.5: "Preliminary" until 8 weeks of switchback have run and the FCA of every month in the period has been billed
     sb_days = sum((date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in switchback_blocks(site_id)

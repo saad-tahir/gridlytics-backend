@@ -401,3 +401,66 @@ def test_each_months_mdi_lever_is_priced_at_that_months_own_rate(company):
     # a scored day stores the schedule version its rates came from
     pr = verify._minute_prices(sites.connections(sid)[0], date(2026, 10, 5), sid)
     assert pr["tariff_version"] == tariffs.card_for("B-2(b)", date(2026, 10, 5))[1]["id"] and pr["tariff_version"]
+
+
+# ------------------------------------------------------------------------------------------------ engine-savings-10: a closed month is re-scored
+
+SRC = {"kind": "manual", "ref": "test", "verified": "primary"}
+RESCORED = "re-scored a closed month's savings days"
+
+
+def _stored(sid: str, day: date) -> tuple[dict, str]:
+    with store.connect() as con:
+        r = con.execute("SELECT data, computed FROM savings_days WHERE site_id = ? AND day_local = ? AND baseline = 'native'", (sid, day.isoformat())).fetchone()
+    return json.loads(r["data"]), r["computed"]
+
+
+def _rescore_audits(sid: str) -> list[dict]:
+    with store.connect() as con:
+        return [json.loads(r["detail"]) for r in con.execute("SELECT detail FROM audit WHERE action = ? AND target = ? ORDER BY rowid", (RESCORED, sid))]
+
+
+def test_a_day_scored_mid_month_is_rescored_once_the_month_closes_and_after_a_later_fca(company, monkeypatch):
+    sid = _closed_loop_day("ICP r7 month end")
+    conn = sites.connections(sid)[0]
+    # the rest of October draws hard on the grid (a second shift started): 1.5 MW, read by the grid meter alone
+    t0, t1 = twin.day_start_utc(D) + 2 * 86400, twin.day_start_utc(date(2026, 10, 31))
+    telemetry.write_rows([(sid, t, "csv", 1.0, 1500.0 * 1000 / 60) for t in range(t0, t1, 60)], ("site_id", "ts", "source_id", "grid_present", "grid_import_wh"))
+    mid = verify.month_totals(sid, conn, D, now=twin.day_start_utc(D) + 86400)["import"]  # what the nightly job of 15 Oct saw: two days scaled up
+    end = verify.month_totals(sid, conn, D)["import"]  # the month as it ended
+    icp = {p: round((mid[p] * end[p]) ** 0.5, 1) for p in ("peak", "off_peak")}  # the October baseline sits between the two
+    assert all(mid[p] < icp[p] < end[p] for p in icp)
+    conn = sites.put_connection(sid, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 500, "regime": "none",
+                                      "icp": {"eligible": True, "peak": {"10": icp["peak"]}, "off_peak": {"10": icp["off_peak"]}}}, "t", conn_id=conn["id"])
+    # 14 Oct scored by the nightly job of 15 Oct, the month's totals projected from its first days: below the ICP baseline, so TOU rates
+    real = verify.month_totals
+    monkeypatch.setattr(verify, "month_totals", lambda s, c, d, now=None: real(s, c, d, twin.day_start_utc(d) + 86400 if now is None else now))
+    early = verify.compute_day(sid, D, with_bound=False, forward=False)["native"]
+    monkeypatch.setattr(verify, "month_totals", real)
+    assert early["icp_case"] == {"peak": "below", "off_peak": "below"} and early["claimed_rs"] != 0.0
+    # the nightly job of 1 Nov scores 31 Oct (no data that day) and settles October: 14 Oct is priced on the month as it ended. Before: nothing
+    # re-scored it, so its TOU-priced levers stood in the ledger, the report and the fee check
+    assert verify.compute_day(sid, date(2026, 10, 31)) is None
+    row, computed = _stored(sid, D)
+    assert row["icp_case"] == {"peak": "above", "off_peak": "above"} and row["month_totals_projected"] is False
+    audits = _rescore_audits(sid)
+    assert len(audits) == 1 and audits[0]["billing_period"] == ["2026-10-01", "2026-10-31"]
+    assert [(x["day"], x["why"], x["claimed_rs_before"]) for x in audits[0]["days"]] == [(D.isoformat(), "prices", early["claimed_rs"])]
+    assert audits[0]["days"][0]["claimed_rs_after"] == row["claimed_rs"] != early["claimed_rs"]
+    # the same figures as scoring the day afresh now
+    fresh = verify.compute_day(sid, D, with_bound=False, forward=False)["native"]
+    assert fresh["levers"] == row["levers"] and fresh["price_basis"] == row["price_basis"]
+    # the next night changes nothing and re-scores nothing
+    scored = []
+    monkeypatch.setattr(verify, "_score_day", lambda s, d, with_bound=True, _f=verify._score_day: scored.append(d) or _f(s, d, with_bound))
+    verify.compute_day(sid, date(2026, 11, 1))
+    assert scored == [date(2026, 11, 1)] and len(_rescore_audits(sid)) == 1
+    # an FCA for October approved after the month closed: the next night re-scores 14 Oct with it (an above-baseline period pays the positive FCA)
+    fca = [a["rate"] for a in tariffs.adders_for("2026-10") if a["key"] == "fca"]
+    v = tariffs.propose("adder", "fca", "2026-10-31", {"name": "FCA billed in October", "rate": (fca or [0.0])[0] + 3.0, "billing_months": ["2026-10"]},
+                        SRC, "t")
+    tariffs.approve(v["id"], "t")
+    verify.compute_day(sid, date(2026, 11, 2))
+    row2 = _stored(sid, D)[0]
+    assert D in scored and row2["price_basis"] != row["price_basis"] and len(_rescore_audits(sid)) == 2
+    assert _rescore_audits(sid)[1]["days"][0]["why"] == "prices" and row2["claimed_rs"] != row["claimed_rs"]
