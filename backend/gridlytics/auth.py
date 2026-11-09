@@ -39,6 +39,8 @@ PERMISSIONS = {
     "see_fee": {"admin", "analyst"},
     "start_pilot": {"admin"},
     "run_jobs": {"admin", "operator", "analyst"},
+    #: issuing the forecasts again by hand (plan Part 9.4, R8 2.8: retraining and refreshing the forecasts are the analyst's and the owner's)
+    "refresh_forecasts": {"admin", "analyst"},
     #: the energy-only report carries no money (plan Part 8.5: the viewer-safe report), so every member may generate it, a viewer included
     "energy_report": {"admin", "operator", "analyst", "viewer"},
 }

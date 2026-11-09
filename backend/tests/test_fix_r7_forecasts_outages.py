@@ -432,3 +432,60 @@ def test_a_rural_feeder_without_a_schedule_starts_from_about_ten_hours_a_day_wit
     # the stored issue carries the flag for the pages
     forecast.issue(seen, t0)
     assert forecast.page(seen, "outage")["issue"]["shed_prior"] == {"down_hours_day": 10.0, "weight": 0.2}
+
+
+# ------------------------------------------------------------------------------------------------ pages-C-21
+
+@pytest.fixture()
+def api_world(tmp_path, monkeypatch):
+    """A company file of its own with one grid-connected site, and a client per role (the administrator is the company's owner)."""
+    import types
+
+    import identities
+    from gridlytics import platform as platformdb, sites
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "workspace.db")
+    co = identities.company("R7 forecasts company", own_file=True)
+    db = platformdb.company_file(co)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with store.use_company(db):
+        sid = sites.create({"name": "Refresh mill", "disco": "FESCO"}, "test")["id"]
+        sites.put_connection(sid, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400}, "test")
+    clients = {role: identities.client(f"{role}@r7fc.test", None if role == "admin" else role, co, "owner" if role == "admin" else "member",
+                                       raise_server_exceptions=False) for role in ("admin", "operator", "analyst", "viewer")}
+    return types.SimpleNamespace(db=db, site=sid, c=clients, use=lambda: store.use_company(db))
+
+
+def test_refreshing_forecasts_is_for_an_administrator_or_an_analyst(api_world):
+    """Plan Part 9.4 and R8 2.8: retraining or refreshing the forecasts is the analyst's and the owner's. v1 let an operator do it (run_jobs)."""
+    w = api_world
+    url = f"/api/sites/{w.site}/forecasts/refresh"
+    for role, code in (("admin", 200), ("analyst", 200), ("operator", 403), ("viewer", 403)):
+        r = w.c[role].post(url)
+        assert r.status_code == code, (role, r.text)
+    assert w.c["operator"].post(url).json()["detail"] == "Refreshing forecasts is for an administrator or an analyst"
+    assert w.c["analyst"].get("/api/meta").json()["permissions"]["refresh_forecasts"] is True
+    assert w.c["operator"].get("/api/meta").json()["permissions"]["refresh_forecasts"] is False
+
+
+def test_a_refresh_keeps_the_quarter_s_observed_outage_when_the_edge_s_rows_lag(api_world, monkeypatch):
+    """The quarter's saved outage issue observed the grid down since 10 minutes ago; the edge's newest rows are now 5 minutes behind (beyond
+    OBSERVED_LAG_MIN), so a fresh issue is blind. A refresh goes through the tick's protection (plans._keep_observed_outage): the observed issue stays.
+    v1 stored the blind issue over it, and the next same-quarter re-solve read that as its prior (DESIGN_LOG rounds 1-2)."""
+    from gridlytics import plans, routes_forecasts
+    w = api_world
+    now = forecast.align(int(datetime.now(timezone.utc).timestamp())) + 450
+    monkeypatch.setattr(routes_forecasts, "now_ts", lambda: now)
+    t0 = forecast.align(now)
+    since = now // 60 * 60 - 600
+    with w.use():
+        ts = np.arange(since - 3600, now // 60 * 60 - 300, 60)
+        telemetry.write_rows([(w.site, int(t), "edge", 0.0 if t >= since else 1.0) for t in ts], ("site_id", "ts", "source_id", "grid_present"))
+        observed = {"since": int(since), "elapsed_min": 10, "expected_remaining_min": 60}
+        telemetry.save_forecast(w.site, "outage", t0, 1, forecast.VERSION, {"p_down": [1.0] * 192, "g": [0.0] * 192, "observed": observed})
+        assert forecast.outage(plans.sites.full(w.site), t0, now=now)["observed"] is None  # the fresh issue alone is blind
+    r = w.c["analyst"].post(f"/api/sites/{w.site}/forecasts/refresh")
+    assert r.status_code == 200, r.text
+    with w.use():
+        kept = telemetry.latest_forecast(w.site, "outage")
+    assert kept["belief_time"] == t0 and kept["observed"] == observed
