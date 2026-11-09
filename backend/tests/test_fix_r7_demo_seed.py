@@ -295,3 +295,12 @@ def test_the_demo_status_names_the_days_of_history_a_build_makes(company, monkey
     store.set_setting("demo_status", {"state": "none"})
     demo.load("t", 5, background=False)
     assert demo.status()["days"] == 5 and routes_demo.status()["days"] == 5
+
+
+def test_only_an_administrator_loads_the_demo_sites(world, monkeypatch):
+    calls = []
+    monkeypatch.setattr(demo, "load", lambda by, days=None, background=True: calls.append(by) or {"state": "running"})
+    for role in ("operator", "analyst", "viewer"):
+        r = world.c[role].post("/api/demo")
+        assert r.status_code == 403, (role, r.text)                          # before: an operator loaded them (edit_sites)
+    assert world.c["admin"].post("/api/demo").status_code == 200 and len(calls) == 1

@@ -1,4 +1,5 @@
-"""Demo sites (plan Part 9.6): load the four twin sites into the current company, watch the build, remove them."""
+"""Demo sites (plan Part 9.6): load the four twin sites into the current company, watch the build, remove them. Loading and removing are for an
+administrator (edit_workspace); every member reads the build's state."""
 from __future__ import annotations
 
 from fastapi import APIRouter
@@ -20,7 +21,8 @@ def status():
 
 @router.post("/api/demo")
 def load():
-    auth.need("edit_sites", "Loading the demo sites")
+    # plan Part 9.6: the demo sites are "made by an admin only" (audit role-operator-07: an operator loaded them through edit_sites)
+    auth.need("edit_workspace", "Loading the demo sites")
     st = demo.load(auth.actor())
     st.pop("trace", None)
     return st
