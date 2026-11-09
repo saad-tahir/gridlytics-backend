@@ -119,11 +119,30 @@ def _stamp_source(data: dict, before: dict | None, by: str) -> None:
         src["confirmed_by"], src["at"] = str(by or "")[:120], _now()
 
 
+#: The largest ICP baseline a month and period may hold (kWh): a 100 MW sanctioned load (ConnectionFields' bound) for a whole month is 74,400,000
+ICP_BASELINE_MAX = 100_000_000
+
+
 class IcpBaseline(Strict):
     eligible: bool = False
     #: kWh per calendar month (1-12) and period of the reference year Dec 2023 to Nov 2024, before the 2.8 percent escalation
     peak: dict[str, float] = Field(default_factory=dict)
     off_peak: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("peak", "off_peak")
+    @classmethod
+    def _months(cls, v: dict[str, float]) -> dict[str, float]:
+        """Keyed by calendar month, '1' to '12' (tariffs.icp_baseline reads str(month); audit engine-tariffs-05: any key and any figure were stored), each
+        from 0 kWh up."""
+        out: dict[str, float] = {}
+        for k, kwh in v.items():
+            month = int(k) if str(k).strip().isdigit() else 0
+            if not 1 <= month <= 12:
+                raise ValueError("The ICP baseline is by calendar month, 1 to 12")
+            if not 0 <= kwh <= ICP_BASELINE_MAX:
+                raise ValueError(f"An ICP baseline is from 0 to {ICP_BASELINE_MAX:,} kWh")
+            out[str(month)] = kwh
+        return out
 
 
 class TaxFlags(Strict):
@@ -132,6 +151,16 @@ class TaxFlags(Strict):
     strn: bool = True
     atl: bool = True
     province: Literal["punjab", "sindh", "kp", "balochistan", "ict"] = "punjab"
+
+    @model_validator(mode="after")
+    def _registered(self):
+        """Input GST is claimed back only under a sales-tax registration (plan Part 6.1; audit engine-tariffs-05: {strn: false} alone kept
+        gst_recoverable true, so a no-STRN site's price left its GST out). Without an STRN the GST is borne; saying it is recovered is refused."""
+        if not self.strn and self.gst_recoverable:
+            if "gst_recoverable" in self.model_fields_set:
+                raise ValueError("A connection without a sales-tax registration (STRN) cannot recover the bill's GST")
+            self.gst_recoverable = False
+        return self
 
 
 #: The province of each DISCO's customers, for the electricity duty (R9 sections 7 and 8.4), the usual one first: K-Electric serves Karachi (Sindh) and
@@ -185,6 +214,7 @@ class ConnectionFields(Strict):
     icp: IcpBaseline = IcpBaseline()
     tax: TaxFlags = TaxFlags()
     seasonal_multiplier: float = Field(1.0, ge=1.0, le=1.5)
+    #: Tariff F's season (R9 1.2: seasonal industrial consumers, at least six months), calendar months 1 to 12; empty: not on Tariff F
     season_months: list[int] = Field(default_factory=list)
     #: the meter's reading day of the month (from the onboarding bill): a day after it belongs to the next month's bill (tariffs.billing_period_for);
     #: unset, the bill is the calendar month. 29 to 31 read as the month's last day in a shorter month
@@ -210,6 +240,24 @@ class ConnectionFields(Strict):
     def _agreement_order(self):
         if self.agreement_start and self.agreement_end and self.agreement_end < self.agreement_start:
             raise ValueError("The agreement must end after it starts")
+        return self
+
+    @field_validator("season_months")
+    @classmethod
+    def _season(cls, v: list[int]) -> list[int]:
+        """Tariff F's season (audit engine-tariffs-05: any numbers were stored): distinct calendar months, six at least, as the tariff bills."""
+        if any(not 1 <= m <= 12 for m in v):
+            raise ValueError("A season month is 1 to 12")
+        if len(set(v)) != len(v):
+            raise ValueError("Each season month is listed once")
+        if v and len(v) < 6:
+            raise ValueError("Tariff F's season runs at least six months")
+        return v
+
+    @model_validator(mode="after")
+    def _tariff_f(self):
+        if self.season_months and tariff_data.category_class(self.tariff_category) != "industrial":
+            raise ValueError("Tariff F (a season) is for industrial connections")
         return self
 
     @field_validator("tariff_category")

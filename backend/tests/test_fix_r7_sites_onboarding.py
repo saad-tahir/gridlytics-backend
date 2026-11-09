@@ -25,6 +25,15 @@ a change back to an edge device takes what the edge last asserted.
 
 role-operator-07: an operator could add, draft and activate sites and change the control limits, which plan 9.4 gives the administrator. They now need
 manage_sites (an administrator's); the operator keeps the site's other fields, the native capture and overrides.
+
+flow-onboarding-02: a K-Electric site's connection took the other DISCOs' time-of-use group and Punjab's duty by default, and K-Electric's group was accepted
+on a FESCO site. The group and province now follow the site's DISCO where a save leaves them out, a group that contradicts the DISCO is refused, and a
+site whose DISCO changed after its connection was saved is not activated until the group matches.
+
+engine-tariffs-05 (and flow-onboarding-13, engine-money-live-10): {strn: false} alone kept gst_recoverable true, so a no-STRN site's price left its GST
+out; the ICP baseline took any key and figure; Tariff F's season took any numbers. A connection without an STRN now bears its GST (saying it recovers it
+is refused), the baseline is by calendar month in kWh from 0, the season is six distinct months at least on an industrial connection, and GET /api/meta
+names the categories the ICP applies to.
 """
 from __future__ import annotations
 
@@ -430,3 +439,48 @@ def test_a_k_electric_sites_connection_takes_its_own_time_of_use_windows_and_pro
     assert r.json()["connections"][0]["data"]["disco_group"] == "ke", r.text
     assert a.post(f"/api/sites/{sid}/activate").status_code == 200
 
+
+# ------------------------------------------------------------------------------------------------ engine-tariffs-05 (and flow-onboarding-13, engine-money-live-10)
+
+def test_tax_flags_the_icp_baseline_and_tariff_f_are_checked_and_no_strn_bears_the_gst(world):
+    a, sid = world.c["admin"], world.site
+    cid = _site(a, sid)["connections"][0]["id"]
+    put = lambda **body: a.put(f"/api/sites/{sid}/connection", json={"id": cid, "sanctioned_load_kw": 400, **body})  # noqa: E731
+    # no STRN said alone: a company without a sales-tax registration cannot claim the bill's GST back, so it bears it (it kept gst_recoverable true)
+    r = put(tariff_category="A-2(c)", tax={"strn": False})
+    assert r.status_code == 200, r.text
+    tax = r.json()["connections"][0]["data"]["tax"]
+    assert (tax["strn"], tax["gst_recoverable"]) == (False, False)
+    with world.use():
+        from datetime import date
+        from gridlytics import tariffs
+        conn = sites.connections(sid)[0]
+        bears = tariffs.energy_factor(conn, date(2026, 11, 2))
+        registered = tariffs.energy_factor({**conn, "data": {**conn["data"], "tax": {**tax, "strn": True, "gst_recoverable": True}}}, date(2026, 11, 2))
+    assert bears == pytest.approx(registered * (1 + 0.03 + 0.18)), (bears, registered)
+    # saying a company with no STRN recovers GST is refused in a sentence
+    r = put(tariff_category="A-2(c)", tax={"strn": False, "gst_recoverable": True})
+    assert r.status_code == 422 and r.json()["detail"] == "A connection without a sales-tax registration (STRN) cannot recover the bill's GST", r.text
+    # the ICP baseline is by calendar month (1 to 12), in kWh from 0 up
+    for icp, sentence in (({"eligible": True, "peak": {"13": 100.0}}, "The ICP baseline is by calendar month, 1 to 12"),
+                          ({"eligible": True, "off_peak": {"1": -5.0}}, "An ICP baseline is from 0 to 100,000,000 kWh"),
+                          ({"eligible": True, "peak": {"1": 1e12}}, "An ICP baseline is from 0 to 100,000,000 kWh")):
+        r = put(tariff_category="B-2(b)", icp=icp)
+        assert r.status_code == 422 and r.json()["detail"] == sentence, (icp, r.text)
+    months = {str(m): 1000.0 * m for m in range(1, 13)}
+    r = put(tariff_category="B-2(b)", icp={"eligible": True, "peak": months, "off_peak": {"01": 5.0, **{str(m): 9000.0 for m in range(2, 13)}}})
+    assert r.status_code == 200, r.text
+    icp = r.json()["connections"][0]["data"]["icp"]
+    assert icp["eligible"] is True and icp["peak"] == months and icp["off_peak"]["1"] == 5.0 and "01" not in icp["off_peak"]
+    # Tariff F: a season of distinct months 1 to 12, six at least (R9 1.2), on an industrial connection
+    r = put(tariff_category="B-2(b)", seasonal_multiplier=1.25, season_months=[4, 5, 6, 7, 8, 9])
+    assert r.status_code == 200 and r.json()["connections"][0]["data"]["season_months"] == [4, 5, 6, 7, 8, 9], r.text
+    for months, category, sentence in (([4, 5], "B-2(b)", "Tariff F's season runs at least six months"),
+                                       ([0, 4, 5, 6, 7, 8], "B-2(b)", "A season month is 1 to 12"),
+                                       ([4, 4, 5, 6, 7, 8], "B-2(b)", "Each season month is listed once"),
+                                       ([4, 5, 6, 7, 8, 9], "A-2(c)", "Tariff F (a season) is for industrial connections")):
+        r = put(tariff_category=category, seasonal_multiplier=1.25, season_months=months)
+        assert r.status_code == 422 and r.json()["detail"] == sentence, (months, category, r.text)
+    # GET /meta names the categories the ICP applies to, for the web app's tab C
+    meta = a.get("/api/meta").json()
+    assert "B-2(b)" in meta["icp_categories"] and "A-2(c)" not in meta["icp_categories"]

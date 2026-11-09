@@ -26,7 +26,16 @@ def meta():
             "brand_grammars": {k: {kk: vv for kk, vv in v.items()} for k, v in delivery.BRANDS.items()},
             "categories": sorted(tariff_data.CARDS_279.keys()), "regimes": ["net_billing", "net_metering_legacy", "none", "flat", "off_grid"],
             "override_kinds": sites.OVERRIDE_KINDS, "role": (auth.current.get() or {}).get("role"),
-            "permissions": {p: auth.can(p) for p in auth.PERMISSIONS}}
+            "permissions": {p: auth.can(p) for p in auth.PERMISSIONS},
+            # the categories the ICP applies to, so tab C asks for the ICP baseline only there (audit engine-tariffs-05)
+            "icp_categories": _icp_categories()}
+
+
+def _icp_categories() -> list[str]:
+    """The tariff categories of the ICP version in force today (none in force: the shipped one's)."""
+    v = tariffs.resolve("icp", "national", today())
+    body = v["body"] if v else next(x["body"] for x in tariff_data.SHIPPED if x["kind"] == "icp")
+    return list(body.get("categories") or [])
 
 
 def control_state(site: dict, last: dict | None, now: int) -> dict:
