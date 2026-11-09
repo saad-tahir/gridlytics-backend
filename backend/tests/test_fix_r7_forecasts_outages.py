@@ -306,3 +306,26 @@ def test_a_window_with_too_few_readings_is_not_a_trial(company):
     o = forecast.outage(site, t0)
     assert o["adherence"] == pytest.approx(16 / 18, abs=1e-3)
     assert o["adherence_windows"] == 8
+
+
+# ------------------------------------------------------------------------------------------------ pages-C-02 (role-viewer-03, role-operator-13)
+
+def test_without_an_announced_schedule_the_outage_issue_has_no_adherence_and_a_schedule_not_yet_seen_is_the_prior(company):
+    """With no announced windows there is nothing to keep: the issue's adherence is None (the pages say "No announced schedule"), not the Beta(8, 2)
+    prior's 0.8 shown as a measured share. With windows entered but none seen whole yet, the adherence is the prior and `adherence_windows` is 0, so
+    the pages can call it a prior; the stored issue (what the pages read) carries both."""
+    sid = "adh-none"
+    site = _grid_site(sid)
+    t0 = int(datetime(2026, 11, 9, 9, 0, tzinfo=PKT).timestamp())
+    _write_grid(sid, np.arange(t0 - 3600, t0, 60), np.ones(60))
+    o = forecast.outage(site, t0)
+    assert o["adherence"] is None and o["adherence_windows"] is None
+    forecast.issue(site, t0)
+    issue = forecast.page(site, "outage")["issue"]
+    assert issue["adherence"] is None and issue["adherence_windows"] is None
+    forecast.set_schedule(sid, [["14:00", "16:00", "daily"]], "manual", "t")
+    o = forecast.outage(site, t0)
+    assert o["adherence"] == pytest.approx(0.8) and o["adherence_windows"] == 0
+    forecast.issue(site, t0)
+    issue = forecast.page(site, "outage")["issue"]
+    assert issue["adherence"] == pytest.approx(0.8) and issue["adherence_windows"] == 0

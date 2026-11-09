@@ -242,7 +242,7 @@ def outages(site_id: str, days: int = 30):
     minutes = sum(o["minutes"] for o in log)
     kpis = {"events": n, "hours": round(minutes / 60, 1), "per_day": round(n / days, 2), "median_minutes": int(np.median([o["minutes"] for o in log])) if log else None,
             "unserved_kwh": round(sum(o["unserved_kwh"] for o in log), 1), "with_genset": sum(1 for o in log if o["genset_minutes"] > 0),
-            "adherence": (fc.get("issue") or {}).get("adherence")}
+            "adherence": (fc.get("issue") or {}).get("adherence"), "adherence_windows": (fc.get("issue") or {}).get("adherence_windows")}
     off_grid = not s.get("connections") or s["connections"][0]["data"].get("regime") == "off_grid"
     return {"off_grid": off_grid, "signal": _grid_signal(site_id, now), "kpis": kpis, "log": list(reversed(log)), "heatmap": {"days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "minutes": heat},
             "schedule": sch, "forecast": fc, "reserve": [{"t": st["t"], "reserve_pct": st["reserve_pct"], "soc_pct": st["soc_pct"], "p_down": st["p_down"]}

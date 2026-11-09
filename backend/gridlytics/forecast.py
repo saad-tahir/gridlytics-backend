@@ -371,7 +371,7 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     if not conns or conns[0]["data"].get("regime") == "off_grid":
         one = np.ones(steps)
         return {"stage": 0, "p_down": one, "p_start": np.zeros(steps), "dur_steps": np.full(steps, 4), "g": np.zeros(steps), "observed": None,
-                "adherence": None, "off_grid": True}
+                "adherence": None, "adherence_windows": None, "off_grid": True}
     sched = schedule(site["id"])
     windows = sched["windows"] if sched else []
     h0 = t0 - 28 * 86400
@@ -455,7 +455,9 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
         p_down[:cur + remaining] = 1.0
         observed = {"since": int(obs_ts[k]), "elapsed_min": int(elapsed), "expected_remaining_min": int(remaining * 15)}
     return {"stage": 1 if days_known >= 7 else 0, "p_down": np.clip(p_down, 0, 1), "p_start": np.clip(p_start, 0, 1), "dur_steps": dur, "g": gvec,
-            "observed": observed, "adherence": round(adherence, 3), "adherence_windows": trials, "median_minutes": med_dur, "windows": windows, "off_grid": False,
+            "observed": observed,
+            # no announced windows: no adherence to show (the prior has nothing to apply to); windows entered but none seen whole: the prior, 0 trials
+            "adherence": round(adherence, 3) if windows else None, "adherence_windows": trials if windows else None, "median_minutes": med_dur, "windows": windows, "off_grid": False,
             "lam_day": round(float(lam_h.sum()), 3)}
 
 
@@ -476,7 +478,8 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
         telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION, {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"])})
         telemetry.save_forecast(site["id"], "outage", t0, o["stage"], VERSION,
                                 {"p_down": _r(o["p_down"]), "p_start": _r(o["p_start"]), "dur_steps": [int(x) for x in o["dur_steps"]], "g": _r(o["g"], 0),
-                                 "observed": o.get("observed"), "adherence": o.get("adherence"), "off_grid": o.get("off_grid")})
+                                 "observed": o.get("observed"), "adherence": o.get("adherence"), "adherence_windows": o.get("adherence_windows"),
+                                 "off_grid": o.get("off_grid")})
     return {"t0": t0, "pv": p, "load": l, "outage": o}
 
 
