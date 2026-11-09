@@ -42,6 +42,8 @@ from . import platform as platformdb
 
 router = APIRouter()
 log = logging.getLogger("gridlytics")
+# A session secret too short to keep the founder's tokens from being forged stops the API as it loads this module, before it answers anyone (security-roles-12)
+founder.check_startup()
 
 #: The founder's audit, a page at a time (the console's AUDIT_PAGE)
 AUDIT_PAGE = 300
