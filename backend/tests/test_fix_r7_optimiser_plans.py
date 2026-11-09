@@ -379,3 +379,156 @@ def test_a_step_saved_for_later_compiles_as_a_hold_like_the_no_flow_reasons_it_r
     battery = {"a_grid": True}
     assert delivery.step_intents([step], battery)[0]["mode"] == "hold"
     assert delivery.step_intents([{**step, "reason": "wear_margin_too_small"}], battery)[0]["mode"] == "hold"
+
+
+# ------------------------------------------------------------------------------------------------ engine-delivery-02, flow-telemetry-plan-control-06
+
+def _floored(p, floor=0.2):
+    """The floor the delivered table holds with the grid up (build_problem writes it from the BMS low cap and the reserve policy)."""
+    p["battery"]["soc_floor_grid"] = floor
+    return p
+
+
+def test_the_plan_holds_the_delivered_floor_on_every_grid_up_step():
+    """The feed mill discharged at 250 kW into the peak down to 13.4 % and 10 %, against slots that all stop at 20 %: the plan counted on
+    energy the device keeps back. With the grid up the plan holds the table's floor, and the peak it could not shave there is imported."""
+    p = _floored(_problem())
+    p["battery"]["E0"] = 120.0
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    E = r["sol"]["E"]
+    assert float(np.min(E[1:])) >= 0.2 * 200.0 - 1e-6
+    assert float(np.sum(r["sol"]["D"])) > 1.0                         # it still discharges in the peak, down to 20 %, not 10 %
+    assert float(np.min(E[73:89])) == pytest.approx(40.0, abs=0.5)
+    # the steps it ships carry the same floor, and so does Mode B
+    from gridlytics import delivery
+    steps = plans._steps_out(p, r, {"outage": {"p_down": np.zeros(p["T"])}})
+    assert min(s["reserve_pct"] for s in steps) >= 20.0
+    assert min(b["soc_floor_pct"] for b in delivery.mode_b(steps)["steps"]) >= 20.0 - 1e-9
+
+
+def test_an_outage_may_use_the_band_down_to_the_bms_cut_off():
+    """In an outage the battery-inverter carries the load to its own cut-off (twin.simulate's outage branch), so the delivered floor binds only
+    with the grid up."""
+    p = _floored(_problem(outage=(40, 56)))
+    p["battery"]["E0"] = 120.0
+    p["Lc"] = np.full(p["T"], 60.0)
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    E = r["sol"]["E"]
+    assert float(np.min(E[41:57])) < 0.2 * 200.0 - 1.0              # the outage takes the battery under 20 %
+    assert float(np.min(E[41:57])) >= 0.1 * 200.0 - 1e-6
+
+
+def test_below_the_floor_after_an_outage_the_battery_does_not_discharge_until_it_is_back_at_the_floor():
+    """After an outage the battery is below the table's floor: the device then holds (no discharge) until it charges back to the floor, and
+    the plan may not count on discharging from there, nor is the state infeasible where it cannot recharge (no grid charging, no sun)."""
+    p = _floored(_problem(outage=(30, 31), peak=(48, 64)))
+    p["battery"]["E0"] = 45.0
+    p["battery"]["a_grid"] = False
+    p["Lc"] = np.full(p["T"], 30.0)
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    E, D = r["sol"]["E"], r["sol"]["D"]
+    assert 20.0 + 1.0 < float(E[31]) < 40.0 - 1.0                     # it came out of the outage between the cut-off and the 20 % floor
+    up_after = range(31, p["T"])
+    assert all(D[t] < 1e-6 for t in up_after)                         # and with nothing to recharge it, it never discharges again (the peak
+    #                                                                   at Rs 60 took it to the 10 % cut-off before)
+    steps = plans._steps_out(p, r, {"outage": {"p_down": np.zeros(p["T"])}})
+    from gridlytics import delivery
+    for s, b in zip(steps, delivery.mode_b(steps)["steps"]):
+        assert b["soc_floor_pct"] <= s["soc_pct"] + 1e-9               # Mode B holds what is there, never asks for energy it lacks
+
+
+def test_a_battery_recharged_to_the_floor_after_an_outage_may_discharge_above_it():
+    """With grid charging allowed the battery is recharged off-peak after the outage and discharged in the peak, never under the floor."""
+    p = _floored(_problem(outage=(20, 36), peak=(72, 88)))
+    p["battery"]["E0"] = 60.0
+    p["Lc"] = np.full(p["T"], 60.0)
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    E, D = r["sol"]["E"], r["sol"]["D"]
+    assert float(E[36]) < 40.0 - 1.0
+    assert float(np.sum(D[72:88])) > 1.0
+    for t in range(36, p["T"]):
+        if D[t] > 1e-6:
+            assert float(E[t + 1]) >= 40.0 - 1e-6
+
+
+def test_a_start_below_the_floor_is_planned_towards_it_and_never_infeasible():
+    p = _floored(_problem(peak=(8, 24)))
+    p["battery"]["E0"] = 30.0                                          # 15 %: under the 20 % floor, over the 10 % cut-off
+    p["battery"]["a_grid"] = False
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    assert float(np.max(r["sol"]["D"])) < 1e-6                        # nothing recharges it, so it holds what it has
+    p["battery"]["a_grid"] = True
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    E, D = r["sol"]["E"], r["sol"]["D"]
+    for t in range(p["T"]):
+        if D[t] > 1e-6:
+            assert float(E[t + 1]) >= 40.0 - 1e-6
+
+
+def test_the_terminal_credit_counts_only_energy_above_the_floor_and_under_its_cap():
+    """Golden: the terminal credit is v_end times E_use, the energy the next peak can use: above the delivered floor (not the cut-off) and never
+    above P_dis H_peak + R_next. Before, the breakdown credited every kWh above the cut-off, past the cap."""
+    p = _floored(_problem(peak=(0, 0)))
+    p["c_imp"] = np.full(p["T"], 28.0)
+    p["battery"]["E0"] = 150.0
+    p["battery"]["c_cyc"] = 0.0
+    p["terminal"] = {"c_next": 60.0, "H_peak": 0.5, "R_next": 0.0, "c_cal_hold": 0.0}
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    v_end = 0.95 * 60.0
+    assert r["v_end"] == pytest.approx(v_end)
+    cap = 100.0 * 0.5                                                  # P_dis x H_peak
+    E_T = float(r["sol"]["E"][-1])
+    assert E_T - 40.0 >= cap - 1e-6                                   # it keeps at least the cap above the floor
+    assert r["breakdown"]["terminal_credit_rs"] == pytest.approx(-v_end * cap, abs=0.05)
+    # and with a battery that ends under the cap, only the energy above the floor counts
+    p["terminal"]["H_peak"] = 4.0
+    p["battery"]["E0"] = 60.0
+    p["battery"]["a_grid"] = False
+    r = optimise.solve(p)
+    E_T = float(r["sol"]["E"][-1])
+    assert r["breakdown"]["terminal_credit_rs"] == pytest.approx(-v_end * max(0.0, E_T - 40.0), abs=0.05)
+
+
+def test_build_problem_plans_on_the_floor_the_compiled_table_holds(company):
+    """The floor the plan holds is the one delivery.compile_mode_a clamps every slot to, max(BMS low + 2, reserve_policy.min_soc_pct), and the
+    fallback block's floor never exceeds it."""
+    from gridlytics import delivery
+    sid = _site()
+    full = sites.full(sid)
+    t0 = twin.day_start_utc(date(2026, 11, 3))
+    p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 96)
+    assert p["battery"]["soc_floor_grid"] == pytest.approx(0.20)
+    assert plans.delivered_floor_pct(full) == pytest.approx(20.0)
+    sites.update(sid, {"reserve_policy": {"p_threshold": 0.2, "min_soc_pct": 5.0}}, "t")
+    assert plans.delivered_floor_pct(sites.full(sid)) == pytest.approx(12.0)   # the BMS's 10 % plus 2
+    step = {"t": int(t0), "discharge_kw": 50.0, "charge_kw": 0.0, "grid_import_kw": 0.0, "grid_export_kw": 0.0, "load_kw": 80.0, "pv_kw": 0.0,
+            "soc_start_pct": 50.0, "soc_pct": 11.0, "reserve_pct": 10.0, "genset_on": False, "reason": "discharge_peak_window", "grid_present": 1.0}
+    for floor, bms in ((20.0, 10.0), (5.0, 10.0), (30.0, 25.0)):
+        site = {**full, "data": {**full["data"], "reserve_policy": {"p_threshold": 0.2, "min_soc_pct": floor}},
+                "assets": {**full["assets"], "battery": {**full["assets"]["battery"], "soc_min": bms / 100.0}}}
+        c = delivery.compile_mode_a([step], "deye", {"a_grid": True}, floor, bms)
+        assert c["days"][0]["slots"][0]["soc_floor_pct"] == pytest.approx(plans.delivered_floor_pct(site))
+
+
+def test_a_ticked_plan_never_plans_grid_up_energy_under_the_delivered_floor(company):
+    """The feed mill's 40 of 40 plans planned grid-up SoC under 20 %. A ticked plan with the default policy (20 %) and a 10 % BMS cut-off."""
+    sid = _site(load_peak_kw=150)
+    t0 = twin.day_start_utc(date(2026, 11, 1))
+    rows = []
+    for t in range(twin.day_start_utc(date(2026, 10, 18)), t0 + 13 * 3600, 60):
+        rows.append((sid, t, "test", 1.0, 150.0 * 1000 / 60, 0.0, 0.0, 150.0 * 1000))
+    telemetry.write_rows(rows, ("site_id", "ts", "source_id", "grid_present", "grid_import_wh", "grid_export_wh", "pv_power_w", "load_power_w"))
+    out = plans.tick(sid, at=t0 + 13 * 3600, save=False)
+    assert out["status"] == "active"
+    up = [x for x in out["steps"] if x["grid_present"] > 0.5]
+    assert sum(x["discharge_kw"] for x in up) > 1.0
+    assert min(x["soc_pct"] for x in up) >= 20.0 - 0.05
+    assert min(s["soc_floor_pct"] for d in out["slots"]["days"] for s in d["slots"]) >= 20.0
+

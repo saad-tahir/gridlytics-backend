@@ -161,6 +161,25 @@ def offgrid_c_next(g_asset: dict, fuel_price: float, load: np.ndarray, pv: np.nd
                                    "c_om": g_asset["c_om_rs_per_kwh"], "c_runhr": g_asset["c_runhr_rs"]}, ratio)
 
 
+def fallback_floor_pct(site: dict) -> float:
+    """The fallback block's floor (`min_soc_floor_pct`): the site's reserve policy, which the edge enforces whatever the slots say (R6 I2)."""
+    return float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
+
+
+def bms_low_pct(site: dict) -> float:
+    """The battery's own cut-off (its soc_min) in percent."""
+    return float(((site.get("assets") or {}).get("battery") or {}).get("soc_min", 0.1)) * 100
+
+
+def delivered_floor_pct(site: dict) -> float:
+    """The state of charge the delivered table holds with the grid up: delivery.compile_mode_a clamps every slot's floor to
+    max(BMS low + 2, fallback floor), and the fallback floor is enforced by the edge whatever the slots say. The plan holds the same floor on its
+    grid-up steps (round 7, engine-delivery-02): before, it planned down to the BMS soc_min (10 %) against slots that all stop at 20 %, so its
+    peak discharges and its savings counted on energy the device keeps back. In an outage the battery-inverter carries the load to its own
+    cut-off, so there the plan keeps the BMS soc_min."""
+    return max(bms_low_pct(site) + 2.0, fallback_floor_pct(site))
+
+
 def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     conn = (site.get("connections") or [None])[0]
     a = site.get("assets") or {}
@@ -263,7 +282,9 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                "a_gen_surplus": bool(d.get("gen_charge_allowed", True)),
                "c_cyc": optimise.wear_cost(b_asset),
                "b_cal": optimise.calendar_slope(temp, b_asset["replacement_cost_per_kwh"]) if d.get("calendar_cost_on", True) else np.zeros(steps),
-               "charge_block": mask["charge_block"]}
+               "charge_block": mask["charge_block"],
+               # the floor the delivered table and the fallback hold with the grid up (round 7, engine-delivery-02); never above soc_max
+               "soc_floor_grid": min(float(b_asset["soc_max"]), delivered_floor_pct(site) / 100.0)}
         p["battery"] = bat
         if floor_pct.any():
             # every manual floor (a caller that drops the overrides drops this key), and its two parts
@@ -290,12 +311,17 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
     r_rows, man = res.get("r") or {}, res.get("manual_floor") or {}
     dump = s.get("W") if s.get("W") is not None else np.zeros(T)
 
+    E_up = float(res.get("E_floor_grid") or 0.0)
+
     def floor_pct(t: int) -> float | None:
-        """The floor the plan holds at step t: soc_min, raised by the reserve row and the manual floor where those rows exist, never above
-        soc_max (the reserve row's 2-sigma widening can push its target past the band)."""
+        """The floor the plan holds at step t: soc_min, raised by the reserve row and the manual floor where those rows exist and, with the grid
+        up, by the floor the delivered table holds (round 7, engine-delivery-02), never above soc_max (the reserve row's 2-sigma widening can
+        push its target past the band)."""
         if not En:
             return None
         f = bat["soc_min"] * En + (float(res["R"][t]) if t in r_rows else 0.0)
+        if float(p["g"][t]) > 0.5:
+            f = max(f, E_up)
         if t in man:
             f = max(f, float(man[t]))
         return round(min(bat["soc_max"] * En, f) / En * 100, 1)
@@ -445,9 +471,9 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                 sites.put_state(site_id, active_plan=None, last_tick=_iso(t0))
         return {"status": "failed", "reason": reason, "control_release": release}
     steps_out = _steps_out(p, res, bundle)
-    fallback_floor = float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
-    bms_low = ((site.get("assets") or {}).get("battery") or {}).get("soc_min", 0.1) * 100
-    compiled = delivery.compile_mode_a(steps_out, brand, p.get("battery"), fallback_floor, bms_low, res["M"][0] if res.get("M") else None)
+    # the slots' floors are max(bms_low + 2, fallback floor): delivered_floor_pct, the floor the plan held on its grid-up steps
+    compiled = delivery.compile_mode_a(steps_out, brand, p.get("battery"), fallback_floor_pct(site), bms_low_pct(site),
+                                       res["M"][0] if res.get("M") else None)
     guard = _guard(site, p, compiled, steps_out)
     summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(res["M"][0], 1) if res.get("M") else None,
                     "v_end": round(res.get("v_end", 0.0), 2), "guard": guard})

@@ -288,6 +288,29 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         e_lb = np.full(T + 1, min(Emin, E0))
         e_ub = np.full(T + 1, max(Emax, E0))
         e_lb[0] = e_ub[0] = E0
+        # the floor the delivered table and the fallback hold with the grid up (round 7, engine-delivery-02): every Mode A slot's floor is at
+        # least max(BMS low + 2, fallback floor) and the edge enforces the fallback floor whatever the slots say, so with the grid up the plan
+        # never counts on the energy under it. In an outage the battery-inverter carries the load to its own cut-off (soc_min). A grid-up run
+        # that starts above the floor (the horizon's first, from E0) holds it as a bound; one that may start under it (after an outage, or E0
+        # under the floor) recovers once, as EMHASS's single-recovery rows do (R2 3.5): until the battery is back at the floor it does not
+        # discharge, as the device holds a battery under its slot floor, and from then on the floor binds. `floor_runs` lists those runs
+        Elo = Emin
+        if bat.get("soc_floor_grid") is not None and not off_grid:
+            Elo = min(Emax, max(Emin, float(bat["soc_floor_grid"]) * En))
+        floor_runs: list[tuple[int, int]] = []
+        if Elo > Emin + 1e-9:
+            t = 0
+            while t < T:
+                if g[t] < 0.5:
+                    t += 1
+                    continue
+                a_ = t
+                while t < T and g[t] > 0.5:
+                    t += 1
+                if a_ == 0 and E0 >= Elo - 1e-9:
+                    e_lb[a_ + 1:t + 1] = np.maximum(e_lb[a_ + 1:t + 1], Elo)
+                else:
+                    floor_runs.append((a_, t))
         cal = np.concatenate([[0.0], np.asarray(bat.get("b_cal", np.zeros(T)), dtype=float)])
         E = m.var("E", T + 1, e_lb, e_ub, cal)
         for t in range(T):
@@ -310,6 +333,24 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                     cols.append(Pg[t])
                     vals.append(-1)
                 m.row(cols, vals, ub=max(0.0, float(PV[t] - L[t])), name=f"charge_surplus[{t}]")
+        # the single recovery to the grid-up floor (see e_lb above): y = 1 once the battery is back at the floor, monotone over the run, one per
+        # clock hour (a crossing within the hour waits for its end, a quarter of the binaries); while y = 0 there is no discharge
+        rec_last = None                                  # the recovery binary of the horizon's last step, where it ends in such a run
+        if floor_runs:
+            hour = np.asarray(p["ts"], dtype=np.int64)[:T] // 3600
+            for a_, b_ in floor_runs:
+                keys = list(dict.fromkeys(int(h) for h in hour[a_:b_]))
+                yv = m.var(f"floor_rec[{a_}]", len(keys), 0, 1, 0.0, integer=True)
+                y_of = {k: int(yv[j]) for j, k in enumerate(keys)}
+                for j in range(1, len(keys)):
+                    m.row([yv[j], yv[j - 1]], [1, -1], lb=0, name=f"floor_rec_order[{a_},{j}]")
+                for t in range(a_, b_):
+                    y = y_of[int(hour[t])]
+                    m.row([D[t], y], [1, -float(bat["P_dis"])], ub=0, name=f"floor_rec_dis[{t}]")
+                    lb_ = float(e_lb[t + 1])
+                    m.row([E[t + 1], y], [1, -(Elo - lb_)], lb=lb_, name=f"floor_rec_e[{t}]")
+                if b_ == T:
+                    rec_last = y_of[int(hour[T - 1])]
         # reserve (soft, expected value): rows only where the grid is up and an outage may start next
         sig = bat.get("sigma0", 0.0)
         R = np.zeros(T)
@@ -415,7 +456,16 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         term = p.get("terminal") or {}
         v_end = max(0.0, bat["eta_d"] * term.get("c_next", 0.0) - c_cyc - term.get("c_cal_hold", 0.0))
         E_use = m.var("E_use", 1, 0, bat["P_dis"] * term.get("H_peak", 4.0) + term.get("R_next", 0.0), -v_end)[0]
-        m.row([E_use, E[T]], [1, -1], ub=-Emin, name="terminal")
+        # the next peak uses only the energy above the floor the table holds with the grid up (round 7, engine-delivery-02); a horizon that
+        # ends in an outage keeps the cut-off, and one that ends in a run still under the floor counts above the floor once it is recovered
+        if T and g[T - 1] > 0.5 and Elo > Emin + 1e-9:
+            if rec_last is None:
+                m.row([E_use, E[T]], [1, -1], ub=-Elo, name="terminal")
+            else:
+                m.row([E_use, E[T], rec_last], [1, -1, Elo - Emin], ub=-Emin, name="terminal")
+                m.row([E_use, rec_last], [1, -float(m.ub[E_use])], ub=0, name="terminal_recovered")
+        else:
+            m.row([E_use, E[T]], [1, -1], ub=-Emin, name="terminal")
     # ---------------------------------------------------------------- the set's surplus and the battery, with the grid down
     if gen and bat and SURPLUS_ROWS and gen_surplus.any() and not thr_t:
         # Two rows the balance implies on a grid-down step (no import, no export) once the set's state is 0 or 1, written out because the
@@ -556,6 +606,9 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     out["manual_floor"] = dict(rm_floor)
     out["M"] = [float(x[i]) for i in M_idx]
     out["v_end"] = v_end if bat else 0.0
+    # the energy the terminal value credits (the next peak's use, above the grid-up floor and under its cap), and that floor in kWh
+    out["E_use"] = float(x[E_use]) if bat else 0.0
+    out["E_floor_grid"] = Elo if bat else 0.0
     out["breakdown"] = _breakdown(p, sol, out)
     out["reasons"] = explain(p, sol, out)
     if off_grid and thr_t and not shed_rule and fix_u is None:
@@ -761,7 +814,9 @@ def _breakdown(p: dict, s: dict, out: dict) -> dict:
         mdi = float(p["mdi"]["rate"] * (out["M"][0] - max(p["mdi"]["M0"], p["mdi"]["floor"])))
     unserved = float(np.sum(H * p["voll"] * s["U"]))
     reserve = float(sum(np.asarray(p["p_start"])[t] * p["c_short"] * r for t, r in out.get("r", {}).items()))
-    terminal = -float(out.get("v_end", 0.0) * max(0.0, s["E"][-1] - (bat["soc_min"] * bat["E_nom"] if bat else 0.0))) if bat else 0.0
+    # the credit the objective takes: v_end times E_use, the energy above the floor the next peak can use and never above its cap (round 7,
+    # engine-delivery-02; before, every kWh above the cut-off was credited, past the cap)
+    terminal = -float(out.get("v_end", 0.0) * out.get("E_use", 0.0)) if bat else 0.0
     return {"energy_rs": round(energy, 2), "genset_rs": round(genset, 2), "wear_rs": round(wear, 2), "mdi_rise_rs": round(mdi, 2),
             "unserved_rs": round(unserved, 2), "expected_shortfall_rs": round(reserve, 2), "terminal_credit_rs": round(terminal, 2),
             "litres": round(float(np.sum(s["F"])), 2), "import_kwh": round(float(np.sum(s["G"]) * H), 2), "export_kwh": round(float(np.sum(s["X"]) * H), 2),
@@ -778,6 +833,7 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
     hold = np.asarray(p.get("override_mask", np.zeros(T, dtype=bool)), dtype=bool)
     En = bat["E_nom"] if bat else 1.0
     Emin = bat["soc_min"] * En if bat else 0.0
+    Efl = max(Emin, float(out.get("E_floor_grid", Emin)))  # the grid-up floor: a battery at it has nothing to hold (round 7, engine-delivery-02)
     R = out.get("R", np.zeros(T))
     R_steps = np.asarray(out.get("R_steps", np.asarray(p["dur_steps"])[:T]), dtype=int)
     icp = p.get("icp") or {}
@@ -920,7 +976,7 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
             # a set running with the grid up (parallel) is named for what it does, never "genset_off" (Part 4.7)
             r = "genset_on"
             d = {"kw": round(P, 1), "rs_per_kwh": round(_gen_marginal(gen), 1)}
-        elif bat and E1 > Emin + tol and (why := held(t, E1)) is not None:
+        elif bat and E1 > (Efl if g[t] > 0.5 else Emin) + tol and (why := held(t, E1)) is not None:
             r, d = why
         elif gen and g[t] > 0.5 and float(p["p_start"][t]) > 0.2:
             r = "genset_off"
