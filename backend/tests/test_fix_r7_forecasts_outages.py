@@ -877,3 +877,76 @@ def test_an_outage_starting_a_few_minutes_before_an_announced_window_is_that_win
         o = log[_pkt(*a)]
         assert o["scheduled"] is announced, a
         assert o["cause"] == ("scheduled" if announced else ""), a
+
+
+# ------------------------------------------------------------------------------------------------ pages-C-07
+
+def _plan_before(sid: str, step_start: int, reserve_pct: float, p_start: float, modelled: bool = False, n: int = 192) -> None:
+    """An active plan issued a step before `step_start` (the outage's step): step 0 is the step before it, holding `reserve_pct` at its end with
+    `p_start` the chance an outage starts in the next step; the outage's own step (step 1) drops to the 10 % floor, and is a modelled outage (grid 0)
+    with `modelled`."""
+    import json as _json
+    from gridlytics import plans
+    b = step_start - 900
+    steps = [{"t": b + 900 * i, "reserve_pct": 10.0, "soc_pct": 70.0, "p_start": 0.0, "p_down": 0.0, "grid_present": 1.0} for i in range(n)]
+    steps[0].update(reserve_pct=reserve_pct, p_start=p_start)
+    if modelled:
+        steps[1].update(grid_present=0.0, p_down=1.0)
+    with store.connect() as con:
+        con.execute("UPDATE plans SET status = 'superseded' WHERE site_id = ? AND status = 'active'", (sid,))
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, steps, slots) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (store.new_id(), sid, plans._iso(b), plans._iso(b), plans._iso(b), plans._iso(b + n * 900), "a", "active", _json.dumps(steps), "[]"))
+
+
+def test_the_outages_page_gives_the_reserve_at_each_outage_s_start_and_the_reserve_adequacy(api_world, monkeypatch):
+    """Plan Part 8.3 and R8 2.7: reserve adequacy is the share of forecastable outages entered with the state of charge at or above the reserve target,
+    and the log gives each outage's reserve target at its start. The target is the floor the plan in force held at the end of the step before the
+    outage's step (optimise.py holds the reserve on E[t + 1] for an outage starting in step t + 1); an outage is forecastable when that plan gave a start
+    in its step a chance of at least 1 % (the optimiser's threshold for a reserve) or modelled the step as an outage. Two points under the target still
+    count as met (the Reserve alert's tolerance). v1 answered none of it, and counted 'with_genset' outages rather than hours on the genset."""
+    from gridlytics import plans, reserve, sites
+    w = api_world
+    #   start              end                 SoC   plan before it: (reserve %, p_start, modelled) or None
+    outs = [((11, 4, 14, 4), (11, 4, 16, 4), 0.65, (60.0, 0.40, False)),   # met
+            ((11, 5, 14, 0), (11, 5, 15, 0), 0.50, (60.0, 0.40, False)),   # short: 50 + 2 < 60 (the outage's own step's 10 % would read met)
+            ((11, 6, 10, 7), (11, 6, 10, 37), 0.30, (10.0, 0.002, False)),  # not forecastable: the plan gave it 0.2 %
+            ((11, 7, 14, 1), (11, 7, 15, 1), 0.55, (10.0, 0.0, True)),     # forecastable: the plan modelled the step as an outage; met
+            ((11, 8, 15, 3), (11, 8, 15, 33), 0.59, (60.0, 0.20, False)),   # met within the 2 points
+            ((10, 31, 12, 0), (10, 31, 12, 20), 0.40, None)]                # no plan in force yet
+    with w.use():
+        sites.put_asset(w.site, "battery", {"nameplate_kwh": 200.0, "p_ch_kw": 100.0, "p_dis_kw": 100.0}, "test")
+        for a, _b, _soc, p in sorted(outs, key=lambda x: _pkt(*x[0])):
+            if p is not None:
+                _plan_before(w.site, _pkt(*a) // 900 * 900, *p)
+        ts = np.arange(PAGE_NOW - 10 * 86400, PAGE_NOW, 60, dtype=np.int64)
+        g, soc, gen = np.ones(len(ts)), np.full(len(ts), 0.7), np.zeros(len(ts))
+        for a, b, s, _p in outs:
+            inside = (ts >= _pkt(*a)) & (ts < _pkt(*b))
+            g[inside], soc[inside] = 0.0, s
+        gen[(ts >= _pkt(11, 4, 14, 4)) & (ts < _pkt(11, 4, 14, 34))] = 1.0  # the genset ran the first 30 minutes of the first outage
+        telemetry.write_rows([(w.site, int(t), "edge", float(x), float(y) * 100, float(z)) for t, x, y, z in zip(ts, g, soc, gen)],
+                             ("site_id", "ts", "source_id", "grid_present", "battery_soc_est_pct", "genset_running"))
+        assert plans.active_at(w.site, _pkt(10, 31, 12, 0)) is None
+    page = _page(w, monkeypatch, 10)
+    log = {o["start"]: o for o in page["log"]}
+    want = {_pkt(11, 4, 14, 4): (60.0, True, True), _pkt(11, 5, 14, 0): (60.0, True, False), _pkt(11, 6, 10, 7): (10.0, False, None),
+            _pkt(11, 7, 14, 1): (10.0, True, True), _pkt(11, 8, 15, 3): (60.0, True, True), _pkt(10, 31, 12, 0): (None, False, None)}
+    for start, (target, forecastable, met) in want.items():
+        o = log[start]
+        assert (o["reserve_pct"], o["forecastable"], o["reserve_met"]) == (target, forecastable, met), o
+    assert log[_pkt(11, 4, 14, 4)]["battery_minutes"] == 90 and log[_pkt(11, 5, 14, 0)]["battery_minutes"] == 60
+    k = page["kpis"]
+    assert (k["reserve_outages"], k["reserve_met"], k["reserve_adequacy_pct"]) == (4, 3, 75.0)
+    assert k["genset_hours"] == 0.5 and k["battery_hours"] == round((320 - 30) / 60, 1)
+    # the same figure for the pilot's gate (Part 15.3), from a function a report or the pilot can call
+    with w.use():
+        a = reserve.adequacy(sites.full(w.site), PAGE_NOW - 10 * 86400, PAGE_NOW)
+    assert (a["outages"], a["met"], a["pct"]) == (4, 3, 75.0) and [s["start"] for s in a["short"]] == [_pkt(11, 5, 14, 0)]
+    # a viewer reads it too (no money in it)
+    assert _page(w, monkeypatch, 10, role="viewer")["kpis"]["reserve_adequacy_pct"] == 75.0
+    # without a battery there is no reserve to enter an outage with
+    with w.use():
+        sites.remove_asset(w.site, "battery", "test")
+    page = _page(w, monkeypatch, 10)
+    assert page["kpis"]["reserve_adequacy_pct"] is None and page["kpis"]["reserve_outages"] == 0 and page["kpis"]["battery_hours"] is None
+    assert all(o["reserve_pct"] is None and o["reserve_met"] is None and o["battery_minutes"] is None for o in page["log"])

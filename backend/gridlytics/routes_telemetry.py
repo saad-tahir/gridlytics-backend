@@ -12,7 +12,7 @@ from fastapi import APIRouter, Body, Request
 from fastapi.responses import PlainTextResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import alerts, auth, battery, forecast, plans, sites, store, telemetry
+from . import alerts, auth, battery, forecast, plans, reserve, sites, store, telemetry
 from .routes_common import PKT, bad, full_or_404, now_ts, out, parse_day, parse_ts, site_or_404, today
 from .schemas import Refusal
 
@@ -237,11 +237,16 @@ def outages(site_id: str, days: int = 30):
             t += 60
     fc = forecast.page(s, "outage")
     plan = plans.current(site_id)
+    # the reserve target at each outage's start and the reserve KPI (plan Part 8.3, R8 2.7; round 7, pages-C-07)
+    rk = reserve.summary(reserve.annotate(s, log))
     n = len(log)
     minutes = sum(o["minutes"] for o in log)
     kpis = {"events": n, "hours": round(minutes / 60, 1), "per_day": round(n / days, 2), "median_minutes": int(np.median([o["minutes"] for o in log])) if log else None,
             "unserved_kwh": round(sum(o["unserved_kwh"] for o in log), 1), "with_genset": sum(1 for o in log if o["genset_minutes"] > 0),
-            "adherence": (fc.get("issue") or {}).get("adherence"), "adherence_windows": (fc.get("issue") or {}).get("adherence_windows")}
+            "adherence": (fc.get("issue") or {}).get("adherence"), "adherence_windows": (fc.get("issue") or {}).get("adherence_windows"),
+            "genset_hours": round(sum(o["genset_minutes"] for o in log) / 60, 1),
+            "battery_hours": round(sum(o["battery_minutes"] for o in log) / 60, 1) if reserve.has_battery(s) else None,
+            "reserve_outages": rk["outages"], "reserve_met": rk["met"], "reserve_adequacy_pct": rk["pct"]}
     off_grid = not s.get("connections") or s["connections"][0]["data"].get("regime") == "off_grid"
     return {"off_grid": off_grid, "signal": _grid_signal(site_id, now), "kpis": kpis, "log": list(reversed(log)), "heatmap": {"days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "minutes": heat},
             "schedule": sch, "forecast": fc, "reserve": [{"t": st["t"], "reserve_pct": st["reserve_pct"], "soc_pct": st["soc_pct"], "p_down": st["p_down"]}
