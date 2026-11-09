@@ -28,22 +28,39 @@ def meta():
             "permissions": {p: auth.can(p) for p in auth.PERMISSIONS}}
 
 
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def until_words(iso: str, now: int) -> str:
+    """An end time in Pakistan time for a control label: "19:07" on the day of `now`, else with its day, "Tue 10 Nov, 19:07" (a hold runs up to 72
+    hours and the edge's pause seven days, so a time alone can be tomorrow's or next week's)."""
+    end = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    end = (end if end.tzinfo else end.replace(tzinfo=timezone.utc)).astimezone(PKT)
+    if end.date() == datetime.fromtimestamp(now, PKT).date():
+        return f"{end:%H:%M}"
+    return f"{_WEEKDAYS[end.weekday()]} {end.day} {_MONTHS[end.month - 1]}, {end:%H:%M}"
+
+
 def control_state(site: dict, last: dict | None, now: int) -> dict:
+    """The control chip: `key`, `label` (in words, an end with its day when it is not today) and, for a pause, a release or a hold, `until`."""
     ovs = sites.overrides(site["id"])
     kinds = {o["kind"]: o for o in ovs}
     tier = site.get("tier", "monitor")
     age = (now - last["ts"]) / 60 if last else None
     if "pause_control" in kinds:
-        return {"key": "paused", "label": "Control paused", "until": kinds["pause_control"]["until_ts"]}
+        until = kinds["pause_control"]["until_ts"]
+        return {"key": "paused", "label": f"Control paused until {until_words(until, now)}", "until": until}
     if "force_native" in kinds:
-        return {"key": "native", "label": "Released to native", "until": kinds["force_native"]["until_ts"]}
+        until = kinds["force_native"]["until_ts"]
+        return {"key": "native", "label": f"Released to native until {until_words(until, now)}", "until": until}
     block = plans.switchback_release(site["id"], now)
     if block:
         # a native block of the switchback calendar: the inverter runs its own settings all day, so no table is keyed in or followed
         return {"key": "native_block", "label": "Switchback: native settings today", "until": block["until"]}
     if "reserve" in kinds:
-        until = datetime.fromisoformat(kinds["reserve"]["until_ts"]).astimezone(PKT).strftime("%H:%M")
-        return {"key": "hold", "label": f"Hold until {until}", "until": kinds["reserve"]["until_ts"]}
+        until = kinds["reserve"]["until_ts"]
+        return {"key": "hold", "label": f"Hold until {until_words(until, now)}", "until": until}
     if tier == "closed_loop" and age is not None and age > 5 and not site.get("demo_link"):
         return {"key": "edge_offline", "label": "Edge offline"}
     if tier == "closed_loop":

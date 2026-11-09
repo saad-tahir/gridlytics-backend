@@ -28,6 +28,7 @@ Batch 3, the control actions and the control state:
 - every action takes effect at once: the plan is re-solved now, so a hold is in the plan and the edge's message straight away and under a pause or a
   release the plan of before is no longer active (audit flow-telemetry-plan-control-15, flow-telemetry-plan-control-21);
 - an operator may resume from the hold or the release an operator may place; a pause stays an administrator's (audit flow-telemetry-plan-control-22);
+- the hold, release and pause chips name their end, with its day when it is not today (audit flow-telemetry-plan-control-23).
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -1015,3 +1016,35 @@ def test_an_operator_may_resume_from_a_release_or_a_hold_but_not_from_a_pause(wo
     with world.use():
         assert sorted(o["kind"] for o in sites.overrides(sid)) == ["force_native", "pause_control"]
     assert admin.post(f"/api/sites/{sid}/control/resume", json={}).status_code == 200
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-23
+
+def test_an_end_is_said_with_its_day_when_it_is_not_today():
+    from gridlytics import routes_sites
+    now = int(datetime(2026, 11, 9, 10, 0, tzinfo=PKT).timestamp())
+    assert routes_sites.until_words("2026-11-09T14:07:00+00:00", now) == "19:07"
+    assert routes_sites.until_words("2026-11-10T14:07:00+00:00", now) == "Tue 10 Nov, 19:07"
+    assert routes_sites.until_words("2026-11-09T19:30:00+00:00", now) == "Tue 10 Nov, 00:30"       # past midnight in Karachi, the 9th in UTC
+    assert routes_sites.until_words("2026-11-16T09:00:00Z", now) == "Mon 16 Nov, 14:00"
+    assert routes_sites.until_words("2027-01-01T02:00:00+00:00", now) == "Fri 1 Jan, 07:00"
+
+
+def test_the_hold_release_and_pause_chips_name_their_end_with_its_day(world, monkeypatch):
+    from gridlytics import routes_sites
+    _no_ticks(monkeypatch)
+    sid, admin = world.site, world.c["admin"]
+    now = datetime.now(PKT)
+
+    def said(iso: str) -> str:
+        end = datetime.fromisoformat(iso).astimezone(PKT)
+        return end.strftime("%H:%M") if end.date() == now.date() else f"{end:%a} {end.day} {end:%b}, {end:%H:%M}"
+
+    c = admin.post(f"/api/sites/{sid}/control/hold", json={"hours": 30}).json()["control"]
+    assert c["label"] == f"Hold until {said(c['until'])}" and "," in c["label"], c          # "Hold until 19:07" for tomorrow before
+    c = admin.post(f"/api/sites/{sid}/control/release", json={"hours": 50}).json()["control"]
+    assert c["key"] == "native" and c["label"] == f"Released to native until {said(c['until'])}", c
+    c = admin.post(f"/api/sites/{sid}/control/pause", json={"hours": 0.5}).json()["control"]
+    assert c["key"] == "paused" and c["label"] == f"Control paused until {said(c['until'])}", c
+    with world.use():
+        assert routes_sites.control_state(sites.get(sid), None, _now())["label"] == c["label"]
