@@ -583,13 +583,16 @@ def _membership_view(m: dict, names: dict) -> dict:
 
 
 def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None) -> dict:
-    owner = next((accounts[m["user_id"]] for m in mine if m["role"] == "owner" and m["status"] == "active" and m["user_id"] in accounts), None)
+    # the owner shown is one who can sign in when there is one; a disabled one is marked (audit founder-console-10)
+    owners = [accounts[m["user_id"]] for m in mine if m["role"] == "owner" and m["status"] == "active" and m["user_id"] in accounts]
+    owner = next((a for a in owners if not a["disabled"]), owners[0] if owners else None)
     seated = _seated(read) if read is not None else None
     seen = [m["last_seen"] for m in read["members"].values() if m["last_seen"]] if read is not None else []
     return {"id": row["id"], "name": row["name"], "enabled": row["enabled"], "seats": row["seats"], "disabled_reason": row["disabled_reason"],
-            "created": row["created"], "owner": {k: owner[k] for k in ("id", "email", "name")} if owner else None, "members": len(mine),
+            "created": row["created"], "owner": {k: owner[k] for k in ("id", "email", "name", "disabled")} if owner else None, "members": len(mine),
             "seats_taken": len(seated) if seated is not None else None,
-            "admins": sum(m["role"] == "admin" for m in seated) if seated is not None else None,
+            # the Gridlytics administrators who can sign in: a disabled account is not counted (audit founder-console-10)
+            "admins": sum(m["role"] == "admin" and not accounts.get(m["user_id"], {}).get("disabled") for m in seated) if seated is not None else None,
             "last_seen": max(seen) if seen else None,
             "sites": read["sites"] if read is not None else None, "plans_issued": read["plans_issued"] if read is not None else None,
             "plan": read["plan"] if read is not None else None}
@@ -808,20 +811,46 @@ def set_password(user_id: str, password: str) -> dict:
     return account
 
 
-def update_account(user_id: str, disabled: bool | None = None, name: str | None = None) -> tuple[dict, dict]:
-    """Rename an account, disable or enable it; the account before and after."""
+def _and(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def owned_alone(user_id: str) -> list[str]:
+    """The names of the companies this account is the only owner of who can sign in (an active owner membership, the account not disabled): what disabling
+    it leaves with nobody to manage the company's members, keys, tariffs or closed-loop control (audit founder-console-10)."""
+    d = directory()
+    every = d.memberships()
+    owners = [m for m in every if m["role"] == "owner" and m["status"] == "active"]
+    mine = {m["company_id"] for m in owners if m["user_id"] == user_id}
+    if not mine:
+        return []
+    others = {m["user_id"] for m in owners if m["company_id"] in mine and m["user_id"] != user_id}
+    usable = {uid for uid in others if not (d.account(uid) or {"disabled": True})["disabled"]}
+    alone = {cid for cid in mine if not any(m["company_id"] == cid and m["user_id"] in usable for m in owners)}
+    return sorted((r["name"] for r in platformdb.list_companies() if r["id"] in alone), key=str.lower)
+
+
+def update_account(user_id: str, disabled: bool | None = None, name: str | None = None, leave_without_owner: bool = False) -> tuple[dict, dict, list[str]]:
+    """Rename an account, disable or enable it; the account before and after, and the companies disabling it left without an owner who can sign in.
+    Disabling a company's only such owner is refused (409), as removing, demoting or suspending them is, unless `leave_without_owner` says the founder
+    knows (an account that must be stopped at once): audit founder-console-10."""
     d = directory()
     before = d.account(user_id)
     if before is None:
         raise NotFound("No such account")
-    after = dict(before)
+    after, left = dict(before), []
+    if disabled and not before["disabled"]:
+        left = owned_alone(user_id)
+        if left and not leave_without_owner:
+            raise Conflict(f"{before['name']} is the only owner of {_and(left)} who can sign in, so nobody could manage its members, keys and tariffs: "
+                           "make another member its owner first, or confirm that it is left without one")
     if name is not None and platformdb._name(name) != before["name"]:
         d.rename(user_id, name)
         after["name"] = platformdb._name(name)
     if disabled is not None and disabled != before["disabled"]:
         d.set_disabled(user_id, disabled)
         after["disabled"] = disabled
-    return before, after
+    return before, after, left
 
 
 def add_membership(user_id: str, company_id: str, role: str) -> dict:

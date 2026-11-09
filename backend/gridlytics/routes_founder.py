@@ -16,7 +16,7 @@
     GET   /api/founder/users                                               -> {users}
     POST  /api/founder/users                         {email, name, password, company_id?, company_role?}  -> 201 {user}
     POST  /api/founder/users/{id}/password           {password}            -> {user}
-    PATCH /api/founder/users/{id}                    {disabled?, name?}    -> {user}
+    PATCH /api/founder/users/{id}                    {disabled?, name?, leave_without_owner?}  -> {user}
     POST  /api/founder/users/{id}/memberships        {company_id, company_role}  -> 201 {membership}
     PATCH /api/founder/users/{id}/memberships/{cid}  {company_role?, status?}    -> {membership}  (with gridlytics_role and last_seen there now)
     DELETE /api/founder/users/{id}/memberships/{cid}                       -> {removed: true}
@@ -345,16 +345,19 @@ def founder_user_password(user_id: str, inp: dict = Body(...)):
 @router.patch("/api/founder/users/{user_id}", dependencies=[Depends(_session)])
 def founder_user_change(user_id: str, inp: dict = Body(...)):
     """Disable an account (its sessions end at once, and a token made before is refused at its next request; in supabase mode a ban) or enable it; rename
-    it."""
+    it. Disabling a company's only owner who can sign in is refused (409) unless leave_without_owner is true (audit founder-console-10)."""
     user_id = _id(user_id, "account")
-    _object(inp, {"disabled", "name"}, "A change of an account")
-    if not inp:
+    _object(inp, {"disabled", "name", "leave_without_owner"}, "A change of an account")
+    if not set(inp) - {"leave_without_owner"}:
         _api._fail("Send whether the account is disabled, or its new name")
     disabled = _yes_no(inp["disabled"], "Say whether the account is disabled: true or false") if "disabled" in inp else None
     name = _text(inp["name"], "Give the person's name, 1 to 80 characters") if "name" in inp else None
+    alone = _yes_no(inp.get("leave_without_owner", False), "Say whether a company may be left without an owner who can sign in: true or false")
     with _said():
-        before, after = store_founder.update_account(user_id, disabled, name)
+        before, after, left = store_founder.update_account(user_id, disabled, name, alone)
         changes = {k: {"from": before[k], "to": after[k]} for k in ("disabled", "name") if before[k] != after[k]}
+        if left:
+            changes["left_without_owner"] = left
         if changes:
             platformdb.founder_audit("changed an account", after["email"], changes)
         return {"user": store_founder.user(user_id)}

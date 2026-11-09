@@ -458,7 +458,7 @@ def test_a_company_is_made_with_its_owner_together_or_not_at_all(fdb):
     assert set(made) == {"company", "owner", "membership"}
     company, owner = made["company"], made["owner"]
     assert company["name"] == "Boxlytics Internal" and company["enabled"] is True and company["seats"] == 5 and "db_file" not in company
-    assert company["owner"] == {"id": owner["id"], "email": OWNER["email"], "name": OWNER["name"]} and company["members"] == 1
+    assert company["owner"] == {"id": owner["id"], "email": OWNER["email"], "name": OWNER["name"], "disabled": False} and company["members"] == 1
     assert made["membership"]["company_role"] == "owner" and made["membership"]["status"] == "active"
     assert platformdb.check_sign_in(OWNER["email"], OWNER["password"])["id"] == owner["id"]
     assert platformdb.company_file(company["id"]) == platformdb.companies_dir() / f"{company['id']}.db"
@@ -922,8 +922,8 @@ def test_supabase_mode_makes_accounts_through_the_admin_api_and_the_company_with
     assert [(u["email"], u["name"], u["disabled"]) for u in users] == [(OWNER["email"], OWNER["name"], False)]
     assert users[0]["memberships"][0]["company_role"] == "owner"
     assert _ok(c.get("/api/founder/companies"))["companies"][0]["owner"]["email"] == OWNER["email"]
-    # disable is a ban; enable lifts it; a reset sets the password; a rename follows the profile
-    _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": True}))
+    # disable is a ban; enable lifts it; a reset sets the password; a rename follows the profile (the company's only owner: said knowingly, round 7)
+    _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": True, "leave_without_owner": True}))
     assert project.users[owner["id"]]["banned_until"] and _ok(c.get("/api/founder/users"))["users"][0]["disabled"] is True
     _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": False, "name": "Saad K. Khan"}))
     assert project.users[owner["id"]]["banned_until"] is None and project.profiles[owner["id"]] == {"id": owner["id"], "first_name": "Saad",

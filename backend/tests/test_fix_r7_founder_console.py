@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 import identities
 from gridlytics import backups, delivery, founder, identity, sites, store, telemetry
 from gridlytics import platform as platformdb
-from test_founder import (PASSWORD, SESSION_SECRET, _audit, _client, _code, _company, _console, _ok, _sentence, clock, fdb)  # noqa: F401  (fixtures)
+from test_founder import (OWNER, PASSWORD, SESSION_SECRET, _audit, _client, _code, _company, _console, _ok, _sentence, clock, fdb)  # noqa: F401  (fixtures)
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "restore_backup.py"
@@ -414,3 +414,39 @@ def test_the_users_page_shows_the_gridlytics_role_a_company_role_change_gives_at
     sunia = _person(c, "sunia@meow.test", "Sunia Ahmed", cid)
     answer = _ok(c.patch(f"/api/founder/users/{sunia['id']}/memberships/{cid}", json={"company_role": "admin"}))["membership"]
     assert answer["gridlytics_role"] is None and _role_on_users(c, sunia["id"], cid) is None
+
+
+def test_disabling_a_companys_only_owner_is_refused_unless_the_founder_says_so_and_the_list_shows_it(fdb):
+    """founder-console-10: the founder could disable a company's only owner with no warning (removing, demoting or suspending that owner is refused), and
+    Companies still showed that owner, unmarked, with '1 admin'."""
+    c = _console()
+    made = _company(c)
+    cid, owner = made["company"]["id"], made["owner"]
+    _ok(_as(owner).get("/api/sites"))
+    r = c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": True})
+    assert r.status_code == 409 and _sentence(r), r.text
+    assert "only owner of Boxlytics Internal" in r.json()["detail"] and "leave_without_owner" not in r.json()["detail"]
+    assert platformdb.account(owner["id"])["disabled"] is False
+    _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"name": "Saad K."}))                  # any other change is not held up
+    r = c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": True, "leave_without_owner": "yes"})
+    assert r.status_code == 422 and _sentence(r)
+    # said knowingly: the account is disabled, the audit says which company is left without an owner, and Companies shows it
+    off = _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": True, "leave_without_owner": True}))["user"]
+    assert off["disabled"] is True
+    assert _audit()[0]["action"] == "changed an account" and _audit()[0]["detail"]["left_without_owner"] == ["Boxlytics Internal"]
+    box = _ok(c.get("/api/founder/companies"))["companies"][0]
+    assert box["owner"] == {"id": owner["id"], "email": OWNER["email"], "name": "Saad K.", "disabled": True} and box["admins"] == 0
+    _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": False}))
+    box = _ok(c.get("/api/founder/companies"))["companies"][0]
+    assert box["owner"]["disabled"] is False and box["admins"] == 1
+    # with a second owner who can sign in (a hand-over), disabling one is not refused, and the list shows the owner who can sign in
+    maaz = _person(c, "maaz@meow.test", "Maaz Ali", cid, "owner")
+    _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": True}))
+    box = _ok(c.get("/api/founder/companies"))["companies"][0]
+    assert box["owner"]["id"] == maaz["id"] and box["owner"]["disabled"] is False
+    # but not when that second owner's account is disabled too
+    r = c.patch(f"/api/founder/users/{maaz['id']}", json={"disabled": True})
+    assert r.status_code == 409 and "Boxlytics Internal" in r.json()["detail"]
+    # a member is disabled without a word
+    sunia = _person(c, "sunia@meow.test", "Sunia Ahmed", cid)
+    _ok(c.patch(f"/api/founder/users/{sunia['id']}", json={"disabled": True}))
