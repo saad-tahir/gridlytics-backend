@@ -51,8 +51,8 @@ def state(site: dict, now: int | None = None) -> dict | None:
     out = {"e_nom_kwh": round(e_nom, 1), "c_cyc": round(optimise.wear_cost(b), 2), "soh_pct": round(b.get("soh", 1.0) * 100, 1),
            "p_ch_kw": b["p_ch_kw"], "p_dis_kw": b["p_dis_kw"], "soc_min_pct": b["soc_min"] * 100, "soc_max_pct": b["soc_max"] * 100}
     if not known.any():
-        return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "trust_basis": None, "usable_kwh": None, "anchor": None, "alerts": [], "waiting_for_anchor": True,
-                "reading_age_min": None, "stale": True, "anchor_due": False, "anchor_soc_pct": None}
+        return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "trust_basis": None, "usable_kwh": None, "anchor": None, "alerts": [],
+                "waiting_for_anchor": True, "reading_age_min": None, "stale": True, "anchor_due": False, "anchor_soc_pct": None}
     last = int(np.where(known)[0][-1])
     soc = float(est[last])
     # sigma at now, not at the last reading (round 7, engine-optimiser-07): it froze where the data stopped, so a plan started from a reading

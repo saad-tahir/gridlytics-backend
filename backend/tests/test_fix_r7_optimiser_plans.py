@@ -1063,3 +1063,13 @@ def test_trust_in_a_bms_with_nothing_independent_to_compare_it_with_is_not_asses
     st = battery.state(sites.full(both), now)
     assert st["trust_basis"] == "independent" and st["trust"] < 0.5
     assert "trust_low" in [a[0] for a in st["alerts"]]
+
+
+def test_an_anchor_deadline_sooner_than_any_hour_end_keeps_the_first_hour_end():
+    p = _problem(peak=(0, 0))
+    p["battery"]["anchor_soc"] = 0.95
+    p["battery"]["anchor_by"] = int(p["ts"][0]) + 900                 # sooner than the horizon's first clock-hour end
+    r = optimise.solve(p)
+    hour = np.asarray(p["ts"]) // 3600
+    first = next(t for t in range(p["T"]) if hour[t + 1] != hour[t])
+    assert r["status"] == "optimal" and r["anchor"]["step"] == first

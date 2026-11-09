@@ -387,9 +387,9 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             hour = np.asarray(p["ts"], dtype=np.int64)[:T] // 3600
             anchor_ends = [t for t in range(T) if t == T - 1 or hour[t + 1] != hour[t]]
             if bat.get("anchor_by"):
-                # by the time an earlier plan fixed for it (plans.build_problem), where the horizon still reaches it
+                # by the time an earlier plan fixed for it (plans.build_problem), or the first hour's end where none is that soon
                 ts_end = np.asarray(p["ts"], dtype=np.int64)[:T] + 900
-                anchor_ends = [t for t in anchor_ends if ts_end[t] <= int(bat["anchor_by"])] or anchor_ends
+                anchor_ends = [t for t in anchor_ends if ts_end[t] <= int(bat["anchor_by"])] or anchor_ends[:1]
             anchor_a = m.var("anchor", len(anchor_ends), 0, 1, 0.0, integer=True)
             m.row([int(a) for a in anchor_a], [1.0] * len(anchor_ends), lb=1, ub=1, name="anchor_one")
             dear = float(np.max(np.asarray(p["c_imp"])[:T])) if not off_grid else float(p.get("c_short", voll))
