@@ -355,3 +355,43 @@ def _app():
     from fastapi.testclient import TestClient
     from gridlytics import api
     return TestClient(api.app, raise_server_exceptions=False)
+
+
+# ------------------------------------------------------------------------------------------------ security-roles-09
+
+def test_signing_out_ends_the_access_token_of_that_session_too(world):
+    """Sign-out ended only the refresh token: the access token went on working for up to an hour. Now the access token names its session (the refresh
+    token's family), and a session that ended refuses it at once, 401 session_ended; the person's other sessions go on."""
+    import identities
+    anon = world.anon
+    one = _sign_in("operator@fix.test", identities.PASSWORD).json()
+    two = _sign_in("operator@fix.test", identities.PASSWORD).json()
+    h1, h2 = (identities.headers(s["access_token"], world.company) for s in (one, two))
+    assert anon.get("/api/sites", headers=h1).status_code == 200
+    assert anon.post("/api/local/logout", json={"refresh_token": one["refresh_token"]}).json() == {"signed_out": True}
+    for path in ("/api/sites", "/api/local/context", "/api/auth/state"):
+        r = anon.get(path, headers=h1)
+        assert r.status_code == 401 and r.json()["code"] == "session_ended", (path, r.text)
+    assert anon.get("/api/sites", headers=h2).status_code == 200                                  # the other session goes on
+    # a renewed session's access tokens, the one of before the renewal too, end with it; a sign-out with the access token alone ends its session
+    renewed = anon.post("/api/local/refresh", json={"refresh_token": two["refresh_token"]}).json()
+    h3 = identities.headers(renewed["access_token"], world.company)
+    assert anon.post("/api/local/logout", headers=h3).json() == {"signed_out": True}
+    for h in (h2, h3):
+        assert anon.get("/api/sites", headers=h).status_code == 401
+    assert anon.post("/api/local/refresh", json={"refresh_token": renewed["refresh_token"]}).status_code == 401
+
+
+def test_a_refresh_token_used_again_ends_the_access_tokens_of_its_session(world, monkeypatch):
+    """A refresh token copied and used after its first use ends its whole session (RFC 9700): the access tokens of that session as well."""
+    import identities
+    from gridlytics import platform as platformdb
+    anon = world.anon
+    first = _sign_in("analyst@fix.test", identities.PASSWORD).json()
+    renewed = anon.post("/api/local/refresh", json={"refresh_token": first["refresh_token"]}).json()
+    h = identities.headers(renewed["access_token"], world.company)
+    assert anon.get("/api/sites", headers=h).status_code == 200
+    later = platformdb._clock() + platformdb.REUSE_SECONDS + 1
+    monkeypatch.setattr(platformdb, "_clock", lambda: later)
+    assert anon.post("/api/local/refresh", json={"refresh_token": first["refresh_token"]}).status_code == 401
+    assert anon.get("/api/sites", headers=h).status_code == 401

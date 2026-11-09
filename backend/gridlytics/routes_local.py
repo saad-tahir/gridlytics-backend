@@ -3,7 +3,8 @@
     POST /api/local/session   {email, password} -> {access_token, token_type, expires_in, expires_at, refresh_token, user}
     POST /api/local/refresh   {refresh_token}   -> the same, with a new refresh token (the one sent is used up); 409 session_renewed when another window
                                                    renewed it a moment ago
-    POST /api/local/logout    {refresh_token}   -> {signed_out: true}; the session of that token ends
+    POST /api/local/logout    {refresh_token}   -> {signed_out: true}; the session of that token ends, its access tokens with it, and the session of the
+                                                   access token sent, when one is
     GET  /api/local/context                     -> {profile, memberships, pending_invites_for_email}, the shape of Supabase's get_my_context
     POST /api/local/password  {current, new}    -> {changed: true, ...a new session}; every other session ends, and a one-time password is replaced
 
@@ -39,7 +40,7 @@ def _session(account: dict, refresh_token: str) -> dict:
     """A session's answer, in the shape of a Supabase session: a one-hour access token and the refresh token that renews it."""
     from . import identity              # stage B1's, imported when a token is made
     started = int(time.time())
-    token = identity.issue_local(account["id"], account["email"], account["name"], platformdb.ACCESS_MINUTES)
+    token = identity.issue_local(account["id"], account["email"], account["name"], platformdb.ACCESS_MINUTES, session_id=platformdb.session_id(refresh_token))
     return {"access_token": token, "token_type": "bearer", "expires_in": platformdb.ACCESS_MINUTES * 60,
             "expires_at": started + platformdb.ACCESS_MINUTES * 60, "refresh_token": refresh_token,
             "user": {k: account[k] for k in ("id", "email", "name", "created")}}
@@ -114,11 +115,15 @@ def local_refresh(inp: dict = Body(...)):
 
 
 @router.post("/api/local/logout")
-def local_logout(inp: dict = Body(...)):
-    """Sign out: the session of the refresh token sent ends. Without one, or with one already ended, there is nothing to end, and the answer is the same."""
-    token = _refresh_token(inp, needed=False)
+def local_logout(request: Request, inp: dict | None = Body(None)):
+    """Sign out: the session of the refresh token sent ends, and its access tokens with it (audit security-roles-09); so does the session of the access token
+    sent, when one is. Without either, or with one already ended, there is nothing to end, and the answer is the same."""
+    token = _refresh_token(inp, needed=False) if inp is not None else None
     if token:
         platformdb.end_session(token)
+    ident = getattr(request.state, "identity", None)
+    if ident is not None:
+        platformdb.end_session_id(ident.user_id, (getattr(ident, "claims", None) or {}).get("session_id"))
     return {"signed_out": True}
 
 

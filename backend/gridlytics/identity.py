@@ -182,9 +182,10 @@ def _kept_secret(path: Path) -> str:
         time.sleep(0.05)          # another worker made it a moment ago and is writing it
 
 
-def issue_local(user_id: str, email: str, name: str, minutes: int = 60) -> str:
+def issue_local(user_id: str, email: str, name: str, minutes: int = 60, session_id: str | None = None) -> str:
     """A local-mode access token for an account (decisions, section 1), in the claim shape of a Supabase Auth access token: `sub` the account's uuid, `role`
-    and `aud` "authenticated", `iss` "gridlytics-local", `amr` a password sign-in, `app_metadata.provider` "email", ending after `minutes`."""
+    and `aud` "authenticated", `iss` "gridlytics-local", `amr` a password sign-in, `app_metadata.provider` "email", ending after `minutes`. `session_id` is
+    the sign-in's session (platform.session_id: its refresh tokens' family), so the token ends with it (audit security-roles-09); a new uuid otherwise."""
     if MODE != "local":
         raise RuntimeError("Local tokens are minted only in local mode")
     if not isinstance(user_id, str) or not _UUID.fullmatch(user_id):
@@ -197,7 +198,8 @@ def issue_local(user_id: str, email: str, name: str, minutes: int = 60) -> str:
     name = " ".join(str(name or "").split())[:80]
     now = int(time.time())
     claims = {"iss": LOCAL_ISSUER, "aud": AUDIENCE, "sub": user_id, "email": email, "phone": "", "role": "authenticated", "iat": now, "exp": now + 60 * minutes,
-              "aal": "aal1", "amr": [{"method": "password", "timestamp": now}], "session_id": str(uuid.uuid4()), "is_anonymous": False,
+              "aal": "aal1", "amr": [{"method": "password", "timestamp": now}], "session_id": str(uuid.UUID(session_id)) if session_id else str(uuid.uuid4()),
+              "is_anonymous": False,
               "app_metadata": {"provider": "email", "providers": ["email"]}, "user_metadata": {"full_name": name} if name else {}}
     return jwt.encode(claims, local_secret(), algorithm="HS256")
 
@@ -289,6 +291,12 @@ def _text(value) -> str:
     return " ".join(value.split()) if isinstance(value, str) else ""
 
 
+def _session_ended(session) -> bool:
+    """Local mode: whether the registry says the token's session has ended. Imported here, not at the top: the registry imports this module."""
+    from . import platform as platformdb
+    return platformdb.session_ended(session)
+
+
 def _password_sign_in(claims: dict) -> bool:
     """A sign-in with an email and a password: `amr` (Supabase's list of {method, timestamp}) names `password`, and the account's provider is `email`. A
     second factor adds a method beside it."""
@@ -337,6 +345,9 @@ def verify(token) -> Identity:
         raise _invalid()
     if not _password_sign_in(claims):
         raise _invalid(PASSWORD_ONLY)
+    if MODE == "local" and _session_ended(claims.get("session_id")):
+        # signed out, or the session ended otherwise: its access token ends with it, not an hour later (audit security-roles-09)
+        raise Refused(401, "session_ended", ENDED)
     email = email.strip().lower()
     meta = claims.get("user_metadata")
     meta = meta if isinstance(meta, dict) else {}

@@ -540,12 +540,51 @@ def rotate_refresh(token: str) -> tuple[dict, str] | None:
 
 
 def end_session(token: str) -> bool:
-    """Sign out: the session the refresh token belongs to ends, every token of it."""
+    """Sign out: the session the refresh token belongs to ends, every token of it, and with them the session's access tokens (`session_ended`)."""
     if not isinstance(token, str) or not token:
         return False
     with _write() as con:
         r = con.execute("SELECT family FROM refresh_tokens WHERE token_hash = ?", (auth.token_hash(token),)).fetchone()
         return bool(r) and con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE family = ?", (r["family"],)).rowcount > 0
+
+
+# A session's id is its refresh tokens' family, as a uuid: the access tokens of the session carry it as their `session_id` (identity.issue_local), so a
+# session that ends (a sign-out, its refresh token used again, a password change, the account disabled) refuses its access tokens at once, not an hour
+# later (audit security-roles-09). A token whose id names no family (one made before this, or by a test) has no session to end.
+
+def _family(session: str | None) -> str | None:
+    try:
+        return uuid.UUID(session).hex if isinstance(session, str) and len(session) <= 64 else None
+    except ValueError:
+        return None
+
+
+def session_id(refresh_token: str) -> str | None:
+    """The id of the session a refresh token belongs to: its family, as a uuid; None for a token that is not known."""
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
+    with _read() as con:
+        r = con.execute("SELECT family FROM refresh_tokens WHERE token_hash = ?", (auth.token_hash(refresh_token),)).fetchone()
+    return str(uuid.UUID(r["family"])) if r and _family(r["family"]) else None
+
+
+def session_ended(session: str | None) -> bool:
+    """Whether the session an access token names has ended: any of its refresh tokens revoked. False for an id that names no session, and while there is
+    no registry (nothing has been signed in to)."""
+    family = _family(session)
+    if family is None or not db_path().exists():
+        return False
+    with _read() as con:
+        return con.execute("SELECT 1 FROM refresh_tokens WHERE family = ? AND revoked = 1 LIMIT 1", (family,)).fetchone() is not None
+
+
+def end_session_id(user_id: str, session: str | None) -> bool:
+    """End one of an account's sessions by its id (a sign-out with the access token alone): every token of it."""
+    family = _family(session)
+    if family is None or not isinstance(user_id, str):
+        return False
+    with _write() as con:
+        return con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE family = ? AND user_id = ? AND revoked = 0", (family, user_id)).rowcount > 0
 
 
 def end_sessions(user_id: str) -> int:

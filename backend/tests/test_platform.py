@@ -75,9 +75,9 @@ def issued(monkeypatch):
     monkeypatch.setenv("GRIDLYTICS_LOCAL_JWT_SECRET", "made-up-local-secret-for-tests-0123456789abcdef")
     real = identity.issue_local
 
-    def recording(user_id, email, name, minutes=60):
+    def recording(user_id, email, name, minutes=60, **session):
         calls.append((user_id, email, name, minutes))
-        return real(user_id, email, name, minutes)
+        return real(user_id, email, name, minutes, **session)
 
     monkeypatch.setattr(identity, "issue_local", recording)
     return calls
