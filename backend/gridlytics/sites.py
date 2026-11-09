@@ -7,6 +7,7 @@ in one sentence. The control tier is two facts (plan Part 2.3): `tier_capable`, 
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timezone
 from typing import Literal
 
@@ -512,13 +513,26 @@ def clear_override(site_id: str, oid: str, author: str) -> None:
 
 # ------------------------------------------------------------------------------------------------ native-settings captures (immutable, plan Part 8.1)
 
+#: A slot's start: a time of day from 00:00 to 23:59 (audit flow-onboarding-14: '99:99' was stored, and the replay read it as a minute that never comes)
+SLOT_START = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+#: The most slots any brand's table holds (Huawei's fourteen periods, delivery.BRANDS); a site's own inverter may hold fewer (routes_sites.native_post)
+NATIVE_MAX_SLOTS = 14
+
+
 class NativeSlot(Strict):
-    start: str = Field(pattern=r"^\d{2}:\d{2}$")
+    start: str
     mode: Literal["self_use", "hold", "charge_grid", "charge_pv_only", "discharge", "export"] = "self_use"
     soc_floor_pct: float = Field(20.0, ge=0, le=100)
     soc_target_pct: float = Field(100.0, ge=0, le=100)
     grid_charge: bool = False
     max_charge_kw: float | None = None
+
+    @field_validator("start")
+    @classmethod
+    def _start(cls, v: str) -> str:
+        if not SLOT_START.match(v):
+            raise ValueError("Each slot starts at a time from 00:00 to 23:59")
+        return v
 
 
 class NativeCapture(Strict):
@@ -526,8 +540,22 @@ class NativeCapture(Strict):
     work_mode: Literal["self_use", "tou", "backup", "feed_in_first"] = "self_use"
     backup_soc_pct: float = Field(20.0, ge=0, le=100)
     grid_charge_allowed: bool = False
-    slots: list[NativeSlot] = Field(default_factory=list, max_length=14)
+    slots: list[NativeSlot] = Field(default_factory=list)
     photo: str = Field("", max_length=7_000_000)
+
+    @field_validator("slots", mode="before")
+    @classmethod
+    def _count(cls, v):
+        if isinstance(v, list) and len(v) > NATIVE_MAX_SLOTS:
+            raise ValueError(f"An inverter's table holds at most {NATIVE_MAX_SLOTS} slots")
+        return v
+
+    @model_validator(mode="after")
+    def _distinct(self):
+        starts = [s.start for s in self.slots]
+        if len(set(starts)) < len(starts):
+            raise ValueError("Two slots cannot start at the same time")
+        return self
 
 
 def native_latest(site_id: str) -> dict | None:

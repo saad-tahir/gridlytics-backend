@@ -9,6 +9,9 @@ empty or unknown category in the web app's sentence, and activation asks for one
 
 flow-onboarding-18: the agreement's dates were any text, in any order, and the genset's money figures and tank had no upper bound. They are now days written
 YYYY-MM-DD, the end not before the start, and Rs 1,000,000 a start or a running hour, Rs 10,000 a kWh of upkeep and a 1,000,000 L tank at most.
+
+flow-onboarding-14 (and flow-savings-pilot-bill-15): a native capture stored slot starts such as '99:99' and two slots starting at the same time, and the
+savings replay then used the impossible slot as the overnight default. A slot now starts at a time from 00:00 to 23:59, and no two slots start together.
 """
 from __future__ import annotations
 
@@ -178,3 +181,27 @@ def test_agreement_dates_are_days_in_order_and_the_gensets_money_and_tank_are_bo
     r = a.put(f"/api/sites/{sid}/assets/genset", json={"rated_kw": 150, "c_start_rs": 1_000_000, "c_runhr_rs": 1_000_000, "c_om_rs_per_kwh": 10_000,
                                                          "tank_l": 1_000_000})
     assert r.status_code == 200 and r.json()["assets"]["genset"]["tank_l"] == 1_000_000, r.text
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-14 (and flow-savings-pilot-bill-15)
+
+def _native(c, sid, starts, **body):
+    return c.post(f"/api/sites/{sid}/native", json={"work_mode": "tou", "slots": [{"start": t, "mode": "self_use"} for t in starts], **body})
+
+
+def test_a_native_capture_holds_real_and_distinct_slot_times(world):
+    a, sid = world.c["admin"], world.site
+    # '99:99' was stored, and the replay read it as minute 6039: the slot that governs every minute before the first real one
+    for bad in ("99:99", "25:99", "24:00", "12:60", "7:00", "07.00"):
+        r = _native(a, sid, ["06:00", bad])
+        assert r.status_code == 422 and r.json()["detail"] == "Each slot starts at a time from 00:00 to 23:59", (bad, r.text)
+    r = _native(a, sid, ["17:00", "06:00", "17:00"])
+    assert r.status_code == 422 and r.json()["detail"] == "Two slots cannot start at the same time", r.text
+    r = _native(a, sid, [f"{h:02d}:00" for h in range(15)])
+    assert r.status_code == 422 and r.json()["detail"] == "An inverter's table holds at most 14 slots", r.text
+    with world.use():
+        assert sites.native_versions(sid) == []
+    r = _native(a, sid, ["00:00", "17:00", "23:59"])
+    assert r.status_code == 200 and [s["start"] for s in r.json()["body"]["slots"]] == ["00:00", "17:00", "23:59"], r.text
+    with world.use():
+        assert [v["version"] for v in sites.native_versions(sid)] == [1]
