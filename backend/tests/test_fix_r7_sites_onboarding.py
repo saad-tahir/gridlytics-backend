@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 
 from gridlytics import sites
+from gridlytics.schemas import Refusal
 from test_fix_api import world  # noqa: F401  (world is a fixture)
 
 
@@ -129,7 +130,7 @@ def test_an_empty_or_unknown_tariff_category_is_refused_and_activation_asks_for_
     r = a.put(f"/api/sites/{sid}/connection", json={"id": conn["id"], "tariff_category": "Z-9"})
     assert r.status_code == 422 and r.json()["detail"] == "Unknown tariff category Z-9", r.text
     with world.use():
-        with pytest.raises(ValueError, match="Choose the tariff category"):
+        with pytest.raises(Refusal, match="Choose the tariff category"):
             sites.put_connection(sid, {"tariff_category": ""}, "test")
     held = _site(a, sid)["connections"]
     assert [c["data"]["tariff_category"] for c in held] == ["B-2(b)"]
