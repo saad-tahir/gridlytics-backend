@@ -513,3 +513,14 @@ def test_my_account_keeps_my_notification_choices(world):
         assert r.status_code == 422 and len(r.json()["detail"].split()) >= 3, (wrong, r.text)
     assert v.put("/api/platform/notifications", json={"follow": []}).json() == {**body, "follow": [], "email": True}
     assert world.anon.get("/api/platform/notifications", headers=world.key(["sites:read"])).status_code == 403
+
+
+def test_the_members_refusal_of_a_name_email_or_password_says_who_changes_them(world):
+    """parity-supabase-auth-02: PUT /api/users sent an administrator to My account for another member's name, email or password, which My account cannot
+    change. OnyxLeaf changes a name or an email (accounts are preassigned); a forgotten password is Sign-in help's one-time password."""
+    a = world.c["admin"]
+    op = _member(world, "operator@fix.test")["id"]
+    for field, value in (("name", "Someone Else"), ("email", "else@fix.test"), ("password", "another password 1")):
+        r = a.put(f"/api/users/{op}", json={field: value})
+        assert r.status_code == 422 and "OnyxLeaf" in r.json()["detail"] and "Sign-in help" in r.json()["detail"], (field, r.text)
+        assert "My account" not in r.json()["detail"]

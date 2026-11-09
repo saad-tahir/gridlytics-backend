@@ -498,7 +498,9 @@ def users_edit(user_id: str, request: Request = None, inp: dict = Body(...)):
     if auth.company.get() is None:
         raise HTTPException(status_code=404, detail="No such user")
     if isinstance(inp, dict) and {"name", "email", "password"} & set(inp):
-        _fail("The name, the email address and the password are kept by the sign-in service: change them in My account")
+        # accounts are preassigned (OnyxLeaf makes them): a member's name and address are OnyxLeaf's to change, and a forgotten password is Sign-in help's
+        # one-time password (plan Part 9.3; audit parity-supabase-auth-02)
+        _fail("OnyxLeaf changes a member's name or email address: ask us. For a forgotten password, use Sign-in help on the member's row")
     fields = _account(inp)
     person = None
     if store_members.member(user_id) is None:
