@@ -72,9 +72,11 @@ class ApplyFields(Strict):
     photo: str = ""
 
 
-#: Each control action: the permission it needs, what a refusal says is being done, and its body
+#: Each control action: the permission it needs, what a refusal says is being done, and its body. A resume needs hold_release, and resume_control
+#: too while a pause is in force: as clearing an override needs the permission of its kind (sites.OVERRIDE_PERMISSION), an operator may end a hold
+#: or a release, and a pause is an administrator's (plan Part 10.5)
 CONTROL_ACTIONS = {"hold": ("hold_release", "Holding the battery", HoldFields), "release": ("hold_release", "Releasing to native", TimedFields),
-                   "pause": ("resume_control", "Pausing control", TimedFields), "resume": ("resume_control", "Resuming control", ResumeFields)}
+                   "pause": ("resume_control", "Pausing control", TimedFields), "resume": (None, "Resuming control", ResumeFields)}
 #: the overrides a resume clears
 RESUMED_KINDS = ("pause_control", "force_native", "reserve")
 
@@ -225,7 +227,13 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
     if action not in CONTROL_ACTIONS:
         raise Refusal(404, "The control actions are hold, release, pause and resume", "not_found")
     perm, doing, model = CONTROL_ACTIONS[action]
-    auth.need(perm, doing)
+    if action == "resume":
+        kinds = {o["kind"] for o in sites.overrides(site_id) if o["kind"] in RESUMED_KINDS}
+        if "pause_control" in kinds:
+            auth.need("resume_control", "Resuming control after a pause")
+        auth.need("hold_release", doing)
+    else:
+        auth.need(perm, doing)
     f = check(model, inp)
     who = auth.actor()
     if action == "resume":

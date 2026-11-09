@@ -27,6 +27,7 @@ Batch 3, the control actions and the control state:
   table (audit pages-B-01, security-roles-13, flow-telemetry-plan-control-20);
 - every action takes effect at once: the plan is re-solved now, so a hold is in the plan and the edge's message straight away and under a pause or a
   release the plan of before is no longer active (audit flow-telemetry-plan-control-15, flow-telemetry-plan-control-21);
+- an operator may resume from the hold or the release an operator may place; a pause stays an administrator's (audit flow-telemetry-plan-control-22);
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -991,3 +992,26 @@ def test_every_action_re_solves_and_a_failed_re_solve_leaves_the_action_standing
     assert r.json()["resolve"]["status"] == "failed" and r.json()["resolve"]["reason"].startswith("The re-solve after the hold failed"), r.json()
     with world.use():
         assert [o["kind"] for o in sites.overrides(sid)] == ["reserve"]
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-22
+
+def test_an_operator_may_resume_from_a_release_or_a_hold_but_not_from_a_pause(world, monkeypatch):
+    sid, admin, op, viewer = world.site, world.c["admin"], world.c["operator"], world.c["viewer"]
+    ticks = _no_ticks(monkeypatch)
+    assert op.post(f"/api/sites/{sid}/control/release", json={"hours": 2}).status_code == 200
+    assert op.post(f"/api/sites/{sid}/control/hold", json={"hours": 2}).status_code == 200
+    assert viewer.post(f"/api/sites/{sid}/control/resume", json={}).status_code == 403
+    r = op.post(f"/api/sites/{sid}/control/resume", json={})
+    assert r.status_code == 200 and r.json()["control"]["key"] not in ("native", "hold") and "resolve" in r.json(), r.text
+    with world.use():
+        assert sites.overrides(sid) == []
+    assert len(ticks) == 3
+    # a pause is an administrator's to end (plan Part 10.5, resume_control), with a release beside it or not
+    assert admin.post(f"/api/sites/{sid}/control/pause", json={"hours": 2}).status_code == 200
+    assert op.post(f"/api/sites/{sid}/control/release", json={"hours": 2}).status_code == 200
+    r = op.post(f"/api/sites/{sid}/control/resume", json={})
+    assert r.status_code == 403 and r.json()["detail"] == "Resuming control after a pause is for an administrator", r.text
+    with world.use():
+        assert sorted(o["kind"] for o in sites.overrides(sid)) == ["force_native", "pause_control"]
+    assert admin.post(f"/api/sites/{sid}/control/resume", json={}).status_code == 200
