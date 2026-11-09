@@ -757,4 +757,143 @@ def test_the_energy_report_says_the_regime_and_the_days_in_words(world, monkeypa
             assert "none" not in header and "no export" in header, header
             d = date.fromisoformat(day)
             assert day not in text and f"{d:%a} {d.day} {d:%b}" in text, text
-    assert not re.search(r"\b(confirmed|not_applied|native_block|recommendation_only)\b", built[-1]), built[-1]
+    assert not re.search(r"\b(not_applied|native_block|recommendation_only|import_unknown|genset_unknown)\b", built[-1]), built[-1]
+    assert not re.search(r"\| confirmed\b", built[-1]) and "| Confirmed" in built[-1], built[-1]   # the daily rows' fidelity in words
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-07 (and tracker-and-docs-14, flow-reports-alerts-members-keys-03, -05)
+
+def _plan_8_5_world(monkeypatch, sid: str, month: str) -> dict:
+    """A month with every part plan 8.5 lists: two days of data, an MDI month, two outages (one carried, one with unserved load), forecast scores,
+    an edge read-back mismatch, a switchback calendar with a carry-over credit and an entered bill."""
+    from datetime import date
+    from gridlytics import verify
+    d1, d2 = f"{month}-08", f"{month}-09"
+    native = _baseline(mdi_months={month: {"actual_kw": 310.0, "baseline_kw": 340.0, "floor_kw": 0.0}}, unserved_kwh_actual=1.5)
+    summ = _fake_summary(month, [_day_row(d1), _day_row(d2, fidelity="partial")], native=native,
+                         tuned=_baseline(saving_rs=800.0, claimed_rs=780.0, perfect_foresight_rs=None, levers={"peak_window": 600.0, "mdi": 200.0}))
+    _with_summary(monkeypatch, summ, [_tday(d1), _tday(d2)])
+    t1 = int(datetime(int(month[:4]), int(month[5:7]), 8, 10, tzinfo=PKT).timestamp())
+    monkeypatch.setattr(telemetry, "outages", lambda site_id, a, b: [
+        {"start": t1, "end": t1 + 3600, "minutes": 60, "soc_start_pct": 80.0, "genset_minutes": 0, "unserved_kwh": 0.0},
+        {"start": t1 + 86400, "end": t1 + 86400 + 7200, "minutes": 120, "soc_start_pct": 30.0, "genset_minutes": 30, "unserved_kwh": 1.5}])
+    blocks = [{"site_id": sid, "block_start": f"{month}-01", "block_end": f"{month}-07", "arm": "plan", "locked": 1},
+              {"site_id": sid, "block_start": f"{month}-08", "block_end": f"{month}-14", "arm": "native", "locked": 1}]
+    monkeypatch.setattr(verify, "switchback_result", lambda site_id: {
+        "blocks": blocks, "days": 14, "carry_over_credits": [{"boundary": f"{month}-08", "from_arm": "plan", "to_arm": "native", "e_end_plan_kwh": 120.0,
+                                                               "e_end_native_kwh": 80.0, "v_end": 30.0, "credit_rs": 1200.0}],
+        "result": {"saving_rs_per_day_unadjusted": 950.0, "saving_rs_per_day_adjusted": 900.0, "plan_days": 7, "native_days": 7,
+                   "carry_over_credit_rs": 1200.0, "carry_over_rs_per_plan_day": 171.43, "saving_rs_per_day_unadjusted_before_carry_over": 778.57,
+                   "saving_rs_per_day_adjusted_before_carry_over": 728.57}})
+    monkeypatch.setattr(verify, "bills", lambda site_id: [{"id": "b1", "site_id": sid, "period_start": f"{month}-01", "period_end": f"{month}-28",
+                                                           "real": {"total_rs": 1000000.0}, "rebuilt": {"total_rs": 1025000.0}, "difference_pct": 2.5}])
+    with store.connect() as con:
+        con.execute("INSERT INTO forecast_scores (site_id, kind, day_local, horizon_class, metric, value, baseline_value) VALUES (?,?,?,?,?,?,?)",
+                    (sid, "pv", d1, "day_ahead", "nrmse", 0.18, None))
+        con.execute("INSERT INTO forecast_scores (site_id, kind, day_local, horizon_class, metric, value, baseline_value) VALUES (?,?,?,?,?,?,?)",
+                    (sid, "load", d1, "day_ahead", "nrmse", 0.10, 0.20))
+        con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
+                    (sid, datetime.fromtimestamp(t1, timezone.utc).isoformat(), "readback_mismatch", "edge", "{}"))
+    return {"d1": date.fromisoformat(d1), "summ": summ}
+
+
+def test_the_monthly_report_carries_what_plan_8_5_lists(world, monkeypatch):
+    """pages-D-07: the PDF had a headline, a native-only ledger, the method, energy and daily rows: no KPI grid (diesel, peak, outage coverage,
+    forecast skill, control health), no tuned ledger, no switchback calendar or carry-over credits, no bill comparison, no assumptions note, no
+    one-page summary with an annex, and no word that the month's data covers only part of it."""
+    from datetime import date
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    with world.use():
+        _plan_8_5_world(monkeypatch, sid, month)
+        built = _story(monkeypatch)
+        reports.generate("monthly_savings", sid, month, "test")
+    text = built[-1]
+    lines = text.splitlines()
+    order = [next(i for i, ln in enumerate(lines) if ln == h) for h in ("Summary", "Key figures", "Ledger by lever", "Switchback", "Bill comparison",
+                                                                         "Annex: energy and daily rows")]
+    assert order == sorted(order), order
+    assert "covers 2 of the month's" in text, text                           # the data covers part of the month, and the report says so
+    grid = {ln.split(" | ")[0]: ln for ln in lines if " | " in ln}
+    assert {"Diesel", "Peak (MDI)", "Outage coverage", "Forecast skill", "Control health"} <= set(grid), grid.keys()
+    assert "310 kW" in grid["Peak (MDI)"] and "340 kW" in grid["Peak (MDI)"], grid["Peak (MDI)"]
+    assert "2 outages" in grid["Outage coverage"] and "1 carried without unserved critical load" in grid["Outage coverage"], grid["Outage coverage"]
+    assert "18.0 %" in grid["Forecast skill"] and "50 % better than" in grid["Forecast skill"], grid["Forecast skill"]
+    assert "1 confirmed" in grid["Control health"] and "1 partly followed" in grid["Control health"], grid["Control health"]
+    assert "1 read-back mismatch" in grid["Control health"], grid["Control health"]
+    ledger = next(ln for ln in lines if ln.startswith("Lever | "))
+    assert ledger == "Lever | Against the native settings | Against a tuned table", ledger
+    assert any(ln.startswith("Peak-window import avoided | Rs 1,500 | Rs 600") for ln in lines), text
+    assert any("Carry-over credit" in ln and "Rs 1,200" in ln for ln in lines), text
+    first = date.fromisoformat(f"{month}-01")
+    assert any(ln.startswith(f"{first:%a} {first.day} {first:%b} | ") and ln.endswith("The plan") for ln in lines), text
+    assert any(ln.endswith("The native settings") for ln in lines), text
+    assert "Rs 900 a day" in text and "Rs 950 a day" in text, text           # the switchback result, adjusted and unadjusted
+    bill = next(ln for ln in lines if "Rs 1,000,000" in ln)
+    assert "Rs 1,025,000" in bill and "2.5 %" in bill, bill
+    assert "GST" in text                                                     # the assumptions note: the bearable-cost basis
+    assert month not in text.replace(f"{month}-", "")                          # no "YYYY-MM" month in the words
+
+
+def test_a_company_roll_up_report_lists_every_site_and_the_total(world, monkeypatch):
+    """pages-D-07 (and tracker-and-docs-14, flow-reports-alerts-members-keys-03): plan 8.5 asks for a roll-up per company; POST /api/reports needed a
+    site."""
+    from gridlytics import verify
+    sid, month = world.site, _past_month()
+    with world.use():
+        two = sites.create({"name": "Mill Two", "disco": "LESCO"}, "test")["id"]
+    by_site = {sid: _fake_summary(month, [_day_row(f"{month}-02")], preliminary=True),
+               two: _fake_summary(month, [], native=_baseline(saving_rs=500.0, claimed_rs=400.0), chain_stale_days=[f"{month}-03"])}
+    monkeypatch.setattr(verify, "summary", lambda site_id, d0, d1, see_fee=False: by_site[site_id])
+    built = _story(monkeypatch)
+    for role in ("viewer", "operator"):
+        assert world.c[role].post("/api/reports", json={"kind": "company_rollup", "period": month}).status_code == 403, role
+    r = world.c["analyst"].post("/api/reports", json={"kind": "company_rollup", "period": month})
+    assert r.status_code == 200, r.text
+    row = r.json()
+    assert row["site_id"] == "" and row["kind"] == "company_rollup" and row["preliminary"] is True, row
+    text = built[-1]
+    assert "Mill One" in text and "Mill Two" in text, text
+    total = next(ln for ln in text.splitlines() if ln.startswith("All sites"))
+    assert "Rs 2,301" in total, total                                      # the claims summed: 1,901.13 + 400
+    assert "Recompute needed" in text and "Mill Two" in next(ln for ln in text.splitlines() if "Recompute needed" in ln)
+    d = world.c["analyst"].get(f"/api/reports/{row['id']}/pdf")
+    assert d.status_code == 200 and f'filename="gridlytics-company-rollup-{month}.pdf"' in d.headers["content-disposition"]
+    csv_rows = world.c["analyst"].get(f"/api/reports/{row['id']}/csv").text.splitlines()
+    assert csv_rows[0].startswith("site_id,site,") and len(csv_rows) == 3, csv_rows
+    assert not [x for x in world.c["viewer"].get("/api/reports").json() if x["kind"] == "company_rollup"]
+
+
+def test_a_pilot_report_fills_the_pre_registered_criteria_and_is_titled_by_tier(world, monkeypatch):
+    """pages-D-07 (and flow-reports-alerts-members-keys-03): POST /api/reports {kind: pilot} answered 422; plan 8.5 asks for the pilot write-up with
+    the pre-registered criteria of Part 15.3 filled in, and R8 2.14 titles it "Counterfactual-only report" below the advisory tier."""
+    sid, month = world.site, _past_month()
+    with world.use():
+        _plan_8_5_world(monkeypatch, sid, month)
+        store.set_setting(f"fee:{sid}", 100.0)
+    built = _story(monkeypatch)
+    assert world.c["operator"].post("/api/reports", json={"kind": "pilot", "site_id": sid, "period": month}).status_code == 403
+    r = world.c["admin"].post("/api/reports", json={"kind": "pilot", "site_id": sid, "period": month})
+    assert r.status_code == 200, r.text
+    text = built[-1]
+    assert text.splitlines()[0] == "Counterfactual-only report: Mill One", text.splitlines()[0]
+    lines = text.splitlines()
+    crit = {ln.split(" | ")[0]: ln for ln in lines if " | " in ln}
+    for name in ("Saving at least", "Unserved critical energy at most", "Reserve adequacy at least", "Plan fidelity at least",
+                 "Verified saving at least", "Solar forecast error at most"):
+        assert any(k.startswith(name) for k in crit), (name, crit.keys())
+    fid = next(v for k, v in crit.items() if k.startswith("Plan fidelity at least"))
+    assert "50 %" in fid and "falls short" in fid, fid                       # 1 of the 2 plan days confirmed, against 80 %
+    stat = next(v for k, v in crit.items() if k.startswith("Lower 80 % bound"))
+    assert "fee" in stat, stat
+    assert "Switchback" in lines and "Forecast accuracy" in lines and "Control health" in lines
+    with world.use():
+        sites.set_tier_capable(sid, "advisory_writes")
+        sites.set_tier_allowed(sid, "advisory_writes", "test")
+    world.c["admin"].post("/api/reports", json={"kind": "pilot", "site_id": sid, "period": month})
+    assert built[-1].splitlines()[0] == "Pilot report: Mill One"
+    # the pilot report carries the fee: a role that does not see the fee neither lists nor downloads it
+    rid = r.json()["id"]
+    assert not [x for x in world.c["operator"].get("/api/reports").json() if x["kind"] == "pilot"]
+    assert world.c["operator"].get(f"/api/reports/{rid}/pdf").status_code == 403
+    assert world.c["analyst"].get(f"/api/reports/{rid}/pdf").status_code == 200

@@ -1,7 +1,9 @@
 """Reports (UI-14): generate, list and download; a viewer may generate and read the energy-only report only.
 
 Who generates what (auth.PERMISSIONS): the monthly savings report is `export` (it carries money), the energy-only report `energy_report` (every member, a
-viewer included: it carries no money), the daily operations sheet `run_jobs`. Each listed row says whether its figures were `preliminary`.
+viewer included: it carries no money), the daily operations sheet `run_jobs`, the company roll-up and the pilot report `export`. Each listed row says
+whether its figures were `preliminary`. The company roll-up covers every site (no site_id; its row keeps an empty one). The pilot report carries the
+fee (its fee multiple), so a role without `see_fee` neither lists nor downloads it.
 """
 from __future__ import annotations
 
@@ -15,7 +17,10 @@ from .schemas import Refusal
 router = APIRouter()
 
 #: The permission that generates each kind of report; another kind is refused by reports.generate after `run_jobs`
-REPORT_PERMISSION = {"monthly_savings": "export", "energy_only": "energy_report", "daily_operations": "run_jobs"}
+REPORT_PERMISSION = {"monthly_savings": "export", "energy_only": "energy_report", "daily_operations": "run_jobs", "company_rollup": "export",
+                     "pilot": "export"}
+#: The kinds that carry the fee: read only by a role that sees it
+FEE_KINDS = ("pilot",)
 
 
 @router.get("/api/reports")
@@ -23,6 +28,8 @@ def listing(site_id: str | None = None):
     rows = reports.listing(site_id)
     if not auth.can("see_costs"):
         rows = [r for r in rows if r["kind"] == "energy_only"]
+    if not auth.can("see_fee"):
+        rows = [r for r in rows if r["kind"] not in FEE_KINDS]
     return rows
 
 
@@ -30,8 +37,10 @@ def listing(site_id: str | None = None):
 def generate(inp: dict = Body(...)):
     kind = str(inp.get("kind", "monthly_savings"))
     auth.need(REPORT_PERMISSION.get(kind, "run_jobs"), "Generating this report")
-    site_id = str(inp.get("site_id", ""))
-    site_or_404(site_id)
+    site_id = ""
+    if kind not in reports.COMPANY_KINDS:  # the company roll-up covers every site
+        site_id = str(inp.get("site_id", ""))
+        site_or_404(site_id)
     period = str(inp.get("period") or today().strftime("%Y-%m"))
     try:
         return reports.generate(kind, site_id, period, auth.actor())
@@ -48,6 +57,8 @@ def download(rid: str, which: str):
         raise Refusal(404, "No such report", "not_found")
     if r["kind"] != "energy_only" and not auth.can("see_costs"):
         raise Refusal(403, "This report carries money figures; your role sees the energy-only report", "role")
+    if r["kind"] in FEE_KINDS and not auth.can("see_fee"):
+        raise Refusal(403, "The pilot report carries the fee, which your role does not see", "role")
     p = reports.file_path(rid, which)
     if p is None:
         raise Refusal(404, "The report's file is missing; generate it again", "not_found")
