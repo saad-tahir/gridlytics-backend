@@ -432,3 +432,69 @@ def test_the_savings_and_product_rules_after_the_nightly_jobs(world, monkeypatch
         assert got["savings_withheld"]["category"] == "Savings" and "not metered" in got["savings_withheld"]["title"], got["savings_withheld"]
     # the viewer sees none of them; the analyst sees the Product one (the fee is theirs to read)
     assert not [a for a in world.c["viewer"].get("/api/alerts").json() if a["category"] in ("Savings", "Product")]
+
+
+# ------------------------------------------------------------------------------------------------ brief-vs-build-18
+
+def _at(y: int, m: int, d: int, hh: int = 12) -> int:
+    return int(datetime(y, m, d, hh, tzinfo=PKT).timestamp())
+
+
+def _tariff_alerts(sid: str) -> dict:
+    return {a["rule"]: a for a in alerts.listing("active", sid) if a["category"] == "Tariff"}
+
+
+def test_a_passed_awaiting_notification_date_and_an_old_fuel_price_raise_tariff_alerts(world):
+    sid = world.site
+    with world.use():
+        from gridlytics import tariffs
+        tariffs.ensure_shipped()
+        # 9 November 2026: the CY2027 placeholder is not due yet and the diesel price is three days old
+        alerts.tariff_staleness(sites.full(sid), _at(2026, 11, 9), alerts.site_rules(sid))
+        assert not {"tariff_awaiting", "fuel_price_old"} & set(_tariff_alerts(sid))
+        # 5 January 2027: NEPRA's CY2027 schedule was due on 1 January and is not in the library; the diesel price is two months old
+        alerts.tariff_staleness(sites.full(sid), _at(2027, 1, 5), alerts.site_rules(sid))
+        got = _tariff_alerts(sid)
+        assert got["tariff_awaiting"]["severity"] == "warning" and "1 January 2027" in got["tariff_awaiting"]["title"], got.get("tariff_awaiting")
+        assert "CY2027" in got["tariff_awaiting"]["title"] and "notification" in got["tariff_awaiting"]["title"]
+        assert "6 November 2026" in got["fuel_price_old"]["title"] and "diesel" in got["fuel_price_old"]["title"].lower(), got.get("fuel_price_old")
+        # an FCA and a QTA for the month's bills are looked for from the 15th
+        assert not any(r.startswith("adder_missing_") for r in got)
+        alerts.tariff_staleness(sites.full(sid), _at(2027, 1, 20), alerts.site_rules(sid))
+        got = _tariff_alerts(sid)
+        assert "January 2027" in got["adder_missing_fca"]["title"] and "adder_missing_qta" in got, got.keys()
+        # the notified schedule approved: the awaiting alert clears; a fresh fuel price clears the other
+        tariffs.add_fuel_price("hsd", "2027-01-19", 371.0, "test")
+        with store.connect() as con:
+            con.execute("UPDATE tariff_versions SET status = 'superseded' WHERE status = 'awaiting_notification'")
+        alerts.tariff_staleness(sites.full(sid), _at(2027, 1, 20), alerts.site_rules(sid))
+        assert not {"tariff_awaiting", "fuel_price_old"} & set(_tariff_alerts(sid))
+
+
+def test_a_version_in_force_that_ended_with_nothing_after_it_raises_a_tariff_alert(world):
+    sid = world.site
+    with world.use():
+        from gridlytics import tariffs
+        tariffs.ensure_shipped()
+        with store.connect() as con:
+            con.execute("UPDATE tariff_versions SET effective_to = '2026-12-31' WHERE kind = 'tou' AND key = 'xwdisco'")
+        alerts.tariff_staleness(sites.full(sid), _at(2026, 12, 20), alerts.site_rules(sid))
+        assert "tariff_lapsed" not in _tariff_alerts(sid)
+        alerts.tariff_staleness(sites.full(sid), _at(2027, 1, 5), alerts.site_rules(sid))
+        lapsed = _tariff_alerts(sid)["tariff_lapsed"]
+        assert "31 December 2026" in lapsed["title"] and "time-of-use" in lapsed["title"], lapsed["title"]
+        # the evaluator runs the check each tick, and a viewer does not receive Tariff alerts
+        alerts.evaluate(sid, _at(2027, 1, 5))
+        assert "tariff_lapsed" in _tariff_alerts(sid)
+    assert not [a for a in world.c["viewer"].get("/api/alerts").json() if a["category"] == "Tariff"]
+
+
+def test_a_captive_gas_price_is_old_after_half_a_year_not_a_fortnight(world):
+    sid = world.site
+    with world.use():
+        g = sites.full(sid)["assets"]["genset"]
+        sites.put_asset(sid, "genset", {"rated_kw": g["rated_kw"], "fuel_kind": "gas_captive"}, "test")
+        alerts.tariff_staleness(sites.full(sid), _at(2026, 11, 9), alerts.site_rules(sid))     # the shipped price is of 1 July 2026
+        assert "fuel_price_old" not in _tariff_alerts(sid)
+        alerts.tariff_staleness(sites.full(sid), _at(2027, 1, 20), alerts.site_rules(sid))
+        assert "captive gas" in _tariff_alerts(sid)["fuel_price_old"]["title"]

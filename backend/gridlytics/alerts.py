@@ -17,7 +17,7 @@ from pydantic import Field, ValidationError
 
 from . import auth
 from . import battery as battery_service
-from . import plans, sites, store, telemetry
+from . import plans, sites, store, tariffs, telemetry
 from .schemas import Strict, message
 
 PKT = timezone(timedelta(hours=5))
@@ -259,6 +259,96 @@ def _forecast_stages(site_id: str, now: int) -> None:
              {"from_stage": before["stage"], "to_stage": cur["stage"]} if changed else {})
 
 
+#: The tariff library's kinds in words, for the staleness rule's titles
+KIND_WORDS = {"schedule": "tariff schedule", "tou": "time-of-use calendar", "tax": "tax rules", "prosumer": "net billing or net metering rules",
+              "icp": "incremental consumption package", "adder": "adjustment"}
+FUEL_WORDS = {"hsd": "diesel (HSD)", "gas_captive": "captive gas", "lng_captive": "captive LNG"}
+#: From this day of the month an FCA or QTA for the month's bills is looked for: NEPRA notifies them during the month they are billed in
+ADDER_FROM_DAY = 15
+
+
+def _long(d: date) -> str:
+    return f"{d.day} {d:%B %Y}"
+
+
+def tariff_staleness(site: dict, now: int, rules_: dict) -> None:
+    """Tariff (brief-vs-build-18): the stored tariff library has gone stale, read from its versions and fuel prices (nothing is fetched from
+    NEPRA, OGRA or a DISCO: a new notification is still drafted and approved by a person, plan Part 6.2):
+    - a placeholder awaiting NEPRA's notification whose date has passed (the CY2027 schedule from 1 January 2027): bills and plans still use the
+      rates before it (tariff_awaiting);
+    - a version in force that ended with no version after it, for the kinds the site's connection resolves (tariff_lapsed);
+    - from the 15th of a month, no FCA or QTA approved for that month's bills, unless one is drafted and waiting for approval, which the counts'
+      `tariff_pending` already says (adder_missing_fca, adder_missing_qta);
+    - at a genset site, the latest price of its fuel older than the rules' days: diesel's (OGRA notifies it at least every fortnight) or captive
+      gas and LNG's (revised about twice a year) (fuel_price_old)."""
+    sid = site["id"]
+    today = datetime.fromtimestamp(now, PKT).date()
+    day = today.isoformat()
+    tariffs.ensure_shipped()
+    grid = [c for c in site.get("connections") or [] if (c.get("data") or {}).get("regime") != "off_grid"]
+    with store.connect() as con:
+        vers = [dict(r) for r in con.execute("SELECT kind, key, effective_from, effective_to, status, body FROM tariff_versions")]
+        fuel = {r["kind"]: r["valid_from"] for r in con.execute("SELECT kind, MAX(valid_from) AS valid_from FROM fuel_prices GROUP BY kind")}
+    for v in vers:
+        try:
+            v["body"] = json.loads(v["body"] or "{}")
+        except ValueError:
+            v["body"] = {}
+    # a notification that was due
+    due = sorted((v for v in vers if v["status"] == "awaiting_notification" and v["effective_from"] <= day), key=lambda v: v["effective_from"])
+    on = bool(grid and due)
+    title = ""
+    if on:
+        first = due[0]
+        name = str(first["body"].get("name") or KIND_WORDS.get(first["kind"], first["kind"])).split(":")[0]
+        name = name[:1].lower() + name[1:]
+        title = (f"NEPRA's notification for the {name} was due on {_long(date.fromisoformat(first['effective_from']))} and is not in the library: "
+                 "bills and plans still use the rates before it" + (f" ({len(due) - 1} more waiting)" if len(due) > 1 else ""))
+    _set(on, sid, "tariff_awaiting", "Tariff", "warning", title, {"due": [(v["kind"], v["key"], v["effective_from"]) for v in due]} if on else {})
+    # a version in force that ended with nothing after it
+    keys = set()
+    for c in grid:
+        d = c.get("data") or {}
+        keys |= {("schedule", "national"), ("tax", "national"), ("tou", "ke" if d.get("disco_group") == "ke" else "xwdisco")}
+        if d.get("regime") in ("net_billing", "net_metering_legacy"):
+            keys.add(("prosumer", d["regime"]))
+    lapsed = []
+    for kind, key in sorted(keys):
+        started = [v for v in vers if v["kind"] == kind and v["key"] == key and v["status"] == "active" and v["effective_from"] <= day]
+        latest = max(started, key=lambda v: v["effective_from"], default=None)
+        if latest and latest["effective_to"] and latest["effective_to"] < day:
+            lapsed.append((kind, key, latest["effective_to"]))
+    title = ""
+    if lapsed:
+        kind, _key, end = lapsed[0]
+        title = (f"The {KIND_WORDS.get(kind, kind)} in force ended on {_long(date.fromisoformat(end[:10]))} and no version follows it"
+                 + (f" ({len(lapsed) - 1} more)" if len(lapsed) > 1 else ""))
+    _set(bool(lapsed), sid, "tariff_lapsed", "Tariff", "warning", title, {"lapsed": lapsed} if lapsed else {})
+    # the month's FCA and QTA
+    month = tariffs.billing_month_for(grid[0], today) if grid else None
+    for key, words in (("fca", "FCA"), ("qta", "QTA")):
+        missing = False
+        if month and today.day >= ADDER_FROM_DAY:
+            def covers(v):
+                bm = v["body"].get("billing_months")
+                return bm == "all" or (isinstance(bm, list) and month in bm)
+            held = [v for v in vers if v["kind"] == "adder" and v["key"] == key and covers(v)]
+            missing = not any(v["status"] in ("active", "pending") for v in held)
+        when = f"{date.fromisoformat(month + '-01'):%B %Y}" if month else ""
+        _set(missing, sid, f"adder_missing_{key}", "Tariff", "info",
+             f"No {words} is in the library for the bills of {when}: they are rebuilt and planned without it" if missing else "",
+             {"billing_month": month} if missing else {})
+    # the fuel price
+    g = (site.get("assets") or {}).get("genset")
+    kind = (g or {}).get("fuel_kind", "hsd")
+    last = fuel.get(kind) if g else None
+    age = (today - date.fromisoformat(last[:10])).days if last else None
+    old = age is not None and age > _th(rules_, "Tariff", "diesel_price_days" if kind == "hsd" else "gas_price_days")
+    _set(old, sid, "fuel_price_old", "Tariff", "info",
+         f"The latest {FUEL_WORDS.get(kind, kind)} price in the library is from {_long(date.fromisoformat(last[:10]))}, {age} days ago" if old else "",
+         {"fuel": kind, "valid_from": last, "days": age} if old else {})
+
+
 GENSET_RULES = ("genset_unrequested", "genset_low_load", "genset_request_missed")
 
 
@@ -375,6 +465,7 @@ def evaluate(site_id: str, now: int | None = None) -> None:
         _set(soon, site_id, f"regime_expiring_{c['id']}", "Tariff", "warning", f"The {c['data']['regime'].replace('_', ' ')} agreement ends on {end}",
              {"connection": c["id"]})
     _bill_residual(site_id, float(_th(rules_, "Tariff", "bill_difference_pct")))
+    tariff_staleness(site, now, rules_)
     _forecast_stages(site_id, now)
     _genset_condition(site, now, rules_)
     genset_requests(site, plan, now)
@@ -578,7 +669,8 @@ THRESHOLDS: dict[str, dict[str, tuple]] = {
     "Control": {"edge_offline_minutes": (15, 5, 1440)},
     "Reserve": {"reserve_margin_pct": (2.0, 0, 20), "unserved_kwh": (0.5, 0, 10000)},
     "Genset": {"unrequested_minutes": (10, 1, 120), "low_load_minutes": (15, 5, 240), "request_window_minutes": (30, 5, 240)},
-    "Tariff": {"agreement_days": (60, 1, 365), "bill_difference_pct": (2.0, 0.5, 50)},
+    "Tariff": {"agreement_days": (60, 1, 365), "bill_difference_pct": (2.0, 0.5, 50), "diesel_price_days": (14, 1, 365),
+               "gas_price_days": (183, 1, 730)},
     "Forecast": {"bust_pct": (30, 5, 100), "bust_hours": (2.0, 0.5, 12)},
 }
 _QUIET = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
