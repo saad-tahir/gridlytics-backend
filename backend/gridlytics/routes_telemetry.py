@@ -292,8 +292,26 @@ def battery_page(site_id: str):
 
 # ------------------------------------------------------------------------------------------------ genset (UI-11)
 
-#: the genset page's period: the last `days` days (1 to GENSET_MAX_DAYS, 14 by default)
+#: the genset page's periods: the last `days` days (1 to GENSET_MAX_DAYS, 14 by default), or a calendar month in Karachi time (`month` YYYY-MM; the current
+#: month runs to now), which also answers the month before it (R8 2.11: run hours and starts this month against last)
 GENSET_MAX_DAYS = 60
+
+
+def _month_window(month: str, now: int) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d{4})-(\d{2})", (month or "").strip())
+    if not m or not 1 <= int(m.group(2)) <= 12:
+        raise bad(ValueError("The month must be written as year and month, for example 2026-11."))
+    y, mo = int(m.group(1)), int(m.group(2))
+    t0 = int(datetime(y, mo, 1, tzinfo=PKT).timestamp())
+    t1 = int(datetime(y + mo // 12, mo % 12 + 1, 1, tzinfo=PKT).timestamp())
+    if t0 >= now:
+        raise bad(ValueError("That month has not started yet."))
+    return t0, min(t1, now)
+
+
+def _previous_month(month: str) -> str:
+    y, mo = int(month[:4]), int(month[5:7])
+    return f"{y - 1}-12" if mo == 1 else f"{y}-{mo - 1:02d}"
 
 
 def _run_kpis(res: dict) -> dict:
@@ -301,19 +319,20 @@ def _run_kpis(res: dict) -> dict:
     runs = res["runs"]
     if not res["signal"]["present"]:
         return {"hours": None, "starts": None, "kwh": None, "litres": None, "litres_metered": None, "litres_curve": None, "litres_source": None,
-                "estimated": False, "avg_load_ratio": None}
+                "estimated": False, "avg_load_ratio": None, "hours_below_min": None}
     hours = sum(r["hours"] for r in runs)
     curve = sum(r["litres_curve"] for r in runs)
     source = "curve" if curve > 0 else "meter" if (runs or res["fuel_read"]) else None
     ratios = [(r["load_ratio"], r["hours"]) for r in runs if r["load_ratio"] is not None]
     return {"hours": round(hours, 1), "starts": len(runs), "kwh": round(sum(r["kwh"] for r in runs), 1), "litres": round(sum(r["litres"] for r in runs), 1),
             "litres_metered": round(sum(r["litres_metered"] for r in runs), 1), "litres_curve": round(curve, 1), "litres_source": source,
-            "estimated": source == "curve", "avg_load_ratio": round(sum(lr * h for lr, h in ratios) / hours, 2) if hours and ratios else None}
+            "estimated": source == "curve", "avg_load_ratio": round(sum(lr * h for lr, h in ratios) / hours, 2) if hours and ratios else None,
+            "hours_below_min": round(sum(r["hours_below_min"] for r in runs), 1)}
 
 
 @router.get("/api/sites/{site_id}/genset")
-def genset_page(site_id: str, days: int = 14):
-    """UI-11: the period's KPIs, runs, the fuel curve, the price, the plan's requests and steps, the
+def genset_page(site_id: str, days: int = 14, month: str | None = None):
+    """UI-11: the period's KPIs, runs, daily hours and litres, the fuel curve, the price, the plan's requests and steps, the
     policy. Litres are metered where a fuel meter reads and from the fuel curve where not (`litres_source` as on the Savings page); each run's fuel is
     priced at the fuel price of its own Karachi day (`price_per_l`, `fuel_cost_rs`); without a genset reading in the period (`signal.present` false) the
     hours, starts and litres are unknown (null), not zero."""
@@ -322,8 +341,14 @@ def genset_page(site_id: str, days: int = 14):
     if not g:
         return {"genset": None}
     now = now_ts()
-    days = max(1, min(int(days), GENSET_MAX_DAYS))
-    res = telemetry.genset_runs(site_id, now - days * 86400, now, g)
+    if month is not None:
+        t0, t1 = _month_window(month, now)
+        period = {"kind": "month", "month": month.strip(), "start": t0, "end": t1, "days": None}
+    else:
+        days = max(1, min(int(days), GENSET_MAX_DAYS))
+        t0, t1 = now - days * 86400, now
+        period = {"kind": "days", "month": None, "start": t0, "end": t1, "days": days}
+    res = telemetry.genset_runs(site_id, t0, t1, g)
     runs = res["runs"]
     from . import tariffs
     kind = g.get("fuel_kind", "hsd")
@@ -344,17 +369,23 @@ def genset_page(site_id: str, days: int = 14):
     kpis = _run_kpis(res)
     known = kpis["litres"] is not None
     kpis["fuel_cost_rs"] = round(sum(r["fuel_cost_rs"] for r in runs), 0) if known else None
+    kpis["fuel_rs_per_kwh"] = round(kpis["fuel_cost_rs"] / kpis["kwh"], 2) if known and kpis["kwh"] else None
     price, src = tariffs.fuel_price(kind, today())
     used = [r["price_per_l"] for r in runs]
-    answer = {"genset": g, "control": s["data"].get("genset_start_control"), "signal": res["signal"], "kpis": kpis,
+    answer = {"genset": g, "control": s["data"].get("genset_start_control"), "period": period, "signal": res["signal"], "kpis": kpis,
               "fuel_price": {"price_per_l": price, "source": src, "kind": kind, "range_per_l": [min(used), max(used)] if used else None},
-              "runs": list(reversed(runs)),
+              "runs": list(reversed(runs)), "daily": res["daily"],
               "curve": {"a": g["a"], "b": g["b"], "rated_kw": g["rated_kw"],
                         "points": [{"load_ratio": lr, "litres_per_hour": round(g["a"] * lr * g["rated_kw"] + g["b"] * g["rated_kw"], 2)}
                                    for lr in (0.25, 0.5, 0.75, 1.0)]},
               "requests": alerts.requests_for(site_id), "plan": [{"t": x["t"], "genset_kw": x["genset_kw"], "reason": x["reason"]}
                                                                   for x in (plans.current(site_id) or {}).get("steps", []) if x["genset_on"]][:96],
               "policy": "Gridlytics never starts or stops the genset itself: it asks, with a reason, and records whether the advice was followed."}
+    if period["kind"] == "month":
+        pm = _previous_month(period["month"])
+        p0, p1 = _month_window(pm, now)
+        prev = _run_kpis(telemetry.genset_runs(site_id, p0, p1, g))
+        answer["previous"] = {"month": pm, **{k: prev[k] for k in ("hours", "starts", "litres", "kwh")}}
     return out(answer)
 
 

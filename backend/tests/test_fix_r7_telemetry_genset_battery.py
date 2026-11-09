@@ -457,11 +457,11 @@ def test_the_genset_page_names_its_litres_and_prices_each_run_at_its_own_day_s_p
     runs = sorted(page["runs"], key=lambda r: r["start"])
     assert [(r["litres"], r["litres_source"], r["price_per_l"], r["fuel_cost_rs"]) for r in runs] == [(30.0, "meter", 300.0, 9000.0),
                                                                                                        (31.0, "curve", 400.0, 12400.0)]
-    assert k["fuel_cost_rs"] == 21400.0 and k["kwh"] == pytest.approx(200.0)
+    assert k["fuel_cost_rs"] == 21400.0 and k["kwh"] == pytest.approx(200.0) and k["fuel_rs_per_kwh"] == pytest.approx(107.0)
     assert page["fuel_price"]["range_per_l"] == [300.0, 400.0]
     v = world.role("viewer").get(f"/api/sites/{sid}/genset").json()
     assert v["kpis"]["litres"] == 61.0 and v["kpis"]["litres_source"] == "curve"
-    assert "fuel_cost_rs" not in v["kpis"] and "fuel_price" not in v
+    assert not {"fuel_cost_rs", "fuel_rs_per_kwh"} & set(v["kpis"]) and "fuel_price" not in v
     assert all(not {"price_per_l", "fuel_cost_rs"} & set(r) for r in v["runs"])
 
 
@@ -477,13 +477,40 @@ def test_no_run_signal_is_unknown_and_a_live_signal_with_no_runs_is_zero(world):
     assert page["signal"] == {"present": False, "last_seen": None, "running": None}
     k = page["kpis"]
     assert (k["hours"], k["starts"], k["litres"], k["kwh"], k["litres_source"], k["estimated"]) == (None, None, None, None, None, False)
-    assert k["fuel_cost_rs"] is None and page["runs"] == []
+    assert k["fuel_cost_rs"] is None and page["runs"] == [] and all(d["hours"] is None and d["litres"] is None for d in page["daily"])
     with world.use():
         _write(sid, t + 3600, 60, grid_present=1, genset_running=0)
     page = c.get(f"/api/sites/{sid}/genset").json()
     assert page["signal"] == {"present": True, "last_seen": t + 3600 + 59 * 60, "running": False}
     k = page["kpis"]
     assert (k["hours"], k["starts"], k["litres"], k["estimated"]) == (0.0, 0, 0.0, False)
+    assert next(d for d in page["daily"] if d["day"] == _pk_day(1).isoformat())["hours"] == 0.0
+
+
+def test_the_month_view_compares_with_the_month_before_and_counts_hours_below_the_minimum_load(world):
+    """pages-C-15: GET /genset?month=YYYY-MM answers that month (to now) with the previous month's hours, starts and litres, a row per day, and the hours
+    below the minimum load; a month that is not one, or has not started, is refused in one sentence."""
+    c = world.owner
+    sid = _route_site(c, "Monthly")
+    d = _pk_day(1)
+    before = (d.replace(day=1) - timedelta(days=1)).replace(day=15)
+    with world.use():
+        _one_run(sid, _pk_ts(d, 10), fuel=0.5)
+        _one_run(sid, _pk_ts(before, 10), minutes=120, power=50000.0, fuel=0.2)  # a quarter of the rating: under f_min 0.3 for 2 hours
+    m, pm = d.strftime("%Y-%m"), before.strftime("%Y-%m")
+    page = c.get(f"/api/sites/{sid}/genset", params={"month": m}).json()
+    assert page["period"]["kind"] == "month" and page["period"]["month"] == m
+    assert (page["kpis"]["hours"], page["kpis"]["starts"], page["kpis"]["litres"]) == (1.0, 1, 30.0)
+    assert page["previous"] == {"month": pm, "hours": 2.0, "starts": 1, "litres": 24.0, "kwh": 100.0}
+    assert page["daily"][0]["day"] == d.replace(day=1).isoformat() and page["daily"][-1]["day"] == datetime.now(PKT).date().isoformat()
+    assert next(x for x in page["daily"] if x["day"] == d.isoformat()) == {"day": d.isoformat(), "hours": 1.0, "litres": 30.0}
+    last = c.get(f"/api/sites/{sid}/genset", params={"month": pm}).json()
+    assert last["kpis"]["hours_below_min"] == 2.0 and last["runs"][0]["hours_below_min"] == 2.0
+    days14 = c.get(f"/api/sites/{sid}/genset").json()
+    assert days14["period"]["kind"] == "days" and days14["period"]["days"] == 14 and "previous" not in days14 and len(days14["daily"]) == 15
+    for bad_month in ("2026-13", "November", (date.today() + timedelta(days=40)).strftime("%Y-%m")):
+        r = c.get(f"/api/sites/{sid}/genset", params={"month": bad_month})
+        assert r.status_code == 422 and r.json()["detail"].endswith("."), (bad_month, r.text)
 
 
 # ------------------------------------------------------------------------------------------------ pages-A-06 (a duplicate of pages-C-03): the Overview
