@@ -149,7 +149,9 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     if tier == "advisory_writes" and plan and not site.get("demo_link"):
         unconfirmed = _peak_unconfirmed(site, now, today)
     if site.get("demo_link") and site["data"].get("twin", {}).get("unconfirmed_alert"):
-        unconfirmed = True
+        # the demo mill's story (plan Part 9.6): its installer marks a day's table the next morning, so it stays raised until today's is marked
+        with store.connect() as con:
+            unconfirmed = con.execute("SELECT 1 FROM applied WHERE site_id = ? AND day_local = ?", (site_id, today)).fetchone() is None
     _set(ready and unconfirmed, site_id, "apply_unconfirmed", "Control", "warning",
          "Today's slot table is not marked as applied: tier 2 has no read-back, so the saving is not claimed until it is")
     # tariff: a regime ending within 60 days

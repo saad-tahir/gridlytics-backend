@@ -117,6 +117,123 @@ def test_the_closed_loop_demo_sites_edge_is_the_twin_and_reports_as_it_runs(worl
     assert world.c["operator"].get(f"/api/sites/{farm}/edge").json()["last_seen"] is None
 
 
+# ------------------------------------------------------------------------------------------------ one keyed table a day (engine-delivery-18)
+
+def test_an_advisory_demo_site_runs_the_table_keyed_for_the_day_not_every_new_plan(company):
+    farm = _demo("farm")
+    day = datetime.now(PKT).date()
+    d0 = twin.day_start_utc(day)
+    nightly = _plan(farm, d0 - 900, "discharge", status="superseded")      # made at 23:45 the night before: the table in force at the day's start
+    later = _plan(farm, d0 + 3 * 3600, "charge_grid")                     # a re-plan at 03:00, the current plan
+    site = sites.full(farm)
+    ts = np.arange(d0 + 4 * 3600, d0 + 5 * 3600, 60, dtype=np.int64)
+    _, modes = demo._policy_for(site, day, ts, plans.get(farm, later))
+    assert (modes == twin.MODE_CODE["discharge"]).all()                    # before: the 03:00 plan's grid charge, as if keyed in at once
+    # a person marks another table applied for the day: the inverter runs that one
+    plans.mark_applied(farm, later, day.isoformat(), "t", "installer_keyed")
+    _, modes = demo._policy_for(site, day, ts, plans.get(farm, later))
+    assert (modes == twin.MODE_CODE["charge_grid"]).all()
+    assert nightly != later
+    # an advisory demo site whose installer keys no table (not one of the demo's own) runs its native settings, whatever plan is current
+    other = make_site(name="Demo advisory r7", tier="advisory_writes", demo_link=demo.DEMO_LINK)
+    _plan(other, d0 - 900, "discharge")
+    native = twin.native_policy(sites.full(other), ts)["mode"]
+    _, modes = demo._policy_for(sites.full(other), day, ts, plans.current(other))
+    assert (modes == native).all()
+
+
+def test_the_demo_installer_marks_one_table_a_day_and_the_mill_marks_it_the_next_morning(company):
+    farm, mill = _demo("farm"), _demo("textile")
+    today = datetime.now(PKT).date()
+    d0 = twin.day_start_utc(today)
+    ids = {}
+    for sid in (farm, mill):
+        ids[sid] = (_plan(sid, d0 - 86400 - 900, "self_use", status="superseded"), _plan(sid, d0 - 900, "discharge", status="superseded"))
+        _plan(sid, d0 + 900, "charge_grid")                                  # today's later plans are not keyed in
+        demo.advance(sid)
+        demo.advance(sid)                                                    # a second run marks nothing twice
+    yesterday = (today - timedelta(days=1)).isoformat()
+    # the farm's installer keys the nightly table and marks it the same day: one table a day, within the write budget
+    assert _marks(farm) == [(today.isoformat(), ids[farm][1], demo.INSTALLER, "vendor_app")]
+    # the Faisalabad mill's marks come the next morning: yesterday's is in, today's is not yet (its alert says so)
+    assert _marks(mill) == [(yesterday, ids[mill][0], demo.INSTALLER, "vendor_app")]
+    written = telemetry.raw(mill, d0, d0 + 86400, ("inverter_mode_active",))["inverter_mode_active"]
+    assert len(written) and set(written) == {"discharge"}                  # the table keyed for today, before anyone marks it
+
+
+def test_the_demo_history_keys_the_nightly_table_once_a_day_and_runs_it(company, monkeypatch):
+    """build_history with the solver replaced by plans written straight to the table: each 00:00 plan discharges all day, every later re-plan
+    charges from the grid. Before: the twin ran every 3-hourly plan at once and no day carried a mark."""
+    from gridlytics import alerts as alerts_mod, forecast
+
+    made = []
+
+    def tick(sid, at=None, steps=192, **k):
+        at = int(at if at is not None else time.time()) // 900 * 900
+        midnight = at == twin.day_start_utc(datetime.fromtimestamp(at, PKT).date())
+        pid = _plan(sid, at, "discharge" if midnight else "charge_grid")
+        made.append((at, pid))
+        return {"plan_id": pid, "status": "active"}
+
+    monkeypatch.setattr(plans, "tick", tick)
+    monkeypatch.setattr(verify, "compute_day", lambda *a, **k: None)
+    monkeypatch.setattr(forecast, "score_day", lambda *a, **k: None)
+    monkeypatch.setattr(alerts_mod, "evaluate", lambda *a, **k: None)
+    farm, mill = _demo("farm"), _demo("textile")
+    days = demo.OBSERVE_DAYS + 2
+    today = datetime.now(PKT).date()
+    plan_days = [today - timedelta(days=k) for k in (2, 1)]
+    for sid in (farm, mill):
+        made.clear()
+        demo.build_history(sid, days)
+        nightly = {datetime.fromtimestamp(at, PKT).date(): pid for at, pid in made if at == twin.day_start_utc(datetime.fromtimestamp(at, PKT).date())}
+        marked = [d for d, *_ in _marks(sid)]
+        if sid == farm:
+            assert marked == [d.isoformat() for d in plan_days + [today]]
+        else:
+            assert marked == [d.isoformat() for d in plan_days]              # today's mark comes tomorrow morning
+        assert all(pid == nightly[date.fromisoformat(d)] and by == demo.INSTALLER for d, pid, by, _ in _marks(sid))
+        for d in plan_days:                                                  # 05:00 to 06:00, after the 03:00 re-plan: still the nightly table
+            t = twin.day_start_utc(d) + 5 * 3600
+            modes = telemetry.raw(sid, t, t + 3600, ("inverter_mode_active",))["inverter_mode_active"]
+            assert set(modes) == {"discharge"}, (sid, d, set(modes))
+        first = twin.day_start_utc(today - timedelta(days=days))             # the observation days run the native settings, unmarked
+        assert set(telemetry.raw(sid, first, first + 3600, ("inverter_mode_active",))["inverter_mode_active"]) == {"self_use"}
+
+
+def test_an_advisory_demo_day_is_confirmed_only_from_its_mark_and_telemetry(company):
+    prev, day = WEEKDAY - timedelta(days=1), WEEKDAY
+    sid = make_site(name="Demo advisory day", tier="advisory_writes", demo_link=demo.DEMO_LINK,
+                    native={"source": "entered", "work_mode": "backup", "backup_soc_pct": 90})
+    _, sp, _ = twin_day(sid, prev, 0.9, seed=1)
+    twin_day(sid, day, float(sp["soc"][-1]), seed=2)
+    r = verify.compute_day(sid, day, with_bound=False)["native"]
+    assert r["fidelity"] == "not_applied" and r["claimed_rs"] == 0.0        # before: 'confirmed' at any demo site, with no table marked
+    # the table marked and followed: confirmed from telemetry, as at any advisory site
+    slots = _slots_plan(day)
+    site = sites.full(sid)
+    tr = twin.truth(site, day)
+    followed = twin.simulate(tr, twin.slots_policy(slots, tr["ts"]), twin.plant_of(site), float(sp["soc"][-1]))
+    _mark(sid, _insert_plan(sid, day, slots, followed), day)
+    telemetry.delete_site(sid)
+    twin_day(sid, prev, 0.9, seed=1)
+    twin_day(sid, day, float(sp["soc"][-1]), seed=2, policy=lambda s, ts: twin.slots_policy(slots, ts))
+    r = verify.compute_day(sid, day, with_bound=False)["native"]
+    assert r["fidelity"] == "confirmed" and r["claimed_rs"] == r["saving_rs"]
+
+
+def test_the_mills_unconfirmed_apply_alert_clears_once_todays_table_is_marked(company):
+    mill = _demo("textile")
+    now = int(time.time())
+    telemetry.write_rows([(mill, now // 60 * 60 - 8 * 86400, "twin", 1.0, 1000.0)], ("site_id", "ts", "source_id", "grid_present", "load_power_w"))
+    pid = _plan(mill, now // 900 * 900 - 900, "discharge")
+    alerts.evaluate(mill, now)
+    assert [a["rule"] for a in alerts.listing("open", mill) if a["rule"] == "apply_unconfirmed"] == ["apply_unconfirmed"]
+    plans.mark_applied(mill, pid, datetime.now(PKT).date().isoformat(), "t", "installer_keyed")
+    alerts.evaluate(mill, now)
+    assert not [a for a in alerts.listing("open", mill) if a["rule"] == "apply_unconfirmed"]  # before: raised for the demo mill whatever was marked
+
+
 # ------------------------------------------------------------------------------------------------ outages run past midnight (role-operator-29)
 
 def test_an_outage_running_at_midnight_goes_on_into_the_next_day(company):

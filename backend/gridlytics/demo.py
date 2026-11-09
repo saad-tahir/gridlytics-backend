@@ -1,8 +1,9 @@
 """Demo mode is the twin (plan Part 9.6 and 7.4): four twin sites a Pakistani energy manager would recognise, with generated history run through
 the real forecasters, the real optimiser and the real savings engine, kept live by the scheduler so no page is empty on day one.
 
-The history runs the inverter's native settings for the first three days (the observation days before the first plan), then follows each day's plan
-compiled to the brand's slot table, except on the native blocks of the switchback calendar.
+The history runs the inverter's native settings for the first three days (the observation days before the first plan), then the plans compiled to
+the brand's slot table, except on the native blocks of the switchback calendar: at the closed-loop site each new plan (its edge, which is the twin,
+runs it), at an advisory site the one table a day its installer keys in (the nightly one) and marks applied.
 """
 from __future__ import annotations
 
@@ -36,6 +37,10 @@ SOURCE_TIER = {"oem_cloud": "advisory_writes", "csv": "advisory_writes"}
 #: How long the closed-loop demo site's edge counts as online after its last report: the edge is the twin, which reports when the 15-minute schedule
 #: runs it (scheduler.tick_company: advance), where a real edge's heartbeat comes every minute
 EDGE_FRESH_S = 20 * 60
+#: Who keys an advisory demo site's daily table into the vendor app and marks it applied (the applied log's `by`). A spec's `marks` says when the
+#: mark comes: 'same_day' (the farm), or 'next_day' (the Faisalabad mill, whose 'apply not confirmed' alert is the plan's story: its own day's
+#: table is never marked yet)
+INSTALLER = "Demo installer"
 
 
 def _clock_minute() -> int:
@@ -61,7 +66,7 @@ DEMO_SITES = [
                 "battery": {"nameplate_kwh": 215, "p_ch_kw": 100, "p_dis_kw": 100},
                 "genset": {"rated_kw": 200, "f_min": 0.3, "fuel_kind": "hsd", "min_up_h": 1.0, "tank_l": 1500}},
      "tier": "advisory_writes", "native": {"source": "photo", "work_mode": "self_use", "backup_soc_pct": 20},
-     "schedule": [["14:00", "16:00", "weekdays"]], "switchback": True},
+     "schedule": [["14:00", "16:00", "weekdays"]], "switchback": True, "marks": "next_day"},
     {"key": "mall",
      "site": {"name": "Lahore mall (demo)", "city": "Lahore", "address": "Gulberg III", "lat": 31.51, "lon": 74.35, "disco": "LESCO", "site_type": "retail",
               "outage_unit": {"kind": "feeder", "code": "113307", "name": "Gulberg Commercial"}, "genset_start_control": "auto_on_grid_loss",
@@ -99,7 +104,7 @@ DEMO_SITES = [
      "assets": {"pv": {"kwp_dc": 80, "kw_ac": 70}, "inverter": {"brand": "voltronic", "model": "Axpert MKS x6", "kw_ac": 66},
                 "battery": {"nameplate_kwh": 120, "p_ch_kw": 40, "p_dis_kw": 40, "soc_min": 0.15},
                 "genset": {"rated_kw": 48, "f_min": 0.3, "fuel_kind": "hsd", "min_up_h": 1.0, "tank_l": 400}},
-     "tier": "advisory_writes", "native": {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 25}, "schedule": []},
+     "tier": "advisory_writes", "native": {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 25}, "schedule": [], "marks": "same_day"},
 ]
 
 _lock = threading.Lock()
@@ -191,16 +196,68 @@ def _merge_policy(plan_pol: dict, native_pol: dict, native_minutes: np.ndarray) 
     return out
 
 
+def _spec(site: dict) -> dict:
+    """The DEMO_SITES entry a demo site was made from (by its name), or {} for any other site."""
+    return next((s for s in DEMO_SITES if s["site"]["name"] == site.get("name")), {})
+
+
+def _keyed_plan(site: dict, day: date) -> dict | None:
+    """The table an advisory (tier 2) demo site's inverter runs on a day (plan Part 7.6: a person keys a daily table in through the vendor app, a few
+    writes a day at most; audit engine-delivery-18: the twin ran every 3-hourly, and live every 15-minute, plan the moment it was made, and each such
+    day counted as confirmed). The table marked applied for the day (the latest mark: a person's own wins); else, where the demo's installer keys
+    tables (the spec's `marks`), the plan in force at the day's start, the nightly table, keyed before its mark comes; else none: the inverter runs
+    its native settings."""
+    with store.connect() as con:
+        r = con.execute("SELECT plan_id FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1",
+                        (site["id"], day.isoformat())).fetchone()
+    if r is not None:
+        return plans.get(site["id"], r["plan_id"])
+    return plans.active_at(site["id"], twin.day_start_utc(day)) if _spec(site).get("marks") else None
+
+
+def _mark_tables(site: dict, t_from: int, t_to: int) -> None:
+    """The demo installer's 'Mark as applied' for the days the span from t_from to t_to reaches (plan Part 9.6's applied records): at an advisory demo
+    site whose installer keys tables, each day's keyed table (the nightly one), one mark a day at most, within every brand's write budget; the farm's
+    on its own day, the Faisalabad mill's on the next (so the mill's own day is never marked yet, as its alert says). A day with no plan in force at
+    its start (an observation day), whose plan has no table for it, or on a native block of the switchback calendar gets no mark. The mark is dated
+    when it was due (the day's start, or the next day's), or the span's start if that is later."""
+    late = {"same_day": 0, "next_day": 1}.get(_spec(site).get("marks"))
+    if late is None or site.get("tier") != "advisory_writes":
+        return
+    sid = site["id"]
+    first, last = datetime.fromtimestamp(int(t_from), PKT).date(), datetime.fromtimestamp(int(t_to), PKT).date()
+    for k in range((last - first).days + 1):
+        day = first + timedelta(days=k - late)
+        due = twin.day_start_utc(day + timedelta(days=late))
+        with store.connect() as con:
+            if due > int(t_to) or con.execute("SELECT 1 FROM applied WHERE site_id = ? AND day_local = ? LIMIT 1", (sid, day.isoformat())).fetchone():
+                continue
+        if verify.arm_on(sid, day) == "native":
+            continue
+        plan = plans.active_at(sid, twin.day_start_utc(day))
+        if plan is None or day.isoformat() not in {d.get("date") for d in (plan.get("slots") or {}).get("days") or []}:
+            continue
+        row = plans.mark_applied(sid, plan["id"], day.isoformat(), INSTALLER, "vendor_app")
+        with store.connect() as con:
+            con.execute("UPDATE applied SET created = ? WHERE id = ?", (_iso(min(max(due, int(t_from)), int(t_to))), row["id"]))
+
+
 def _policy_for(site: dict, day: date, ts: np.ndarray, plan: dict | None) -> tuple[dict, np.ndarray]:
+    """The per-minute policy a demo site's inverter runs on `day`, and its modes. Its native settings at a monitor site (a recommendation changes
+    nothing on site), on a native block of the switchback calendar, and on minutes a pause or a release covers; else the slots of the table in force:
+    at an advisory site the table keyed in for the day (_keyed_plan), run as compiled, its genset flags included, which is what the table's
+    confirmation replays (verify.confirm_applied); else the plan the caller holds, a manual genset following its runs step by step."""
     arm = verify.arm_on(site["id"], day)
-    if plan is None or arm == "native" or site.get("tier") == "monitor":  # monitor recommends; the inverter keeps its own settings
+    keyed = site.get("tier") == "advisory_writes"
+    table = _keyed_plan(site, day) if keyed and arm != "native" else plan
+    if table is None or arm == "native" or site.get("tier") == "monitor":  # monitor recommends; the inverter keeps its own settings
         pol = twin.native_policy(site, ts)
     else:
-        slots = [s for d in (plan.get("slots") or {}).get("days", []) for s in d["slots"]]
+        slots = [s for d in (table.get("slots") or {}).get("days", []) for s in d["slots"]]
         pol = twin.slots_policy(slots, ts)
-        steps = plan.get("steps") or []
+        steps = table.get("steps") or []
         gmap = {s["t"]: s["genset_on"] for s in steps}
-        if site["data"].get("genset_start_control") == "manual":
+        if site["data"].get("genset_start_control") == "manual" and not keyed:
             # 1 in a planned run, 0 outside one: "no planned run", under which the twin's operator still rescues a site about to go dark
             pol["genset"] = np.array([1 if gmap.get(int(t) // 900 * 900) else 0 for t in ts]) if gmap else pol["genset"]
         released = _released(site["id"], ts)
@@ -311,6 +368,7 @@ def _replanned_span(site_id: str, t_from: int, t_to: int, every: int) -> None:
     while t < t_to:
         r = plans.tick(site_id, at=t, steps=HISTORY_STEPS, time_limit=5.0)
         plan = plans.get(site_id, r["plan_id"]) if r.get("plan_id") else None
+        _mark_tables(sites.full(site_id), t, t)        # an advisory site's installer marks the table keyed at the day's start, once
         end = min(t_to, t + every)
         _simulate_span(sites.full(site_id), t, end, plan)
         t = end
@@ -438,4 +496,5 @@ def advance(site_id: str, now: int | None = None) -> int:
     start = max(start, now - 3 * 86400)
     if start >= now:
         return 0
+    _mark_tables(site, start, now)
     return _simulate_span(site, start, now, plans.current(site_id))  # _policy_for runs the released minutes on the native settings
