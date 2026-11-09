@@ -1,15 +1,18 @@
 """Round 7 (audit), the Fleet and site Overview: the month-to-date saving is the Savings page's month figure, MDI lever included, with its method and
 computation date (flow-savings-pilot-bill-02, its duplicates role-owner-01, role-operator-01 and role-analyst-02, and pages-A-08), and off-grid in the
 fleet is the site's own fact, so a grid site whose connection is not saved yet is not labelled Off-grid and its outage counts (pages-A-03,
-role-viewer-09)."""
+role-viewer-09). The Overview carries the plan's KPI tiles (today's solar used on site, battery cycles and outages covered), the peak window of
+its chart's actual steps and the genset start requests waiting for an answer, its quick action (pages-A-09)."""
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from gridlytics import sites, store, telemetry
-from gridlytics.routes_common import today
-from test_fix_api import _now, world  # noqa: F401  (world is a fixture)
+import numpy as np
+
+from gridlytics import alerts, plans, routes_sites, sites, store, telemetry
+from gridlytics.routes_common import PKT, today
+from test_fix_api import _genset_plan, _now, world  # noqa: F401  (world is a fixture)
 
 
 def _row(fleet: dict, site_id: str) -> dict:
@@ -80,3 +83,63 @@ def test_a_grid_site_without_its_connection_yet_is_not_off_grid_in_the_fleet_and
     assert a.put(f"/api/sites/{two}/connection", json={"regime": "off_grid"}).status_code == 200
     fleet = a.get("/api/fleet").json()
     assert _row(fleet, two)["category"] == "Off-grid" and fleet["summary"]["in_outage"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ pages-A-09
+
+def test_the_overview_reads_today_s_solar_used_on_site_battery_cycles_and_outages_covered(world, monkeypatch):
+    a, sid = world.c["admin"], world.site                  # Mill One: a 200 kWh pack, a grid connection
+    d = today() - timedelta(days=1)                        # a whole day in the past, whatever the hour the test runs at
+    day0 = int(datetime(d.year, d.month, d.day, tzinfo=PKT).timestamp())
+    now = day0 + 14 * 3600
+    monkeypatch.setattr(routes_sites, "now_ts", lambda: now)
+    monkeypatch.setattr(routes_sites, "today", lambda: d)
+    rows = []
+    for m in range(240):                                   # 10:00 to 14:00
+        r = {"ts": day0 + 10 * 3600 + 60 * m, "grid_present": 1, "pv_power_w": 0, "battery_power_w": 0, "grid_export_wh": 0, "unserved_w": 0}
+        if m < 120:
+            r.update(pv_power_w=60_000, grid_export_wh=250)        # 120 kWh of solar, 30 kWh of it exported: 75 % used on site
+        if 120 <= m < 180:
+            r["battery_power_w"] = 50_000                          # 50 kWh out of the 200 kWh pack: a quarter of a cycle
+        if 120 <= m < 150:
+            r["grid_present"] = 0                                  # an outage the battery carries
+        if 180 <= m < 200:
+            r.update(grid_present=0, unserved_w=5_000)             # one that leaves critical load unserved
+        rows.append(r)
+    with world.use():
+        telemetry.ingest(sid, rows, "edge", now=now)
+    k = a.get(f"/api/sites/{sid}/now").json()["today_kpis"]
+    assert k == {"pv_self_pct": 75.0, "battery_cycles": 0.25, "outages": 2, "outages_covered": 1}
+    assert world.c["viewer"].get(f"/api/sites/{sid}/now").json()["today_kpis"] == k          # energy and counts: a viewer reads them too
+    # a site with no data today has none of them, never a zero
+    assert a.get(f"/api/sites/{world.other}/now").json()["today_kpis"] == {"pv_self_pct": None, "battery_cycles": None, "outages": None,
+                                                                           "outages_covered": None}
+
+
+def test_the_overview_chart_marks_the_peak_window_of_its_actual_steps(world):
+    a, sid = world.c["admin"], world.site
+    now = _now()
+    with world.use():
+        telemetry.ingest(sid, [{"ts": now - 900 * i - 60, "grid_present": 1, "pv_power_w": 1000} for i in range(96)], "edge")
+        conn = sites.connections(sid)[0]
+    c = a.get(f"/api/sites/{sid}/overview/chart").json()
+    ts = c["actual"]["ts"]
+    assert len(ts) >= 95 and len(c["peak"]) == len(ts)
+    with world.use():
+        expected = [bool(x) for x in plans.peak_mask(conn, np.asarray(ts))]
+    assert c["peak"] == expected and any(expected) and not all(expected)     # B-2(b) has a peak window in every day
+    assert world.c["viewer"].get(f"/api/sites/{sid}/overview/chart").json()["peak"] == expected
+    # a site with no grid tariff has no peak window
+    assert all(not x for x in a.get(f"/api/sites/{world.other}/overview/chart").json()["peak"])
+
+
+def test_the_overview_lists_the_genset_start_requests_waiting_for_an_answer(world):
+    a, sid = world.c["admin"], world.site                  # Mill One: a manual-start genset
+    t0 = _now() // 900 * 900
+    with world.use():
+        telemetry.ingest(sid, [{"ts": t0 - 60, "grid_present": 0, "genset_running": 0}], "edge")
+        alerts.genset_requests(sites.full(sid), _genset_plan(t0, range(0, 8)), t0 + 30)
+    waiting = a.get(f"/api/sites/{sid}/now").json()["genset_requests"]
+    assert [r["payload"]["start"] for r in waiting] == [t0]
+    assert a.post(f"/api/sites/{sid}/genset/requests/{waiting[0]['id']}", json={"outcome": "done"}).status_code == 200
+    assert a.get(f"/api/sites/{sid}/now").json()["genset_requests"] == []

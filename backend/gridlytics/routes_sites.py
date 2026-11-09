@@ -95,7 +95,7 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
     conn = (sites.connections(s["id"]) or [None])[0]
     # off-grid is the site's own fact, as tab C and POST /activate read it (_grid_settled): a connection of regime off_grid, or none at a farm or a
     # site whose data says off_grid. A grid site whose connection is not saved yet has no category yet (null), and its outages count (audit pages-A-03)
-    off_grid = conn["data"].get("regime") == "off_grid" if conn is not None else _grid_settled(s, [])
+    off_grid = _off_grid(s, conn)
     category = "Off-grid" if off_grid else conn["data"]["tariff_category"] if conn is not None else None
     return {"id": s["id"], "name": s["name"], "status": s["status"], "tier": s["tier"], "demo": bool(s.get("demo_link")), "city": s["data"].get("city"),
             "disco": s["data"].get("disco"), "category": category,
@@ -407,6 +407,35 @@ def overrides_delete(site_id: str, oid: str):
     return sites.overrides(site_id)
 
 
+def _off_grid(site: dict, conn: dict | None) -> bool:
+    """Off-grid as the site's own fact (tab C and POST /activate read it so, _grid_settled): a connection of regime off_grid, or none at a farm or at a
+    site whose data says off_grid."""
+    return conn["data"].get("regime") == "off_grid" if conn is not None else _grid_settled(site, [])
+
+
+def _today_kpis(site: dict, td: dict | None, bs: dict | None, now: int, day: date) -> dict:
+    """The Overview's KPI tiles of the plan (R8 2.4) for today in Pakistan time: the share of the solar made that was used on site (not exported), the
+    battery's equivalent full cycles (its discharge over the usable pack, as the battery page counts them) and the outages with how many of them the
+    site rode through with no critical load unserved. A figure without its data (no reading today, no solar yet, no battery, an off-grid site's
+    outages) is None, never a zero (audit pages-A-09)."""
+    td = td or {}
+    pv, exp, dis = td.get("pv_kwh"), td.get("export_kwh"), td.get("discharge_kwh")
+    self_pct = round(100 * min(1.0, max(0.0, (pv - (exp or 0)) / pv)), 1) if pv else None
+    e_nom = (bs or {}).get("e_nom_kwh")
+    cycles = round(dis / e_nom, 2) if dis is not None and e_nom else None
+    outages = covered = None
+    if td and not _off_grid(site, (site.get("connections") or [None])[0]):
+        log = telemetry.outages(site["id"], int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp()), now)
+        outages, covered = len(log), sum(1 for o in log if not o["unserved_kwh"])
+    return {"pv_self_pct": self_pct, "battery_cycles": cycles, "outages": outages, "outages_covered": covered}
+
+
+def _waiting_genset_requests(site_id: str, limit: int = 3) -> list[dict]:
+    """The genset start requests nobody has answered yet, newest first: the Overview's "Log the genset start" quick action answers them as the genset
+    page does (POST /sites/:id/genset/requests/:nid; audit pages-A-09)."""
+    return [r for r in alerts.requests_for(site_id) if r["status"] == "pending" and not r.get("outcome")][:limit]
+
+
 @router.get("/api/sites/{site_id}/now")
 def site_now(site_id: str):
     """The overview's snapshot: the energy flow now, the plan's current step and the next three reasons, today's and the month's figures."""
@@ -434,13 +463,14 @@ def site_now(site_id: str):
                           "saving_rs_method": MTD_SAVING_METHOD, "saving_rs_computed": computed},
                 "spark": spark, "battery": {k: (bs or {}).get(k) for k in ("soc_pct", "sigma_pct", "trust", "usable_kwh")} if bs else None,
                 "alerts": alerts.listing("active", site_id)[:5], "last_data": last["ts"] if last else None,
-                "first_data": telemetry.first_ts(site_id)})
+                "first_data": telemetry.first_ts(site_id), "today_kpis": _today_kpis(s, td, bs, now, t),
+                "genset_requests": _waiting_genset_requests(site_id)})
 
 
 @router.get("/api/sites/{site_id}/overview/chart")
 def overview_chart(site_id: str, hours: int = 24):
     """The actual-versus-plan chart: the last day's 15-minute actuals and the active plan's steps for the next day."""
-    site_or_404(site_id)
+    s = full_or_404(site_id)
     now = now_ts()
     hours = max(6, min(int(hours), 72))
     actual = telemetry.series(site_id, now - hours * 3600, now, ["pv_power_w", "load_power_w", "grid_power_w", "battery_power_w", "battery_soc_est_pct",
@@ -452,7 +482,16 @@ def overview_chart(site_id: str, hours: int = 24):
         ser["battery_soc_est_pct"] = [e if e is not None else b for e, b in zip(est, bms)]
     plan = plans.current(site_id)
     steps = [st for st in (plan or {}).get("steps", []) if st["t"] < now + hours * 3600]
-    return out({"actual": actual, "plan": steps, "now": now})
+    # the TOU peak window of each actual step, as the plan's steps carry theirs, for the chart's shading (R8 2.4; audit pages-A-09); none off-grid
+    conn = (s.get("connections") or [None])[0]
+    ts = actual.get("ts") or []
+    peak = [False] * len(ts)
+    if ts and conn is not None and not _off_grid(s, conn):
+        try:
+            peak = [bool(x) for x in plans.peak_mask(conn, np.asarray(ts, dtype=np.int64))]
+        except (LookupError, ValueError):
+            pass                                      # a tariff the calendar cannot read: the chart goes without its shading, never a 500
+    return out({"actual": actual, "plan": steps, "now": now, "peak": peak})
 
 
 #: The drafts `GET /api/drafts` lists, newest first
