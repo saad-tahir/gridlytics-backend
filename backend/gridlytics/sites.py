@@ -186,6 +186,52 @@ def _now() -> str:
     return store._now()
 
 
+# ------------------------------------------------------------------------------------------------ saves based on older values (audit flow-onboarding-05)
+
+#: A save that carries no `if_unchanged`: written without the check, as before
+UNCHECKED = object()
+
+ASSET_NAMES = {"pv": "PV array", "inverter": "inverter", "battery": "battery", "genset": "genset"}
+_FIELD_WORDS = {"lat": "latitude", "lon": "longitude", "load_peak_kw": "typical peak load", "sanctioned_load_kw": "sanctioned load",
+                "export_cap_kw": "export cap", "mdi_interval_min": "MDI interval", "kwp_dc": "DC size", "kw_ac": "AC size", "gamma_pdc": "temperature coefficient",
+                "losses_pct": "losses", "nameplate_kwh": "nameplate energy", "soh": "state of health", "p_ch_kw": "charge power", "p_dis_kw": "discharge power",
+                "eta_c": "charge efficiency", "eta_d": "discharge efficiency", "soc_min": "lowest state of charge", "soc_max": "highest state of charge",
+                "rated_kw": "rating", "f_min": "minimum loading", "tank_l": "tank", "min_up_h": "minimum run", "min_down_h": "minimum rest"}
+
+
+class Changed(Exception):
+    """A save based on stored values that were changed since: the route answers 409 `site_changed` with this sentence and the fields (`changed`)."""
+
+    def __init__(self, sentence: str, changed: list[str]):
+        super().__init__(sentence)
+        self.changed = changed
+
+
+def _listing(words: list[str]) -> str:
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def check_unchanged(held: dict | None, expect, what: str) -> None:
+    """The optimistic check of the site editors: `expect` is the save's `if_unchanged`, the stored values its form was based on as the client last read
+    them (an object of fields), or None when it read none stored. When they are no longer what is held, someone changed them since (in Site settings, or
+    another person), and the save raises Changed rather than writing over the newer values. UNCHECKED (left out of the save) checks nothing."""
+    if expect is UNCHECKED:
+        return
+    if expect is not None and not isinstance(expect, dict):
+        raise ValueError("if_unchanged is the set of stored values the form was based on")
+    again = "load the current values, or save yours over them"
+    if expect is None:
+        if held is not None:
+            raise Changed(f"{what} was added after this form was loaded: {again}", [])
+        return
+    if held is None:
+        raise Changed(f"{what} was removed after this form was loaded: {again}", [])
+    changed = sorted(k for k, v in expect.items() if held.get(k) != v)
+    if changed:
+        words = [_FIELD_WORDS.get(k, k.replace("_", " ")) for k in changed]
+        raise Changed(f"{what}'s {_listing(words)} changed after this form was loaded: {again}", changed)
+
+
 # ------------------------------------------------------------------------------------------------ sites
 
 def _site_out(r) -> dict:
@@ -224,25 +270,28 @@ def create(fields: dict, by: str, site_id: str | None = None, demo_link: str | N
     return get(sid)
 
 
-def update(site_id: str, fields: dict, by: str) -> dict:
+def update(site_id: str, fields: dict, by: str, if_unchanged=UNCHECKED) -> dict:
     """The site's fields changed by `fields` (a partial set, or the form sent back whole). A stored key SiteFields does not know (a demo site's `twin`,
-    which the demo writes) is carried through unvalidated and unchanged: the request may send it back as stored, never change or add it."""
-    site = get(site_id)
-    if site is None:
-        raise KeyError(site_id)
-    stored = dict(site.get("data") or {})
-    carried = {k: stored.pop(k) for k in list(stored) if k not in SiteFields.model_fields}
-    incoming = dict(fields)
-    for k in [k for k in incoming if k in carried]:
-        if incoming[k] != carried[k]:
-            raise ValueError(f"The site's {k.replace('_', ' ')} is kept as stored and cannot be changed here")
-        incoming.pop(k)
-    data = check(SiteFields, {**stored, **incoming}).model_dump()
-    _stamp_source(data, site.get("data"), by)
-    data = {**data, **carried}
-    with store.connect() as con:
+    which the demo writes) is carried through unvalidated and unchanged: the request may send it back as stored, never change or add it.
+    `if_unchanged` (check_unchanged) is compared with the stored fields in the same write transaction as the write, so no save lands in between."""
+    with store.write_transaction() as con:
+        r = con.execute("SELECT * FROM sites WHERE id = ? AND deleted IS NULL", (site_id,)).fetchone()
+        if r is None:
+            raise KeyError(site_id)
+        before = store.row(r).get("data") or {}
+        check_unchanged(before, if_unchanged, "The site")
+        stored = dict(before)
+        carried = {k: stored.pop(k) for k in list(stored) if k not in SiteFields.model_fields}
+        incoming = dict(fields)
+        for k in [k for k in incoming if k in carried]:
+            if incoming[k] != carried[k]:
+                raise ValueError(f"The site's {k.replace('_', ' ')} is kept as stored and cannot be changed here")
+            incoming.pop(k)
+        data = check(SiteFields, {**stored, **incoming}).model_dump()
+        _stamp_source(data, before, by)
+        data = {**data, **carried}
         con.execute("UPDATE sites SET name = ?, data = ?, updated = ? WHERE id = ?", (data["name"], json.dumps(data), _now(), site_id))
-    store.audit(by, "changed a site", data["name"], {"site_id": site_id, "fields": sorted(fields)})
+        store.audit(by, "changed a site", data["name"], {"site_id": site_id, "fields": sorted(fields)}, con=con)
     return get(site_id)
 
 
@@ -281,16 +330,20 @@ def connections(site_id: str) -> list[dict]:
     return [store.row(r) for r in rows]
 
 
-def put_connection(site_id: str, fields: dict, by: str, conn_id: str | None = None) -> dict:
+def put_connection(site_id: str, fields: dict, by: str, conn_id: str | None = None, if_unchanged=UNCHECKED) -> dict:
+    """Saves the connection `conn_id` (or a new one). `if_unchanged` is checked against that connection's stored fields (none stored: None) in the
+    write's own transaction."""
     data = check(ConnectionFields, fields).model_dump()
     cid = conn_id or store.new_id()
     now = _now()
-    with store.connect() as con:
-        if conn_id and con.execute("SELECT 1 FROM connections WHERE id = ? AND site_id = ?", (conn_id, site_id)).fetchone():
+    with store.write_transaction() as con:
+        held = con.execute("SELECT data FROM connections WHERE id = ? AND site_id = ?", (conn_id, site_id)).fetchone() if conn_id else None
+        check_unchanged(json.loads(held["data"]) if held else None, if_unchanged, "The grid connection")
+        if held:
             con.execute("UPDATE connections SET data = ?, updated = ? WHERE id = ?", (json.dumps(data), now, conn_id))
         else:
             con.execute("INSERT INTO connections (id, site_id, data, created, updated) VALUES (?,?,?,?,?)", (cid, site_id, json.dumps(data), now, now))
-    store.audit(by, "saved a connection", site_id, {"connection_id": cid, "category": data["tariff_category"]})
+        store.audit(by, "saved a connection", site_id, {"connection_id": cid, "category": data["tariff_category"]}, con=con)
     return next(c for c in connections(site_id) if c["id"] == cid)
 
 
@@ -305,19 +358,22 @@ def assets(site_id: str) -> dict:
     return out
 
 
-def put_asset(site_id: str, role: str, fields: dict, by: str) -> dict:
+def put_asset(site_id: str, role: str, fields: dict, by: str, if_unchanged=UNCHECKED) -> dict:
+    """Saves the site's asset of this role. `if_unchanged` is checked against the stored asset's fields (none stored: None) in the write's own
+    transaction."""
     if role not in ASSET_MODELS:
         raise ValueError(f"An asset is one of {', '.join(ASSET_MODELS)}")
     data = check(ASSET_MODELS[role], fields).model_dump()
     now = _now()
-    with store.connect() as con:
-        held = con.execute("SELECT id FROM assets WHERE site_id = ? AND role = ?", (site_id, role)).fetchone()
+    with store.write_transaction() as con:
+        held = con.execute("SELECT id, data FROM assets WHERE site_id = ? AND role = ?", (site_id, role)).fetchone()
+        check_unchanged(json.loads(held["data"]) if held else None, if_unchanged, f"The {ASSET_NAMES[role]}")
         if held:
             con.execute("UPDATE assets SET data = ?, updated = ? WHERE id = ?", (json.dumps(data), now, held["id"]))
         else:
             con.execute("INSERT INTO assets (id, site_id, role, data, created, updated) VALUES (?,?,?,?,?,?)",
                         (store.new_id(), site_id, role, json.dumps(data), now, now))
-    store.audit(by, f"saved the {role}", site_id)
+        store.audit(by, f"saved the {role}", site_id, con=con)
     return assets(site_id)[role]
 
 

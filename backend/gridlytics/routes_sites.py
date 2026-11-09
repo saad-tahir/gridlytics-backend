@@ -147,14 +147,35 @@ def site_get(site_id: str):
     return _site_answer(site_id)
 
 
+def _if_unchanged(inp: dict, held_may_be_none: bool = True):
+    """The save's `if_unchanged` (sites.check_unchanged), taken out of the body: the stored values the client's form was based on, or null when it read
+    none stored (a connection or an asset only: a site always exists). Left out, the save is not checked (sites.UNCHECKED)."""
+    if "if_unchanged" not in inp:
+        return sites.UNCHECKED
+    expect = inp.pop("if_unchanged")
+    if not isinstance(expect, dict) and not (expect is None and held_may_be_none):
+        raise Refusal(422, "if_unchanged is the set of stored values the form was based on", "invalid")
+    return expect
+
+
+def _changed(exc: sites.Changed) -> Refusal:
+    """A save based on values changed since (audit flow-onboarding-05): 409, with the fields that changed."""
+    return Refusal(409, str(exc), "site_changed", extra={"changed": exc.changed})
+
+
 @router.put("/api/sites/{site_id}")
 def site_update(site_id: str, inp: dict = Body(...)):
+    """Saves the site's fields (a partial set). With `if_unchanged` (the stored fields the form was based on), a save whose fields were changed since is
+    refused with 409 `site_changed` (and `changed`, the fields) instead of writing over the newer values."""
     auth.need("edit_sites", "Editing a site")
     s = site_or_404(site_id)
+    expect = _if_unchanged(inp, held_may_be_none=False)
     _need_money_settings(inp, {**_defaults(sites.SiteFields, SITE_MONEY_FIELDS), **(s.get("data") or {})}, SITE_MONEY_FIELDS,
                          "Changing the site's value of lost load or wear costing")
     try:
-        sites.update(site_id, inp, auth.actor())
+        sites.update(site_id, inp, auth.actor(), expect)
+    except sites.Changed as exc:
+        raise _changed(exc) from None
     except ValueError as exc:
         raise bad(exc) from None
     return _site_answer(site_id)
@@ -219,7 +240,8 @@ def _same_connection(site_id: str, inp: dict, key: str | None) -> str | None:
 def connection_put(site_id: str, inp: dict = Body(...), idempotency_key: str | None = Header(default=None)):
     """Saves a connection: with `id`, that one; without, a new one, unless the save repeats one already made (`_same_connection`), which is then saved
     in place, so a retried first save never makes a duplicate. Two connections on one site differ in regime, tariff or meter reference, or are saved
-    with idempotency keys of their own."""
+    with idempotency keys of their own. With `id` and `if_unchanged` (that connection's stored fields the form was based on, or null when it read
+    none), a save whose connection was changed since is refused with 409 `site_changed`."""
     auth.need("edit_sites", "Editing the grid connection")
     site_or_404(site_id)
     conn_id = inp.pop("id", None)
@@ -227,17 +249,23 @@ def connection_put(site_id: str, inp: dict = Body(...), idempotency_key: str | N
     if key is not None and (not isinstance(key, str) or not 1 <= len(key.strip()) <= IDEMPOTENCY_KEY_MAX):
         raise Refusal(422, f"The idempotency key is text of 1 to {IDEMPOTENCY_KEY_MAX} characters", "invalid")
     key = key.strip() if key else None
+    # if_unchanged (the stored fields of the connection `id` the form was read from) goes with that id: a new connection has nothing stored to compare
+    expect = _if_unchanged(inp)
+    if expect is not sites.UNCHECKED and not conn_id:
+        raise Refusal(422, "if_unchanged goes with the id of the saved connection it was read from", "invalid")
     try:
         if inp.get("tariff_category") and inp["tariff_category"] not in tariff_data.CARDS_279:
             raise ValueError(f"Unknown tariff category {inp['tariff_category']}")
         if conn_id:
-            sites.put_connection(site_id, inp, auth.actor(), conn_id)
+            sites.put_connection(site_id, inp, auth.actor(), conn_id, expect)
         else:
             with _connection_lock:
                 same = _same_connection(site_id, inp, key)
                 saved = sites.put_connection(site_id, inp, auth.actor(), same)
                 if key:
                     store.set_setting(_idem_setting(site_id, key), saved["id"])
+    except sites.Changed as exc:
+        raise _changed(exc) from None
     except ValueError as exc:
         raise bad(exc) from None
     return out(sites.full(site_id))
@@ -264,9 +292,14 @@ def connection_delete(site_id: str, conn_id: str):
 
 @router.put("/api/sites/{site_id}/assets/{role}")
 def asset_put(site_id: str, role: str, inp: dict = Body(...)):
+    """Saves the site's asset of this role. With `if_unchanged` (the stored asset's fields the form was based on, or null when it read none), a save
+    whose asset was changed, added or removed since is refused with 409 `site_changed`."""
     auth.need("edit_sites", "Editing the site's equipment")
     site_or_404(site_id)
     inp.pop("id", None)
+    expect = _if_unchanged(inp)
+    if isinstance(expect, dict):
+        expect.pop("id", None)
     names = ASSET_MONEY_FIELDS.get(role, ())
     if names:
         cur = sites.assets(site_id).get(role)
@@ -276,7 +309,9 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
             inp.update({k: cur[k] for k in names if k not in inp and k in cur})
         _need_money_settings(inp, before, names, "Changing the equipment's money settings (prices and wear)")
     try:
-        sites.put_asset(site_id, role, inp, auth.actor())
+        sites.put_asset(site_id, role, inp, auth.actor(), expect)
+    except sites.Changed as exc:
+        raise _changed(exc) from None
     except ValueError as exc:
         raise bad(exc) from None
     return out(sites.full(site_id))
