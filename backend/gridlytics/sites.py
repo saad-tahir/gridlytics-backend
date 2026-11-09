@@ -83,15 +83,20 @@ class SiteFields(Strict):
 SOURCE_CAPABLE = {"csv": "advisory_writes", "oem_cloud": "advisory_writes"}
 
 
-def _source_capable(con, site_id: str, data: dict, before: dict | None) -> str | None:
-    """`tier_capable` as the saved data source sets it, or None to keep the stored one. A CSV or cloud source: SOURCE_CAPABLE. A change to an edge device
-    from another kind: what that site's edge last asserted (its latest capabilities message), else monitor until it reports. No source (a site added
-    before sources were recorded, the demo's), or an edge kept: unchanged."""
+def _source_capable(con, site_id: str, data: dict, before: dict | None, held: str = "monitor") -> str | None:
+    """`tier_capable` as the saved data source sets it, or None to keep the stored one (`held`). A CSV or cloud source chosen (on a new site, or in place
+    of another kind): SOURCE_CAPABLE; kept by a later save (a note, the name): never lowered, only raised to SOURCE_CAPABLE (a site saved at monitor
+    before this rule), so what the site's edge asserted meanwhile stays until the kind is changed. A change to an edge device from another kind: what
+    that site's edge last asserted (its latest capabilities message), else monitor until it reports. No source (a site added before sources were
+    recorded, the demo's), or an edge kept: unchanged."""
     kind = (data.get("data_source") or {}).get("kind")
-    if kind in SOURCE_CAPABLE:
-        return SOURCE_CAPABLE[kind]
     old = ((before or {}).get("data_source") or {})
-    if kind == "edge" and isinstance(old, dict) and old.get("kind") in SOURCE_CAPABLE:
+    old_kind = old.get("kind") if isinstance(old, dict) else None
+    if kind in SOURCE_CAPABLE:
+        if kind == old_kind and held in TIERS and TIERS.index(held) > TIERS.index(SOURCE_CAPABLE[kind]):
+            return None
+        return SOURCE_CAPABLE[kind]
+    if kind == "edge" and old_kind in SOURCE_CAPABLE:
         r = con.execute("SELECT body FROM capabilities WHERE site_id = ? ORDER BY seq DESC LIMIT 1", (site_id,)).fetchone()
         tier = (json.loads(r["body"]) or {}).get("tier") if r else None
         return tier if tier in TIERS else "monitor"
@@ -363,7 +368,7 @@ def update(site_id: str, fields: dict, by: str, if_unchanged=UNCHECKED) -> dict:
         data = check(SiteFields, {**stored, **incoming}).model_dump()
         _stamp_source(data, before, by)
         data = {**data, **carried}
-        capable = _source_capable(con, site_id, data, before) or r["tier_capable"]
+        capable = _source_capable(con, site_id, data, before, r["tier_capable"]) or r["tier_capable"]
         con.execute("UPDATE sites SET name = ?, data = ?, tier_capable = ?, updated = ? WHERE id = ?",
                     (data["name"], json.dumps(data), capable, _now(), site_id))
         store.audit(by, "changed a site", data["name"], {"site_id": site_id, "fields": sorted(fields)}, con=con)

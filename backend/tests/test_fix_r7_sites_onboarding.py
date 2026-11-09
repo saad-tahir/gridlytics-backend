@@ -368,3 +368,21 @@ def test_a_limit_sent_as_stored_is_no_change_and_one_a_partial_policy_resets_is(
     r = a.put(f"/api/sites/{sid}", json={"cycle_cap_per_day": 99})
     assert r.status_code == 422 and r.json()["code"] == "invalid", r.text
 
+
+def test_a_save_that_keeps_the_kind_of_source_never_lowers_what_the_site_can_reach(world):
+    """Review of flow-onboarding-03: the source's tier is set when its kind is chosen or changed, and a later save that keeps the kind (a note, the name)
+    only raises it to what the kind supports: an edge's capabilities message that raised a CSV site stays until the kind is changed."""
+    a, op, sid = world.c["admin"], world.c["operator"], world.site
+    r = a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "csv", "grid_signal_confirmed": True}})
+    assert r.json()["tier_capable"] == "advisory_writes", r.text
+    with world.use():
+        sites.set_tier_capable(sid, "closed_loop")       # what routes_edge.edge_caps does when the site's edge reports closed loop
+    r = op.put(f"/api/sites/{sid}", json={"notes": "Edge box fitted in the plant room"})
+    assert r.status_code == 200 and r.json()["tier_capable"] == "closed_loop", r.text
+    # choosing another kind sets what that kind supports
+    r = a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}})
+    assert r.json()["tier_capable"] == "advisory_writes", r.text
+    # a site whose CSV source was saved at monitor before this rule is raised by its next save
+    with world.use():
+        sites.set_tier_capable(sid, "monitor")
+    assert op.put(f"/api/sites/{sid}", json={"notes": "Logger export weekly"}).json()["tier_capable"] == "advisory_writes"
