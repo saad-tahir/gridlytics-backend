@@ -1,13 +1,22 @@
 """Reports (UI-14): generate, list and download; a viewer may generate and read the energy-only report only.
 
-Who generates a kind lists and downloads it (audit role-operator-20), so an operator neither lists nor downloads the monthly savings report or the
-company roll-up, which are savings exports. Who generates what (auth.PERMISSIONS): the monthly savings report is `export` (it carries money), the energy-only report `energy_report` (every member, a
-viewer included: it carries no money), the daily operations sheet `run_jobs` (its period is a day, YYYY-MM-DD, today's by default; every other kind's a
-month), the company roll-up and the pilot report `export`. Each listed row says
-whether its figures were `preliminary`. The company roll-up covers every site (no site_id; its row keeps an empty one). The pilot report carries the
-fee (its fee multiple), so a role without `see_fee` neither lists nor downloads it.
+Who generates what (auth.PERMISSIONS): the monthly savings report is `export` (it carries money), the energy-only report `energy_report` (every
+member, a viewer included: it carries no money), the daily operations sheet `run_jobs` (its period is a day, YYYY-MM-DD, today's by default; every
+other kind's a month), the company roll-up and the pilot report `export`. Who generates a kind lists and downloads it (audit role-operator-20), so an
+operator neither lists nor downloads the monthly savings report or the company roll-up, which are savings exports. Each listed row says whether its
+figures were `preliminary`. The company roll-up covers every site (no site_id; its row keeps an empty one). The pilot report carries the fee (its
+fee multiple), so a role without `see_fee` neither lists nor downloads it.
+
+Generating is bounded per person (audit security-roles-08): each report renders its PDF in the request and writes two files, so a script looping
+POST /api/reports filled the disk and loaded the one API process, whose solves degrade under CPU load (HANDOFF 8.A.3). One person generates at most
+GENERATE_LIMIT reports an hour and one at a time, at most RENDERING reports render at once on the server, and reports.generate keeps only the newest
+copies of a report (reports.KEEP_COPIES).
 """
 from __future__ import annotations
+
+import os
+import threading
+from contextlib import contextmanager
 
 from fastapi import APIRouter, Body
 from fastapi.responses import FileResponse
@@ -23,6 +32,59 @@ REPORT_PERMISSION = {"monthly_savings": "export", "energy_only": "energy_report"
                      "pilot": "export"}
 #: The kinds that carry the fee: read only by a role that sees it
 FEE_KINDS = ("pilot",)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+#: (reports, seconds): what one person may generate in the window, counted in auth's rate limiter. A month's end at a company of six sites is
+#: about 19 reports; a loop is stopped. GRIDLYTICS_RATE_REPORTS changes the count; 0 turns it off
+GENERATE_LIMIT = (_env_int("GRIDLYTICS_RATE_REPORTS", 30), 3600)
+#: Reports rendering at once on the server, and how long a further one waits for its turn before it is refused
+RENDERING = 2
+RENDER_WAIT_S = 20.0
+_rendering = threading.BoundedSemaphore(RENDERING)
+_busy: set[tuple] = set()
+_busy_lock = threading.Lock()
+
+
+def _person() -> tuple:
+    """Who is generating: the company and the person (one key for the workspace in open mode)."""
+    return (str((auth.company.get() or {}).get("id") or ""), str((auth.current.get() or {}).get("id") or "open"))
+
+
+def _minutes(seconds: int) -> str:
+    m = max(1, -(-int(seconds) // 60))
+    return f"{m} minute{'s' if m != 1 else ''}"
+
+
+@contextmanager
+def _turn():
+    """The person's turn to render a report: refused (429, with Retry-After) while their previous one renders, when they have generated
+    GENERATE_LIMIT reports in the window, or when the server's RENDERING slots stay taken for RENDER_WAIT_S."""
+    who = _person()
+    with _busy_lock:
+        if who in _busy:
+            raise Refusal(429, "Your previous report is still being generated; try again when it is ready", "too_many_requests", headers={"Retry-After": "5"})
+        _busy.add(who)
+    try:
+        count, window = GENERATE_LIMIT
+        if count and (wait := auth.limiter().hit(("reports", *who), count, window)):
+            raise Refusal(429, f"One person may generate {count} reports an hour; try again in {_minutes(wait)}", "too_many_requests",
+                          headers={"Retry-After": str(wait)})
+        if not _rendering.acquire(timeout=RENDER_WAIT_S):
+            raise Refusal(429, "Other reports are being generated; try again in a minute", "too_many_requests", headers={"Retry-After": "30"})
+        try:
+            yield
+        finally:
+            _rendering.release()
+    finally:
+        with _busy_lock:
+            _busy.discard(who)
 
 
 def _may_read(kind: str) -> bool:
@@ -48,7 +110,9 @@ def generate(inp: dict = Body(...)):
     # the daily operations sheet is for a day (audit pages-D-24), today's by default; the other kinds for a month, this one by default
     period = str(inp.get("period") or (today().isoformat() if kind == "daily_operations" else today().strftime("%Y-%m")))
     try:
-        return reports.generate(kind, site_id, period, auth.actor())
+        reports.period_bounds(kind, period, today())  # a request refused for its kind or period is not counted against the person
+        with _turn():
+            return reports.generate(kind, site_id, period, auth.actor())
     except ValueError as exc:
         raise bad(exc) from None
 

@@ -968,8 +968,33 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
         con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?)", (rid, site_id, kind, period, store._now(), h, str(pdf_path), str(csv_path), "done",
                                                      None if prelim is None else int(prelim)))
-    store.audit(by, f"generated a {kind.replace('_', ' ')} report", site_id, {"period": period})
+    replaced = _prune(kind, site_id, period)
+    store.audit(by, f"generated a {kind.replace('_', ' ')} report", site_id, {"period": period, "report": rid, **({"replaced": replaced} if replaced else {})})
     return get(rid)
+
+
+#: The copies of one report (its kind, site and period) kept, newest first: an older copy is removed, row and files, when a newer one is made
+#: (audit security-roles-08: nothing capped the files a loop of POST /api/reports wrote). Each generation and download stays in the audit trail
+KEEP_COPIES = 3
+
+
+def _stored(path: str) -> Path:
+    """A report file's path as the row keeps it."""
+    return Path(path)
+
+
+def _prune(kind: str, site_id: str, period: str) -> list[str]:
+    """Remove the copies of this report beyond the newest KEEP_COPIES, rows and files; the ids removed, oldest first."""
+    with store.connect() as con:
+        old = con.execute("SELECT id, pdf_path, csv_path FROM reports WHERE kind = ? AND site_id = ? AND period = ? "
+                          "ORDER BY generated_at DESC, rowid DESC LIMIT -1 OFFSET ?", (kind, site_id, period, max(1, int(KEEP_COPIES)))).fetchall()
+        for r in old:
+            con.execute("DELETE FROM reports WHERE id = ?", (r["id"],))
+    for r in old:
+        for p in (r["pdf_path"], r["csv_path"]):
+            if p:
+                _stored(p).unlink(missing_ok=True)
+    return [r["id"] for r in reversed(old)]
 
 
 def _row_out(r) -> dict:
@@ -993,7 +1018,7 @@ def _row_out(r) -> dict:
 
 def listing(site_id: str | None = None) -> list[dict]:
     with store.connect() as con:
-        rows = con.execute("SELECT * FROM reports" + (" WHERE site_id = ?" if site_id else "") + " ORDER BY generated_at DESC LIMIT 200",
+        rows = con.execute("SELECT * FROM reports" + (" WHERE site_id = ?" if site_id else "") + " ORDER BY generated_at DESC, rowid DESC LIMIT 200",
                            ((site_id,) if site_id else ())).fetchall()
     names = {s["id"]: s["name"] for s in sites.listing()}
     return [{**_row_out(r), "site_name": names.get(r["site_id"], "")} for r in rows]
@@ -1014,5 +1039,5 @@ def file_path(rid: str, which: str) -> Path | None:
         r = con.execute("SELECT pdf_path, csv_path FROM reports WHERE id = ?", (rid,)).fetchone()
     if r is None:
         return None
-    p = Path(r["pdf_path"] if which == "pdf" else r["csv_path"])
+    p = _stored(r["pdf_path"] if which == "pdf" else r["csv_path"])
     return p if p.exists() else None

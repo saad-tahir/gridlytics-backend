@@ -1065,3 +1065,70 @@ def test_a_report_is_listed_and_downloaded_by_the_roles_that_may_generate_its_ki
     refused = world.c["operator"].get(f"/api/reports/{made['monthly_savings']}/csv").json()["detail"]
     assert refused == "The monthly savings report is for an administrator or an analyst", refused
 
+
+# ------------------------------------------------------------------------------------------------ security-roles-08
+
+def test_report_generation_is_bounded_per_person(world, monkeypatch):
+    from gridlytics import routes_reports
+    sid, month = world.site, _past_month()
+    monkeypatch.setattr(routes_reports, "GENERATE_LIMIT", (2, 3600))
+    body = {"kind": "energy_only", "site_id": sid, "period": month}
+    v = world.c["viewer"]
+    assert [v.post("/api/reports", json=body).status_code for _ in range(2)] == [200, 200]
+    r = v.post("/api/reports", json=body)
+    assert r.status_code == 429 and int(r.headers["retry-after"]) > 0, r.text
+    assert "2 reports an hour" in r.json()["detail"], r.text
+    # a refused request (a bad period) is not counted, and another person is not held up by this one
+    assert world.c["analyst"].post("/api/reports", json={**body, "period": "2026-13"}).status_code == 422
+    assert [world.c["analyst"].post("/api/reports", json=body).status_code for _ in range(2)] == [200, 200]
+
+
+def test_one_person_generates_one_report_at_a_time(world, monkeypatch):
+    import threading
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    entered, release = threading.Event(), threading.Event()
+    real = reports.generate
+
+    def slow(*args, **kw):
+        entered.set()
+        release.wait(10)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(reports, "generate", slow)
+    body = {"kind": "energy_only", "site_id": sid, "period": month}
+    first: list = []
+    t = threading.Thread(target=lambda: first.append(world.c["analyst"].post("/api/reports", json=body)))
+    t.start()
+    try:
+        assert entered.wait(10)
+        r = world.c["analyst"].post("/api/reports", json=body)
+        assert r.status_code == 429 and "still being generated" in r.json()["detail"], r.text
+        assert r.headers.get("retry-after"), r.headers
+    finally:
+        release.set()
+        t.join(30)
+    assert first and first[0].status_code == 200, first
+    assert world.c["analyst"].post("/api/reports", json=body).status_code == 200      # its turn is over
+
+
+def test_only_the_newest_copies_of_a_report_are_kept(world, monkeypatch):
+    from pathlib import Path
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    monkeypatch.setattr(reports, "KEEP_COPIES", 2)
+    with world.use():
+        made = [reports.generate("energy_only", sid, month, "test") for _ in range(4)]
+        other = reports.generate("energy_only", sid, _past_month(2), "test")
+        with store.connect() as con:
+            paths = {r["id"]: (r["pdf_path"], r["csv_path"]) for r in con.execute("SELECT id, pdf_path, csv_path FROM reports")}
+        kept = [r["id"] for r in reports.listing(sid) if r["period"] == month]
+        assert kept == [made[3]["id"], made[2]["id"]], kept                       # the two newest of the same kind, site and period
+        assert reports.get(other["id"]) is not None and reports.file_path(other["id"], "pdf") is not None
+        for old in made[:2]:
+            assert reports.get(old["id"]) is None and reports.file_path(old["id"], "pdf") is None
+        files = sorted(p.name for p in Path(paths[made[3]["id"]][0]).parent.iterdir())
+        assert files == sorted(f"{rid}.{ext}" for rid in (made[2]["id"], made[3]["id"], other["id"]) for ext in ("pdf", "csv")), files
+        acts = [r["detail"] for r in store.list_audit() if r["action"].startswith("generated a")]
+        assert any(d.get("replaced") == [made[1]["id"]] for d in acts), acts
+
