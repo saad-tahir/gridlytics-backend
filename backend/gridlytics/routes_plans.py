@@ -175,11 +175,19 @@ def plan_apply(site_id: str, inp: dict = Body(...)):
     site_or_404(site_id)
     f = check(ApplyFields, inp)
     try:
-        return plans.mark_applied(site_id, f.plan_id, f.day or today().isoformat(), auth.actor(), f.method, f.photo)
+        res = plans.mark_applied(site_id, f.plan_id, f.day or today().isoformat(), auth.actor(), f.method, f.photo)
     except KeyError:
         raise bad(ValueError("No such plan")) from None
     except ValueError as exc:
         raise bad(exc) from None
+    # a mark for today: the answer says at once when the "it took" card comes (plan Part 9.5); a failed check never undoes the mark
+    res["early_check"] = None
+    if res["day_local"] == today().isoformat():
+        try:
+            res["early_check"] = plans.early_check(site_id, now_ts())
+        except Exception:
+            log.exception("the early check after a mark failed for site %s", site_id)
+    return res
 
 
 @router.get("/api/sites/{site_id}/plan/compare")

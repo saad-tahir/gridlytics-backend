@@ -1265,3 +1265,93 @@ def test_the_scheduler_issues_the_days_table_after_its_tick_and_tomorrows_at_23_
     scheduler.nightly_tables_company(company)
     (nightly,) = plans.issued_tables(sid, (today + timedelta(days=1)).isoformat())
     assert nightly["reason"] == "nightly" and scheduler.NIGHTLY_TABLES_AT == (23, 5)
+
+
+# ------------------------------------------------------------------------------------------------ batch 4: pages-B-08
+
+D8 = date(2026, 10, 14)
+T8 = int(datetime(D8.year, D8.month, D8.day, tzinfo=PKT).timestamp())
+PEAK8 = (T8 + 18 * 3600, T8 + 22 * 3600)
+DUE8 = PEAK8[0] + 1800
+
+
+def _keyed(name: str) -> str:
+    """An advisory site whose inverter, left to itself, holds the battery for outages (native backup at 90 %), a plan with D8's table (a hold, a
+    discharge from 18:00 to 22:00, a hold) and a mark of it made at 10:00 that morning."""
+    from test_fix_savings import make_site
+    sid = make_site(name=name, tier="advisory_writes", genset=False, native={"source": "entered", "work_mode": "backup", "backup_soc_pct": 90})
+    pid = store.new_id()
+    table = [{**s, "soc_floor_pct": 90.0 if s["mode"] == "hold" and s["start"] == "00:00" else s["soc_floor_pct"]} for s in _day_table(D8)]
+    with store.connect() as con:
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, steps, slots) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)", (pid, sid, _iso(T8 - 3600), _iso(T8 - 3600), _iso(T8 - 3600), _iso(T8 + 86400), "a", "active", "[]",
+                                                     json.dumps({"days": [{"date": D8.isoformat(), "slots": table}]})))
+        con.execute("INSERT INTO applied (id, site_id, plan_id, day_local, by, method, created) VALUES (?,?,?,?,?,?,?)",
+                    (store.new_id(), sid, pid, D8.isoformat(), "Installer", "installer_keyed", _iso(T8 + 10 * 3600)))
+    return sid
+
+
+def _readings(sid: str, bat_kw, battery: bool = True) -> None:
+    """Grid-up minutes from 17:00 to 19:30: 150 kW of load, no PV, the battery's power by minute (kW, discharge positive) and its state of charge."""
+    rows, soc = [], 90.0
+    for t in range(T8 + 17 * 3600, T8 + 19 * 3600 + 1800, 60):
+        b = bat_kw(t)
+        soc -= b / 60 / 215 * 100
+        rows.append((sid, t, "edge", 1.0, 0.0, 150_000.0, b * 1000 if battery else None, soc))
+    telemetry.write_rows(rows, ("site_id", "ts", "source_id", "grid_present", "pv_power_w", "load_power_w", "battery_power_w", "battery_soc_bms_pct"))
+
+
+@pytest.fixture()
+def peak8(monkeypatch):
+    monkeypatch.setattr(plans, "peak_mask", lambda conn, ts: (np.asarray(ts) >= PEAK8[0]) & (np.asarray(ts) < PEAK8[1]))
+
+
+def test_a_keyed_table_gets_its_took_card_30_minutes_after_its_first_peak_slot(company, peak8):
+    """Plan 9.5 and 7.6: 30 minutes after the keyed table's first discharge slot in the peak, the readings say whether it took; the day's class and
+    its claim stay the nightly check's."""
+    followed = _keyed("Took")
+    _readings(followed, lambda t: 100.0 if t >= PEAK8[0] else 0.0)
+    early = plans.early_check(followed, PEAK8[0] + 20 * 60)
+    assert early["verdict"] == "waiting" and early["due_ts"] == DUE8 and early["slot_start"] == "18:00", early
+    # before: nothing until the nightly job at 00:40 (verify.compute_day was the only caller of confirm_applied)
+    early = plans.early_check(followed, DUE8 + 60)
+    assert early["verdict"] == "took" and early["max_discharge_kw"] == 100.0, early
+    row = plans.applied_rows(followed)[0]
+    assert row["early_check"]["verdict"] == "took" and row["confirmation"] == "pending"
+    assert plans.early_check(followed, DUE8 + 3600) == early                    # a verdict is kept, not computed again
+    # the inverter kept its native backup setting: the battery never discharged at 18:00
+    ignored = _keyed("Did not take")
+    _readings(ignored, lambda t: 0.0)
+    assert plans.early_check(ignored, DUE8 + 60)["verdict"] == "did_not_take"
+
+
+def test_no_battery_reading_waits_and_a_day_with_no_peak_discharge_says_so(company, peak8):
+    blind = _keyed("Blind")
+    _readings(blind, lambda t: 100.0, battery=False)
+    assert {k: plans.early_check(blind, DUE8 + 60)[k] for k in ("verdict", "reason")} == {"verdict": "waiting", "reason": "no_battery_power"}
+    late = _keyed("Marked late")
+    with store.connect() as con:                                             # keyed at 20:00, after the discharge slot started
+        con.execute("UPDATE applied SET created = ? WHERE site_id = ?", (_iso(T8 + 20 * 3600), late))
+    assert plans.early_check(late, DUE8 + 3 * 3600)["verdict"] == "no_peak_slot"
+
+
+def test_marking_todays_table_says_when_the_card_comes_and_the_tick_runs_the_check(world, monkeypatch):
+    from gridlytics import scheduler
+    sid, day = world.site, datetime.now(PKT).date()
+    with world.use():
+        _tier(sid, "advisory_writes")
+        pid = _today_plan(sid, day)
+    monkeypatch.setattr(plans, "peak_mask", lambda conn, ts: (np.asarray(ts) >= _pkt(day, 18)) & (np.asarray(ts) < _pkt(day, 22)))
+    r = world.c["operator"].post(f"/api/sites/{sid}/plan/apply", json={"plan_id": pid, "day": day.isoformat()})
+    assert r.status_code == 200, r.text
+    early = r.json()["early_check"]
+    if _now() < _pkt(day, 18) + 900:                                             # marked before the 18:00 slot: the card comes at 18:30
+        assert early["verdict"] == "waiting" and early["due_ts"] == _pkt(day, 18) + 1800, early
+    else:
+        assert early["verdict"] in ("no_peak_slot", "waiting"), early
+    assert world.c["viewer"].get(f"/api/sites/{sid}/control").json()["applied"][0]["early_check"]["verdict"] == early["verdict"]
+    calls = []
+    monkeypatch.setattr(plans, "issue_tables", lambda site_id: calls.append("issue") or 1 / 0)
+    monkeypatch.setattr(plans, "early_check", lambda site_id: calls.append("early"))
+    scheduler._after_tick(sid)
+    assert calls == ["issue", "early"]                                         # a failed issue does not stop the check

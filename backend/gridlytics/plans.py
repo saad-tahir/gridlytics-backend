@@ -745,16 +745,22 @@ def mark_applied(site_id: str, plan_id: str, day_local: str, by: str, method: st
 
 def applied_rows(site_id: str, limit: int = 30) -> list[dict]:
     """The applied log, newest first. Each row says which table was keyed (`table`, round 7: audit pages-B-02): the issue of its plan for its day
-    ({issued_at, reason, superseded: a later issue for the day names another plan}), None when that plan's table was never issued for the day."""
+    ({issued_at, reason, superseded: a later issue for the day names another plan}), None when that plan's table was never issued for the day; and
+    its early verdict (`early_check`, the "it took" card: early_check, audit pages-B-08), None before one."""
     with store.connect() as con:
-        rows = con.execute("SELECT id, plan_id, day_local, by, method, confirmation, fidelity, created FROM applied WHERE site_id = ? ORDER BY created DESC LIMIT ?",
-                           (site_id, limit)).fetchall()
+        rows = con.execute("SELECT id, plan_id, day_local, by, method, confirmation, fidelity, data, created FROM applied WHERE site_id = ? "
+                           "ORDER BY created DESC LIMIT ?", (site_id, limit)).fetchall()
         days = sorted({r["day_local"] for r in rows})
         issues = con.execute("SELECT plan_id, day_local, issued_at, reason FROM table_issues WHERE site_id = ? AND day_local IN "
                              f"({','.join('?' * len(days))}) ORDER BY issued_at, rowid", (site_id, *days)).fetchall() if days else []
     out = []
     for r in rows:
         d = dict(r)
+        try:
+            extra = json.loads(d.pop("data") or "{}")
+        except (TypeError, ValueError):
+            extra = {}
+        d["early_check"] = extra.get("early_check") if isinstance(extra, dict) else None
         day = [i for i in issues if i["day_local"] == d["day_local"]]
         mine = [i for i in day if i["plan_id"] == d["plan_id"]]
         d["table"] = ({"issued_at": mine[0]["issued_at"], "reason": mine[0]["reason"], "superseded": day[-1]["plan_id"] != d["plan_id"]}
@@ -1296,3 +1302,113 @@ def write_policy(site: dict | None) -> tuple[dict, dict]:
     """The plan message's U3 5.4 mode_a.apply_policy and R6 3.6 write_budget (audit engine-delivery-09)."""
     return ({"write_if_changed_only": True, "max_table_writes_per_day": EDGE_TABLE_WRITE_CAP, "apply_window_local": APPLY_WINDOW_LOCAL},
             {"table_writes_per_day": table_budget(site), "event_writes_per_day": EVENT_WRITES_PER_DAY})
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the "it took" card
+
+#: Plan Part 9.5 and 7.6 (audit pages-B-08): the early verdict on a keyed table comes this long after its first discharge slot in the peak starts
+EARLY_CHECK_S = 1800
+#: the verdicts that are kept and not computed again
+EARLY_FINAL = ("took", "did_not_take", "no_evidence", "no_peak_slot")
+_DISCHARGING = ("discharge", "export")
+
+
+def _keep_early(applied_id: str, check: dict) -> dict:
+    """The early verdict written to the applied row's data (`early_check`), what else the row holds kept (the nightly confirmation's detail)."""
+    with store.write_transaction() as con:
+        r = con.execute("SELECT data FROM applied WHERE id = ?", (applied_id,)).fetchone()
+        try:
+            data = json.loads((r["data"] if r else None) or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        con.execute("UPDATE applied SET data = ? WHERE id = ?", (json.dumps({**data, "early_check": check}), applied_id))
+    return check
+
+
+def early_check(site_id: str, now: int | None = None, site: dict | None = None) -> dict | None:
+    """The "it took" or "it did not take" card (plan Part 9.5): today's keyed table at an advisory site, read from telemetry 30 minutes after its first
+    discharge (or export) slot that starts in the peak window (any discharge start at a site with no peak window), from a quarter before the mark on
+    (a table cannot be followed before it is keyed). The test is the nightly confirmation's boundary test (verify.confirm_applied: discharge above 10
+    percent of rated within 30 minutes of the start, grid present). The table and the native capture in force are replayed through the twin over the
+    hour round the start from the measured state of charge: where the table would not discharge there either there is no evidence (the battery
+    near its floor), and where the native settings would discharge too, the measured energy over the hour must be nearer one replay than the other
+    by 2 percent of the battery (the nightly not-applied margin).
+
+    Kept on the latest mark of today as `early_check` ({verdict, reason, boundary_ts, due_ts, slot_start, plan_id, max_discharge_kw, checked}).
+    Verdicts: waiting (before the due time, or no battery reading for the window yet: a CSV source uploads later), took, did_not_take, no_evidence,
+    no_peak_slot; a final one is not computed again. It never sets the day's class, its fidelity or its claim: the nightly confirm_applied does.
+    None when the site is not at the advisory tier or today has no mark."""
+    from . import verify  # verify imports plans at module load
+
+    site = site or sites.full(site_id)
+    if site is None or site.get("tier") != "advisory_writes":
+        return None
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    day = _local(now).date()
+    with store.connect() as con:
+        row = con.execute("SELECT id, plan_id, data, created FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1",
+                          (site_id, day.isoformat())).fetchone()
+    if row is None:
+        return None
+    try:
+        prior = (json.loads(row["data"] or "{}") or {}).get("early_check") or {}
+    except (TypeError, ValueError, AttributeError):
+        prior = {}
+    if prior.get("verdict") in EARLY_FINAL and prior.get("plan_id") == row["plan_id"]:
+        return prior
+    plan = get(site_id, row["plan_id"])
+    t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    every = sorted((s for d in ((plan or {}).get("slots") or {}).get("days") or [] for s in d.get("slots") or []), key=lambda s: int(s["start_ts"]))
+    marked = _ts(row["created"]) or now
+    conn = (site.get("connections") or [None])[0]
+    quarters = np.arange(t0, t0 + 86400, 900, dtype=np.int64)
+    pk = np.asarray(peak_mask(conn, quarters), dtype=bool) if conn else np.zeros(len(quarters), dtype=bool)
+    cur = next((c for prev, c in zip(every, every[1:]) if c["mode"] in _DISCHARGING and prev["mode"] not in _DISCHARGING
+                and t0 <= int(c["start_ts"]) < t0 + 86400 and int(c["start_ts"]) >= marked - 900
+                and (not pk.any() or bool(pk[(int(c["start_ts"]) - t0) // 900]))), None)
+    if cur is None:
+        return _keep_early(row["id"], {"verdict": "no_peak_slot", "reason": None, "plan_id": row["plan_id"], "checked": store._now()})
+    bnd = int(cur["start_ts"])
+    out = {"boundary_ts": bnd, "due_ts": bnd + EARLY_CHECK_S, "slot_start": cur.get("start"), "plan_id": row["plan_id"]}
+    if now < bnd + EARLY_CHECK_S:
+        return _keep_early(row["id"], {**out, "verdict": "waiting", "reason": None})
+    g = telemetry.minute_grid(site_id, bnd - EARLY_CHECK_S, bnd + EARLY_CHECK_S)
+    f = telemetry.filled(g)
+    ts = g["ts"]
+    bat = np.asarray(g["bat"], dtype=float)
+    seen = ~np.isnan(bat) & (np.asarray(f["grid"]) > 0.5)
+    after = seen & (ts >= bnd)
+    soc = verify._soc(g)
+    with_soc = np.flatnonzero(~np.isnan(soc))
+    plant = twin.plant_of(site)
+    if int(after.sum()) < 10 or not with_soc.size or plant.e_nom <= 0:
+        # no battery reading for the window yet: the next tick tries again; the nightly check decides the day
+        return _keep_early(row["id"], {**out, "verdict": "waiting", "reason": "no_battery_power"})
+    p_dis = max(plant.p_dis, 1e-6)
+    measured = bool(np.any(bat[after] > 0.10 * p_dis))
+    k = int(with_soc[0])
+    hours = ((ts + 5 * 3600) % 86400) // 3600
+    load = f["load"] + f["unserved"]
+    series = {"ts": ts[k:], "pv": (f["pv"] + f["curtail"])[k:], "load": load[k:], "grid": f["grid"][k:],
+              "crit": np.minimum(twin.critical_share(site)[hours], load)[k:], "temp": np.nan_to_num(g["temp"], nan=30.0)[k:]}
+    native_site = {**site, "native": verify.native_for_day(site_id, day) or site.get("native")}
+    sims = {"table": twin.simulate(series, twin.slots_policy(every, series["ts"]), plant, float(soc[k])),
+            "native": twin.simulate(series, twin.native_policy(native_site, series["ts"]), plant, float(soc[k]))}
+    win = (series["ts"] >= bnd) & (np.asarray(series["grid"]) > 0.5)
+    shows = {name: bool(np.any(np.asarray(sim["bat"])[win] > 0.10 * p_dis)) for name, sim in sims.items()}
+    if not shows["table"]:
+        verdict, reason = "no_evidence", "no_observable_change"          # the table itself would not discharge there (the battery near its floor)
+    elif not shows["native"]:
+        verdict, reason = ("took" if measured else "did_not_take"), None
+    else:
+        # the native settings would discharge there too: the measured energy over the hour says which the battery followed
+        w = seen[k:]
+        e_meas = float(np.sum(bat[k:][w]) / 60)
+        d_tab = abs(float(np.sum(np.asarray(sims["table"]["bat"])[w]) / 60) - e_meas)
+        d_nat = abs(float(np.sum(np.asarray(sims["native"]["bat"])[w]) / 60) - e_meas)
+        margin = 0.02 * plant.e_nom
+        verdict = "took" if d_tab + margin < d_nat else "did_not_take" if d_nat + margin < d_tab else "no_evidence"
+        reason = "native_alike"
+    return _keep_early(row["id"], {**out, "verdict": verdict, "reason": reason, "max_discharge_kw": round(max(float(np.max(bat[after])), 0.0), 1),
+                                   "checked": store._now()})

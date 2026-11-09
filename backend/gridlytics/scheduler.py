@@ -19,11 +19,13 @@ NIGHTLY_TABLES_AT = (23, 5)
 
 
 def _after_tick(site_id: str) -> None:
-    """What follows a site's solve: today's table issued or re-issued when worth a write (plans.issue_tables). A failure is logged, never the tick's."""
-    try:
-        plans.issue_tables(site_id)
-    except Exception:
-        log.exception("issuing the table failed for site %s", site_id)
+    """What follows a site's solve: today's table issued or re-issued when worth a write (plans.issue_tables), then the "it took" card of today's
+    keyed table (plans.early_check, plan Part 9.5). A failure of either is logged, never the tick's."""
+    for what, fn in (("issuing the table", plans.issue_tables), ("the early check of the keyed table", plans.early_check)):
+        try:
+            fn(site_id)
+        except Exception:
+            log.exception("%s failed for site %s", what, site_id)
 
 
 def tick_company(path) -> dict:
