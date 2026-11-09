@@ -13,6 +13,7 @@ import math
 import sqlite3
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
@@ -158,6 +159,8 @@ EARLIEST_TS = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
 AHEAD_S = 86400
 #: one CSV upload spans at most this many days: the import aggregates every day it fills
 UPLOAD_MAX_DAYS = 400
+#: a CSV's rows are at most this many minutes apart (an hourly logger); rows further apart are refused, as no minute between them can be filled
+STEP_MAX_MIN = 60
 
 
 def _now_ts() -> int:
@@ -179,18 +182,28 @@ def _epoch(v) -> int | None:
     return int(v)
 
 
-def ingest(site_id: str, records: list[dict], source: str, now: int | None = None, count_overlap: bool = False) -> dict:
+#: the columns that hold a row's energy over its interval, not a reading at its start: a coarse row's value is spread evenly over the minutes it covers
+INTERVAL_ENERGY = ("grid_import_wh", "grid_export_wh", "genset_fuel_l")
+_ENERGY_AT = tuple(ALL.index(c) for c in INTERVAL_ENERGY)
+
+
+def ingest(site_id: str, records: list[dict], source: str, now: int | None = None, count_overlap: bool = False,
+           spans: list[int] | None = None, step_min: int = 1) -> dict:
     """Normalised dict rows (edge batches and CSV) into the minute table; idempotent by (site, minute), the last value wins.
 
     A stored minute is merged, never replaced whole: a column the row leaves missing (absent, blank or unreadable) keeps its stored value, so a CSV that
     carries only the load never erases the PV, the battery or an edge batch's own columns for the minutes it overlaps (audit R7). With `count_overlap`
     the answer also gives `overlap`, the minutes that were already stored.
 
+    `spans` (a CSV of 5- or 15-minute rows, audit R7) gives each record the minutes it covers from its own: the row is stored on each of them, its
+    readings held and its interval energy (INTERVAL_ENERGY) divided by `step_min`, the file's interval, so a day's energy, its peak and its outage minutes
+    come out as from 1-minute rows. `accepted` counts the minutes written.
+
     A row whose ts is not a time, or lies before 2015 or more than a day after `now`, is skipped and counted (`skipped`, and `out_of_range` for the
     dated ones), never raised: one bad row must not fail the batch on every retry."""
     rows, skipped, unreadable, out_of_range = [], 0, 0, 0
     latest_ok = (_now_ts() if now is None else int(now)) + AHEAD_S
-    for r in records:
+    for n, r in enumerate(records):
         ts = _epoch(r.get("ts"))
         if ts is None:
             skipped += 1
@@ -211,7 +224,16 @@ def ingest(site_id: str, records: list[dict], source: str, now: int | None = Non
                 row.append(x)
         if row[3] is None and row[_VOLT] is not None:
             row[3] = 1.0 if row[_VOLT] >= 180 else 0.0  # grid present from voltage (plan Part 7.5; 180 V to confirm); an unreadable voltage stays unknown
-        rows.append(tuple(row))
+        span = max(1, int(spans[n])) if spans is not None else 1
+        if step_min > 1:
+            for j in _ENERGY_AT:
+                if row[j] is not None:
+                    row[j] = row[j] / step_min
+        for k in range(span):
+            if k and ts + 60 * k > latest_ok:
+                break
+            row[1] = ts + 60 * k
+            rows.append(tuple(row))
     res = {"accepted": len(rows), "skipped": skipped, "unreadable_cells": unreadable, "out_of_range": out_of_range}
     if count_overlap:
         res["overlap"] = 0
@@ -297,7 +319,8 @@ def imports(site_id: str, limit: int = 20) -> list[dict]:
 def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
                file_name: str | None = None) -> dict:
     """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
-    `duplicates` the rows dropped, both in the notes); gaps over 5 minutes are reported.
+    `duplicates` the rows dropped, both in the notes); rows 2 to 60 minutes apart are stored as the minutes each covers (`step_min`, `minutes`; see
+    ingest), rows further apart are refused; gaps over 5 minutes (or over the step) are reported.
 
     The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
     nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
@@ -351,8 +374,20 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     if duplicates:
         log.append(f"{duplicates:,} row{'s repeat' if duplicates != 1 else ' repeats'} a minute that a later row of the file also gives: the last row "
                    f"of each minute was kept")
-    gaps = sum(1 for a, b in zip(records, records[1:]) if b["ts"] - a["ts"] > 300)
-    res = ingest(site_id, records, "csv", now=now, count_overlap=True)
+    # the logger's interval: the most common step between rows, in whole minutes (the shorter on a tie). A 5- or 15-minute row is stored as the minutes it
+    # starts (up to the next row), so its energy, the day's peak and its outage minutes are counted in full (audit R7)
+    starts = [r["ts"] // 60 for r in records]
+    steps = Counter(b - a for a, b in zip(starts, starts[1:]))
+    step = min(steps.items(), key=lambda kv: (-kv[1], kv[0]))[0] if steps else 1
+    if step > STEP_MAX_MIN:
+        raise ValueError(f"Rows are {step} minutes apart: the import reads rows at most {STEP_MAX_MIN} minutes apart; upload the logger's "
+                         f"1-, 5- or 15-minute rows")
+    spans = [min(step, b - a) for a, b in zip(starts, starts[1:])] + [step]
+    if step > 1:
+        log.append(f"Rows are {step} minutes apart: each row was stored as the {step} minutes it starts, its readings held over them and its energy "
+                   f"({', '.join(INTERVAL_ENERGY)}) spread evenly")
+    gaps = sum(1 for a, b in zip(starts, starts[1:]) if b - a > max(5, step))
+    res = ingest(site_id, records, "csv", now=now, count_overlap=True, spans=spans, step_min=step)
     res["skipped"] += bad_ts
     if res["overlap"]:
         log.append(f"{res['overlap']:,} minutes were already stored: the file's values replaced theirs, and the columns the file does not carry (or "
@@ -369,10 +404,11 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         con.execute("INSERT INTO imports (id, site_id, source, file_hash, rows, gaps, status, log, created, from_ts, to_ts, file_name) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (iid, site_id, "csv", digest, len(records), gaps, "done", json.dumps(log), store._now(), first, last, name))
-    for day in _local_days(r["ts"] for r in records):  # only the days that received rows, not every day between the first and the last
+    filled_to = (r["ts"] // 60 * 60 + 60 * (n - 1) for r, n in zip(records, spans))  # a coarse row's last minute may fall on the next day
+    for day in _local_days([r["ts"] for r in records] + list(filled_to)):  # only the days that received rows, not every day between the first and the last
         aggregate_day(site_id, day)
     return {"id": iid, "rows": len(records), "skipped": res["skipped"], "gaps": gaps, "log": log, "duplicates": duplicates, "minutes": res["accepted"],
-            "overlap": res["overlap"],
+            "step_min": step, "overlap": res["overlap"],
             "from": datetime.fromtimestamp(first, timezone.utc).isoformat(), "to": datetime.fromtimestamp(last, timezone.utc).isoformat(),
             "from_ts": first, "to_ts": last, "file_name": name}
 

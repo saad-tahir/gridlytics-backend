@@ -119,3 +119,49 @@ def test_duplicate_times_are_counted_once_and_reported(company):
     # a clean file reports no duplicates
     clean = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), [(_local(t + 7200 + 60 * i), 1, 5) for i in range(5)]), 5, now=NOW)
     assert clean["duplicates"] == 0 and not any("repeat a minute" in line for line in clean["log"])
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-10: 5- and 15-minute files
+
+@pytest.mark.parametrize("step", [5, 15])
+def test_a_coarse_file_is_stored_as_the_intervals_its_rows_cover(company, step):
+    """The audit's case: a day at 15-minute (or 5-minute) steps, 200 kW of load all day, the grid off 14:00-15:00 and the meter's import as Wh per row.
+    Each row is stored as the minutes it starts, energy spread evenly over them: the day's load is 4,800 kWh (not 1/15th), the peak 200 kW, the outage
+    60 minutes, the day complete, and no row is a gap."""
+    sid = _site(f"Coarse {step}")
+    n = 1440 // step
+    rows = []
+    for i in range(n):
+        ts = T0 + i * step * 60
+        up = not (14 * 60 <= i * step < 15 * 60)
+        rows.append((_local(ts), 1 if up else 0, 200000 if up else 0, 200000, 200000 * step / 60 if up else 0))
+    res = telemetry.import_csv(sid, _file(("ts", "grid_present", "grid_power_w", "load_power_w", "grid_import_wh"), rows), 5, now=NOW)
+    assert (res["rows"], res["step_min"], res["minutes"], res["gaps"]) == (n, step, 1440, 0)
+    assert any(f"Rows are {step} minutes apart" in line for line in res["log"]), res["log"]
+    day = _day(sid)
+    assert day["load_kwh"] == pytest.approx(4800.0)
+    assert day["import_kwh"] == pytest.approx(200 * 23)
+    assert day["peak_kw"] == pytest.approx(200.0)
+    assert day["outage_minutes"] == 60
+    assert day["completeness"] == 1.0
+    out = telemetry.outages(sid, T0, T0 + 86400)
+    assert [(o["start"], o["minutes"]) for o in out] == [(T0 + 14 * 3600, 60)]
+
+
+def test_a_missing_row_in_a_coarse_file_is_a_gap_and_its_minutes_stay_missing(company):
+    sid = _site("Coarse gap")
+    rows = [(_local(T0 + i * 900), 1, 100000) for i in range(96) if i != 40]
+    res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), rows), 5, now=NOW)
+    assert (res["rows"], res["step_min"], res["minutes"], res["gaps"]) == (95, 15, 1425, 1)
+    assert _day(sid)["completeness"] == pytest.approx(1425 / 1440, abs=1e-4)
+    # a 1-minute file keeps its rows as single minutes
+    one = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), [(_local(T0 + 86400 + 60 * i), 1, 1) for i in range(30)]), 5, now=NOW)
+    assert (one["step_min"], one["minutes"]) == (1, 30)
+
+
+def test_rows_more_than_an_hour_apart_are_refused(company):
+    sid = _site("Sparse")
+    body = _file(("ts", "grid_present", "load_power_w"), [(_local(T0 + i * 7200), 1, 100000) for i in range(12)])
+    with pytest.raises(ValueError, match="120 minutes apart"):
+        telemetry.import_csv(sid, body, 5, now=NOW)
+    assert telemetry.first_ts(sid) is None  # nothing stored
