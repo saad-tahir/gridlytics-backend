@@ -126,6 +126,12 @@ def _month_bounds(ym: str) -> tuple[str, str]:
     return f"{ym}-01", f"{ym}-{_calendar.monthrange(y, m)[1]:02d}"
 
 
+def _month_names(months: list[int]) -> str:
+    """[3, 4, 11] as "March, April and November"."""
+    names = [_calendar.month_name[m] for m in months]
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
 def validate_body(kind: str, key: str, body, effective_from: str | None = None) -> None:
     """Refuse (ValueError) a version body the engine could not price with: one approved malformed row would otherwise stop every plan, price and bill."""
     if not isinstance(body, dict):
@@ -172,6 +178,7 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
         seasons = body.get("seasons")
         if not isinstance(seasons, list) or not seasons:
             raise ValueError("A TOU calendar needs seasons, each with months and a peak window")
+        listed: list[int] = []
         for s in seasons:
             months = s.get("months") if isinstance(s, dict) else None
             peak = s.get("peak") if isinstance(s, dict) else None
@@ -179,6 +186,15 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
                 raise ValueError("Each TOU season needs months: a list of month numbers 1 to 12")
             if not isinstance(peak, (list, tuple)) or len(peak) != 2 or not all(isinstance(x, str) and _HHMM.match(x) for x in peak):
                 raise ValueError('Each TOU season needs a peak window: ["HH:MM", "HH:MM"]')
+            if peak[0] == peak[1]:
+                raise ValueError("Each TOU season needs a peak window whose start and end differ")
+            listed += months
+        # peak membership is a function of the month for every month (R9 2.3): a month left out would have no peak at all, one listed twice two windows
+        missing, twice = sorted(set(range(1, 13)) - set(listed)), sorted({m for m in listed if listed.count(m) > 1})
+        if missing:
+            raise ValueError(f"A TOU calendar must give every month one season: {_month_names(missing)} {'has' if len(missing) == 1 else 'have'} none")
+        if twice:
+            raise ValueError(f"A TOU calendar must give every month one season: {_month_names(twice)} {'is' if len(twice) == 1 else 'are'} listed twice")
     elif kind == "icp":
         if not _num(body.get("rate")) or body["rate"] < 0:
             raise ValueError("The ICP needs its rate in Rs/kWh")
