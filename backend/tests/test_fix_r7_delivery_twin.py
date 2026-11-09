@@ -190,3 +190,85 @@ def test_a_whole_day_huawei_period_ends_at_23_59_and_a_day_of_holds_has_no_perio
     assert "peak_shaving_power_w" not in {x["key"] for x in t["settings"]}                    # no MDI cap on the plan
     held = _table("huawei", [_slot("00:00", "00:00", "hold", 60, 60)])
     assert held["rows"] == [] and {x["key"]: x["value"] for x in held["settings"]}["charge_from_grid"] is False
+
+
+# ------------------------------------------------------------------------------------------------ the other brands' layouts (pages-B-05, engine-delivery-06,
+# tracker-and-docs-06, flow-onboarding-23)
+
+def test_every_brands_rows_are_exactly_its_grammars_fields():
+    """Growatt, Sungrow, Voltronic, Solis and 'other' all got {slot, start, end, mode, soc_pct}, while the grammar (and the web contract: columns =
+    grammar.fields) said ['start', 'end', 'enabled'], ['start', 'end', 'target_soc'], ['mode'], ['start', 'end', 'current_a'], ['start', 'mode',
+    'soc_pct']."""
+    for brand, g in delivery.BRANDS.items():
+        t = _table(brand, mdi={"cap_kw": 300.0, "held": brand == "huawei", "not_enforceable": None})
+        assert t["rows"] and len(t["rows"]) == len(t["slots"]), brand
+        assert all(list(r) == g["fields"] for r in t["rows"]), (brand, t["rows"][0], g["fields"])
+
+
+def test_sungrow_keys_its_forced_charge_windows_with_their_targets_and_says_what_self_consumption_cannot_hold():
+    t = _table("sungrow", limits={"max_charge_w": 300000, "max_discharge_w": 300000, "battery_v": None})
+    assert t["rows"] == [{"window": 1, "start": "00:00", "end": "05:00", "target_soc": 80}, {"window": 2, "start": "22:30", "end": "23:59", "target_soc": 60}]
+    assert t["slots"] == [[0], [5]]
+    s = {x["key"]: x["value"] for x in t["settings"]}
+    assert (s["ems_mode"], s["forced_charging"], s["min_soc"], s["max_soc"], s["reserved_soc_backup"]) == ("Self-consumption", "Enabled, every day", 25,
+                                                                                                         95, 20)
+    assert (s["max_charging_power_w"], s["max_discharging_power_w"]) == (50000, 300000)
+    assert any("cannot keep the battery from discharging" in n and "05:00 to 09:00" in n for n in t["notes"]), t["notes"]
+    assert any("one Min SoC (25 %)" in n and "16:00 to 18:30" in n for n in t["notes"]), t["notes"]
+    three = _table("sungrow", [_slot("00:00", "04:00", "charge_grid", 30, 70, ch=1), _slot("04:00", "08:00", "discharge", 40, 70, dis=1),
+                               _slot("08:00", "12:00", "charge_grid", 40, 80, ch=1), _slot("12:00", "16:00", "discharge", 40, 80, dis=1),
+                               _slot("16:00", "00:00", "charge_grid", 40, 90, ch=1)])
+    assert len(three["rows"]) == 2 and any("two forced-charge windows" in n and "16:00 to 23:59" in n for n in three["notes"])
+
+
+def test_growatt_has_three_battery_first_and_three_grid_first_windows_with_load_first_between_them():
+    """BRANDS said 'three charge and three discharge windows' and 'up to 3 slots' at once (the onboarding card and the Slots view printed both):
+    the plan's 3 plus 3 (Part 7.1 step 2), with self-use as Load First between windows, which takes no window."""
+    g = delivery.BRANDS["growatt"]
+    assert g["max_slots"] == 6 and g["layout"].startswith("three Battery First and three Grid First windows")
+    t = _table("growatt")
+    assert [(r["priority"], r["window"], r["start"], r["end"], r["enabled"]) for r in t["rows"]] == [("battery_first", 1, "00:00", "16:00", True),
+                                                                                                      ("battery_first", 2, "22:30", "23:59", True)]
+    assert t["slots"] == [[0, 1, 2], [5]]
+    s = {x["key"]: x["value"] for x in t["settings"]}
+    assert (s["charge_from_grid"], s["battery_first_stop_soc"], s["grid_first_min_soc"], s["load_first_stop_soc"]) == (True, 95, 20, 25)
+    assert any("charges from the grid too" in n for n in t["notes"]), t["notes"]
+    exp = _table("growatt", [_slot("00:00", "18:00", "self_use", 30, 90), _slot("18:00", "21:00", "export", 40, 90, dis=1),
+                             _slot("21:00", "00:00", "self_use", 40, 90)])
+    assert [(r["priority"], r["window"]) for r in exp["rows"]] == [("grid_first", 1)]
+    assert {x["key"]: x["value"] for x in exp["settings"]}["grid_first_min_soc"] == 40
+
+
+def test_the_compiler_fits_a_growatt_day_into_three_windows_of_each_priority():
+    """With six slots and Load First taking no window, a compiled Growatt day never needs a fourth window of one priority."""
+    import itertools
+    for modes in itertools.product(("charge_grid", "hold", "discharge", "export"), repeat=6):
+        slots = [_slot(f"{2 * k:02d}:00", f"{2 * k + 2:02d}:00", m, 40, 60) for k, m in enumerate(modes)]
+        if any(a == b for a, b in zip(modes, modes[1:])):
+            continue                                                                 # the compiler merges equal neighbours
+        t = _table("growatt", slots)
+        for pri in ("battery_first", "grid_first"):
+            assert sum(r["priority"] == pri for r in t["rows"]) <= 3, modes
+        assert not any("cannot be keyed" in n for n in t["notes"]), modes
+
+
+def test_voltronic_keys_its_source_priorities_at_each_change_and_solis_its_charge_and_discharge_slots():
+    v = _table("voltronic")
+    assert [(r["change"], r["at"], r["output_priority"], r["charger_priority"]) for r in v["rows"]] == [
+        (1, "00:00", "SUB", "SNU"), (2, "05:00", "SUB", "OSO"), (3, "16:00", "SBU", "OSO"), (4, "22:30", "SUB", "SNU")]
+    assert {x["key"]: x["value"] for x in v["settings"]}["back_to_utility_soc"] == 25
+    assert any("no time table" in n for n in v["notes"])
+    s = _table("solis")
+    assert [(r["kind"], r["slot"], r["start"], r["end"], r["power_w"], r["current_a"]) for r in s["rows"]] == [
+        ("charge", 1, "00:00", "05:00", 50000, None), ("discharge", 1, "18:30", "22:30", 150000, None), ("charge", 2, "22:30", "23:59", 30000, None)]
+    assert any("nominal voltage" in n for n in s["notes"]) and any("05:00 to 09:00" in n and "self-use" in n for n in s["notes"])
+    with_v = _table("solis", limits={"max_charge_w": None, "max_discharge_w": None, "battery_v": 500.0})
+    assert [r["current_a"] for r in with_v["rows"]] == [100, 300, 60] and not any("nominal voltage" in n for n in with_v["notes"])
+
+
+def test_the_compiled_table_carries_the_batterys_limits_for_the_brands_that_key_them_once():
+    from test_fix_r3_optimiser import _steps_for
+    comp = delivery.compile_mode_a(_steps_for([("idle", 0.0, 0.0)] * 96), "sungrow", {"E_nom": 1000.0, "P_ch": 250.0, "P_dis": 300.0}, 20.0)
+    assert comp["limits"] == {"max_charge_w": 250000, "max_discharge_w": 300000, "battery_v": None}
+    assert delivery.compile_mode_a(_steps_for([("idle", 0.0, 0.0)] * 96), "sungrow", None, 20.0)["limits"] == {
+        "max_charge_w": None, "max_discharge_w": None, "battery_v": None}

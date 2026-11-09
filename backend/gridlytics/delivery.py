@@ -25,22 +25,25 @@ from . import store, twin
 PKT = timezone(timedelta(hours=5))
 CONTRACT = "ems-edge/1.0"
 
+#: `fields` are the vendor table's columns in order: exactly the keys of each row vendor_table writes (the web contract: columns = grammar.fields).
+#: `max_slots` is what compile_mode_a fits a day into: Growatt's 3 plus 3 windows (Part 7.1 step 2) with Load First between them, which takes none
 BRANDS = {
     "deye": {"label": "Deye / Sunsynk", "max_slots": 6, "layout": "six programs (Time of Use)", "ring": True, "min_slot_minutes": 30,
-             "fields": ["time", "power_w", "soc_pct", "grid_charge", "gen_charge"], "table_writes_per_day": 3, "mdi_primitive": False},
+             "fields": ["program", "time", "power_w", "soc_pct", "grid_charge", "gen_charge"], "table_writes_per_day": 3, "mdi_primitive": False},
     "huawei": {"label": "Huawei SUN2000", "max_slots": 14, "layout": "fourteen TOU periods (charge or discharge), with a global cut-off and floors",
                "ring": False, "min_slot_minutes": 15, "fields": ["period", "start", "end", "charge_or_discharge", "days"], "table_writes_per_day": 3,
                "mdi_primitive": True},
-    "growatt": {"label": "Growatt", "max_slots": 3, "layout": "three charge and three discharge windows", "ring": False, "min_slot_minutes": 30,
-                "fields": ["start", "end", "enabled"], "table_writes_per_day": 3, "mdi_primitive": False},
-    "sungrow": {"label": "Sungrow", "max_slots": 2, "layout": "two forced-charge windows (emulated)", "ring": False, "min_slot_minutes": 30,
-                "fields": ["start", "end", "target_soc"], "table_writes_per_day": 4, "mdi_primitive": False},
-    "voltronic": {"label": "Voltronic / Axpert", "max_slots": 3, "layout": "emulated mode changes", "ring": False, "min_slot_minutes": 60,
-                  "fields": ["mode"], "table_writes_per_day": 3, "mdi_primitive": False},
-    "solis": {"label": "Solis", "max_slots": 6, "layout": "three charge and three discharge slots", "ring": False, "min_slot_minutes": 30,
-              "fields": ["start", "end", "current_a"], "table_writes_per_day": 3, "mdi_primitive": False},
+    "growatt": {"label": "Growatt", "max_slots": 6, "layout": "three Battery First and three Grid First windows, Load First between them", "ring": False,
+                "min_slot_minutes": 30, "fields": ["priority", "window", "start", "end", "enabled"], "table_writes_per_day": 3, "mdi_primitive": False},
+    "sungrow": {"label": "Sungrow", "max_slots": 2, "layout": "two forced-charge windows (emulated), self-consumption between them", "ring": False,
+                "min_slot_minutes": 30, "fields": ["window", "start", "end", "target_soc"], "table_writes_per_day": 4, "mdi_primitive": False},
+    "voltronic": {"label": "Voltronic / Axpert", "max_slots": 3, "layout": "emulated mode changes (output and charger source priority)", "ring": False,
+                  "min_slot_minutes": 60, "fields": ["change", "at", "output_priority", "charger_priority"], "table_writes_per_day": 3,
+                  "mdi_primitive": False},
+    "solis": {"label": "Solis", "max_slots": 6, "layout": "three charge and three discharge slots, self-use between them", "ring": False,
+              "min_slot_minutes": 30, "fields": ["kind", "slot", "start", "end", "power_w", "current_a"], "table_writes_per_day": 3, "mdi_primitive": False},
     "other": {"label": "Generic", "max_slots": 6, "layout": "generic six-slot table", "ring": False, "min_slot_minutes": 30,
-              "fields": ["start", "mode", "soc_pct"], "table_writes_per_day": 3, "mdi_primitive": False},
+              "fields": ["slot", "start", "end", "mode", "soc_pct"], "table_writes_per_day": 3, "mdi_primitive": False},
 }
 FALLBACK_HOURS = 3
 
@@ -217,6 +220,10 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
         days.append({"date": day, "slots": slots})
     out = {"brand": brand, "grammar": gram, "days": days, "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": fallback_floor_pct,
                                                                        "revert_after_hours": FALLBACK_HOURS}}
+    # the battery's own limits, for the brands that key a power once for the table, or a power where a slot has none (Deye's self-use program)
+    b = battery or {}
+    out["limits"] = {"max_charge_w": round(b["P_ch"] * 1000) if b.get("P_ch") else None,
+                     "max_discharge_w": round(b["P_dis"] * 1000) if b.get("P_dis") else None, "battery_v": b.get("V_nom")}
     out["mdi"] = {"cap_kw": round(float(mdi_cap_kw), 1) if mdi_cap_kw else None, "held": held,
                   "not_enforceable": None if held or not mdi_cap_kw else _mdi_not_enforceable(steps, out, battery, site, float(mdi_cap_kw))}
     return out
@@ -399,13 +406,132 @@ def _huawei(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
     return rows, settings, notes
 
 
+def _limit(compiled: dict, key: str) -> int | None:
+    return (compiled.get("limits") or {}).get(key)
+
+
+def _floor_notes(brand: str, what: str, floor: float, slots: list[dict]) -> list[str]:
+    """A sentence per discharging slot whose own floor the brand's one global floor (`floor`) cannot keep (more than 3 points apart, the fidelity
+    tolerance)."""
+    return [f"{brand} keeps one {what} ({floor:.0f} %): the discharge from {_span(s)} is planned to stop at {s['soc_floor_pct']:.0f} % but will run on "
+            f"to {floor:.0f} %." for s in slots if s["mode"] in DISCHARGING and s["soc_floor_pct"] > floor + 3]
+
+
+def _sungrow(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
+    """Sungrow SH in self-consumption with forced charging (R6 3.3): two forced-charge windows of start, end and target SoC, every day; outside
+    them the battery serves the load down to Min SoC (0 to 50 %). Max SoC (50 to 100 %), Min SoC, the backup reserve and the power limits are global.
+    The forced-charge target is the slot's charge target (the floor was keyed before)."""
+    charge = [(k, s) for k, s in enumerate(slots) if s["mode"] == "charge_grid"]
+    rows = [{"window": i + 1, "start": s["start"], "end": _end(s), "target_soc": round(s["soc_target_pct"]), "_slots": [k]}
+            for i, (k, s) in enumerate(charge[:2])]
+    dis = [s for s in slots if s["mode"] in DISCHARGING]
+    floor = min((s["soc_floor_pct"] for s in dis), default=_min_floor(compiled))
+    min_soc = min(floor, 50.0)
+    max_soc = min(100.0, max([s["soc_target_pct"] for s in slots] + [50.0]))
+    settings = [_setting("ems_mode", "EMS mode", "Self-consumption"),
+                _setting("forced_charging", "Forced charging", "Enabled, every day" if charge else "Disabled"),
+                _setting("max_soc", "Max SoC", _pct(max_soc), "%"),
+                _setting("min_soc", "Min SoC", _pct(min_soc), "%"),
+                _setting("reserved_soc_backup", "Reserved SoC for backup", _pct(_min_floor(compiled)), "%"),
+                _setting("max_charging_power_w", "Max charging power", max((s["max_charge_w"] or 0 for _, s in charge), default=0)
+                         or _limit(compiled, "max_charge_w"), "W"),
+                _setting("max_discharging_power_w", "Max discharging power", _limit(compiled, "max_discharge_w")
+                         or max((s["max_discharge_w"] or 0 for s in dis), default=0) or None, "W")]
+    notes = []
+    if len(charge) > 2:
+        notes.append(f"Sungrow has two forced-charge windows: the charge from {_joined([_span(s) for _, s in charge[2:]])} cannot be keyed.")
+    held = [s for s in slots if s["mode"] in ("hold", "charge_pv_only")]
+    if held:
+        notes.append(f"Sungrow cannot keep the battery from discharging outside a forced-charge window: from {_joined([_span(s) for s in held])} it "
+                     f"serves the load down to the Min SoC ({min_soc:.0f} %).")
+    if floor > 50.0:
+        notes.append(f"Sungrow's Min SoC goes up to 50 %: the plan's floor of {floor:.0f} % is keyed as 50 %.")
+    return rows, settings, notes + _floor_notes("Sungrow", "Min SoC", min_soc, slots)
+
+
+#: Growatt's priority per slot mode: Battery First charges (from the grid where the global flag allows) and does not discharge, so a hold is one too;
+#: Grid First discharges to the grid; discharge and self-use are Load First, the default between windows (None: no window)
+_GROWATT = {"charge_grid": "battery_first", "charge_pv_only": "battery_first", "hold": "battery_first", "export": "grid_first"}
+
+
+def _growatt(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
+    """Growatt SPH (R6 3.4): up to three Battery First windows (charge to one global stop SoC, from the grid per one global flag, no discharge)
+    and up to three Grid First windows (discharge to the grid down to one global floor), each a begin, end and enable; the rest of the day runs
+    Load First (the battery serves the load). Adjacent slots of one priority are one window, so a six-slot day needs at most three of each."""
+    rows, notes, n = [], [], {"battery_first": 0, "grid_first": 0}
+    for w in _windows(slots, lambda s: _GROWATT.get(s["mode"])):
+        n[w["kind"]] += 1
+        rows.append({"priority": w["kind"], "window": n[w["kind"]], "start": w["first"]["start"], "end": _end(w["last"]), "enabled": True,
+                     "_slots": w["slots"]})
+    for pri, name in (("battery_first", "Battery First"), ("grid_first", "Grid First")):
+        if n[pri] > 3:
+            notes.append(f"Growatt has three {name} windows: the plan's {name} windows 4 to {n[pri]} cannot be keyed.")
+    charge = [s for s in slots if s["mode"].startswith("charge")]
+    grid = any(s["mode"] == "charge_grid" for s in slots)
+    stop = max((s["soc_target_pct"] for s in charge), default=max((s["soc_floor_pct"] for s in slots if s["mode"] == "hold"), default=None))
+    exp_floor = min((s["soc_floor_pct"] for s in slots if s["mode"] == "export"), default=_min_floor(compiled))
+    load_floor = min((s["soc_floor_pct"] for s in slots if s["mode"] in ("discharge", "self_use")), default=_min_floor(compiled))
+    settings = [_setting("charge_from_grid", "Battery First: charge from grid", grid),
+                _setting("battery_first_stop_soc", "Battery First stop SoC", _pct(stop), "%"),
+                _setting("grid_first_min_soc", "Grid First minimum SoC", _pct(exp_floor), "%"),
+                _setting("load_first_stop_soc", "Load First: stop discharging at", _pct(load_floor), "%")]
+    if grid and any(s["mode"] in ("hold", "charge_pv_only") for s in slots):
+        notes.append("A hold or a solar-only charge is a Battery First window: while charging from the grid is on, it charges from the grid too.")
+    return rows, settings, notes + _floor_notes("Growatt", "Load First floor", load_floor, [s for s in slots if s["mode"] != "export"])
+
+
+#: Voltronic / Axpert output source priority per slot mode (SUB: solar, utility, then battery, so the battery holds while the grid is up; SBU:
+#: solar, battery, then utility) and charger source priority (SNU: solar and utility; OSO: only solar)
+_POP = {"hold": "SUB", "charge_grid": "SUB", "charge_pv_only": "SUB"}
+
+
+def _voltronic(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
+    """Voltronic / Axpert: no time table on the inverter. At each boundary where the priorities change, the output and charger source priorities
+    are set (by a person, or by an edge device: the emulation the plan names), and the battery goes back to utility at one SoC."""
+    rows = []
+    for k, s in enumerate(slots):
+        pop, pcp = _POP.get(s["mode"], "SBU"), "SNU" if s["mode"] == "charge_grid" else "OSO"
+        if rows and (rows[-1]["output_priority"], rows[-1]["charger_priority"]) == (pop, pcp):
+            rows[-1]["_slots"].append(k)
+            continue
+        rows.append({"change": len(rows) + 1, "at": s["start"], "output_priority": pop, "charger_priority": pcp, "_slots": [k]})
+    floor = min((s["soc_floor_pct"] for s in slots if s["mode"] in DISCHARGING), default=_min_floor(compiled))
+    notes = ["Voltronic has no time table: each change is made at its time, by a person or by an edge device."] if len(rows) > 1 else []
+    return rows, [_setting("back_to_utility_soc", "Back to utility at SoC", _pct(floor), "%")], notes + _floor_notes(
+        "Voltronic", "back-to-utility SoC", floor, slots)
+
+
+def _solis(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
+    """Solis (R8 2.15): three charge and three discharge slots, each with its times and a current; self-use outside them. The current is the
+    slot's power over the battery's nominal voltage (`limits.battery_v`), null where the battery's voltage is not known."""
+    v = _limit(compiled, "battery_v")
+    rows, notes, n = [], [], {"charge": 0, "discharge": 0}
+    kind = lambda s: "charge" if s["mode"] == "charge_grid" else "discharge" if s["mode"] in ("discharge", "export") else None
+    for w in _windows(slots, kind):
+        n[w["kind"]] += 1
+        ws = [slots[k] for k in w["slots"]]
+        power = max(((s["max_charge_w"] if w["kind"] == "charge" else s["max_discharge_w"]) or 0) for s in ws) or None
+        rows.append({"kind": w["kind"], "slot": n[w["kind"]], "start": w["first"]["start"], "end": _end(w["last"]), "power_w": power,
+                     "current_a": round(power / v) if v and power else None, "_slots": w["slots"]})
+    if rows and not v:
+        notes.append("Solis takes a current for each slot: divide its power by the battery's nominal voltage, which this battery's details do not give.")
+    held = [s for s in slots if s["mode"] in ("hold", "charge_pv_only")]
+    if held:
+        notes.append(f"Solis cannot hold the battery outside its slots: from {_joined([_span(s) for s in held])} it runs self-use.")
+    for k in ("charge", "discharge"):
+        if n[k] > 3:
+            notes.append(f"Solis has three {k} slots: the plan's {k} slots 4 to {n[k]} cannot be keyed.")
+    floor = min((s["soc_floor_pct"] for s in slots if s["mode"] in DISCHARGING), default=_min_floor(compiled))
+    return rows, [_setting("overdischarge_soc", "Overdischarge SoC", _pct(floor), "%")], notes + _floor_notes("Solis", "overdischarge SoC", floor, slots)
+
+
 def _generic(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
     rows = [{"slot": k + 1, "start": s["start"], "end": s["end"], "mode": s["mode"], "soc_pct": _soc_keyed(s), "_slots": [k]}
             for k, s in enumerate(slots)]
     return rows, [], []
 
 
-VENDOR = {"deye": _deye, "huawei": _huawei, "other": _generic}
+VENDOR = {"deye": _deye, "huawei": _huawei, "growatt": _growatt, "sungrow": _sungrow, "voltronic": _voltronic, "solis": _solis, "other": _generic}
 
 
 def vendor_table(compiled: dict | None, day_index: int = 0) -> dict:
