@@ -10,9 +10,12 @@ router = APIRouter()
 
 @router.get("/api/demo")
 def status():
+    """The build's state, and `days`: the days of history it makes, which the pages name (audit pages-A-04: they promised 90). The build's own; for a
+    build recorded before its days were kept, its site-days per demo site; with none, what a load would build now."""
     st = demo.status()
     st.pop("trace", None)
-    return {**st, "sites": [{"id": s["id"], "name": s["name"]} for s in demo.demo_sites()]}
+    days = st.get("days") or (int(st["total"]) // max(1, len(demo.DEMO_SITES)) if st.get("total") else demo.default_days())
+    return {**st, "days": days, "sites": [{"id": s["id"], "name": s["name"]} for s in demo.demo_sites()]}
 
 
 @router.post("/api/demo")

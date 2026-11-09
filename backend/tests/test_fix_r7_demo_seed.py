@@ -280,3 +280,18 @@ def test_one_companys_demo_build_neither_blocks_nor_shows_in_anothers(tmp_path, 
             assert st["state"] == "ready" and demo.status()["state"] == "ready"
     finally:
         held.release()
+
+
+# ------------------------------------------------------------------------------------------------ the days of history (pages-A-04), the load gate
+
+def test_the_demo_status_names_the_days_of_history_a_build_makes(company, monkeypatch):
+    monkeypatch.setenv("GRIDLYTICS_DEMO_DAYS", "9")
+    assert routes_demo.status()["days"] == 9                                 # nothing loaded: what a load would build
+    monkeypatch.delenv("GRIDLYTICS_DEMO_DAYS")
+    assert routes_demo.status()["days"] == 21                                # the default (DESIGN_LOG: the plan's 90 took too long to seed)
+    demo._set_status(state="ready", progress=56, total=56)                   # a build recorded before its days were kept: 14 days of 4 sites
+    assert routes_demo.status()["days"] == 14
+    monkeypatch.setattr(demo, "create_sites", lambda by, **k: [])
+    store.set_setting("demo_status", {"state": "none"})
+    demo.load("t", 5, background=False)
+    assert demo.status()["days"] == 5 and routes_demo.status()["days"] == 5

@@ -412,6 +412,12 @@ def build_history(site_id: str, days: int, progress=None) -> None:
     alerts.evaluate(site_id)
 
 
+def default_days() -> int:
+    """The days of history a load builds when none is asked for: GRIDLYTICS_DEMO_DAYS, else 21 (DESIGN_LOG, v1 build, Demo: the plan says 90,
+    which took too long to seed)."""
+    return int(os.environ.get("GRIDLYTICS_DEMO_DAYS", "21"))
+
+
 def load(by: str, days: int | None = None, background: bool = True) -> dict:
     """Create the demo sites in the current company and build their history (in a background thread unless asked otherwise)."""
     if demo_sites():
@@ -420,8 +426,8 @@ def load(by: str, days: int | None = None, background: bool = True) -> dict:
     lock = _lock_for(db)
     if not lock.acquire(blocking=False):
         return {"state": "running", "message": "The demo is already being built"}
-    days = int(days or os.environ.get("GRIDLYTICS_DEMO_DAYS", "21"))
-    _set_status(state="running", progress=0, total=days * len(DEMO_SITES), started=store._now(), message="Creating the demo sites")
+    days = int(days or default_days())
+    _set_status(state="running", progress=0, total=days * len(DEMO_SITES), days=days, started=store._now(), message="Creating the demo sites")
 
     def run():
         try:
