@@ -857,6 +857,8 @@ def test_a_company_roll_up_report_lists_every_site_and_the_total(world, monkeypa
     total = next(ln for ln in text.splitlines() if ln.startswith("All sites"))
     assert "Rs 2,301" in total, total                                      # the claims summed: 1,901.13 + 400
     assert "Recompute needed" in text and "Mill Two" in next(ln for ln in text.splitlines() if "Recompute needed" in ln)
+    prelim = next(ln for ln in text.splitlines() if ln.startswith("Preliminary."))
+    assert "The figures of Mill One are preliminary" in prelim, prelim         # the site's name as it is written
     d = world.c["analyst"].get(f"/api/reports/{row['id']}/pdf")
     assert d.status_code == 200 and f'filename="gridlytics-company-rollup-{month}.pdf"' in d.headers["content-disposition"]
     csv_rows = world.c["analyst"].get(f"/api/reports/{row['id']}/csv").text.splitlines()

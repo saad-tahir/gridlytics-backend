@@ -676,7 +676,8 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
     if prelim:
         why = ([f"the figures of {', '.join(prelim_names)} are preliminary (each site's monthly report says why)"] if prelim_names else []) + \
               ([] if over else ["the month is not over"])
-        doc.p("Preliminary. " + "; ".join(why).capitalize() + ".", lead="Preliminary.")
+        said = "; ".join(why)
+        doc.p("Preliminary. " + said[:1].upper() + said[1:] + ".", lead="Preliminary.")  # (not capitalize(): it lowercases the sites' names)
         doc.gap()
     if stale_names:
         doc.p(f"Recompute needed: {', '.join(stale_names)} {'has' if len(stale_names) == 1 else 'have'} days out of step, so "
