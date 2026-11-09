@@ -689,3 +689,28 @@ def test_energy_handed_to_a_day_the_plan_did_not_run_is_claimed_at_what_that_day
                                            start_carry=500.0, end_carry=200.0) for b in ("native", "tuned")}})
     n = verify.summary(sid, "2026-10-01", "2026-10-03")["baselines"]["native"]
     assert n["carry_over_provisional_rs"] == 550.0 and n["claimed_rs"] == pytest.approx(1000.0 + 700.0)
+
+
+# ------------------------------------------------------------------------------------------------ engine-savings-08, engine-money-live-02: HANDOFF
+# ------------------------------------------------------------------------------------------------ 8.A.1's done criterion, 11 days on three seeds
+
+ELEVEN = [LEAD + timedelta(days=i) for i in range(1, 12)]
+
+
+@pytest.mark.parametrize("seed", ["a", "b", "c"])
+def test_the_off_grid_farms_eleven_day_ledger_tracks_the_continuous_replay_and_its_claim_rests_on_no_carry_over_value(company, seed):
+    # The audit read the per-day ledger before round 6: each day's replays restarted from the actual arm's state and the whole end gap was credited
+    # at v_end (the genset's all-in cost at its night load, Rs 150-180/kWh), so 11 days missed the continuous replay by -6.2k to +7.9k and the
+    # farm's month was claimed on carry-over while it burnt more diesel than native. With chained replays (round 6), the last day's credit
+    # provisional (round 7, role-owner-02) and the hand-over to days the plan did not run realised (brief-vs-build-11), the period's ledger is the
+    # continuous replay, and the claim is the cost difference alone: no rupee of it rests on how stored energy is valued
+    sid = _farm(f"Farm eleven r7 {seed}")
+    _run(sid, [LEAD] + ELEVEN, _night_runs)
+    rows = [verify.compute_day(sid, d, with_bound=False)["native"] for d in ELEVEN]
+    assert all(r["claimed_rs"] == r["saving_rs"] for r in rows)
+    cont = _continuous(sid, ELEVEN, rows[-1]["actual"]["v_end"])
+    n = verify.summary(sid, ELEVEN[0].isoformat(), ELEVEN[-1].isoformat())["baselines"]["native"]
+    assert abs(n["saving_rs"] - cont) < 1_000.0 and n["saving_rs"] == pytest.approx(cont, abs=5.0), (n["saving_rs"], cont)
+    end = rows[-1]["chain"]["end"]["carry_rs"]
+    assert n["carry_over_provisional_rs"] == pytest.approx(end, abs=0.01)
+    assert n["claimed_rs"] == pytest.approx(cont - end, abs=5.0) and n["levers_claimed_rs"]["carry_over"] == pytest.approx(0.0, abs=0.05)
