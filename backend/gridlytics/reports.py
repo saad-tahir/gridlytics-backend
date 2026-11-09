@@ -27,6 +27,9 @@ KINDS = ("monthly_savings", "energy_only", "daily_operations")
 LEVER_NAMES = {"peak_window": "Peak-window import avoided", "offpeak_energy": "Off-peak energy (charging)", "export": "Export credit",
                "genset": "Genset fuel and running cost", "wear": "Battery wear", "carry_over": "Carry-over (change in stored energy)",
                "mdi": "Maximum demand (MDI)"}
+#: A connection's regime in words (the Site settings' words; audit role-viewer-17: the header printed the raw value "none")
+REGIME_WORDS = {"net_billing": "net billing (2026 rules)", "net_metering_legacy": "legacy net metering", "none": "no export (no net metering)",
+                "flat": "flat rate", "off_grid": "off-grid"}
 #: A day's fidelity class in words, as the Savings page's badges say it (savings-days-table.tsx FIDELITY)
 FIDELITY_WORDS = {"confirmed": "Confirmed", "partial": "Partly followed", "pending": "Awaiting confirmation", "not_applied": "Not applied",
                   "native_block": "Native block", "recommendation_only": "Recommendation only"}
@@ -220,7 +223,7 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     story.append(Paragraph(f"{title}: {_text(site['name'])}", styles["Title"]))
     conn = (site.get("connections") or [None])[0]
     sub = f"{p0:%d %B %Y} to {p1:%d %B %Y}. " + (f"{_text(site['data'].get('disco') or '')} {_text(conn['data']['tariff_category'])}, "
-                                                   f"{_text(conn['data']['regime'].replace('_', ' '))}. " if conn else "Off-grid. ")
+                                                   f"{_text(REGIME_WORDS.get(conn['data'].get('regime'), str(conn['data'].get('regime')).replace('_', ' ')))}. " if conn else "Off-grid. ")
     sub += f"Generated {datetime.now(PKT):%d %b %Y %H:%M} PKT by Gridlytics."
     story.append(Paragraph(sub, styles["Normal"]))
     story.append(Spacer(1, 4 * mm))
@@ -279,7 +282,7 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
                    (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld"] if money else []))
         for d in tdays:
             s = by_day.get(d["day"], {})
-            rows.append([d["day"], num(d.get("import_kwh")), num(d.get("pv_kwh")), num(d.get("outage_minutes"), ".1f", scale=60),
+            rows.append([_short_day(d["day"]), num(d.get("import_kwh")), num(d.get("pv_kwh")), num(d.get("outage_minutes"), ".1f", scale=60),
                          num(d.get("genset_hours"), ".1f")] +
                         ([rs(s.get("saving_native_rs")), _day_fidelity(s)] if money else []))
             ids = ""

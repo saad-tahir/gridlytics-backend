@@ -271,6 +271,28 @@ def _long(d: date) -> str:
     return f"{d.day} {d:%B %Y}"
 
 
+#: A connection's regime in words (the Site settings' words), for the agreement alert's title (audit role-viewer-17)
+REGIME_WORDS = {"net_billing": "net billing", "net_metering_legacy": "legacy net metering", "none": "no export", "flat": "flat rate",
+                "off_grid": "off-grid"}
+
+
+def _regime(regime) -> str:
+    return REGIME_WORDS.get(str(regime or ""), str(regime or "").replace("_", " "))
+
+
+def _long_day(day) -> str:
+    """"23 December 2026" for "2026-12-23"; the text itself when it is not a day."""
+    try:
+        return _long(date.fromisoformat(str(day)[:10]))
+    except ValueError:
+        return str(day)
+
+
+def _connection_words(data: dict) -> str:
+    """A grid connection as a person knows it: its meter reference, else its tariff and regime (never its internal id)."""
+    return str(data.get("meter_ref") or "").strip() or f"{data.get('tariff_category') or 'Grid connection'}, {_regime(data.get('regime'))}"
+
+
 def tariff_staleness(site: dict, now: int, rules_: dict) -> None:
     """Tariff (brief-vs-build-18): the stored tariff library has gone stale, read from its versions and fuel prices (nothing is fetched from
     NEPRA, OGRA or a DISCO: a new notification is still drafted and approved by a person, plan Part 6.2):
@@ -462,8 +484,8 @@ def evaluate(site_id: str, now: int | None = None) -> None:
                 soon = (date.fromisoformat(end) - datetime.fromtimestamp(now, PKT).date()).days <= _th(rules_, "Tariff", "agreement_days")
             except ValueError:
                 soon = False
-        _set(soon, site_id, f"regime_expiring_{c['id']}", "Tariff", "warning", f"The {c['data']['regime'].replace('_', ' ')} agreement ends on {end}",
-             {"connection": c["id"]})
+        _set(soon, site_id, f"regime_expiring_{c['id']}", "Tariff", "warning", f"The {_regime(c['data'].get('regime'))} agreement ends on {_long_day(end)}",
+             {"connection": _connection_words(c["data"]), "agreement_end": end})
     _bill_residual(site_id, float(_th(rules_, "Tariff", "bill_difference_pct")))
     tariff_staleness(site, now, rules_)
     _forecast_stages(site_id, now)

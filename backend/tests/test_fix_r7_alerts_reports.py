@@ -714,3 +714,47 @@ def test_a_report_made_while_days_are_out_of_step_says_so_and_the_fleet_roll_up_
     assert "Recompute needed" not in built[-1]
     fleet = world.c["admin"].get(f"/api/fleet/savings?month={month}").json()
     assert fleet["sites"][0]["chain_stale_days"] == [] and fleet["stale_sites"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ role-viewer-17
+
+def test_the_agreement_alert_says_its_date_and_connection_in_words(world):
+    """role-viewer-17: the title read "The net metering legacy agreement ends on 2026-12-23" and the drawer showed the connection's internal id."""
+    from datetime import date
+    sid, now = world.site, _now()
+    end = datetime.fromtimestamp(now, PKT).date() + timedelta(days=30)
+    with world.use():
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "regime": "net_metering_legacy", "agreement_end": end.isoformat(), "meter_ref": "FS-24-11-0042"},
+                             "test", conn_id=conn["id"])
+        alerts.evaluate(sid, now)
+        got = next(a for a in alerts.listing("active", sid) if a["rule"].startswith("regime_expiring_"))
+    assert got["title"] == f"The legacy net metering agreement ends on {end.day} {end:%B %Y}", got["title"]
+    assert conn["id"] not in json.dumps(got["detail"]) and got["detail"]["connection"] == "FS-24-11-0042", got["detail"]
+    assert date.fromisoformat(got["detail"]["agreement_end"]) == end
+    # a connection without a meter reference is named by its tariff and regime
+    with world.use():
+        sites.put_connection(sid, {**conn["data"], "regime": "net_billing", "agreement_end": end.isoformat(), "meter_ref": ""}, "test", conn_id=conn["id"])
+        alerts.evaluate(sid, now)
+        got = next(a for a in alerts.listing("active", sid) if a["rule"].startswith("regime_expiring_"))
+    assert got["detail"]["connection"] == "B-2(b), net billing", got["detail"]
+    assert got["title"].startswith("The net billing agreement ends on"), got["title"]
+
+
+def test_the_energy_report_says_the_regime_and_the_days_in_words(world, monkeypatch):
+    """role-viewer-17: the energy report's header read "FESCO B-2(b), none." and its rows ISO dates."""
+    from datetime import date
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    day = f"{month}-06"
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(day)]), [_tday(day)])
+    built = _story(monkeypatch)
+    with world.use():
+        for kind in ("energy_only", "monthly_savings"):
+            reports.generate(kind, sid, month, "test")
+            text = built[-1]
+            header = text.splitlines()[1]
+            assert "none" not in header and "no export" in header, header
+            d = date.fromisoformat(day)
+            assert day not in text and f"{d:%a} {d.day} {d:%b}" in text, text
+    assert not re.search(r"\b(confirmed|not_applied|native_block|recommendation_only)\b", built[-1]), built[-1]
