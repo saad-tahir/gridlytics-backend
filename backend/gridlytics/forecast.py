@@ -222,7 +222,54 @@ def censored_minutes(site: dict, g: dict) -> np.ndarray:
     return cen
 
 
+#: the critical load learnt from outages (plan Part 4.1 and 5.2): the CRIT_QUANTILE of the load seen while the battery alone carried the site through an
+#: outage (the genset off, the state of charge above the cut-off plus CRIT_SOC_MARGIN), per local hour; an hour is learnt from at least
+#: CRIT_MIN_MINUTES of such load on at least CRIT_MIN_DAYS days, and every other hour keeps the entered profile (`critical_load_kw`)
+CRIT_QUANTILE = 0.75
+CRIT_SOC_MARGIN = 0.05
+CRIT_MIN_MINUTES = 30
+CRIT_MIN_DAYS = 2
+
+
+def critical_profile(site: dict, g: dict) -> tuple[np.ndarray, int]:
+    """(the critical load by local hour (kW, 24 values), the hours of it learnt from outages): the entered profile where an hour has too few adequately
+    backed outage minutes. A minute is adequately backed when the grid was down, the load was read, the battery's state of charge was known and above
+    its cut-off plus CRIT_SOC_MARGIN, the genset was not running (unknown counts as running at a site with a genset: a doubtful minute teaches
+    nothing), nothing went unserved and the source did not flag the minute censored. The load then is what the battery carried: the critical
+    circuits. A site without a battery has no such outage, and an off-grid site has no outages at all (its grid always reads 0), so both keep the
+    entered profile. Minutes are counted in the source's own interval, as the stage rules are."""
+    prof = np.asarray(twin.critical_share(site), dtype=float).copy()
+    assets = site.get("assets") or {}
+    bat = assets.get("battery")
+    conns = site.get("connections") or []
+    if not bat or not conns or conns[0]["data"].get("regime") == "off_grid" or not len(g.get("ts", [])):
+        return prof, 0
+    n = len(g["ts"])
+    lo = np.asarray(g["load"], dtype=float)
+    nan = np.full(n, np.nan)
+    soc = np.asarray(g.get("soc", nan), dtype=float)
+    gen_on = np.asarray(g.get("gen_on", nan), dtype=float)
+    gen_off = (gen_on == 0) | (np.isnan(gen_on) & (not assets.get("genset")))
+    ok = ((np.asarray(g["grid"], dtype=float) == 0) & ~np.isnan(lo) & gen_off & (soc > float(bat.get("soc_min", 0.10)) + CRIT_SOC_MARGIN)
+          & ~(np.nan_to_num(np.asarray(g.get("unserved", nan), dtype=float)) > 0) & ~(np.asarray(g.get("censored", nan), dtype=float) == 1))
+    if not ok.any():
+        return prof, 0
+    iv = sample_minutes(~np.isnan(lo))
+    loc = np.asarray(g["ts"], dtype=np.int64) + 5 * 3600
+    hour, day = (loc % 86400) // 3600, loc // 86400
+    learnt = 0
+    for h in range(24):
+        m = ok & (hour == h)
+        if m.sum() * iv >= CRIT_MIN_MINUTES and len(np.unique(day[m])) >= CRIT_MIN_DAYS:
+            prof[h] = float(np.quantile(lo[m], CRIT_QUANTILE))
+            learnt += 1
+    return prof, learnt
+
+
 def load(site: dict, t0: int, steps: int = STEPS) -> dict:
+    """The load quantiles per step and the critical load (`crit`, learnt from outages where it can be: critical_profile), with `crit_learned_hours`,
+    the hours of the day learnt, and `crit_zero`, set when the critical load is zero in every hour (nothing entered or learnt: the reserve rule then
+    holds nothing for an outage, and the pages say so)."""
     t = step_times(t0, steps)
     tmpl = _mean15(lambda x: twin.load_template(site, x), t)
     h0 = t0 - 21 * 86400
@@ -233,11 +280,13 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     iv = sample_minutes(~np.isnan(g["load"]))
     have_days = int(np.sum(~np.isnan(lo)) * iv // 1440)
     hours = ((t + 5 * 3600) % 86400) // 3600
-    crit = twin.critical_share(site)[hours]
+    prof, learnt = critical_profile(site, g)
+    crit = prof[hours]
+    crit_info = {"crit_learned_hours": int(learnt), "crit_zero": bool(np.all(prof <= 0))}
     if have_days < 3:
         q = {name: tmpl * (1 + 0.25 * (v - 0.5) / 0.45) for name, v in zip(QS, QV)}
         q["q50"] = tmpl
-        return {"stage": 0, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days}
+        return {"stage": 0, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days, **crit_info}
     # equivalent-day persistence: per target step, the same slot on the last same-day-type days (up to 7)
     lo15 = np.nanmean(lo[: len(lo) // 15 * 15].reshape(-1, 15), axis=1)
     hist_t = h0 + STEP_S * np.arange(len(lo15))
@@ -271,7 +320,7 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
             w = np.exp(-np.arange(steps) / 8.0)
             qarr = qarr * (1 + (ratio - 1) * w)
     q = {name: qarr[j] for j, name in enumerate(QS)}
-    return {"stage": 1, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days}
+    return {"stage": 1, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days, **crit_info}
 
 
 # ------------------------------------------------------------------------------------------------ outages
@@ -525,7 +574,8 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
     p, l, o = pv(site, t0), load(site, t0), outage(site, t0, now=now)
     if save:
         telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION, {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr")})
-        telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION, {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"])})
+        telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION, {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"]),
+                                                                           "crit_learned_hours": l.get("crit_learned_hours"), "crit_zero": l.get("crit_zero")})
         telemetry.save_forecast(site["id"], "outage", t0, o["stage"], VERSION,
                                 {"p_down": _r(o["p_down"]), "p_start": _r(o["p_start"]), "dur_steps": [int(x) for x in o["dur_steps"]], "g": _r(o["g"], 0),
                                  "observed": o.get("observed"), "adherence": o.get("adherence"), "adherence_windows": o.get("adherence_windows"),

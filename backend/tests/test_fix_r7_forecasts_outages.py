@@ -489,3 +489,112 @@ def test_a_refresh_keeps_the_quarter_s_observed_outage_when_the_edge_s_rows_lag(
     with w.use():
         kept = telemetry.latest_forecast(w.site, "outage")
     assert kept["belief_time"] == t0 and kept["observed"] == observed
+
+
+# ------------------------------------------------------------------------------------------------ load: helpers
+
+#: a 200 kWh battery whose cut-off is 10 %: the backing is adequate while the state of charge is above 15 %
+BATTERY = {"e_nom_kwh": 200.0, "p_ch_kw": 100.0, "p_dis_kw": 100.0, "soc_min": 0.10, "soc_max": 0.95, "eta_c": 0.95, "eta_d": 0.95}
+
+
+def _load_site(sid: str, crit=None, battery: bool = True, genset: bool = False, **data) -> dict:
+    d = {"disco": "LESCO", "lat": LAT, "lon": LON, "site_type": "industrial_2_shift", "load_peak_kw": 100.0, **data}
+    if crit is not None:
+        d["critical_load_kw"] = [float(crit)] * 24
+    assets = {"battery": BATTERY} if battery else {}
+    if genset:
+        assets["genset"] = {"kva": 100.0, "kw": 80.0}
+    return {"id": sid, "data": d, "connections": [{"id": "c1", "data": {"regime": "none"}}], "assets": assets}
+
+
+def _write_load(sid: str, ts, load_kw, grid=None, soc=None, gen_on=None) -> None:
+    """1-minute load rows with, where given, the grid-present flag, the estimated state of charge (0-1) and the genset's running flag."""
+    cols = ["site_id", "ts", "source_id", "load_power_w"]
+    extra = []
+    for name, col in ((grid, "grid_present"), (soc, "battery_soc_est_pct"), (gen_on, "genset_running")):
+        if name is not None:
+            cols.append(col)
+            extra.append(np.broadcast_to(np.asarray(name, dtype=float), (len(ts),)))
+    scale = {"battery_soc_est_pct": 100.0}
+    rows = []
+    for i, (t, v) in enumerate(zip(ts, load_kw)):
+        row = [sid, int(t), "edge", float(v) * 1000]
+        for c, a in zip(cols[4:], extra):
+            row.append(float(a[i]) * scale.get(c, 1.0))
+        rows.append(tuple(row))
+    telemetry.write_rows(rows, tuple(cols))
+
+
+def _local_hour(ts) -> np.ndarray:
+    return ((np.asarray(ts, dtype=np.int64) + 5 * 3600) % 86400) // 3600
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-05
+
+def _evening_outages(sid: str, t0: int, days: int = 6, crit_kw: float = 30.0, soc: float = 0.6, gen_on=None) -> None:
+    """`days` days of 100 kW load before t0 with the grid down from 18:00 to 20:00 each evening, when only the backed-up circuits run (crit_kw)."""
+    ts = np.arange(t0 - days * 86400, t0, 60, dtype=np.int64)
+    h = _local_hour(ts)
+    down = (h >= 18) & (h < 20)
+    _write_load(sid, ts, np.where(down, crit_kw, 100.0), grid=np.where(down, 0.0, 1.0), soc=np.full(len(ts), soc),
+                gen_on=None if gen_on is None else np.full(len(ts), float(gen_on)))
+
+
+def test_the_critical_load_is_learnt_from_outages_the_battery_carried(company):
+    """Plan Part 4.1 and 5.2: Lc is the 75th percentile of the load seen in adequately backed outages (the genset off, the state of charge above the
+    cut-off plus 5 points), per hour of day, with the entered profile as the fallback. Six evenings with the grid down from 18:00 to 20:00 and 30 kW
+    carried by the battery: the forecast's critical load is 30 kW in those hours and the entered 0 elsewhere. v1 read only the onboarding form's
+    profile, whose default of 0 kW left the reserve rule with nothing to hold."""
+    site = _load_site("crit-learnt")
+    t0 = _midnight(date(2026, 11, 5))
+    _evening_outages("crit-learnt", t0)
+    f = forecast.load(site, t0)
+    h = _local_hour(forecast.step_times(t0))
+    assert np.allclose(f["crit"][(h >= 18) & (h < 20)], 30.0, atol=0.5), f["crit"][(h >= 18) & (h < 20)]
+    assert np.all(f["crit"][(h < 18) | (h >= 20)] == 0.0)
+    assert f["crit_learned_hours"] == 2 and f["crit_zero"] is False
+    # the issue carries both, for the forecast page
+    forecast.issue(site, t0)
+    body = telemetry.latest_forecast("crit-learnt", "load")
+    assert body["crit_learned_hours"] == 2 and body["crit_zero"] is False
+
+
+@pytest.mark.parametrize("case", ["soc_at_cut_off", "genset_running", "soc_unknown", "no_battery"])
+def test_an_outage_without_adequate_backing_teaches_nothing_and_the_entered_profile_stays(company, case):
+    """An outage carried at the battery's cut-off (plus 5 points), with the genset running, with no state of charge, or at a site without a battery
+    says nothing about the critical load: the entered 50 kW stays in every hour."""
+    sid = f"crit-{case}"
+    site = _load_site(sid, crit=50, battery=case != "no_battery", genset=case == "genset_running")
+    t0 = _midnight(date(2026, 11, 5))
+    if case == "soc_unknown":
+        ts = np.arange(t0 - 6 * 86400, t0, 60, dtype=np.int64)
+        down = (_local_hour(ts) >= 18) & (_local_hour(ts) < 20)
+        _write_load(sid, ts, np.where(down, 30.0, 100.0), grid=np.where(down, 0.0, 1.0))
+    else:
+        _evening_outages(sid, t0, soc=0.12 if case == "soc_at_cut_off" else 0.6, gen_on=1 if case == "genset_running" else None)
+    f = forecast.load(site, t0)
+    assert np.allclose(f["crit"], 50.0), np.unique(f["crit"])
+    assert f["crit_learned_hours"] == 0 and f["crit_zero"] is False
+
+
+def test_a_critical_load_of_zero_everywhere_is_flagged(company):
+    """Nothing entered (the form's default of 0 kW) and nothing learnt: the issue flags `crit_zero`, so the pages can say the plan holds no reserve."""
+    site = _load_site("crit-zero", battery=False)
+    t0 = _midnight(date(2026, 11, 5))
+    _evening_outages("crit-zero", t0)
+    f = forecast.load(site, t0)
+    assert np.all(f["crit"] == 0.0) and f["crit_zero"] is True and f["crit_learned_hours"] == 0
+    # stage 0 (no history) flags it too
+    g = forecast.load(_load_site("crit-zero-new", battery=False), t0)
+    assert g["stage"] == 0 and g["crit_zero"] is True
+
+
+def test_an_off_grid_site_does_not_learn_its_critical_load_from_the_always_down_grid(company):
+    """An off-grid site's grid reads 0 at every minute: those are not outages, so the entered profile stays (the plan carries the whole load there)."""
+    site = _load_site("crit-offgrid", crit=8)
+    site["connections"] = [{"id": "c1", "data": {"regime": "off_grid"}}]
+    t0 = _midnight(date(2026, 11, 5))
+    ts = np.arange(t0 - 6 * 86400, t0, 60, dtype=np.int64)
+    _write_load("crit-offgrid", ts, np.full(len(ts), 40.0), grid=np.zeros(len(ts)), soc=np.full(len(ts), 0.6))
+    f = forecast.load(site, t0)
+    assert np.allclose(f["crit"], 8.0) and f["crit_learned_hours"] == 0
