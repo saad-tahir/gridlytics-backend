@@ -51,7 +51,7 @@ def state(site: dict, now: int | None = None) -> dict | None:
     out = {"e_nom_kwh": round(e_nom, 1), "c_cyc": round(optimise.wear_cost(b), 2), "soh_pct": round(b.get("soh", 1.0) * 100, 1),
            "p_ch_kw": b["p_ch_kw"], "p_dis_kw": b["p_dis_kw"], "soc_min_pct": b["soc_min"] * 100, "soc_max_pct": b["soc_max"] * 100}
     if not known.any():
-        return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "usable_kwh": None, "anchor": None, "alerts": [], "waiting_for_anchor": True,
+        return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "trust_basis": None, "usable_kwh": None, "anchor": None, "alerts": [], "waiting_for_anchor": True,
                 "reading_age_min": None, "stale": True, "anchor_due": False, "anchor_soc_pct": None}
     last = int(np.where(known)[0][-1])
     soc = float(est[last])
@@ -72,12 +72,18 @@ def state(site: dict, now: int | None = None) -> dict | None:
     # that sends the estimate part of the time), and comparing the BMS with itself there would dilute the gap and hide a low trust
     soc_est = g.get("soc_est", g["soc"])
     both = known & ~np.isnan(g["soc_bms"]) & ~np.isnan(soc_est)
-    gap = float(np.mean(np.abs(g["soc_bms"][both] - soc_est[both])) * 100) if both.any() else 0.0
     anchor_cov = min(1.0, len(np.unique(g["ts"][anchors] // 86400)) / 30.0) if len(anchors) else 0.0
-    trust = round(0.4 * max(0.0, 1 - gap / 10.0) + 0.3 * max(0.0, 1 - sigma / 25.0) + 0.2 * (1.0 if gap < 5 else 0.5) + 0.1 * anchor_cov, 3)
+    if both.any():
+        gap = float(np.mean(np.abs(g["soc_bms"][both] - soc_est[both])) * 100)
+        trust = round(0.4 * max(0.0, 1 - gap / 10.0) + 0.3 * max(0.0, 1 - sigma / 25.0) + 0.2 * (1.0 if gap < 5 else 0.5) + 0.1 * anchor_cov, 3)
+        basis = "independent"
+    else:
+        # nothing independent to check the BMS against (a BMS-only or CSV source: the estimate is the BMS itself): trust is not assessed (round 7,
+        # brief-vs-build-03). Scored with a gap of 0 it read 0.6 to 1.0 whatever the BMS's quality, and trust_low could never fire
+        trust, basis = None, "bms_only"
     usable = e_nom * max(0.0, soc - 2 * sigma / 100.0 - b["soc_min"]) * b["eta_d"]
     alerts = []
-    if trust < 0.5:
+    if trust is not None and trust < 0.5:
         alerts.append(("trust_low", f"Battery estimate trust is {trust:.2f}, under 0.5"))
     bms_now = g["soc_bms"][last]
     if not np.isnan(bms_now) and abs(bms_now - soc) > 0.10:
@@ -103,7 +109,7 @@ def state(site: dict, now: int | None = None) -> dict | None:
     days_seen = max(1.0, known.sum() / 1440)
     cycles = disch / max(e_nom, 1e-6)
     return {**out, "soc_pct": round(soc * 100, 1), "soc_bms_pct": None if np.isnan(bms_now) else round(float(bms_now) * 100, 1),
-            "sigma_pct": round(sigma, 1), "trust": trust, "usable_kwh": round(usable, 1), "anchor": anchor_ts, "alerts": alerts,
+            "sigma_pct": round(sigma, 1), "trust": trust, "trust_basis": basis, "usable_kwh": round(usable, 1), "anchor": anchor_ts, "alerts": alerts,
             "throughput_30d_kwh": round(float(disch), 1), "cycles_30d": round(cycles, 2), "cycles_per_day": round(cycles / days_seen, 2),
             "hot_full_hours_24h": round(float(hot), 1), "wear_30d_rs": round(float(disch * optimise.wear_cost(b)), 0), "last_ts": int(g["ts"][last]),
             "waiting_for_anchor": anchor_ts is None, "reading_age_min": round(age_min, 1), "stale": bool(age_min > STALE_MINUTES),

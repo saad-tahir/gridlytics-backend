@@ -1042,3 +1042,24 @@ def test_the_first_plan_that_schedules_the_anchor_fixes_when_so_re_planning_neve
     assert battery.state(sites.full(sid), t_full)["anchor_due"] is False
     plans.tick(sid, at=t_full)
     assert sites.full(sid)["state"].get("anchor_by") is None
+
+
+# ------------------------------------------------------------------------------------------------ brief-vs-build-03
+
+def test_trust_in_a_bms_with_nothing_independent_to_compare_it_with_is_not_assessed(company):
+    """A BMS-only (or CSV) source compared the BMS with itself: the gap was 0, so trust read 0.6 to 1.0 whatever the BMS's quality and trust_low
+    could never fire. With no independent estimate trust is not assessed (null, basis "bms_only"); with one it is scored as before."""
+    from gridlytics import battery
+    start = twin.day_start_utc(date(2026, 11, 3))
+    now = start + 2 * 86400 + 18 * 3600
+    bms_only = _battery_site()
+    _daily_cycles(bms_only, start, 3, top=95.0, est=False, until=now)
+    st = battery.state(sites.full(bms_only), now)
+    assert st["soc_pct"] is not None
+    assert st["trust"] is None and st["trust_basis"] == "bms_only"
+    assert "trust_low" not in [a[0] for a in st["alerts"]]
+    both = _battery_site()
+    _daily_cycles(both, start, 3, top=95.0, bms_off=12.0, until=now)  # an estimate 12 points under the BMS
+    st = battery.state(sites.full(both), now)
+    assert st["trust_basis"] == "independent" and st["trust"] < 0.5
+    assert "trust_low" in [a[0] for a in st["alerts"]]
