@@ -3,8 +3,13 @@
 flow-onboarding-05: a resumed wizard draft sent its older values back with `PUT /api/sites/:id` and silently reverted what the owner had changed in Site
 settings since. A save may now carry `if_unchanged`, the stored values its form was based on (null: none was stored); when they are no longer what is
 stored, the save is refused with 409 `site_changed` instead of writing over the newer values. Without it a save is written as before.
+
+flow-onboarding-07: an empty tariff category was stored (200), after which the active site never planned and raised no alert. ConnectionFields now refuses an
+empty or unknown category in the web app's sentence, and activation asks for one when a connection stored before the check has none.
 """
 from __future__ import annotations
+
+import pytest
 
 from gridlytics import sites
 from test_fix_api import world  # noqa: F401  (world is a fixture)
@@ -104,3 +109,35 @@ def test_an_asset_save_based_on_older_values_is_refused(world):
     held = {k: v for k, v in _site(a, sid)["assets"]["battery"].items() if k != "id"}
     r = op.put(f"/api/sites/{sid}/assets/battery", json={**held, "soc_min": 0.15, "if_unchanged": held})
     assert r.status_code == 200 and r.json()["assets"]["battery"]["soc_min"] == 0.15, r.text
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-07
+
+def test_an_empty_or_unknown_tariff_category_is_refused_and_activation_asks_for_one(world):
+    a, sid = world.c["admin"], world.site
+    conn = _site(a, sid)["connections"][0]
+    # an empty category (or one of spaces) was stored with 200, and the site then never planned: refused in the web app's own sentence
+    for empty in ("", "   "):
+        r = a.put(f"/api/sites/{sid}/connection", json={"id": conn["id"], "tariff_category": empty})
+        assert r.status_code == 422 and r.json()["code"] == "invalid", r.text
+        assert r.json()["detail"] == "Choose the tariff category printed on the bill"
+    r = a.put(f"/api/sites/{sid}/connection", json={"tariff_category": "", "meter_ref": "M-2"})
+    assert r.status_code == 422 and r.json()["detail"] == "Choose the tariff category printed on the bill", r.text
+    r = a.put(f"/api/sites/{sid}/connection", json={"id": conn["id"], "tariff_category": "Z-9"})
+    assert r.status_code == 422 and r.json()["detail"] == "Unknown tariff category Z-9", r.text
+    with world.use():
+        with pytest.raises(ValueError, match="Choose the tariff category"):
+            sites.put_connection(sid, {"tariff_category": ""}, "test")
+    held = _site(a, sid)["connections"]
+    assert [c["data"]["tariff_category"] for c in held] == ["B-2(b)"]
+    # a connection stored with no category before this check: the site is not activated, and is told which tab to finish
+    with world.use():
+        from gridlytics import store
+        with store.connect() as con:
+            con.execute("UPDATE connections SET data = json_set(data, '$.tariff_category', '') WHERE id = ?", (conn["id"],))
+        sites.put_asset(sid, "inverter", {"kw_ac": 100}, "test")
+    a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "csv", "grid_signal_confirmed": True}})
+    r = a.post(f"/api/sites/{sid}/activate")
+    assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
+    assert "the tariff category of each grid connection (tab C)" in r.json()["detail"]
+    assert _site(a, sid)["status"] != "active"

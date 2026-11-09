@@ -207,6 +207,9 @@ def site_activate(site_id: str):
         missing.append("the inverter (tab B)")
     if not _grid_settled(s, s.get("connections") or []):
         missing.append("the grid connection and tariff (tab C)")
+    elif any((c.get("data") or {}).get("tariff_category") not in tariff_data.CARDS_279 for c in s.get("connections") or []):
+        # a connection stored before the category was checked (audit flow-onboarding-07): the tick could price nothing and the site never planned
+        missing.append("the tariff category of each grid connection (tab C)")
     if missing:
         raise Refusal(422, "Add " + " and ".join(missing) + " before activating", "incomplete")
     sites.set_status(site_id, "active")
@@ -254,8 +257,7 @@ def connection_put(site_id: str, inp: dict = Body(...), idempotency_key: str | N
     if expect is not sites.UNCHECKED and not conn_id:
         raise Refusal(422, "if_unchanged goes with the id of the saved connection it was read from", "invalid")
     try:
-        if inp.get("tariff_category") and inp["tariff_category"] not in tariff_data.CARDS_279:
-            raise ValueError(f"Unknown tariff category {inp['tariff_category']}")
+        # the tariff category is checked by ConnectionFields (an empty or unknown one is refused, audit flow-onboarding-07)
         if conn_id:
             sites.put_connection(site_id, inp, auth.actor(), conn_id, expect)
         else:

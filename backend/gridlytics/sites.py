@@ -10,9 +10,9 @@ import json
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
-from . import store
+from . import store, tariff_data
 from .schemas import Strict, check
 
 TIERS = ("monitor", "advisory_writes", "closed_loop")
@@ -124,6 +124,16 @@ class ConnectionFields(Strict):
     #: the meter's reading day of the month (from the onboarding bill): a day after it belongs to the next month's bill (tariffs.billing_period_for);
     #: unset, the bill is the calendar month. 29 to 31 read as the month's last day in a shorter month
     reading_day: int | None = Field(None, ge=1, le=31)
+
+    @field_validator("tariff_category")
+    @classmethod
+    def _category(cls, v: str) -> str:
+        """A category the rate cards know (audit flow-onboarding-07): an empty one was stored, and the site then never planned and raised no alert."""
+        if not v:
+            raise ValueError("Choose the tariff category printed on the bill")
+        if v not in tariff_data.CARDS_279:
+            raise ValueError(f"Unknown tariff category {v}")
+        return v
 
 
 class PvFields(Strict):
