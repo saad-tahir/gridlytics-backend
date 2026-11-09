@@ -203,6 +203,11 @@ def site_activate(site_id: str):
     if not s:
         raise HTTPException(status_code=404, detail="No such site")
     missing = []
+    src = (s.get("data") or {}).get("data_source") or {}
+    if not (isinstance(src, dict) and src.get("kind") in sites.DATA_SOURCE_KINDS and src.get("grid_signal_confirmed")):
+        # plan 9.3 tab A: without a grid-presence signal outages cannot be seen and the reserve cannot be planned (audit flow-onboarding-08: a site with no
+        # source, or an unconfirmed one, was activated and planned)
+        missing.append("the data source, with its grid-presence signal confirmed (tab A)")
     if not (s.get("assets") or {}).get("inverter"):
         missing.append("the inverter (tab B)")
     if not _grid_settled(s, s.get("connections") or []):

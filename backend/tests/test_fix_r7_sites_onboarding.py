@@ -15,6 +15,9 @@ savings replay then used the impossible slot as the overnight default. A slot no
 
 role-operator-16 (and role-owner-35, role-analyst-27): a native capture held up to fourteen slots whatever the inverter, so a six-program Deye could be given
 a table it cannot hold. A capture now holds at most the slots of the site's inverter brand (delivery.BRANDS, GET /api/meta brand_grammars).
+
+flow-onboarding-08: the API activated a site with no data source, or with a grid-presence signal nobody confirmed, and it was then planned although its
+outages could not be seen. Activation now asks for the data source with its grid-presence signal confirmed (tab A), as the wizard does.
 """
 from __future__ import annotations
 
@@ -232,3 +235,30 @@ def test_a_native_capture_holds_no_more_slots_than_the_sites_inverter_table(worl
     assert _native(op, sid, hours[:7]).json()["detail"] == "An inverter's table holds at most 6 slots"
     with world.use():
         assert [v["version"] for v in sites.native_versions(sid)] == [2, 1]        # newest first: only the two that fit were kept
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-08
+
+def test_activation_asks_for_a_data_source_whose_grid_signal_was_confirmed(world):
+    a, sid = world.c["admin"], world.site
+    with world.use():
+        sites.put_asset(sid, "inverter", {"kw_ac": 100}, "test")
+    # no data source at all: the site was activated (200) and planned, although outages could not be seen
+    r = a.post(f"/api/sites/{sid}/activate")
+    assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
+    assert r.json()["detail"] == "Add the data source, with its grid-presence signal confirmed (tab A) before activating"
+    # a source whose grid-presence signal was never confirmed: refused the same way
+    assert a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "oem_cloud", "grid_signal_confirmed": False}}).status_code == 200
+    r = a.post(f"/api/sites/{sid}/activate")
+    assert r.status_code == 422 and "the data source, with its grid-presence signal confirmed (tab A)" in r.json()["detail"], r.text
+    assert _site(a, sid)["status"] != "active"
+    # every missing part is named, in tab order
+    with world.use():
+        sites.remove_asset(sid, "inverter", "test")
+    r = a.post(f"/api/sites/{sid}/activate")
+    assert r.json()["detail"] == "Add the data source, with its grid-presence signal confirmed (tab A) and the inverter (tab B) before activating"
+    with world.use():
+        sites.put_asset(sid, "inverter", {"kw_ac": 100}, "test")
+    assert a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}}).status_code == 200
+    r = a.post(f"/api/sites/{sid}/activate")
+    assert r.status_code == 200 and r.json()["status"] == "active", r.text
