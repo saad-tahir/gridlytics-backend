@@ -84,3 +84,46 @@ def test_a_viewer_receives_only_the_energy_categories_of_alerts(world):
     with world.use():
         product = next(a for a in alerts.listing("active", sid) if a["category"] == "Product")
     assert world.c["operator"].post(f"/api/alerts/{product['id']}/acknowledge", json={}).status_code == 404
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-27
+
+def _activated_at(sid: str, ts: int) -> None:
+    """The site activated at `ts`, as POST /activate records it (status and its audit line)."""
+    sites.set_status(sid, "active")
+    with store.connect() as con:
+        con.execute("INSERT INTO audit (at, actor, action, target) VALUES (?,?,?,?)",
+                    (datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds"), "test", "activated a site", sid))
+
+
+def test_a_site_that_never_sent_data_raises_a_data_alert_after_its_sources_limit(world):
+    sid = world.site
+    now = _now()
+    with world.use():
+        _activated_at(sid, now - 20 * 60)
+        assert telemetry.latest(sid) is None
+        alerts.evaluate(sid, now)                           # 20 minutes after activation: an edge or batch source may take 30
+        assert "data_stale" not in _rules_of(alerts.listing("active", sid))
+        alerts.evaluate(sid, now + 15 * 60)                 # 35 minutes
+        stale = [a for a in alerts.listing("active", sid) if a["rule"] == "data_stale"]
+        assert len(stale) == 1 and stale[0]["category"] == "Data" and stale[0]["severity"] == "warning", stale
+        assert "No data has arrived" in stale[0]["title"] and stale[0]["detail"]["last_ts"] is None, stale
+        alerts.evaluate(sid, now + 3 * 3600)                # past the critical limit
+        assert [a["severity"] for a in alerts.listing("active", sid) if a["rule"] == "data_stale"] == ["critical"]
+        # the first reading clears it
+        telemetry.ingest(sid, [{"ts": (now + 3 * 3600) // 60 * 60 - 60, "grid_present": 1}], "edge")
+        alerts.evaluate(sid, now + 3 * 3600)
+        assert "data_stale" not in _rules_of(alerts.listing("active", sid))
+
+
+def test_a_csv_site_that_never_uploaded_waits_a_day(world):
+    sid = world.site
+    now = _now()
+    with world.use():
+        sites.update(sid, {"data_source": {"kind": "csv"}}, "test")
+        _activated_at(sid, now - 23 * 3600)
+        alerts._stale(sid, None, now)
+        assert "data_stale" not in _rules_of(alerts.listing("active", sid))
+        alerts._stale(sid, None, now + 2 * 3600)
+        stale = [a for a in alerts.listing("active", sid) if a["rule"] == "data_stale"]
+        assert len(stale) == 1 and "No data has arrived" in stale[0]["title"], stale

@@ -71,11 +71,31 @@ def _last_upload(site_id: str) -> int | None:
         return None
 
 
+def _activated(site_id: str) -> int | None:
+    """When the site was last activated (its audit line), else when it was added: the start of the wait for its first reading."""
+    with store.connect() as con:
+        r = con.execute("SELECT at FROM audit WHERE action = 'activated a site' AND target = ? ORDER BY id DESC LIMIT 1", (site_id,)).fetchone()
+        if r is None:
+            r = con.execute("SELECT created AS at FROM sites WHERE id = ?", (site_id,)).fetchone()
+    try:
+        return int(datetime.fromisoformat(r["at"]).timestamp()) if r else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _stale(site_id: str, last: dict | None, now: int) -> None:
+    """The Data alert of a source gone quiet, by its kind's limits; a site that never sent a reading waits from its activation (pages-D-27: on day one
+    the Data category fires first, R8 2.16), under the limits of the kind of source it was set up with."""
     source = str((last or {}).get("source_id") or "")
+    if last is None:
+        source = str(((sites.get(site_id) or {}).get("data", {}).get("data_source") or {}).get("kind") or "")
     warn, crit = STALE_MINUTES.get(source, STALE_DEFAULT)
     if last is None:
-        age, title = None, ""
+        since = _activated(site_id)
+        age = (now - since) / 60 if since is not None else None
+        hours = (age or 0) / 60
+        title = ("No data has arrived since the site was activated "
+                 + (f"{int(age)} minutes ago" if (age or 0) < 120 else f"{int(hours)} hours ago" if hours < 48 else f"{int(hours // 24)} days ago"))
     elif source == "csv":
         up = _last_upload(site_id)
         age = (now - max(last["ts"], up or 0)) / 60
