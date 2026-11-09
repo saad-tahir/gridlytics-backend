@@ -251,7 +251,9 @@ def test_the_mdi_lever_respects_the_billing_floor_and_the_mdi_interval(company):
     assert s["baselines"]["native"]["levers"]["mdi"] == 0.0  # before: Rs 50,000 though the bill is the same at both peaks
     assert s["baselines"]["native"]["claimed_rs"] == 0.0
     _put_rows(sid, {"2026-10-10": {b: _row(peak_a=80.0, peak_b=120.0, rate=1250.0, floor=100.0) for b in ("native", "tuned")}})
-    assert verify.summary(sid, "2026-10-01", "2026-10-31")["baselines"]["native"]["levers"]["mdi"] == pytest.approx(25_000.0)
+    n = verify.summary(sid, "2026-10-01", "2026-10-31")["baselines"]["native"]
+    # the month's lever is 25,000; its one scored day carries 1/31 of it (round 7, audit flow-savings-pilot-bill-01: a day's share, not the month's)
+    assert n["mdi_months"]["2026-10"]["lever_rs"] == pytest.approx(25_000.0) and n["levers"]["mdi"] == pytest.approx(25_000.0 / 31, abs=0.01)
     # 15-minute MDI blocks, as the bill engine reads them
     conn = {"id": "c1", "data": {"disco_group": "xwdisco", "tariff_category": "B-2(b)", "regime": "none", "sanctioned_load_kw": 400, "export_cap_kw": 0,
                                  "mdi_interval_min": 15, "icp": {"eligible": False}, "tax": {"province": "punjab"}, "seasonal_multiplier": 1.0,

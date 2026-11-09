@@ -4,14 +4,14 @@ Each test fails on the code before its fix. Test data: the demo twin's generated
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from test_fix_r2_savings import NIGHT_CHARGER, D, P
 from test_fix_r6_savings import DAYS, LEAD, _blank_evening, _farm, _night_runs, _run
 from test_fix_savings import _put_rows, company, make_site, twin_day  # noqa: F401 (company is a fixture)
 
-from gridlytics import sites, store, telemetry, twin, verify
+from gridlytics import sites, store, tariffs, telemetry, twin, verify
 
 
 def _iso(ts: float) -> str:
@@ -290,3 +290,114 @@ def test_a_carry_over_credit_is_claimed_once_a_later_day_has_used_the_stored_ene
     n = verify.summary(sid, "2026-10-01", "2026-10-05")["baselines"]["native"]
     assert n["claimed_rs"] == 2300.0 and n["carry_over_provisional_rs"] == 100.0  # 1,100 + 900 + 400, less the new last day's 100
     assert n["levers_claimed_rs"]["carry_over"] == 500.0  # 500 + 300 - 200, less the 100 still provisional
+
+
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-01, pages-D-03, engine-savings-04,
+# ------------------------------------------------------------------------------------------------ engine-savings-05: the MDI lever is the billing month's
+
+def _mdi_day(peak_a: float, peak_b: float, rate: float = 1250.0, floor: float = 125.0, fidelity: str = "confirmed", withheld: str | None = None,
+             version: str | None = None) -> dict:
+    """A day row that saves Rs 100 in its peak window, with its 30-minute peaks on both arms and its month's MDI terms as compute_day stores them."""
+    return {**_day(_lv(peak_window=100.0), fidelity=fidelity, withheld=withheld), "peak_kw_actual": peak_a, "peak_kw_baseline": peak_b,
+            "mdi_rate": rate, "mdi_floor_kw": floor, "genset_unknown": withheld == "genset_unknown", "tariff_version": version}
+
+
+def _put_mdi(sid: str, rows: dict) -> None:
+    _put_rows(sid, {d: {"native": r, "tuned": r} for d, r in rows.items()})
+
+
+def _telemetry_day(sid: str, day: str, peak_kw: float) -> None:
+    """A day with telemetry and no savings row (an observation day under the native settings), as aggregate_day stores it."""
+    with store.connect() as con:
+        con.execute("INSERT OR REPLACE INTO telemetry_days (site_id, day_local, data) VALUES (?,?,?)",
+                    (sid, day, json.dumps({"peak_kw": peak_kw, "import_kwh": 5000.0, "completeness": 1.0})))
+
+
+#: 1-10 Oct: 300 kW actual every day, the native replay's 340 kW on 3 Oct and 310 kW on the others. October's lever: (340 - 300) x Rs 1,250 = 50,000
+#: over its 31 days, so each day carries 50,000 / 31
+OCT_MDI = {f"2026-10-{d:02d}": _mdi_day(300.0, 340.0 if d == 3 else 310.0) for d in range(1, 11)}
+SHARE = 50_000.0 / 31
+
+
+def test_the_mdi_lever_is_the_billing_months_and_a_range_gets_its_days_share(company):
+    sid = make_site(name="Golden r7 mdi range")
+    _put_mdi(sid, OCT_MDI)
+    one = verify.summary(sid, "2026-10-03", "2026-10-03")
+    n = one["baselines"]["native"]
+    # one day: its share of the month's lever. Before: the whole month's 50,000 on the strength of the day's own 340 kW
+    assert n["levers_claimed_rs"]["mdi"] == pytest.approx(SHARE, abs=0.01) and n["claimed_rs"] == pytest.approx(100.0 + SHARE, abs=0.01)
+    assert one["days"][0]["mdi_month"] == "2026-10" and one["days"][0]["mdi_share_native_rs"] == pytest.approx(SHARE, abs=0.01)
+    a = verify.summary(sid, "2026-10-01", "2026-10-05")["baselines"]["native"]
+    b = verify.summary(sid, "2026-10-06", "2026-10-10")["baselines"]["native"]
+    w = verify.summary(sid, "2026-10-01", "2026-10-10")["baselines"]["native"]
+    # the halves add up to the whole. Before: 1-5 Oct claimed 50,000 and 6-10 Oct 12,500 (its own 310 kW), against 50,000 for 1-10 Oct
+    assert b["levers_claimed_rs"]["mdi"] == pytest.approx(5 * SHARE, abs=0.01)
+    assert a["claimed_rs"] + b["claimed_rs"] == pytest.approx(w["claimed_rs"], abs=0.02)
+    assert w["claimed_rs"] == pytest.approx(1000.0 + 10 * SHARE, abs=0.01) and w["levers"]["mdi"] == pytest.approx(10 * SHARE, abs=0.01)
+    m = w["mdi_months"]["2026-10"]
+    assert (m["actual_kw"], m["baseline_kw"], m["floor_kw"], m["rate_rs_per_kw"], m["lever_rs"]) == (300.0, 340.0, 125.0, 1250.0, 50_000.0)
+    assert (m["days_in_month"], m["scored_days"], m["claiming_days"], m["from"], m["to"]) == (31, 10, 10, "2026-10-01", "2026-10-31")
+    # a day of the month with telemetry and no row (the native settings ran it) sets the month's peak on both arms: its measured 360 kW is the
+    # bill's MDI whatever the plan did on the other days. Before: the range's own days only, so the plan was credited 50,000
+    _telemetry_day(sid, "2026-10-12", 360.0)
+    w = verify.summary(sid, "2026-10-01", "2026-10-10")["baselines"]["native"]
+    assert (w["mdi_months"]["2026-10"]["actual_kw"], w["mdi_months"]["2026-10"]["baseline_kw"]) == (360.0, 360.0)
+    assert w["levers_claimed_rs"]["mdi"] == 0.0 and w["claimed_rs"] == 1000.0
+
+
+def test_a_month_not_over_books_its_scored_days_share_of_the_mdi_lever_marked_provisional(company, monkeypatch):
+    sid = make_site(name="Golden r7 mdi to date")
+    _put_mdi(sid, {f"2026-10-{d:02d}": _mdi_day(300.0, 333.0) for d in range(1, 9)})  # to date (33 kW x 1,250) = 41,250, 8 days scored
+    monkeypatch.setattr(verify, "_today", lambda: date(2026, 10, 9), raising=False)
+    s = verify.summary(sid, "2026-10-01", "2026-10-09")
+    n = s["baselines"]["native"]
+    # before: the month-to-date 41,250 booked in full after 8 days (95 % of the headline), with nothing to say the month is not over
+    assert n["levers_claimed_rs"]["mdi"] == pytest.approx(41_250.0 * 8 / 31, abs=0.01)
+    assert n["mdi_provisional_rs"] == pytest.approx(41_250.0 * 8 / 31, abs=0.01)
+    assert n["mdi_months"]["2026-10"]["provisional"] is True and all(d["mdi_provisional"] for d in s["days"])
+    monkeypatch.setattr(verify, "_today", lambda: date(2026, 11, 1))
+    s = verify.summary(sid, "2026-10-01", "2026-10-09")
+    assert s["baselines"]["native"]["mdi_provisional_rs"] == 0.0 and s["baselines"]["native"]["mdi_months"]["2026-10"]["provisional"] is False
+    assert not any(d["mdi_provisional"] for d in s["days"])
+
+
+def test_a_withheld_day_claims_no_mdi_share_and_its_replayed_peak_credits_nothing(company):
+    sid = make_site(name="Golden r7 mdi withheld")
+    # every day withheld for a genset that may have run unseen: a parallel run cut the actual arm's peak (250 kW against the replay's 300)
+    _put_mdi(sid, {f"2026-10-{d:02d}": _mdi_day(250.0, 300.0, withheld="genset_unknown") for d in range(1, 4)})
+    n = verify.summary(sid, "2026-10-01", "2026-10-03")["baselines"]["native"]
+    # before: (300 - 250) x 1,250 = 62,500 claimed, though every day says its claim is withheld
+    assert n["claimed_rs"] == 0.0 and n["levers_claimed_rs"]["mdi"] == 0.0 and n["levers"]["mdi"] == 0.0
+    assert n["mdi_months"]["2026-10"]["lever_rs"] == 0.0  # its measured 250 kW stands on both arms
+    # a claiming day beside a withheld one: the withheld day's measured peak counts on both arms, its replayed 400 kW on neither
+    _put_mdi(sid, {"2026-10-04": _mdi_day(300.0, 320.0), "2026-10-05": _mdi_day(260.0, 400.0, withheld="genset_unknown")})
+    n = verify.summary(sid, "2026-10-04", "2026-10-05")["baselines"]["native"]
+    # before: (400 - 300) x 1,250 = 125,000 claimed on the strength of the withheld day's replay
+    assert n["mdi_months"]["2026-10"]["lever_rs"] == 25_000.0  # (320 - 300) x 1,250
+    assert n["levers_claimed_rs"]["mdi"] == pytest.approx(25_000.0 / 31, abs=0.01) and n["levers"]["mdi"] == pytest.approx(25_000.0 / 31, abs=0.01)
+    assert n["mdi_months"]["2026-10"]["claiming_days"] == 1 and n["claimed_rs"] == pytest.approx(100.0 + 25_000.0 / 31, abs=0.01)
+
+
+def test_each_months_mdi_lever_is_priced_at_that_months_own_rate(company):
+    sid = make_site(name="Golden r7 mdi rate")
+    # Tariff F: September out of season (no fixed charge), October in season; 40 kW lower on the replay in both months
+    sep = {f"2026-09-{d:02d}": _mdi_day(300.0, 340.0, rate=0.0) for d in range(25, 31)}
+    octo = {f"2026-10-{d:02d}": _mdi_day(300.0, 340.0, rate=1250.0, version="v-oct") for d in range(1, 6)}
+    _put_mdi(sid, {**sep, **octo})
+    n = verify.summary(sid, "2026-09-25", "2026-10-05")["baselines"]["native"]
+    # before: the last day's 1,250 priced September too, and both months were claimed in full (100,000)
+    assert n["levers_claimed_rs"]["mdi"] == pytest.approx(50_000.0 * 5 / 31, abs=0.01)
+    assert n["mdi_months"]["2026-09"]["lever_rs"] == 0.0 and n["mdi_months"]["2026-10"]["lever_rs"] == 50_000.0
+    assert n["mdi_months"]["2026-10"]["tariff_version"] == "v-oct" and n["mdi_months"]["2026-09"]["rate_rs_per_kw"] == 0.0
+    # the other way round: before, October's rate of 0 zeroed September's lever
+    _put_mdi(sid, {**{d: {**r, "mdi_rate": 1250.0} for d, r in sep.items()}, **{d: {**r, "mdi_rate": 0.0} for d, r in octo.items()}})
+    n = verify.summary(sid, "2026-09-25", "2026-10-05")["baselines"]["native"]
+    assert n["levers_claimed_rs"]["mdi"] == pytest.approx(50_000.0 * 6 / 30, abs=0.01)
+    assert n["mdi_months"]["2026-09"]["lever_rs"] == 50_000.0 and n["mdi_months"]["2026-10"]["lever_rs"] == 0.0
+    # a new tariff version inside the month: the bill prices the month's MDI at the version in force at its end, the rate its last scored day has
+    _put_mdi(sid, {"2026-10-04": _mdi_day(300.0, 340.0, rate=1000.0, version="v-old"), "2026-10-05": _mdi_day(300.0, 340.0, rate=1250.0, version="v-new")})
+    m = verify.summary(sid, "2026-10-01", "2026-10-05")["baselines"]["native"]["mdi_months"]["2026-10"]
+    assert (m["rate_rs_per_kw"], m["tariff_version"], m["lever_rs"]) == (1250.0, "v-new", 50_000.0)
+    # a scored day stores the schedule version its rates came from
+    pr = verify._minute_prices(sites.connections(sid)[0], date(2026, 10, 5), sid)
+    assert pr["tariff_version"] == tariffs.card_for("B-2(b)", date(2026, 10, 5))[1]["id"] and pr["tariff_version"]

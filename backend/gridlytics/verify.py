@@ -74,7 +74,8 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
     t0 = twin.day_start_utc(day)
     if conn is None or conn["data"].get("regime") == "off_grid":
         z = np.zeros(1440)
-        return {"c_imp": z, "c_exp": z, "peak": np.zeros(1440, dtype=bool), "mdi_rate": 0.0, "mdi_floor": 0.0, "mdi_interval": 30, "icp": {}}
+        return {"c_imp": z, "c_exp": z, "peak": np.zeros(1440, dtype=bool), "mdi_rate": 0.0, "mdi_floor": 0.0, "mdi_interval": 30, "icp": {},
+                "tariff_version": None}
     if month_q is None or (month_x is None and _legacy(conn)):
         tot = month_totals(site_id, conn, day)
         month_q = tot["import"] if month_q is None else month_q
@@ -93,7 +94,9 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
         iv = 30
     return {"c_imp": np.repeat(vec["c_imp"], 15), "c_exp": np.repeat(c_exp, 15), "peak": np.repeat(vec["peak"], 15),
             "mdi_rate": mdi.get("rate_rs_per_kw", 0.0), "mdi_floor": float(mdi.get("floor_kw", 0.0) or 0.0), "mdi_interval": iv,
-            "icp": {p: info["case"] for p, info in (vec.get("icp") or {}).items()}}
+            "icp": {p: info["case"] for p, info in (vec.get("icp") or {}).items()},
+            # the schedule version the day's rates come from (round 7, audit engine-savings-05: a month's MDI is priced at its own version)
+            "tariff_version": tariffs.card_for(conn["data"]["tariff_category"], day)[1].get("id")}
 
 
 def _genset_cost(site: dict, sim: dict, day: date, on_before: bool = False) -> tuple[float, float]:
@@ -1147,7 +1150,7 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
                       "import_rebuilt_share": round(float(np.mean(rebuilt)), 4) if len(rebuilt) else 0.0,
                       "import_unresolved_share": round(unresolved_share, 4),
                       "peak_kw_actual": a["peak_kw"], "peak_kw_baseline": n["peak_kw"], "mdi_rate": pr["mdi_rate"],
-                      "mdi_floor_kw": pr["mdi_floor"], "mdi_interval_min": pr["mdi_interval"], "icp_case": pr["icp"],
+                      "mdi_floor_kw": pr["mdi_floor"], "mdi_interval_min": pr["mdi_interval"], "icp_case": pr["icp"], "tariff_version": pr["tariff_version"],
                       "native_capture_version": (site.get("native") or {}).get("version"),
                       "unserved_kwh_actual": a["unserved_kwh"], "unserved_kwh_baseline": n["unserved_kwh"], "chain": chains[base],
                       "control": control}
@@ -1464,11 +1467,68 @@ def _day_claims(d: dict) -> bool:
     return _claims(d) and not d.get("import_unknown")
 
 
+def _today() -> date:
+    """Today in Pakistan time."""
+    return datetime.now(PKT).date()
+
+
+def _measured_peak_kw(site_id: str, tday: dict, interval_min: int) -> float:
+    """A telemetry day's highest MDI block (kW): its stored 30-minute peak (aggregate_day), or its minutes read again for another interval."""
+    if interval_min == 30 or interval_min <= 0 or 1440 % interval_min:
+        return float(tday.get("peak_kw") or 0.0)
+    t0 = twin.day_start_utc(date.fromisoformat(tday["day"][:10]))
+    imp = np.nan_to_num(np.asarray(telemetry.filled(telemetry.minute_grid(site_id, t0, t0 + 86400))["imp"], dtype=float))
+    return float(imp.reshape(len(imp) // interval_min, interval_min).mean(axis=1).max()) if len(imp) == 1440 else float(tday.get("peak_kw") or 0.0)
+
+
+def _mdi_month(site_id: str, conn: dict | None, bm: str, today: date) -> dict:
+    """A billing month's MDI lever per baseline, from every day of the month so far (plan 8.2: the MDI is the month's single highest block, so the
+    lever comes from the full-month counterfactual only and is the same whatever range is viewed; round 7, audit flow-savings-pilot-bill-01).
+
+    A scored day whose saving is known gives each arm its own peak. A day with telemetry and no row (the native settings ran it, or it could not be
+    scored) and a day withheld for missing data give their measured peak to both arms: the bill's MDI counts them, and the plan is credited nothing
+    on them (audit engine-savings-04: an unseen parallel genset run cuts the actual peak the replay cannot see). The month is priced at its own rate
+    and floor, those its last scored day was priced at, i.e. the tariff version in force latest in the month, as the bill takes the version at its
+    end (audit engine-savings-05). Each day of the billing month carries 1/days of the lever (summary), and the lever is provisional until the
+    month is over: a later day can still set its peak (audit pages-D-03)."""
+    p0, p1 = tariffs.billing_period_for(conn, date(int(bm[:4]), int(bm[5:7]), 1))
+    with store.connect() as con:
+        rows = con.execute("SELECT day_local, baseline, data FROM savings_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? "
+                           "ORDER BY day_local", (site_id, p0.isoformat(), p1.isoformat())).fetchall()
+    by_day: dict[str, dict] = {}
+    for r in rows:
+        by_day.setdefault(r["day_local"], {})[r["baseline"]] = json.loads(r["data"])
+    last = by_day[max(by_day)] if by_day else {}
+    terms = last.get("native") or next(iter(last.values()), {})
+    rate, floor = float(terms.get("mdi_rate") or 0.0), float(terms.get("mdi_floor_kw") or 0.0)
+    measured: list[float] = []
+    if rate > 0:  # the measured peaks of the month's days with no row, read only where the lever has a price
+        iv = int(terms.get("mdi_interval_min") or 30)
+        measured = [_measured_peak_kw(site_id, t, iv) for t in telemetry.days(site_id, p0.isoformat(), min(p1, today).isoformat())
+                    if t["day"] not in by_day]
+    out = {"from": p0.isoformat(), "to": p1.isoformat(), "days_in_month": (p1 - p0).days + 1, "closed": p1 < today, "rate": rate, "floor": floor,
+           "tariff_version": terms.get("tariff_version"), "by_base": {}}
+    for base in ("native", "tuned"):
+        a_pk = b_pk = max(measured, default=0.0)
+        for by in by_day.values():
+            r = by.get(base)
+            if r is None:
+                continue
+            x = float(r.get("peak_kw_actual") or 0.0)
+            y = x if _day_withheld(r) else float(r.get("peak_kw_baseline") or 0.0)
+            a_pk, b_pk = max(a_pk, x), max(b_pk, y)
+        # the bill charges max(floor, MDI) a month: below the floor a lower peak saves nothing
+        out["by_base"][base] = {"actual_kw": a_pk, "baseline_kw": b_pk, "lever": (max(floor, b_pk) - max(floor, a_pk)) * rate}
+    return out
+
+
 def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
     """The period's ledger per baseline and its days (plan 8.5). Per baseline: `claimed_rs`, the headline (the claiming days' savings, less the
-    carry-over still provisional, plus the claimed MDI lever), with `levers_claimed_rs` its split by lever; `saving_rs` and `levers`, the replay over
-    every scored day whose saving is known (a day withheld for missing data adds to neither); `carry_over_provisional_rs`, the claiming days'
-    carry-over no later scored day has used yet; and the days that claim, are withheld or claim nothing on read data."""
+    carry-over still provisional, plus their shares of the MDI lever), with `levers_claimed_rs` its split by lever; `saving_rs` and `levers`, the
+    replay over every scored day whose saving is known (a day withheld for missing data adds to neither); `carry_over_provisional_rs`, the claiming
+    days' carry-over no later scored day has used yet; and the days that claim, are withheld or claim nothing on read data. The MDI lever is each
+    billing month's, from every day of the month (_mdi_month); a day adds 1/days of its month's lever where it adds its saving, so sub-ranges add up
+    to the whole, and `mdi_provisional_rs` is the claimed part from months not over yet (round 7)."""
     site = sites.get(site_id)
     with store.connect() as con:
         rows = con.execute("SELECT day_local, baseline, data, computed FROM savings_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? ORDER BY day_local",
@@ -1511,8 +1571,17 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         # a row stored before chaining valued its whole end gap as its carry-over lever
         return float(end["carry_rs"]) if "carry_rs" in end else float((d.get("levers") or {}).get("carry_over") or 0.0)
 
-    #: per baseline and month: (claimed rupees of the days, days scored, the month's claimed MDI lever), for the fee check
-    per_month: dict[str, dict[str, tuple[float, int, float]]] = {}
+    today = _today()
+    #: per billing month the days touch: its MDI lever per baseline, from every day of the month
+    mdi_info = {bm: _mdi_month(site_id, conn0, bm, today) for bm in sorted({bill_month(d) for d in days})}
+
+    def mdi_share(day: str, base: str) -> float:
+        """The day's share of its billing month's MDI lever: 1/days of the month's."""
+        info = mdi_info[bill_month(day)]
+        return info["by_base"][base]["lever"] / info["days_in_month"]
+
+    #: per baseline and month: (claimed rupees of the days, their MDI shares included; days whose saving is known), for the fee check
+    per_month: dict[str, dict[str, tuple[float, int]]] = {}
     #: per baseline and day: the provisional carry-over left out of the claim
     prov_by_day: dict[str, dict[str, float]] = {}
     for base in ("native", "tuned"):
@@ -1523,10 +1592,11 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         verified = 0
         gen_unknown_days = imp_unknown_days = 0
         bound = 0.0
-        # per month: actual peak, baseline peak, billing-demand floor, claiming days, claimed rupees, days scored (a day whose import is unknown is not)
+        # per billing month: claimed rupees (MDI shares included), days whose saving is known, claiming days, MDI shares of the known days and of
+        # the claiming days
         months: dict[str, list] = {}
+        mdi = mdi_claimed = mdi_prov = 0.0
         unserved_a = unserved_b = 0.0
-        rate = 0.0
         for day, by in days.items():
             d = by.get(base)
             if not d:
@@ -1559,32 +1629,39 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             imp_unknown_days += int(imp_unknown)
             verified += int(d["fidelity"] == "confirmed" and not imp_unknown and not d.get("claim_withheld"))
             bound += d.get("perfect_foresight_rs") or 0.0
-            m = months.setdefault(bill_month(day), [0.0, 0.0, 0.0, 0, 0.0, 0])
-            if not imp_unknown:  # an unmetered day's actual peak reads zero: it says nothing about the month's MDI on either arm
-                m[0] = max(m[0], d["peak_kw_actual"])
-                m[1] = max(m[1], d["peak_kw_baseline"])
-            m[2] = max(m[2], float(d.get("mdi_floor_kw") or 0.0))
-            m[3] += int(d["fidelity"] in CLAIMING and not imp_unknown)
-            m[4] += d["claimed_rs"] - prov
-            m[5] += int(not imp_unknown and not d.get("claim_withheld"))  # an unknown saving is not a zero saving: the fee's rate is over the days that could claim
-            rate = d.get("mdi_rate") or rate
+            # the day's share of its month's MDI lever goes where its saving goes: a withheld day's to no total, a day that claims nothing's not to the
+            # claim (round 7, audit engine-savings-04: before, one claiming day claimed the whole month's lever, a withheld day's included)
+            share = mdi_share(day, base)
+            closed = mdi_info[bill_month(day)]["closed"]
+            m = months.setdefault(bill_month(day), [0.0, 0, 0, 0.0, 0.0])
+            m[0] += d["claimed_rs"] - prov + (share if claims else 0.0)
+            m[1] += int(not withheld)  # an unknown saving is not a zero saving: the fee's rate is over the days that could claim
+            m[2] += int(claims)
+            m[3] += 0.0 if withheld else share
+            m[4] += share if claims else 0.0
+            mdi += 0.0 if withheld else share
+            mdi_claimed += share if claims else 0.0
+            mdi_prov += share if claims and not closed else 0.0
             unserved_a += d["unserved_kwh_actual"]
             unserved_b += d["unserved_kwh_baseline"]
-        # the bill charges max(floor, MDI) a month: below the floor a lower peak saves nothing
-        mdi_by_month = {k: (max(v[2], v[1]) - max(v[2], v[0])) * rate for k, v in months.items()}
-        mdi = sum(mdi_by_month.values())
-        mdi_claimed = sum(x for k, x in mdi_by_month.items() if months[k][3])
-        per_month[base] = {k: (v[4], v[5], mdi_by_month[k] if v[3] else 0.0) for k, v in months.items()}
+        per_month[base] = {k: (v[0], v[1]) for k, v in months.items()}
         levers["mdi"] = round(mdi, 2)
         levers_claimed = {k: levers_claimed.get(k, 0.0) for k in levers if k != "mdi"} | {k: v for k, v in levers_claimed.items() if k not in levers}
         levers_claimed["mdi"] = round(mdi_claimed, 2)
         out["baselines"][base] = {"saving_rs": round(total + mdi, 2), "claimed_rs": round(claimed + mdi_claimed, 2),
                                   "levers": {k: round(v, 2) for k, v in levers.items()},
                                   "levers_claimed_rs": {k: round(v, 2) for k, v in levers_claimed.items()},
-                                  "carry_over_provisional_rs": round(prov_total, 2), "claiming_days": claiming_days, "withheld_days": withheld_days,
+                                  "carry_over_provisional_rs": round(prov_total, 2), "mdi_provisional_rs": round(mdi_prov, 2),
+                                  "claiming_days": claiming_days, "withheld_days": withheld_days,
                                   "unclaimed_days": unclaimed_days, "litres_saved": round(litres, 1), "verified_days": verified,
                                   "perfect_foresight_rs": round(bound, 2) if base == "native" else None,
-                                  "mdi_months": {k: {"actual_kw": v[0], "baseline_kw": v[1], "floor_kw": v[2]} for k, v in months.items()},
+                                  "mdi_months": {k: {"actual_kw": mdi_info[k]["by_base"][base]["actual_kw"],
+                                                     "baseline_kw": mdi_info[k]["by_base"][base]["baseline_kw"], "floor_kw": mdi_info[k]["floor"],
+                                                     "rate_rs_per_kw": mdi_info[k]["rate"], "tariff_version": mdi_info[k]["tariff_version"],
+                                                     "lever_rs": round(mdi_info[k]["by_base"][base]["lever"], 2), "from": mdi_info[k]["from"],
+                                                     "to": mdi_info[k]["to"], "days_in_month": mdi_info[k]["days_in_month"], "scored_days": v[1],
+                                                     "claiming_days": v[2], "share_rs": round(v[3], 2), "claimed_rs": round(v[4], 2),
+                                                     "provisional": not mdi_info[k]["closed"]} for k, v in months.items()},
                                   "unserved_kwh_actual": round(unserved_a, 1), "unserved_kwh_baseline": round(unserved_b, 1),
                                   "genset_unknown_days": gen_unknown_days, "import_unknown_days": imp_unknown_days}
     for day, by in sorted(days.items()):
@@ -1607,12 +1684,15 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "litres_native": (n.get("baseline") or {}).get("litres"), "peak_kw": (n.get("actual") or {}).get("peak_kw"),
                             "peak_import_kwh": (n.get("actual") or {}).get("peak_import_kwh"), "levers": n.get("levers"),
                             "import_unknown": bool(n.get("import_unknown")), "claim_withheld": n.get("claim_withheld"),
-                            "baseline_start": (n.get("chain") or {}).get("from")})
+                            "baseline_start": (n.get("chain") or {}).get("from"),
+                            # round 7: the day's share of its billing month's MDI lever (in its saving where the day's saving counts), and whether
+                            # the month is still open
+                            "mdi_month": bill_month(day), "mdi_share_native_rs": round(mdi_share(day, "native"), 2) if n else None,
+                            "mdi_provisional": not mdi_info[bill_month(day)]["closed"]})
     verified = out["baselines"].get("native", {}).get("verified_days", 0)
     # plan 8.5: "Preliminary" until 8 weeks of switchback have run and the FCA of every month in the period has been billed
-    today_l = datetime.now(PKT).date()
     sb_days = sum((date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in switchback_blocks(site_id)
-                  if date.fromisoformat(b["block_end"]) < today_l)
+                  if date.fromisoformat(b["block_end"]) < today)
     fca_billed = (not on_grid) or all(any(a["key"] == "fca" for a in tariffs.adders_for(mk))
                                       for mk in _months_between(bill_month(d0) + "-01", bill_month(d1) + "-01"))
     out["preliminary"] = (verified < VERIFIED_DAYS_FOR_FINAL or not native_capture or sb_days < 7 * SWITCHBACK_WEEKS_FOR_FINAL or not fca_billed)
@@ -1623,19 +1703,20 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                      "(recoverable GST and adjustable s.235 excluded), with the dated fuel price and the same wear charge on both arms")
     if see_fee and site:
         fee = float(store.get_setting(f"fee:{site_id}", 0) or 0)
-        # each month's claimed rate scaled to the whole billing month (a part month is not a month), plus its MDI lever; the smaller of the two
-        # baselines (plan 8.1: claims must beat the tuned baseline); the months averaged
+        # each month's claimed rate, the days' MDI shares included, scaled to the whole billing month (a part month is not a month; a month whose
+        # every day claims scales to its whole MDI lever); the smaller of the two baselines (plan 8.1: claims must beat the tuned baseline); the
+        # months averaged
         monthly = []
         for mk in sorted({bill_month(d) for d in days}):
-            b0, b1 = tariffs.billing_period_for(conn0, date(int(mk[:4]), int(mk[5:7]), 1))  # day 1 is billed in its own month's bill
-            dim = (b1 - b0).days + 1
-            cands = [c / n * dim + mdi_c for (c, n, mdi_c) in (per_month.get(base, {}).get(mk, (0.0, 0, 0.0)) for base in ("native", "tuned")) if n]
+            dim = mdi_info[mk]["days_in_month"]
+            cands = [c / n * dim for (c, n) in (per_month.get(base, {}).get(mk, (0.0, 0)) for base in ("native", "tuned")) if n]
             if cands:
                 monthly.append(min(cands))
         saving_pm = sum(monthly) / len(monthly) if monthly else 0.0
         out["fee"] = {"fee_rs_per_month": fee, "verified_saving_rs_per_month": round(saving_pm, 0),
                       "within_one_third": fee <= saving_pm / 3 if fee else None,
-                      "basis": "claimed saving per scored day x days in the month, plus the month's MDI lever; the smaller of the native and tuned baselines"}
+                      "basis": ("claimed saving per scored day, each day's share of its month's MDI lever included, x days in the month; the smaller "
+                                "of the native and tuned baselines")}
     return out
 
 
