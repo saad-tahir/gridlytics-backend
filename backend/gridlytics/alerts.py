@@ -16,7 +16,7 @@ from pydantic import Field, ValidationError
 
 from . import auth
 from . import battery as battery_service
-from . import plans, sites, store, telemetry, twin
+from . import plans, sites, store, telemetry
 from .schemas import Strict, message
 
 PKT = timezone(timedelta(hours=5))
@@ -406,6 +406,7 @@ THRESHOLDS: dict[str, dict[str, tuple]] = {
     "Data": {"stale_minutes": (None, 5, 2880)},
     "Reserve": {"reserve_margin_pct": (2.0, 0, 20), "unserved_kwh": (0.5, 0, 10000)},
     "Tariff": {"agreement_days": (60, 1, 365)},
+    "Forecast": {"bust_pct": (30, 5, 100), "bust_hours": (2.0, 0.5, 12)},
 }
 _QUIET = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
 QUIET_WORDS = "Quiet hours are two times of day in Karachi time, such as 22:00-07:00"
@@ -583,11 +584,52 @@ def tariff_pending_count() -> int:
         return con.execute("SELECT COUNT(*) FROM tariff_versions WHERE status = 'pending'").fetchone()[0]
 
 
+def forecast_bust(site: dict, day: date, bust_pct: float = 30.0) -> dict | None:
+    """How long the day-ahead PV forecast of `day` (the issue the nightly scores: the last at or before local midnight, at most 6 hours before)
+    busted: plan Part 2.4 calls a PV error above 30 percent of the clear-sky ceiling over 30 minutes a forecast bust (engine-forecast-10; the
+    daily nRMSE by nameplate the rule read before reaches 0.6 only when a plant makes nothing all day). Per 30-minute window of daylight (a
+    ceiling above a tenth of the day's highest), the measured mean against the forecast's median, as a share of the window's ceiling. None when
+    the day cannot be scored (no PV, no such issue, or under half the day's data)."""
+    pv = (site.get("assets") or {}).get("pv")
+    if not pv:
+        return None
+    t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    f = telemetry.latest_forecast(site["id"], "pv", t0)
+    if f is None or t0 - f["belief_time"] > 6 * 3600 or not f.get("cs") or not f.get("q50"):
+        return None
+    off = (t0 - f["belief_time"]) // STEP_S
+    pred = np.asarray(f["q50"][off:off + 96], dtype=float)
+    cs = np.asarray(f["cs"][off:off + 96], dtype=float)
+    if len(pred) < 96 or len(cs) < 96:
+        return None
+    g = telemetry.minute_grid(site["id"], t0, t0 + 86400)
+    if g["completeness"] < 0.5:
+        return None
+    with np.errstate(invalid="ignore"):
+        act = np.nanmean(g["pv"].reshape(96, 15), axis=1)
+        a30 = np.nanmean(act.reshape(48, 2), axis=1)
+    p30, c30 = pred.reshape(48, 2).mean(axis=1), cs.reshape(48, 2).mean(axis=1)
+    day_ok = ~np.isnan(a30) & (c30 > 0.1 * max(float(np.max(c30)), 1e-6))
+    err = np.where(day_ok, np.abs(p30 - a30) / np.maximum(c30, 1e-6), 0.0)
+    busted = day_ok & (err > bust_pct / 100)
+    ok = ~np.isnan(act) & (cs > 0.1 * max(float(np.max(cs)), 1e-6))
+    kw = float(pv.get("kw_ac") or 1.0)
+    worst = int(np.argmax(err))
+    return {"day": day.isoformat(), "hours": round(float(busted.sum()) * 0.5, 1), "windows_scored": int(day_ok.sum()),
+            "worst_at": t0 + worst * 1800 if busted.any() else None, "worst_pct": round(float(err[worst]) * 100) if busted.any() else None,
+            "nrmse": round(float(np.sqrt(np.mean((pred[ok] - act[ok]) ** 2)) / kw), 4) if ok.any() else None}
+
+
 def nightly(site_id: str, day: date) -> None:
-    """Forecast-bust and savings checks after the nightly jobs."""
+    """The checks after the nightly jobs: the day's forecast scores (forecast.score_day stores them) and the forecast bust."""
     from . import forecast
-    rows = [r for r in forecast.score_day(sites.full(site_id), day)] if sites.get(site_id) else []
-    pv = next((r for r in rows if r["kind"] == "pv"), None)
-    _set(bool(pv and pv["value"] > 0.6), site_id, "forecast_bust", "Forecast", "info",
-         f"Yesterday's PV forecast missed by {pv['value'] * 100:.0f} percent (nRMSE)" if pv else "")
-    _ = twin
+    site = sites.full(site_id)
+    if site is None:
+        return
+    forecast.score_day(site, day)
+    rules_ = site_rules(site_id)
+    pct, hours = float(_th(rules_, "Forecast", "bust_pct")), float(_th(rules_, "Forecast", "bust_hours"))
+    bust = forecast_bust(site, day, pct)
+    _set(bool(bust and bust["hours"] >= hours), site_id, "forecast_bust", "Forecast", "info",
+         f"The day-ahead PV forecast for {day.day} {day:%B} was off by more than {pct:g} % of the clear-sky output for "
+         f"{bust['hours']:g} hours" if bust else "", bust)

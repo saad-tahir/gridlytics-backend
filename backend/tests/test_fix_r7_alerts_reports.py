@@ -211,3 +211,61 @@ def test_the_reserve_and_agreement_thresholds_change_what_is_raised(world):
         store.set_setting(f"alert_rules:site:{sid}", {"Tariff": {"thresholds": {"agreement_days": 120}}})
         alerts.evaluate(sid, now)
         assert any(r.startswith("regime_expiring_") for r in _rules_of(alerts.listing("active", sid)))
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-10
+
+def _pv_day(sid: str, day, forecast_kw, actual_kw, cs_kw) -> None:
+    """A day-ahead PV issue at the day's local midnight (q50 = `forecast_kw`, the clear-sky ceiling `cs_kw`, per 15-minute step) and the measured PV
+    (`actual_kw` per 15-minute step, written per minute)."""
+    import numpy as np
+    from gridlytics import twin
+    t0 = twin.day_start_utc(day)
+    body = {"cs": [float(x) for x in cs_kw] * 2, **{q: [float(x) for x in forecast_kw] * 2 for q in ("q05", "q10", "q25", "q50", "q75", "q90", "q95")}}
+    telemetry.save_forecast(sid, "pv", t0, 1, "test", body)
+    rows = [{"ts": t0 + 60 * m, "grid_present": 1, "pv_power_w": float(actual_kw[m // 15]) * 1000, "load_power_w": 30000.0} for m in range(1440)]
+    telemetry.ingest(sid, rows, "edge", now=t0 + 86400 + 600)
+    _ = np
+
+
+def _clear_sky_day() -> list[float]:
+    """A clear-sky ceiling of a 100 kW plant: zero at night, a half-sine from 06:30 to 17:30."""
+    import math
+    out = []
+    for i in range(96):
+        h = i / 4 + 0.125
+        out.append(100 * math.sin(math.pi * (h - 6.5) / 11) if 6.5 <= h <= 17.5 else 0.0)
+    return out
+
+
+def test_a_forecast_bust_is_the_plans_and_a_fog_morning_raises_it(world):
+    sid = world.site
+    day = datetime.now(PKT).date() - timedelta(days=1)
+    cs = _clear_sky_day()
+    fog = [x * 0.35 if 8 <= i / 4 < 12 else x * 0.95 for i, x in enumerate(cs)]   # a fog morning: four hours at a third of a clear sky
+    with world.use():
+        sites.put_asset(sid, "pv", {"kwp_dc": 120, "kw_ac": 100}, "test")
+        _pv_day(sid, day, [x * 0.95 for x in cs], fog, cs)
+        rows = alerts.forecast_bust(sites.full(sid), day)
+        assert rows and rows["hours"] >= 3.5 and rows["nrmse"] < 0.6, rows    # the old rule (daily nRMSE by nameplate > 0.6) never saw it
+        alerts.nightly(sid, day)
+        bust = [a for a in alerts.listing("active", sid) if a["rule"] == "forecast_bust"]
+        assert len(bust) == 1 and bust[0]["category"] == "Forecast", bust
+        assert "30 %" in bust[0]["title"] and "4 hours" in bust[0]["title"] and day.strftime("%-d %B") in bust[0]["title"], bust[0]["title"]
+        assert "Yesterday" not in bust[0]["title"]
+        # a threshold the site sets higher (6 hours) is not reached: the alert clears
+        store.set_setting(f"alert_rules:site:{sid}", {"Forecast": {"thresholds": {"bust_hours": 6}}})
+        alerts.nightly(sid, day)
+        assert "forecast_bust" not in _rules_of(alerts.listing("active", sid))
+
+
+def test_an_ordinary_day_raises_no_bust(world):
+    sid = world.site
+    day = datetime.now(PKT).date() - timedelta(days=2)
+    cs = _clear_sky_day()
+    with world.use():
+        sites.put_asset(sid, "pv", {"kwp_dc": 120, "kw_ac": 100}, "test")
+        _pv_day(sid, day, [x * 0.9 for x in cs], [x * 0.8 for x in cs], cs)   # off by a tenth of the ceiling all day
+        assert alerts.forecast_bust(sites.full(sid), day)["hours"] == 0
+        alerts.nightly(sid, day)
+        assert "forecast_bust" not in _rules_of(alerts.listing("active", sid))
