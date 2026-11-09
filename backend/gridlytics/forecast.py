@@ -67,6 +67,15 @@ def _mean15(f, t: np.ndarray) -> np.ndarray:
 
 # ------------------------------------------------------------------------------------------------ PV
 
+def available_pv(g: dict) -> np.ndarray:
+    """The PV a plant could deliver at each minute of a minute grid (kW): its output plus what it curtailed, unknown where the output is. A zero-export
+    site curtails once its battery is full, and its clearest days are the most curtailed; the forecast, its fit and its score describe the plant, and
+    curtailment is the optimiser's own decision (K[t]), so they read available power, not output."""
+    pvm = np.asarray(g["pv"], dtype=float)
+    cur = g.get("curtail")
+    return pvm if cur is None else pvm + np.nan_to_num(np.asarray(cur, dtype=float))
+
+
 def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
     pv_asset = (site.get("assets") or {}).get("pv")
     t = step_times(t0, steps)
@@ -86,7 +95,7 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
     iv = sample_minutes(g["present"])  # sample counts in minutes of data, so a 5- or 15-minute source qualifies as a 1-minute one does
     if g["present"][fit].sum() * iv > 3 * 600:
         csm = solar.pv_power(g["ts"][fit], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"][fit]))
-        pvm = g["pv"][fit]
+        pvm = available_pv(g)[fit]
         for d in range(14):
             sl = slice(d * 1440, (d + 1) * 1440)
             ok = ~np.isnan(pvm[sl]) & (csm[sl] > 0.2 * pv_asset["kw_ac"])
@@ -112,7 +121,7 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
     q = {name: np.minimum(cap, cs * scale * kq[i]) for i, name in enumerate(QS)}
     # smart persistence for the first 2 hours: blend the q50 towards the last hour's observed clearness
     if stage == 1 and g["present"][-60:].sum() * iv > 30:
-        last = g["pv"][-60:]
+        last = available_pv(g)[-60:]
         csl = solar.pv_power(g["ts"][-60:], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"][-60:]))
         ok = ~np.isnan(last) & (csl > 0.1 * pv_asset["kw_ac"])
         if ok.sum() * iv > 20:
@@ -451,7 +460,7 @@ def page(site: dict, kind: str) -> dict:
     actual = None
     if kind in ("pv", "load"):
         g = telemetry.minute_grid(site["id"], t0, t1)
-        col = g["pv"] if kind == "pv" else g["load"]
+        col = available_pv(g) if kind == "pv" else g["load"]
         n = len(col) // 15
         actual = [None if np.isnan(x) else round(float(x), 2) for x in np.nanmean(col[: n * 15].reshape(-1, 15), axis=1)] if n else []
     elif kind == "outage":
@@ -508,7 +517,7 @@ def score_day(site: dict, day) -> list[dict]:
         off = (t0 - f["belief_time"]) // STEP_S
         sl = slice(off, off + 96)
         if kind in ("pv", "load"):
-            col = g["pv"] if kind == "pv" else g["load"]
+            col = available_pv(g) if kind == "pv" else g["load"]
             act = np.nanmean(col.reshape(96, 15), axis=1)
             pred = np.array(f["q50"][sl])
             ok = ~np.isnan(act)

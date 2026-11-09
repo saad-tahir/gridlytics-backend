@@ -75,3 +75,26 @@ def test_the_pv_fit_reads_whole_local_days_so_every_tick_of_a_day_fits_the_same_
         assert (q05, q25, q50, q95) == pytest.approx((0.45, 0.45, 0.725, 1.0), abs=0.02), seen
 
 
+# ------------------------------------------------------------------------------------------------ engine-forecast-04
+
+def test_the_pv_fit_and_score_read_available_power_not_curtailed_output(company):
+    """A zero-export plant on 15 clear days curtails 40 % of its output from 11:00 to 14:00 once the battery is full. Its fit reads the PV it could
+    deliver (output plus curtail_w), so it fits a ratio of 1.0, and the day's score of a clear-sky forecast is near zero. v1 read the curtailed output:
+    a ratio near 0.8 on a healthy plant, and the curtailed hours scored as forecast error."""
+    sid = "pv-curtail"
+    site = _pv_site(sid)
+    day = date(2026, 11, 9)
+    t0 = _midnight(day)
+    ts = np.arange(t0 - 14 * 86400, t0 + 86400, 60, dtype=np.int64)
+    avail = _clear(ts)
+    hour = ((ts + 5 * 3600) % 86400) // 3600
+    cut = np.where((hour >= 11) & (hour < 14), 0.4 * avail, 0.0)
+    _write_pv(sid, ts, avail - cut, cut)
+    f = forecast.pv(site, t0)
+    assert f["stage"] == 1 and f["pr"] == pytest.approx(1.0, abs=0.01), f["pr"]
+    q50 = forecast._mean15(_clear, forecast.step_times(t0))
+    telemetry.save_forecast(sid, "pv", t0, 1, "v1.0", {"cs": [round(float(x), 3) for x in q50], "q50": [round(float(x), 3) for x in q50]})
+    r = next(x for x in forecast.score_day(site, day) if x["kind"] == "pv")
+    assert r["value"] < 0.01, r
+
+
