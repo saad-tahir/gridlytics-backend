@@ -127,3 +127,87 @@ def test_a_csv_site_that_never_uploaded_waits_a_day(world):
         alerts._stale(sid, None, now + 2 * 3600)
         stale = [a for a in alerts.listing("active", sid) if a["rule"] == "data_stale"]
         assert len(stale) == 1 and "No data has arrived" in stale[0]["title"], stale
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-29
+
+def test_the_rule_editor_refuses_quiet_hours_that_are_not_two_times_and_keeps_canonical_ones(world):
+    admin = world.c["admin"]
+    for bad_value in ("whenever", "22:00", "25:00-07:00", "22:00-22:00", "22.00-07.00", 2200):
+        r = admin.put("/api/alerts/rules", json={"Data": {"channels": ["in_app"], "quiet_hours": bad_value}})
+        assert r.status_code == 422 and "Quiet hours" in r.json()["detail"], (bad_value, r.text)
+    r = admin.put("/api/alerts/rules", json={"Data": {"channels": ["in_app", "email"], "quiet_hours": " 22:00 - 07:00 "}})
+    assert r.status_code == 200, r.text
+    assert r.json()["Data"]["quiet_hours"] == "22:00-07:00" and r.json()["Data"]["channels"] == ["in_app", "email"]
+    assert admin.get("/api/alerts/rules").json()["Data"]["quiet_hours"] == "22:00-07:00"
+    # escalation and channels are checked too, in one sentence each
+    assert admin.put("/api/alerts/rules", json={"Data": {"escalate_after_min": 0}}).status_code == 422
+    assert admin.put("/api/alerts/rules", json={"Data": {"escalate_after_min": "soon"}}).status_code == 422
+    assert admin.put("/api/alerts/rules", json={"Data": {"channels": ["pager"]}}).status_code == 422
+    assert admin.put("/api/alerts/rules", json={"Data": {"colour": "red"}}).status_code == 422
+    assert admin.put("/api/alerts/rules", json={"Weather": {}}).status_code == 422
+    # quiet hours across midnight, in Karachi time, for the sender to come
+    rule = admin.get("/api/alerts/rules").json()["Data"]
+    at = lambda hh, mm: int(datetime(2026, 11, 9, hh, mm, tzinfo=PKT).timestamp())  # noqa: E731
+    assert alerts.in_quiet_hours(rule, at(23, 30)) and alerts.in_quiet_hours(rule, at(6, 59))
+    assert not alerts.in_quiet_hours(rule, at(7, 0)) and not alerts.in_quiet_hours(rule, at(12, 0))
+
+
+def test_an_old_free_text_quiet_hours_reads_as_none(world):
+    with world.use():
+        store.set_setting("alert_rules", {"Data": {"channels": ["in_app"], "quiet_hours": "whenever", "escalate_after_min": None}})
+    assert world.c["admin"].get("/api/alerts/rules").json()["Data"]["quiet_hours"] is None
+
+
+def test_thresholds_are_kept_per_company_and_per_site_and_the_evaluator_reads_them(world):
+    sid = world.site
+    admin = world.c["admin"]
+    rules = admin.get("/api/alerts/rules").json()
+    assert rules["Data"]["thresholds"]["stale_minutes"] is None              # by the data source
+    assert rules["Reserve"]["thresholds"]["unserved_kwh"] == 0.5 and rules["Tariff"]["thresholds"]["agreement_days"] == 60
+    # unknown names and values out of range are refused in a sentence
+    r = admin.put("/api/alerts/rules", json={"Reserve": {"thresholds": {"colour": 1}}})
+    assert r.status_code == 422 and "colour" in r.json()["detail"], r.text
+    r = admin.put("/api/alerts/rules", json={"Data": {"thresholds": {"stale_minutes": 1}}})
+    assert r.status_code == 422 and "stale minutes" in r.json()["detail"], r.text
+    # the company's rule: data stale after 60 minutes at every site
+    assert admin.put("/api/alerts/rules", json={"Data": {"thresholds": {"stale_minutes": 60}}}).json()["Data"]["thresholds"]["stale_minutes"] == 60
+    now = _now()
+    with world.use():
+        telemetry.ingest(sid, [{"ts": (now - 45 * 60) // 60 * 60, "grid_present": 1}], "edge")
+        alerts.evaluate(sid, now)                          # 45 minutes: past the edge's 30, under the company's 60
+        assert "data_stale" not in _rules_of(alerts.listing("active", sid))
+    # the site overrides it with 40: only what differs from the company's rules is kept for the site
+    r = admin.put(f"/api/alerts/rules/sites/{sid}", json={"Data": {"thresholds": {"stale_minutes": 40}}, "Reserve": rules["Reserve"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["overrides"] == {"Data": {"thresholds": {"stale_minutes": 40}}}, r.json()
+    assert r.json()["rules"]["Data"]["thresholds"]["stale_minutes"] == 40 and r.json()["rules"]["Reserve"] == rules["Reserve"]
+    assert admin.get(f"/api/alerts/rules/sites/{sid}").json()["overrides"] == {"Data": {"thresholds": {"stale_minutes": 40}}}
+    with world.use():
+        alerts.evaluate(sid, now)
+        assert "data_stale" in _rules_of(alerts.listing("active", sid))
+    # an empty body puts the site back on the company's rules
+    assert admin.put(f"/api/alerts/rules/sites/{sid}", json={}).json()["overrides"] == {}
+    with world.use():
+        alerts.evaluate(sid, now)
+        assert "data_stale" not in _rules_of(alerts.listing("active", sid))
+    # only an administrator changes them; everyone reads them; an unknown site is 404
+    for role in ("operator", "analyst", "viewer"):
+        assert world.c[role].put(f"/api/alerts/rules/sites/{sid}", json={}).status_code == 403, role
+        assert world.c[role].get(f"/api/alerts/rules/sites/{sid}").status_code == 200, role
+    assert admin.get("/api/alerts/rules/sites/nosuchsite").status_code == 404
+    assert admin.put("/api/alerts/rules/sites/nosuchsite", json={}).status_code == 404
+
+
+def test_the_reserve_and_agreement_thresholds_change_what_is_raised(world):
+    sid = world.site
+    now = _now()
+    end = (datetime.fromtimestamp(now, PKT).date() + timedelta(days=90)).isoformat()
+    with world.use():
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "regime": "net_billing", "agreement_end": end}, "test", conn_id=conn["id"])
+        alerts.evaluate(sid, now)
+        assert not any(r.startswith("regime_expiring_") for r in _rules_of(alerts.listing("active", sid)))
+        store.set_setting(f"alert_rules:site:{sid}", {"Tariff": {"thresholds": {"agreement_days": 120}}})
+        alerts.evaluate(sid, now)
+        assert any(r.startswith("regime_expiring_") for r in _rules_of(alerts.listing("active", sid)))

@@ -7,19 +7,22 @@ product never starts or stops a genset itself.
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
+from typing import Literal
 
 import numpy as np
+from pydantic import Field, ValidationError
 
 from . import auth
 from . import battery as battery_service
 from . import plans, sites, store, telemetry, twin
+from .schemas import Strict, message
 
 PKT = timezone(timedelta(hours=5))
 STEP_S = 900  # a plan step
 CATEGORIES = ("Data", "Control", "Reserve", "Battery", "Genset", "Forecast", "Tariff", "Savings", "Product")
 SEVERITIES = ("info", "warning", "critical")
-DEFAULT_RULES = {c: {"channels": ["in_app"], "quiet_hours": None, "escalate_after_min": None} for c in CATEGORIES}
 #: The categories every member receives: the energy kind (plan Part 10.5, "a viewer gets ... only energy-category alerts"; R8 2.16, "Viewer sees ...
 #: alerts of the energy kind (outage, genset, data) but no Savings or Product alerts"). The others need a permission: Control, Tariff and Savings alerts
 #: speak of plans, prices and claims (`see_costs`); Product alerts are fee and contract notices (`see_fee`)
@@ -83,13 +86,16 @@ def _activated(site_id: str) -> int | None:
         return None
 
 
-def _stale(site_id: str, last: dict | None, now: int) -> None:
-    """The Data alert of a source gone quiet, by its kind's limits; a site that never sent a reading waits from its activation (pages-D-27: on day one
-    the Data category fires first, R8 2.16), under the limits of the kind of source it was set up with."""
+def _stale(site_id: str, last: dict | None, now: int, stale_minutes: float | None = None) -> None:
+    """The Data alert of a source gone quiet, by its kind's limits, or after `stale_minutes` when the rules set it (critical after the same multiple
+    of it as the kind's critical limit is of its warning); a site that never sent a reading waits from its activation (pages-D-27: on day one the
+    Data category fires first, R8 2.16), under the limits of the kind of source it was set up with."""
     source = str((last or {}).get("source_id") or "")
     if last is None:
         source = str(((sites.get(site_id) or {}).get("data", {}).get("data_source") or {}).get("kind") or "")
     warn, crit = STALE_MINUTES.get(source, STALE_DEFAULT)
+    if stale_minutes:
+        warn, crit = float(stale_minutes), float(stale_minutes) * crit / warn
     if last is None:
         since = _activated(site_id)
         age = (now - since) / 60 if since is not None else None
@@ -152,8 +158,9 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     if site is None:
         return
     now = int(now or datetime.now(timezone.utc).timestamp())
+    rules_ = site_rules(site_id)
     last = telemetry.latest(site_id)
-    _stale(site_id, last, now)
+    _stale(site_id, last, now, _th(rules_, "Data", "stale_minutes"))
     plan = plans.current(site_id)
     ready = settled(site_id, plan, now)
     latest_attempt = (plan or {}).get("latest_attempt")
@@ -161,16 +168,17 @@ def evaluate(site_id: str, now: int | None = None) -> None:
          "The last solve did not produce a plan; the previous plan stays active", {"reason": (latest_attempt or {}).get("reason")})
     # reserve: outages in the last day entered below the reserve the plan asked for, and unserved critical load
     outs = telemetry.outages(site_id, now - 86400, now)
+    margin = float(_th(rules_, "Reserve", "reserve_margin_pct"))
     short = []
     if plan and (site.get("assets") or {}).get("battery"):
         for o in outs:
             step = plans.active_at(site_id, o["start"])
             st = next((s for s in (step or {}).get("steps", []) if s["t"] <= o["start"] < s["t"] + 900), None)
-            if st and st.get("reserve_pct") and o["soc_start_pct"] is not None and o["soc_start_pct"] + 2 < st["reserve_pct"]:
+            if st and st.get("reserve_pct") and o["soc_start_pct"] is not None and o["soc_start_pct"] + margin < st["reserve_pct"]:
                 short.append({"start": o["start"], "soc": o["soc_start_pct"], "reserve": st["reserve_pct"]})
     _set(bool(short), site_id, "reserve_short", "Reserve", "warning", "An outage started with the battery below the planned reserve", {"outages": short[:5]})
     unserved = sum(o["unserved_kwh"] for o in outs)
-    _set(unserved > 0.5, site_id, "unserved", "Reserve", "critical", f"{unserved:.1f} kWh of critical load went unserved in the last day")
+    _set(unserved > float(_th(rules_, "Reserve", "unserved_kwh")), site_id, "unserved", "Reserve", "critical", f"{unserved:.1f} kWh of critical load went unserved in the last day")
     # battery
     bs = battery_service.state(site, now)
     held = {a[0] for a in (bs or {}).get("alerts", [])}
@@ -187,13 +195,13 @@ def evaluate(site_id: str, now: int | None = None) -> None:
         unconfirmed = True
     _set(ready and unconfirmed, site_id, "apply_unconfirmed", "Control", "warning",
          "Today's slot table is not marked as applied: tier 2 has no read-back, so the saving is not claimed until it is")
-    # tariff: a regime ending within 60 days
+    # tariff: a regime ending within the rules' days (60 by default)
     for c in site.get("connections") or []:
         end = c["data"].get("agreement_end")
         soon = False
         if end:
             try:
-                soon = (date.fromisoformat(end) - datetime.fromtimestamp(now, PKT).date()).days <= 60
+                soon = (date.fromisoformat(end) - datetime.fromtimestamp(now, PKT).date()).days <= _th(rules_, "Tariff", "agreement_days")
             except ValueError:
                 soon = False
         _set(soon, site_id, f"regime_expiring_{c['id']}", "Tariff", "warning", f"The {c['data']['regime'].replace('_', ' ')} agreement ends on {end}",
@@ -389,20 +397,185 @@ def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "")
     return {**dict(r2), "detail": json.loads(r2["detail"] or "{}"), "site_name": (sites.get(r2["site_id"]) or {}).get("name", "")}
 
 
+# ------------------------------------------------------------------------------------------------ the rules (R8 2.16: per company, with site overrides)
+
+CHANNELS = ("in_app", "email", "sms", "whatsapp")
+#: Each category's thresholds as name: (default, lowest, highest). The company sets them in the rule editor and a site may override them; the evaluator
+#: reads the site's (`site_rules`). A default of None means "by the data source" (Data's staleness: plan Part 2.4's limits per kind of source).
+THRESHOLDS: dict[str, dict[str, tuple]] = {
+    "Data": {"stale_minutes": (None, 5, 2880)},
+    "Reserve": {"reserve_margin_pct": (2.0, 0, 20), "unserved_kwh": (0.5, 0, 10000)},
+    "Tariff": {"agreement_days": (60, 1, 365)},
+}
+_QUIET = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
+QUIET_WORDS = "Quiet hours are two times of day in Karachi time, such as 22:00-07:00"
+
+
+def quiet_hours(value) -> str | None:
+    """Quiet hours as "HH:MM-HH:MM" in Karachi time (across midnight when the second time is the earlier), or None; anything else is refused."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(QUIET_WORDS)
+    t = re.sub(r"\s+", "", value).replace("\u2013", "-")
+    m = _QUIET.match(t)
+    if not m or m.group(1, 2) == m.group(3, 4):
+        raise ValueError(QUIET_WORDS)
+    return t
+
+
+def in_quiet_hours(rule: dict, ts: int) -> bool:
+    """True when `ts` falls in the rule's quiet hours (Karachi time), for the sender of email, SMS and WhatsApp (not built: HANDOFF 8.C)."""
+    q = rule.get("quiet_hours")
+    if not q:
+        return False
+    a, b = (int(x[:2]) * 60 + int(x[3:]) for x in q.split("-"))
+    local = datetime.fromtimestamp(int(ts), PKT)
+    m = local.hour * 60 + local.minute
+    return a <= m < b if a < b else (m >= a or m < b)
+
+
+class RuleIn(Strict):
+    """A category's rule as the editor sends it."""
+    channels: list[Literal[CHANNELS]] = Field(default_factory=lambda: ["in_app"], max_length=4)
+    quiet_hours: str | int | float | None = None
+    escalate_after_min: int | None = Field(None, ge=1, le=10080)
+    thresholds: dict[str, float | None] = Field(default_factory=dict)
+
+
+def _threshold_values(cat: str, given: dict | None, strict: bool) -> dict:
+    """The category's thresholds: each known name at the value given (None or absent: its default), checked against its range when `strict`
+    (an edit), else a stored value out of range or of an unknown name is read as the default."""
+    out = {}
+    known = THRESHOLDS.get(cat, {})
+    for name in given or {}:
+        if name not in known and strict:
+            raise ValueError(f"{cat} alerts: there is no threshold named '{name}'")
+    for name, (default, lo, hi) in known.items():
+        v = (given or {}).get(name)
+        if v is None:
+            out[name] = default
+            continue
+        ok = isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi
+        if not ok:
+            if strict:
+                raise ValueError(f"{cat} alerts: the {name.replace('_', ' ')} threshold must be from {lo:g} to {hi:g}")
+            out[name] = default
+            continue
+        out[name] = int(v) if float(v).is_integer() and isinstance(default, int) else float(v)
+    return out
+
+
+def _rule(cat: str, v: dict | None, strict: bool) -> dict:
+    """A category's rule in its stored shape: channels (in the app always first), quiet hours, escalation and thresholds. With `strict` (an edit) a
+    problem is a ValueError of one sentence; otherwise a stored value that is no longer valid reads as its default (quiet hours typed as free text
+    before they were checked read as none)."""
+    v = v if isinstance(v, dict) else {}
+    if strict:
+        try:
+            r = RuleIn.model_validate(v)
+        except ValidationError as exc:
+            words = message(exc).replace("The escalate after min", "The escalation").replace("The thresholds's ", "The threshold ")
+            raise ValueError(f"{cat} alerts: {words}") from None
+        try:
+            quiet = quiet_hours(r.quiet_hours)
+        except ValueError as exc:
+            raise ValueError(f"{cat} alerts: {exc}") from None
+        channels, escalate = r.channels, r.escalate_after_min
+    else:
+        try:
+            quiet = quiet_hours(v.get("quiet_hours"))
+        except ValueError:
+            quiet = None
+        channels = [c for c in v.get("channels") or [] if c in CHANNELS]
+        e = v.get("escalate_after_min")
+        escalate = e if isinstance(e, int) and not isinstance(e, bool) and 1 <= e <= 10080 else None
+    return {"channels": [c for c in CHANNELS if c == "in_app" or c in channels], "quiet_hours": quiet, "escalate_after_min": escalate,
+            "thresholds": _threshold_values(cat, v.get("thresholds"), strict)}
+
+
 def rules() -> dict:
-    return store.get_setting("alert_rules", DEFAULT_RULES)
+    """The company's rules, every category in its stored shape."""
+    stored = store.get_setting("alert_rules", None) or {}
+    return {c: _rule(c, stored.get(c), False) for c in CATEGORIES}
+
+
+def _check_body(body) -> dict:
+    if not isinstance(body, dict):
+        raise ValueError("The alert rules are a set of categories, each with its rule")
+    for cat in body:
+        if cat not in CATEGORIES:
+            raise ValueError(f"Unknown alert category: {cat}")
+    return body
 
 
 def set_rules(body: dict, by: str) -> dict:
-    out = dict(DEFAULT_RULES)
-    for cat, v in (body or {}).items():
-        if cat not in CATEGORIES or not isinstance(v, dict):
-            raise ValueError(f"Unknown alert category: {cat}")
-        ch = [c for c in v.get("channels", ["in_app"]) if c in ("in_app", "email", "sms", "whatsapp")]
-        out[cat] = {"channels": ch or ["in_app"], "quiet_hours": v.get("quiet_hours"), "escalate_after_min": v.get("escalate_after_min")}
+    """The company's rules replaced by `body` ({category: rule}); a category left out is put back to its defaults."""
+    body = _check_body(body)
+    out = {c: _rule(c, body.get(c), True) for c in CATEGORIES}
     store.set_setting("alert_rules", out)
     store.audit(by, "changed the alert rules")
     return out
+
+
+def _site_key(site_id: str) -> str:
+    return f"alert_rules:site:{site_id}"
+
+
+def _merge(base: dict, over: dict | None) -> dict:
+    over = over or {}
+    return {**base, **{k: v for k, v in over.items() if k != "thresholds"}, "thresholds": {**base["thresholds"], **(over.get("thresholds") or {})}}
+
+
+def site_rules(site_id: str) -> dict:
+    """The rules the evaluator applies at a site: the company's, with the site's overrides on top."""
+    company = rules()
+    over = store.get_setting(_site_key(site_id), None) or {}
+    return {c: _rule(c, _merge(company[c], over.get(c)), False) for c in CATEGORIES}
+
+
+_FIELDS = ("channels", "quiet_hours", "escalate_after_min")
+
+
+def _diff(rule: dict, company: dict) -> dict:
+    """What a site's rule of one category keeps apart from the company's: the fields, and the thresholds, that differ."""
+    diff = {k: rule[k] for k in _FIELDS if rule[k] != company[k]}
+    th = {k: v for k, v in rule["thresholds"].items() if v != company["thresholds"].get(k)}
+    if th:
+        diff["thresholds"] = th
+    return diff
+
+
+def site_overrides(site_id: str) -> dict:
+    """What the site keeps apart from the company's rules, per category."""
+    company, eff = rules(), site_rules(site_id)
+    return {c: d for c in CATEGORIES if (d := _diff(eff[c], company[c]))}
+
+
+def set_site_rules(site_id: str, body: dict, by: str) -> dict:
+    """The site's rules from `body` ({category: rule, whole or in part}): each category's rule is the company's with what `body` gives on top, and only
+    what then differs from the company's rules is kept for the site, so the rest follows the company. An empty body puts the site back on them."""
+    body = _check_body(body)
+    company = rules()
+    over = {}
+    for c, v in body.items():
+        if not isinstance(v, dict):
+            raise ValueError(f"{c} alerts: the rule must be a set of named values")
+        th = v.get("thresholds") or {}
+        if not isinstance(th, dict):
+            raise ValueError(f"{c} alerts: the thresholds must be a set of named values")
+        merged = {**{k: company[c][k] for k in _FIELDS}, **{k: x for k, x in v.items() if k != "thresholds"},
+                  "thresholds": {**company[c]["thresholds"], **th}}
+        if d := _diff(_rule(c, merged, True), company[c]):
+            over[c] = d
+    store.set_setting(_site_key(site_id), over)
+    store.audit(by, "changed a site's alert rules", site_id, {"categories": sorted(over)})
+    return {"site_id": site_id, "rules": site_rules(site_id), "overrides": site_overrides(site_id)}
+
+
+def _th(rules_: dict, cat: str, name: str):
+    """A threshold of the site's rules (its default when the rules lack it)."""
+    return (rules_.get(cat) or {}).get("thresholds", {}).get(name, THRESHOLDS[cat][name][0])
 
 
 def tariff_pending_count() -> int:

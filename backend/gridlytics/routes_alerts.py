@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body
 
 from . import alerts, auth
-from .routes_common import bad, out
+from .routes_common import bad, out, site_or_404
 from .schemas import Refusal
 
 router = APIRouter()
@@ -32,6 +32,23 @@ def rules_put(inp: dict = Body(...)):
     auth.need("edit_workspace", "Changing the alert rules")
     try:
         return alerts.set_rules(inp, auth.actor())
+    except ValueError as exc:
+        raise bad(exc) from None
+
+
+@router.get("/api/alerts/rules/sites/{site_id}")
+def site_rules_get(site_id: str):
+    """The rules the evaluator applies at a site (the company's with the site's overrides on top) and the overrides themselves."""
+    site_or_404(site_id)
+    return {"site_id": site_id, "rules": alerts.site_rules(site_id), "overrides": alerts.site_overrides(site_id)}
+
+
+@router.put("/api/alerts/rules/sites/{site_id}")
+def site_rules_put(site_id: str, inp: dict = Body(...)):
+    auth.need("edit_workspace", "Changing a site's alert rules")
+    site_or_404(site_id)
+    try:
+        return alerts.set_site_rules(site_id, inp, auth.actor())
     except ValueError as exc:
         raise bad(exc) from None
 
