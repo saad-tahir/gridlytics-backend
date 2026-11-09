@@ -98,3 +98,24 @@ def test_an_overlapping_upload_keeps_every_column_the_file_does_not_carry(compan
     assert after["load_kwh"] > before["load_kwh"]
     assert res["overlap"] == 60 and res["rows"] == 60
     assert any("60 minutes were already stored" in line for line in res["log"]), res["log"]
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-24: duplicates
+
+def test_duplicate_times_are_counted_once_and_reported(company):
+    """Each minute 10:00-10:59 twice: 60 minutes are stored (the last row of each), the answer and the imports row say 60 rows, and the duplicates are
+    named in the notes."""
+    sid = _site("Twice")
+    t = T0 + 10 * 3600
+    rows = []
+    for i in range(60):
+        rows += [(_local(t + 60 * i), 1, 1000), (_local(t + 60 * i), 1, 2000)]
+    res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), rows), 5, now=NOW)
+    assert (res["rows"], res["duplicates"], res["minutes"]) == (60, 60, 60)
+    assert any(line.startswith("60 rows repeat a minute") for line in res["log"]), res["log"]
+    assert telemetry.imports(sid)[0]["rows"] == 60
+    d = telemetry.raw(sid, t, t + 3600, ("load_power_w",))
+    assert len(d["ts"]) == 60 and np.all(d["load_power_w"] == 2000)  # the last row of each minute
+    # a clean file reports no duplicates
+    clean = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), [(_local(t + 7200 + 60 * i), 1, 5) for i in range(5)]), 5, now=NOW)
+    assert clean["duplicates"] == 0 and not any("repeat a minute" in line for line in clean["log"])

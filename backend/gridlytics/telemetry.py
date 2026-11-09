@@ -296,7 +296,8 @@ def imports(site_id: str, limit: int = 20) -> list[dict]:
 
 def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
                file_name: str | None = None) -> dict:
-    """A CSV upload: one row per minute; blanks are missing; duplicates keep the last; gaps over 5 minutes are reported.
+    """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
+    `duplicates` the rows dropped, both in the notes); gaps over 5 minutes are reported.
 
     The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
     nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
@@ -341,7 +342,15 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     _check_window([r["ts"] for r in records], now)  # before anything is written
     if bad_ts:
         log.append(f"{bad_ts} rows without a readable ts were skipped")
-    records.sort(key=lambda r: r["ts"])
+    records.sort(key=lambda r: r["ts"])  # a stable sort: of two rows with one time, the later in the file stays later
+    by_minute: dict[int, dict] = {}
+    for r in records:
+        by_minute[r["ts"] // 60] = r  # duplicate times keep the last row (plan Part 7.5), and are counted once
+    duplicates = len(records) - len(by_minute)
+    records = list(by_minute.values())
+    if duplicates:
+        log.append(f"{duplicates:,} row{'s repeat' if duplicates != 1 else ' repeats'} a minute that a later row of the file also gives: the last row "
+                   f"of each minute was kept")
     gaps = sum(1 for a, b in zip(records, records[1:]) if b["ts"] - a["ts"] > 300)
     res = ingest(site_id, records, "csv", now=now, count_overlap=True)
     res["skipped"] += bad_ts
@@ -359,10 +368,11 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         iid = store.new_id()
         con.execute("INSERT INTO imports (id, site_id, source, file_hash, rows, gaps, status, log, created, from_ts, to_ts, file_name) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (iid, site_id, "csv", digest, res["accepted"], gaps, "done", json.dumps(log), store._now(), first, last, name))
+                    (iid, site_id, "csv", digest, len(records), gaps, "done", json.dumps(log), store._now(), first, last, name))
     for day in _local_days(r["ts"] for r in records):  # only the days that received rows, not every day between the first and the last
         aggregate_day(site_id, day)
-    return {"id": iid, "rows": res["accepted"], "skipped": res["skipped"], "gaps": gaps, "log": log, "minutes": res["accepted"], "overlap": res["overlap"],
+    return {"id": iid, "rows": len(records), "skipped": res["skipped"], "gaps": gaps, "log": log, "duplicates": duplicates, "minutes": res["accepted"],
+            "overlap": res["overlap"],
             "from": datetime.fromtimestamp(first, timezone.utc).isoformat(), "to": datetime.fromtimestamp(last, timezone.utc).isoformat(),
             "from_ts": first, "to_ts": last, "file_name": name}
 
