@@ -340,12 +340,6 @@ def _person(c, email: str, name: str, cid: str, company_role: str = "member") ->
                                                    "company_id": cid, "company_role": company_role}), 201)["user"]
 
 
-def _role_on_users(c, user_id: str, cid: str) -> str | None:
-    """The Gridlytics role the founder's Users page shows for the person in the company."""
-    user = next(u for u in _ok(c.get("/api/founder/users"))["users"] if u["id"] == user_id)
-    return next(m for m in user["memberships"] if m["company_id"] == cid)["gridlytics_role"]
-
-
 def test_the_founders_answers_carry_the_gridlytics_role_and_not_the_lifted_name(fdb):
     """founder-console-18: every membership and member carried 'solarlytics_role' beside 'gridlytics_role', kept for a console page that no longer read it."""
     c = _console()
@@ -356,3 +350,34 @@ def test_the_founders_answers_carry_the_gridlytics_role_and_not_the_lifted_name(
     users = _ok(c.get("/api/founder/users"))["users"]
     assert members[0]["gridlytics_role"] == "admin" and users[0]["memberships"][0]["gridlytics_role"] == "admin"
     assert "solarlytics" not in json.dumps(members) + json.dumps(users)
+
+
+def test_a_company_admin_is_a_gridlytics_administrator_and_a_role_set_in_gridlytics_stays(fdb):
+    """founder-console-04: the console offered the company role Admin and said the person 'is admin', but it gave nothing: auth/state still said viewer,
+    with manage_members false. A company admin is now an administrator in Gridlytics, as its owner is (not pinned); a member starts as a viewer."""
+    c = _console()
+    made = _company(c)
+    cid, owner = made["company"]["id"], made["owner"]
+    boss = _as(owner)
+    _ok(boss.get("/api/sites"))
+    maaz = _person(c, "maaz@meow.test", "Maaz Ali", cid, "admin")
+    # before the first sign-in, the company's own Users list says what the company role gives
+    assert {u["email"]: u["role"] for u in _ok(boss.get("/api/users"))}["maaz@meow.test"] == "admin"
+    state = _ok(_as(maaz).get("/api/auth/state"))
+    assert state["user"]["role"] == "admin" and state["company_role"] == "admin" and state["can"]["manage_members"] is True
+    _ok(c.patch(f"/api/founder/users/{maaz['id']}/memberships/{cid}", json={"company_role": "member"}))
+    state = _ok(_as(maaz).get("/api/auth/state"))
+    assert state["user"]["role"] == "viewer" and state["can"]["manage_members"] is False
+    _ok(c.patch(f"/api/founder/users/{maaz['id']}/memberships/{cid}", json={"company_role": "admin"}))
+    assert _ok(_as(maaz).get("/api/auth/state"))["user"]["role"] == "admin"
+    # a role an administrator set in Gridlytics stays whatever the company role
+    sunia = _person(c, "sunia@meow.test", "Sunia Ahmed", cid)
+    _ok(_as(sunia).get("/api/sites"))
+    _ok(boss.put(f"/api/users/{sunia['id']}", json={"role": "operator"}))
+    _ok(c.patch(f"/api/founder/users/{sunia['id']}/memberships/{cid}", json={"company_role": "admin"}))
+    assert _ok(_as(sunia).get("/api/auth/state"))["user"]["role"] == "operator"
+    # the owner who hands the ownership over and becomes an admin stays an administrator, no longer pinned
+    _ok(c.patch(f"/api/founder/users/{maaz['id']}/memberships/{cid}", json={"company_role": "owner"}))
+    _ok(c.patch(f"/api/founder/users/{owner['id']}/memberships/{cid}", json={"company_role": "admin"}))
+    me = next(u for u in _ok(_as(owner).get("/api/users")) if u["id"] == owner["id"])
+    assert (me["role"], me["role_source"], me["company_role"]) == ("admin", "default", "admin")

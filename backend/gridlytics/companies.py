@@ -15,8 +15,9 @@ person's member row in that company's file, which is made, at the current schema
 
 In both modes only an active membership of a verified company counts, and only for a company that platform.db has switched on (policy `listed`, design K.1):
 whether it is on, its seats and its file are the registry's, found by the company's uuid, never the context's. The person's role (decisions, section 3): the
-company's owner is an administrator, pinned (source `owner`); everyone else starts as a viewer (source `default`), or with the role a preset of their address
-gives (source `set`, used once); a role set in Gridlytics stays. In a workspace linked to its company (link_company.py), the user of before with the
+company's owner is an administrator, pinned (source `owner`); a company admin is an administrator too, not pinned, and a member starts as a viewer (source
+`default`, which follows the company role: audit founder-console-04); either may instead have the role a preset of their address gives (source `set`, used
+once); a role set in Gridlytics stays. In a workspace linked to its company (link_company.py), the user of before with the
 person's address is linked at the first sight (design F.4): their role (source `legacy`) unless the ownership or a preset gives one, their licence and seal,
 whether they were switched off, and the rows they owned. Seats are the registry's, against the members not switched off; the owner always has one.
 
@@ -66,8 +67,10 @@ MAX_KEPT = 10_000
 FETCH_TIMEOUT = 5
 #: A context is a few kilobytes; an answer far larger is not one
 MAX_CONTEXT_BYTES = 256 * 1024
-#: Everyone but the company's owner starts as this (decisions, section 3)
+#: A member of the company starts as this (decisions, section 3)
 MEMBER_ROLE = "viewer"
+#: The company roles whose people are the company's Gridlytics administrators by default: the owner (pinned) and its admins (audit founder-console-04)
+ADMIN_ROLES = ("owner", "admin")
 #: Why a member's row is switched off when it was made with no seat left; a seat freed lets the member in again
 NO_SEAT = "no seat"
 #: Why a member's row is switched off when the user of before it was linked to was: only an administrator lets them in
@@ -265,6 +268,24 @@ def _choose(ctx: dict, wanted: str | None) -> tuple[dict, dict]:
 
 # ================================================================================================================ the person's member row
 
+def default_role(company_role: str) -> str:
+    """The Gridlytics role a company role gives until one is set in Gridlytics: an administrator for the owner and the company's admins, a viewer for a
+    member (audit founder-console-04: the company role admin gave nothing, though the console offered it)."""
+    return "admin" if company_role in ADMIN_ROLES else MEMBER_ROLE
+
+
+def role_follows(found: dict, company_role: str) -> dict:
+    """The changes that bring a member row in step with the person's company role: the company role itself, the owner's pinned administrator, and a role
+    derived from the company role (source `default`, or the owner's once no longer owner) derived again; a role set or carried from before stays."""
+    changes = {"company_role": company_role} if found["company_role"] != company_role else {}
+    if company_role == "owner":
+        if (found["role"], found["role_source"]) != ("admin", "owner"):
+            changes.update(role="admin", role_source="owner")
+    elif found["role_source"] in ("owner", "default") and (found["role"], found["role_source"]) != (default_role(company_role), "default"):
+        changes.update(role=default_role(company_role), role_source="default")
+    return changes
+
+
 #: First sights and seats freed are decided one at a time in this process, so two first requests at once cannot both take the last seat
 _seat_lock = threading.Lock()
 
@@ -276,7 +297,7 @@ def _seated(row: dict, owner: bool) -> bool:
 def _first_sight(user_id: str, email: str, name: str, company_role: str, row: dict) -> dict:
     """The member row of a person's first request in the company (design B.5, with the decisions' mapping): the owner an administrator, pinned; else the
     role of an unused preset of the address, taken once; else the role of the user of before with the address, in a workspace linked to its company (design
-    F.4); else a viewer. With no seat left, the row is made switched off."""
+    F.4); else the role the company role gives (an admin an administrator, a member a viewer). With no seat left, the row is made switched off."""
     owner = company_role == "owner"
     preset = None if owner else store_members.preset(email)
     # The user of before is linked whatever gives the role: their licence, seal and rows are theirs, and the owner of the workspace is most often its owner
@@ -288,7 +309,7 @@ def _first_sight(user_id: str, email: str, name: str, company_role: str, row: di
     elif legacy is not None and legacy["role"] in auth.ROLES:
         role, source = legacy["role"], "legacy"
     else:
-        role, source = MEMBER_ROLE, "default"
+        role, source = default_role(company_role), "default"
     # Switched off before, switched off now (the owner is let in by _follow, pinned): by a person, so a seat freed does not let them in
     kept_off = legacy is not None and legacy["disabled"] and not owner
     seated = kept_off or _seated(row, owner)
@@ -311,17 +332,10 @@ def _first_sight(user_id: str, email: str, name: str, company_role: str, row: di
 def _follow(found: dict, email: str, name: str, company_role: str) -> dict:
     """A known member brought in step with the sign-in and the membership: the address, the name and the company role follow them; the owner is an enabled
     administrator whatever the row says; a role derived from the company role (or the owner's, once no longer owner) is derived again; a role set stays."""
-    changes = {}
-    for key, value in (("email", email), ("name", name), ("company_role", company_role)):
-        if found[key] != value:
-            changes[key] = value
-    if company_role == "owner":
-        if (found["role"], found["role_source"]) != ("admin", "owner"):
-            changes.update(role="admin", role_source="owner")
-        if found["disabled"] or found["disabled_reason"]:
-            changes.update(disabled=False, disabled_reason="")
-    elif found["role_source"] in ("owner", "default") and (found["role"], found["role_source"]) != (MEMBER_ROLE, "default"):
-        changes.update(role=MEMBER_ROLE, role_source="default")
+    changes = {key: value for key, value in (("email", email), ("name", name)) if found[key] != value}
+    changes.update(role_follows(found, company_role))
+    if company_role == "owner" and (found["disabled"] or found["disabled_reason"]):
+        changes.update(disabled=False, disabled_reason="")
     return store_members.update_member(found["user_id"], **changes) if changes else found
 
 

@@ -262,13 +262,14 @@ def test_the_owner_is_an_administrator_and_stays_one(local):
         "role": "admin", "role_source": "owner", "disabled": False, "disabled_reason": ""}
 
 
-def test_everyone_else_starts_as_a_viewer(local):
+def test_a_company_admin_starts_as_an_administrator_and_a_member_as_a_viewer(local):
+    """Round 7, audit founder-console-04: the company role admin gave nothing (a viewer, as a member); it now gives the administrator role, not pinned."""
     north = _company("Northwind Solar")
     sunia = _account("sunia@example.test", "Sunia Ahmed", (north, "admin"))
     maaz = _account("maaz@example.test", "Maaz Ali", (north, "member"))
-    for acct, company_role in ((sunia, "admin"), (maaz, "member")):
+    for acct, company_role, role in ((sunia, "admin", "admin"), (maaz, "member", "viewer")):
         who = companies.resolve(_token(acct), None)
-        assert (who.user["role"], who.user["company_role"]) == ("viewer", company_role)
+        assert (who.user["role"], who.user["company_role"]) == (role, company_role)
         assert _member(north, acct)["role_source"] == "default"
 
 
@@ -322,12 +323,12 @@ def test_later_requests_follow_the_account_and_the_membership(local):
     assert _member(north, maaz)["last_seen"]
     platformdb.rename_account(maaz["id"], "Maaz A. Ali")
     assert companies.resolve(token, None).user["name"] == "Maaz A. Ali"
-    # made the company's owner: the pinned administrator; no longer the owner: derived again, a viewer
+    # made the company's owner: the pinned administrator; no longer the owner but an admin: derived again, an administrator not pinned (founder-console-04)
     platformdb.set_membership(maaz["id"], north["id"], role="owner")
     assert (companies.resolve(token, None).user["role"], _member(north, maaz)["role_source"]) == ("admin", "owner")
     platformdb.set_membership(maaz["id"], north["id"], role="admin")
     who = companies.resolve(token, None)
-    assert (who.user["role"], who.user["company_role"], _member(north, maaz)["role_source"]) == ("viewer", "admin", "default")
+    assert (who.user["role"], who.user["company_role"], _member(north, maaz)["role_source"]) == ("admin", "admin", "default")
     # a role set in Gridlytics stays when the company role moves between admin and member
     with store.use_company(_file(north)):
         store_members.update_member(maaz["id"], role="estimator", role_source="set")

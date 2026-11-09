@@ -434,7 +434,7 @@ def _not_seen() -> list[dict]:
             continue
         owner = p["company_role"] == "owner"
         preset = None if owner else store_members.preset(p["email"])
-        role, source = ("admin", "owner") if owner else (preset["role"], "set") if preset else (companies.MEMBER_ROLE, "default")
+        role, source = ("admin", "owner") if owner else (preset["role"], "set") if preset else (companies.default_role(p["company_role"]), "default")
         out.append({"id": p["id"], "email": p["email"], "name": p["name"], "role": role, "role_source": source, "company_role": p["company_role"],
                     "disabled": False, "disabled_reason": "", "first_seen": None, "last_seen": None, "seen": False})
     return out
