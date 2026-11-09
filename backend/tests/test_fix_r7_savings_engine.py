@@ -1,0 +1,126 @@
+"""Round-7 regression tests for the savings engine (verify.py), from the end-to-end audit: which days claim, and what the headline sums.
+
+Each test fails on the code before its fix. Test data: the demo twin's generated days and hand-made day rows only; nothing here calls the network."""
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+
+import numpy as np
+import pytest
+from test_fix_r2_savings import NIGHT_CHARGER, D, P
+from test_fix_r6_savings import DAYS, LEAD, _farm, _night_runs, _rows, _run
+from test_fix_savings import company, make_site, twin_day  # noqa: F401 (company is a fixture)
+
+from gridlytics import sites, store, telemetry, twin, verify
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat(timespec="seconds")
+
+
+def _override(sid: str, kind: str, t_from: float, t_to: float, cleared: float | None = None) -> None:
+    """An override row as sites.add_override writes it, set in the past (the route refuses an end in the past)."""
+    with store.connect() as con:
+        con.execute("INSERT INTO overrides (id, site_id, kind, value, from_ts, until_ts, author, reason, created, cleared) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (store.new_id(), sid, kind, None, _iso(t_from), _iso(t_to), "t", "", _iso(t_from), None if cleared is None else _iso(cleared)))
+
+
+def _plan_row(sid: str, belief: float, valid_until: float, status: str = "superseded", reason: str = "", summary: dict | None = None) -> None:
+    """A plans row as plans.tick stores it (the light columns active_at reads)."""
+    with store.connect() as con:
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, reason, summary) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)", (store.new_id(), sid, _iso(belief), _iso(belief), _iso(belief), _iso(valid_until), "a", status, reason,
+                                                     json.dumps(summary or {})))
+
+
+def _event(sid: str, ts: float, kind: str) -> None:
+    with store.connect() as con:
+        con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)", (sid, _iso(ts), kind, "edge", "{}"))
+
+
+def _clear(sid: str, *tables: str) -> None:
+    with store.connect() as con:
+        for t in tables:
+            con.execute(f"DELETE FROM {t} WHERE site_id = ?", (sid,))
+
+
+# ------------------------------------------------------------------------------------------------ engine-savings-02: control in force
+
+def _closed_loop_day(name: str) -> str:
+    """A closed-loop grid site (no demo) whose inverter ran the night charger the day before and on D, every minute read."""
+    sid = make_site(name=name, tier="closed_loop")
+    _, sp, _ = twin_day(sid, P, 0.9, seed=1, policy=lambda s, ts: twin.table_policy(NIGHT_CHARGER, ts))
+    twin_day(sid, D, float(sp["soc"][-1]), seed=2, policy=lambda s, ts: twin.table_policy(NIGHT_CHARGER, ts))
+    return sid
+
+
+def test_a_closed_loop_day_claims_only_while_control_was_in_force(company):
+    sid = _closed_loop_day("Closed r7 control")
+    t0 = twin.day_start_utc(D)
+    full = verify.compute_day(sid, D, with_bound=False)["native"]
+    assert full["fidelity"] == "confirmed" and full["claimed_rs"] == full["saving_rs"] and full["claimed_rs"] != 0.0
+    assert full["control"]["in_force_share"] == 1.0 and full["fidelity_score"] == 1.0
+
+    # paused all day: the tick held its plans and the edge was sent a signed release, so the inverter ran its own settings. Before: "confirmed" by
+    # construction, and the replay's error claimed
+    _override(sid, "pause_control", t0 - 3600, t0 + 86400 + 3600)
+    r = verify.compute_day(sid, D, with_bound=False)["native"]
+    assert r["fidelity"] == "not_applied" and r["claimed_rs"] == 0.0 and r["control"]["released_min"] == 1440
+    assert r["control"]["in_force_share"] == 0.0
+    assert verify.summary(sid, D.isoformat(), D.isoformat())["baselines"]["native"]["verified_days"] == 0
+
+    # released to native from 00:00, cleared at 06:00: a quarter of the day ran native, the rest the plan; a partial day claims, its fidelity beside it
+    _clear(sid, "overrides")
+    _override(sid, "force_native", t0, t0 + 2 * 86400, cleared=t0 + 6 * 3600)
+    r = verify.compute_day(sid, D, with_bound=False)["native"]
+    assert r["fidelity"] == "partial" and r["claimed_rs"] == r["saving_rs"] and r["control"]["released_min"] == 360
+    assert r["fidelity_score"] == 0.75
+
+    # no plan in force: none was ever made (the site never ticked), so nothing on the day was the product's doing
+    _clear(sid, "overrides", "plans")
+    r = verify.compute_day(sid, D, with_bound=False)["native"]
+    assert r["fidelity"] == "not_applied" and r["claimed_rs"] == 0.0 and r["control"]["no_plan_min"] == 1440
+
+    # the plan in force expired at 10:00 (the ticks failed, so nothing replaced it): the edge reverts to native on expiry
+    _plan_row(sid, t0 - 3600, t0 + 10 * 3600)
+    _plan_row(sid, t0 + 3600, t0 + 3600 + 192 * 900, status="failed", reason="not solved")  # a failed tick leaves the plan in force
+    r = verify.compute_day(sid, D, with_bound=False)["native"]
+    assert r["control"]["no_plan_min"] == 14 * 60 and r["fidelity"] == "not_applied" and r["claimed_rs"] == 0.0
+
+    # a pause's held tick at 08:00 ends the plan in force; a fresh plan at 12:00 (the pause cleared) is in force from then on
+    _clear(sid, "plans")
+    _plan_row(sid, t0 - 3600, t0 + 2 * 86400)
+    _plan_row(sid, t0 + 8 * 3600, t0 + 2 * 86400, status="held", reason="control_paused")
+    _plan_row(sid, t0 + 12 * 3600, t0 + 2 * 86400, status="active")
+    r = verify.compute_day(sid, D, with_bound=False)["native"]
+    assert r["control"]["no_plan_min"] == 4 * 60 and r["fidelity"] == "partial" and r["claimed_rs"] == r["saving_rs"]
+
+    # the edge fell back to native (its own report) from 04:00 to 18:00: the device ran its own settings for most of the day
+    _clear(sid, "plans")
+    _plan_row(sid, t0 - 3600, t0 + 2 * 86400)
+    _event(sid, t0 + 4 * 3600, "fallback_engaged")
+    _event(sid, t0 + 18 * 3600, "fallback_cleared")
+    r = verify.compute_day(sid, D, with_bound=False)["native"]
+    assert r["control"]["edge_fallback_min"] == 14 * 60 and r["fidelity"] == "not_applied" and r["claimed_rs"] == 0.0
+    # control disabled on the edge the evening before and never enabled again: no minute of the day was under the plan
+    _clear(sid, "events")
+    _event(sid, t0 - 3600, "control_disabled")
+    r = verify.compute_day(sid, D, with_bound=False)["native"]
+    assert r["control"]["edge_fallback_min"] == 1440 and r["claimed_rs"] == 0.0
+    _event(sid, t0 + 23 * 3600, "control_enabled")
+    assert verify.compute_day(sid, D, with_bound=False)["native"]["control"]["edge_fallback_min"] == 23 * 60
+
+
+def test_a_demo_day_under_a_pause_claims_nothing(company):
+    # the demo twin runs the native settings while control is paused (round 2), so the day's saving is not the product's. Before: a demo day was
+    # "confirmed" whatever was in force
+    sid = _farm("Farm paused r7")
+    _run(sid, [LEAD] + DAYS[:1], _night_runs)
+    assert verify.compute_day(sid, DAYS[0], with_bound=False)["native"]["fidelity"] == "confirmed"
+    t0 = twin.day_start_utc(DAYS[0])
+    _override(sid, "pause_control", t0 - 600, t0 + 86400)
+    r = verify.compute_day(sid, DAYS[0], with_bound=False)["native"]
+    assert r["fidelity"] == "not_applied" and r["claimed_rs"] == 0.0 and r["control"]["released_min"] == 1440
+    # the demo has no edge: its telemetry and events say nothing about an edge, so only the plan in force counts
+    assert r["control"]["edge_fallback_min"] == 0 and r["control"]["edge_unheard_min"] == 0

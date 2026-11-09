@@ -663,6 +663,123 @@ def _gen_running_before(site_id: str, t0: int) -> bool:
     return bool(np.nan_to_num(fuel) > 0.0)
 
 
+# ------------------------------------------------------------------------------------------------ control in force (plan 8.3 control health, gating 8.4)
+
+#: A closed-loop or demo day's share of minutes under the plan: at or above CONTROL_CONFIRMED the day is confirmed, at or above CONTROL_PARTIAL
+#: partial (it claims, its share beside it as its fidelity, plan 8.4), below it not applied (it claims nothing)
+CONTROL_CONFIRMED = 0.95
+CONTROL_PARTIAL = 0.5
+#: ems-edge/1.0 events that put the device on its own settings, each with the event that ends it
+EDGE_NATIVE_EVENTS = {"fallback_engaged": "fallback_cleared", "control_disabled": "control_enabled"}
+
+
+def _epoch(iso) -> int | None:
+    """Epoch seconds of a stored ISO time (UTC unless it says otherwise); None for a blank or unreadable one."""
+    if not iso:
+        return None
+    try:
+        return plans._ts(str(iso))
+    except (TypeError, ValueError):
+        return None
+
+
+def _plan_decides(r) -> tuple[bool, int | None] | None:
+    """What a stored tick says about the plan in force from its belief time on (plans.active_at's rules): (True, valid_until) for a plan made
+    (active or superseded), (False, None) for a held or failed tick of a pause or a release to native (no plan in force), None for a tick that
+    leaves the plan before it in force (a guard hold, a failed solve)."""
+    if r["status"] in ("active", "superseded"):
+        return True, _epoch(r["valid_until"]) or 0
+    if r["status"] == "held" and r["reason"] in plans.RELEASE_REASONS.values():
+        return False, None
+    if r["status"] == "failed":
+        try:
+            release = (json.loads(r["summary"] or "{}") or {}).get("control_release")
+        except (TypeError, ValueError, AttributeError):
+            release = None
+        if release:
+            return False, None
+    return None
+
+
+def _spans(marks: list[tuple[int, bool]], ts: np.ndarray) -> np.ndarray:
+    """The minutes of `ts` inside the spans that `marks` open and close: (time, True) opens one, (time, False) closes the open one."""
+    out = np.zeros(len(ts), dtype=bool)
+    start = None
+    for t, opens in sorted(marks, key=lambda m: m[0]):
+        if opens and start is None:
+            start = t
+        elif not opens and start is not None:
+            out |= (ts >= start) & (ts < t)
+            start = None
+    if start is not None:
+        out |= ts >= start
+    return out
+
+
+def _control(site_id: str, g: dict, edge: bool) -> dict:
+    """Which minutes of a day the plan was in control at a closed-loop or demo site (plan 8.3's control health), as minutes and the share in force:
+    - `released_min`: a pause or a release to native in force, from the override history (its start to its end, or to when it was cleared;
+      plans._released_at): the tick holds its plans and the edge, or the demo's twin, runs the native settings;
+    - `no_plan_min`: no plan in force, by plans.active_at's rules over the stored ticks: none made yet, the one in force past its valid_until (the
+      edge reverts to native on expiry), or a held or failed tick of a pause or release ended it (a guard hold or a failed solve otherwise leaves
+      the plan before it in force);
+    - `edge_fallback_min` (`edge`: a closed-loop site's own edge, not the demo's twin): the edge reported the device on its own settings
+      (fallback_engaged to fallback_cleared, control_disabled to control_enabled);
+    - `edge_unheard_min` (`edge`): minutes with no telemetry row at all, where nothing shows the edge running the plan.
+    `in_force_share` is the share of the day's minutes free of all four."""
+    ts = np.asarray(g["ts"], dtype=np.int64)
+    n = len(ts)
+    if not n:
+        return {"in_force_share": 0.0, "released_min": 0, "no_plan_min": 0, "edge_fallback_min": 0, "edge_unheard_min": 0}
+    t0, t1 = int(ts[0]), int(ts[-1]) + 60
+    with store.connect() as con:
+        ovs = con.execute("SELECT from_ts, until_ts, cleared FROM overrides WHERE site_id = ? AND kind IN (?, ?)",
+                          (site_id, *plans.RELEASE_REASONS)).fetchall()
+        cols = "status, reason, belief_time, valid_until, summary"
+        today = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND belief_time >= ? AND belief_time < ? "
+                            "ORDER BY belief_time, generated_at, rowid", (site_id, plans._iso(t0), plans._iso(t1))).fetchall()
+        before = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND belief_time < ? ORDER BY belief_time DESC, generated_at DESC, rowid DESC "
+                             "LIMIT 200", (site_id, plans._iso(t0))).fetchall()
+        last = None
+        if not any(_plan_decides(r) for r in before):
+            last = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND status IN ('active', 'superseded') AND belief_time < ? "
+                               "ORDER BY belief_time DESC LIMIT 1", (site_id, plans._iso(t0))).fetchone()
+        evs = con.execute(f"SELECT ts, type FROM events WHERE site_id = ? AND type IN ({', '.join('?' * 2 * len(EDGE_NATIVE_EVENTS))}) ORDER BY id",
+                          (site_id, *EDGE_NATIVE_EVENTS, *EDGE_NATIVE_EVENTS.values())).fetchall() if edge else []
+    released = np.zeros(n, dtype=bool)
+    for o in ovs:
+        start, end, cleared = _epoch(o["from_ts"]), _epoch(o["until_ts"]), _epoch(o["cleared"])
+        if cleared is not None and (end is None or cleared < end):
+            end = cleared
+        if end is not None:
+            released |= (ts < end) & (ts >= (start if start is not None else t0 - 1))
+    # the plan in force at the day's start: the latest tick before it that decides (a plan made, or a pause's tick that ended it)
+    state = next((d for d in map(_plan_decides, before) if d is not None), None) or (_plan_decides(last) if last else None)
+    valid = state[1] if state and state[0] else None
+    in_force = np.zeros(n, dtype=bool)
+    i0 = 0
+    for r in today:
+        d = _plan_decides(r)
+        if d is None:
+            continue
+        i1 = int(np.searchsorted(ts, _epoch(r["belief_time"]) or t0, side="left"))
+        if valid is not None:
+            in_force[i0:i1] = ts[i0:i1] < valid
+        valid, i0 = (d[1] if d[0] else None), max(i0, i1)
+    if valid is not None:
+        in_force[i0:] = ts[i0:] < valid
+    fallback = np.zeros(n, dtype=bool)
+    unheard = np.zeros(n, dtype=bool)
+    if edge:
+        for opens, closes in EDGE_NATIVE_EVENTS.items():
+            marks = [(t, e["type"] == opens) for e in evs if e["type"] in (opens, closes) and (t := _epoch(e["ts"])) is not None]
+            fallback |= _spans(marks, ts)
+        unheard = ~np.asarray(g.get("present", np.ones(n, dtype=bool)), dtype=bool)
+    ok = in_force & ~released & ~fallback & ~unheard
+    return {"in_force_share": round(float(np.mean(ok)), 4), "released_min": int(released.sum()), "no_plan_min": int((~in_force).sum()),
+            "edge_fallback_min": int(fallback.sum()), "edge_unheard_min": int(unheard.sum())}
+
+
 def _claims(row: dict | None) -> bool:
     """Whether a stored row claims its saving: a claiming fidelity (CLAIMING) and no claim withheld."""
     return bool(row) and row.get("fidelity") in CLAIMING and not row.get("claim_withheld")
@@ -870,8 +987,10 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
                                "v_rs_per_kwh": v_start, "carry_rs": v_start * gap_start},
                      "end": {"state": _end_state(sim), "baseline_e_kwh": e_end_base, "actual_e_kwh": e_end_actual, "gap_kwh": gap_end,
                              "v_rs_per_kwh": v_end, "carry_rs": v_end * gap_end, "unread_min": unread}}
-    # fidelity gates the claim (plan 8.4): a monitor site only recommends, even in the demo; the twin and closed loop follow the plan by construction;
-    # in tier advisory a day counts only once telemetry confirms the keyed table (plan 7.6), never on the mark alone
+    # fidelity gates the claim (plan 8.4): a monitor site only recommends, even in the demo; the twin and closed loop follow the plan, but only while
+    # one is in force (_control: no pause or release to native, a plan made and not expired, and at a closed-loop site's own edge no fallback to
+    # native and telemetry heard), so the day's class is its share of minutes under the plan; in tier advisory a day counts only once telemetry
+    # confirms the keyed table (plan 7.6), never on the mark alone
     tier = site.get("tier", "monitor")
     with store.connect() as con:
         applied = con.execute("SELECT * FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1",
@@ -880,12 +999,16 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
                         (site_id, day.isoformat(), day.isoformat())).fetchone()
     switch = r["arm"] if r else None
     fidelity_score = None
+    control = None
     if switch == "native":
         fidelity = "native_block"
     elif tier == "monitor":
         fidelity = "recommendation_only"
     elif site.get("demo_link") or tier == "closed_loop":
-        fidelity = "confirmed"
+        control = _control(site_id, act["g"], edge=not site.get("demo_link"))
+        share = control["in_force_share"]
+        fidelity = "confirmed" if share >= CONTROL_CONFIRMED else "partial" if share >= CONTROL_PARTIAL else "not_applied"
+        fidelity_score = round(share, 3)
     elif tier == "advisory_writes":
         if applied is None:
             fidelity = "not_applied"
@@ -926,7 +1049,8 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
                       "peak_kw_actual": a["peak_kw"], "peak_kw_baseline": n["peak_kw"], "mdi_rate": pr["mdi_rate"],
                       "mdi_floor_kw": pr["mdi_floor"], "mdi_interval_min": pr["mdi_interval"], "icp_case": pr["icp"],
                       "native_capture_version": (site.get("native") or {}).get("version"),
-                      "unserved_kwh_actual": a["unserved_kwh"], "unserved_kwh_baseline": n["unserved_kwh"], "chain": chains[base]}
+                      "unserved_kwh_actual": a["unserved_kwh"], "unserved_kwh_baseline": n["unserved_kwh"], "chain": chains[base],
+                      "control": control}
     if with_bound and b:
         # the hindsight solve prices every minute: it is held against the native arm priced the same way
         native_cost = (price_arm(site, sims["native"], pr, day, 0.0, 0.0, gen_before=befores["native"])["cost_rs"] if unresolved.any()

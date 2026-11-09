@@ -12,7 +12,7 @@ from datetime import date, timedelta
 import numpy as np
 import pytest
 from test_fix_r3_savings import SHIFTING
-from test_fix_savings import company, make_site  # noqa: F401 (company is a fixture)
+from test_fix_savings import company, make_site, standing_plan  # noqa: F401 (company is a fixture)
 
 from gridlytics import demo, optimise, sites, store, tariffs, telemetry, twin, verify
 
@@ -32,6 +32,7 @@ def _farm(name: str) -> str:
     sites.set_tier_capable(sid, "closed_loop")
     sites.set_tier_allowed(sid, spec["tier"], "t", "demo")
     sites.capture_native(sid, spec["native"], "t")
+    standing_plan(sid)
     return sid
 
 

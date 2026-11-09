@@ -41,7 +41,18 @@ def make_site(name="Mill", control="manual", load_mode=0, tier="closed_loop", tw
     sites.set_tier_capable(sid, "closed_loop")
     sites.set_tier_allowed(sid, tier, "t")
     sites.capture_native(sid, native or {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 20}, "t")
+    standing_plan(sid)
     return sid
+
+
+def standing_plan(sid):
+    """A plan in force on every test day (made in 2015, valid to 2100), as the 15-minute ticks keep one in force at a live site: a closed-loop or demo
+    day claims only while a plan was in force (round 7, audit engine-savings-02). Stored as superseded, so `plans.current` still reads only the plans
+    a test makes."""
+    with store.connect() as con:
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status) VALUES (?,?,?,?,?,?,?,?)",
+                    (store.new_id(), sid, "2015-01-01T00:00:00+00:00", "2015-01-01T00:00:00+00:00", "2015-01-01T00:00:00+00:00",
+                     "2100-01-01T00:00:00+00:00", "a", "superseded"))
 
 
 def twin_day(sid, day, soc0, seed=1, policy=None):
