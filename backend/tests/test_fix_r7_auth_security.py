@@ -48,3 +48,50 @@ def test_every_answer_is_filtered_for_a_viewer_and_a_count_is_not_money(world):
     sid = world.site
     assert world.c["viewer"].get(f"/api/sites/{sid}/native").status_code == 200
     assert world.anon.get(f"/api/sites/{sid}/overrides", headers=world.key(["sites:read"])).status_code == 200
+
+
+# ------------------------------------------------------------------------------------------------ role-operator-06 (pages-C-20)
+
+#: The money settings and the figures made from them alone (the wear price is the replacement cost over the warranty)
+MONEY_SETTINGS = {"voll", "voll_rs_per_kwh", "replacement_cost_per_kwh", "c_cyc", "c_start", "c_start_rs", "c_runhr", "c_runhr_rs", "c_om", "c_om_rs_per_kwh",
+                  "c_short"}
+
+
+def test_an_operator_sees_costs_but_not_the_money_settings(world):
+    sid, a, op, an = world.site, world.c["admin"], world.c["operator"], world.c["analyst"]
+    assert a.put(f"/api/sites/{sid}", json={"voll_rs_per_kwh": 650}).status_code == 200
+    battery = {"nameplate_kwh": 200, "p_ch_kw": 100, "p_dis_kw": 100}
+    assert a.put(f"/api/sites/{sid}/assets/battery", json={**battery, "replacement_cost_per_kwh": 61000}).status_code == 200
+    assert a.put(f"/api/sites/{sid}/assets/genset", json={"rated_kw": 150, "c_start_rs": 1700, "c_runhr_rs": 450, "c_om_rs_per_kwh": 9}).status_code == 200
+    pages = (f"/api/sites/{sid}", f"/api/sites/{sid}/battery", f"/api/sites/{sid}/genset", "/api/sites")
+    for url in pages:
+        assert op.get(url).status_code == 200, url
+        assert MONEY_SETTINGS & _keys(op.get(url).json()) == set(), url
+    # the administrator and the analyst read them (plan 9.4: "Analyst: everything including money settings")
+    for c in (a, an):
+        assert {"replacement_cost_per_kwh", "c_cyc"} <= _keys(c.get(f"/api/sites/{sid}/battery").json())
+        assert {"voll_rs_per_kwh", "c_start_rs"} <= _keys(c.get(f"/api/sites/{sid}").json())
+    # costs stay the operator's: the genset's estimated fuel cost and the fuel price
+    genset = op.get(f"/api/sites/{sid}/genset").json()
+    assert "fuel_cost_rs" in genset["kpis"] and genset["fuel_price"]["price_per_l"] is not None
+    assert {r: c.get("/api/meta").json()["permissions"]["see_money_settings"] for r, c in world.c.items()} == \
+        {"admin": True, "operator": False, "analyst": True, "viewer": False}
+
+
+def test_an_operator_saves_the_equipment_without_the_money_settings_it_cannot_see(world):
+    """The settings form fills a field the answer left out with its default and sends the asset back whole: the stored money settings are kept, and the
+    operator's change of what it may edit is saved."""
+    sid, a, op = world.site, world.c["admin"], world.c["operator"]
+    assert a.put(f"/api/sites/{sid}/assets/battery", json={"nameplate_kwh": 200, "p_ch_kw": 100, "p_dis_kw": 100, "replacement_cost_per_kwh": 61000}).status_code == 200
+    assert a.put(f"/api/sites/{sid}/assets/genset", json={"rated_kw": 150, "c_start_rs": 1700, "c_runhr_rs": 450, "c_om_rs_per_kwh": 9}).status_code == 200
+    r = op.put(f"/api/sites/{sid}/assets/battery", json={"nameplate_kwh": 220, "p_ch_kw": 100, "p_dis_kw": 100, "replacement_cost_per_kwh": 52000,
+                                                         "warranted_cycles": 6000, "warranted_depth": 0.8})
+    assert r.status_code == 200, r.text
+    r = op.put(f"/api/sites/{sid}/assets/genset", json={"rated_kw": 160, "c_start_rs": 1500, "c_runhr_rs": 400, "c_om_rs_per_kwh": 8})
+    assert r.status_code == 200, r.text
+    assets = a.get(f"/api/sites/{sid}").json()["assets"]
+    assert (assets["battery"]["nameplate_kwh"], assets["battery"]["replacement_cost_per_kwh"]) == (220, 61000)
+    assert (assets["genset"]["rated_kw"], assets["genset"]["c_start_rs"], assets["genset"]["c_runhr_rs"], assets["genset"]["c_om_rs_per_kwh"]) == (160, 1700, 450, 9)
+    # a figure other than the form's default is a change, and a change is still an administrator's
+    r = op.put(f"/api/sites/{sid}/assets/battery", json={"nameplate_kwh": 220, "p_ch_kw": 100, "p_dis_kw": 100, "replacement_cost_per_kwh": 40000})
+    assert r.status_code == 403 and "administrator" in r.json()["detail"]

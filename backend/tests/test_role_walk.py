@@ -3,7 +3,7 @@ a viewer and a site key (sites:read and plans:read), on the demo company with a 
 
 - The viewer's answer holds no money key at any depth (`money.is_money`), no rupee figure inside a sentence, and no money value of the administrator's
   answer: a figure the administrator reads under a money key, and under no other key, appears nowhere in the viewer's answer.
-- The operator's answer holds no fee (plan 9.4: "costs but not money settings or the fee").
+- The operator's answer holds no fee and no money setting (plan 9.4: "costs but not money settings or the fee"; audit role-operator-06).
 - A key's answer holds no money key at all, whatever its scopes (plan Part 10.5).
 - The walk covers every GET route: the routes are read from the app, so a new route is walked without being listed here; a path parameter the walk cannot
   fill fails the walk until it is taught one.
@@ -198,12 +198,12 @@ def test_the_viewer_holds_no_money_on_any_route(walk):
     assert problems == [], "\n".join(problems)
 
 
-def test_the_operator_holds_no_fee_on_any_route(walk):
+def test_the_operator_holds_no_fee_and_no_money_setting_on_any_route(walk):
     from gridlytics import money
     problems = []
     for _, url, got in _read(walk, "operator"):
         body = got["operator"][1]
-        keys = sorted({k for _, k, _, _ in _items(body) if k in money.FEE_KEYS})
+        keys = sorted({k for _, k, _, _ in _items(body) if k in money.FEE_KEYS | money.MONEY_SETTING_KEYS})
         if keys:
             problems.append(f"{url}: {keys}")
     assert problems == [], "\n".join(problems)

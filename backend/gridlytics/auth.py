@@ -38,6 +38,10 @@ PERMISSIONS = {
     "export": {"admin", "analyst"},
     "see_costs": {"admin", "operator", "analyst"},
     "see_fee": {"admin", "analyst"},
+    #: the money settings (the value of lost load, the battery's replacement cost and the wear price made from it, the genset's start, run-hour and
+    #: upkeep costs): plan 9.4 gives the operator "costs but not money settings or the fee", and UI-10 the battery's economics card to owner and analyst
+    #: (audit role-operator-06). Changing one is still edit_money_settings.
+    "see_money_settings": {"admin", "analyst"},
     "start_pilot": {"admin"},
     "run_jobs": {"admin", "operator", "analyst"},
     #: the energy-only report carries no money (plan Part 8.5: the viewer-safe report), so every member may generate it, a viewer included

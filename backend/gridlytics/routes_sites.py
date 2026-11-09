@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 from fastapi import APIRouter, Body, Header, HTTPException
 
-from . import alerts, auth, battery, delivery, plans, sites, store, store_members, tariff_data, tariffs, telemetry
+from . import alerts, auth, battery, delivery, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry
 from .routes_common import PKT, bad, full_or_404, now_ts, out, put_state, site_or_404, today
 from .schemas import Refusal
 
@@ -270,10 +270,13 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
     names = ASSET_MONEY_FIELDS.get(role, ())
     if names:
         cur = sites.assets(site_id).get(role)
-        before = {**_defaults(sites.ASSET_MODELS[role], names), **(cur or {})}
+        defaults = _defaults(sites.ASSET_MODELS[role], names)
+        before = {**defaults, **(cur or {})}
         if cur is not None:
-            # a money setting left out keeps its stored value (the asset is saved whole, so it would otherwise fall back to its default)
-            inp.update({k: cur[k] for k in names if k not in inp and k in cur})
+            # a money setting left out keeps its stored value (the asset is saved whole, so it would otherwise fall back to its default); so does one the
+            # role is not shown (an operator, audit role-operator-06) sent at its default, which the form put in place of the value it never received
+            hidden = money.unseen(names)
+            inp.update({k: cur[k] for k in names if k in cur and (k not in inp or k in hidden and inp[k] == defaults.get(k))})
         _need_money_settings(inp, before, names, "Changing the equipment's money settings (prices and wear)")
     try:
         sites.put_asset(site_id, role, inp, auth.actor())

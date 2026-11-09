@@ -234,13 +234,15 @@ def test_only_an_administrator_changes_money_settings(world):
     r = operator.put(f"/api/sites/{sid}/assets/battery", json={**pack, "soh": 0.9})
     assert r.status_code == 200, r.text
     bat = r.json()["assets"]["battery"]
-    assert bat["soh"] == 0.9 and bat["replacement_cost_per_kwh"] == 60000
+    # an operator is not shown the money settings (plan 9.4; audit role-operator-06), so its answer leaves them out and they stay as stored
+    assert bat["soh"] == 0.9 and "replacement_cost_per_kwh" not in bat
     assert operator.put(f"/api/sites/{sid}/assets/battery", json={**bat, "soh": 0.85}).status_code == 200
     r = operator.put(f"/api/sites/{sid}", json={"name": "Mill One East", "voll_rs_per_kwh": 800})
-    assert r.status_code == 200 and r.json()["data"]["voll_rs_per_kwh"] == 800
+    assert r.status_code == 200 and "voll_rs_per_kwh" not in r.json()["data"]
     assert operator.post("/api/sites", json={"name": "New site"}).status_code == 200
     with world.use():
         assert sites.assets(sid)["battery"]["replacement_cost_per_kwh"] == 60000
+        assert sites.get(sid)["data"]["voll_rs_per_kwh"] == 800
 
 
 # ------------------------------------------------------------------------------------------------ security-switchback-rupees-to-viewer
