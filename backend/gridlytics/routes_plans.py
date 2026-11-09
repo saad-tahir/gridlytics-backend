@@ -208,7 +208,9 @@ def control(site_id: str, day: int = 0):
     from .routes_sites import control_state
     from . import telemetry
     with store.connect() as con:
-        writes_today = con.execute("SELECT COUNT(*) FROM plan_messages WHERE site_id = ? AND substr(sent_at,1,10) = ?", (site_id, today().isoformat())).fetchone()[0]
+        # the sends of the Karachi day: a stored stamp is UTC, so its first ten characters are not the local date before 05:00 (audit pages-B-06)
+        writes_today = con.execute("SELECT COUNT(*) FROM plan_messages WHERE site_id = ? AND sent_at >= ? AND sent_at < ?",
+                                   (site_id, *plans.karachi_day_bounds(today()))).fetchone()[0]
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "tier_capable", "tier_allowed")}, "control": control_state(s, telemetry.latest(site_id), now_ts()),
                 "brand": brand, "grammar": delivery.BRANDS.get(brand, delivery.BRANDS["other"]), "compiled": comp,
                 "vendor_view": [delivery.vendor_view(comp, i) for i in range(len((comp or {}).get("days", [])))] if comp else [],

@@ -1039,3 +1039,13 @@ class ClockDemoted(Exception):
         super().__init__(f"The inverter clock is {clock_words(offset_s)} off, so control is demoted and no plan is sent until the clock is within "
                          f"{CLOCK_WARN_S} seconds")
 
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): Karachi days of stored stamps
+
+def karachi_day_bounds(day: date) -> tuple[str, str]:
+    """The stored UTC stamps (store._now()'s form) at which a Karachi day starts and the next one starts: a stamp s is on the day when lo <= s < hi.
+    A stored stamp's first ten characters are its UTC date, which is the Karachi date only from 05:00, so a local day is never matched on them
+    (audit pages-B-06)."""
+    lo = datetime(day.year, day.month, day.day, tzinfo=PKT).astimezone(timezone.utc)
+    return lo.isoformat(timespec="seconds"), (lo + timedelta(days=1)).isoformat(timespec="seconds")

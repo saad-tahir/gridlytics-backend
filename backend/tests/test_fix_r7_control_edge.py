@@ -1090,3 +1090,30 @@ def test_a_demo_site_says_its_control_state_as_a_customer_site_does(company):
     today = datetime.now(PKT).date()
     plans.mark_applied(adv, _today_plan(adv, today), today.isoformat(), "Installer", "installer_keyed")
     assert state(adv, {"ts": now}) == {"key": "following", "label": "Following plan (table applied)"}
+
+
+# ------------------------------------------------------------------------------------------------ batch 4: pages-B-06
+
+def _sent(sid: str, at: datetime, day_modes: dict[str, str]) -> None:
+    """A plan_messages row sent at `at` whose table holds one slot per day, of the mode given for that day."""
+    days = [{"date": d, "slots": [{"start": "00:00", "end": "00:00", "mode": m}]} for d, m in day_modes.items()]
+    body = {"type": "plan", "plan_id": "p", "mode_a": {"days": days}, "signature": {"key_id": "k"}}
+    with store.connect() as con:
+        con.execute("INSERT INTO plan_messages (id, site_id, plan_id, key_id, body, sent_at) VALUES (?,?,?,?,?,?)",
+                    (store.new_id(), sid, "p", "k", json.dumps(body), at.astimezone(timezone.utc).isoformat(timespec="seconds")))
+
+
+def test_the_write_meter_counts_a_karachi_day(world):
+    """The meter's day is Karachi's: a send at 00:30 Pakistan time (19:30 UTC the day before) is today's, one at 23:30 last night is not (audit
+    pages-B-06; before, the UTC stamp's date was compared with the Karachi date)."""
+    sid = world.site
+    today = datetime.now(PKT).date()
+    yday = today - timedelta(days=1)
+    at = lambda d, h, m: datetime(d.year, d.month, d.day, h, m, tzinfo=PKT)  # noqa: E731
+    with world.use():
+        _tier(sid, "closed_loop")
+        _sent(sid, at(yday, 23, 30), {yday.isoformat(): "hold", today.isoformat(): "charge_grid"})
+        _sent(sid, at(today, 0, 30), {today.isoformat(): "discharge"})
+        _sent(sid, at(today, 9, 0), {today.isoformat(): "hold"})
+    budget = world.c["admin"].get(f"/api/sites/{sid}/control").json()["budget"]
+    assert budget["used_today"] == 2, budget                               # 1 before: the 00:30 send was counted on yesterday's date
