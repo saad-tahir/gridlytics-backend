@@ -256,6 +256,9 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                               else (round(grid_cap * 1000) if mode == "charge_grid" else None)),
                           "gen_charge": False, "export_allowed": mode == "export",
                           "genset": any(st["genset_on"] for st in steps[r["start"]:r["end"]]) or None,
+                          # the plan's own genset runs inside the slot ([start_ts, end_ts], epoch s): a replay runs the set in these and not
+                          # through the whole slot, as `genset` alone made it do (the off-grid farm's one self-use slot a day ran its set all day)
+                          "genset_runs": _runs([st for st in span if st["genset_on"]]),
                           "intent": _intent_words(mode, floor, target)})
             if mdi_cap_kw and not held and _translate_mdi(slots[-1], span, battery, float(mdi_cap_kw), lo):
                 slots[-1]["intent"] = _intent_words(mode, slots[-1]["soc_floor_pct"], target)
@@ -268,6 +271,18 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                      "max_discharge_w": round(b["P_dis"] * 1000) if b.get("P_dis") else None, "battery_v": b.get("V_nom")}
     out["mdi"] = {"cap_kw": round(float(mdi_cap_kw), 1) if mdi_cap_kw else None, "held": held,
                   "not_enforceable": None if held or not mdi_cap_kw else _mdi_not_enforceable(steps, out, battery, site, float(mdi_cap_kw))}
+    return out
+
+
+def _runs(on: list[dict]) -> list[list[int]]:
+    """[start_ts, end_ts] of each stretch of consecutive quarters among `on` (the steps of a slot with the genset on)."""
+    out: list[list[int]] = []
+    for st in on:
+        t = int(st["t"])
+        if out and out[-1][1] == t:
+            out[-1][1] = t + 900
+        else:
+            out.append([t, t + 900])
     return out
 
 

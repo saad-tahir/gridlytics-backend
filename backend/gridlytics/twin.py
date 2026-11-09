@@ -194,7 +194,9 @@ def native_policy(site: dict, ts: np.ndarray) -> dict:
 
 
 def slots_policy(slots: list[dict], ts: np.ndarray) -> dict:
-    """A per-minute policy from compiled slots (each with start_ts and end_ts in epoch seconds); minutes outside every slot run self-use."""
+    """A per-minute policy from compiled slots (each with start_ts and end_ts in epoch seconds); minutes outside every slot run self-use. The genset
+    command follows each slot's `genset_runs` (the plan's own runs), so every replay of a plan's slots (the wrong-plan guard, the compare drawer, the
+    demo, the fidelity check) runs the set when the plan does."""
     n = len(ts)
     pol = {"mode": np.full(n, MODE_CODE["self_use"]), "floor": np.full(n, 0.2), "target": np.full(n, 1.0), "max_dis": np.full(n, np.inf),
            "max_ch": np.full(n, np.inf), "grid_charge": np.zeros(n, dtype=bool), "genset": np.full(n, -1), "grid_cap": np.full(n, np.inf)}
@@ -212,7 +214,13 @@ def slots_policy(slots: list[dict], ts: np.ndarray) -> dict:
         pol["grid_charge"][m] = bool(s.get("grid_charge"))
         if s.get("grid_cap_w"):
             pol["grid_cap"][m] = s["grid_cap_w"] / 1000.0
-        if s.get("genset") is not None:
+        if s.get("genset_runs") is not None:
+            # the plan's own runs (round 7): 1 in a run, 0 elsewhere in the slot ("no planned run", under which the operator still rescues a
+            # site about to go dark), as the demo has always set it per step; a slot stored before carries only `genset`, for the whole slot
+            pol["genset"][m] = 0
+            for a, b in s["genset_runs"]:
+                pol["genset"][m & (ts >= a) & (ts < b)] = 1
+        elif s.get("genset") is not None:
             pol["genset"][m] = 1 if s["genset"] else 0
     return pol
 

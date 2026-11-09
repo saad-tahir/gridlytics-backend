@@ -371,3 +371,51 @@ def test_a_short_planned_discharge_is_widened_to_the_brands_minimum_not_folded_i
     assert _shape(delivery.compile_mode_a(steps, "deye", SMALL, 20.0)) == [("00:00", "23:30", "hold"), ("23:30", "00:00", "discharge")]
     steps = _day_of([("idle", 1, 0.0, 0.0), ("discharge_peak_window", 95, 0.0, 5.0)], soc0=90.0)
     assert _shape(delivery.compile_mode_a(steps, "deye", SMALL, 20.0)) == [("00:00", "00:00", "discharge")]
+
+
+# ------------------------------------------------------------------------------------------------ the plan's genset runs (flow-telemetry-plan-control-04)
+
+def _outage_day(gen_from: int = 72, gen_to: int = 80) -> list[dict]:
+    """A grid site's day with a forecast outage 18:00-22:00 (quarters 72-88) in which the plan runs the genset 18:00-20:00 only, a 40 kW load (20 kW
+    critical), no PV, the battery holding at 80 % outside the outage."""
+    from test_fix_r3_optimiser import _steps_for
+    steps = _steps_for([("hold_for_outage", 0.0, 0.0)] * 96)
+    for i, st in enumerate(steps):
+        down = 72 <= i < 88
+        st.update(grid_present=0.0 if down else 1.0, grid_import_kw=0.0 if down else 40.0, load_kw=40.0, critical_kw=20.0, pv_forecast_kw=0.0,
+                  soc_start_pct=80.0, soc_pct=80.0, genset_on=gen_from <= i < gen_to, c_imp=40.0, c_exp=0.0, peak=False)
+    return steps
+
+
+def test_a_slot_carries_the_plans_genset_runs_and_the_replay_runs_the_set_only_in_them():
+    """The compiled slot's genset flag was any(genset_on) over its steps, so a replay of the slots (the guard, the compare drawer, the demo and the
+    fidelity check) ran the set through the whole slot: the off-grid farm's Voltronic day was one self-use slot, and its genset ran all day."""
+    import numpy as np
+
+    from gridlytics import twin
+    steps = _outage_day()
+    comp = delivery.compile_mode_a(steps, "voltronic", SMALL, 20.0)
+    slots = [s for d in comp["days"] for s in d["slots"]]
+    run = [s for s in slots if s["genset"]]
+    assert len(run) == 1 and run[0]["start_ts"] < steps[72]["t"] + 1 and run[0]["end_ts"] > steps[80]["t"]   # the slot is wider than the run
+    assert run[0]["genset_runs"] == [[steps[72]["t"], steps[80]["t"]]]
+    assert all(s["genset_runs"] == [] for s in slots if not s["genset"])
+    ts = np.arange(steps[0]["t"], steps[-1]["t"] + 900, 60)
+    gen = twin.slots_policy(slots, ts)["genset"]
+    in_run = (ts >= steps[72]["t"]) & (ts < steps[80]["t"])
+    assert (gen[in_run] == 1).all() and (gen[~in_run] == 0).all()        # 1 for the whole slot before; 0 is "no planned run" (a rescue still runs)
+    older = [{k: v for k, v in s.items() if k != "genset_runs"} for s in slots]
+    assert (twin.slots_policy(older, ts)["genset"][(ts >= run[0]["start_ts"]) & (ts < run[0]["end_ts"])] == 1).all()   # a stored plan as it was
+
+
+def test_compare_with_native_burns_the_plans_genset_hours_not_the_whole_slots(world, monkeypatch):
+    """The farm's drawer said diesel native 235 L against plan 283 L while the plan's own figure was 218 L: the plan arm ran the set wherever a slot
+    had any run. Here the plan runs the 150 kW set for two hours of a four-hour outage (about 33 L at its 45 kW minimum load, less once the battery
+    is full)."""
+    from gridlytics import plans
+    steps = _outage_day()
+    comp = delivery.compile_mode_a(steps, "voltronic", SMALL, 20.0)
+    monkeypatch.setattr(plans, "current", lambda site_id, *a, **k: {"id": "p1", "slots": comp, "steps": steps, "summary": {}})
+    arms = world.c["admin"].get(f"/api/sites/{world.site}/plan/compare").json()["compare"]
+    assert 28.0 <= arms["plan"]["litres"] <= 36.0, arms["plan"]           # 50 L before: the set ran through the whole outage
+
