@@ -1164,3 +1164,40 @@ def test_a_workspace_file_of_schema_2_gains_the_reports_generated_by_column(tmp_
         with store.connect() as con:
             assert con.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION > 2
     assert rows[0]["generated_by"] == "" and rows[0]["preliminary"] is False, rows     # not recorded before
+
+
+# ------------------------------------------------------------------------------------------------ pages-C-11
+
+def _request(sid: str, nid: str, start: int, status: str = "pending") -> None:
+    with store.connect() as con:
+        con.execute("INSERT INTO notifications (id, site_id, ts, kind, payload, status) VALUES (?,?,?,?,?,?)",
+                    (nid, sid, store._now(), "genset_request", json.dumps({"key": f"genset_request:{start}", "start": start, "end": start + 3600,
+                                                                           "kw": 90.0, "reason": "genset_on", "detail": {}, "plan_id": "p0"}), status))
+
+
+def test_a_genset_request_is_answered_once_and_a_withdrawn_one_not_at_all(world):
+    """pages-C-11: answer_request updated the row whatever its status, so a withdrawn request (the run asked for again at another start) became
+    'answered' and counted as asked, and a second answer overwrote the first."""
+    sid, start = world.site, _now() // 900 * 900 + 3600
+    with world.use():
+        _request(sid, "n1", start)
+        _request(sid, "n2", start + 7200, "withdrawn")
+        alerts._open(sid, f"genset_request_{start + 7200}", "Genset", "info", "Please start the genset", {"start": start + 7200})
+        alerts._clear(sid, f"genset_request_{start + 7200}")
+    op = world.c["operator"]
+    r = op.post(f"/api/sites/{sid}/genset/requests/n1", json={"outcome": "done"})
+    assert r.status_code == 200 and r.json()["outcome"] == "done", r.text
+    again = op.post(f"/api/sites/{sid}/genset/requests/n1", json={"outcome": "not_now"})
+    assert again.status_code == 409 and again.json()["code"] == "request_answered", again.text
+    assert "already answered" in again.json()["detail"] and "Done" in again.json()["detail"], again.text
+    gone = op.post(f"/api/sites/{sid}/genset/requests/n2", json={"outcome": "done"})
+    assert gone.status_code == 409 and gone.json()["code"] == "request_withdrawn", gone.text
+    with world.use():
+        rows = {r["id"]: r for r in alerts.requests_for(sid)}
+        assert (rows["n1"]["status"], rows["n1"]["outcome"]) == ("answered", "done"), rows["n1"]
+        assert (rows["n2"]["status"], rows["n2"]["outcome"]) == ("withdrawn", ""), rows["n2"]
+        with store.connect() as con:
+            note = con.execute("SELECT state, note FROM alerts WHERE rule = ?", (f"genset_request_{start + 7200}",)).fetchone()
+        assert (note["state"], note["note"]) == ("resolved", "Condition cleared"), dict(note)     # the withdrawn request's alert is left as it was
+        with pytest.raises(alerts.RequestClosed):
+            alerts.answer_request(sid, "n1", "done", "operator@r7.test")

@@ -18,7 +18,7 @@ from pydantic import Field, ValidationError
 from . import auth
 from . import battery as battery_service
 from . import plans, sites, store, tariffs, telemetry
-from .schemas import Strict, message
+from .schemas import Refusal, Strict, message
 
 PKT = timezone(timedelta(hours=5))
 STEP_S = 900  # a plan step
@@ -604,14 +604,35 @@ def requests_for(site_id: str, limit: int = 50) -> list[dict]:
     return [{**dict(r), "payload": json.loads(r["payload"])} for r in rows]
 
 
+#: A genset request's answers in words (the genset page's buttons)
+OUTCOME_WORDS = {"done": "Done", "not_now": "Not now"}
+
+
+class RequestClosed(Refusal):
+    """An answer to a genset request that is no longer pending (audit pages-C-11): it was answered already, and an answer is not changed, or it was
+    withdrawn (the run was asked for again at another start, or no plan runs it), so it is not scored. 409 through the API's refusal handler; not a
+    ValueError, so the route's 422 for a bad answer does not swallow it."""
+
+    def __init__(self, row) -> None:
+        if row["status"] == "withdrawn":
+            super().__init__(409, "This request was withdrawn (the plan moved the run or no longer runs the genset), so it is not answered", "request_withdrawn")
+        else:
+            said = OUTCOME_WORDS.get(row["outcome"], "given")
+            super().__init__(409, f"This request is already answered ({said}), and an answer is not changed", "request_answered")
+
+
 def answer_request(site_id: str, nid: str, outcome: str, by: str) -> dict:
+    """Answers a pending genset request, once: a request answered already, or withdrawn, is refused (`RequestClosed`), so the first answer stands and a
+    withdrawn request never counts as asked (`genset_requests`) or followed."""
     if outcome not in ("done", "not_now"):
         raise ValueError("The answer is done or not_now")
     with store.connect() as con:
-        r = con.execute("SELECT * FROM notifications WHERE id = ? AND site_id = ?", (nid, site_id)).fetchone()
+        r = con.execute("SELECT * FROM notifications WHERE id = ? AND site_id = ? AND kind = 'genset_request'", (nid, site_id)).fetchone()
         if r is None:
             raise KeyError(nid)
-        con.execute("UPDATE notifications SET status = 'answered', outcome = ?, scored_at = ? WHERE id = ?", (outcome, store._now(), nid))
+        if r["status"] != "pending" or con.execute("UPDATE notifications SET status = 'answered', outcome = ?, scored_at = ? WHERE id = ? AND status = 'pending'",
+                                                   (outcome, store._now(), nid)).rowcount != 1:
+            raise RequestClosed(con.execute("SELECT status, outcome FROM notifications WHERE id = ?", (nid,)).fetchone())
         payload = json.loads(r["payload"])
         con.execute("UPDATE alerts SET state = 'closed', closed_at = ?, note = ? WHERE site_id = ? AND rule = ? AND state != 'closed'",
                     (store._now(), f"Answered {outcome} by {by}", site_id, f"genset_request_{payload['start']}"))
