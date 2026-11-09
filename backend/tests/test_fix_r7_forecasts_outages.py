@@ -628,3 +628,86 @@ def test_load_is_scored_on_unshed_minutes_with_the_baseline_over_the_same_slots(
     for r in rows:
         if r["kind"] == "load":
             assert r["value"] == pytest.approx(0.0, abs=1e-6) and r["baseline_value"] == pytest.approx(0.0, abs=1e-6), r
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-11 (brief-vs-build-17)
+
+def test_the_pakistan_calendar_knows_the_public_holidays_eid_and_ramadan():
+    """A dated table of Pakistan's federal holidays (pk_calendar): fixed dates, the lunar dates announced in 2024 and 2025, and every other year's from
+    the arithmetic Islamic calendar, marked estimated."""
+    from gridlytics import pk_calendar
+    assert pk_calendar.day(date(2026, 11, 9)) == ("holiday", "Iqbal Day", False)
+    assert pk_calendar.day(date(2021, 11, 9)) is None  # restored from 2022
+    assert pk_calendar.day(date(2024, 5, 28)) == ("holiday", "Youm-e-Takbeer", False)
+    assert pk_calendar.day(date(2023, 5, 28)) is None
+    assert pk_calendar.day(date(2024, 4, 13)) == ("eid", "Eid ul-Fitr", False)  # four days announced in 2024
+    assert pk_calendar.day(date(2025, 6, 6)) == ("eid", "Eid ul-Adha", False)
+    assert pk_calendar.day(date(2025, 3, 10)) == ("ramadan", "Ramadan", False)
+    assert pk_calendar.day(date(2025, 3, 23)) == ("holiday", "Pakistan Day", False)  # a holiday inside Ramadan is a holiday
+    assert pk_calendar.day(date(2025, 3, 1)) is None  # Ramadan began on 2 March in Pakistan
+    assert pk_calendar.day(date(2027, 3, 10)) == ("eid", "Eid ul-Fitr", True)
+    assert pk_calendar.day(date(2027, 2, 20)) == ("ramadan", "Ramadan", True)
+    assert pk_calendar.day(date(2026, 11, 10)) is None
+
+
+def test_load_day_types_follow_the_calendar_and_the_site_s_off_and_half_days():
+    """Day types (plan Part 5.2): working, off day (the site's own, Sunday by default), public holiday, Ramadan working day, Eid, half day. v1 knew
+    only Sunday."""
+    def at(d: date, hour: int = 12) -> int:
+        return int(datetime(d.year, d.month, d.day, hour, tzinfo=PKT).timestamp())
+    site = {"id": "s", "data": {}}
+    days = [date(2026, 11, 8), date(2026, 11, 9), date(2026, 11, 10), date(2027, 2, 22), date(2027, 3, 10), date(2026, 11, 13)]
+    types = forecast._day_type(np.array([at(d) for d in days]), site)
+    assert list(types) == [forecast.DAY_OFF, forecast.DAY_HOLIDAY, forecast.DAY_WORKING, forecast.DAY_RAMADAN, forecast.DAY_EID, forecast.DAY_WORKING]
+    friday = {"id": "s", "data": {"off_days": ["fri"], "half_days": ["sat"]}}
+    types = forecast._day_type(np.array([at(date(2026, 11, 13)), at(date(2026, 11, 14)), at(date(2026, 11, 15))]), friday)
+    assert list(types) == [forecast.DAY_OFF, forecast.DAY_HALF, forecast.DAY_WORKING]
+
+
+def _weeks(sid: str, t0: int, days: int, work_kw: float = 100.0, off_kw: float = 20.0, shut: tuple = ()) -> None:
+    """`days` days of flat load before t0: work_kw on working days, off_kw on Sundays and on the local dates in `shut`."""
+    ts = np.arange(t0 - days * 86400, t0, 60, dtype=np.int64)
+    loc = (ts + 5 * 3600) // 86400
+    sunday = (loc + 3) % 7 == 6
+    closed = sunday | np.isin(loc, [(_midnight(d) + 5 * 3600) // 86400 for d in shut])
+    _write_load(sid, ts, np.where(closed, off_kw, work_kw), grid=np.ones(len(ts)))
+
+
+def test_a_public_holiday_is_forecast_as_an_off_day(company):
+    """Iqbal Day (Monday 9 November 2026): no holiday in the 21 days behind it, so it takes the off days' load (20 kW), and the Tuesday after is a
+    working day again (100 kW). v1 forecast the holiday as a working day, so the plan charged for a peak that does not come."""
+    sid = "holiday"
+    site = _load_site(sid, battery=False, site_type="tower")
+    t0 = _midnight(date(2026, 11, 9))
+    _weeks(sid, t0, 21)
+    f = forecast.load(site, t0)
+    q50 = f["q"]["q50"]
+    assert np.allclose(q50[:96], 20.0, atol=0.5), q50[:96:8]
+    assert np.allclose(q50[96 + 8:], 100.0, atol=0.5), q50[96::8]  # past the first two hours, where the ratio's weight has faded
+    assert [c["day"] for c in f["calendar"]] == ["2026-11-09"] and f["calendar"][0]["type"] == "public_holiday"
+    assert f["calendar"][0]["name"] == "Iqbal Day" and f["calendar"][0]["estimated"] is False
+
+
+def test_a_holiday_in_the_history_stays_out_of_the_working_days(company):
+    """The plant shut on Iqbal Day (Monday 9 November): on Wednesday 11 November the working days behind the forecast leave it out, so the spread
+    stays the working days' own. v1 counted the shut Monday as a working day, which pulled the band down by about 36 kW."""
+    sid = "holiday-history"
+    site = _load_site(sid, battery=False, site_type="tower")
+    t0 = _midnight(date(2026, 11, 11))
+    _weeks(sid, t0, 21, shut=(date(2026, 11, 9),))
+    f = forecast.load(site, t0)
+    q = f["q"]
+    assert np.allclose(q["q50"][8:96], 100.0, atol=0.5)
+    assert np.allclose(q["q05"][8:96], 100.0 * (1 - 1.645 * 0.06), atol=0.5), q["q05"][8:96:8]
+
+
+def test_the_site_s_off_days_and_half_days_are_settings():
+    """SiteFields carries the site's weekly off days (Sunday by default) and half days, refused in a sentence when not a weekday."""
+    from gridlytics import schemas, sites
+    s = schemas.check(sites.SiteFields, {"name": "Mill"})
+    assert s.off_days == ["sun"] and s.half_days == []
+    s = schemas.check(sites.SiteFields, {"name": "Mill", "off_days": ["fri"], "half_days": ["sat"]})
+    assert s.off_days == ["fri"] and s.half_days == ["sat"]
+    with pytest.raises(schemas.Refusal) as e:
+        schemas.check(sites.SiteFields, {"name": "Mill", "off_days": ["friday"]})
+    assert "off days" in e.value.detail and "must be one of" in e.value.detail

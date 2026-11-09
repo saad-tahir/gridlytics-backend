@@ -8,7 +8,7 @@ it Preliminary.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import warnings
 
@@ -16,7 +16,7 @@ import numpy as np
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="(Mean of empty slice|All-NaN slice)")
 
-from . import solar, store, telemetry, twin
+from . import pk_calendar, solar, store, telemetry, twin
 
 PKT = timezone(timedelta(hours=5))
 STEPS = 192
@@ -150,9 +150,58 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
 
 # ------------------------------------------------------------------------------------------------ load
 
-def _day_type(ts: np.ndarray) -> np.ndarray:
-    dow = ((np.asarray(ts) + 5 * 3600) // 86400 + 3) % 7
-    return (dow == 6).astype(int)  # 1 = Sunday (off day)
+#: the load's day types (plan Part 5.2): equivalent-day persistence reads the same slot on the last days of the same type
+DAY_WORKING, DAY_OFF, DAY_HOLIDAY, DAY_RAMADAN, DAY_EID, DAY_HALF = range(6)
+DAY_NAMES = {DAY_WORKING: "working", DAY_OFF: "off_day", DAY_HOLIDAY: "public_holiday", DAY_RAMADAN: "ramadan_working_day", DAY_EID: "eid",
+             DAY_HALF: "half_day"}
+#: where a day type has too few days in the history (a holiday, Eid, the first days of Ramadan), the persistence reads these types next, in order,
+#: then the template
+DAY_FALLBACK = {DAY_EID: (DAY_HOLIDAY, DAY_OFF), DAY_HOLIDAY: (DAY_OFF,), DAY_RAMADAN: (DAY_WORKING,), DAY_HALF: (DAY_WORKING,)}
+#: the day types the stage-0 template draws with its off-day shape (twin.load_template's Sunday)
+OFF_TYPES = (DAY_OFF, DAY_HOLIDAY, DAY_EID)
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _weekdays(site: dict | None, key: str, default: tuple) -> set[int]:
+    v = ((site or {}).get("data") or {}).get(key)
+    return {WEEKDAYS.index(d) for d in (default if v is None else v) if d in WEEKDAYS}
+
+
+def _day_type(ts: np.ndarray, site: dict | None = None) -> np.ndarray:
+    """The day type of each time's local day: Eid and public holidays from Pakistan's calendar (pk_calendar), then the site's weekly off days
+    (`off_days`, Sunday when unset) and half days (`half_days`), then a working day of Ramadan, else a working day."""
+    off, half = _weekdays(site, "off_days", ("sun",)), _weekdays(site, "half_days", ())
+    days = (np.asarray(ts, dtype=np.int64) + 5 * 3600) // 86400
+    out = np.full(len(days), DAY_WORKING)
+    for dn in np.unique(days):
+        d = date(1970, 1, 1) + timedelta(days=int(dn))
+        kind = (pk_calendar.day(d) or (None,))[0]
+        out[days == dn] = (DAY_EID if kind == "eid" else DAY_HOLIDAY if kind == "holiday" else DAY_OFF if d.weekday() in off
+                           else DAY_HALF if d.weekday() in half else DAY_RAMADAN if kind == "ramadan" else DAY_WORKING)
+    return out
+
+
+def _calendar(t: np.ndarray, types: np.ndarray) -> list[dict]:
+    """The local days of a horizon that are not plain working days: {day, type, name (the holiday's, or None), estimated (a lunar date not yet
+    announced)}."""
+    out = []
+    days = (np.asarray(t, dtype=np.int64) + 5 * 3600) // 86400
+    for dn in np.unique(days):
+        ty = int(types[np.argmax(days == dn)])
+        if ty == DAY_WORKING:
+            continue
+        d = date(1970, 1, 1) + timedelta(days=int(dn))
+        sp = pk_calendar.day(d) if ty in (DAY_HOLIDAY, DAY_EID, DAY_RAMADAN) else None
+        out.append({"day": d.isoformat(), "type": DAY_NAMES[ty], "name": sp[1] if sp else None, "estimated": bool(sp[2]) if sp else False})
+    return out
+
+
+def _template(site: dict, t: np.ndarray, types: np.ndarray) -> np.ndarray:
+    """The stage-0 template per step by day type: twin.load_template's weekly shape has Sunday as its off day, so an off-type day (the site's off day,
+    a public holiday, Eid) reads it on a Sunday at the same time of day, and every other day on a Monday."""
+    dow = ((np.asarray(t, dtype=np.int64) + 5 * 3600) // 86400 + 3) % 7  # 0 = Monday
+    shift = ((np.where(np.isin(types, OFF_TYPES), 6, 0) - dow) % 7) * 86400
+    return _mean15(lambda x: twin.load_template(site, x), np.asarray(t, dtype=np.int64) + shift)
 
 
 #: the drop rule's outage runs are formed over the known samples of the minute grid (plan Part 5.2): minutes without a grid reading (a lost row, a 5- or
@@ -271,7 +320,9 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     the hours of the day learnt, and `crit_zero`, set when the critical load is zero in every hour (nothing entered or learnt: the reserve rule then
     holds nothing for an outage, and the pages say so)."""
     t = step_times(t0, steps)
-    tmpl = _mean15(lambda x: twin.load_template(site, x), t)
+    step_type = _day_type(t, site)
+    tmpl = _template(site, t, step_type)
+    cal = _calendar(t, step_type)
     h0 = t0 - 21 * 86400
     g = telemetry.minute_grid(site["id"], h0, t0)
     lo = np.where(censored_minutes(site, g), np.nan, g["load"])  # censored samples leave the persistence medians and the ratio (plan Part 5.2)
@@ -282,22 +333,30 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     hours = ((t + 5 * 3600) % 86400) // 3600
     prof, learnt = critical_profile(site, g)
     crit = prof[hours]
-    crit_info = {"crit_learned_hours": int(learnt), "crit_zero": bool(np.all(prof <= 0))}
+    crit_info = {"crit_learned_hours": int(learnt), "crit_zero": bool(np.all(prof <= 0)), "calendar": cal}
     if have_days < 3:
         q = {name: tmpl * (1 + 0.25 * (v - 0.5) / 0.45) for name, v in zip(QS, QV)}
         q["q50"] = tmpl
         return {"stage": 0, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days, **crit_info}
-    # equivalent-day persistence: per target step, the same slot on the last same-day-type days (up to 7)
+    # equivalent-day persistence: per target step, the same slot on the last same-day-type days (up to 7); a type with fewer than 2 such days reads
+    # the next type of its fallback (DAY_FALLBACK: Eid and a holiday from the off days, a Ramadan or half day from the working days), then the template
     lo15 = np.nanmean(lo[: len(lo) // 15 * 15].reshape(-1, 15), axis=1)
     hist_t = h0 + STEP_S * np.arange(len(lo15))
-    hist_type = _day_type(hist_t)
+    hist_type = _day_type(hist_t, site)
     slot_of = ((hist_t + 5 * 3600) % 86400) // STEP_S
+    known15 = ~np.isnan(lo15)
+
+    def same_slot(s: int, dt_: int, need: int) -> np.ndarray:
+        """The last 7 values of slot s on days of type dt_ (or of its fallback types, the first with at least `need`); empty when none has."""
+        for k in (dt_, *DAY_FALLBACK.get(dt_, ())):
+            v = lo15[(slot_of == s) & (hist_type == k) & known15][-7:]
+            if len(v) >= need:
+                return v
+        return lo15[:0]
+
     qarr = np.zeros((len(QS), steps))
     for i, tt in enumerate(t):
-        s = ((tt + 5 * 3600) % 86400) // STEP_S
-        dt_ = _day_type(np.array([tt]))[0]
-        m = (slot_of == s) & (hist_type == dt_) & ~np.isnan(lo15)
-        vals = lo15[m][-7:]
+        vals = same_slot(((tt + 5 * 3600) % 86400) // STEP_S, int(step_type[i]), 2)
         if len(vals) < 2:
             vals = np.array([tmpl[i]])
         med = float(np.median(vals))
@@ -308,11 +367,11 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     recent = lo[-120:]
     if np.sum(~np.isnan(recent)) * iv > 60:
         rt = t0 - 7200 + 60 * np.arange(120)
+        rt_type = _day_type(rt, site)
         ref = []
-        for x in rt:
-            s = ((x + 5 * 3600) % 86400) // STEP_S
-            m = (slot_of == s) & (hist_type == _day_type(np.array([x]))[0]) & ~np.isnan(lo15)
-            ref.append(np.median(lo15[m][-7:]) if m.any() else np.nan)
+        for x, k in zip(rt, rt_type):
+            v = same_slot(((x + 5 * 3600) % 86400) // STEP_S, int(k), 1)
+            ref.append(np.median(v) if len(v) else np.nan)
         ref = np.array(ref)
         ok = ~np.isnan(recent) & ~np.isnan(ref) & (ref > 0)
         if ok.sum() * iv > 30:
@@ -575,7 +634,8 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
     if save:
         telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION, {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr")})
         telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION, {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"]),
-                                                                           "crit_learned_hours": l.get("crit_learned_hours"), "crit_zero": l.get("crit_zero")})
+                                                                           "crit_learned_hours": l.get("crit_learned_hours"), "crit_zero": l.get("crit_zero"),
+                                                                           "calendar": l.get("calendar")})
         telemetry.save_forecast(site["id"], "outage", t0, o["stage"], VERSION,
                                 {"p_down": _r(o["p_down"]), "p_start": _r(o["p_start"]), "dur_steps": [int(x) for x in o["dur_steps"]], "g": _r(o["g"], 0),
                                  "observed": o.get("observed"), "adherence": o.get("adherence"), "adherence_windows": o.get("adherence_windows"),
