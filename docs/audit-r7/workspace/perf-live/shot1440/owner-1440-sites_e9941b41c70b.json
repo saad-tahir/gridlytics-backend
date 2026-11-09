@@ -1,0 +1,64 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/e9941b41c70b",
+  "url": "http://127.0.0.1:5295/sites/e9941b41c70b",
+  "signedIn": true,
+  "loadMs": 2376,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Karachi feed mill (demo)",
+    "H2: Energy flow now",
+    "H2: Now and next",
+    "H2: Actual and plan, 24 hours each side of now",
+    "H2: The next 12 hours",
+    "H2: Alerts"
+  ],
+  "buttons": [
+    "Karachi feed mill (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "PV",
+    "Load",
+    "Grid",
+    "Battery",
+    "Genset",
+    "SoC",
+    "Plan: load",
+    "Plan: PV",
+    "Plan: SoC",
+    "Reserve"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [
+    "Rs 40",
+    "Rs 1,956"
+  ],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Karachi feed mill (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Closed loop Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Karachi feed mill (demo) Karachi feed mill (demo) DEMO Closed loop Following plan Karachi K-Electric · B-3 Last data: 10 min ago Energy flow now Reading at 17:14 Site PV 30.0 kW Load 785 kW Grid 778 kW Battery 23.4 kW SoC 84 % Genset 0.0 kW Off Now and next Now (17:15) Idle Nothing to gain from moving energy in this slot. Next 18:00 Peak discharge Discharging in the peak window to avoid importing at Rs 40.02/kWh. 19:30 Wear > saving Not discharging: the price gap is smaller than the battery's wear cost. 22:00 Idle Nothing to gain from moving energy in this slot. Plan status: Solved within tolerance · forecast stage 1 Grid import today 11,162 kWh 0.0 kWh in the peak window Solar today 2,018 kWh Peak demand today 776 kW Outage today 0.0 h Battery 83.7 % 233 kWh usable · trust 67 % Genset this month 0.0 h 0.0 L (estimated) Saving this month PRELIMINARY Rs 1,956 against the native settings Import this month 141,488 kWh peak 902 kW Actual and plan, 24 hours each side of now Solid lines are what happened; dashed lines are the plan. The red dashed line is the outage reserve. PV Load Grid Battery Genset SoC Plan: load Plan: PV Plan: SoC Reserve The next 12 hours 17:15 Idle 18:15 · Peak Peak discharge 19:15 · Peak Peak discharge 20:15 · Peak Wear > saving 21:15 · Peak Wear > saving 22:15 Idle 23:15 Idle 00:15 Idle 01:15 Idle 02:15 Idle 03:15 Idle 04:15 Idle Alerts All alerts Nothing needs you at this site.",
+  "a11yTree": null
+}

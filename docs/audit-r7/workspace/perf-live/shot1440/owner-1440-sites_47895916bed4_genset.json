@@ -1,0 +1,64 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/47895916bed4/genset",
+  "url": "http://127.0.0.1:5295/sites/47895916bed4/genset",
+  "signedIn": true,
+  "loadMs": 2667,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Rahim Yar Khan farm (demo)",
+    "H2: Genset",
+    "H2: Advice",
+    "H3: Requests",
+    "H3: The plan's next runs",
+    "H2: Runs",
+    "H2: Fuel curve",
+    "H2: Fuel price",
+    "H2: Policy",
+    "H2: Fuel log",
+    "H2: Fuel logged"
+  ],
+  "buttons": [
+    "Rahim Yar Khan farm (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "Log fuel"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [
+    "Rs 545,624",
+    "Rs 382",
+    "Rs 382",
+    "Rs,"
+  ],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Rahim Yar Khan farm (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Advisory (slot tables) Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Rahim Yar Khan farm (demo) Genset Rahim Yar Khan farm (demo) DEMO Advisory (slot tables) Following plan (table applied) Rahim Yar Khan No DISCO · Off-grid Last data: 11 min ago Genset Run hours, 14 days 217 h 19 starts Fuel, 14 days 1,427 L Estimated from the fuel curve Starts 19 over 14 days Average load 38 % of 48.0 kW rated Fuel cost, 14 days Rs 545,624 litres × Rs 382.25/L, price of 6 Nov 2026 Advice A request arrives up to two hours before each run the plan wants; answer it so the savings count what really happened. Requests No requests. The next one comes before the plan's next run. The plan's next runs Mon 9 Nov, 17:15 to Tue 10 Nov 09:15 up to 35.5 kW Genset on Tue 10 Nov, 15:15 to 23:15 up to 24.0 kW Genset on Runs The last 14 days, newest first, in Karachi time. Genset runs Start End Hours Energy Litres (estimated) Load Grid Plan asked 9 Nov 2026, 16:15 Running 1.0 h 18.2 kWh 6.6 L 38 % Outage Yes 9 Nov 2026, 05:15 08:30 3.3 h 80.6 kWh 27.2 L 52 % Outage Yes 8 Nov 2026, 16:15 9 Nov 2026, 02:00 9.8 h 154 kWh 57.5 L 33 % Outage Yes 8 Nov 2026, 04:30 09:00 4.5 h 98.6 kWh 34.0 L 46 % Outage Yes 7 Nov 2026, 15:30 21:15 5.8 h 104 kWh 37.4 L 38 % Outage Yes 6 Nov 2026, 16:15 7 Nov 2026, 09:00 17 h 304 kWh 110 L 38 % Outage Yes 5 Nov 2026, 14:46 6 Nov 2026, 09:00 18 h 329 kWh 119 L 38 % Outage No 4 Nov 2026, 14:37 5 Nov 2026, 09:00 18 h 328 kWh 119 L 37 % Outage No 3 Nov 2026, 14:00 4 Nov 2026, 08:45 19 h 336 kWh 122 L 37 % Outage Yes 2 Nov 2026, 15:23 3 Nov 2026, 09:00 18 h 326 kWh 117 L 39 % Outage No 1 Nov 2026, 15:58 2 Nov 2026, 09:45 18 h 321 kWh 116 L 38 % Outage No 1 Nov 2026, 04:30 10:00 5.5 h 117 kWh 40.7 L 44 % Outage Yes 31 Oct 2026, 15:45 19:45 4.0 h 66.3 kWh 24.4 L 35 % Outage Yes 30 Oct 2026, 16:15 31 Oct 2026, 08:15 16 h 274 kWh 100 L 36 % Outage Yes 30 Oct 2026, 04:15 09:00 4.8 h 108 kWh 36.9 L 47 % Outage Yes 29 Oct 2026, 15:45 21:30 5.8 h 96.7 kWh 35.5 L 35 % Outage Yes 29 Oct 2026, 04:30 09:45 5.3 h 109 kWh 38.1 L 43 % Outage Yes 27 Oct 2026, 17:34 28 Oct 2026, 20:30 27 h 486 kWh 175 L 38 % Outage No 26 Oct 2026, 19:28 27 Oct 2026, 12:46 17 h 314 kWh 113 L 38 % Outage No Fuel curve Litres an hour = 0.273 × load kW + 0.033 × 48.0 kW rated. Fuel without a meter is estimated from it. 25 % 50 % 75 % 100 % 0 L 4 L 8 L 12 L 16 L 25 %: 4.9 L/h 50 %: 8.1 L/h 75 %: 11.4 L/h 100 %: 14.7 L/h Fuel price What a litre costs in the plan and the fuel-cost figures. Rs 382.25/L Hsd · OGRA · read 6 Nov 2026 OGRA daily HSD notifications as reported by APP, Dawn and Business Recorder Secondary source Where it comes from P",
+  "a11yTree": null
+}

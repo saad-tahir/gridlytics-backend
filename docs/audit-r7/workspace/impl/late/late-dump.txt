@@ -1,0 +1,866 @@
+===== engine-money-live-01 high backend backend/gridlytics/verify.py
+T: Daily carry-over credits stored energy at the peak price while the next day's native replay inherits that energy, so a plan that just holds a full battery shows a saving
+A: The carry-over uses v_end = 0.95 × the day's highest import price − wear = Rs 27.19/kWh in November (Rs 40.02 peak). Next morning the native arm starts with that energy and self-use spends it off-peak (worth 0.95 × 26.98 − 10.83 ≈ Rs 14.8/kWh). Each kWh of end-of-day gap is over-credited by about Rs 12.4.
+- Faisalabad 8 Nov: the whole month's claim of Rs 1,901 is carry-over +4,384 (204.25 kWh actual against 43.0 kWh native at day end), wear +1,666 and off-peak −4,149. The actual discharged 0.8 kWh and the native 154.57 kWh. Peak import was identical (384.74 kWh), so the native used its stored solar off-peak. A two-day continuous calculation gives about Rs 1,900 less than the per-day ledger for each night the battery is held full. The site is now in 'hold' at 95%.
+- Karachi 2 Nov: +4,748 is mostly carry-over +5,792 (286.4 against 73.36 kWh). On 3 Nov the native replay starts at 286.4, dis
+E: A kWh left in the battery at day end should be credited at what it is worth to the arm that would otherwise have it. Each day's native replay starts from the actual's measured state of charge, so the native arm then spends that energy itself the next day. The two days together should equal a continuous replay: the energy's value counted once.
+V: API 8 Nov (Faisalabad): levers {peak_window 0, offpeak_energy −4149, wear 1666, carry_over 4384}, saving 1901.13.
+DB rows: FSD 2026-11-08 eA 204.25 eN 43.0 v 27.19 dis 0.8/154.57 pkimp 384.74/384.74; KHI 2026-11-02 eA 286.4 eN 73.36 carry 5791.8; KHI 2026-11-03 native dis 153.33 eN 125.0.
+Code: verify.py:641-645 (both replays start at the actual's soc0), 669-675 (c_next = max(c_imp), v_end), 733 (carry). Spec Part 8.2 prices carry-over only at switchback block boundaries.
+===== engine-money-live-02 high backend backend/gridlytics/verify.py
+T: Off-grid farm claims Rs 12,581 this month (Rs 21,349 over 12 days) while burning more diesel than its native settings; the claim is all carry-over
+A: - November: saving Rs 12,581, of which carry-over is Rs 9,244 (73%), wear Rs 2,839 and genset Rs 497. Diesel saved is −0.3 L.
+- 28 Oct–8 Nov: claimed Rs 21,349. Carry-over is +30,046, genset −13,972, and 34.6 L more diesel was burnt.
+- The actual arm burnt more fuel than native on 7 of 12 days and ended the day higher than native on 11 of 12.
+- v_end is Rs 152–163/kWh: the genset's all-in average cost at its night load ratio (about 0.34), including no-load burn and Rs 400/h run-hour cost. The set runs 10–20 h a day, so a stored kWh mostly displaces genset output at the margin: fuel slope 0.273 L × Rs ~400 + O&M 8 → 0.95 × 117.4 − 10.83 ≈ Rs 101/kWh. Valued that way, the 12-day carry-over falls from about 30.0k to about 19.3k.
+- The fee check reads Rs 47,178 a month (one third Rs 15,726) on this basis.
+E: At a site whose only running cost is diesel (plus wear), a saving should come with litres saved. Stored energy should be valued at the fuel it actually displaces. Customers see this per-day ledger, and it drives the fee check.
+V: API (native baseline, 1 Oct–9 Nov): levers {genset −13971.53, wear 5275.26, carry_over 30045.63}, litres_saved −34.6.
+DB v_end 151.61–163.19.
+The page shows 'Diesel saved −0.3 L' beside 'Rs 12,581'.
+DESIGN_LOG 2026-11-07 Round 5 'Open: the per-day carry-over at off-grid sites is noisy... Customers see the per-day ledger, so this matters before a pilot'.
+Code: verify.py:669-675.
+===== engine-money-live-03 high backend backend/gridlytics/verify.py
+T: The MDI lever changes with the chosen date range: one day can claim a whole month's MDI, and unscored days in the month are ignored
+A: - Karachi 3 Nov alone: 'Saving against the native settings Rs 41,099'. The day lost Rs 1,526, and MDI +42,625 comes from that day's 839 against 873 kW. The month's real peak so far is 902 kW.
+- 1–3 Nov shows Rs 53,336, more than the whole month to date (Rs 43,594).
+- 8 Nov alone shows −Rs 20,415.
+- 'Last 30 days' shows Rs 90,112: two months of MDI (Rs 94,088) from 12 scored days, whose daily sum is −Rs 3,975.
+- Faisalabad October: MDI −Rs 30,275 (328.45 actual against 304.23 baseline, from 28–31 Oct only). October's billed MDI was 337.06 kW, set on 26 Oct, a native observation day, so both arms' October demand is 337.06 kW and the true lever is 0.
+- The fee check follows these numbers: Faisalabad 28 Oct alone gives Rs 173,741 a month.
+E: Spec Part 8.2: MDI is the month's single highest block, so the lever comes from the full-month counterfactual and is the same whatever sub-range is viewed. The month's peak must include every day of the billing month, including observation and unscored days. A one-day view should not book a month's demand charge.
+V: API (start/end): KHI 11-03 claimed 41099.29, mdi 42625, months {'2026-11': 838.57/872.67}; KHI 11-01..11-03 claimed 53336.09; KHI 11-08 −20414.97; FSD Oct mdi −30275 {328.45, 304.23}.
+Telemetry days: FSD 2026-10-26 peak 337.06 (not in savings_days).
+Code: verify.py:1047-1066 (months built only from the rows inside [d0,d1]).
+===== engine-money-live-04 high backend backend/gridlytics/tariffs.py
+T: Legacy net-metering agreement end date is ignored: exports stay priced at the import rate after expiry instead of the net-billing rate (Rs 8.13)
+A: - Lahore 24 Dec 2026 and 1 Feb 2027: c_exp is 38.95 and 47.75, the same as before expiry.
+- The audit site whose agreement ended on 1 Jan 2025 still exports at 26.97/40.01 on 9 Nov 2026.
+- agreement_start and agreement_end are read only by an alert ('The net metering legacy agreement ends on 2026-12-23'). Pricing ignores them.
+- An optimiser seeing about 5× the real export value would plan battery and PV exports at peak, and the export lever would be credited at the import rate.
+E: R9 8.3 and SRO 547(I)/2026: a legacy agreement keeps its terms only until it expires. After agreement_end the connection is billed under net billing: exports credited at NAEPP (Rs 8.13 in the library), imports at the TOU rate. The optimiser, the prices page, the ledger and the bill rebuild should all switch on that date.
+V: API: lhr 2026-12-24 c_exp [38.95, 47.75]; f014f039638b c_exp [26.97, 40.01] with agreement_end 2025-01-01.
+Code: the only use of the dates is alerts.py:155-163. tariffs.py:701, 723-745 (vectors) and 548-553, 607-611 (rebuild) branch on regime only.
+===== engine-money-live-05 medium both backend/gridlytics/routes_sites.py
+T: Month saving differs between pages: fleet row and site overview say Rs 1,956 for Karachi, the savings page, report and fleet-savings API say Rs 43,594
+A: - Fleet and overview: Rs 1,956. /api/fleet's mtd_saving_rs sums only the daily claimed_rs (no MDI), using the calendar month and not the billing month.
+- Savings page, monthly report and /api/fleet/savings: Rs 43,594 (includes MDI 41,637.5).
+- /api/fleet's summary.mtd_saving_rs = 16,438, while /api/fleet/savings' total_claimed_rs = 58,076.
+- The sparkline uses saving_rs, not claimed_rs.
+E: One month-to-date figure against the native settings, the same on every page and in the report, including the month's MDI lever the savings page counts.
+V: /api/fleet: Karachi mtd_saving_rs 1956.0, summary mtd 16438.0.
+/api/fleet/savings: Karachi claimed_rs 43593.81, total 58076.
+Code: routes_sites.py:66-79 (_mtd_saving sums the daily claimed_rs only). reports.py:105 uses verify.summary (with MDI).
+===== engine-money-live-06 medium backend backend/gridlytics/verify.py
+T: Month-to-date saving books the whole month's MDI reduction while the daily cost of holding it builds up, overstating Karachi's month
+A: - Headline Rs 43,594, of which MDI is Rs 41,638 (33 kW × Rs 1,250), booked in full after 8 days. Every day without an outage loses money: 3–8 Nov average −Rs 1,713 a day. The plan cycles 240–420 kWh a day to hold the 902 kW cap; peak +9.2–11.5k, off-peak −7.4–8.8k, wear −2.6–4.6k.
+- If the remaining 22 days look like 3–8 Nov with no outage, the month ends near +Rs 5,900, not Rs 43,594.
+- The fee check (Rs 37,508 a month) and the headline both lean on this front-loaded credit. A 1 MW plant's 'perfect' bound is Rs 615 on the same page.
+E: A month-to-date figure that a CFO can believe: either a full-month MDI lever set against a full month of the costs that achieve it, or the lever shown as provisional or spread over the month.
+V: API daily native savings 3–8 Nov: −1525.71, −3622.25, −498.6, −1870.86, −2273.1, −489.97. MDI lever 41637.5. Discharge kWh: 465.94, 324.59, 237.97, 357.47, 421.04, 242.72 (db.py).
+===== engine-money-live-07 medium backend backend/gridlytics/verify.py
+T: The 'perfect-foresight upper bound' is below the claimed saving and even negative, so it is not a bound
+A: - Karachi November: bound Rs 615 against a claim of Rs 43,594.
+- Karachi 3 Nov: bound −Rs 3,121 against a claim of +Rs 41,099.
+- Lahore (monitor, actual equals native): bound −Rs 7,314, including −6,327.77 on 6 Nov and −1,816.93 on 1 Nov.
+- Causes:
+  - The bound's cost (energy + genset + wear − terminal) leaves out the MDI it pays to cap; the hindsight solve takes the day's month-to-date M0.
+  - It solves at 15 minutes but is compared with the native arm priced per minute.
+  - It has a 5 s limit.
+- These days were computed 14:41–14:44 UTC on 8 Nov, before the audit load, so load does not explain them.
+E: Spec 8.2: a hindsight re-solve reported as the upper bound ('not achievable, for reference'). It should be at least the realised saving and never below about zero against native, measured on the same levers (MDI included) and the same 1-minute basis.
+V: API native perfect_foresight_rs: KHI Nov 615.12; LHR Nov −7314. DB per day: KHI 11-04 −4883.2, 11-03 −3120.93; LHR 11-06 −6327.77.
+Code: verify.py:771-810 (cost excludes the MDI value; time_limit=5.0).
+===== engine-money-live-08 medium both frontend/src/features/savings/bills-panel.tsx
+T: Bill comparison with missing meter data counts the gap as zero, while the page says the gaps were filled from the profile
+A: - telemetry.filled() turns blank import minutes into 0 kWh. The 17-day bill shows exactly the same energy units as the 15-day full-data bill (44,830 / 202,023 kWh).
+- The page then shows −9.25% and −66.62% 'Outside the 2% check'.
+- The notice says: 'Part of the period has no meter data, so the rebuilt lines fill the gaps from the profile', which is false.
+E: Either fill gaps from a load profile, as the notice says, or withhold or scale the difference when completeness is below 100%. A data gap should not be shown as a rebuild error 'Outside the 2% check'.
+V: GET /bills: completeness 0.8824, difference_pct −9.25, units equal to the 1.0-complete bill; completeness 0.2258, difference_pct −66.62.
+Code: verify.py:1278-1288; telemetry.py:417-421 ('energy blanks as zero'); bills-panel.tsx:70 (copy).
+===== engine-money-live-09 medium frontend frontend/src/features/savings/savings-kpis.tsx
+T: A captive-gas genset's fuel is shown as diesel litres (the figures are MMBtu of gas)
+A: - The page says 'Diesel saved 1.9 L', 'Diesel burned 0.0 L', '0.0 L / 1.4 L'. The 1.39 is MMBtu of gas: Rs 5,838 of the Rs 11,087 genset lever at Rs 4,200 each.
+- The fuel price form label is fixed at 'Price (Rs per L)'.
+E: The fuel, its unit and its label come from the genset's fuel kind: 'Gas saved 1.9 MMBtu' and a price in Rs per MMBtu.
+V: Karachi 1 Nov: litres_native 1.39, genset lever 11087 = 1.39 × 4200 + start 4000 + 0.32 h × 1500 + O&M 6 × ~128 kWh. /api/tariffs/fuel: gas_captive 4200 'Rs per MMBtu'.
+Code: savings-kpis.tsx:36, 53 (fixed 'Diesel' and litres()).
+===== engine-money-live-10 medium both frontend/src/features/sites/onboarding/site-form.ts
+T: Connection tax flags and the ICP baseline cannot be set in the web app; every site is priced as a GST-registered filer with no ICP
+A: - The form edits only the province.
+- site-form.ts:187 says 'the fields this form does not edit (ICP baseline, tax flags, seasonal multiplier) are kept from the saved connection'.
+- The backend defaults all flags to True (sites.py:103) and icp.eligible to false.
+- The bearable-cost basis, the optimiser's prices and every saving therefore assume a registered, ATL industrial filer with no ICP. This is wrong for the very sites (B-2/B-3 with growth) the brief targets, and silently 18–21% low for non-recoverable sites.
+E: Spec Part 3 'connections': ICP baseline by month and period, and tax flags gst_recoverable, s235_adjustable, STRN and ATL. Spec Part 6: the wizard's tariff tab captures them from a bill. An ICP-eligible B-2 or B-3 site above its baseline is priced at Rs 22.98 + positive FCA instead of 26.98/40.02. A site without STRN, or a domestic or agricultural one, pays 18% GST plus 3% further tax on every rupee.
+V: grep in frontend/src: no gst_recoverable, s235 or icp input. site-form.ts:187, 207. sites.py:103. tariffs.py:475, 484. Spec EMS_BUILD_PLAN.md lines 227, 563.
+===== engine-money-live-11 medium backend backend/gridlytics/verify.py
+T: The 'tuned' baseline can be worse than native: Lahore's tuned table costs Rs 294 a day more than the native settings
+A: - On 9 of 12 days the tuned table costs +Rs 293.77 more than actual (which equals native at this monitor site). Every day it discharges 57 kWh at peak (+2,752), recharges off-peak (−2,078), pays wear (−617.5) and ends 10 kWh lower (−350).
+- On A-2(c) the spread (48.28 against 39.48 / 0.9025) is below wear (Rs 10.83/kWh), so it loses money.
+- All 8 TUNED_VARIANTS force a peak 'discharge' row and none is plain self-use.
+- fit_tuned prices candidates with v_end = 0, so draining the battery looks free.
+E: Spec 8.1: the tuned baseline is the best static table the engine can fit, and claims must beat it. It should never be worse than the native capture, so the candidates must include a native-like self-use table, and the fit should value end-of-day energy as the ledger does.
+V: DB tuned rows LHR: levers {peak_window −2752.13, offpeak_energy 2078.05, wear 617.5, carry_over 350.35} → 293.77, on 1–5, 7 and 8 Nov, plus 30–31 Oct at 299.56–299.57.
+Code: verify.py:541-555 (TUNED_VARIANTS, tuned_table); verify.py:600-604 (price_arm(..., 0.0)).
+===== engine-money-live-12 medium both frontend/src/features/savings/fee-card.tsx
+T: The fee check labels the tuned figure as 'against the native settings' and turns 1 to 4 days into a monthly 'verified saving'
+A: - Karachi: Rs 37,508 is the tuned figure (−1,101.11 / 8 × 30 + 41,637.5). Native would be Rs 48,974. The tile says 'claimed against the native settings'.
+- Faisalabad November: Rs 1,719 is tuned (native Rs 7,129).
+- Faisalabad October (4 days, claimed −Rs 3,264): Rs 87,676 a month.
+- Faisalabad 28 Oct alone: Rs 173,741 a month.
+- Farm November: Rs 47,178 a month (see the carry-over finding).
+E: The label names the baseline actually used (the smaller of native and tuned). The fee check is withheld or marked until enough scored days exist, as the pilot's 28-day rule does elsewhere.
+V: API fee.verified_saving_rs_per_month: KHI 37508; FSD Nov 1719; FSD Oct 87676; FSD 28 Oct 173741.
+Code: fee-card.tsx:41 (sub-label); verify.py:1092-1102 (min over native and tuned, scaled from n days).
+===== engine-money-live-13 medium backend backend/gridlytics/routes_savings.py
+T: The savings CSV leaves out MDI, the levers, carry-over, the baseline peak and the version ids, so it adds up to a different total than the page
+A: - The 8 rows add up to Rs 1,956.31; the page shows Rs 43,594. There is no MDI line and no baseline peak_kw, so it cannot be rebuilt.
+- Per row, native − actual cost does not equal the saving because carry-over is hidden. 2 Nov: 474,096.13 − 475,139.50 = −1,043 against saving +4,748.
+- There is no tariff version, capture version or plan id.
+E: Spec 8.5: 'The data behind every figure downloadable as CSV with the tariff version, the capture version and the plan ids, so a dispute can be re-run'. The MDI lever, the levers per day and the baseline's peak kW are needed to re-derive the headline.
+V: CSV header: day,saving_native_rs,saving_tuned_rs,fidelity,actual_cost_rs,native_cost_rs,litres_actual,litres_native,peak_kw,peak_import_kwh.
+Code: routes_savings.py:59-71.
+===== engine-money-live-14 low both backend/gridlytics/routes_sites.py
+T: Fleet 7-day sparkline blows up rounding noise: Lahore's −Rs 0.09 draws as a full-height red loss
+A: - The Lahore row shows a tall red bar for 6 Nov (saving_rs −0.09) and a red dash for 2 Nov (−0.01). Each row is scaled to its own range, so noise looks like a loss.
+- The spark uses saving_rs, not claimed_rs (0 for the monitor tier).
+E: Bars on a scale that shows rupees, or that hides changes under Rs 1. A monitor site that claims nothing shows no saving.
+V: /api/fleet Lahore spark: [−0.01, 0.0, 0.0, 0.0, 0.0, −0.09, 0.0].
+Code: routes_sites.py:78.
+===== engine-money-live-15 low backend backend/gridlytics/tariffs.py
+T: A genset day before the first entered diesel price is silently priced at a later price
+A: - The first HSD price is valid from 30 Oct (Rs 400.67).
+- 29 Oct's genset lever of Rs 20,644 for 43.71 L implies about Rs 400.7/L, so it borrowed 30 Oct's price. tariffs.fuel_price falls back to the earliest row of any date.
+- The genset lever carries no flag for this.
+E: A day with no price on or before it is flagged ('no fuel price for this day') or uses the latest earlier price. It does not borrow a future price without saying so.
+V: DB FSD 2026-10-29 litres native 43.71, genset lever 20644. /api/tariffs/fuel: first hsd valid_from 2026-10-30.
+Code: tariffs.py:299-301.
+===== flow-reports-alerts-members-keys-01 high backend backend/gridlytics/reports.py
+T: Daily operations sheet prints the day after tomorrow's partial table as "Tomorrow's slot table", with no date in the PDF
+A: At 17:11 PKT on 9 Nov the sheet shows only 2026-11-11 00:00-13:15 'hold 20 %'. That is the last, partial day of the 48-hour plan. The PDF has no date column, and its header says '01 November 2026 to 30 November 2026'. An installer keying this into the vendor app would hold the battery all day instead of charging and discharging. The same happens for Faisalabad (2026-11-11 00:00-12:30 hold 95 %).
+E: The sheet shows tomorrow's full slot table (2026-11-10): charge_grid 00:00-17:45, then discharge 17:45-00:00. The PDF names the date, and the header names that day, not a month.
+V: reports.py:163-171 uses `for d in comp["days"][-1:]` (the last day, not tomorrow). Spec EMS_BUILD_PLAN.md line 582 says 'Two day-tables are compiled (today's remainder and tomorrow)'. Files: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/apidl/resume-dailyops-karachi.pdf, /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/apidl/owner-2cb0dd6067f5-daily_operations-e9941b41c70b.csv. Plan days at that moment: 2026-11-10 [00
+===== flow-reports-alerts-members-keys-02 medium both frontend/src/features/reports/reports-page.tsx
+T: No report schedules exist, but the empty Reports page promises an automatic report on the 3rd
+A: The page says 'Your first monthly report on the 3rd. Each month's report is generated on the 3rd, once the month's last days are priced.' Nothing generates reports: the scheduler runs only the 15-minute tick and the nightly job, and reports.generate is called only from POST /api/reports. Neither /reports nor /settings has a schedules section.
+E: UI-14 and UI-18 call for report schedules, and the empty state 'Your first monthly report on the 3rd' only makes sense if a job generates it. Either the schedule exists, or the page does not promise it.
+V: reports-page.tsx:70-71 (empty-state text). scheduler.py:71-72 (only the 'tick' and 'nightly' jobs; no reports import). routes_reports.py:37 is the only caller of reports.generate. EMS_BUILD_PLAN.md line 730 (UI-14: 'schedules') and line 734 (UI-18: 'report schedules').
+===== flow-reports-alerts-members-keys-03 medium both backend/gridlytics/reports.py
+T: No company (fleet) roll-up report, no pilot report and no browser preview
+A: The dialog's Site select lists single sites only, so there is no fleet or company report. The API answers kind 'pilot' with 422 'A report is one of monthly_savings, energy_only, daily_operations'. Reports can only be downloaded; there is no in-browser preview.
+E: Spec Part 8.5 asks for 'a monthly report per site and a roll-up per company' and a pilot write-up (WP10). UI-14 lists 'monthly savings, pilot report, daily operations sheet, energy-only' and 'a browser preview from the same components'.
+V: reports.py:20 KINDS = ('monthly_savings','energy_only','daily_operations'); generate() needs site_id. generate-report-dialog.tsx:55 offers sites only. The pilot POST gave 422 (prior run). EMS_BUILD_PLAN.md line 96 ('a monthly PDF per site and per company'), line 686 onward (8.5), line 730 (UI-14).
+===== flow-reports-alerts-members-keys-04 medium backend backend/gridlytics/reports.py
+T: Report CSV has no tariff or capture version though the PDF points to them; its plan_ids are the first four plans by UTC date
+A: The CSV columns are day, import_kwh, export_kwh, pv_kwh, load_kwh, genset_hours, litres, outage_minutes, peak_kw, saving_native_rs, saving_tuned_rs, fidelity, plan_ids. There is no tariff version and no capture version. plan_ids keeps the first 4 plans whose UTC belief_time date equals the PKT day. For 2026-11-01 it lists the 01:00, 04:00, 07:00 and 10:00 UTC plans. It misses the plans that ran from 00:00 to 05:00 PKT (19:00 and 22:00 UTC the day before), and counts the evening UTC plans under the wrong day.
+E: Spec 8.5: 'The data behind every figure downloadable as CSV with the tariff version, the capture version and the plan ids, so a dispute can be re-run.' The PDF's claim 'tariff versions as dated in the CSV annex' should be true. plan_ids should be the plans in force during each Karachi day.
+V: reports.py:144-159: the CSV header has no version columns. reports.py:152 queries `substr(belief_time,1,10) = ?` and keeps `[:4]`. reports.py:159 has the PDF text 'tariff versions as dated in the CSV annex'. File: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/apidl/owner-fcf48366c734-monthly_savings-6d4db49bf87e.csv. Belief times checked: c8af6b0c6572 01:00Z, 35d70ca053a1 04:00Z, 91ac30c41633 07:00Z, cb43cc52f877 10:00Z.
+===== flow-reports-alerts-members-keys-05 medium backend backend/gridlytics/reports.py
+T: Monthly savings PDF lacks most of the content spec 8.5 lists
+A: The PDF has the Headline, the Ledger, the Method, Energy, Daily rows and one closing line. Missing: forecast skill, control health, the switchback calendar and carry-over credits, the bill comparison, and outage coverage (only outage hours appear). The page has Switchback and Bill comparison tabs for the same period, so the report omits figures the product already has. The October report spans '01 October to 31 October' but holds data only from 25 Oct, and does not say so.
+E: Spec 8.5: 'the headline saving against each baseline with the method stated, the ledger by lever, diesel, peak, outage coverage, forecast skill, control health, the switchback calendar with the carry-over credits and the bill comparison; a one-page summary and an annex of daily rows'.
+V: File: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/apidl/oct-fai.pdf. reports.py:103-160 (story sections). Owner Savings page text: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/resume/owner-1440-sites_6d4db49bf87e_savings.json ('Counterfactual Switchback Bill comparison'). EMS_BUILD_PLAN.md line 688.
+===== flow-reports-alerts-members-keys-06 medium frontend frontend/src/lib/api/client.ts
+T: Member with no seat or with access switched off sees "This is not available for your role" instead of the reason
+A: The app shell loads with the sidebar (Fleet, Alerts, Reports, Tariffs, Settings, Members; 'No sites yet'), and every page says 'This is not available for your role.' The person is not told they lack a seat or were switched off, or whom to ask.
+E: The server's sentence is shown in place of the page: 'OnyxLeaf Demo has 5 seats in Gridlytics and every one is taken: ask its owner to switch someone off, or ask us for more seats', or 'Your access to Gridlytics in OnyxLeaf Demo is switched off; ask its owner'. session.ts:148 maps no_seat and member_disabled to the step 'notice' for exactly this.
+V: client.ts:64-73 has no branch for nextStep()==='notice', so the 403 is thrown as usual. query-state.tsx:36-37 renders any 403 as NotForRole. GET /api/auth/state for seat6 returned refusal {code:'no_seat', detail:'OnyxLeaf Demo has 5 seats...'}; /api/fleet returned 403 no_seat. After switch-off: 403 member_disabled. Screenshots: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/seats/seat6-no-seat-signin.png and /tmp/claude-0/-home-user/f64857cc-0ca7-5cb
+===== flow-reports-alerts-members-keys-07 medium backend backend/gridlytics/api.py
+T: Person removed from the company by the founder stays in Members; the owner can switch them on (taking a seat) and make them administrator
+A: Both PUTs return 200. seats_used goes from 4 to 5, so a person outside the company holds one of the 5 paid seats and a real new member would get 'no seat'. They also show as Administrator in the list. (I reverted this afterwards; seats used is 4.)
+E: Someone who is no longer a member of the company leaves the Members list, or is shown as removed and cannot be switched on, promoted, or counted against seats.
+V: api.py:479-500: users_edit checks only the company's members table (store_members.member) and the seat count, not the registry membership. Prior-run output: 'switch on removed member 200 ... seats_used 5', 'make removed member admin 200'. Members list after removal: ('audit.seat5@onyxleaf.demo', True, ''), ('audit.seat6@onyxleaf.demo', True, '').
+===== flow-reports-alerts-members-keys-08 medium backend backend/gridlytics/alerts.py
+T: Acknowledging a closed alert reopens it, creating a duplicate in the inbox
+A: 200; the state becomes 'acknowledged' again with closed_at still set. The inbox then holds two Lahore 'The net metering legacy agreement ends on 2026-12-23' alerts (one acknowledged, one open), and Need attention goes up by one.
+E: Acknowledging a closed or resolved alert is refused (409) or does nothing.
+V: alerts.py:331-332 updates state to 'acknowledged' with no state check. Prior run: 'ack after close 200 acknowledged', then 'ack closed 200 acknowledged 2026-11-09T07:42:47'. Active list: ('14d22ca6d18f','open','regime_expiring_d90fccdc'), ('ee9d3b4ffcbb','acknowledged','regime_expiring_d90fccdc', closed_at 07:42:47).
+===== flow-reports-alerts-members-keys-09 medium backend backend/gridlytics/alerts.py
+T: Closing an alert whose condition still holds is undone at the next tick (new alert, new id)
+A: At 07:45:24 a new alert (14d22ca6d18f) with the same rule was raised, without the earlier note or assignment. Closing a persistent condition only resets its history. The drawer gives no warning.
+E: A person's close sticks: the condition is snoozed or suppressed until it changes, or the drawer explains that closing a still-true condition will raise it again.
+V: alerts.py:24-33: _open looks only for state IN ('open','acknowledged') and inserts a new row otherwise. Times from the prior run: closed 07:42:47, re-raised 07:45:24. The module docstring says 'people acknowledge, assign and close them', with no snooze or suppress.
+===== flow-reports-alerts-members-keys-10 medium backend backend/gridlytics/alerts.py
+T: PUT /api/alerts/rules has no validation: 500 on a bad type, garbage stored
+A: (a) 500 server_error (request bd1f299ae2e94c8e, re-run at 12:1x UTC). (b) and (c) 200, and quiet_hours 'banana', escalate -7, 'soon' and a 5,000-character object are stored. (d) 200, with the unknown channel silently dropped. (e) 422 'Unknown alert category: Data', although Data is a known category. The UI's quiet-hours field also takes any text ('kept as you type them').
+E: 422 with a sentence for each bad value: channels must be a list of known channels, quiet hours must be HH:MM-HH:MM, escalation must be 1 to 10,080 minutes (the UI's own rule). Nothing invalid is stored.
+V: alerts.py:352-361: `for c in v.get('channels', ...)` iterates an int, giving TypeError, giving 500. quiet_hours and escalate_after_min are copied unchecked. The UI checks escalation only (alert-words.ts:93-98, escalateProblem). The rules were restored afterwards (restore 200 True).
+===== flow-reports-alerts-members-keys-11 medium frontend frontend/src/features/alerts/alert-rules.tsx
+T: Email, SMS and WhatsApp alert channels look live and save, but nothing sends; only a muted footnote says so
+A: Every Email, SMS and WhatsApp checkbox can be ticked and saved. The only disclosure is a small muted footnote under the 9-row table: 'sending by email, SMS and WhatsApp, quiet hours and escalation take effect once those channels are switched on for your company'. There is no switch for this anywhere. The empty fields show the placeholders '22:00-07:00' and 'Never', which read like real values (the API holds quiet_hours null). At 375 px the Email, SMS and WhatsApp, Quiet hours and Escalate columns are scrolled off the card.
+E: The channels that cannot send yet are visibly disabled or marked 'not sending yet' beside the checkboxes, so an administrator does not rely on an SMS for a critical Reserve alert. Quiet hours and escalation fields do not look already set.
+V: alert-rules.tsx:124 (placeholder '22:00-07:00'), :128 (placeholder 'Never'), :138 (footnote). GET /api/alerts/rules shows quiet_hours null for every category. The backend has no delivery code for these channels (DEFAULT_RULES in alerts.py:21, channels only stored).
+===== flow-reports-alerts-members-keys-12 medium backend backend/gridlytics/apikeys.py
+T: API key scopes do not match their descriptions: sites:read reads far more than settings; plans:read cannot read the current plan
+A: The sites:read key gets 200 from /plan (104 kB, every step), /telemetry, /telemetry/days, /battery, /outages, /forecasts/*, /savings, /pilot, /switchback, /overview/chart, /genset and /now: all operational data under the site path. The plans:read key gets 403 out_of_scope on GET /api/sites/{id}/plan (the current plan), but 200 on /plans, /plans/{id} and /plans/current/message. A partner given 'settings' access therefore reads telemetry and plans.
+E: sites:read ('Read its site's settings (no money fields)') reads the site's settings only. plans:read ('Read its site's current plan (no money fields)') reads the current plan, GET /api/sites/{id}/plan.
+V: apikeys.py:35-43: RESOURCES maps any /api/sites/{id}/... path that is not under /plans/ to 'sites', and /plan (singular) to sites. The SCOPES words are at apikeys.py:37-38 and new-key-dialog.tsx:21-22. Probes: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/py/keys2.py and keys4.py (re-run 12:1x UTC: '/api/sites/6d4db49bf87e/plan 403 out_of_scope ... it holds plans:read').
+===== flow-reports-alerts-members-keys-13 low both backend/gridlytics/reports.py
+T: Report period not validated: '2026-11-05', '2026-1', '1999-01' and future '2027-03' are accepted and listed
+A: All return 200 and are kept. The list shows 'March 2027 Preliminary', '2026-11-05 Preliminary', '2026-1 Preliminary' and 'January 1999 Preliminary'. Only '2026-13' is refused.
+E: 422 'The period is a month as YYYY-MM' for anything that is not exactly YYYY-MM, and a refusal for months before the site's data or after the current month (the UI's month input already has max = this month).
+V: reports.py:60-62: _period reads period[:4] and period[5:7] with no full-format check and no bounds. Screenshot: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/resume/owner-1440-reports.png (rows 9-12). Report ids: f32a4d17e87d (2027-03), b96c6d1892cb (2026-11-05), ed0a426155b8 (2026-1), 60b6ab730f48 (1999-01).
+===== flow-reports-alerts-members-keys-14 low both backend/gridlytics/sites.py
+T: Deleting a site leaves its reports (shown by raw id) and its API keys active
+A: The key stays 'Active' (revoked: null), bound to the deleted site (requests now get 404). The report stays listed and downloadable (200), with the Site cell showing the raw id 'dbaa27cc02e6'. The same holds for 7076e9259b33.
+E: The site's keys are revoked when it is removed, and its reports are hidden, or shown with the site's name and marked 'site removed'.
+V: sites.py:270-273: delete only sets sites.deleted. reports.py:211-212: site_name falls back to ''. Output of /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/py/orphan.py: "key listed after site delete {'revoked': None}", "reports listed [('3e29351ba765','energy_only',\"''\")]", 'report dl 200'.
+===== flow-reports-alerts-members-keys-15 low both backend/gridlytics/routes_reports.py
+T: Downloaded report file names omit the site, so different sites' reports get the same name
+A: Both save as 'gridlytics-monthly_savings-2026-11.pdf', so the second overwrites the first or becomes '(1)'. The same applies to every kind.
+E: Names that identify the site, e.g. gridlytics-faisalabad-textile-mill-monthly_savings-2026-11.pdf.
+V: routes_reports.py:56: filename=f"gridlytics-{r['kind']}-{r['period']}.{which}". endpoints.ts:36 has the same fallback. Saved names in /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/dl/ (owner-27e794d27db2-... and owner-220da99e5a3d-gridlytics-monthly_savings-2026-11.pdf).
+===== flow-reports-alerts-members-keys-16 low backend backend/gridlytics/reports.py
+T: Report header calls a grid-connected site without a connection 'Off-grid' and prints the raw regime 'none'; an empty period is not stated
+A: The subtitle says '... Off-grid. Generated ...' for a MEPCO grid site. The monthly report is all 'Rs 0' rows with 0 verified days and no note that there is no data. The daily sheet for a site with no plan is an empty table with no sentence. Faisalabad's subtitle reads 'FESCO B-2(b), none.'
+E: 'Grid-connected, no tariff connection yet' (or similar), and 'No data in this period' when there are no rows. For connected sites, the regime is in words or left out when it is none.
+V: reports.py:96-97 (`... if conn else "Off-grid. "`; regime printed raw). Files: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/apidl/edge-5bb8d87a8f23.pdf and /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/apidl/edge-f8e58f2c5960.pdf.
+===== flow-reports-alerts-members-keys-17 low backend backend/gridlytics/reports.py
+T: PDF Preliminary note omits the switchback condition the Savings page uses; litres have no 'Estimated' mark and show '-0 L'
+A: The PDF prints one fixed sentence: 'Fewer than 28 verified days, the month is not over, or a fuel adjustment of the period is not yet billed'. It does not say which condition applies and leaves out the 8-week switchback condition. 'Diesel saved 72 L' has no 'Estimated' (the page shows '72.4 L Estimated'). The farm report shows 'Diesel saved -0 L'.
+E: The report states the same Preliminary conditions as the page: '28 verified days (4 so far); 8 weeks of switchback (1 so far)'. Curve-based litres are marked Estimated as on the page, and a zero shows as '0 L'.
+V: reports.py:107-110 (fixed sentence), :117-119 (num(litres_saved) gives '-0'). Page text: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/resume/owner-1440-sites_6d4db49bf87e_savings.json. PDFs: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/apidl/oct-fai.pdf and /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/apidl/owner-220da99e5a3d-monthly_savings-47895916bed4.pdf.
+===== flow-reports-alerts-members-keys-18 low backend backend/gridlytics/routes_reports.py
+T: Operator can download the monthly savings CSV though exporting savings is refused to operators
+A: (1) 403 'Exporting savings is for an administrator or an analyst'. (2) 200, a CSV with saving_native_rs, saving_tuned_rs and plan_ids. The report route checks only see_costs.
+E: The same rule for the same data. Exporting savings needs 'export' (administrator, analyst), which also gates generating the monthly savings report.
+V: routes_reports.py:49 checks only `see_costs` for non-energy kinds. auth.py PERMISSIONS: export = {admin, analyst}. Re-run at 12:1x UTC: 'savings export 403 ... report csv 200'.
+===== flow-reports-alerts-members-keys-19 low frontend frontend/src/features/reports/generate-report-dialog.tsx
+T: Generate dialog asks for a month for the daily operations sheet and says it will be marked Preliminary
+A: The dialog shows 'Month: November 2026 - The month is not over: the report will be marked Preliminary.' The sheet ignores the month (the same content for 1999-01 or 2026-10) and is never marked Preliminary (preliminary: null). The list labels these sheets 'November 2026' or 'October 2026'.
+E: The daily sheet has no month input; it names the day it is for. No Preliminary hint, since the server never marks it.
+V: generate-report-dialog.tsx:58-59 shows the hint for every kind. routes_reports.py:36. Screenshot shows the hint under the Month field.
+===== flow-reports-alerts-members-keys-20 medium frontend frontend/src/features/reports/reports-table.tsx
+T: At 375 px the Reports, API keys and Members tables push their actions (PDF/CSV, Revoke, Switch off) off-screen
+A: Reports: only Site, Report and Month fit. The Preliminary badge is cut off, and Generated, Status and the PDF/CSV buttons are off the right edge. Keys: only Name, Key and Kind show; State and Revoke are hidden. Members: Access and 'Switch off' are hidden and the role select is clipped. The page itself reports no overflow, because the scroll is inside the card.
+E: On a phone each row stacks, or the action stays visible, so downloading a report, revoking a key or switching a person off needs no hidden sideways scroll inside a card.
+V: Screenshots: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/owner-375-reports.png, /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/owner-375-settings_view_keys.png, /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/owner-375-settings_view_members.png.
+===== flow-reports-alerts-members-keys-21 low frontend frontend/src/features/org/keys-tab.tsx
+T: Role refusal on API keys reads 'The API keys is not available for your role' and does not say who may
+A: 'The API keys is not available for your role.' and 'The members list is not available for your role.'
+E: 'API keys are for an administrator.' and 'The members list is for an administrator.': grammatical, and naming the role that may, as other pages do.
+V: keys-tab.tsx:64 (what="The API keys"), members-tab.tsx:34, query-state.tsx:16-21 (NotForRole: '{what} is not available for your role').
+===== flow-reports-alerts-members-keys-22 low frontend frontend/src/components/layout/sidebar.tsx
+T: Sidebar highlights both 'Settings' and 'Members' on every Company settings tab
+A: Both Settings and Members are highlighted on every tab, including API keys and Company.
+E: Only the matching entry is highlighted: Members on view=members, Settings otherwise.
+V: nav.ts:42 links Members to '/settings?view=members'. sidebar.tsx:63: NavLink with `end` matches the pathname only and ignores the query. Screenshots: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/keys/owner-1440-after-revoke.png and /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/viewer-1440-settings_view_members.png.
+===== flow-reports-alerts-members-keys-23 low frontend frontend/src/features/org/members-tab.tsx
+T: Member role changes, including promotion to Administrator, save on select change with no confirmation
+A: The PUT is sent immediately on change, and the person becomes an administrator from one mis-click. Only switching off has a confirm dialog.
+E: Promotion to Administrator (members, money settings, tier changes, API keys) asks for confirmation, as switching off does.
+V: members-tab.tsx:102: onChange={(e) => change.mutate({ m, body: { role: ... } })}. The switch-off confirm text was captured in the prior run: 'Switch off AUDIT seat5? ... Keep them on / Switch off'.
+===== flow-reports-alerts-members-keys-24 low frontend frontend/src/features/org/new-key-dialog.tsx
+T: One-time API key dialog closes on Escape, the overlay or the close button; keys list shows a misleading 'Role on record'
+A: Escape closes the dialog at once (dialogOpenAfterEscape: 0 in keys-flow), and the key is lost for good; it must be revoked and made again. The list has a 'Role on record' column showing Operator or Administrator for keys that the page says hold no role permission.
+E: The dialog that shows the only copy of the key closes only through 'I have copied it', or asks 'You have not copied the key; close anyway?'. A key that 'holds no role permission' does not show a role column, or explains it.
+V: new-key-dialog.tsx:128-130: onOpenChange={(o) => !o && onDone()}. keys-tab.tsx:76 'Role on record'. apikeys.py:48 DEFAULT_ROLE 'operator'. Screenshot: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/keys/owner-1440-token-dialog.png.
+===== flow-reports-alerts-members-keys-25 low both backend/gridlytics/alerts.py
+T: Tariff regime alert says 'ends on 2020-01-01' for agreements that ended long ago; the drawer shows raw rule and connection ids
+A: The title uses 'ends on' with a past date. The two identical rows cannot be told apart. The drawer shows 'Rule: Regime expiring d90fccdc728a' and 'Connection: d90fccdc728a'.
+E: An agreement that has already ended reads 'ended on 1 Jan 2020' (likely a critical tariff problem). The two connections are told apart. The drawer names the connection (meter reference or regime), not an internal id.
+V: alerts.py:161 `(end - today).days <= 60` includes negatives. alerts.py:164 (title 'ends on {end}', ISO date). Screenshots: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/viewer-1440-alerts.png and /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/alerts/operator-1440-drawer-after.png.
+===== flow-reports-alerts-members-keys-26 low both backend/gridlytics/alerts.py
+T: Alert assignment is free text for operators and the API stores any string; no member link or notification
+A: Only an administrator gets a member list; operators, who act on alerts most, type any name. The API stored 'Nobody Real <script>' (200). The assignee is not notified and nothing filters 'assigned to me'.
+E: Assignment picks one of the company's members (stored by member id) for every role that may act, and the API refuses a name that is not a member.
+V: alerts.py:334 (`assignee[:120]`, no check). alert-drawer.tsx:31-53 (the list only with manage_users). Prior run: 'assign arbitrary 200 Nobody Real <script>'. Screenshot: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/a375/operator-375-alerts.png.
+===== flow-reports-alerts-members-keys-27 low backend backend/gridlytics/apikeys.py
+T: Solarlytics leftovers in wording: key error suggests a non-existent scope 'quotes:read'; audit says 'generated a energy only report'
+A: 422 'Give the key one or more scopes, such as quotes:read'. With scopes ['quotes:read'], the API answers 'Unknown scope quotes:read'. The audit trail reads 'generated a energy only report' (7 entries). The apikeys.py module docstring still describes quotes, customers and projects scopes.
+E: 'Give the key one or more scopes, such as plans:read'. Audit line: 'generated an energy-only report'.
+V: apikeys.py:111, apikeys.py:1-20 (docstring), reports.py:184 (f"generated a {kind.replace('_',' ')} report"). Audit counter from the prior run: 'generated a energy only report': 7.
+===== flow-reports-alerts-members-keys-28 low both frontend/src/features/org/members-tab.tsx
+T: An owner cannot add, invite or remove a member, and the Members page does not say how people are added
+A: There is no add, invite or remove action, only Switch off and on. The footnote says 'People join the company through the sign-in service', which does not tell the owner what to do. Removal is founder-only, and removed people still appear (see the separate finding).
+E: Either an invite/add action, or (by the owner's decision that people are added by the founder) a sentence like 'To add or remove a person, ask OnyxLeaf'. Removing is distinct from switching off.
+V: members-tab.tsx:125 (footnote). platform.py:456 ('people are added by the founder, never invited'). EMS_BUILD_PLAN.md line 734 (UI-18 'Members and roles').
+===== flow-reports-alerts-members-keys-29 low frontend frontend/src/features/reports/reports-page.tsx
+T: Viewer's Reports page does not say in words that only energy-only reports are listed for the role
+A: The page lead says 'Monthly savings, the viewer-safe energy report and the daily operations sheet ...', but the list silently shows only energy-only rows (the server filters). The note at reports-page.tsx:66 can never show, because every role holds energy_report. The role sentence appears only inside the generate dialog.
+E: A role sentence on the page, e.g. 'Your role is listed the energy-only reports; monthly savings and daily operations sheets are for an administrator, an operator or an analyst' (plan Part 9.7: role differences said, not silently removed).
+V: reports-page.tsx:54 (lead) and :66 (dead branch, since canGenerate is always true). routes_reports.py:22-26 filters to energy_only. Screenshot: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/viewer-1440-reports.png.
+===== flow-reports-alerts-members-keys-30 low both backend/gridlytics/reports.py
+T: Off-grid site's energy report shows meaningless grid rows (import 0, peak import 0.0 kW, 'Outage time 168 h')
+A: 'Grid import 0 kWh', 'Grid export 0 kWh', 'Outage time 168.0 h' (24 h every day) and 'Peak 30-minute import 0.0 kW'. The daily rows show 'Outage h 24.0' every day. The Savings page shows the same ('Outage time 205 h').
+E: An off-grid report leaves out grid import, export and peak import, and does not count every hour as an outage (it has no grid), or labels the row clearly.
+V: reports.py:130-135 prints the same rows for every site. File: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/apidl/viewer-49d263ab2186-energy_only-farm.pdf. Page: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/reports/shots/viewer-1440-sites_47895916bed4_savings.json.
+===== parity-architecture-01 high both .github/workflows/ci.yml (missing in both repos)
+T: No CI in either Gridlytics repository: no .github/workflows on any branch, so pull requests into v1-build are merged with no automated test, type check, audit or browser check
+A: No .github folder exists in either repository on origin/main, origin/v1-build, origin/fix/offgrid-carry-over or origin/docs/plan-package; every count is 0. The only gates are the suites people run by hand before a push, as HANDOFF section 2 asks. An open pull request (fix/offgrid-carry-over) already exists with no CI run on it.
+E: Both repositories carry ci.yml in the family's shape (plan 10.9 and 11.5; Solarlytics wave 2 items 8 and 9).
+Backend jobs:
+- backend-linux on every push and pull request: Python 3.12, `pytest -n auto`, gridlytics-frontend checked out beside it with a read-only FRONTEND_READ_TOKEN;
+- backend-windows on a pull request into main, by hand and weekly;
+- audit: `pip-audit -r requirements.txt`;
+- licences: pip-licenses against the Part 14 allow-list;
+- bench (the 192-step 20 s gate) and image (the Dock
+V: git ls-tree on all remote branches: 0 .github, Dockerfile or CLAUDE.md files in the backend; 0 .github, vercel.json, CLAUDE.md or eslint files in the frontend. solarlytics-backend/.github/workflows/ci.yml has jobs backend-linux, backend-windows, audit and verification; solarlytics-frontend/.github/workflows/ci.yml has jobs frontend, frontend-windows, audit and browser. HANDOFF.md section 8.C: "Deployment: CI (DEP-01) ..." not built. EMS_BUILD_PLAN.md Part 10.9 and Part 11.5.
+===== parity-architecture-02 high backend Dockerfile, .dockerignore, .env.production.example, docs/DEPLOY.md (all missing)
+T: The API cannot be deployed as the family deploys: no Dockerfile, .dockerignore, .env.production.example, DEPLOY.md, compose or proxy notes, and 27 of the 31 server settings are documented nowhere
+A: None of these files exist. The only settings documented anywhere are GRIDLYTICS_SCHEDULER, DATA_DIR, DEMO_DAYS and DEMO_REPLAN_HOURS. Undocumented: AUTH_MODE, HOSTS, CORS_ORIGINS, CORS_ORIGIN_REGEX, LOCAL_JWT_SECRET, TRUST_PROXY, the founder four, the Supabase five, JWKS_TTL, MEMBERSHIP_TTL, JWT_AUDIENCE, the three RATE_* limits, DAILY_BACKUP, RESET_BACKUP, LOGS, DOCS, DB and WEB_DIST. A hosted start with GRIDLYTICS_HOSTS set and no LOCAL_JWT_SECRET is refused by identity.check_startup, and no document says why. The live API sends `server: uvicorn`. No backend host is chosen anywhere in the repositories.
+E: The image follows the Solarlytics S0b shape:
+- `python:3.12-slim-bookworm`, API only, the package and requirements pins only;
+- a non-root user, a /data volume holding platform.db, companies/, keys/, reports/, backup/ and logs/;
+- HEALTHCHECK on /api/health;
+- one uvicorn worker (one scheduler per data folder) with `--proxy-headers --no-server-header`;
+- a .dockerignore that leaves out data/, .scratch/, tests, .env* and demo/*.local.md.
+.env.production.example lists every setting with its defaul
+V: Undocumented-settings diff: 27 of 31. curl /api/health response headers include `server: uvicorn`. backend/gridlytics/identity.py:116-136 (check_startup). solarlytics-backend/Dockerfile (uid 10001, VOLUME /data, HEALTHCHECK, --proxy-headers --no-server-header), solarlytics-backend/.env.production.example, solarlytics-backend/docs/DEPLOY.md, solarlytics-backend/backend/tests/test_deploy_docs.py. EMS_BUILD_PLAN Part 10.1 (Dockerfile, .dockerignore, .env.production.example), Part 10.3 (every name i
+===== parity-architecture-03 medium frontend frontend/vercel.json (missing)
+T: No Vercel configuration: no frontend/vercel.json (SPA rewrite, CSP and security headers, asset caching) and no build-time deploy check, although the plan names Vercel as the web host
+A: There is no vercel.json, so a static Vite deploy answers 404 to any deep link or refresh outside "/". No CSP or frame headers are sent for the page (index.html has no meta CSP). Nothing checks the build's settings. BUILD_NOTES lists "a CI workflow and vercel.json" as not done.
+E: frontend/vercel.json in the Solarlytics F8 shape:
+- framework vite and `npm ci`;
+- a buildCommand that runs deploy_check before and after the build;
+- a rewrite of every non-asset path to /index.html;
+- headers: a Content-Security-Policy whose connect-src names the API host, X-Content-Type-Options, X-Frame-Options DENY, Referrer-Policy no-referrer, and immutable caching for /assets/*.
+deploy_check.mjs refuses a build whose VITE_AUTH_MODE is unset or unknown, whose API address is not https, whose
+V: gridlytics-frontend tracked files contain no vercel.json (`git ls-files`). docs/BUILD_NOTES.md:79-81 ("Not done or simplified ... a CI workflow and `vercel.json`"). solarlytics-frontend/frontend/vercel.json (rewrites `/((?!assets/|fonts/).*)`, CSP, nosniff, DENY, no-referrer, immutable assets); solarlytics-frontend/frontend/scripts/deploy_check.mjs. EMS_BUILD_PLAN Part 11.2 (".github/workflows/ci.yml, .nvmrc, vercel.json"), Part 2 deployment table ("Vercel (SPA rewrite)").
+===== parity-architecture-04 medium frontend frontend/src/app/env.ts
+T: env.ts throws away every build setting when one is invalid: VITE_AUTH_MODE=supabase, which the backend accepts, silently resets VITE_API_BASE_URL to '' so a hosted page calls /api on its own host
+A: safeParse fails on the enum, and env.ts falls back to the whole default object {VITE_API_BASE_URL:'', VITE_AUTH_MODE:'local'}, so API_BASE becomes '/api'. A Vercel build pointed at the API host would call its own origin (404 on Vercel) and post to /api/local/session, a route a supabase-mode server never mounts (api.py mounts routes_local only in local mode). Nothing warns.
+E: An invalid or unsupported setting stops the build with a sentence (Solarlytics' deploy_check.mjs refuses an unset or unknown VITE_AUTH_MODE). A valid VITE_API_BASE_URL is never discarded because a different variable failed. The backend and the web app agree on which sign-in modes exist: either the web app gains supabase mode, or the backend's supabase mode is documented as not usable with this web app.
+V: frontend/src/app/env.ts:7-17: `VITE_AUTH_MODE: z.enum(["local"])` and `export const env = parsed.success ? parsed.data : { VITE_API_BASE_URL: "", VITE_AUTH_MODE: "local" as const }`. Node reproduction with the repository's zod: `false {"VITE_API_BASE_URL":"","VITE_AUTH_MODE":"local"} API_BASE= /api`. backend api.py:530-532 (routes_local mounted only when identity.MODE == 'local'). solarlytics-frontend/frontend/scripts/deploy_check.mjs envProblems().
+===== parity-architecture-05 medium both backend/gridlytics/api.py
+T: Every scratch run writes its log into the owner's data folder: api.py logs beside GRIDLYTICS_DB's default (gridlytics-backend/data/logs), and the launcher's --scratch sets only GRIDLYTICS_DATA_DIR
+A: The scratch API (pid 183, port 8151) runs with GRIDLYTICS_DATA_DIR=.scratch/data and no GRIDLYTICS_DB. It holds gridlytics-backend/data/logs/gridlytics.log open. That file has 2,128 lines, was last written 9 Nov 12:26 by scratch requests, and holds the scratch run's 13 ERROR entries (7 tick failures, 6 unanswered requests). The scratch data folder has no logs/. Anyone debugging a scratch run must read the owner's folder, and the owner's real log gets mixed with test traffic.
+E: A scratch run writes nothing under gridlytics-backend/data (HANDOFF section 7: "Never delete, reseed or write test data into gridlytics-backend/data"). Its log goes to <scratch folder>/logs. Two ways to fix it, and both are worth doing:
+- api.py logs to platformdb.data_dir()/'logs' rather than store.DB_PATH.parent/'logs';
+- the launcher sets GRIDLYTICS_DB=<folder>/gridlytics.db together with GRIDLYTICS_DATA_DIR, as Solarlytics' launcher does (`env.update(SOLARLYTICS_DB=..., SOLARLYTICS_DATA_DIR=
+V: backend/gridlytics/api.py:34-44 (`_logs = store.DB_PATH.parent / "logs"`); store.py:24 (DB_PATH defaults to <repo>/data/gridlytics.db); backups.py:87 (daily_all always includes Path(store.DB_PATH)). gridlytics-frontend/scripts/start_local.py:248-266 (only GRIDLYTICS_DATA_DIR set). solarlytics-frontend/scripts/start_local.py:231-236 (sets both SOLARLYTICS_DB and SOLARLYTICS_DATA_DIR). Process check: `GRIDLYTICS_DATA_DIR=/home/user/saad-tahir/gridlytics-backend/.scratch/data`, open fd `/home/user/
+===== parity-architecture-06 medium backend backend/gridlytics/scheduler.py
+T: A failing 15-minute tick is invisible: the scheduler logs the exception and skips alerts.evaluate, and there is no plan_failed alert, no error webhook and no status figure, so a site can go hours without a plan while the page says 'first plan within 15 minutes'
+A: scheduler.tick_company catches the exception, logs "tick failed for site …" and continues, so alerts.evaluate is never reached. The plan_failed rule needs an attempt row that is never written. GET /api/alerts?site_id=… returns [] for both sites, and GET /plan returns {plan: null, held: null}. The page reads "No plan yet. The first plan arrives within 15 minutes, as a recommendation." with "Done" ticks, roughly 5 hours after the first failure. The only trace is in a log file, and that file is in the owner's data folder (see the logging finding). GRIDLYTICS_ERROR_WEBHOOK does not exist (Solarlytics api.py:191-212 has it).
+E: The family's observability (Solarlytics' SOLARLYTICS_ERROR_WEBHOOK; plan 10.3 lists _ERROR_WEBHOOK; DEP-05 asks for the rotating log, the error webhook, per-tick timings, a status endpoint and fallback-share figures in the founder console):
+- a tick exception writes a failed `runs` row and raises the site's plan_failed alert with the reason;
+- the error record is posted to the configured webhook;
+- the plan page says that planning is failing and why, instead of promising a plan in 15 minutes;
+- 
+V: backend/gridlytics/scheduler.py:20-35 (try: plans.tick ... alerts.evaluate; except: log.exception). alerts.py:125 (plan_failed needs latest_attempt). Log: "ERROR tick failed for site 1d0dfac8457a" at 08:00, 08:15, 12:15 and 12:30 with gridlytics.tariffs.NoTariffVersion. API: /api/alerts?site_id=1d0dfac8457a → []. Screenshot /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/arch-parity/owner-1440-sites_1d0dfac8457a_plan.png. grep shows no ERROR_WEBHOOK in backend/grid
+===== parity-architecture-07 medium both backend/gridlytics/identity.py (and the other lifted modules)
+T: The sign-in, tenancy and founder code is a hand copy of Solarlytics with no drift check: 8 backend modules are byte-identical after a rename and 7 differ by 2-59 lines, so a security fix in one product will not reach the other
+A: Lines changed after the rename:
+- 0: identity (345), platform (629), companies (386), routes_local (153), founder (317), routes_founder (412), mfa (99), version (42);
+- 2: backups; 8: jobs; 26: store_members; 32: seed_demo; 44: store_founder; 51: apikeys; 59: auth.
+About 2,400 lines are byte-identical and about 4,700 lines are copied in all. In the frontend, session.ts differs by 5 lines, authstate.ts by 7, local-auth.service.ts by 7 and founder.service.ts by 11. Nothing records or checks the relation beyond prose. Plan D3 chose "lift", which is fine for a first product but becomes a maintenance trap for a third.
+E: A family that shares its sign-in, tenancy and founder console keeps them in one place: an `onyxleaf-platform` Python package parameterised by env prefix, company header, key prefix and role table, and an `@onyxleaf/auth` TS package with the founder console, each consumed by version or tag. At minimum, a drift test (test_lift_drift.py and a TS equivalent) holds each lifted file to the upstream at the commit recorded in THIRD_PARTY_NOTICES (with the rename map), so a divergence is a recorded decis
+V: Rename-and-diff counts above (commands in steps). Upstream commits c853130 (solarlytics-backend HEAD) and d582a5f (solarlytics-frontend HEAD). gridlytics-backend/THIRD_PARTY_NOTICES.md ("Same owner; no licence obligation"); docs/DESIGN_LOG.md "The lift (Part 10.4)".
+===== parity-architecture-08 medium both THIRD_PARTY_NOTICES.md (both repos)
+T: Code derived from Boxlytics (another party) is not recorded in THIRD_PARTY_NOTICES or the DESIGN_LOG: the founder session-token format, the founder store and client, and the founder lists' search
+A: Both notices name only solarlytics-backend at c853130 and solarlytics-frontend at d582a5f. The Boxlytics origin appears only in code comments, so a reviewer of the notices would conclude that no Boxlytics construction is used. Plan Part 14 says of Boxlytics: "Patterns only, rewritten; no file copied. The hands-off rule stays."
+E: Both THIRD_PARTY_NOTICES.md files carry a section "Constructions from Boxlytics (another party)" listing each Gridlytics file, the Boxlytics path (supabase/functions/_shared/founder-auth.ts, src/stores/founderAdmin.store.ts, src/services/founderAdmin.service.ts), commit c429bef and the owner's decision of 24 October 2026 that allows it. DESIGN_LOG's first section records it, as plan 10.4 step 7 requires ("the owner confirms the second reuse"). The plain-sha256 founder hash (a Boxlytics compatibi
+V: backend/gridlytics/founder.py:14, 72-75, 130-137 (accepts Boxlytics' plain sha256 hash with a warning). frontend/src/features/ops/founder-admin.store.ts:3-4, founder.service.ts:3-7. gridlytics-backend/THIRD_PARTY_NOTICES.md, gridlytics-frontend/THIRD_PARTY_NOTICES.md. EMS_BUILD_PLAN.md Part 10.4 item 7, Part 14 table ("Boxlytics (another party's repository) | Private | Patterns only, rewritten; no file copied").
+===== parity-architecture-09 medium both backend/tests/sibling.py, frontend/src/test/sibling.ts (missing)
+T: No cross-repository contract tests (Solarlytics S0a sibling.py and sibling.ts): types, permissions, refusal codes and fixtures are copied by hand from the backend, and served fields are already missing from them
+A: Nothing reads the other repository; the API's types are hand-mirrored. Fixtures are a 6 Nov snapshot. Served fields absent from both types/api.ts and the fixtures:
+- `today.import_completeness` (now);
+- `steps[].genset_dump_kw`, `steps[].grid_charge_permitted`, `plan.summary.control_release` (plan).
+Typed but absent from the fixtures:
+- savings `final_conditions`, `days[].claim_withheld`, `baselines.*.import_unknown_days`;
+- site `tier_signoff`, `data.off_grid`;
+- plan `summary.solver.mip_gap`, `retry_of`, `slots[].charge_end`.
+backend/tests/conftest.py sets CORS settings "for the tests of CORS (test_hygiene)", but that test was never carried over (see the guard-tests finding).
+E: Solarlytics' S0a mechanism:
+- backend/tests/sibling.py (GRIDLYTICS_FRONTEND_DIR, else ../gridlytics-frontend; refuses a folder that also holds backend/gridlytics; GRIDLYTICS_SKIP_SIBLING=1 only on a developer's machine);
+- frontend/src/test/sibling.ts (GRIDLYTICS_BACKEND_DIR).
+Tests through them:
+- auth.PERMISSIONS keys equal the Permission union;
+- api.SIGN_IN_CODES equal the authstate table;
+- CORS_ALLOW_HEADERS cover every header lib/api sends;
+- the money suffixes match the viewer filter;
+- 
+V: Key-diff output: plan.json live-only includes 'plan.summary.control_release', 'plan.steps[].genset_dump_kw', 'plan.steps[].grid_charge_permitted'; savings.json live-only includes 'final_conditions', 'days[].claim_withheld'; site.json live-only includes 'tier_signoff'; now.json live-only includes 'today.import_completeness'. grep counts in types/api.ts: import_completeness 0, genset_dump_kw 0, grid_charge_permitted 0, control_release 0. frontend/src/test/fixtures/index.ts:2 ("Real answers of the 
+===== parity-architecture-10 medium backend backend/tests/conftest.py
+T: The lifted request guard has no tests: Solarlytics' test_hygiene, test_signin_guard, test_deploy_docs, test_seed_demo and test_role_walk were not carried over, so host, CORS, JSON-only, body-limit and security-header behaviour is unpinned
+A: None of these files exist in Gridlytics. The guard works today (I checked live: Host evil.example → 400; cross-site preflight → 400; nosniff, DENY, no-referrer and CSP present), but a refactor of api.py could drop any of it with the suite still green. conftest.py configures CORS origins for "test_hygiene", which does not exist, and still skips 7 lifted tests by name.
+E: The plan 10.4 step 5 carry-over:
+- test_hygiene's first five or more, with the security headers;
+- test_signin_guard less the share links;
+- test_deploy_docs once DEPLOY.md exists;
+- test_seed_demo;
+- test_role_walk;
+- the 7 skipped lifted tests re-aimed. This includes test_two_companies_resolve_in_isolation, the only two-company isolation test.
+The guard is the security boundary of a hosted product, so each of its rules has a regression test.
+V: backend/tests listing (conftest, identities, test_api_walk, test_companies, test_engine, test_fix_*, test_founder, test_identity, test_platform, test_public_data). conftest.py: "The web app served from another origin, and its preview origins, for the tests of CORS (test_hygiene)". _SOLARLYTICS_ONLY set (7 names). solarlytics-backend/backend/tests/test_hygiene.py:15-79. curl results: `-H 'Host: evil.example'` → 400.
+===== parity-architecture-11 medium backend backend/gridlytics/reports.py
+T: The data folder cannot be moved to another machine or volume: report files and per-site signing keys are stored by absolute path in the company database, and keys/ and reports/ are outside every backup
+A: reports.pdf_path and csv_path hold '/home/user/saad-tahir/gridlytics-backend/.scratch/data/reports/<company>/<id>.pdf', and site_keys.private_path holds '/home/user/.../.scratch/data/keys/<company>/<site>-<kid>.pem'. After a move every stored report download fails. delivery._site_key then finds no file and silently generates and inserts a new key without retiring the old one, so an edge that pinned the old key would reject plans. backups.daily_all copies only the database files.
+E: Files inside the data folder are stored relative to it and resolved through platform.data_dir(), as the lifted platform does for companies (`companies/<id>.db` derived from the data folder; an absolute db_file only for tests). The backups and the founder console's copies include keys/ and reports/, or the keys are kept in the company database. A missing key is an alert and a refusal to sign, never a silent new key.
+V: sqlite (read-only) on .scratch/data/companies/6321e32a-...db:
+- ('energy_only', '/home/user/saad-tahir/gridlytics-backend/.scratch/data/reports/6321e32a-.../73b1eb259388.pdf');
+- site_keys 6d4db49bf87e → '/home/user/saad-tahir/gridlytics-backend/.scratch/data/keys/6321e32a-.../6d4db49bf87e-da97af5e.pem'.
+Code: reports.py:174-182, 223-226; delivery.py:248-272; backups.py:82-100; platform.py:250-255 (the portable convention). The signing-key half is also reported by the engine-delivery reviewer; t
+===== parity-architecture-12 medium backend backend/gridlytics/version.py
+T: Plans, savings days and reports do not record the engine version that computed them (Solarlytics PS-27), and version.py's lifted docstring describes PDF footers and modules that do not exist
+A: The stamp exists only as a response header. A savings figure recomputed after a code change cannot be told apart from one computed before it. version.py's docstring is Solarlytics' verbatim: it says the pages print "Printed with Gridlytics <stamp>" on every PDF, mentions a calculation package's Engine row, climate.json and the `market` module, and none of these exist in Gridlytics.
+E: As Solarlytics does ("A calculation package's Engine row carries the stored result's own version"), every stored plan, savings day, bill rebuild and report records version.stamp() at compute time. The monthly savings PDF and CSV print it in the footer, so a saving shown to a customer, and the fee based on it, can be traced to the code that made it. The docstring describes Gridlytics.
+V: backend/gridlytics/version.py:1-15. store.py:164-200 (table definitions). reports.py has no stamp (only 'Native capture version' at line 159). solarlytics-backend/backend/solarlytics/version.py (the same text, true there).
+===== parity-architecture-13 medium backend .gitignore
+T: The backend .gitignore does not ignore .env, .env.production, .env.founder or platform.secret outside data/, and the launcher reads .env.founder from the backend root as a fallback
+A: .env, .env.production, .env.founder, backend/.env and platform.secret are all NOT ignored; only data/ and demo/DEMO_ACCOUNTS.local.md are. For the owner's data folder (gridlytics-backend/data), founder_file() also reads <data>/../.env.founder, which is gridlytics-backend/.env.founder. That file would hold the founder's password hash, TOTP secret and session secret, and `git add -A` would commit it.
+E: The same rules as solarlytics-backend/.gitignore: `.env`, `.env.*`, `!.env*.example`, `data/platform.secret` and `demo/*.local.md`. Any secret file a developer may create following the family's DEPLOY.md ("copy .env.production.example to .env.production") or the launcher's fallback location is ignored, with a check-ignore test (Solarlytics stage Z).
+V: check-ignore output: `.env NOT-ignored`, `.env.production NOT-ignored`, `.env.founder NOT-ignored`, `backend/.env NOT-ignored`, `platform.secret NOT-ignored`. gridlytics-backend/.gitignore (data/, .scratch/, __pycache__/, *.pyc, .pytest_cache/, demo/DEMO_ACCOUNTS.local.md, release/, *.egg-info/). start_local.py:152-157 (`for p in (folder / FOUNDER_FILE, folder.parent / FOUNDER_FILE)`).
+===== parity-architecture-14 medium both CLAUDE.md (missing)
+T: No CLAUDE.md in either Gridlytics repository, although the family is built and maintained by Claude Code sessions and Solarlytics (both repositories) and Boxlytics carry one
+A: These rules live only in HANDOFF.md section 7 and the traps in section 9, which a session does not load by itself. .claude/launch.json hard-codes the Windows venv path `../gridlytics-backend/.scratch/venv/Scripts/python.exe`, so the preview configuration fails on Linux or macOS (here the venv is .scratch/venv/bin/python).
+E: A short CLAUDE.md per repository (plan 10.1 lists it), loaded by every agent session. It states:
+- which Python to use (.scratch/venv);
+- never write to gridlytics-backend/data, and use --scratch on ports 8151 and 5295;
+- work on a branch, never push to main or v1-build, never merge;
+- origin is the only remote;
+- clean-room rules and no GPL or AGPL code; Boxlytics is another party's, so record every reuse;
+- never print accounts-file secrets;
+- read only through sibling helpers;
+- LF line endin
+V: git ls-tree on all branches: 0 CLAUDE.md in both repositories. gridlytics-frontend/.claude/launch.json. solarlytics-backend/CLAUDE.md ("Never delete or reseed data/solarlytics.db ... Work on a branch. Never merge ..."). EMS_BUILD_PLAN Part 10.1 root files ("CHANGELOG.md CLAUDE.md README.md").
+===== parity-architecture-15 medium both docs/ (backend)
+T: The docs set does not match the family's: no CHANGELOG, ACCOUNTS, TROUBLESHOOTING, DEPLOY, PRODUCT_BRIEF, EQUATIONS, ASSUMPTIONS, TEST_MATRIX or OWNER_CHECKLIST; the plan and tracker are only on an unmerged branch; README figures are stale
+A: The backend docs hold only DESIGN_LOG.md, and there is no CHANGELOG in either repository even though both carry version 0.1.0. The plan, tracker and requirements are on origin/docs/plan-package (790c883, 40 files) and not on v1-build, so a fresh clone of v1-build has no acceptance tracker. The backend README says "423 passed and 7 skipped on 7 November"; HANDOFF says 495 and 7. The developer handoff sits at the backend root as HANDOFF.md, where Solarlytics uses docs/BUILD_HANDOFF.md plus HANDOFF_NEXT.md, so the family has three naming schemes. There is no RUN_LOCALLY-style page; HANDOFF section 3 covers it.
+E: Plan 10.8, in the Solarlytics shape:
+- backend docs: PRODUCT_BRIEF, EQUATIONS (MILP rows, tariff rules, fuel and wear curves, with [verify] marks), ASSUMPTIONS, COMPETITORS, DESIGN_LOG, TEST_MATRIX, GATES, ACCOUNTS, TROUBLESHOOTING (a flowchart R1..Rn), DEPLOY, OWNER_CHECKLIST, HANDOFF_NEXT, CHANGELOG.md at 0.1.0;
+- the build plan, handoff and tracker kept in the repository;
+- web docs: CONVENTIONS, plus ACCOUNTS and TROUBLESHOOTING identical to the backend's and pinned equal by a sibling test;
+
+V: `git ls-files` outputs above. gridlytics-backend/README.md 'Tests' (423 passed) vs HANDOFF.md section 2 (495 passed). origin/docs/plan-package diff: docs/plan/build-plan/EMS_BUILD_PLAN.md, EMS_BUILD_PROGRESS.md and others. EMS_BUILD_PLAN Part 10.8 and DOC-01, DOC-07. HANDOFF 8.C: "the documentation set (DOC-02, DOC-04 to DOC-07)".
+===== parity-architecture-16 medium backend scripts/ (missing)
+T: No scripts/ folder: the founder console tells the founder to run scripts/restore_backup.py, which does not exist, and GRIDLYTICS_WEB_DIST and the ignored release/ folder point at a release build that has no script
+A: None exist. In a data-loss incident the founder console's only instruction ("To restore one, stop the server and run scripts/restore_backup.py with its name") leads nowhere. backups.restore() exists but no entry point calls it, and it restores only the workspace file. The release path that api.py supports cannot be built.
+E: Plan 10.1 scripts/:
+- restore_backup.py, which restores both files of a company plus its keys and reports, with the app stopped, and is tested;
+- build_release.py, which packs the API with a local-mode web build served through GRIDLYTICS_WEB_DIST;
+- load_check.py, fetch_tariffs.py, fetch_schedules.py and export_contract.py.
+Every command the UI or the docs name exists and is tested.
+V: founder-backups.tsx:52-53; routes_founder.py:269-270 ("Restoring stays a step by hand on the server (stop it, scripts/restore_backup.py)"); backups.py:127-140; api.py:535-547; solarlytics-backend/scripts/restore_backup.py. The missing restore script is also reported by the founder-console reviewer; the release, load and contract scripts are new.
+===== parity-architecture-17 medium frontend frontend/package.json
+T: The three products run on three frontend toolchains with no shared UI package, so Boxlytics' components cannot be reused: React 18 + Vite 5 + plain CSS, React 19 + Vite 7 + Tailwind 3 + shadcn, and React 19.3 + Vite 8 + Tailwind 4 + custom Radix
+A: No component, token or config file can be shared between any two products. Gridlytics' tokens use different names and hex values (the visual-parity reviewers list the visible differences). react-hook-form, required by plan 11.1 and 11.4, is not used, and BUILD_NOTES does not record that, although it does record eslint, msw and Playwright as not done.
+E: One family baseline. Gridlytics' React 19, Vite and Tailwind 4 with vitest is the most current and the closest to Boxlytics. A shared `@onyxleaf/ui` package carries the tokens in Boxlytics' shadcn names (background, foreground, primary, muted, border, radius) through Tailwind 4 @theme, plus the Radix wrappers (Button variants, Card, Dialog, Tabs, Tooltip, Field) and cn(). Gridlytics consumes it and adds its energy-source colours. Solarlytics migrates later. Forms follow plan 11.4 (react-hook-for
+V: package.json of all three products (versions above). boxlytics-main/tailwind.config.js:10-40 (shadcn semantic colours). gridlytics-frontend/frontend/src/styles/index.css:7-45 (@theme hex tokens). gridlytics-frontend/frontend/src/features/sites/onboarding/site-form.ts (zod only). EMS_BUILD_PLAN D12 ("Stay on Vite 7, Tailwind 3 ... to match Boxlytics exactly" was the alternative), Part 11.1, 11.4.
+===== parity-architecture-18 low frontend frontend/package.json
+T: No lint or format gate: no eslint flat config, no prettier, no lint, format:check or coverage threshold scripts; Boxlytics runs eslint with react-hooks rules and plan 11.5 requires all three
+A: Only tsc and source-rules.test.ts guard the code, so hook-dependency mistakes and formatting drift are unchecked. BUILD_NOTES records "eslint and prettier (source rules are a vitest test instead)" as not done. Solarlytics has no lint either, so only Boxlytics has the gate.
+E: Plan 11.5:
+- `lint --max-warnings 0` with eslint 9 flat config, typescript-eslint, react-hooks (exhaustive-deps) and import ordering;
+- prettier 3 with the Tailwind plugin and a `format:check`;
+- coverage with a threshold starting at 60 % of lines;
+- all three inside `npm run gates` and CI.
+The source-rules test stays as a complement.
+V: frontend/package.json scripts; docs/BUILD_NOTES.md:79-81; boxlytics-main/eslint.config.js; EMS_BUILD_PLAN Part 11.5 ("Scripts: ... lint --max-warnings 0, format, format:check, test (vitest with coverage) ... a coverage threshold starting at 60 percent").
+===== parity-architecture-19 low both requirements.txt
+T: Unused runtime dependencies are pinned and declared as shipped: pandas in the backend, date-fns and @radix-ui/react-popover in the web app
+A: requirements.txt pins pandas==3.0.2, a large wheel that would go into the image and the pip-audit surface, and THIRD_PARTY_NOTICES lists "pandas (BSD)" as a runtime dependency. package.json lists date-fns 4.4.0 and @radix-ui/react-popover 1.3.1, and the frontend notice lists both as "in the shipped web app".
+E: Only what the code imports is a dependency (plan 11.3: "unused dependencies" are among the Boxlytics faults to leave behind). Solarlytics' test_requirements_w2 pins "every package the app imports is pinned", and the converse ("every pinned package is imported") would catch this. The notices list what ships.
+V: Import counts per dependency in frontend/src: date-fns 0, @radix-ui/react-popover 0. Import list of backend/gridlytics: no pandas. requirements.txt line 'pandas==3.0.2'. gridlytics-backend/THIRD_PARTY_NOTICES.md 'Runtime dependencies'. gridlytics-frontend/THIRD_PARTY_NOTICES.md 'Open-source packages in the shipped web app'.
+===== parity-architecture-20 low backend requirements.txt
+T: The sign-in stack's pins differ from Solarlytics', where the identical lifted modules were last tested, and no dependency scan runs
+A: Gridlytics pins vs Solarlytics:
+- fastapi 0.141.1 vs 0.150.0
+- starlette 1.6.0 vs 1.7.0
+- uvicorn 0.52.3 vs 0.54.0
+- pydantic 2.13.4 vs 2.13.5
+- PyJWT 2.10.1 vs 2.15.1
+- cryptography 46.0.3 vs 50.0.2
+- pytest 8.4.2 vs 9.1.1
+- test HTTP client: httpx 0.28.1 vs httpx2 2.13.1
+The Gridlytics pins say "read on 6 November", yet they are older than Solarlytics' pins of 20 and 25 October. No pip-audit has run (there is no CI).
+E: One family pin set for the shared stack: fastapi, starlette, pydantic, uvicorn, PyJWT, cryptography and the test client. It is updated in both products together with pip-audit in CI, so the byte-identical identity, founder and mfa modules run on the versions their tests passed with. The solver pair (scipy 1.17.1 and numpy 2.4.3) stays held as plan 10.7 decides, with that reason in the requirements comment.
+V: gridlytics-backend/requirements.txt and requirements-dev.txt; installed venv versions match those pins (pip list). solarlytics-backend/requirements.txt ("PyJWT==2.15.1, cryptography==50.0.2 ... at the versions its tests passed with on 25 October 2026").
+===== parity-architecture-21 low frontend .gitignore
+T: The web repository's .gitignore does not ignore Python caches, so running the launcher's tests leaves scripts/__pycache__ and scripts/tests/__pycache__ untracked
+A: `git status --short` shows `?? scripts/__pycache__/` and `?? scripts/tests/__pycache__/`, which a `git add -A` would commit.
+E: `__pycache__/`, `*.pyc` and `.pytest_cache/` are ignored, as solarlytics-frontend/.gitignore does.
+V: gridlytics-frontend/.gitignore (node_modules/, dist/, coverage/, .env, .env.*, !.env.example, .scratch/, *.log, .vite/, *.tsbuildinfo). git status output above. solarlytics-frontend/.gitignore lines __pycache__/, .pytest_cache/, *.pyc.
+===== parity-architecture-22 low backend verification/, bench/ (missing)
+T: No verification/ or bench/ folder: the family's independent-check harness (Solarlytics verification/ with its own requirements and weekly CI job) and the plan's 192-step benchmark gate are absent
+A: Neither folder exists, and the only engine checks are the in-suite invariants and goldens in test_engine.py. HANDOFF 8.C lists VER-05, VER-06, VER-07 and DEP-02 as open, so the gap is known, but it is not yet scheduled as the family's verification shape.
+E: Plan 10.1:
+- verification/: a replay against python-microgrid (LGPL, unmodified, never imported by the product) and the REopt-style reference case, with its own requirements.txt and a weekly CI job;
+- bench/: the MILP benchmark, with backtests and a REPORT regenerated by --update.
+This matters most because plan quality is known to depend on CPU load (HANDOFF 8.A.3), which a bench gate would catch.
+V: Repository listing. solarlytics-backend/verification/* and .github/workflows/ci.yml job 'verification'. EMS_BUILD_PLAN Part 10.1 ('verification/', 'bench/', 'contracts/ems-edge/1.0/'). HANDOFF.md 8.A.3 and 8.C.
+===== parity-architecture-23 low both frontend/src/features/pilot/switchback-rules.ts
+T: An engine rule is re-implemented in the browser and already disagrees with the server: the pilot page demands 6 days on each arm, while verify.switchback_result needs 6 days in total
+A: switchback-rules.ts adds the check "At least 6 days on each arm for a result" (ok only if plan ≥ 6 and native ≥ 6). For the 3+3 calendar the server allows, the tab status becomes "error" (pilot-page.tsx:41) and Review lists it as failing. verify.switchback_result computes a result once the calendar has 6 days in total with both arms present (`if len(set(arms)) < 2 or len(y) < 6: result None`).
+E: Solarlytics stage IP: every rule the engine applies is answered by the server, and the browser only shows the words. The server returns its own checks for the calendar, and a test keeps engine rules out of frontend/src. The page and the server can then never disagree about whether a calendar will produce a result.
+V: frontend/src/features/pilot/switchback-rules.ts:50 (`ok: a.plan >= 6 && a.native >= 6`); calendar-tab.tsx:40; review-tab.tsx:53; pilot-page.tsx:41. backend/gridlytics/verify.py:1216. routes_savings.py:86-89. solarlytics-backend/docs/split/IP.md ("Every computation of item 28 is answered by the server; the browser keeps only the words and the display").
+===== parity-supabase-auth-01 medium backend backend/gridlytics/platform.py
+T: A session started in the same second as a password reset survives it for up to an hour (and one from the second of a disable comes back on re-enable)
+A: 3 of 3 same-second trials: the old access token answers 200 after the reset; only its refresh token is revoked (401). The control (1.2 s gap) gives 401. A token from the second of a disable answers 401 while disabled but 200 again after re-enable. Cause: sessions_from is int(time) and the check is `iat < sessions_from` (platform.py:342, :354, :365), so a token with iat equal to that second passes. An attacker who knows a password and signs in every ~150 ms (one PBKDF2 each) almost always holds a token minted in the reset's second, and keeps an hour of access after the owner resets the password. The same code is in solarlytics-backend platform.py:342/354/365.
+E: Every access token made before the reset (or the disable) is refused at once (401 session_ended). The plan (Part 2.8) and platform.py's own docstring say 'a password change or a disable ... refuses older tokens at once'.
+V: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/supa-auth/t4.out: '0 same second sign-in done 0.16s, reset done 0.23s old access -> 200 old refresh -> 401' (x3); 'control sign-in 1.2 s before reset old access -> 401'; 'disable same second while disabled -> 401 after re-enable -> 200'. Code: backend/gridlytics/platform.py:342 `iat < found["sessions_from"]`, :354 `int(_clock())`; identity.issue_local iat in whole seconds (identity.py:199). Fix: compare against a sess
+===== parity-supabase-auth-02 medium both frontend/src/features/auth/login-page.tsx
+T: 'Forgotten your password? Ask your company's administrator' sends people to someone who cannot reset a password, clear a lockout or change a name or email
+A: The hint names the company administrator (login-page.tsx:71), but an admin has no path. PUT /api/users refuses password, name and email with 'The name, the email address and the password are kept by the sign-in service: change them in My account' (api.py:476). My account changes only the caller's own password, so another member's name or email can be changed nowhere; the email cannot be changed even by the founder (PATCH /api/founder/users accepts only disabled and name). POST /api/users/{id}/password gives 404. A person locked out or with a forgotten password has no route except an unstated email to OnyxLeaf.
+E: Under Solarlytics' model, only the founder (OnyxLeaf) issues and resets passwords, and its login page says 'Forgotten your password? Ask us for a new one' (solarlytics-frontend pages/auth/Login.tsx:69). Or, per the Gridlytics plan (EMS_BUILD_PLAN.md line 736), the company admin issues a one-time password with a forced change and can clear a lockout, and the hint names the admin. Either the words or the feature must hold.
+V: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/supa-auth/t6.out (owner of AUDIT Tenancy A): PUT ['name'] / ['password'] / ['email'] -> 422 'kept by the sign-in service: change them in My account'; POST /api/users/{id}/password -> 404. Files: gridlytics-frontend/frontend/src/features/auth/login-page.tsx:71; gridlytics-frontend/frontend/src/features/org/account-page.tsx (read-only name and email); backend/gridlytics/api.py:476; backend/gridlytics/routes_founder.py:3
+===== parity-supabase-auth-03 medium backend backend/gridlytics/store_founder.py
+T: No supabase/ folder: Solarlytics' SQL (preflight, migration, rollback) and its owner checklist were never ported, though the code and plan reference them
+A: Nothing was ported, and DESIGN_LOG's lift section (lines 244-257) does not record dropping it.
+
+The lifted code expects the schema anyway:
+- companies._project_context calls rpc/get_my_context;
+- store_founder._Project writes `companies` and `company_memberships` through PostgREST with the service-role key.
+
+So GRIDLYTICS_AUTH_MODE=supabase would meet a project with no matching tables or functions. None of Boxlytics' Google, sign-up, invites or onboarding should come with it; the owner's rule matches Solarlytics' checklist exactly.
+E: Plan Part 10.1 ('supabase/ SQL for review only (copied from Solarlytics and renamed), for supabase mode later'), U2 lines 90 and 338, and decision D3 ('Supabase mode's SQL ships for review only') all require the port.
+
+The port: grid_000_preflight.sql, grid_001_accounts_and_companies.sql and grid_001_rollback.sql. grid_001 holds:
+- profiles, the handle_new_user trigger, touch_updated_at and memberships_stamp_activated;
+- companies, and company_memberships with the one-owner index;
+- is_active_me
+V: `find gridlytics-backend -name '*.sql'` gives nothing; backend/gridlytics/store_founder.py:7-8 ('PostgREST for its `companies` and `company_memberships` (supabase/migrations)'); companies.py:115-216 (the supabase-mode context); plan .scratch/plan/docs/plan/build-plan/EMS_BUILD_PLAN.md:789; research/U2-backends.md:90, 125 (test_supabase_sql.py, 484 lines), 338; solarlytics-backend/supabase/README.md sections 2-9.
+===== parity-supabase-auth-04 medium both frontend/src/app/env.ts
+T: Supabase mode is half-lifted: the backend carries it, but the web app is local-only, so GRIDLYTICS_AUTH_MODE=supabase leaves no way to sign in
+A: Only the backend half exists:
+- identity.py, companies.py and store_founder.py are identical to Solarlytics, including JWKS verification and the Admin API.
+- The web app can only post /api/local/session, which a supabase-mode backend does not mount, so every sign-in fails.
+- .env.example says 'Only "local" ... is built today'.
+
+Neither DESIGN_LOG nor HANDOFF section 8 lists this as a deviation or as open work. PLT-11 ('Supabase sign-in mode live', later) covers making a project live, not omitting the carried mode.
+E: As in Solarlytics, where the mode is optional and owner-applied (U2 line 594: 'The EMS can carry the mode unused, as Solarlytics does'). The web app gets:
+- services/supabase.client.ts, made on first use, with detectSessionInUrl only on /reset-password;
+- auth.service.ts makeSupabaseAuth: signInWithPassword, getSession and refreshSession, signOut({scope:'local'}), changePassword re-checking the current password, rpc('get_my_context');
+- pages/auth/ResetPassword.tsx with watchRecovery and the rou
+V: gridlytics-frontend/frontend/src/app/env.ts:9; gridlytics-frontend/.env.example ('Only "local" ... is built today'); gridlytics-frontend/frontend/src/test/source-rules.test.ts:35-37; backend/gridlytics/api.py:530; solarlytics-frontend/frontend/src/services/supabase.client.ts, services/auth.service.ts, pages/auth/ResetPassword.tsx, main.tsx:58, .env.example; solarlytics-frontend/frontend/tests/supabaseauth.test.ts.
+===== parity-supabase-auth-05 low backend backend/gridlytics/api.py
+T: Members list drops Solarlytics' supabase branch: in supabase mode nobody who has not signed in yet is listed, so an admin cannot set a role ahead
+A: In supabase mode platform.db holds no memberships (the founder console writes them to the project), so `_not_seen()` returns [] and PUT /api/users/{id} for a person not seen yet answers 404 'No such user'. Neither `_project_members` nor its tests were carried, and DESIGN_LOG does not mention it.
+E: In supabase mode the project's memberships are listed, as Solarlytics does. That is what lets an admin give a role before a member's first sign-in, and it is covered by solarlytics test_members_b4b.py:369-470.
+V: backend/gridlytics/api.py:426-429 (`_not_seen()` reads platformdb.company_members); `grep -rn '_project_members\|company_list_members' backend/` finds nothing; solarlytics-backend/backend/solarlytics/api.py:4935-4990; solarlytics-backend/backend/tests/test_members_b4b.py:369-470.
+===== parity-supabase-auth-06 medium both .env.production.example
+T: No .env.production.example, DEPLOY.md or test_deploy_docs.py: about 30 GRIDLYTICS_* settings are documented nowhere, though the tracker marks PLT-02 done
+A: The backend reads GRIDLYTICS_AUTH_MODE, the Supabase names, the founder names, MEMBERSHIP_TTL, JWKS_TTL, RATE_USER, RATE_ADDRESS, RATE_PUBLIC and more, with no example file and no deploy guide. Nothing tells a deployer that the service-role key is server-only or that the founder console answers 503 until all four founder secrets are set. The tracker's PLT-02 [x] is not true of the repository, and HANDOFF section 8 lists Docker and DEPLOY as open but not the env example.
+E: Plan 10.3: 'Every name appears in .env.production.example first, enforced by the lifted test_deploy_docs.py scan.' That covers:
+- GRIDLYTICS_AUTH_MODE and _LOCAL_JWT_SECRET;
+- the Supabase five: _SUPABASE_URL, _SUPABASE_ANON_KEY, _SUPABASE_SERVICE_ROLE_KEY (server only), _SUPABASE_JWT_SECRET, _JWT_AUDIENCE, plus _JWKS_TTL and _MEMBERSHIP_TTL;
+- the founder four;
+- _HOSTS, _CORS_*, _TRUST_PROXY and the RATE_* limits;
+- the EMS's own settings.
+
+Secrets are written as NAME= and defaults commented, 
+V: `grep -rhoE 'GRIDLYTICS_[A-Z_]+' backend/gridlytics/*.py | sort -u` lists 30 names. Not found: gridlytics-backend/.env.production.example, docs/DEPLOY.md, backend/tests/test_deploy_docs.py. The tracker line is .scratch/plan/docs/plan/build-plan/EMS_BUILD_PROGRESS.md:40. Compare solarlytics-backend/.env.production.example:9-35 and gridlytics-frontend/.env.example (VITE_API_BASE_URL and VITE_AUTH_MODE only).
+===== parity-supabase-auth-07 low backend .gitignore
+T: Backend .gitignore does not ignore .env files, so a root .env holding the service-role key or founder secrets would be committed
+A: The ignore list is data/, .scratch/, caches, demo/DEMO_ACCOUNTS.local.md, release/ and *.egg-info only. git check-ignore reports nothing for .env, .env.founder or .env.production, so a deployer's .env with GRIDLYTICS_SUPABASE_SERVICE_ROLE_KEY or GRIDLYTICS_FOUNDER_* would be staged by `git add -A`.
+E: As in solarlytics-backend, solarlytics-frontend and gridlytics-frontend: `.env`, `.env.*` and `!.env*.example` (U2 line 270).
+V: gridlytics-backend/.gitignore (8 lines); `git check-ignore -v .env .env.founder .env.production` prints nothing. Compare solarlytics-backend/.gitignore:7-9 and gridlytics-frontend/.gitignore:4-6.
+===== parity-supabase-auth-08 low backend backend/gridlytics/auth.py
+T: Sign-in throttling is about 200 times looser than Supabase's defaults: 1,200 tries a minute per address, about 50 ms of PBKDF2 each, no per-account cap across addresses
+A: All 65 attempts got 401, none 429. Sequential: 52 ms median each. Concurrent: 0.86 s median and 1.55 s max latency, so the single API process saturates.
+- RATE_PUBLIC is 1,200 a minute per address (auth.py:79-80).
+- Unknown-email tries are not recorded.
+- The lock is per (email, address) only (platform.lock_wait), so one address can try 4 passwords per account per 15 minutes across every account, and many addresses are unlimited per account.
+- PBKDF2 runs 200,000 rounds (auth.py:52), below OWASP's 600,000 for PBKDF2-SHA256 [recalled].
+E: Throttling comparable to the Supabase Auth mode the owner may switch to: about 30 sign-in requests per 5 minutes per IP by default [recalled]. Also a cap per account across addresses, so the lock cannot be stepped around, and an unauthenticated flood that cannot buy unbounded hashing.
+V: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/supa-auth/t5.out: 'sequential unknown-email sign-ins: n=25 codes {401: 25} median latency 0.052 s'; 'concurrent (20 at a time) n=40 codes {401: 40} median 0.86 s, max 1.55 s'. Code: backend/gridlytics/auth.py:52, 79-80; routes_local.py:76-99; platform.py:564-578.
+===== parity-supabase-auth-09 low backend backend/gridlytics/companies.py
+T: A suspended or pending membership is told 'You are not a member of that company'
+A: Both states give 403 not_a_member, 'You are not a member of that company in Gridlytics; choose one of yours', because companies._counted drops non-active memberships before _choose. A person with only that company falls through to no_company and the not-set-up page.
+E: A sentence that names the state and who can change it, e.g. 'Your membership of B is suspended; ask its owner or OnyxLeaf'. Boxlytics keeps 'suspended' and 'pending' as states of their own.
+V: /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/audit/supa-auth/t2.out: '3 B suspended, header B: 403 ... not_a_member'; '3b B pending, header B: 403 ... not_a_member'. Code: backend/gridlytics/companies.py:231-258 (identical in Solarlytics).
+===== parity-supabase-auth-10 low backend THIRD_PARTY_NOTICES.md
+T: The reuse of Boxlytics code (founder token format, sha256 founder hash) is not recorded with path and commit as the rules and the plan ask
+A: THIRD_PARTY_NOTICES lists only solarlytics-backend@c853130. DESIGN_LOG mentions only that 'the founder password accepts Boxlytics' plain sha256 with a warning, as the lifted code did'. No path or commit is recorded for the founder-auth.ts port, and there is no owner confirmation. The provenance is visible only in a module docstring.
+E: Plan Part 10.4 step 7 and U2 line 600: record in DESIGN_LOG's first section the founder token format's origin in Boxlytics' supabase/functions/_shared/founder-auth.ts at c429bef. This is a second reuse of another party's code, which the owner confirms. Each reused Boxlytics file is listed with its path and commit, as the project rules require. Gridlytics never had a Boxlytics founder hash to migrate, so the unsalted sha256 acceptance 'for parity' could be dropped.
+V: backend/gridlytics/founder.py:5-17; THIRD_PARTY_NOTICES.md:3-6; docs/DESIGN_LOG.md:246-250; plan EMS_BUILD_PLAN.md (10.4 step 7); research/U2-backends.md:600.
+===== performance-live-01 high backend None
+T: Plan rows are never pruned and each stores about 130 KB of JSON: the workspace file grows about 12.5 MB per site per day (4.6 GB per site-year), copied daily x14, and plan-history reads slow down linearly
+A: Every 15-minute plan keeps its full steps JSON: 644 B per step x 192 steps, with the keys repeated in every step.
+- Today: plans are 69.72 MB of the 70.6 MB file (528 rows; avg steps 126,084 B, slots 3,602 B, summary 1,107 B).
+- Growth: 96 plans per site per day x about 131 KB = about 12.5 MB per site per day, 4.6 GB per site-year, about 228 GB per year at 50 sites, all in one company file.
+- backups.daily_all copies that file every day and keeps 14 copies (KEEP=14): at 50 sites a 250 GB disk fills in about a month.
+- Synthetic file: 2,500 / 5,000 / 10,000 plans (26 / 52 / 104 days) = 328 / 656 / 1,311 MB.
+- plans.active_at took 12.9 / 28.7 / 51.5 ms. Its query uses the (site_id, generated_at) index, then sorts by belief_time ('USE TEMP B-TREE FOR ORDER BY'), so it scans the site's whole history: about 180 ms per call at a year.
+- active_at is called up to 16 times per tick per advisory 
+E: Spec Part 3.3 retention (EMS_BUILD_PLAN.md line 278): steps and slots of superseded plans are kept 90 days, then only for the first plan of each hour, the plan active at each step and applied plans. File growth is bounded, and plan reads do not grow with history length.
+V: dbstat: plans 69.72 MB / 528 rows; companies/backup holds 51.5 MB and 59.9 MB daily copies.
+plans_growth.py output: {plans:10000, file_mb:1311, active_at_ms:51.5, report_month_plan_ids_ms:432.9}.
+Code: plans.py:455-467 (insert, no prune); plans.py:603-622 (active_at); alerts.py:91-92 and 132; routes_telemetry.py:323; reports.py:152; backups.py:26,86-87.
+Spec: line 278. Tracker: DAT-09 is [~].
+===== performance-live-02 medium both None
+T: Every site page polls /now every 30 s only for its header, and /now re-reads 30 days of 1-minute data (battery.state) on each call: the API caps at about 7 /now requests per second
+A: Each open site tab costs 0.13-0.22 s of the single API worker every 30 s. The battery page computes battery.state twice per refresh (/now and /battery).
+- Throughput: 1 caller 7.5 req/s; 8 callers 7.3 req/s with p50 0.68 s, p95 2.96 s, max 4.3 s.
+- For the 27-day site: 4.7 req/s, p95 3.45 s, max 5.1 s.
+- So about 140-220 open site tabs saturate the worker before any other work.
+- In page loads, /now took 0.30-0.37 s while the page's other calls ran.
+E: The header's control state and last-data stamp come from a couple of indexed reads (milliseconds). The battery estimate is computed once per minute or per tick and cached, not on every request.
+V: perf-live/routes-owner.json; concurrency output ('/api/sites/6d4db49bf87e/now threads=8 n=91 rps=7.3 p50=0.680 p95=2.964').
+Code: routes_sites.py:398-424 (battery.state at 414); battery.py:21; telemetry.py:362-374 (raw) and 377-400 (minute_grid); routes_telemetry.py:281.
+===== performance-live-03 medium backend None
+T: Every telemetry read takes the telemetry file's write lock (BEGIN IMMEDIATE), so all reads and writes of a company's telemetry run one at a time
+A: Thread B's 0.2 ms read waited 1.233 s behind A. The plain WAL read (C) took 0.000 s.
+- export_csv formats the whole CSV inside the lock (telemetry.py:583-591): the 32-day export (4.5 MB) holds it for 0.47 s.
+- /now, charts, battery reads, the tick's forecast reads, CSV ingest and every edge batch therefore queue on one lock. A holder longer than busy_timeout (30 s) makes the others fail with 'database is locked'.
+- During the upload, the telemetry route peaked at 1.26 s against 0.82 s for the route that reads no telemetry.
+E: Readers use deferred (read) transactions: in WAL mode they never wait for each other or for a writer. Only writers take BEGIN IMMEDIATE.
+V: In-process result: {'C_plain_wal_read': 0.0, 'A': 1.373, 'B_latest_wait': 1.233}.
+perf-live/lockwatch-60d.json.
+Code: telemetry.py:102-113, 350-353, 362-366, 583-591.
+===== performance-live-04 medium backend None
+T: A 23.5 MB CSV upload takes 14 s, raises the API process's memory by 544 MB (23x the file) and stalls other users' requests to about 1 s
+A: 200 after 14.16 s.
+- API RSS went from 212 MB to a 756 MB peak, and was still 357 MB afterwards.
+- /alerts/counts (8 ms when idle) took 0.98, 1.06, 0.89, 0.74 and 0.44 s during the parse: pure Python holding the GIL in the single worker.
+- Three concurrent uploads at the 25 MB limit would add about 1.6 GB.
+- Cause: routes_telemetry.py:66-114 decodes and parses the whole file for the date-window check. telemetry.import_csv then decodes it again into a list of 230k dicts (telemetry.py:283-305) before ingest, and aggregates every day.
+- A year of 1-minute data (about 54 MB at 102 B per row) needs 3 or more files because of MAX_BODY 25 MB (api.py:100).
+E: Bounded memory and a streamed or chunked parse (spec Part 2.8: untrusted CSV parsed with size and time caps). Other users' requests are unaffected.
+V: perf-live/upload-160d.json: {seconds:14.16, rows:230400, rss_before_mb:212, rss_peak_mb:756, rss_after_mb:357, other_requests_max_s:1.058}.
+Code: routes_telemetry.py:66-114, 124-131 and 146-170; telemetry.py:273-330.
+===== performance-live-05 medium backend None
+T: Re-solve, resume and savings recompute run the solver inside the HTTP request: 3.6 s measured, up to 30 s for a solve, and up to 62 five-second solves for one recompute
+A: The solve answered after 3.59 s (solve_seconds 3.517; 3,071 variables; 766 binaries). The same site's scheduled solve took 6.91 s at 12:30 on an idle machine.
+- The code allows three 10 s limits per tick, so up to 30 s or more per click.
+- /savings/recompute runs a perfect-foresight MILP per day (verify.py:801, time_limit 5 s): 14 days took 3.4-4.6 s per demo site (0.25-0.33 s per day). The allowed 62 days is about 15-20 s, and about 5 minutes worst case, in one request. Behind a 60 s proxy timeout it fails while the work continues.
+- The solve releases the GIL: other requests stayed at 34 ms or less during it.
+E: Work that can take seconds runs as a job: answer 202, then the page polls (jobs.py, lifted with progress and cancel, is unused). Or it is bounded well under a proxy's read timeout.
+V: Live answer {'status': 'active', 'plan_id': 'f552fb48573c', 'solve_seconds': 3.517} after 3.59 s; runs row 9df495def65d at the 12:30 tick: solve_s 6.905.
+Copy timings: 'Karachi savings recompute 14 days 4.645 s'.
+Code: routes_plans.py:76-89, 187-200; routes_savings.py:46-56; verify.py:801, 987-994; jobs.py (no caller).
+===== performance-live-06 medium backend None
+T: Telemetry file sizing: forecast issues store the full 48-hour quantile JSON each hour forever (about 240 MB per site-year, 4x the 1-minute data), and minute rows are never pruned
+A: Size now:
+- forecast_issues 15.0 MB (1,572 rows) against minute 11.17 MB (94,251 rows).
+- Per issue: PV about 10.1 KB, load about 12.9 KB, outage about 4.3 KB = 27.3 KB per site per belief time.
+- Every issue is kept for 3 days, then the hourly ones are kept forever.
+- Minute rows are 118.5 B (twin) to 134.9 B (17-column CSV), with no prune and no Parquet export (DAT-07 not started).
+
+Extrapolated:
+- Forecasts about 240 MB per site-year; minute rows 62-71 MB per site-year.
+- About 0.3 GB per site-year in total: 15 GB per year at 50 sites, about 300 GB per year at 1,000 sites (5x the spec's estimate).
+- Plus 14 daily backup copies (companies/backup already holds 21.3 MB and 23.3 MB telemetry copies).
+E: Spec Part 3.3: 1-minute rows 13 months in SQLite, then Parquet (DAT-07). Its sizing estimates about 57 GB of hot telemetry at 1,000 sites.
+V: dbstat before the upload: forecast_issues 15.00 MB, minute 11.17 MB.
+After uploading 230,400 rows: minute 42.25 MB, i.e. +31.08 MB, 134.9 B per row.
+Per-kind sums: e.g. 6d4db49bf87e load 125 issues 1.61 MB, pv 1.26 MB, outage 0.54 MB.
+Code: telemetry.py:600-607.
+Spec: EMS_BUILD_PLAN.md lines 274 and 278.
+Tracker: DAT-07 [ ], DAT-09 [~].
+===== performance-live-07 medium backend None
+T: A --scratch run writes its API log (and probably the default database's daily copy) into the owner's data/ folder
+A: data/logs/gridlytics.log was modified at 2026-11-09 12:26:55 UTC while only the scratch app was running (231 KB). The scratch run's tick and solve log is therefore in the protected folder; I did not read it, per the audit rules.
+
+backups.daily_all also copies Path(store.DB_PATH) every day (backups.py:86-87). That is code reading only: I did not check it on disk.
+E: A scratch run writes only inside its data folder (the launcher's own promise: '--scratch runs on a throwaway folder'). The API log sits beside the data folder, where the tick and solve log can be read.
+V: stat: '2026-11-09 12:26:55.157429287 +0000 231064'.
+Code: api.py:35-41; store.py:24; backups.py:82-96; gridlytics-frontend/scripts/start_local.py:136-137, 253-266.
+===== performance-live-08 low both None
+T: The app shell polls the full /fleet answer on every page each minute only to fill the site switcher: about 4 ms per site (about 0.4 s at the 100-site gate), and the slowest call in page loads
+A: fleet_row (routes_sites.py:82-95) costs 3.5-4.2 ms per site: telemetry.latest, first_ts, plans.current (parses the 126 KB steps JSON for next_event), _mtd_saving, connections, control_state.
+- Each new SQLite connection re-runs PRAGMA journal_mode and user_version (store.py:237-246): 148 connections took 29 of 63 ms in the profile.
+- 8 callers: 8.5 req/s, p50 0.87 s, p95 1.22 s.
+- In 110 page loads, /fleet was the slowest API call at 300-420 ms on most site pages.
+- About 0.4 s per call per tab per minute at the 100-site performance gate (DEP-02).
+E: The shell reads a light list (GET /api/sites answers in 7 ms). The full fleet summary is computed only on /fleet. Each request reuses a connection instead of opening about 8 per site.
+V: pp-owner-dev.json slowApi entries such as '415ms /api/fleet' on /sites/6d4db49bf87e/battery.
+concurrency: '/api/fleet threads=8 n=107 rps=8.5 p50=0.869 p95=1.217'.
+cProfile: 18 fleet_row calls 0.063 s, 148 store.connect.
+===== performance-live-09 low backend None
+T: Tick timing cannot be observed: no tick or per-site duration is logged, and a manual re-solve overwrites the scheduled run's row
+A: runs has primary key (site_id, tick), and both the scheduler and the solve route write it with INSERT OR REPLACE (plans.py:440, 466), so a re-solve in the same quarter erases the tick's timing. This made the 07:45 and 08:00 ticks look 841 s and 397 s long.
+
+Sites whose tick raises leave no run row at all: 1d0dfac8457a and 70492545d4ec raise NoTariffVersion every tick.
+
+No duration is logged anywhere.
+E: Each scheduled tick records its own start, end and per-site durations, separately from manual re-solves, and logs a line per tick. Failed sites are recorded too.
+V: Runs rows: ('6132568cd101','2026-11-09T07:59:21+00:00',...,0.011) in tick 07:45; ('2026-11-09T12:15:00+00:00', 10, '12:15:20', '12:22:06').
+Audit row: ('2026-11-09T07:59:21+00:00','Demo Owner','re-solved the plan','6132568cd101').
+prof_tick1.log errors for the two failing sites.
+===== performance-live-10 low backend None
+T: API answers are not compressed: the plan page fetches 173 KB of JSON that gzip makes about 14 KB
+A: Raw vs gzip:
+- /plan 117,377 B vs 10,456 B; /overview/chart 63,002 vs 6,589.
+- /telemetry 24 h 61,664 vs 13,821; 30 d 72,031 vs 19,939.
+- /plans 41,448 vs 3,026; /audit 73,975 vs 4,708; export.csv 14 d 2,209,935 vs 407,928.
+
+On the emulated phone, the plan page took 2.5 s (173 KB of API JSON, about 0.8 s of it transfer) and the overview took 2.9 s.
+E: Text answers are gzip-compressed (Starlette GZipMiddleware with a minimum size, or the reverse proxy; DEP-06 is not built).
+V: perf-live/pp-prod-phone.json: '/sites/6d4db49bf87e/plan idle 2503 ms apiKB=173'.
+api.py has no GZip middleware (grep).
+===== performance-live-11 low backend None
+T: The 15-minute tick runs every site of every company in one thread inside the API process; its per-site cost grows with history and a genset site may take three 10 s limits
+A: Live ticks: 12:15 took 8 s, 12:30 took 10 s (10 sites each). At 12:30 the AUDIT farm alone solved in 6.91 s on an idle machine (3.5-3.6 s in other runs; limit 10 s).
+
+Copy profile: 12 sites in 8.8 s. Each demo site costs 0.8-0.93 s:
+- forecast.issue 0.26-0.38 s
+- battery.state x2 0.23-0.31 s (reads 30 days, so this doubles as data ages)
+- build_problem 0.14-0.29 s
+- alerts.evaluate 0.12-0.17 s
+- solve 0.03-0.30 s
+At a year of plans, alerts' active_at adds about 3 s per advisory site.
+
+One thread uses one core, whatever the machine. With max_instances=1 and coalesce, an overrun skips the next quarter.
+
+During the 12:15 tick, /now rose to 0.36 s (baseline p50 0.137 s) and /fleet to 0.49 s (0.07 s).
+E: A tick's length is bounded well under the quarter and does not grow with history. The documented ~90 sites per core holds, or the solves move to workers.
+V: Runs: tick 12:30 10 sites 12:30:20-12:30:30, 9df495def65d solve_s 6.905.
+prof_tick1.log 'TOTAL 8.77'.
+Code: scheduler.py:19-35, 64-67 (docstring: 'at about 90 sites per core the solves move to workers'); optimise.py comment 'A tick stays within three limits'.
+HANDOFF.md:262 (plan quality depends on CPU load).
+===== performance-live-12 low frontend None
+T: Two chart libraries are shipped: the fleet landing page loads Recharts only for 84 x 24 px spark bars, and the battery page loads Recharts and ECharts
+A: Recharts: CartesianChart 287,561 B (85 KB gz) + BarChart 20,513 B + YAxis 66,067 B (17 KB gz). ECharts: echarts-setup 680,451 B (224 KB gz).
+- /fleet requests BarChart and CartesianChart only for SparkBars (components/charts/spark-bars.tsx:1).
+- /battery requests BarChart, CartesianChart, YAxis, ReferenceLine and echarts-setup (battery-charts.tsx:6-7).
+- The spec (EMS_BUILD_PLAN.md line 888) chose both libraries, so this is by design.
+E: One charting library, or Recharts loaded only where its charts are needed. A sparkline can be a few lines of SVG.
+V: gzip table: 'echarts-setup 680451 223951', 'CartesianChart 287561 85291'.
+chunks.cjs: /fleet [... 'BarChart', 'CartesianChart' ...]; /sites/6d4db49bf87e/battery [... 'YAxis:17KB', 'echarts-setup:220KB'].
+===== performance-live-13 low backend None
+T: Telemetry chart series exceed the spec's cap of about 2,000 points (2,880 points for 2 days at 1 minute and 2,881 for 30 days at 15 minutes)
+A: 2 d: 1m, 2,880 points. 7 d: 15m, 673. 14 d: 15m, 1,345. 30 d: 15m, 2,881 (135 KB raw for 5 series). 32 d: 1h, 769. 60 d: 1h, 1,441. 90 d: 1h, 2,161.
+E: Spec Part 9 (line 888) and the telemetry.py row (line 804): every dense series downsampled by the API to about 2,000 points.
+V: Script output '2 days 1m 2880', '30 days 15m 2881'.
+Code: routes_telemetry.py:23-31.
+===== tests-and-perf-01 high backend backend/gridlytics/routes_telemetry.py
+T: GET /api/sites/{id}/events returns fuel-log rupees (cost_rs) to viewers and API keys; the money tests never look there
+A: events() (routes_telemetry.py:187-192) has no auth.need and no out(). It returns json.loads(detail) unfiltered. GET /genset/fuel wraps the same rows in out(), and its docstring says cost_rs is money a viewer must not see. test_fix_r3_api.py:441 checks only /genset/fuel. test_api_walk.py lists /events in PAGES but checks only the status code.
+E: Every answer that can carry money goes through out()/money.for_reader (plan Part 10.5). Viewers and API keys get no money field: money.for_reader strips everything for a key.
+V: routes_telemetry.py:187-192 returns [{**dict(r), "detail": json.loads(r["detail"])}] with no out(). Line 394 inserts the fuel_log detail with cost_rs. Line 370 applies out() only on /genset/fuel. test_api_walk.py:63-73 covers only plan, fleet, savings, genset and site.
+===== tests-and-perf-02 medium backend backend/tests/test_api_walk.py
+T: The money-filter test is not the every-route walk Part 10.5 requires; money.py cites a test_role_walk.py that does not exist
+A: Only /plan, /fleet, /savings, /genset and /sites/{id} are checked, for c_imp, cost_rs, saving_rs, objective_rs, levers, mtd_saving_rs, c_fuel, replacement_cost_per_kwh and fuel_cost_rs. The test does not use money.is_money and covers no keys and no exports. The other 28 GET routes in PAGES are checked for status 200 only. The /events leak (the previous finding) passes the whole suite.
+E: Plan Part 10.5 (EMS_BUILD_PLAN.md:860): test_role_walk.py compares the admin's and the viewer's answer to every route and fails on any shared money value. The money.py docstring (line 5) says that test exists. It should also cover API keys and the CSV/PDF exports.
+V: money.py:5 mentions test_role_walk.py, but grep finds it only in .scratch/plan. test_api_walk.py:63-73. EMS_BUILD_PLAN.md:833 and 860.
+===== tests-and-perf-03 medium backend backend/tests/test_fix_tariffs.py
+T: No hand-worked golden bill exists, although TAR-06 and TAR-02 are ticked; every bill test compares the engine with itself
+A: The tracker marks TAR-06 and TAR-02 [x] (EMS_BUILD_PROGRESS.md:63, 67), but no test pins any rebuilt total_rs or line item to a hand-computed value. A systematic error shared by rebuild() and vectors() passes every test, for example a wrong GST or adder rate, fixed-charge proration or the export credit gross-up, because the tests are self-consistency checks.
+E: Plan Part 6.3 (EMS_BUILD_PLAN.md:555) and TAR-06's acceptance ask for four hand-worked bills in test docstrings, matched to the paisa: a B-2(b) ICP month across the Nov-Dec window change, A-2(c) net billing with export credit and GST, legacy net metering, and A-3 flat. TAR-02 asks for a hand-worked golden per regime.
+V: EMS_BUILD_PLAN.md:555 says 'a fixture produced by the engine is not a golden'. The tests in test_fix_tariffs.py and test_engine.py compare one call of the engine with another.
+===== tests-and-perf-04 medium backend backend/gridlytics/telemetry.py
+T: Every telemetry read takes SQLite's write lock (BEGIN IMMEDIATE), so the company's readers and edge writers queue behind each other
+A: Every read holds the one write slot of the company's telemetry file for its fetch. Ticks (about 4 months of minutes per site), the fleet page (latest + first_ts per site, so 2N lock round trips), page polls and edge ingest all run one at a time. A CSV import's single executemany blocks all of them.
+E: In WAL mode, readers use deferred or autocommit reads and run concurrently. Only writes (write_rows, next_seq, delete) take BEGIN IMMEDIATE.
+V: telemetry.py:101-112 (connect with BEGIN IMMEDIATE) and :82 (busy_timeout 30000). Scale: with 1 site this is unnoticeable. With 50 sites in one company file, every tick's reads, every 30-s /now poll and every edge minute-batch go through one lock at a time.
+===== tests-and-perf-05 medium backend backend/gridlytics/routes_telemetry.py
+T: The telemetry series route lets any role request 400 days at 1-minute resolution, a multi-megabyte JSON answer built in Python
+A: The route accepts any res with a span of up to 400 days (lines 27-31), and series() honours an explicit res (telemetry.py:438-440). The request builds about 576,000 buckets × 24 series as Python lists (tens of MB of JSON), runs for seconds and holds the telemetry write lock during the fetch. No permission is needed.
+E: telemetry.series's own docstring says a request 'never returns more than about 3,000 points'. An explicit resolution should be capped or downgraded so that span/step stays within a few thousand buckets. Plan Part 11 asks for about 2,000 points.
+V: routes_telemetry.py:22-32 checks only t1 - t0 > 400*86400. telemetry.py:436-459 uses auto only when res == 'auto'.
+===== tests-and-perf-06 medium backend backend/gridlytics/plans.py
+T: The plans table grows about 13 MB a day per site with no retention; SELECT * readers pull those blobs; plan_messages has no index
+A: Growth is about 4.5 GB per site-year in the workspace file, and backups.py keeps 14 daily copies of it.
+Readers that load the blobs:
+- plans.history (582-585) SELECT * loads 30 plans' steps for a list that drops them; plan-history.tsx polls every 5 min.
+- fleet_row calls plans.current, a full 130 KB parse per site, on every 60-s AppShell fleet poll.
+forecast_issues keeps hourly issues forever (telemetry.py:606-607).
+E: Keep the summary and drop or compress the steps and slots of superseded plans after N days. Index plan_messages(site_id, sent_at) and acks(site_id, received_at). Select only the columns a reader needs.
+V: plans.py:461-465 insert. store.py:168-169 (indexes). routes_plans.py:142. routes_edge.py:427. routes_sites.py:82-96. backups.py:26 KEEP = 14. Scale: 1 site is about 4.5 GB a year (plus 14 copies); 50 sites about 225 GB a year.
+===== tests-and-perf-07 medium backend backend/gridlytics/plans.py
+T: plans.active_at is called in loops (per genset run, per peak quarter, per outage); each call sorts all of a site's plans and parses a full plan
+A: Cost is O(runs × plans per site). After 14 days a site has about 1.3k plans; after a year about 35k. The farm's genset page (about 40 runs) then sorts 35k rows 40 times and parses 40 plans every minute per open tab, and ticks add up to 16 more calls per advisory site.
+E: Fetch the plans covering the range once per request. Add an index on (site_id, belief_time). Read only the step needed.
+V: plans.py:603-622. store.py:168 has only plans_site(site_id, generated_at). routes_telemetry.py:321-325. alerts.py:91-95 and 131-133.
+===== tests-and-perf-08 medium backend backend/gridlytics/sites.py
+T: native_latest uses SELECT * and so reads the native-capture photo (up to 7 MB) on every sites.full(): every tick and nearly every site page
+A: Each of those requests reads the photo's overflow pages and allocates a multi-MB Python string, only to throw it away.
+E: Select explicit columns and compute has_photo with length(photo) > 0. Load the photo only on the route that serves it.
+V: sites.py:427-435 (SELECT * ... d.pop('photo')). sites.py:335. routes_common.full_or_404. routes_plans.py:148.
+===== tests-and-perf-09 medium both backend/gridlytics/telemetry.py
+T: Each tick re-reads about 4 months of 1-minute rows per site, all 17 columns, converted cell by cell in Python; /now re-reads 30 days on every 30-s header poll
+A: About 126 overlapping days × 1,440 rows × 17 columns per site per tick. A micro-benchmark of one 30-day read (43,200 × 17, in memory, plain tuples) took 0.11 s to fetch and 0.05 s to convert, so about 0.7 s per site per tick before any solve, all under the telemetry write lock.
+Scale:
+- 1 site: negligible;
+- 50 sites: about 35 s of every 15-minute tick;
+- 90 sites (scheduler.py's stated per-core limit): about 60 s.
+Each open site tab adds a 30-day read every 30 s.
+E: Read only the columns a caller needs (forecast.outage needs only grid_present). Read the history window once per tick and share it between forecasters. Cache or incrementally update the battery state instead of rescanning 30 days per page poll.
+V: telemetry.py:362-375 (per-column list comprehensions) and :377-400 (minute_grid always reads COLUMNS[3:] plus censored). forecast.py:76, 200, 330, 388. plans.py:63, 98. battery.py:21. routes_sites.py:414. frontend use-meta.ts:43-45.
+===== tests-and-perf-10 medium backend backend/gridlytics/routes_sites.py
+T: The overview's 'today' figures freeze for live (edge) sites: GET /now writes today's day row once and nothing refreshes it until the next night
+A: The aggregate_day callers are:
+- demo.py:235 and 361 (demo sites only);
+- scheduler.nightly (yesterday only, scheduler.py:49);
+- import_csv (uploaded days);
+- this route, only when the row is missing.
+For an edge site the overview tiles 'Grid import today', 'Solar today', 'Peak demand today' and 'Outage today' (overview-page.tsx:188-191), the month sums (routes_sites.py:415-420) and the savings page's energy totals (routes_savings.py:24-28) stay at the first view's values until 00:40. The row is also written without peak_flags, so peak_import_kwh is missing.
+E: Today's import, solar, peak and outage figures track the latest telemetry. Either compute today on the fly or re-aggregate when the stored row is older than the last minute.
+V: routes_sites.py:404-409. grep aggregate_day: demo.py:235, 361; routes_sites.py:409; scheduler.py:49; telemetry.py:337. No test covers /now for a non-demo site.
+===== tests-and-perf-11 medium backend backend/gridlytics/routes_savings.py
+T: POST /savings/recompute runs up to 62 days of replays and MILP bound solves synchronously inside one HTTP request
+A: About 30 days take 30 s to several minutes in one sync handler, with no rate limit. Proxies may time out, and clicking again starts another run. The CPU it burns degrades the concurrent ticks' time-limited plans (HANDOFF trap 1, 8.A.3).
+E: The work runs as a background job with progress (jobs.py already provides the pattern), one at a time per site, at low priority next to the scheduler's wall-clock-limited ticks.
+V: routes_savings.py:46-56. verify.py:987-994 (compute_range) and 771-805 (_bound's 5 s solve). frontend savings-actions.tsx:28-52.
+===== tests-and-perf-12 medium backend backend/tests/test_fix_r2_optimiser.py
+T: Three optimiser tests assert wall-clock times or 'optimal within 10 s' under -n 4 (HANDOFF trap 6); they will flake on CI or a loaded machine
+A: The results depend on wall-clock time and parallel load. No xdist_group or serial marker exists. This is the same root cause as the product issue in HANDOFF 8.A.3, and it will make CI (DEP-01) red at random.
+E: Quality assertions (gap, no dodged shed, runs on the hour) that do not depend on CPU speed. Either use a deterministic budget (scipy milp's node_limit option) or mark these serial or slow and run them alone. Keep the relative timing check (sum(secs) < 1.8 × ref) only where both runs share the machine.
+V: test_fix_r2_optimiser.py:286-292. test_fix_r3_optimiser.py:112. test_fix_r5_genset.py:89 and 105. optimise.py:65-66 passes only time_limit and mip_rel_gap.
+===== tests-and-perf-13 medium backend backend/gridlytics/scheduler.py
+T: The scheduler's tick and nightly jobs are never executed by any test
+A: The code that runs the product every 15 minutes and every night has no coverage: the use_company per file, the per-site exception isolation, the order aggregate → compute_day → alerts.nightly, and APScheduler's max_instances/coalesce settings. A regression there would show up only in production.
+E: A test with two companies and a few sites each (one raising) that calls tick_company and nightly_company. It should assert:
+- the plans, runs and savings_days rows land in each company's own file;
+- the failing site does not stop the others;
+- a demo site advances before its tick;
+- 'yesterday' is the PKT day;
+- aggregate_day gets the peak mask.
+DLV-09 asks for a scheduler test with 50 twins.
+V: scheduler.py:19-52 and 66-73. No import of gridlytics.scheduler in backend/tests. EMS_BUILD_PROGRESS.md:193 (DLV-09 [ ]).
+===== tests-and-perf-14 medium backend backend/tests/conftest.py
+T: No test checks company isolation on the EMS routes; the only two-company isolation test is one of the 7 skipped lifted tests
+A: Cross-company access to sites, telemetry, plans and signing keys is untested. The per-company keys folder (delivery._key_dir) and the ContextVar company selection have no regression guard.
+E: A re-aimed isolation test, as the 'tracked follow-up' in DESIGN_LOG ('Lifted tests') promises. A member of A gets 404 for B's site ids across the site routes. A's edge key is refused on B's site path. A's telemetry and keys/ files are never opened for B.
+V: conftest.py:104-114. test_companies.py:372-396. test_api_walk.py:85-99 covers only same-company cross-site keys.
+===== tests-and-perf-15 medium backend backend/tests/test_engine.py
+T: The Part 7.4 contract test suite does not exist, although DAT-03 and DLV-03 are ticked on it; per-brand Mode A grammar is tested only as slot counts
+A: DAT-03 is [x] on 'Contract tests 1 and 8; a batch a minute from 50 twins costs no platform.db read' and DLV-03 is [x] on 'Contract tests 2 and 3', yet neither suite exists. No test checks that a brand receives only modes it can express, or that the compiled table keeps the plan's saving per brand.
+E: EMS_BUILD_PLAN.md:608 describes the suite: schema validation of every message; signature replay and foreign-site rejection; the plan lifecycle; 'Mode A grammar per brand'; budgets ('the fifth table write is refused'); link loss; 30 days of telemetry. DLV-01's acceptance asks for grammar tests per brand and at least 80 % of the plan's saving kept by the compiled table, per brand.
+V: EMS_BUILD_PLAN.md:608. EMS_BUILD_PROGRESS.md:88, 185, 187. delivery.py:28-43 and 95-195. test_fix_r4_optimiser.py:255-258.
+===== tests-and-perf-16 low frontend frontend/src/app/env.ts
+T: Full zod (69.5 kB gzip) is in the eager bundle only to parse two environment variables
+A: About 32 % of the roughly 215 kB gzip loaded before the first page (index 124 kB, zod chunk 69.5 kB, format 12 kB, others) is zod. This matters on the 375 px phone flow over Pakistani mobile links.
+E: Plain parsing (or zod/mini) in env.ts. Full zod stays in the lazily loaded onboarding form (site-form.ts).
+V: dist/assets sizes measured with gzip -c | wc -c. env.ts:5-15. vite modulepreload list in dist/index.html.
+===== tests-and-perf-17 low frontend frontend/src/components/charts/echarts-setup.ts
+T: The 680 kB ECharts chunk registers six modules nothing uses, and the size warning is switched off
+A: echarts-setup-*.js is 680,451 B raw and 224,489 B gzip. The Fleet landing page also pulls recharts (CartesianChart 287 kB raw, about 85 kB gzip, plus BarChart) only for 7-bar sparklines (spark-bars.tsx). Fleet → Overview downloads both chart libraries, about 310 kB gzip.
+E: Register only LineChart, BarChart and the components used. Keep the default warning so growth is seen. GATES should record the chunk sizes.
+V: echarts-setup.ts:2-13. vite.config.ts build.chunkSizeWarningLimit = 1200. dist/assets listing. fleet-page.tsx:10, 172.
+===== tests-and-perf-18 low frontend frontend/src/test/fixtures/index.ts
+T: Web-app fixtures predate rounds 3-5 and the role map is hard-coded, so page tests do not follow the API they claim to mirror
+A: Tests for the newer fields (plan-round5, settings-round4, savings-unmetered) hand-add them to old fixtures. A page that breaks on the real current shape can pass. A change to the backend permission map will not show up in the UI role tests.
+E: Fixtures re-captured after each API change, or a contract check that compares the fixtures' keys with a live or sibling-read backend answer through tests/sibling.ts. metaFor is derived from fx.meta.
+V: fixtures/index.ts:1-4. The grep found 0 files for each of the 7 fields. render.tsx metaFor BY map. backend auth.py:22-43.
+===== tests-and-perf-19 low frontend frontend/src/features/sites/onboarding/new-site-page.test.tsx
+T: Onboarding: no test drives tab D, the Review tab or POST /activate
+A: The wizard's last half and the first-use activation path are untested in both repos.
+E: One test that fills A to D, reaches Review, sees the readiness checks, calls POST /sites/:id/activate and lands on the site. A backend test of the activation gate for a grid-connected site (its connection and battery requirements).
+V: new-site-page.test.tsx:28-100 (5 tests). onboarding/tab-d-control.tsx and tab-review.tsx have no test. routes_sites.py:178-193.
+===== tests-and-perf-20 low backend backend/tests/test_fix_r5_api.py
+T: Some tests check constants or compatibility shims rather than behaviour
+A: These tests stay green whatever the real CORS answer is. The fallback tests keep dead code alive and mask held_info failures.
+E: An OPTIONS preflight with Origin and Access-Control-Request-Headers: Idempotency-Key, asserting the response header. Remove the transitional shims and their 'fallback' parametrisations so tests cover the code that runs.
+V: test_fix_r5_api.py:30-31. routes_plans.py:43-52. test_fix_r3_api.py:211-217 and 547-552.
+===== tests-and-perf-21 low backend backend/gridlytics/scheduler.py
+T: The 15-minute tick runs every company and site one after another in one thread; an overrun silently skips the next tick
+A: A typical farm-type site takes about 2-12 s per tick (reads plus solve). At about 75 such sites a tick passes 900 s, and APScheduler drops the next run with only a log line, so sites are planned every 30 minutes. Late sites in the list get their plan minutes after the quarter starts. Nothing measures or alerts on this.
+E: Spread the solves over a worker pool (the docstring's own plan at about 90 sites per core; DLV-09 staggering). Record tick duration and raise an alert when a tick overruns or a site's last_tick is older than 30 minutes.
+V: scheduler.py:19-35 and 66-73. The scheduler.py docstring mentions 'about 90 sites per core'. EMS_BUILD_PROGRESS.md:193 (DLV-09 [ ]).
+===== tests-and-perf-22 low backend backend/gridlytics/api.py
+T: Large JSON answers are sent uncompressed (/plan about 140 kB; /overview/chart every 60 s)
+A: On a 1 Mbps mobile link one /plan takes about 1 s, and each site tab keeps re-downloading roughly 100 kB a minute.
+E: GZipMiddleware(minimum_size=1000), which typically cuts this JSON by 5-8×. Trim the chart answer to the fields the chart draws.
+V: api.py:376-378. plans.py:_steps_out (33 keys per step). routes_sites.py:427-442.
+===== tests-and-perf-23 low backend backend/gridlytics/routes_telemetry.py
+T: A CSV upload is read whole and parsed twice into Python dicts, then written in one locking transaction; the 30 MB check can never trigger
+A: Peak memory is several hundred MB per upload, and two uploads double it. Every telemetry reader of the company (ticks, pages, edge) waits for the whole write. import_csv's 'larger than 30 MB' refusal (telemetry.py:280) is dead, because the 25 MB body limit refuses first.
+E: Stream or chunk the parse, parse once, write in batches of about a day so readers are not starved, and give one size limit that actually applies.
+V: routes_telemetry.py:66-110 and 146-170. telemetry.py:270-340 and 280. api.py:100.
+===== tests-and-perf-24 low backend backend/gridlytics/forecast.py
+T: The outage forecaster's announced-window outputs (p_start, dur_steps, g) and its prior shrinkage are untested
+A: These outputs drive the optimiser's outage reserve, but an off-by-one or a sign error in them (forecast.py:367-385) would pass the suite.
+E: Unit tests that, for a schedule with a 14:00-16:00 window:
+- p_start at the step before the window equals the adherence;
+- dur_steps covers the window;
+- g = 0 only when adherence > 0.9;
+- unscheduled hazard follows the DISCO prior with no history and moves toward the counts after 28 days.
+V: forecast.py:318-412. No assertion on o['p_start'], o['dur_steps'] or o['g'] for scheduled windows in backend/tests.
+===== tests-and-perf-25 low backend backend/gridlytics/tariffs.py
+T: Every tariff lookup first re-checks that the shipped library is seeded, costing an extra connection and a full key scan
+A: About 2 extra queries and 1 extra connection per lookup, which multiplies through ticks, the prices page, nightly savings and peak_mask calls in loops. Each costs little on its own.
+E: Seed once per company file and process, for example with a flag cached per db_path or a schema-version step, not on every lookup.
+V: tariffs.py:44-55, 80, 92, 228, 296, 316, 376.

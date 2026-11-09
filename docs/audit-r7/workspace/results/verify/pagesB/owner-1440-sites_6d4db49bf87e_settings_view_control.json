@@ -1,0 +1,55 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/6d4db49bf87e/settings?view=control",
+  "url": "http://127.0.0.1:5295/sites/6d4db49bf87e/settings?view=control",
+  "signedIn": true,
+  "loadMs": 2250,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Faisalabad textile mill (demo)",
+    "H2: Site settings",
+    "H2: Control tier",
+    "H2: Mode and limits"
+  ],
+  "buttons": [
+    "Faisalabad textile mill (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "General",
+    "Assets",
+    "Tariff",
+    "Control tier",
+    "Native settings",
+    "Notifications",
+    "Remove",
+    "Change the tier",
+    "Save the changes"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 3 Reports SITE Faisalabad textile mill (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Advisory (slot tables) Administrator 3 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Faisalabad textile mill (demo) Site settings Faisalabad textile mill (demo) DEMO Advisory (slot tables) Following plan (table applied) Faisalabad FESCO · B-2(b) Last data: 6 min ago Site settings General Assets Tariff Control tier Native settings Notifications Remove Control tier The effective tier is the lower of what the data source supports and what an administrator allows. Running at Advisory (slot tables) Allowed by an administrator Advisory (slot tables) The data source supports Closed loop Allowed tier set to Advisory (slot tables) by demo seed on 8 Nov 2026, 19:40 (Karachi time). Installer sign-off: demo Allowed tier Monitor (recommendation only) The plan reads as a recommendation; nothing is written to the inverter. Advisory (slot tables) The plan is written as a daily slot table in the inverter's own layout, keyed in by a person and marked as applied. Closed loop The edge device writes the plan and reads it back, within its write budget; hold, release and resume are available. Change the tier Mode and limits This is a demo site: its figures are illustrative and regenerated nightly. Control mode Advisory: the plan as recommendations and requests Mode A: a daily slot table keyed into the inverter Mode B: set-points written by the edge device What the tier allows decides whether anything is written; the mode says how. Cycle cap (full cycles a day) PRELIMINARY Reserve when an outage is this likely (%) PRELIMINARY Above this chance of an outage in the next hours, the plan keeps energy back for the critical load. Reserve floor (% state of charge) PRELIMINARY Critical load (what must stay on in an outage) The same every hour Critical load (kW, every hour) Save the changes No changes",
+  "a11yTree": null
+}

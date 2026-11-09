@@ -1,0 +1,100 @@
+{
+ "prices": [
+  {
+   "kind": "gas_captive",
+   "valid_from": "2026-07-01",
+   "price": 4200.0,
+   "source": {
+    "kind": "ogra",
+    "ref": "Captive gas: placeholder Rs per MMBtu, enter the site's contract price",
+    "url": "https://www.dawn.com/news/2042367",
+    "retrieved_on": "2026-11-06",
+    "verified": "unverified"
+   }
+  },
+  {
+   "kind": "hsd",
+   "valid_from": "2026-10-30",
+   "price": 400.67,
+   "source": {
+    "kind": "ogra",
+    "ref": "OGRA daily HSD notifications as reported by APP, Dawn and Business Recorder",
+    "url": "https://www.dawn.com/news/2042367",
+    "retrieved_on": "2026-11-06",
+    "verified": "secondary"
+   }
+  },
+  {
+   "kind": "hsd",
+   "valid_from": "2026-10-31",
+   "price": 402.96,
+   "source": {
+    "kind": "ogra",
+    "ref": "OGRA daily HSD notifications as reported by APP, Dawn and Business Recorder",
+    "url": "https://www.dawn.com/news/2042367",
+    "retrieved_on": "2026-11-06",
+    "verified": "secondary"
+   }
+  },
+  {
+   "kind": "hsd",
+   "valid_from": "2026-11-03",
+   "price": 395.2,
+   "source": {
+    "kind": "ogra",
+    "ref": "OGRA daily HSD notifications as reported by APP, Dawn and Business Recorder",
+    "url": "https://www.dawn.com/news/2042367",
+    "retrieved_on": "2026-11-06",
+    "verified": "secondary"
+   }
+  },
+  {
+   "kind": "hsd",
+   "valid_from": "2026-11-04",
+   "price": 391.52,
+   "source": {
+    "kind": "ogra",
+    "ref": "OGRA daily HSD notifications as reported by APP, Dawn and Business Recorder",
+    "url": "https://www.dawn.com/news/2042367",
+    "retrieved_on": "2026-11-06",
+    "verified": "secondary"
+   }
+  },
+  {
+   "kind": "hsd",
+   "valid_from": "2026-11-05",
+   "price": 387.81,
+   "source": {
+    "kind": "ogra",
+    "ref": "OGRA daily HSD notifications as reported by APP, Dawn and Business Recorder",
+    "url": "https://www.dawn.com/news/2042367",
+    "retrieved_on": "2026-11-06",
+    "verified": "secondary"
+   }
+  },
+  {
+   "kind": "hsd",
+   "valid_from": "2026-11-06",
+   "price": 382.25,
+   "source": {
+    "kind": "ogra",
+    "ref": "OGRA daily HSD notifications as reported by APP, Dawn and Business Recorder",
+    "url": "https://www.dawn.com/news/2042367",
+    "retrieved_on": "2026-11-06",
+    "verified": "secondary"
+   }
+  },
+  {
+   "kind": "lng_captive",
+   "valid_from": "2026-07-01",
+   "price": 4800.0,
+   "source": {
+    "kind": "ogra",
+    "ref": "Captive RLNG: placeholder Rs per MMBtu, enter the site's contract price",
+    "url": "https://www.dawn.com/news/2042367",
+    "retrieved_on": "2026-11-06",
+    "verified": "unverified"
+   }
+  }
+ ]
+}

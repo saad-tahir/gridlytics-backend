@@ -1,0 +1,1107 @@
+[
+ {
+  "id": "7483cd970e08",
+  "kind": "adder",
+  "key": "dss",
+  "effective_from": "2023-04-01",
+  "effective_to": null,
+  "known_from": "2023-04-01",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "name": "Debt service surcharge (printed as FC or PHL surcharge)",
+   "rate": 3.23,
+   "billing_months": "all",
+   "exempt": [
+    "icp_units",
+    "lifeline"
+   ]
+  },
+  "source": {
+   "kind": "manual",
+   "ref": "Rs 3.23/kWh (Profit 15-01-2026; ICP decision names it DSS)",
+   "url": "https://power.gov.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "secondary"
+  },
+  "hash": "19d6805e317e4f95",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "60b75fa050dc",
+  "kind": "adder",
+  "key": "fca",
+  "effective_from": "2026-09-01",
+  "effective_to": null,
+  "known_from": "2026-09-05",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "name": "FCA July 2026",
+   "rate": 2.0581,
+   "billing_months": [
+    "2026-09"
+   ],
+   "exempt": [
+    "lifeline",
+    "prepaid",
+    "evcs"
+   ],
+   "negative_exempt_icp": true
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "FCA July 2026 (Dawn, 05-09-2026)",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "secondary"
+  },
+  "hash": "6ee9067fc4f80758",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "d6ede7ed85fb",
+  "kind": "adder",
+  "key": "fca",
+  "effective_from": "2026-10-01",
+  "effective_to": null,
+  "known_from": "2026-10-08",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "name": "FCA August 2026",
+   "rate": 1.11,
+   "billing_months": [
+    "2026-10"
+   ],
+   "exempt": [
+    "lifeline",
+    "prepaid",
+    "evcs"
+   ],
+   "negative_exempt_icp": true
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "FCA August 2026 (Tribune, 08-10-2026)",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "secondary"
+  },
+  "hash": "0e614820e5ca0f61",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "3f29538eabba",
+  "kind": "adder",
+  "key": "fca",
+  "effective_from": "2026-11-01",
+  "effective_to": null,
+  "known_from": "2026-11-06",
+  "status": "pending",
+  "supersedes": null,
+  "body": {
+   "name": "FCA September 2026 (requested, decision reserved)",
+   "rate": 2.5624,
+   "billing_months": [
+    "2026-11"
+   ],
+   "exempt": [
+    "lifeline",
+    "prepaid",
+    "evcs"
+   ],
+   "negative_exempt_icp": true
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "FCA September 2026 requested (Tribune, 30-10-2026)",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "unverified"
+  },
+  "hash": "a4c67e6f739592df",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "a001241dd4c2",
+  "kind": "adder",
+  "key": "qta",
+  "effective_from": "2026-06-01",
+  "effective_to": null,
+  "known_from": "2026-05-19",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "name": "QTA Q1 CY2026",
+   "rate": -1.9857,
+   "billing_months": [
+    "2026-06",
+    "2026-07",
+    "2026-08"
+   ],
+   "exempt": [
+    "icp_units",
+    "lifeline",
+    "prepaid"
+   ]
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "QTA Q1 CY2026 (Business Recorder, hearing 19-05-2026)",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "secondary"
+  },
+  "hash": "0ba877dbc4160511",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "17876a36cf5e",
+  "kind": "adder",
+  "key": "qta",
+  "effective_from": "2026-09-01",
+  "effective_to": null,
+  "known_from": "2026-09-07",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "name": "QTA Q2 CY2026",
+   "rate": 0.5194,
+   "billing_months": [
+    "2026-09",
+    "2026-10",
+    "2026-11"
+   ],
+   "exempt": [
+    "icp_units",
+    "lifeline",
+    "prepaid"
+   ]
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "SRO 1501(I)/2026 of 07-09-2026 (QTA Q2 CY2026; NAEPP accounting para 23)",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "primary"
+  },
+  "hash": "0e59b37dd7449781",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "4886bfd52236",
+  "kind": "icp",
+  "key": "national",
+  "effective_from": "2025-12-01",
+  "effective_to": null,
+  "known_from": "2025-12-10",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "rate": 22.98,
+   "reference_months": "2023-12..2024-11",
+   "escalation": 0.028,
+   "first_month": "2025-12",
+   "last_month": "2028-11",
+   "categories": [
+    "B-1",
+    "B-1(b)",
+    "B-2(a)",
+    "B-2(b)",
+    "B-3",
+    "B-4",
+    "B-5",
+    "D-2(a)",
+    "D-2(b)"
+   ],
+   "carries": [
+    "positive_fca"
+   ],
+   "not_carries": [
+    "qta",
+    "dss",
+    "negative_fca"
+   ],
+   "load_factors": {
+    "B-1": 0.4,
+    "B-2": 0.5,
+    "B-3": 0.6,
+    "B-4": 0.5
+   },
+   "review_pending": "5 Oct 2026 hearing, no notified outcome"
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "SRO 2409(I)/2025 of 10-12-2025 and NEPRA decision of 09-12-2025 (Incremental Consumption Package)",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "primary"
+  },
+  "hash": "26f5abe1a7cc929d",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "71d1dd8ea98c",
+  "kind": "prosumer",
+  "key": "net_billing",
+  "effective_from": "2026-02-09",
+  "effective_to": null,
+  "known_from": "2026-09-07",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "naepp": 8.13,
+   "quarter": "2026-04..2026-06",
+   "settlement": "billing_cycle_carry_or_quarterly",
+   "tou_export_schedule": null
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "NEPRA (Prosumer) Regulations 2026, SRO 251(I)/2026 of 09-02-2026, regulation 14; SRO 547(I)/2026",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "primary"
+  },
+  "hash": "7a07312c0ed4fb09",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "e589574e9137",
+  "kind": "prosumer",
+  "key": "net_metering_legacy",
+  "effective_from": "2015-09-01",
+  "effective_to": null,
+  "known_from": "2026-09-07",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "netting": "by_period",
+   "surplus_rate": "off_peak",
+   "accounting_rate": 25.32,
+   "netting_verified": "unverified"
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "SRO 547(I)/2026 keeps 2015 agreements to expiry; netting by period is DISCO practice (secondary, unverified)",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "primary"
+  },
+  "hash": "036e1a759a2fbc2e",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "b9bd6f61dc06",
+  "kind": "schedule",
+  "key": "national",
+  "effective_from": "2025-07-01",
+  "effective_to": null,
+  "known_from": "2025-07-01",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "name": "Uniform schedule FY2025-26 (rates not read: repeats January 2026's cards, unverified)",
+   "cards": {
+    "A-1(b)": {
+     "peak": 46.85,
+     "off_peak": 34.53,
+     "flat": null,
+     "fixed": 675.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "A-2(a)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 37.44,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": false,
+     "unverified": true
+    },
+    "A-2(b)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 39.76,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": false,
+     "unverified": true
+    },
+    "A-2(c)": {
+     "peak": 43.82,
+     "off_peak": 35.15,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "A-3": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 42.48,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": false,
+     "unverified": true
+    },
+    "B-1": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 26.23,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": false,
+     "unverified": true
+    },
+    "B-1(b)": {
+     "peak": 35.74,
+     "off_peak": 25.48,
+     "flat": null,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": true,
+     "unverified": true
+    },
+    "B-2(a)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 26.16,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": false,
+     "unverified": true
+    },
+    "B-2(b)": {
+     "peak": 36.68,
+     "off_peak": 27.41,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "B-3": {
+     "peak": 35.68,
+     "off_peak": 23.67,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "B-4": {
+     "peak": 35.68,
+     "off_peak": 23.38,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "B-5": {
+     "peak": 35.68,
+     "off_peak": 23.13,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "C-1(b)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 40.63,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": false,
+     "unverified": true
+    },
+    "C-1(c)": {
+     "peak": 46.31,
+     "off_peak": 37.54,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "C-2": {
+     "peak": 46.31,
+     "off_peak": 36.03,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "D-2(a)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 28.9,
+     "fixed": 400.0,
+     "fixed_basis": "sanctioned_kw_month",
+     "floor_share": 0.25,
+     "tou": false,
+     "unverified": true
+    },
+    "D-2(b)": {
+     "peak": 29.54,
+     "off_peak": 28.69,
+     "flat": null,
+     "fixed": 400.0,
+     "fixed_basis": "sanctioned_kw_month",
+     "floor_share": 0.25,
+     "tou": true,
+     "unverified": true
+    }
+   }
+  },
+  "source": {
+   "kind": "nepra_decision",
+   "ref": "Uniform schedule FY2025-26 from 01-07-2025: rates not read (R9); placeholder repeating SRO 41-52(I)/2026's cards",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "unverified"
+  },
+  "hash": "c034badbefaec576",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "d930bff28867",
+  "kind": "schedule",
+  "key": "national",
+  "effective_from": "2026-01-01",
+  "effective_to": null,
+  "known_from": "2026-01-13",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "name": "Uniform schedule, January 2026 (SRO 41-52(I)/2026)",
+   "cards": {
+    "A-1(b)": {
+     "peak": 46.85,
+     "off_peak": 34.53,
+     "flat": null,
+     "fixed": 675.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "A-2(a)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 37.44,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": false,
+     "unverified": true
+    },
+    "A-2(b)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 39.76,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": false,
+     "unverified": true
+    },
+    "A-2(c)": {
+     "peak": 43.82,
+     "off_peak": 35.15,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "A-3": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 42.48,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": false,
+     "unverified": true
+    },
+    "B-1": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 26.23,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": false,
+     "unverified": true
+    },
+    "B-1(b)": {
+     "peak": 35.74,
+     "off_peak": 25.48,
+     "flat": null,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": true,
+     "unverified": true
+    },
+    "B-2(a)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 26.16,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": false,
+     "unverified": true
+    },
+    "B-2(b)": {
+     "peak": 36.68,
+     "off_peak": 27.41,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true
+    },
+    "B-3": {
+     "peak": 35.68,
+     "off_peak": 23.67,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "B-4": {
+     "peak": 35.68,
+     "off_peak": 23.38,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "B-5": {
+     "peak": 35.68,
+     "off_peak": 23.13,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "C-1(b)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 40.63,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": false,
+     "unverified": true
+    },
+    "C-1(c)": {
+     "peak": 46.31,
+     "off_peak": 37.54,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "C-2": {
+     "peak": 46.31,
+     "off_peak": 36.03,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true,
+     "unverified": true
+    },
+    "D-2(a)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 28.9,
+     "fixed": 400.0,
+     "fixed_basis": "sanctioned_kw_month",
+     "floor_share": 0.25,
+     "tou": false,
+     "unverified": true
+    },
+    "D-2(b)": {
+     "peak": 29.54,
+     "off_peak": 28.69,
+     "flat": null,
+     "fixed": 400.0,
+     "fixed_basis": "sanctioned_kw_month",
+     "floor_share": 0.25,
+     "tou": true,
+     "unverified": true
+    }
+   }
+  },
+  "source": {
+   "kind": "press",
+   "ref": "SRO 41-52(I)/2026 of 13-01-2026 (B-2 rates as reported by Dawn, 17-02-2026; other categories not read)",
+   "url": "https://www.dawn.com/news/1973828",
+   "retrieved_on": "2026-11-06",
+   "verified": "secondary"
+  },
+  "hash": "885e2a5ede2ab13e",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "945849328891",
+  "kind": "schedule",
+  "key": "national",
+  "effective_from": "2026-02-12",
+  "effective_to": null,
+  "known_from": "2026-02-12",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "name": "Uniform schedule CY2026 (SRO 279(I)/2026)",
+   "cards": {
+    "A-1(b)": {
+     "peak": 46.85,
+     "off_peak": 34.53,
+     "flat": null,
+     "fixed": 675.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.5,
+     "tou": true
+    },
+    "A-2(a)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 37.44,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": false
+    },
+    "A-2(b)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 39.76,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": false
+    },
+    "A-2(c)": {
+     "peak": 43.82,
+     "off_peak": 35.15,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": true
+    },
+    "A-3": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 42.48,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": false
+    },
+    "B-1": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 26.23,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": false
+    },
+    "B-1(b)": {
+     "peak": 35.74,
+     "off_peak": 25.48,
+     "flat": null,
+     "fixed": 1000.0,
+     "fixed_basis": "per_consumer_month",
+     "floor_share": 0.25,
+     "tou": true
+    },
+    "B-2(a)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 26.16,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": false
+    },
+    "B-2(b)": {
+     "peak": 35.68,
+     "off_peak": 22.83,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": true
+    },
+    "B-3": {
+     "peak": 35.68,
+     "off_peak": 23.67,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": true
+    },
+    "B-4": {
+     "peak": 35.68,
+     "off_peak": 23.38,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": true
+    },
+    "B-5": {
+     "peak": 35.68,
+     "off_peak": 23.13,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": true
+    },
+    "C-1(b)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 40.63,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": false
+    },
+    "C-1(c)": {
+     "peak": 46.31,
+     "off_peak": 37.54,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": true
+    },
+    "C-2": {
+     "peak": 46.31,
+     "off_peak": 36.03,
+     "flat": null,
+     "fixed": 1250.0,
+     "fixed_basis": "per_kw_month",
+     "floor_share": 0.25,
+     "tou": true
+    },
+    "D-2(a)": {
+     "peak": null,
+     "off_peak": null,
+     "flat": 28.9,
+     "fixed": 400.0,
+     "fixed_basis": "sanctioned_kw_month",
+     "floor_share": 0.25,
+     "tou": false
+    },
+    "D-2(b)": {
+     "peak": 29.54,
+     "off_peak": 28.69,
+     "flat": null,
+     "fixed": 400.0,
+     "fixed_basis": "sanctioned_kw_month",
+     "floor_share": 0.25,
+     "tou": true
+    }
+   }
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "SRO 279(I)/2026 dated 12-02-2026 (NEPRA decision TRF-100/2935-57 of 11-02-2026, Annex A-1 and Annex-C)",
+   "url": "https://www.iesco.com.pk/tariff-guide",
+   "retrieved_on": "2026-11-06",
+   "verified": "primary"
+  },
+  "hash": "59f9484df196b75a",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "b59bf7cfa3cf",
+  "kind": "schedule",
+  "key": "national",
+  "effective_from": "2027-01-01",
+  "effective_to": null,
+  "known_from": "2026-11-06",
+  "status": "awaiting_notification",
+  "supersedes": null,
+  "body": {
+   "name": "Uniform schedule CY2027: awaiting NEPRA's notification (petitions heard 13-15 Oct 2026)",
+   "cards": {}
+  },
+  "source": {
+   "kind": "nepra_sro",
+   "ref": "CY2027 rebasing pending",
+   "url": "https://www.iesco.com.pk/tariff-guide",
+   "retrieved_on": "2026-11-06",
+   "verified": "unverified"
+  },
+  "hash": "87dce15ec39eb169",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "c8e88d16ba38",
+  "kind": "tax",
+  "key": "national",
+  "effective_from": "2025-07-01",
+  "effective_to": null,
+  "known_from": "2025-07-01",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "gst": 0.18,
+   "further_tax_no_strn": 0.03,
+   "electricity_duty": {
+    "sindh": {
+     "industrial": 0.015,
+     "commercial": 0.02,
+     "bulk": 0.02,
+     "agricultural": 0.01,
+     "domestic": 0.015
+    },
+    "punjab": {
+     "industrial": 0.015,
+     "commercial": 0.015,
+     "bulk": 0.015,
+     "agricultural": 0.015,
+     "domestic": 0.015
+    },
+    "kp": {
+     "industrial": 0.015,
+     "commercial": 0.015,
+     "bulk": 0.015,
+     "agricultural": 0.015,
+     "domestic": 0.015
+    },
+    "balochistan": {
+     "industrial": 0.015,
+     "commercial": 0.015,
+     "bulk": 0.015,
+     "agricultural": 0.015,
+     "domestic": 0.015
+    },
+    "ict": {
+     "industrial": 0.015,
+     "commercial": 0.015,
+     "bulk": 0.015,
+     "agricultural": 0.015,
+     "domestic": 0.015
+    }
+   },
+   "electricity_duty_verified": {
+    "sindh": "primary",
+    "punjab": "unverified",
+    "kp": "unverified",
+    "balochistan": "unverified",
+    "ict": "unverified"
+   },
+   "s235": {
+    "industrial": {
+     "nil_upto": 500,
+     "mid_rate": 0.1,
+     "mid_upto": 20000,
+     "base_above": 1950,
+     "rate_above": 0.05
+    },
+    "commercial": {
+     "nil_upto": 500,
+     "mid_rate": 0.1,
+     "mid_upto": 20000,
+     "base_above": 1950,
+     "rate_above": 0.12
+    }
+   },
+   "ptv": {
+    "domestic": 35,
+    "commercial": 60,
+    "industrial": 0
+   },
+   "muct_ke": 750,
+   "punjab_selfgen_per_kwh": 0.04
+  },
+  "source": {
+   "kind": "manual",
+   "ref": "Power Division 'Electricity Billing' page; KE page; FBR s.235 cards (rates as R9 section 7)",
+   "url": "https://power.gov.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "secondary"
+  },
+  "hash": "8d40d399bb31f786",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "20ebfb10dd9b",
+  "kind": "tou",
+  "key": "ke",
+  "effective_from": "2019-01-01",
+  "effective_to": null,
+  "known_from": "2019-01-01",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "seasons": [
+    {
+     "months": [
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+     ],
+     "peak": [
+      "18:30",
+      "22:30"
+     ]
+    },
+    {
+     "months": [
+      11,
+      12,
+      1,
+      2,
+      3
+     ],
+     "peak": [
+      "18:00",
+      "22:00"
+     ]
+    }
+   ],
+   "dst_adjust": false
+  },
+  "source": {
+   "kind": "ke_page",
+   "ref": "K-Electric tariff structure and FAQs",
+   "url": "https://ke.com.pk/faqs/",
+   "retrieved_on": "2026-11-06",
+   "verified": "primary"
+  },
+  "hash": "6af58cad6c967c38",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ },
+ {
+  "id": "eb79377247fc",
+  "kind": "tou",
+  "key": "xwdisco",
+  "effective_from": "2023-07-14",
+  "effective_to": null,
+  "known_from": "2023-07-14",
+  "status": "active",
+  "supersedes": null,
+  "body": {
+   "seasons": [
+    {
+     "months": [
+      12,
+      1,
+      2
+     ],
+     "peak": [
+      "17:00",
+      "21:00"
+     ]
+    },
+    {
+     "months": [
+      3,
+      4,
+      5
+     ],
+     "peak": [
+      "18:00",
+      "22:00"
+     ]
+    },
+    {
+     "months": [
+      6,
+      7,
+      8
+     ],
+     "peak": [
+      "19:00",
+      "23:00"
+     ]
+    },
+    {
+     "months": [
+      9,
+      10,
+      11
+     ],
+     "peak": [
+      "18:00",
+      "22:00"
+     ]
+    }
+   ],
+   "dst_adjust": false
+  },
+  "source": {
+   "kind": "nepra_decision",
+   "ref": "NEPRA Terms and Conditions of Tariff, clause 10 (LESCO determination 14-07-2023, Annex-V)",
+   "url": "https://nepra.org.pk",
+   "retrieved_on": "2026-11-06",
+   "verified": "primary"
+  },
+  "hash": "d0d1f18f2b04b3b7",
+  "created": "2026-11-08T14:40:56+00:00",
+  "by": "shipped"
+ }
+]

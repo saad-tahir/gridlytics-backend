@@ -1,0 +1,189 @@
+{
+ "id": "6d4db49bf87e",
+ "name": "Faisalabad textile mill (demo)",
+ "status": "active",
+ "tier_capable": "closed_loop",
+ "tier_allowed": "advisory_writes",
+ "demo_link": "demo",
+ "data": {
+  "name": "Faisalabad textile mill (demo)",
+  "address": "Jhang Road industrial area",
+  "city": "Faisalabad",
+  "lat": 31.42,
+  "lon": 73.08,
+  "timezone": "Asia/Karachi",
+  "disco": "FESCO",
+  "site_type": "industrial_2_shift",
+  "outage_unit": {
+   "kind": "feeder",
+   "code": "411205",
+   "name": "Jhang Road Industrial"
+  },
+  "genset_start_control": "manual",
+  "outage_load_mode": 0,
+  "critical_load_kw": [
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0,
+   70.0
+  ],
+  "voll_rs_per_kwh": 500.0,
+  "reserve_policy": {
+   "p_threshold": 0.2,
+   "min_soc_pct": 20.0
+  },
+  "cycle_cap_per_day": 1.5,
+  "control_mode": "mode_a",
+  "enclosure_temp_offset_c": 7.0,
+  "calendar_cost_on": true,
+  "grid_charge_allowed": true,
+  "gen_charge_allowed": true,
+  "notes": "Two-shift spinning; manual genset start; switchback calendar running.",
+  "load_peak_kw": 330,
+  "off_grid": false,
+  "data_source": null,
+  "twin": {
+   "windows": [
+    [
+     "14:00",
+     "16:00"
+    ]
+   ],
+   "adherence": 0.8,
+   "trips_per_day": 0.8,
+   "trip_minutes": 70,
+   "unconfirmed_alert": true
+  }
+ },
+ "created": "2026-11-08T14:40:56+00:00",
+ "updated": "2026-11-08T14:40:56+00:00",
+ "deleted": null,
+ "tier": "advisory_writes",
+ "connections": [
+  {
+   "id": "9d35f675b860",
+   "site_id": "6d4db49bf87e",
+   "data": {
+    "meter_ref": "FS-24-11-0042",
+    "disco_group": "xwdisco",
+    "tariff_category": "B-2(b)",
+    "regime": "none",
+    "agreement_start": null,
+    "agreement_end": null,
+    "sanctioned_load_kw": 500.0,
+    "export_cap_kw": 0.0,
+    "mdi_interval_min": 30,
+    "icp": {
+     "eligible": false,
+     "peak": {},
+     "off_peak": {}
+    },
+    "tax": {
+     "gst_recoverable": true,
+     "s235_adjustable": true,
+     "strn": true,
+     "atl": true,
+     "province": "punjab"
+    },
+    "seasonal_multiplier": 1.0,
+    "season_months": [],
+    "reading_day": null
+   },
+   "created": "2026-11-08T14:40:56+00:00",
+   "updated": "2026-11-08T14:40:56+00:00"
+  }
+ ],
+ "assets": {
+  "pv": {
+   "kwp_dc": 300.0,
+   "kw_ac": 250.0,
+   "tilt": 15.0,
+   "azimuth": 180.0,
+   "gamma_pdc": -0.0035,
+   "losses_pct": 14.0,
+   "id": "a440189c10c9"
+  },
+  "inverter": {
+   "brand": "deye",
+   "model": "SUN-50K-SG01HP3 x5",
+   "kw_ac": 250.0,
+   "firmware": "",
+   "id": "52c6a6d2acd7"
+  },
+  "battery": {
+   "nameplate_kwh": 215.0,
+   "soh": 1.0,
+   "p_ch_kw": 100.0,
+   "p_dis_kw": 100.0,
+   "eta_c": 0.95,
+   "eta_d": 0.95,
+   "soc_min": 0.1,
+   "soc_max": 0.95,
+   "replacement_cost_per_kwh": 52000.0,
+   "warranted_cycles": 6000.0,
+   "warranted_depth": 0.8,
+   "id": "2a58a9960379"
+  },
+  "genset": {
+   "rated_kw": 200.0,
+   "f_min": 0.3,
+   "fuel_kind": "hsd",
+   "a": 0.273,
+   "b": 0.033,
+   "c_start_rs": 1500.0,
+   "c_runhr_rs": 400.0,
+   "c_om_rs_per_kwh": 8.0,
+   "min_up_h": 1.0,
+   "min_down_h": 0.5,
+   "cap_hours_per_day": 24.0,
+   "tank_l": 1500.0,
+   "parallel_allowed": false,
+   "id": "e52b20b8982c"
+  }
+ },
+ "state": {
+  "active_plan": "4b2fe258bc75",
+  "last_tick": "2026-11-08T15:00:00+00:00"
+ },
+ "native": {
+  "site_id": "6d4db49bf87e",
+  "version": 1,
+  "captured_at": "2026-11-08T14:40:56+00:00",
+  "by": "demo seed",
+  "source": "photo",
+  "body": {
+   "source": "photo",
+   "work_mode": "self_use",
+   "backup_soc_pct": 20.0,
+   "grid_charge_allowed": false,
+   "slots": []
+  },
+  "has_photo": false
+ },
+ "tier_signoff": {
+  "tier": "advisory_writes",
+  "signoff": "demo",
+  "by": "demo seed",
+  "at": "2026-11-08T14:40:56+00:00"
+ }
+}

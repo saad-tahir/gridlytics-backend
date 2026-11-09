@@ -1,0 +1,58 @@
+{
+  "profile": {
+    "id": "0b7e3c52-6a1d-4f8e-9c2b-5d4a3e2f1a00",
+    "email": "saad@example.test",
+    "name": "Saad Khan",
+    "first_name": "Saad",
+    "last_name": "Khan",
+    "avatar_url": null,
+    "is_super_admin": false,
+    "assignment_status": "none",
+    "requested_company_name": null,
+    "created_at": "2026-10-20T09:15:02.123456+00:00",
+    "updated_at": "2026-10-20T09:15:02.123456+00:00"
+  },
+  "memberships": [
+    {
+      "id": "c0a80101-0000-4000-8000-000000000001",
+      "role": "owner",
+      "status": "active",
+      "created_at": "2026-10-20T09:16:40.000000+00:00",
+      "activated_at": "2026-10-20T09:16:40.000000+00:00",
+      "company": {"id": "3f6c1d2e-8a4b-4c7d-9e1f-2a3b4c5d6e7f", "name": "Northwind Solar", "verified": true}
+    },
+    {
+      "id": "c0a80101-0000-4000-8000-000000000003",
+      "role": "member",
+      "status": "pending",
+      "created_at": "2026-10-21T11:02:13.000000+00:00",
+      "activated_at": null,
+      "company": {"id": "9e8d7c6b-5a49-4382-a716-0f1e2d3c4b5a", "name": "Pending Panels", "verified": true}
+    },
+    {
+      "id": "c0a80101-0000-4000-8000-000000000002",
+      "role": "member",
+      "status": "active",
+      "created_at": "2026-10-21T10:00:00.000000+00:00",
+      "activated_at": "2026-10-21T10:00:00.000000+00:00",
+      "company": {"id": "7c2d9e4f-1b3a-4d5c-8e6f-0a1b2c3d4e5f", "name": "Southwind Energy", "verified": true}
+    },
+    {
+      "id": "c0a80101-0000-4000-8000-000000000005",
+      "role": "member",
+      "status": "suspended",
+      "created_at": "2026-10-22T08:30:00.000000+00:00",
+      "activated_at": "2026-10-22T08:30:00.000000+00:00",
+      "company": {"id": "5d4c3b2a-1f0e-4d9c-8b7a-6f5e4d3c2b1a", "name": "Suspended Systems", "verified": true}
+    },
+    {
+      "id": "c0a80101-0000-4000-8000-000000000004",
+      "role": "admin",
+      "status": "active",
+      "created_at": "2026-10-22T08:00:00.000000+00:00",
+      "activated_at": "2026-10-22T08:00:00.000000+00:00",
+      "company": {"id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", "name": "Unverified Arrays", "verified": false}
+    }
+  ],
+  "pending_invites_for_email": []
+}

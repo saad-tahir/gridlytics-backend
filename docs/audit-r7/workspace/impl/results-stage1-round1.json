@@ -1,0 +1,804 @@
+{
+ "savings-engine": {
+  "1": {
+   "results": [
+    {
+     "id": "engine-savings-02",
+     "status": "implemented",
+     "summary": "Closed-loop and demo days were 'confirmed' by construction. compute_day now runs verify._control per minute: the override history (pause_control/force_native, to its end or to when it was cleared), the stored ticks by plans.active_at's rules (no plan made, the one in force past valid_until, a held or failed tick of a release; a guard hold or a failed solve keeps the plan before it in force), and at a closed-loop site's own edge (not the demo) the fallback_engaged/cleared and control_disabled/enabled events plus minutes with no telemetry row. At least 95 % of minutes under the plan is confirmed, at least 50 % partial (claims, share as fidelity_score), below that not_applied (claims nothing). The row carries `control` {in_force_share, released_min, no_plan_min, edge_fallback_min, edge_unheard_min}. Test helpers make_site and r6 _farm now store a standing plan (status superseded, 2015 to 2100), as a live site's ticks keep one.",
+     "commits": [
+      "3d4c5e4 (backend)"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_savings_engine.py::test_a_closed_loop_day_claims_only_while_control_was_in_force",
+      "backend/tests/test_fix_r7_savings_engine.py::test_a_demo_day_under_a_pause_claims_nothing",
+      "backend/tests/test_fix_r7_savings_engine.py::test_a_closed_loop_edge_not_heard_for_two_hours_is_partial_and_its_claim_withheld"
+     ],
+     "files": [
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/gridlytics/verify.py",
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/tests/test_fix_savings.py",
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/tests/test_fix_r6_savings.py",
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/tests/test_fix_r7_savings_engine.py"
+     ]
+    },
+    {
+     "id": "pr-review-03",
+     "status": "implemented",
+     "summary": "_expected_start now restarts from the measured state (reset 'arm_change') on a day whose arm can be the plan (_plan_arm: not monitor, not a switchback native block) after a day the plan did not run (NOT_PLAN_ARM: recommendation_only, native_block, not_applied incl. control not in force, pending). Days the plan did not run still chain among themselves, and days withheld for data on read inputs keep the chain. _chain_starts and _chain_stale pass the same rule, so the restart is never reported stale. This amends round 6's DESIGN_LOG rule that a monitor or not-applied day keeps the chain (same reasoning as round 6's switchback restart); the r6 test that asserted chaining through a monitor day now covers a data-withheld day instead.",
+     "commits": [
+      "a3dd614 (backend)"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_savings_engine.py::test_the_first_plan_day_after_days_the_plan_did_not_run_restarts_from_the_measured_state",
+      "backend/tests/test_fix_r6_savings.py::test_a_day_withheld_on_read_inputs_keeps_the_chain_and_a_later_dropout_on_it_is_stale"
+     ],
+     "files": [
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/gridlytics/verify.py",
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/tests/test_fix_r6_savings.py",
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/tests/test_fix_r7_savings_engine.py"
+     ]
+    },
+    {
+     "id": "pr-review-11",
+     "status": "implemented",
+     "summary": "Measured first: replays counted a blank PV/load as zero, so 5 min of blank PV at noon over-claimed a farm day by Rs 663 and 15 min at a grid site by Rs 1,366 (load blanks under-claimed). verify._balance_fill now takes a blank PV or load from the minute's balance where the other flows were read; when both are blank, the net is exact and the PV is interpolated across the gap. The measured cases now move by Rs 0. A day whose load or daylight PV stays unread for more than 5 % of its minutes (REPLAY_UNREAD_MAX = GRID_UNRESOLVED_MAX) claims nothing (claim_withheld 'inputs_unread', row field inputs_unread_min), and the next day restarts under the existing rule. That cap also covers full logger dropouts, which the grid rule's 'seen' filter never counted. A PV blank at night (sun_position) is not an unread minute. The compute_day docstring now states what holds, including the known limit: a gap the balance cannot close and under 5 % is carried. The web app labels the new reason 'Claim withheld: load or solar data missing'. Separately, a seed-dependent r4 test's tolerance now allows for the 0.01 kWh rounding of the stored end energies (it failed on some draws).",
+     "commits": [
+      "b2198fb (backend)",
+      "5789b40 (backend, r4 test tolerance)",
+      "8503c19 (backend, docstring reflow)",
+      "32c2ad5 (frontend)"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_savings_engine.py::test_a_blank_pv_or_load_is_closed_from_the_balance_and_a_day_the_balance_cannot_close_is_withheld",
+      "backend/tests/test_fix_r7_savings_engine.py::test_a_closed_loop_edge_not_heard_for_two_hours_is_partial_and_its_claim_withheld",
+      "frontend/src/features/savings/savings-withheld.test.tsx"
+     ],
+     "files": [
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/gridlytics/verify.py",
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/tests/test_fix_r7_savings_engine.py",
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/tests/test_fix_r4_savings.py",
+      "/home/user/wt/savings-engine/gridlytics-frontend/frontend/src/features/savings/savings-days-table.tsx",
+      "/home/user/wt/savings-engine/gridlytics-frontend/frontend/src/features/savings/savings-withheld.test.tsx"
+     ]
+    },
+    {
+     "id": "engine-savings-06",
+     "status": "partial",
+     "summary": "Also covers pages-D-02 (a duplicate). verify.summary per baseline now has `claimed_rs` as the headline: the claiming days, less the provisional carry-over, plus the claimed MDI. New fields: `levers_claimed_rs` (the claim by lever, sums to claimed_rs); `saving_rs`/`levers` over every day whose saving is known (a withheld day's partial levers add to no total; before, golden 2,820 vs now 2,020); counts claiming_days, withheld_days and unclaimed_days. The fee check uses the same claim. Day rows: saving null on a withheld day, plus claimed_native_rs, claimed_tuned_rs, claims, not_claimed_reason, levers_kept, carry_over_provisional(_native_rs), control_share and inputs_unread_min. The web app's tiles and ledger now lead with the claim: 'Claimed saving against the native settings / a tuned table', lever rows from levers_claimed_rs, bold 'Claimed', then 'Every scored day, claimed or not'. Types and API_CONTRACT (Round 7 section) updated. Not done here: the export columns. routes_savings.savings_csv belongs to stage 2 savings-ui-crosscut, and reports.py's PDF headline, daily rows and CSV belong to alerts-reports; the per-day chart and days table are stage 2's. All the fields they need are now in the summary.",
+     "commits": [
+      "dea4533 (backend)",
+      "359590b (frontend)"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_savings_engine.py::test_the_headline_is_the_claim_and_a_withheld_days_partial_levers_add_to_no_total",
+      "frontend/src/features/savings/savings-claim.test.tsx"
+     ],
+     "files": [
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/gridlytics/verify.py",
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/tests/test_fix_r7_savings_engine.py",
+      "/home/user/wt/savings-engine/gridlytics-frontend/frontend/src/features/savings/savings-kpis.tsx",
+      "/home/user/wt/savings-engine/gridlytics-frontend/frontend/src/features/savings/savings-ledger.tsx",
+      "/home/user/wt/savings-engine/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/savings-engine/gridlytics-frontend/docs/API_CONTRACT.md",
+      "/home/user/wt/savings-engine/gridlytics-frontend/frontend/src/features/savings/savings-claim.test.tsx"
+     ],
+     "reason": "The CSV and PDF columns (claimed, withheld reason) are in files other packages own: routes_savings.savings_csv (stage 2) and reports.py (alerts-reports). The API now carries every field they need."
+    },
+    {
+     "id": "role-owner-02",
+     "status": "implemented",
+     "summary": "A claiming day's carry-over credit (its end gap at v_end) is now provisional while no later day has been scored: verify.summary leaves it out of claimed_rs and levers_claimed_rs.carry_over and reports it as carry_over_provisional_rs (per day: carry_over_provisional and carry_over_provisional_native_rs). Once the next day is scored, chained from it or restarting at a switchback block (plan 8.2's hand-over at v_end), the credit enters the claim. Golden: a claim of 2,000 with a last-day 300 credit reads 1,700 + 300 provisional, and 2,000 once day 5 is scored. The Faisalabad case (whole claim = last day's carry-over) now shows the realised figure with the carry-over apart. The fee check excludes it too. The web app shows 'Rs X of carry-over is provisional until the stored energy is used' under the tiles and a ledger row 'Carry-over still provisional (not in the claim)'. The off-grid farm's carry-over versus diesel (RYK) is round 6's chained ledger plus batch 2's carry-over items.",
+     "commits": [
+      "dea4533 (backend)",
+      "359590b (frontend)"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_savings_engine.py::test_a_carry_over_credit_is_claimed_once_a_later_day_has_used_the_stored_energy",
+      "backend/tests/test_fix_r7_savings_engine.py::test_the_headline_is_the_claim_and_a_withheld_days_partial_levers_add_to_no_total",
+      "frontend/src/features/savings/savings-claim.test.tsx"
+     ],
+     "files": [
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/gridlytics/verify.py",
+      "/home/user/wt/savings-engine/gridlytics-backend/backend/tests/test_fix_r7_savings_engine.py",
+      "/home/user/wt/savings-engine/gridlytics-frontend/frontend/src/features/savings/savings-kpis.tsx",
+      "/home/user/wt/savings-engine/gridlytics-frontend/frontend/src/features/savings/savings-ledger.tsx"
+     ]
+    }
+   ],
+   "notes": "Batch 0 of savings-engine is committed on audit/savings-engine in both worktrees: 6 backend commits and 2 web-app commits, git status clean. The test file is backend/tests/test_fix_r7_savings_engine.py, as the task says; the plan's owns_files name test_r7_savings_engine.py.\n\nTest results:\n- Full backend suite: 510 passed, 8 skipped.\n- tf.sh savings-engine src/features/savings/ src/test/source-rules.test.ts: typecheck clean, 6 files and 27 tests pass.\n- I checked that each new test fails on the code before its fix.\n\nFiles owned by others, changed minimally:\n- frontend/src/features/savings/ (stage 2): savings-kpis.tsx and savings-ledger.tsx so the claim is the headline, and savings-days-table.tsx for the inputs_unread label. Nobody else's batches carry the headline half of engine-savings-06 or pages-D-02. auth-security owns only the viewer litres and verified-days parts of savings-kpis.tsx, which I left alone.\n- test_fix_savings.make_site and test_fix_r6_savings._farm now store a standing plan.\n- The r6 test that asserted chaining through a monitor day was rewritten, because pr-review-03 changes that rule.\n- One r4 test's tolerance was widened. It was seed-dependent and failed on some site ids.\n\nSettled rules this changes, for the docs WP's DESIGN_LOG round 7:\n1. Closed-loop and demo fidelity is now the share of minutes under the plan: at least 95 % confirmed, at least 50 % partial, otherwise not applied.\n2. The first plan day after a day the plan did not run restarts with reset 'arm_change'. Round 6 said monitor and not-applied days keep the chain.\n3. Blank PV or load is filled from the balance for the replays. A day with more than 5 % of its minutes unread claims nothing ('inputs_unread').\n4. summary's claimed_rs leaves out carry-over that no later scored day has used yet (carry_over_provisional_rs). saving_rs and levers no longer include days withheld for missing data.\n\nFor other packages:\n- alerts-reports: reports.py's PDF headline should lead with claimed_rs and its ledger should use levers_claimed_rs. A withheld day's saving_native_rs is now null.\n- savings-ui-crosscut (stage 2):\n  - savings_csv needs claimed_native_rs, not_claimed_reason, claim_withheld and levers_kept.\n  - The days table and daily chart can use claims, not_claimed_reason and carry_over_provisional.\n- fleet-overview: fleet_savings and routes_sites._mtd_saving should read claimed_rs from verify.summary. Per-day stored claimed_rs does not subtract the provisional carry-over.\n\nLeft for later batches: the MDI claim still counts claiming-fidelity days that are withheld (engine-savings-04, batch 1), and the perfect-foresight bound still sums every day (batch 3)."
+  }
+ },
+ "tariffs": {},
+ "delivery-twin": {},
+ "control-edge": {
+  "1": {
+   "results": [
+    {
+     "id": "flow-telemetry-plan-control-03",
+     "status": "implemented",
+     "summary": "Only a closed-loop site's edge now gets a plan. Below closed loop, plans.signed_message raises the new plans.NotClosedLoop: nothing is signed, sent or recorded in plan_messages, so a monitor site no longer shows 'Table writes today 1 of 3'. The key-only route GET /sites/:id/plans/current/message answers 409 not_closed_loop with a one-sentence reason, for example \"The site's control tier is monitor, so no plan is sent to its edge: the plan is a recommendation\". This covers its duplicate engine-plans-live-11. The gate also covers advisory_writes. Plan Part 2.3 sends signed plans to closed loop only. A signed release would make the edge restore native settings and overwrite the table a person keyed in, so a refusal is the safe answer. API_CONTRACT.md documents it under 'Round 7 (audit): control-edge'.",
+     "commits": [
+      "backend 391956a",
+      "frontend e2c81ec"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_control_edge.py::test_a_site_below_closed_loop_sends_its_edge_no_plan[monitor]",
+      "backend/tests/test_fix_r7_control_edge.py::test_a_site_below_closed_loop_sends_its_edge_no_plan[advisory_writes]",
+      "backend/tests/test_fix_r7_control_edge.py::test_a_closed_loop_site_sends_its_edge_the_signed_plan",
+      "backend/tests/test_fix_r7_control_edge.py::test_the_edge_route_refuses_a_plan_below_closed_loop_and_serves_it_at_closed_loop",
+      "backend/tests/test_api_walk.py::test_an_edge_key_reaches_only_its_own_site (updated)"
+     ],
+     "files": [
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/plans.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/routes_edge.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_r7_control_edge.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_api_walk.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_optimiser.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_r2_optimiser.py",
+      "/home/user/wt/control-edge/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "engine-delivery-01",
+     "status": "implemented",
+     "summary": "plans._guard can now refuse a plan, following Part 7.1 step 8 and R6 C2. A refused plan is held and the previous one stays in force. The guard returns the first rule broken: slot_floor_below_fallback (a slot floor under the fallback's minimum state of charge); replayed_soc_below_floor (with the grid up, the table replayed through the twin discharges the battery under the fallback floor; tolerance 5 points); unserved_in_outage (in forecast outages the replay leaves more critical load unserved than the plan did, by more than max(2 kWh, 5 % of the outage's critical energy)); mdi_cap_exceeded (see engine-plans-live-05); sheds_load_with_grid_up (the plan sheds load with the grid up that the replay serves from the grid); genset_slot_with_grid (a genset slot lies wholly in expected grid-present time at a site whose genset may not run beside the grid); export_not_allowed (an export slot at a connection with no export). The two old checks could never trip and are gone. A probe built 12 demo days with 3-hourly ticks (320 plans) on the new guard and held 1 plan, at Lahore, for real grid-up shedding. At a 2-point tolerance the floor rule had held 8 of 80 Lahore plans over a 2.1-point peak-shave dip, which is why the tolerance is 5 points. The web app names every new reason in words (GUARD_REASONS).",
+     "commits": [
+      "backend adcf87f",
+      "frontend 97c550c"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_control_edge.py::test_the_guard_passes_a_table_that_keeps_every_rule",
+      "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_slot_floor_under_the_fallback",
+      "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_table_that_drains_the_battery_under_the_fallback_floor_with_the_grid_up",
+      "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_table_that_leaves_critical_load_unserved_in_a_forecast_outage",
+      "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_plan_that_sheds_load_with_the_grid_up",
+      "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_genset_slot_where_the_grid_is_expected_present",
+      "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_an_export_slot_where_nothing_may_be_exported",
+      "backend/tests/test_fix_r7_control_edge.py::test_a_tick_passes_the_solves_mdi_cap_to_the_guard",
+      "frontend/src/features/plan/plan-held.test.tsx (Round 7: says the guard's reason ... in words)"
+     ],
+     "files": [
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/plans.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_r7_control_edge.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_optimiser.py",
+      "/home/user/wt/control-edge/gridlytics-frontend/frontend/src/features/plan/plan-held.tsx",
+      "/home/user/wt/control-edge/gridlytics-frontend/frontend/src/features/plan/plan-held.test.tsx",
+      "/home/user/wt/control-edge/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "engine-plans-live-05",
+     "status": "implemented",
+     "summary": "The guard now checks the plan's MDI cap (mdi_cap_exceeded). tick passes the solve's res to _guard, which is a one-line edit in tick, a function optimiser-plans owns. For each MDI block the guard takes the plan's own grid draw, adds back any load the plan sheds with the grid up (the meter reads that load), and adds the first block's minutes already elapsed, as the MILP row does. It refuses when the block mean exceeds res['M'] by more than 1 kW, using M2 after the billing month's end. This catches plans that meet their MDI only by shedding load the site cannot shed (the 02f1e98208e1 case). A single 15-minute step above the cap inside a 30-minute block whose mean is under it is not a new maximum demand, so it is not refused; a test covers this. That answers the per-step evidence (step 14, 962 kW against a 902 kW cap). A version that replayed the compiled table instead would have held about 25 % of the Faisalabad and Karachi demo plans. The cause there is a compile artefact: a non-charge slot's grid_cap is the maximum import of its span, which belongs to delivery-twin. Per Part 7.1 step 4, an MDI rise the device cannot prevent is reported as mdi_not_enforceable, not refused.",
+     "commits": [
+      "backend adcf87f",
+      "frontend 97c550c"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_plan_whose_own_grid_draw_exceeds_its_mdi_cap",
+      "backend/tests/test_fix_r7_control_edge.py::test_a_tick_passes_the_solves_mdi_cap_to_the_guard"
+     ],
+     "files": [
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/plans.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_r7_control_edge.py",
+      "/home/user/wt/control-edge/gridlytics-frontend/frontend/src/features/plan/plan-held.tsx"
+     ]
+    },
+    {
+     "id": "engine-delivery-24",
+     "status": "implemented",
+     "summary": "A plan past its valid_until is no longer in force. plans.current(site_id, now=None) returns None once valid_until has passed, and plans.active_at returns None for any instant at or after the plan's valid_until. held_info answers {reason: 'plan_expired', until: null, plan_id, since: valid_until}, and GET /plan passes 'since' through. signed_message returns None and the edge route answers 404 plan_expired. GET /control answers compiled: null, so no expired table is offered for keying in. The Plan page says 'The last plan ran out on <Pakistan date and time> ... the inverter runs its fallback, its own native settings', with a 'Read the last plan' button. The next good tick puts a plan in force again. Four existing test fixtures stored plans with valid_until equal to generated_at, or read today's clock for a historical tick; they were updated: test_fix_r3_api._plan_row (48 h), test_fix_savings._insert_plan (48 h) and test_engine (current(now=tick time)).",
+     "commits": [
+      "backend 924509d",
+      "frontend 7839a9b"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_control_edge.py::test_a_plan_past_its_valid_until_is_not_in_force_nor_served",
+      "backend/tests/test_fix_r7_control_edge.py::test_the_plan_and_control_pages_and_the_edge_see_an_expired_plan_as_no_plan",
+      "frontend/src/features/plan/plan-held.test.tsx (Round 7: says the last plan ran out ...)"
+     ],
+     "files": [
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/plans.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/routes_edge.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/routes_plans.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_r7_control_edge.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_r3_api.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_engine.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_savings.py",
+      "/home/user/wt/control-edge/gridlytics-frontend/frontend/src/features/plan/plan-held.tsx",
+      "/home/user/wt/control-edge/gridlytics-frontend/frontend/src/features/plan/plan-held.test.tsx",
+      "/home/user/wt/control-edge/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/control-edge/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "engine-savings-01",
+     "status": "implemented",
+     "summary": "On a native-block day of the switchback calendar the live site now runs its native settings, which also covers duplicates brief-vs-build-01 and flow-savings-pilot-bill-05. plans.control_release falls back to a new plans.switchback_release when no person's pause or release is in force; a person's pause or release still comes first. switchback_release reads verify.arm_on for the Pakistan-time day, as verify.compute_day and the demo do, and returns {reason: 'switchback_native', kind: 'switchback', until: midnight PKT after the block's last day, author: 'switchback calendar', override_id: null}. tick needed no edit: it stores the plan as held, supersedes the active plan and clears active_plan. signed_message sends a signed release (release.reason switchback_native). _released_at and active_at treat the day as released, so an advisory site gets no apply-unconfirmed alert and the ledger's native days are truly native. held_info and GET /plan report the block, and control_state gives the new key native_block ('Switchback: native settings today', until the block's end). The web app reads native_block as no plan in force (releasedBy gives switchback_native) and the Plan page says 'A native block of the switchback calendar is running until ...', with the block's end, not Resume, as the way back. The demo probe stored 48 held switchback_native plans on Faisalabad's native-block days.",
+     "commits": [
+      "backend b413a37",
+      "frontend d2dc48f"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_control_edge.py::test_a_native_block_day_releases_the_live_site_to_its_native_settings",
+      "backend/tests/test_fix_r7_control_edge.py::test_a_plan_block_day_runs_the_plan_and_a_persons_pause_comes_before_the_calendar",
+      "backend/tests/test_fix_r7_control_edge.py::test_the_plan_and_control_pages_say_a_native_block_day",
+      "frontend/src/features/plan/plan-held.test.tsx (Round 7: says a native block of the switchback calendar ...; reads a native-block control chip as no plan in force)"
+     ],
+     "files": [
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/plans.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/routes_plans.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/gridlytics/routes_sites.py",
+      "/home/user/wt/control-edge/gridlytics-backend/backend/tests/test_fix_r7_control_edge.py",
+      "/home/user/wt/control-edge/gridlytics-frontend/frontend/src/features/plan/plan-held.tsx",
+      "/home/user/wt/control-edge/gridlytics-frontend/frontend/src/features/plan/plan-held.test.tsx",
+      "/home/user/wt/control-edge/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/control-edge/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    }
+   ],
+   "notes": "Batch 1 of control-edge: all 5 ids implemented. There are 4 commits in each repository (one per finding group), on branch audit/control-edge, and both trees are clean.\n\nTests: the full backend suite passes on the final branch (521 passed). The full web-app gates pass (38 files, 268 tests, build). Each intermediate commit was also checked: full backend suite on the first three backend commits, and typecheck plus the plan-held tests on the middle two web-app commits.\n\nEdits outside my owned list:\n- plans.tick (optimiser-plans owns it): one line, `_guard(site, p, compiled, steps_out, res)`, so the guard gets the MDI cap.\n- Existing tests changed where the behaviour changes on purpose:\n  - test_api_walk, test_fix_optimiser and test_fix_r2_optimiser: the edge-message tests now set the site to closed loop.\n  - test_fix_optimiser::test_a_battery_starting_below_the_floor_is_planned_not_held: now asserts the floor rules never refuse a low start, and that the plan is active exactly when the guard is None. Today the guard holds that toy plan for sheds_load_with_grid_up, the optimiser's grid-up shedding to spare the MDI. Once optimiser-plans removes grid-up shedding it is active again.\n  - test_fix_r3_api._plan_row and test_fix_savings._insert_plan (savings-engine's file): plans now valid for 48 h.\n  - test_engine: current(now=tick time).\n\nFor integration:\n1. alerts.py (alerts-reports): evaluate() reads plans.current. After valid_until, and on native-block days once the tick has held the plan, that is None, so settled() closes the Control and Savings alerts, plan_failed included. Their planned plan-expiry alert should read plans.held_info(...)['reason'] == 'plan_expired', which also carries 'since'. genset_requests' wording map could add switchback_native; it says 'No plan in force' today.\n2. demo.py (demo-seed): _replanned_span simulates a plan the guard held as if it were in force; it should run the previous plan.\n3. delivery-twin: once the twin stops peak-shaving below the slot floor (engine-delivery-15), replayed_soc_below_floor will trip less often. The MDI rule reads the plan's own draw, not the replay, so mdi_not_enforceable does not interact with it.\n4. The switchback release follows verify.arm_on at any tier and whether or not the calendar is locked, the same as compute_day's native_block label. If savings-engine makes only locked blocks count, switchback_release follows automatically.\n5. control_state's native_block label is a first wording; batch 3 adds the day and end to the labels.\n\nThe probe script is /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/ce_probe/probe_new.py. The script that split the work into commits is /tmp/claude-0/-home-user/f64857cc-0ca7-5cbb-b665-d2b474fb2fb8/scratchpad/ce_split/split_b0.py."
+  }
+ },
+ "optimiser-plans": {
+  "1": {
+   "results": [
+    {
+     "id": "engine-optimiser-01",
+     "status": "implemented",
+     "summary": "Fixes engine-plans-live-01 too. On a grid-up step, U may now only take load beyond what the connection (G_max) and PV can carry: U_ub = max(0, L - G_max - PV). So the plan imports and prices the MDI rise instead of shedding real load. explain() names any unserved step 'unserved' with detail grid up, down or none (it used to say idle, self_consumption or mdi_cap). build_problem raises a VoLL saved below the horizon's dearest import price to that price, which closes the 'VoLL 0 makes floors and shortfall free' hole on the engine side. The web app's unserved sentence follows detail.grid. The audit's own repro (L[40:44] = 300, M0 = 100, E0 = 25) shed 194 kW with the grid up before the fix and sheds 0 after. A tick-level test checks a mill with a 100 to 300 kW afternoon hour: on the old code that plan shed 4 grid-up steps (Rs 95,880) and imported above its own cap on 25 steps; now it does neither.",
+     "commits": [
+      "backend bc94f47",
+      "backend 155e48f",
+      "frontend 278dea7"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_the_plan_never_sheds_load_with_the_grid_up_to_hold_its_mdi",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_a_voll_of_zero_never_sheds_with_the_grid_up",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_only_load_beyond_the_connection_and_pv_is_unserved_with_the_grid_up_and_it_is_named",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_the_problem_values_lost_load_at_least_at_the_dearest_import_price",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_a_ticked_plan_never_sheds_with_the_grid_up_nor_imports_above_its_own_cap",
+      "frontend/src/lib/reasons.test.ts (unserved sentences)"
+     ],
+     "files": [
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/gridlytics/optimise.py",
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/gridlytics/plans.py",
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/tests/test_fix_r7_optimiser_plans.py",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/lib/reasons.ts",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/lib/reasons.test.ts",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "flow-telemetry-plan-control-02",
+     "status": "implemented",
+     "summary": "Fixes engine-plans-live-04 and engine-plans-live-13 too. A grid charge that is not cheaper than the price its energy is used at, and that binding reserve rows hold, is now the new reason charge_for_reserve. Its detail carries rs_per_kwh, p, within_h, hours and kwh. p is the chance of an outage starting over the hold's whole window, not one step's p. hours is two steps behind an AMF panel, taken from solve's new R_steps. kwh is never above the usable band. charge_from_grid now carries use_t and use_rs_per_kwh. The web app sentence names the price paid and when the energy is used, and mentions a dearer price only when the use price really is dearer; 'while energy is cheaper' is gone. Peak buying itself is kept only where the reserve's priced shortfall pays for it ('priced and labelled'): below p = 0.01 there is no row and no peak grid charging (tested). The deeper causes of the inflated reserve (sigma, the AMF reserve, discharge power) are in later batches of this package.",
+     "commits": [
+      "backend 011a971",
+      "frontend 71cedf0"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_grid_charging_in_the_peak_for_the_reserve_is_named_for_the_reserve_and_never_cheaper",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_no_grid_charging_in_the_peak_without_a_reserve_row",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_off_peak_grid_charging_names_the_price_and_the_time_the_energy_is_used_at",
+      "frontend/src/lib/reasons.test.ts (charge_from_grid / charge_for_reserve sentences)"
+     ],
+     "files": [
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/gridlytics/optimise.py",
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/tests/test_fix_r7_optimiser_plans.py",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/lib/reasons.ts",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/lib/reasons.test.ts",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "flow-telemetry-plan-control-08",
+     "status": "implemented",
+     "summary": "Fixes engine-plans-live-14 too. A grid-up step with energy above the floor that neither charges nor discharges is now named from the solution's own figures, in this order:\n- hold_for_outage: a reserve row binds from this step on, before the battery next charges or discharges. This also covers steps whose own p_start is under 0.01, so a held peak no longer flips with 'Wear > saving'. kwh is never above what the battery holds, p is the chance over the window, and hours is 0.5 h behind an AMF panel.\n- save_for_later (new): the energy is discharged later, before the next charge. Detail use_t, use_rs_per_kwh, use_reason (for example the Karachi MDI case).\n- wear_margin_too_small: only where putting the kWh back at the next charge leaves a positive gap below the wear cost. Detail gap_rs_per_kwh and wear_rs_per_kwh.\n- terminal_value: nothing in the horizon refills or uses the energy.\nAt an off-grid site the battery 'carries the load' (carry_load, new) instead of 'carry_outage'. A tie-break of 0.002 Rs/kWh across the horizon, on grid-up steps only, discharges the earlier and charges the later of two equal steps. This removes the 80/0/80/0 'Peak discharge'/'Wear' alternation at one price; grid-down and off-grid costs are unchanged, so the farm's solve times are unaffected. On the web app, the hold sentence and the legend no longer say 'a likely outage': the legend gives the range of p its steps carry. Sentences were added for save_for_later, carry_load and wear with its figures. delivery.step_intents compiles save_for_later as a hold, like the no-flow reasons it replaces.",
+     "commits": [
+      "backend 74a8c1a",
+      "frontend 55eb5ab"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_a_battery_held_through_the_peak_for_the_reserve_says_so_on_every_step_without_flipping",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_a_peak_step_whose_energy_is_spent_later_says_when_not_wear",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_wear_is_named_only_where_a_positive_price_gap_is_smaller_than_the_wear_cost",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_an_off_grid_battery_carries_the_load_not_an_outage",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_the_reserve_behind_an_amf_panel_says_it_covers_two_steps",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_a_discharge_at_one_price_is_one_run_not_peak_discharge_and_wear_by_turns",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_a_step_saved_for_later_compiles_as_a_hold_like_the_no_flow_reasons_it_replaces",
+      "frontend/src/lib/reasons.test.ts (hold/save/wear/carry sentences)",
+      "frontend/src/features/plan/reasons-legend.test.tsx"
+     ],
+     "files": [
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/gridlytics/optimise.py",
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/gridlytics/delivery.py",
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/tests/test_fix_r7_optimiser_plans.py",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/lib/reasons.ts",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/lib/reasons.test.ts",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/features/plan/reasons-legend.tsx",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/features/plan/reasons-legend.test.tsx",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/features/overview/overview-page.test.tsx",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/optimiser-plans/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "engine-plans-live-17",
+     "status": "implemented",
+     "summary": "Every Mode A slot carries grid_cap_w = M, and the device shaves each instant above it, but the MDI rows only bounded each 30-minute block's mean. So a step could import above the cap (Karachi: 962 kW against 902), and charging ran 65.6/0/188.6/0 kW. Each grid-up step now gets its own row, G[t] + (Lhi[t] - L[t]) <= M (M2 after the month's end), under the upper load quantile as the block rows are. Planned import now stays at or under the plan's own cap step by step. Grid charging and peak shaving under a binding cap are smooth instead of alternating. The tick-level test also checks that no step imports above mdi_cap_kw.",
+     "commits": [
+      "backend 42f349f",
+      "backend 155e48f"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_each_steps_import_stays_under_the_plans_own_mdi_cap_and_grid_charging_is_smooth",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_a_peak_discharge_held_to_the_cap_under_the_upper_load_does_not_alternate",
+      "backend/tests/test_fix_r7_optimiser_plans.py::test_a_ticked_plan_never_sheds_with_the_grid_up_nor_imports_above_its_own_cap"
+     ],
+     "files": [
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/gridlytics/optimise.py",
+      "/home/user/wt/optimiser-plans/gridlytics-backend/backend/tests/test_fix_r7_optimiser_plans.py"
+     ]
+    }
+   ],
+   "notes": "All four findings in batch 1 (index 0) are implemented, along with their duplicates (engine-plans-live-01, -04, -13, -14). Both worktrees are clean on audit/optimiser-plans. Backend: 5 commits, bc94f47..155e48f. Web app: 3 commits, 278dea7..55eb5ab.\n\nChecks:\n- Full backend suite: 520 passed, 8 skipped.\n- Full web app gates: typecheck clean, 265 tests in 40 files pass, build clean.\n- Under the machine's load (about 10 on 4 CPUs) three time-limited tests in test_fix_r2_optimiser flaked once. They passed when rerun alone and in the full locked run.\n\nEdits outside my files, each minimal:\n- backend/gridlytics/delivery.py (delivery-twin's): one word added to the step_intents tuple, so the new save_for_later reason compiles as a hold like the no-flow reasons it replaces. It has its own test.\n- frontend/src/features/overview/overview-page.test.tsx (fleet-overview's): one regex updated to the new reserve sentence, which now says 'in the next 15 minutes, lasting about 1 h'.\n\nShared additive files, appended only: frontend/src/types/api.ts (new optional ReasonDetail fields: grid, use_t, use_rs_per_kwh, within_h, use_reason, gap_rs_per_kwh, wear_rs_per_kwh) and docs/API_CONTRACT.md (new section '## Round 7 (audit): optimiser-plans').\n\nNew reason keys: charge_for_reserve, save_for_later, carry_load. The new money detail keys end in _rs_per_kwh, so money.py strips them for viewers and API keys. The sentences read without them.\n\nFor integration and other packages:\n- control-edge: the wrong-plan guard's MDI check is yours. The tick-level test here proves a ticked plan never sheds with the grid up and never plans import above mdi_cap_kw.\n- sites-onboarding: sites.py still accepts voll >= 0. The engine now floors VoLL at the horizon's dearest import price in build_problem. A matching server-side lower bound is optional.\n- telemetry-genset-battery: battery-cards.tsx still has the hint 'Held back for a likely outage'. It is not a plan reason and was left alone.\n- For the round 7 DESIGN_LOG, two rules worth settling:\n  - No unserved load with the grid up except beyond G_max + PV. This departs from spec 4.3, where Lserved = L with the grid up.\n  - Each step's import stays under the plan's own MDI cap, under q75. This is stricter than the bill's 30-minute mean, deliberately, because the device enforces the cap per instant.\n- The large mdi_rise_rs on a site's first plans of a month (M0 = 0) is batch 4's engine-optimiser-02 / engine-plans-live-08. It was not touched here."
+  }
+ },
+ "forecasts-outages": {
+  "1": {
+   "results": [
+    {
+     "id": "engine-forecast-01",
+     "status": "implemented",
+     "summary": "forecast.pv now fits the performance ratio and the clearness fan on the 14 whole local days before the tick's own day (new _local_midnight helper; the partial day is left out of the fit; the last-hour blend still reads up to t0). On the finding's alternating clear/0.45 history, the ticks at 00:00, 09:00, 12:00 and 15:00 now all fit pr 1.0 and the fan 0.45/0.45/0.725/1.0. Before the fix, the 09:00 tick fitted 0.937 and the 12:00 tick 0.742.",
+     "commits": [
+      "7949d90"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_forecasts_outages.py::test_the_pv_fit_reads_whole_local_days_so_every_tick_of_a_day_fits_the_same_ratio_and_fan"
+     ],
+     "files": [
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/gridlytics/forecast.py",
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/tests/test_fix_r7_forecasts_outages.py"
+     ]
+    },
+    {
+     "id": "engine-forecast-04",
+     "status": "implemented",
+     "summary": "New forecast.available_pv(g) returns pv + curtail_w (NaN where the output is unknown). The stage-1 fit, the last-hour smart-persistence blend, score_day's PV actuals and the forecast page's PV actuals now read it instead of the curtailed pv_power_w. A clear plant that curtails 40 % from 11:00 to 14:00 now fits pr 1.0 (before: 0.83), and a clear-sky forecast now scores under 1 % nRMSE.",
+     "commits": [
+      "775d55e"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_forecasts_outages.py::test_the_pv_fit_and_score_read_available_power_not_curtailed_output"
+     ],
+     "files": [
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/gridlytics/forecast.py",
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/tests/test_fix_r7_forecasts_outages.py"
+     ]
+    },
+    {
+     "id": "pages-C-22",
+     "status": "implemented",
+     "summary": "Covers duplicates engine-forecast-07 and role-analyst-18. Backend: the score_day PV and load rows moved into a new _power_scores. The PV day-ahead row now carries a smart-persistence baseline: clear sky times yesterday's clearness index at the same step, with model and baseline scored over the same daytime slots. PV and load also get one row per horizon class (0-2h, 2-6h, 6-24h, 24-48h), scored over every stored issue whose steps fall on the day at that horizon. PV class baselines are the persistence known at the issue time: last hour's clearness for 0-2h (reported only), same step yesterday for 2-6h and 6-24h, two days before for 24-48h. Load's baseline is the same slot a week before. The day-ahead row stays first because alerts.nightly reads the first PV row. scores() returns: days with only the day-ahead rows plus skill and horizon_class; a summary per kind with last7/n7 over the last 7 calendar days, last30/n, baseline means, skill_last7/skill_last30, baseline_kind and horizons[]; plus from/from7. Web app: the 7-day tile says 'N of the last 7 days scored' (role-analyst-18). A new 'Skill against <baseline>, last 30 days' tile shows each kind's skill. PV and load get an 'accuracy by hours ahead' table that names the plan's 25 % gate at 6-24 h. The outage model card now counts its Brier days per window and adds its skill. An older answer keeps the earlier wording. API_CONTRACT has a 'Round 7 (audit): forecasts-outages' section.",
+     "commits": [
+      "f49fa6a",
+      "056ac24"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_forecasts_outages.py::test_pv_scores_carry_a_smart_persistence_baseline_and_every_horizon_class",
+      "backend/tests/test_fix_r7_forecasts_outages.py::test_the_accuracy_summary_gives_skill_overall_and_by_horizon_class",
+      "frontend/src/features/forecasts/forecasts-r7.test.tsx (counts the 7-day tile's days..., shows each kind's skill..., an older answer...)",
+      "frontend/src/features/outages/outage-model-card.test.tsx"
+     ],
+     "files": [
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/gridlytics/forecast.py",
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/tests/test_fix_r7_forecasts_outages.py",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/forecasts/accuracy-cards.tsx",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/forecasts/forecast-words.ts",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/forecasts/forecast-panel.tsx",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/outages/outage-model-card.tsx",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/test/fixtures/fc_scores_r7.json",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/forecasts/forecasts-r7.test.tsx",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/outages/outage-model-card.test.tsx",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "pages-C-01",
+     "status": "implemented",
+     "summary": "Backend: forecast.page() now also returns `past`: the 96 steps before belief_time with their 15-minute actuals (available PV, load, or 1 where the grid was down). It also carries the arrays of the issue held a day before over those steps (q05-q95 and cs for PV, quantiles and crit for load, p_down and p_start for outages). Its belief_time is None when no such issue exists. The actual computation moved into the shared helpers _actual15 and _past. Web app: withPast (forecast-words.ts, memoised in the panel) joins the past in front of the latest issue for the PV and load fans and the outage chart. The now line sits at belief_time between past and forecast, and a line under each chart says which issue the past shows. 'No actuals yet' shows only when neither part has a reading. An older backend without `past` renders as before.",
+     "commits": [
+      "77bc903",
+      "ce0d6e3"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_forecasts_outages.py::test_the_forecast_page_carries_the_past_24_hours_of_actuals_and_the_issue_held_then",
+      "backend/tests/test_fix_r7_forecasts_outages.py::test_the_past_of_a_site_without_an_older_issue_still_has_its_actuals",
+      "frontend/src/features/forecasts/forecasts-r7.test.tsx (draws the past 24 hours..., withPast x2)"
+     ],
+     "files": [
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/gridlytics/forecast.py",
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/tests/test_fix_r7_forecasts_outages.py",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/forecasts/forecast-panel.tsx",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/forecasts/forecast-words.ts",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/forecasts/forecasts-r7.test.tsx",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "engine-forecast-03",
+     "status": "implemented",
+     "summary": "With 3 to 6 fitted days, forecast.pv now keeps the prior's shape but moves its median from the month's climatology towards the site's median clearness, with weight days/7. The step to the empirical quantiles at 7 days stays small. Before the fix, the scaling term median(kn)/median(kn) was 1, so the prior was used unchanged. A mostly overcast 4-day site now forecasts a median below the prior's 0.89, and an all-clear site a median above it.",
+     "commits": [
+      "35f94af"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_forecasts_outages.py::test_with_three_to_six_fitted_days_the_clearness_quantiles_move_with_the_site_s_days"
+     ],
+     "files": [
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/gridlytics/forecast.py",
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/tests/test_fix_r7_forecasts_outages.py"
+     ]
+    },
+    {
+     "id": "engine-forecast-14",
+     "status": "implemented",
+     "summary": "Both halves are fixed. (1) The 'last 7 days' figure now covers the last 7 calendar days in Pakistan time, with n7 days scored, instead of the last 7 scored rows. This is in scores() in the scoring commit, and the tiles show the n7 count. (2) The outage chart's p_start: p_start[i] is the chance an outage starts in step i+1, matching how optimise.py:314 holds the reserve at the end of step i. The new outageSeries (outage-probability-chart.tsx, used by both the Forecasts and Outages pages) now draws that series at t[i] + 15 minutes. The backend answer is unchanged.",
+     "commits": [
+      "f49fa6a",
+      "77d2289",
+      "056ac24"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_forecasts_outages.py::test_the_seven_day_summary_covers_the_last_seven_calendar_days",
+      "frontend/src/features/outages/outage-probability-chart.test.ts"
+     ],
+     "files": [
+      "/home/user/wt/forecasts-outages/gridlytics-backend/backend/gridlytics/forecast.py",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/outages/outage-probability-chart.tsx",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/outages/outage-probability-chart.test.ts",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/frontend/src/features/forecasts/forecast-panel.tsx",
+      "/home/user/wt/forecasts-outages/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    }
+   ],
+   "notes": "Batch 1 of 5 (PV fit, scoring and accuracy summary) is implemented in both worktrees on branch audit/forecasts-outages, and both are clean.\n\nCommits:\n- Backend: 7949d90, 775d55e, 35f94af, f49fa6a, 77bc903.\n- Web app: 77d2289, 056ac24, ce0d6e3.\n\nChecks:\n- Full backend suite with -n 4: exit 0, no failures. The doubled -q hid the summary line.\n- Full web gates: typecheck, 41 files and 269 tests, build all pass.\n- Each new test was run first and failed for the right reason. Only \"an older answer keeps the earlier wording\" passed before the fix; it is a compatibility guard.\n\nPoints for the later batches and for integration:\n- The load day-ahead row is unchanged on purpose: its value is on `ok` and its baseline on `okp`, with no censoring. engine-forecast-06 (batch 3) should apply the same-slot-set rule that PV now uses in _power_scores. The load actuals there are `act = _q15(g[\"load\"])`, one place to censor, which also feeds the new load horizon-class rows.\n- alerts.nightly reads the first PV row of score_day. score_day keeps the day-ahead row first, so alerts.py (another package's file) did not need editing.\n- No store.py migration: the existing forecast_scores table already keys on horizon_class and has baseline_value.\n- Shared files edited, all additive: frontend/src/types/api.ts (optional fields on ForecastPage and ForecastScores, plus new ForecastPast, ForecastScoreWindow and ForecastScoreSummary) and docs/API_CONTRACT.md (a new section, \"Round 7 (audit): forecasts-outages\").\n- The new fixture fc_scores_r7.json is imported directly by the tests and is not registered in test/fixtures/index.ts, to avoid conflicts in that shared file.\n- The forecast page's `past` key also reaches the Outages page through routes_telemetry's forecast.page(s, \"outage\"). That page's chart does not use it yet; batch 4 can.\n- In _power_scores I chose to score the PV day-ahead model and its baseline over the same slots when yesterday has at least 8 of them, so the skill compares like with like. Otherwise the value covers all daytime slots and there is no baseline.\n- HANDOFF and DESIGN_LOG were left alone, as the plan asks."
+  }
+ },
+ "telemetry-genset-battery": {},
+ "sites-onboarding": {
+  "1": {
+   "results": [
+    {
+     "id": "flow-onboarding-05",
+     "status": "implemented",
+     "summary": "Fixed in both repositories. On the server, PUT /api/sites/:id, PUT /api/sites/:id/connection (with id) and PUT /api/sites/:id/assets/:role take an optional if_unchanged: the stored fields the form was based on, or null for a connection or asset when none was stored. If any of those fields has changed since, the save gets 409 site_changed. The sentence names the fields, `changed` lists their keys, and nothing is written. The check and the write share one write transaction, and the audit line is written in it. A save without if_unchanged works as before, so Site settings is unchanged. In the wizard, the form keeps the site as it last matched it (form.base, saved in the draft). A tab counts as complete only when its values are what the site holds, not when they match the draft's own snapshot. A resumed draft whose site changed since shows 'The site was changed after this draft last matched it, on tab A ...' with two buttons: 'Use the site's values' or 'Keep the draft's values'. A draft from before round 7 that differs from its site gets the same choice. Every save sends its part as if_unchanged. A 409 reads the site again and offers the same choice. Tab B's own per-asset Save and Remove buttons also check and move the base, one asset at a time, so another person's change to an asset this save did not write is still caught. Text in the site and asset bodies is trimmed the way the server stores it, so a saved tab compares equal to the site.",
+     "commits": [
+      "gridlytics-backend 9b945b4",
+      "gridlytics-frontend 11022fb",
+      "gridlytics-frontend bf28ceb"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_sites_onboarding.py::test_a_site_save_based_on_older_values_is_refused_rather_than_written_over_newer_ones",
+      "backend/tests/test_fix_r7_sites_onboarding.py::test_a_connection_save_based_on_older_values_is_refused",
+      "backend/tests/test_fix_r7_sites_onboarding.py::test_an_asset_save_based_on_older_values_is_refused",
+      "frontend/src/features/sites/onboarding/r7-draft-integrity.test.tsx (describe 'flow-onboarding-05: a resumed draft never reverts newer changes to its site', 4 tests)",
+      "frontend/src/features/sites/onboarding/r7-draft-integrity.test.tsx (describe 'flow-onboarding-05: the wizard's own saves move its base with them', 2 tests)"
+     ],
+     "files": [
+      "/home/user/wt/sites-onboarding/gridlytics-backend/backend/gridlytics/sites.py",
+      "/home/user/wt/sites-onboarding/gridlytics-backend/backend/gridlytics/routes_sites.py",
+      "/home/user/wt/sites-onboarding/gridlytics-backend/backend/tests/test_fix_r7_sites_onboarding.py",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/onboarding-tabs.ts",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/use-onboarding.ts",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/new-site-page.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/site-form.ts",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/assets-editor.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/tab-b-assets.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/r7-draft-integrity.test.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "flow-onboarding-15",
+     "status": "implemented",
+     "summary": "The wizard now sends what the autosave has not sent yet when it unmounts, that is when another page of the app opens. It also sends it on beforeunload, where it calls preventDefault so the browser asks before leaving. The 1.5 s autosave timer skips a payload that was already sent this way, so nothing is saved twice. I did not use keepalive fetch, because that would mean editing lib/api/client.ts, which belongs to auth-security; the browser's leave prompt gives the request time to finish instead.",
+     "commits": [
+      "gridlytics-frontend 6cd2c07"
+     ],
+     "tests": [
+      "frontend/src/features/sites/onboarding/r7-draft-integrity.test.tsx (describe 'flow-onboarding-15: the last edits are kept when the person leaves the wizard', 2 tests)"
+     ],
+     "files": [
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/use-onboarding.ts",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/r7-draft-integrity.test.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "pages-A-10",
+     "status": "implemented",
+     "summary": "Review and activate is now locked until tabs A to D are all complete (plan 9.3, R8 2.2). The page names the tabs still open: 'Review and activate opens once tabs A to D are complete: tab D is not complete yet'. Tab D's 'Save and review' saves and then opens Review once it unlocks. LetteredNav's own next button cannot reach a locked tab, so tab D uses its own button. Each Review row that still holds a typical default carries a Preliminary mark: map pin, worked-out peak load, PV tilt, azimuth and losses, battery health, efficiencies and state-of-charge band, wear economics, genset curve and costs, sanctioned load, reserve policy, cycle cap, critical load. A note lists them all. A 'What happens next' card follows R8 2.19 step 6. Its savings sentence is reworded to the conditions verify.py actually applies (28 verified days, native capture, 8 weeks of switchback, each month's fuel charge adjustment), because R8's 'Verified after 28 days' is not true of the code.",
+     "commits": [
+      "gridlytics-frontend c63f51e"
+     ],
+     "tests": [
+      "frontend/src/features/sites/onboarding/r7-review.test.tsx (describe 'pages-A-10: Review opens once tabs A to D are complete, with the defaults marked and what happens next', 2 tests)"
+     ],
+     "files": [
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/use-onboarding.ts",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/tab-review.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/tab-d-control.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/new-site-page.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/r7-review.test.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "flow-onboarding-06",
+     "status": "implemented",
+     "summary": "Review cannot be opened while equipment is typed but not saved, because tab B is then incomplete and Review is locked. Review shows what GET /sites/:id holds (formFromSite of the site), not the typed form. The hook has a new saveAll, used by tab D's 'Save and review' and by Activate. It saves every incomplete tab in order and stops at, and opens, a tab that cannot be saved. Activate sends POST /activate only after that, so typed PV and battery figures are saved before activation and are not lost with the draft. The server's activation rule (data source, tariff) is the batch-2 findings and was not touched here.",
+     "commits": [
+      "gridlytics-frontend c63f51e"
+     ],
+     "tests": [
+      "frontend/src/features/sites/onboarding/r7-review.test.tsx (describe 'flow-onboarding-06: nothing typed and unsaved is activated past, or shown as saved')"
+     ],
+     "files": [
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/use-onboarding.ts",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/tab-review.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/tab-d-control.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/r7-review.test.tsx"
+     ]
+    },
+    {
+     "id": "pages-A-15",
+     "status": "implemented",
+     "summary": "The shared DataSourceCard (wizard tab A and Site settings General) now clears the grid-signal tick when another kind of source is chosen. The source schema then refuses the save on the page until the person ticks it again for the new kind. So {kind: 'csv', grid_signal_confirmed: true} is only sent after a real confirmation, and the server's stamp (sites._stamp_source) records the person who gave it.",
+     "commits": [
+      "gridlytics-frontend 1264efd"
+     ],
+     "tests": [
+      "frontend/src/features/sites/settings/r7-data-source.test.tsx (2 tests: Site settings General and wizard tab A)"
+     ],
+     "files": [
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/onboarding/tab-a-site.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/frontend/src/features/sites/settings/r7-data-source.test.tsx",
+      "/home/user/wt/sites-onboarding/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    }
+   ],
+   "notes": "All five ids of batch 1 (index 0) are implemented, test-first: each new test was run against the unfixed code and failed for the stated reason before the fix. Both worktrees are clean on audit/sites-onboarding. Nothing pushed or merged.\n\nChecks: full backend suite 506 passed, 8 skipped. Web app full gates (typecheck, 41 files and 272 tests, build) pass, run on the final code.\n\nThings for integration:\n- API change: PUT /api/sites/:id, PUT /api/sites/:id/connection (with id) and PUT /api/sites/:id/assets/:role take an optional `if_unchanged`. A mismatch gets 409 `site_changed` with `changed`. `if_unchanged` without `id` on a connection is 422, and null on a site is 422. This is recorded under '## Round 7 (audit): sites-onboarding' at the end of the web app's docs/API_CONTRACT.md. The older UI-02 line 'Tabs B to Review are locked until site exists' was left as it was (append-only); the new section supersedes it.\n- sites.update, put_connection and put_asset now run as one write transaction (BEGIN IMMEDIATE) with the audit line written in it. demo.py's seeding calls them outside any open write connection, so it is unaffected. sites.py has new public names: UNCHECKED, Changed, check_unchanged, ASSET_NAMES.\n- Shared web-app helpers changed. siteBody now trims outage_unit code and name, and assetBody trims text fields, as the server stores them. Without this a saved tab would never compare equal. The fix also removes a latent 'Unsaved changes' forever after a trailing space in a model name.\n- AssetsEditor has an optional `guard` prop, which Site settings does not pass. New exports in onboarding-tabs.ts: SiteBase, SITE_KEYS, baseFrom, stableJson, siteChangedSince, sectionKey, staleTabs, takeFromSite, tabWords, pickFields.\n- Tab D's next step is now its own 'Save and review' button that calls saveAll. It passes lt with nextId: null to LetteredNav, so components/workflow (owned by other packages) was not edited.\n- saveAll saves every incomplete tab, which can save tab C's default connection if the person never opened it. That fits R8 2.2 (activate with defaults, each marked Preliminary). The sanctioned-load default is marked; the tariff-category and DISCO default marks are left for this package's batch 3.\n- No file owned by another package was edited. lib/api/client.ts was deliberately not touched for keepalive.\n- Housekeeping: the flow-onboarding-15 commit was amended once, locally and unpushed, to fix a type error (useRef<() => boolean>) and to drop a test file that `git add -A` had swept in. History is clean.\n- The batch notes mention backend/tests/test_r7_sites.py; following the task text, the backend test file is backend/tests/test_fix_r7_sites_onboarding.py."
+  }
+ },
+ "fleet-overview": {
+  "1": {
+   "results": [
+    {
+     "id": "flow-onboarding-04",
+     "status": "implemented",
+     "summary": "A site that has been created but not activated is no longer a dead end. The Overview and Plan pages now offer 'Activate the site' (POST /sites/:id/activate, which needs edit_sites; a refusal is shown in the server's own words, and the answer updates the cached site). It is the last step of the first-plan checklist. When everything else is in, or a plan from a manual re-solve is in force, a notice says the site is not activated yet and the optimiser plans only active sites, and offers Activate. The 15-minute promise is gone for such a site. A role without edit_sites is told that an administrator or operator activates it. The Fleet's Next column reads 'Not activated yet, so no plan'.",
+     "commits": [
+      "frontend 143f47b"
+     ],
+     "tests": [
+      "frontend/src/features/plan/plan-empty.test.tsx (A site that is not activated: 3 tests)",
+      "frontend/src/features/overview/overview-page.test.tsx (UI-04 for a site that is not activated: 3 tests, including clicking Activate posts /activate and the notice turns to the active wording)",
+      "frontend/src/features/sites/fleet-page.test.tsx (says a site is not activated yet where its next plan step would be)",
+      "frontend/src/lib/site-rules.test.ts (isActivated)"
+     ],
+     "files": [
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/overview/activate-site.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/overview/overview-page.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/plan/plan-empty.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/sites/fleet-page.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/lib/site-rules.ts",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "pages-A-01",
+     "status": "implemented",
+     "summary": "Fixed by the same commit as flow-onboarding-04. The Overview and Plan checklists read site.status, and the Overview takes the site's own status first and then /now's site.status. For an observing site they add 'Activate the site' as the last step and drop 'it solves every 15 minutes' and 'the first plan arrives within 15 minutes'. Their hints now say the optimiser plans only active sites. The Plan page's half lives in plan-empty.tsx (this package's), so plan-page.tsx is untouched.",
+     "commits": [
+      "frontend 143f47b"
+     ],
+     "tests": [
+      "frontend/src/features/plan/plan-empty.test.tsx",
+      "frontend/src/features/overview/overview-page.test.tsx"
+     ],
+     "files": [
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/overview/overview-page.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/plan/plan-empty.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/overview/activate-site.tsx"
+     ]
+    },
+    {
+     "id": "flow-savings-pilot-bill-02",
+     "status": "implemented",
+     "summary": "Covers its duplicates role-owner-01, role-operator-01 and role-analyst-02. Before, _mtd_saving summed only the daily claimed_rs, so Fleet and Overview left out the month's MDI lever. It now reads verify.summary from the 1st to today, exactly as GET /savings does for 'This month', and takes the native baseline's claimed_rs, MDI lever included. The figure is null while no day of the month is scored. The fleet summary is the sum of the rows and matches /fleet/savings total_claimed_rs within rounding. The test checks equality with the Savings answer and does not pin a figure. The test's data gives a non-zero MDI lever (before the fix: 1212 vs 61212). The sparkline still reads per-day saving_rs; that is batch 3's.",
+     "commits": [
+      "backend b0cbdb7",
+      "frontend 522bb35"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_fleet_overview.py::test_the_month_to_date_saving_on_fleet_and_overview_is_the_savings_page_s_month_figure_with_its_mdi_lever"
+     ],
+     "files": [
+      "/home/user/wt/fleet-overview/gridlytics-backend/backend/gridlytics/routes_sites.py",
+      "/home/user/wt/fleet-overview/gridlytics-backend/backend/tests/test_fix_r7_fleet_overview.py",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "pages-B-12",
+     "status": "implemented",
+     "summary": "Added lib/site-rules.gridSettled, which mirrors routes_sites._grid_settled: a connection, a farm, or data.off_grid on a site of any type. The Overview Checklist and PlanEmpty use it, so a non-farm off-grid site's grid step reads Done. site-form.ts canRemoveConnection belongs to sites-onboarding and already applies the same rule, so it was not touched.",
+     "commits": [
+      "frontend 1620eec"
+     ],
+     "tests": [
+      "frontend/src/lib/site-rules.test.ts (gridSettled)",
+      "frontend/src/features/plan/plan-empty.test.tsx (UI-09 cold-start checklist, the grid step)",
+      "frontend/src/features/overview/overview-page.test.tsx (UI-04 checklist, the grid step)"
+     ],
+     "files": [
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/lib/site-rules.ts",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/plan/plan-empty.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/overview/overview-page.tsx"
+     ]
+    },
+    {
+     "id": "pages-A-03",
+     "status": "implemented",
+     "summary": "Covers its duplicate role-viewer-09 for this package's half. In the backend, fleet_row now treats off-grid as a fact about the site: a connection of regime off_grid, or no connection at a farm or at a site whose data says off_grid (it reuses _grid_settled). A grid site with no saved connection gets category null, and summary.in_outage now counts it. In the web app, FleetSite.category is string | null and the row shows 'Grid connection not saved'. Not done here: the site header line (site-header.tsx belongs to shell-nav) and the Outages page's 'no grid connection (off grid)' sentence that role-viewer-09 cites (features/outages belongs to forecasts-outages).",
+     "commits": [
+      "backend af08a4a",
+      "frontend 097d968"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_fleet_overview.py::test_a_grid_site_without_its_connection_yet_is_not_off_grid_in_the_fleet_and_its_outage_counts",
+      "frontend/src/features/sites/fleet-page.test.tsx (reads 'Grid connection not saved' ...)",
+      "backend/tests/test_fix_r3_api.py (the existing off-grid connection case still passes)"
+     ],
+     "files": [
+      "/home/user/wt/fleet-overview/gridlytics-backend/backend/gridlytics/routes_sites.py",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/sites/fleet-page.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/types/api.ts",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/docs/API_CONTRACT.md"
+     ]
+    },
+    {
+     "id": "pages-A-08",
+     "status": "implemented",
+     "summary": "Covers the money-tile half of its duplicate frontend-states-formats-19. The fleet row, the fleet summary and /now's month now carry the method ('counterfactual') and the computation date of the month's days, as mtd_saving_rs_method/mtd_saving_rs_computed and month.saving_rs_method/saving_rs_computed. Because the names contain '_rs_', money.py strips them for a viewer and an API key, along with the figure. The tiles read, for example, 'Counterfactual replay against the native settings, computed 9 Nov 2026, 05:40' in Karachi time; Fleet says 'last computed' and uses the newest date. Without a scored day they say no day of the month is scored yet. The 'Estimated' mark on SoC that frontend-states-formats-19 also mentions is not a money tile and is not in this batch.",
+     "commits": [
+      "backend b0cbdb7",
+      "frontend 522bb35"
+     ],
+     "tests": [
+      "backend/tests/test_fix_r7_fleet_overview.py (method and computed equal the Savings answer's; the viewer's answers hold none of them)",
+      "frontend/src/features/overview/overview-page.test.tsx (UI-04 the month's saving names its method and computation date)",
+      "frontend/src/features/sites/fleet-page.test.tsx (names the saving's method and when it was last computed; fleetKpis picks the newest real-site date)"
+     ],
+     "files": [
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/overview/saving-basis.ts",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/overview/overview-page.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-frontend/frontend/src/features/sites/fleet-page.tsx",
+      "/home/user/wt/fleet-overview/gridlytics-backend/backend/gridlytics/routes_sites.py"
+     ]
+    }
+   ],
+   "notes": "Batch 1 of fleet-overview is done in both worktrees on audit/fleet-overview. Both trees are clean; nothing was pushed or merged.\n\nBackend commits:\n- b0cbdb7: month-to-date saving taken from verify.summary, with its method and computation date.\n- af08a4a: fleet category reads off-grid from the site; a grid site with no saved connection gets null.\n\nBoth change only _mtd_saving, fleet_row, fleet and site_now in routes_sites.py, and add the 'verify' import. fleet_row calls _grid_settled (sites-onboarding's function) read-only.\n\nWeb app commits:\n- 097d968: pages-A-03.\n- 143f47b: activation.\n- 1620eec: gridSettled.\n- 522bb35: saving method and date.\n\nNew web app files:\n- frontend/src/lib/site-rules.ts and its test\n- features/overview/activate-site.tsx\n- features/overview/saving-basis.ts\n- features/plan/plan-empty.test.tsx\n\nShared files, appended only:\n- types/api.ts: FleetSite.category changed to string | null; the other new fields are optional.\n- docs/API_CONTRACT.md: new section '## Round 7 (audit): fleet-overview'.\n\nNot touched, and left to other packages: site-header.tsx (shell-nav), the Outages page wording (forecasts-outages), site-form.ts (sites-onboarding), plan-page.tsx (optimiser-plans). use-settle.ts is imported only.\n\nTests:\n- The new backend tests failed first for the right reasons (1212 vs 61212 without the MDI lever; 'Off-grid' for a grid site with no connection).\n- The new web app tests failed first: 12 failures before the fix.\n- Backend: test_fix_r7_fleet_overview, test_api_walk, test_fix_api, test_fix_r2_api, test_fix_r3_api, test_fix_r5_api and test_fix_r6_savings all pass on the final state (89 passed).\n- Web app full gates: typecheck clean, 40 files and 274 tests pass, build clean.\n- One plan-page test ('re-solves on request') failed once under machine load and passed on two reruns. It is unrelated to these changes.\n\nNew keys mtd_saving_rs_method, mtd_saving_rs_computed, saving_rs_method and saving_rs_computed: the '_rs_' in their names deliberately puts them under money.py's by-name filter, so viewers and API keys never get them.\n\nDecision: the tile figure is the native baseline's claimed_rs, as before, but now with the month's MDI lever. It equals the Savings page's 'Claimed on verified days' and /fleet/savings, and on the demo it equals the Savings headline too. The month is the calendar month, as the Savings page's 'This month' uses."
+  }
+ },
+ "alerts-reports": {},
+ "auth-security": {},
+ "founder-console": {},
+ "shell-nav": {
+  "1": {
+   "results": [
+    {
+     "id": "frontend-a11y-01",
+     "status": "implemented",
+     "summary": "Each route now carries its page name in its `handle` (app/router.tsx). Company pages use their own headings (Fleet, Alerts, Reports, Tariffs, Company settings, My account, Add a site). Site pages use the menu's words through the new sitePageLabel() in nav.ts, which the breadcrumb now uses too. The not-found route is 'Page not found'. The shell sets the tab title with useDocumentTitle (components/layout/route-title.ts): 'Plan \u00b7 Faisalabad textile mill (demo) \u00b7 Gridlytics' on a site page, 'No such site \u00b7 Gridlytics' for a 404 site, and the same strings PageHeader already writes on company pages. After a move to a new path, but not on first load and not for a query-string change, usePageFocus moves focus to the page's h1, or to <main> when there is no h1 yet. The phone menu's Radix dialog no longer sends focus back to its button when one of its links changed the page. A heading or <main> that receives focus shows no ring, using an important modifier to beat the unlayered :focus-visible rule. This also covers duplicates frontend-states-formats-08, role-viewer-10 and role-owner-18. Checked in the worktree's app at 1440 and 375 px: after a sidebar or phone-menu link, the next Tab lands on the stamp right after the site h1.",
+     "commits": [
+      "3a56828"
+     ],
+     "tests": [
+      "frontend/src/components/layout/app-shell.test.tsx: 'names the page in the tab, with the site's name on a site's page'",
+      "frontend/src/components/layout/app-shell.test.tsx: 'moves focus to the new page's heading after a navigation, and leaves it alone on the first load'",
+      "frontend/src/app/router.test.tsx: 'names every page of the app in its route, a site's pages with the menu's own words'",
+      "frontend/src/app/router.test.tsx: 'titles a site's page with the page and the site'"
+     ],
+     "files": [
+      "frontend/src/components/layout/route-title.ts",
+      "frontend/src/components/layout/app-shell.tsx",
+      "frontend/src/components/layout/nav.ts",
+      "frontend/src/components/layout/site-header.tsx",
+      "frontend/src/app/router.tsx",
+      "frontend/src/app/router.test.tsx",
+      "frontend/src/components/layout/app-shell.test.tsx"
+     ]
+    },
+    {
+     "id": "frontend-a11y-02",
+     "status": "implemented",
+     "summary": "A 'Skip to main content' link is now the first Tab stop on every shell page. It sits off screen until it has focus, and it is placed outside the shell's grid so showing it does not move the layout. Activating it focuses <main id=\"main\" tabIndex={-1}> without adding '#main' to the address (preventDefault, then focus). This also covers duplicates role-viewer-11, role-owner-12, role-operator-25 and role-analyst-22. A browser screenshot of the worktree app confirms the link appears at the top left on the first Tab.",
+     "commits": [
+      "055219f"
+     ],
+     "tests": [
+      "frontend/src/components/layout/app-shell.test.tsx: 'offers 'Skip to main content' as the first Tab stop, and it moves focus into the page'"
+     ],
+     "files": [
+      "frontend/src/components/layout/app-shell.tsx",
+      "frontend/src/components/layout/app-shell.test.tsx"
+     ]
+    },
+    {
+     "id": "role-owner-19",
+     "status": "implemented",
+     "summary": "Added components/layout/not-found.tsx: an h1, one plain sentence and a 'Go to the fleet' button. The '*' route uses it ('There is no such page', tab title 'Page not found'). SiteLayout uses it for a site that answers 404 ('There is no such site', tab title 'No such site'). The shell's useShellSite now treats a route site that answers 404 as no site, so the Site group links, the phone's short menu, Pilot set-up, the tier chip and the DEMO ribbon offer nothing for it. A site is now remembered as the last one worked on only after it has answered, so a bad id is never stored. This also covers duplicate role-viewer-23. Checked in the worktree's app: /sites/doesnotexist shows the heading, the sentence and the button, the menu shows only 'Choose a site', and there are now 2 API 404s instead of 3.",
+     "commits": [
+      "c94baac"
+     ],
+     "tests": [
+      "frontend/src/components/layout/app-shell.test.tsx: 'says so under a heading, with a way back, and the menu offers no links to the missing site'",
+      "frontend/src/app/router.test.tsx: 'answers an unknown address with a heading, a title and a way back to the fleet'",
+      "frontend/src/app/router.test.tsx: 'answers a site the company does not have with a heading and a way back, and no links to it'"
+     ],
+     "files": [
+      "frontend/src/components/layout/not-found.tsx",
+      "frontend/src/components/layout/site-layout.tsx",
+      "frontend/src/components/layout/app-shell.tsx",
+      "frontend/src/app/router.tsx",
+      "frontend/src/components/layout/app-shell.test.tsx",
+      "frontend/src/app/router.test.tsx"
+     ]
+    },
+    {
+     "id": "frontend-states-formats-22",
+     "status": "implemented",
+     "summary": "RouteErrorBoundary no longer shows a JavaScript error's message as the explanation. It says in a plain sentence what happened and what to do: reload, and tell your administrator if it happens again. The program's own message is kept under a closed 'Technical details' disclosure. A failed lazy chunk, which often follows a new release, gets its own sentence: 'Its code could not be loaded ... Reload the page'. An ApiError shows the server's own sentence, which is already written for people. A router 404 says 'There is no such page'. The heading 'This page could not be drawn' is unchanged, so the browser check's crash detection (scripts/e2e/pages.mjs) still works.",
+     "commits": [
+      "0879fd2"
+     ],
+     "tests": [
+      "frontend/src/components/ui/route-error-boundary.test.tsx (3 tests: plain sentence with the raw message hidden in details; chunk-load failure; ApiError sentence shown)"
+     ],
+     "files": [
+      "frontend/src/components/ui/route-error-boundary.tsx",
+      "frontend/src/components/ui/route-error-boundary.test.tsx"
+     ]
+    },
+    {
+     "id": "role-owner-41",
+     "status": "implemented",
+     "summary": "The router's page() helper now gives every lazy route (all 19 pages and /admin/*) a HydrateFallback, the PageLoading spinner. On first load the guards and the shell draw at once, with the spinner where the page will be. React Router no longer logs 'No `HydrateFallback` element provided to render during initial hydration'. Before the fix, the test saw the warning on a first load of /alerts. After it, the worktree app's console was clean on /fleet, /nosuchpage and /sites/doesnotexist. This also covers duplicate role-operator-33.",
+     "commits": [
+      "2e14bd6"
+     ],
+     "tests": [
+      "frontend/src/app/router.test.tsx: 'draws a lazy page on the first load without React Router's 'No HydrateFallback' warning'",
+      "frontend/src/app/router.test.tsx: 'gives every lazy page a loading fallback and an error boundary'"
+     ],
+     "files": [
+      "frontend/src/app/router.tsx",
+      "frontend/src/app/router.test.tsx"
+     ]
+    }
+   ],
+   "notes": "All five findings are implemented in the web-app worktree /home/user/wt/shell-nav/gridlytics-frontend on branch audit/shell-nav, in five commits on top of 499cebb: 0879fd2, 2e14bd6, 3a56828, 055219f, c94baac. The backend worktree is unchanged, because no API answer changed; for the same reason API_CONTRACT.md was not updated. Both worktrees are clean.\n\nChecks:\n- Full web-app gates (tf.sh shell-nav): typecheck clean, 40 files and 272 tests pass, build clean. Before this batch it was 38 files and 259 tests; this batch adds 13 tests in 3 files.\n- Each intermediate commit typechecks on its own; this was run in a temporary worktree, which has been removed.\n- Every new test failed before its fix for the expected reason.\n- I also checked the behaviour in a browser, using a Vite dev server of this worktree on port 5391 against the scratch API on 8151 (now stopped).\n\nFiles edited outside my own: none of another package's files were edited. The tab-title mechanism lives entirely in shell-owned files (router handles plus components/layout/route-title.ts).\n\nFor integration:\n1. PageHeader (components/ui/page-header.tsx, owned by ui-charts-a11y) still sets document.title itself. The route handles use exactly the same strings ('Fleet', 'Alerts', 'Reports', 'Tariffs', 'Company settings', 'My account', 'Add a site'), so the two writers agree. If either side renames a page, keep them in step, or drop PageHeader's title effect.\n2. Site-page titles come from nav.ts through sitePageLabel(). Batch 2's renames (for example the distinct names for 'Devices and data' and 'Devices and control', and Pilot set-up under the site) will flow into the tab titles and the breadcrumb automatically. The router test checks that the handles equal the menu labels.\n3. After a site is chosen in the Radix Select site switcher, the Select puts focus back on its own trigger, which may override the move to the page heading. This belongs to batch 3 (the site switcher).\n4. On /sites/doesnotexist, one GET /sites/<id>/now still answers 404, because SiteHeader renders while the site is loading. This is harmless.\n5. useShellSite now remembers a route's site only once that site has answered, rather than immediately."
+  }
+ },
+ "ui-charts-a11y": {},
+ "demo-seed": {}
+}

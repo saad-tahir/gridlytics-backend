@@ -1,0 +1,286 @@
+{
+ "summary": {
+  "sites": 4,
+  "online": 4,
+  "alerts": 3,
+  "critical": 0,
+  "mtd_saving_rs": 13452.0,
+  "in_outage": 0
+ },
+ "sites": [
+  {
+   "id": "6d4db49bf87e",
+   "name": "Faisalabad textile mill (demo)",
+   "status": "active",
+   "tier": "advisory_writes",
+   "demo": true,
+   "city": "Faisalabad",
+   "disco": "FESCO",
+   "category": "B-2(b)",
+   "control": {
+    "key": "following",
+    "label": "Following plan (table applied)"
+   },
+   "last_data": 1794149940,
+   "now": {
+    "ts": 1794149940,
+    "pv_kw": 0.0,
+    "load_kw": 92.82,
+    "grid_kw": 92.82,
+    "battery_kw": 0.0,
+    "genset_kw": 0.0,
+    "soc_pct": 95.0,
+    "grid_present": 1.0,
+    "genset_running": 0.0,
+    "mode": "hold"
+   },
+   "next_event": {
+    "t": 1794150900,
+    "local": "20:15",
+    "reason": "hold_for_outage",
+    "detail": {
+     "p": 0.03,
+     "hours": 1.75,
+     "kwh": 171.1
+    }
+   },
+   "open_alerts": 1,
+   "mtd_saving_rs": 0.0,
+   "spark": [
+    {
+     "day": "2026-11-01",
+     "saving_rs": 0.0
+    },
+    {
+     "day": "2026-11-02",
+     "saving_rs": -0.27
+    },
+    {
+     "day": "2026-11-03",
+     "saving_rs": 0.01
+    },
+    {
+     "day": "2026-11-04",
+     "saving_rs": -0.16
+    },
+    {
+     "day": "2026-11-05",
+     "saving_rs": -0.43
+    },
+    {
+     "day": "2026-11-06",
+     "saving_rs": 0.07
+    },
+    {
+     "day": "2026-11-07",
+     "saving_rs": 0.15
+    }
+   ],
+   "collecting_day": null
+  },
+  {
+   "id": "e9941b41c70b",
+   "name": "Karachi feed mill (demo)",
+   "status": "active",
+   "tier": "closed_loop",
+   "demo": true,
+   "city": "Karachi",
+   "disco": "K-Electric",
+   "category": "B-3",
+   "control": {
+    "key": "following",
+    "label": "Following plan"
+   },
+   "last_data": 1794149940,
+   "now": {
+    "ts": 1794149940,
+    "pv_kw": 0.0,
+    "load_kw": 512.88,
+    "grid_kw": 512.88,
+    "battery_kw": 0.0,
+    "genset_kw": 0.0,
+    "soc_pct": 20.0,
+    "grid_present": 1.0,
+    "genset_running": 0.0,
+    "mode": "hold"
+   },
+   "next_event": {
+    "t": 1794150900,
+    "local": "20:15",
+    "reason": "wear_margin_too_small",
+    "detail": {}
+   },
+   "open_alerts": 0,
+   "mtd_saving_rs": 2446.0,
+   "spark": [
+    {
+     "day": "2026-11-01",
+     "saving_rs": 7488.37
+    },
+    {
+     "day": "2026-11-02",
+     "saving_rs": 4748.43
+    },
+    {
+     "day": "2026-11-03",
+     "saving_rs": -1525.71
+    },
+    {
+     "day": "2026-11-04",
+     "saving_rs": -3622.25
+    },
+    {
+     "day": "2026-11-05",
+     "saving_rs": -498.6
+    },
+    {
+     "day": "2026-11-06",
+     "saving_rs": -1870.86
+    },
+    {
+     "day": "2026-11-07",
+     "saving_rs": -2273.1
+    }
+   ],
+   "collecting_day": null
+  },
+  {
+   "id": "37b2fd882dcb",
+   "name": "Lahore mall (demo)",
+   "status": "active",
+   "tier": "monitor",
+   "demo": true,
+   "city": "Lahore",
+   "disco": "LESCO",
+   "category": "A-2(c)",
+   "control": {
+    "key": "recommendation",
+    "label": "Recommendation only"
+   },
+   "last_data": 1794149940,
+   "now": {
+    "ts": 1794149940,
+    "pv_kw": 0.0,
+    "load_kw": 417.51,
+    "grid_kw": 417.51,
+    "battery_kw": 0.0,
+    "genset_kw": 0.0,
+    "soc_pct": 30.0,
+    "grid_present": 1.0,
+    "genset_running": 0.0,
+    "mode": "self_use"
+   },
+   "next_event": {
+    "t": 1794156300,
+    "local": "21:45",
+    "reason": "hold_for_outage",
+    "detail": {
+     "p": 0.01,
+     "hours": 1.0,
+     "kwh": 115.0
+    }
+   },
+   "open_alerts": 1,
+   "mtd_saving_rs": 0.0,
+   "spark": [
+    {
+     "day": "2026-11-01",
+     "saving_rs": 0.01
+    },
+    {
+     "day": "2026-11-02",
+     "saving_rs": -0.01
+    },
+    {
+     "day": "2026-11-03",
+     "saving_rs": 0.0
+    },
+    {
+     "day": "2026-11-04",
+     "saving_rs": 0.0
+    },
+    {
+     "day": "2026-11-05",
+     "saving_rs": 0.0
+    },
+    {
+     "day": "2026-11-06",
+     "saving_rs": -0.09
+    },
+    {
+     "day": "2026-11-07",
+     "saving_rs": 0.0
+    }
+   ],
+   "collecting_day": null
+  },
+  {
+   "id": "47895916bed4",
+   "name": "Rahim Yar Khan farm (demo)",
+   "status": "active",
+   "tier": "advisory_writes",
+   "demo": true,
+   "city": "Rahim Yar Khan",
+   "disco": null,
+   "category": "Off-grid",
+   "control": {
+    "key": "following",
+    "label": "Following plan (table applied)"
+   },
+   "last_data": 1794149940,
+   "now": {
+    "ts": 1794149940,
+    "pv_kw": 0.0,
+    "load_kw": 11.76,
+    "grid_kw": 0.0,
+    "battery_kw": -2.64,
+    "genset_kw": 14.4,
+    "soc_pct": 56.91,
+    "grid_present": 0.0,
+    "genset_running": 1.0,
+    "mode": "self_use"
+   },
+   "next_event": {
+    "t": 1794155400,
+    "local": "21:30",
+    "reason": "carry_outage",
+    "detail": {
+     "kw": 8.7
+    }
+   },
+   "open_alerts": 1,
+   "mtd_saving_rs": 11006.0,
+   "spark": [
+    {
+     "day": "2026-11-01",
+     "saving_rs": -177.33
+    },
+    {
+     "day": "2026-11-02",
+     "saving_rs": 1943.29
+    },
+    {
+     "day": "2026-11-03",
+     "saving_rs": 2143.85
+    },
+    {
+     "day": "2026-11-04",
+     "saving_rs": 1082.77
+    },
+    {
+     "day": "2026-11-05",
+     "saving_rs": 1186.15
+    },
+    {
+     "day": "2026-11-06",
+     "saving_rs": 1545.12
+    },
+    {
+     "day": "2026-11-07",
+     "saving_rs": 3281.7
+    }
+   ],
+   "collecting_day": null
+  }
+ ]
+}

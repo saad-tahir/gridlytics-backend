@@ -1,0 +1,2648 @@
+[
+ {
+  "label": "meta",
+  "path": "/api/meta",
+  "site": null,
+  "p50": 0.005,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 2642,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "fleet",
+  "path": "/api/fleet",
+  "site": null,
+  "p50": 0.067,
+  "p95": 0.075,
+  "first": 0.062,
+  "bytes": 8672,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "alerts/counts",
+  "path": "/api/alerts/counts",
+  "site": null,
+  "p50": 0.007,
+  "p95": 0.01,
+  "first": 0.01,
+  "bytes": 155,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "alerts active",
+  "path": "/api/alerts",
+  "site": null,
+  "p50": 0.007,
+  "p95": 0.009,
+  "first": 0.007,
+  "bytes": 2246,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "alerts all",
+  "path": "/api/alerts?state=",
+  "site": null,
+  "p50": 0.006,
+  "p95": 0.008,
+  "first": 0.006,
+  "bytes": 3049,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "alerts/rules",
+  "path": "/api/alerts/rules",
+  "site": null,
+  "p50": 0.005,
+  "p95": 0.005,
+  "first": 0.005,
+  "bytes": 708,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "demo",
+  "path": "/api/demo",
+  "site": null,
+  "p50": 0.006,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 391,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "reports",
+  "path": "/api/reports",
+  "site": null,
+  "p50": 0.008,
+  "p95": 0.008,
+  "first": 0.008,
+  "bytes": 5550,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "tariffs",
+  "path": "/api/tariffs",
+  "site": null,
+  "p50": 0.013,
+  "p95": 0.014,
+  "first": 0.013,
+  "bytes": 11473,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "tariffs/fuel",
+  "path": "/api/tariffs/fuel",
+  "site": null,
+  "p50": 0.006,
+  "p95": 0.007,
+  "first": 0.006,
+  "bytes": 2084,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "drafts",
+  "path": "/api/drafts",
+  "site": null,
+  "p50": 0.01,
+  "p95": 0.01,
+  "first": 0.01,
+  "bytes": 8113,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "sites",
+  "path": "/api/sites",
+  "site": null,
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.007,
+  "bytes": 18869,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "users",
+  "path": "/api/users",
+  "site": null,
+  "p50": 0.006,
+  "p95": 0.007,
+  "first": 0.006,
+  "bytes": 1750,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "platform/org",
+  "path": "/api/platform/org",
+  "site": null,
+  "p50": 0.005,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 120,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "platform/keys",
+  "path": "/api/platform/keys",
+  "site": null,
+  "p50": 0.005,
+  "p95": 0.006,
+  "first": 0.005,
+  "bytes": 2523,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "audit",
+  "path": "/api/audit?offset=0",
+  "site": null,
+  "p50": 0.009,
+  "p95": 0.009,
+  "first": 0.009,
+  "bytes": 70316,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "local/context",
+  "path": "/api/local/context",
+  "site": null,
+  "p50": 0.004,
+  "p95": 0.006,
+  "first": 0.004,
+  "bytes": 662,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "site",
+  "path": "/api/sites/6d4db49bf87e",
+  "site": "Faisalabad",
+  "p50": 0.009,
+  "p95": 0.011,
+  "first": 0.011,
+  "bytes": 2980,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "now",
+  "path": "/api/sites/6d4db49bf87e/now",
+  "site": "Faisalabad",
+  "p50": 0.12,
+  "p95": 0.142,
+  "first": 0.142,
+  "bytes": 2663,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "overview/chart 24h",
+  "path": "/api/sites/6d4db49bf87e/overview/chart?hours=24",
+  "site": "Faisalabad",
+  "p50": 0.014,
+  "p95": 0.015,
+  "first": 0.014,
+  "bytes": 70794,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plan",
+  "path": "/api/sites/6d4db49bf87e/plan",
+  "site": "Faisalabad",
+  "p50": 0.022,
+  "p95": 0.023,
+  "first": 0.021,
+  "bytes": 116624,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plans",
+  "path": "/api/sites/6d4db49bf87e/plans",
+  "site": "Faisalabad",
+  "p50": 0.016,
+  "p95": 0.017,
+  "first": 0.017,
+  "bytes": 69311,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plans/:id",
+  "path": "/api/sites/6d4db49bf87e/plans/d946faf7aa74",
+  "site": "Faisalabad",
+  "p50": 0.017,
+  "p95": 0.02,
+  "first": 0.017,
+  "bytes": 115800,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plan/compare",
+  "path": "/api/sites/6d4db49bf87e/plan/compare",
+  "site": "Faisalabad",
+  "p50": 0.032,
+  "p95": 0.045,
+  "first": 0.045,
+  "bytes": 4321,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "overrides",
+  "path": "/api/sites/6d4db49bf87e/overrides",
+  "site": "Faisalabad",
+  "p50": 0.006,
+  "p95": 0.02,
+  "first": 0.006,
+  "bytes": 2,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "control",
+  "path": "/api/sites/6d4db49bf87e/control",
+  "site": "Faisalabad",
+  "p50": 0.012,
+  "p95": 0.016,
+  "first": 0.016,
+  "bytes": 2765,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "edge",
+  "path": "/api/sites/6d4db49bf87e/edge",
+  "site": "Faisalabad",
+  "p50": 0.014,
+  "p95": 0.014,
+  "first": 0.014,
+  "bytes": 370,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/quality 14",
+  "path": "/api/sites/6d4db49bf87e/telemetry/quality?days=14",
+  "site": "Faisalabad",
+  "p50": 0.008,
+  "p95": 0.009,
+  "first": 0.008,
+  "bytes": 650,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/quality 30",
+  "path": "/api/sites/6d4db49bf87e/telemetry/quality?days=30",
+  "site": "Faisalabad",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.007,
+  "bytes": 690,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "native",
+  "path": "/api/sites/6d4db49bf87e/native",
+  "site": "Faisalabad",
+  "p50": 0.006,
+  "p95": 0.008,
+  "first": 0.006,
+  "bytes": 381,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings this_month",
+  "path": "/api/sites/6d4db49bf87e/savings?start=2026-11-01&end=2026-11-09",
+  "site": "Faisalabad",
+  "p50": 0.04,
+  "p95": 0.045,
+  "first": 0.045,
+  "bytes": 4964,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings last_month",
+  "path": "/api/sites/6d4db49bf87e/savings?start=2026-10-01&end=2026-10-31",
+  "site": "Faisalabad",
+  "p50": 0.029,
+  "p95": 0.03,
+  "first": 0.03,
+  "bytes": 3508,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings last_30",
+  "path": "/api/sites/6d4db49bf87e/savings?start=2026-10-11&end=2026-11-09",
+  "site": "Faisalabad",
+  "p50": 0.042,
+  "p95": 0.046,
+  "first": 0.042,
+  "bytes": 6741,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "switchback",
+  "path": "/api/sites/6d4db49bf87e/switchback",
+  "site": "Faisalabad",
+  "p50": 0.014,
+  "p95": 0.332,
+  "first": 0.332,
+  "bytes": 1170,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "bills",
+  "path": "/api/sites/6d4db49bf87e/bills",
+  "site": "Faisalabad",
+  "p50": 0.006,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 1494,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings/export.csv",
+  "path": "/api/sites/6d4db49bf87e/savings/export.csv?start=2026-11-01&end=2026-11-09",
+  "site": "Faisalabad",
+  "p50": 0.011,
+  "p95": 0.014,
+  "first": 0.014,
+  "bytes": 763,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "pilot",
+  "path": "/api/sites/6d4db49bf87e/pilot",
+  "site": "Faisalabad",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.007,
+  "bytes": 1351,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "pilot/calendar.ics",
+  "path": "/api/sites/6d4db49bf87e/pilot/calendar.ics",
+  "site": "Faisalabad",
+  "p50": 0.006,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 1519,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 24h default names",
+  "path": "/api/sites/6d4db49bf87e/telemetry?start=1794139507&end=1794225907",
+  "site": "Faisalabad",
+  "p50": 0.019,
+  "p95": 0.02,
+  "first": 0.019,
+  "bytes": 51694,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 7d default names",
+  "path": "/api/sites/6d4db49bf87e/telemetry?start=1793621107&end=1794225907",
+  "site": "Faisalabad",
+  "p50": 0.014,
+  "p95": 0.015,
+  "first": 0.014,
+  "bytes": 31417,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 30d default names",
+  "path": "/api/sites/6d4db49bf87e/telemetry?start=1791633907&end=1794225907",
+  "site": "Faisalabad",
+  "p50": 0.029,
+  "p95": 0.029,
+  "first": 0.029,
+  "bytes": 71234,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 90d default names",
+  "path": "/api/sites/6d4db49bf87e/telemetry?start=1786449907&end=1794225907",
+  "site": "Faisalabad",
+  "p50": 0.025,
+  "p95": 0.03,
+  "first": 0.02,
+  "bytes": 18476,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 7d all names",
+  "path": "/api/sites/6d4db49bf87e/telemetry?start=1793621107&end=1794225907&names=pv_power_w,load_power_w,grid_power_w,battery_power_w,genset_power_w,battery_soc_est_pct,battery_soc_bms_pct,grid_present,battery_temp_c,genset_fuel_l,grid_voltage_v",
+  "site": "Faisalabad",
+  "p50": 0.021,
+  "p95": 0.022,
+  "first": 0.021,
+  "bytes": 51524,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 24h res=raw",
+  "path": "/api/sites/6d4db49bf87e/telemetry?start=1794139507&end=1794225907&names=pv_power_w,load_power_w,grid_power_w,battery_power_w,genset_power_w,battery_soc_est_pct,battery_soc_bms_pct,grid_present,battery_temp_c,genset_fuel_l,grid_voltage_v&res=raw",
+  "site": "Faisalabad",
+  "p50": 0.006,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 103,
+  "codes": [
+   422,
+   422,
+   422
+  ]
+ },
+ {
+  "label": "telemetry grid_present 7d 1h",
+  "path": "/api/sites/6d4db49bf87e/telemetry?names=grid_present&res=1h&start=1793621107&end=1794225907",
+  "site": "Faisalabad",
+  "p50": 0.011,
+  "p95": 0.013,
+  "first": 0.013,
+  "bytes": 2529,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 7",
+  "path": "/api/sites/6d4db49bf87e/telemetry/heatmap?name=load_power_w&days=7",
+  "site": "Faisalabad",
+  "p50": 0.01,
+  "p95": 0.012,
+  "first": 0.01,
+  "bytes": 1689,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 28",
+  "path": "/api/sites/6d4db49bf87e/telemetry/heatmap?name=load_power_w&days=28",
+  "site": "Faisalabad",
+  "p50": 0.013,
+  "p95": 0.015,
+  "first": 0.015,
+  "bytes": 1717,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 90",
+  "path": "/api/sites/6d4db49bf87e/telemetry/heatmap?name=load_power_w&days=90",
+  "site": "Faisalabad",
+  "p50": 0.018,
+  "p95": 0.021,
+  "first": 0.013,
+  "bytes": 1717,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/export.csv 14d",
+  "path": "/api/sites/6d4db49bf87e/telemetry/export.csv?start=1793016307&end=1794225907",
+  "site": "Faisalabad",
+  "p50": 0.216,
+  "p95": 0.218,
+  "first": 0.218,
+  "bytes": 2186260,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/pv",
+  "path": "/api/sites/6d4db49bf87e/forecasts/pv",
+  "site": "Faisalabad",
+  "p50": 0.009,
+  "p95": 0.011,
+  "first": 0.011,
+  "bytes": 10809,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/load",
+  "path": "/api/sites/6d4db49bf87e/forecasts/load",
+  "site": "Faisalabad",
+  "p50": 0.012,
+  "p95": 0.014,
+  "first": 0.014,
+  "bytes": 13794,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/outage",
+  "path": "/api/sites/6d4db49bf87e/forecasts/outage",
+  "site": "Faisalabad",
+  "p50": 0.008,
+  "p95": 0.008,
+  "first": 0.008,
+  "bytes": 5835,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/scores 30",
+  "path": "/api/sites/6d4db49bf87e/forecasts/scores?days=30",
+  "site": "Faisalabad",
+  "p50": 0.007,
+  "p95": 0.009,
+  "first": 0.007,
+  "bytes": 2753,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 7",
+  "path": "/api/sites/6d4db49bf87e/outages?days=7",
+  "site": "Faisalabad",
+  "p50": 0.04,
+  "p95": 0.04,
+  "first": 0.04,
+  "bytes": 20654,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 30",
+  "path": "/api/sites/6d4db49bf87e/outages?days=30",
+  "site": "Faisalabad",
+  "p50": 0.07,
+  "p95": 0.078,
+  "first": 0.078,
+  "bytes": 21962,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 90",
+  "path": "/api/sites/6d4db49bf87e/outages?days=90",
+  "site": "Faisalabad",
+  "p50": 0.071,
+  "p95": 0.077,
+  "first": 0.077,
+  "bytes": 21962,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "battery",
+  "path": "/api/sites/6d4db49bf87e/battery",
+  "site": "Faisalabad",
+  "p50": 0.141,
+  "p95": 0.144,
+  "first": 0.144,
+  "bytes": 17672,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "genset 14",
+  "path": "/api/sites/6d4db49bf87e/genset?days=14",
+  "site": "Faisalabad",
+  "p50": 0.071,
+  "p95": 0.11,
+  "first": 0.071,
+  "bytes": 1835,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "genset/fuel",
+  "path": "/api/sites/6d4db49bf87e/genset/fuel?limit=200",
+  "site": "Faisalabad",
+  "p50": 0.007,
+  "p95": 0.009,
+  "first": 0.007,
+  "bytes": 11,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "prices",
+  "path": "/api/sites/6d4db49bf87e/prices",
+  "site": "Faisalabad",
+  "p50": 0.08,
+  "p95": 0.098,
+  "first": 0.08,
+  "bytes": 2840,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "site",
+  "path": "/api/sites/e9941b41c70b",
+  "site": "Karachi",
+  "p50": 0.008,
+  "p95": 0.008,
+  "first": 0.008,
+  "bytes": 2858,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "now",
+  "path": "/api/sites/e9941b41c70b/now",
+  "site": "Karachi",
+  "p50": 0.121,
+  "p95": 0.126,
+  "first": 0.126,
+  "bytes": 2290,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "overview/chart 24h",
+  "path": "/api/sites/e9941b41c70b/overview/chart?hours=24",
+  "site": "Karachi",
+  "p50": 0.014,
+  "p95": 0.015,
+  "first": 0.014,
+  "bytes": 71908,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plan",
+  "path": "/api/sites/e9941b41c70b/plan",
+  "site": "Karachi",
+  "p50": 0.016,
+  "p95": 0.017,
+  "first": 0.016,
+  "bytes": 117763,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plans",
+  "path": "/api/sites/e9941b41c70b/plans",
+  "site": "Karachi",
+  "p50": 0.014,
+  "p95": 0.016,
+  "first": 0.014,
+  "bytes": 69143,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plans/:id",
+  "path": "/api/sites/e9941b41c70b/plans/e39233460055",
+  "site": "Karachi",
+  "p50": 0.018,
+  "p95": 0.02,
+  "first": 0.016,
+  "bytes": 116839,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plan/compare",
+  "path": "/api/sites/e9941b41c70b/plan/compare",
+  "site": "Karachi",
+  "p50": 0.034,
+  "p95": 0.039,
+  "first": 0.034,
+  "bytes": 4325,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "overrides",
+  "path": "/api/sites/e9941b41c70b/overrides",
+  "site": "Karachi",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.007,
+  "bytes": 2,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "control",
+  "path": "/api/sites/e9941b41c70b/control",
+  "site": "Karachi",
+  "p50": 0.01,
+  "p95": 0.013,
+  "first": 0.013,
+  "bytes": 3542,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "edge",
+  "path": "/api/sites/e9941b41c70b/edge",
+  "site": "Karachi",
+  "p50": 0.008,
+  "p95": 0.008,
+  "first": 0.008,
+  "bytes": 201,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/quality 14",
+  "path": "/api/sites/e9941b41c70b/telemetry/quality?days=14",
+  "site": "Karachi",
+  "p50": 0.007,
+  "p95": 0.009,
+  "first": 0.007,
+  "bytes": 650,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/quality 30",
+  "path": "/api/sites/e9941b41c70b/telemetry/quality?days=30",
+  "site": "Karachi",
+  "p50": 0.007,
+  "p95": 0.008,
+  "first": 0.007,
+  "bytes": 690,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "native",
+  "path": "/api/sites/e9941b41c70b/native",
+  "site": "Karachi",
+  "p50": 0.008,
+  "p95": 0.008,
+  "first": 0.007,
+  "bytes": 393,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings this_month",
+  "path": "/api/sites/e9941b41c70b/savings?start=2026-11-01&end=2026-11-09",
+  "site": "Karachi",
+  "p50": 0.03,
+  "p95": 0.031,
+  "first": 0.03,
+  "bytes": 5102,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings last_month",
+  "path": "/api/sites/e9941b41c70b/savings?start=2026-10-01&end=2026-10-31",
+  "site": "Karachi",
+  "p50": 0.025,
+  "p95": 0.026,
+  "first": 0.026,
+  "bytes": 3484,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings last_30",
+  "path": "/api/sites/e9941b41c70b/savings?start=2026-10-11&end=2026-11-09",
+  "site": "Karachi",
+  "p50": 0.051,
+  "p95": 0.055,
+  "first": 0.055,
+  "bytes": 6844,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "switchback",
+  "path": "/api/sites/e9941b41c70b/switchback",
+  "site": "Karachi",
+  "p50": 0.007,
+  "p95": 0.011,
+  "first": 0.011,
+  "bytes": 27,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "bills",
+  "path": "/api/sites/e9941b41c70b/bills",
+  "site": "Karachi",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.007,
+  "bytes": 4781,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings/export.csv",
+  "path": "/api/sites/e9941b41c70b/savings/export.csv?start=2026-11-01&end=2026-11-09",
+  "site": "Karachi",
+  "p50": 0.015,
+  "p95": 0.025,
+  "first": 0.015,
+  "bytes": 769,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "pilot",
+  "path": "/api/sites/e9941b41c70b/pilot",
+  "site": "Karachi",
+  "p50": 0.006,
+  "p95": 0.009,
+  "first": 0.009,
+  "bytes": 528,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "pilot/calendar.ics",
+  "path": "/api/sites/e9941b41c70b/pilot/calendar.ics",
+  "site": "Karachi",
+  "p50": 0.006,
+  "p95": 0.009,
+  "first": 0.006,
+  "bytes": 83,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 24h default names",
+  "path": "/api/sites/e9941b41c70b/telemetry?start=1794139507&end=1794225907",
+  "site": "Karachi",
+  "p50": 0.02,
+  "p95": 0.02,
+  "first": 0.019,
+  "bytes": 57923,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 7d default names",
+  "path": "/api/sites/e9941b41c70b/telemetry?start=1793621107&end=1794225907",
+  "site": "Karachi",
+  "p50": 0.015,
+  "p95": 0.025,
+  "first": 0.025,
+  "bytes": 35489,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 30d default names",
+  "path": "/api/sites/e9941b41c70b/telemetry?start=1791633907&end=1794225907",
+  "site": "Karachi",
+  "p50": 0.03,
+  "p95": 0.038,
+  "first": 0.03,
+  "bytes": 78320,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 90d default names",
+  "path": "/api/sites/e9941b41c70b/telemetry?start=1786449907&end=1794225907",
+  "site": "Karachi",
+  "p50": 0.018,
+  "p95": 0.022,
+  "first": 0.022,
+  "bytes": 20122,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 7d all names",
+  "path": "/api/sites/e9941b41c70b/telemetry?start=1793621107&end=1794225907&names=pv_power_w,load_power_w,grid_power_w,battery_power_w,genset_power_w,battery_soc_est_pct,battery_soc_bms_pct,grid_present,battery_temp_c,genset_fuel_l,grid_voltage_v",
+  "site": "Karachi",
+  "p50": 0.023,
+  "p95": 0.023,
+  "first": 0.022,
+  "bytes": 55491,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 24h res=raw",
+  "path": "/api/sites/e9941b41c70b/telemetry?start=1794139507&end=1794225907&names=pv_power_w,load_power_w,grid_power_w,battery_power_w,genset_power_w,battery_soc_est_pct,battery_soc_bms_pct,grid_present,battery_temp_c,genset_fuel_l,grid_voltage_v&res=raw",
+  "site": "Karachi",
+  "p50": 0.006,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 103,
+  "codes": [
+   422,
+   422,
+   422
+  ]
+ },
+ {
+  "label": "telemetry grid_present 7d 1h",
+  "path": "/api/sites/e9941b41c70b/telemetry?names=grid_present&res=1h&start=1793621107&end=1794225907",
+  "site": "Karachi",
+  "p50": 0.009,
+  "p95": 0.013,
+  "first": 0.013,
+  "bytes": 2529,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 7",
+  "path": "/api/sites/e9941b41c70b/telemetry/heatmap?name=load_power_w&days=7",
+  "site": "Karachi",
+  "p50": 0.009,
+  "p95": 0.011,
+  "first": 0.011,
+  "bytes": 1753,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 28",
+  "path": "/api/sites/e9941b41c70b/telemetry/heatmap?name=load_power_w&days=28",
+  "site": "Karachi",
+  "p50": 0.013,
+  "p95": 0.014,
+  "first": 0.013,
+  "bytes": 1760,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 90",
+  "path": "/api/sites/e9941b41c70b/telemetry/heatmap?name=load_power_w&days=90",
+  "site": "Karachi",
+  "p50": 0.014,
+  "p95": 0.014,
+  "first": 0.014,
+  "bytes": 1760,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/export.csv 14d",
+  "path": "/api/sites/e9941b41c70b/telemetry/export.csv?start=1793016307&end=1794225907",
+  "site": "Karachi",
+  "p50": 0.194,
+  "p95": 0.212,
+  "first": 0.194,
+  "bytes": 2324396,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/pv",
+  "path": "/api/sites/e9941b41c70b/forecasts/pv",
+  "site": "Karachi",
+  "p50": 0.01,
+  "p95": 0.011,
+  "first": 0.01,
+  "bytes": 11085,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/load",
+  "path": "/api/sites/e9941b41c70b/forecasts/load",
+  "site": "Karachi",
+  "p50": 0.011,
+  "p95": 0.014,
+  "first": 0.014,
+  "bytes": 14246,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/outage",
+  "path": "/api/sites/e9941b41c70b/forecasts/outage",
+  "site": "Karachi",
+  "p50": 0.009,
+  "p95": 0.01,
+  "first": 0.01,
+  "bytes": 5853,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/scores 30",
+  "path": "/api/sites/e9941b41c70b/forecasts/scores?days=30",
+  "site": "Karachi",
+  "p50": 0.009,
+  "p95": 0.011,
+  "first": 0.009,
+  "bytes": 2732,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 7",
+  "path": "/api/sites/e9941b41c70b/outages?days=7",
+  "site": "Karachi",
+  "p50": 0.038,
+  "p95": 0.041,
+  "first": 0.038,
+  "bytes": 19378,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 30",
+  "path": "/api/sites/e9941b41c70b/outages?days=30",
+  "site": "Karachi",
+  "p50": 0.061,
+  "p95": 0.072,
+  "first": 0.072,
+  "bytes": 19661,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 90",
+  "path": "/api/sites/e9941b41c70b/outages?days=90",
+  "site": "Karachi",
+  "p50": 0.066,
+  "p95": 0.071,
+  "first": 0.066,
+  "bytes": 19662,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "battery",
+  "path": "/api/sites/e9941b41c70b/battery",
+  "site": "Karachi",
+  "p50": 0.14,
+  "p95": 0.14,
+  "first": 0.14,
+  "bytes": 18583,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "genset 14",
+  "path": "/api/sites/e9941b41c70b/genset?days=14",
+  "site": "Karachi",
+  "p50": 0.043,
+  "p95": 0.05,
+  "first": 0.043,
+  "bytes": 1034,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "genset/fuel",
+  "path": "/api/sites/e9941b41c70b/genset/fuel?limit=200",
+  "site": "Karachi",
+  "p50": 0.006,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 11,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "prices",
+  "path": "/api/sites/e9941b41c70b/prices",
+  "site": "Karachi",
+  "p50": 0.086,
+  "p95": 0.087,
+  "first": 0.086,
+  "bytes": 2841,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "site",
+  "path": "/api/sites/37b2fd882dcb",
+  "site": "Lahore",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.007,
+  "bytes": 2938,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "now",
+  "path": "/api/sites/37b2fd882dcb/now",
+  "site": "Lahore",
+  "p50": 0.131,
+  "p95": 0.142,
+  "first": 0.114,
+  "bytes": 2666,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "overview/chart 24h",
+  "path": "/api/sites/37b2fd882dcb/overview/chart?hours=24",
+  "site": "Lahore",
+  "p50": 0.015,
+  "p95": 0.016,
+  "first": 0.016,
+  "bytes": 70932,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plan",
+  "path": "/api/sites/37b2fd882dcb/plan",
+  "site": "Lahore",
+  "p50": 0.023,
+  "p95": 0.024,
+  "first": 0.017,
+  "bytes": 116975,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plans",
+  "path": "/api/sites/37b2fd882dcb/plans",
+  "site": "Lahore",
+  "p50": 0.016,
+  "p95": 0.027,
+  "first": 0.027,
+  "bytes": 68739,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plans/:id",
+  "path": "/api/sites/37b2fd882dcb/plans/801b953f7a6b",
+  "site": "Lahore",
+  "p50": 0.017,
+  "p95": 0.017,
+  "first": 0.017,
+  "bytes": 116426,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plan/compare",
+  "path": "/api/sites/37b2fd882dcb/plan/compare",
+  "site": "Lahore",
+  "p50": 0.034,
+  "p95": 0.035,
+  "first": 0.034,
+  "bytes": 4323,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "overrides",
+  "path": "/api/sites/37b2fd882dcb/overrides",
+  "site": "Lahore",
+  "p50": 0.006,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 2,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "control",
+  "path": "/api/sites/37b2fd882dcb/control",
+  "site": "Lahore",
+  "p50": 0.012,
+  "p95": 0.012,
+  "first": 0.012,
+  "bytes": 3073,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "edge",
+  "path": "/api/sites/37b2fd882dcb/edge",
+  "site": "Lahore",
+  "p50": 0.013,
+  "p95": 0.119,
+  "first": 0.119,
+  "bytes": 201,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/quality 14",
+  "path": "/api/sites/37b2fd882dcb/telemetry/quality?days=14",
+  "site": "Lahore",
+  "p50": 0.007,
+  "p95": 0.009,
+  "first": 0.007,
+  "bytes": 650,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/quality 30",
+  "path": "/api/sites/37b2fd882dcb/telemetry/quality?days=30",
+  "site": "Lahore",
+  "p50": 0.008,
+  "p95": 0.011,
+  "first": 0.008,
+  "bytes": 690,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "native",
+  "path": "/api/sites/37b2fd882dcb/native",
+  "site": "Lahore",
+  "p50": 0.007,
+  "p95": 0.01,
+  "first": 0.01,
+  "bytes": 393,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings this_month",
+  "path": "/api/sites/37b2fd882dcb/savings?start=2026-11-01&end=2026-11-09",
+  "site": "Lahore",
+  "p50": 0.032,
+  "p95": 0.058,
+  "first": 0.032,
+  "bytes": 4990,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings last_month",
+  "path": "/api/sites/37b2fd882dcb/savings?start=2026-10-01&end=2026-10-31",
+  "site": "Lahore",
+  "p50": 0.027,
+  "p95": 0.027,
+  "first": 0.027,
+  "bytes": 3424,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings last_30",
+  "path": "/api/sites/37b2fd882dcb/savings?start=2026-10-11&end=2026-11-09",
+  "site": "Lahore",
+  "p50": 0.049,
+  "p95": 0.05,
+  "first": 0.05,
+  "bytes": 6702,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "switchback",
+  "path": "/api/sites/37b2fd882dcb/switchback",
+  "site": "Lahore",
+  "p50": 0.008,
+  "p95": 0.012,
+  "first": 0.012,
+  "bytes": 27,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "bills",
+  "path": "/api/sites/37b2fd882dcb/bills",
+  "site": "Lahore",
+  "p50": 0.007,
+  "p95": 0.008,
+  "first": 0.008,
+  "bytes": 1441,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings/export.csv",
+  "path": "/api/sites/37b2fd882dcb/savings/export.csv?start=2026-11-01&end=2026-11-09",
+  "site": "Lahore",
+  "p50": 0.013,
+  "p95": 0.015,
+  "first": 0.015,
+  "bytes": 830,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "pilot",
+  "path": "/api/sites/37b2fd882dcb/pilot",
+  "site": "Lahore",
+  "p50": 0.007,
+  "p95": 0.008,
+  "first": 0.008,
+  "bytes": 528,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "pilot/calendar.ics",
+  "path": "/api/sites/37b2fd882dcb/pilot/calendar.ics",
+  "site": "Lahore",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.006,
+  "bytes": 83,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 24h default names",
+  "path": "/api/sites/37b2fd882dcb/telemetry?start=1794139507&end=1794225907",
+  "site": "Lahore",
+  "p50": 0.018,
+  "p95": 0.024,
+  "first": 0.024,
+  "bytes": 51553,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 7d default names",
+  "path": "/api/sites/37b2fd882dcb/telemetry?start=1793621107&end=1794225907",
+  "site": "Lahore",
+  "p50": 0.016,
+  "p95": 0.021,
+  "first": 0.015,
+  "bytes": 30928,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 30d default names",
+  "path": "/api/sites/37b2fd882dcb/telemetry?start=1791633907&end=1794225907",
+  "site": "Lahore",
+  "p50": 0.031,
+  "p95": 0.032,
+  "first": 0.031,
+  "bytes": 70413,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 90d default names",
+  "path": "/api/sites/37b2fd882dcb/telemetry?start=1786449907&end=1794225907",
+  "site": "Lahore",
+  "p50": 0.019,
+  "p95": 0.027,
+  "first": 0.017,
+  "bytes": 18043,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 7d all names",
+  "path": "/api/sites/37b2fd882dcb/telemetry?start=1793621107&end=1794225907&names=pv_power_w,load_power_w,grid_power_w,battery_power_w,genset_power_w,battery_soc_est_pct,battery_soc_bms_pct,grid_present,battery_temp_c,genset_fuel_l,grid_voltage_v",
+  "site": "Lahore",
+  "p50": 0.022,
+  "p95": 0.029,
+  "first": 0.029,
+  "bytes": 51056,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 24h res=raw",
+  "path": "/api/sites/37b2fd882dcb/telemetry?start=1794139507&end=1794225907&names=pv_power_w,load_power_w,grid_power_w,battery_power_w,genset_power_w,battery_soc_est_pct,battery_soc_bms_pct,grid_present,battery_temp_c,genset_fuel_l,grid_voltage_v&res=raw",
+  "site": "Lahore",
+  "p50": 0.006,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 103,
+  "codes": [
+   422,
+   422,
+   422
+  ]
+ },
+ {
+  "label": "telemetry grid_present 7d 1h",
+  "path": "/api/sites/37b2fd882dcb/telemetry?names=grid_present&res=1h&start=1793621107&end=1794225907",
+  "site": "Lahore",
+  "p50": 0.011,
+  "p95": 0.012,
+  "first": 0.011,
+  "bytes": 2529,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 7",
+  "path": "/api/sites/37b2fd882dcb/telemetry/heatmap?name=load_power_w&days=7",
+  "site": "Lahore",
+  "p50": 0.016,
+  "p95": 0.027,
+  "first": 0.01,
+  "bytes": 1696,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 28",
+  "path": "/api/sites/37b2fd882dcb/telemetry/heatmap?name=load_power_w&days=28",
+  "site": "Lahore",
+  "p50": 0.017,
+  "p95": 0.017,
+  "first": 0.014,
+  "bytes": 1699,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 90",
+  "path": "/api/sites/37b2fd882dcb/telemetry/heatmap?name=load_power_w&days=90",
+  "site": "Lahore",
+  "p50": 0.019,
+  "p95": 0.059,
+  "first": 0.019,
+  "bytes": 1699,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/export.csv 14d",
+  "path": "/api/sites/37b2fd882dcb/telemetry/export.csv?start=1793016307&end=1794225907",
+  "site": "Lahore",
+  "p50": 0.204,
+  "p95": 0.219,
+  "first": 0.204,
+  "bytes": 2208795,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/pv",
+  "path": "/api/sites/37b2fd882dcb/forecasts/pv",
+  "site": "Lahore",
+  "p50": 0.015,
+  "p95": 0.017,
+  "first": 0.015,
+  "bytes": 10582,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/load",
+  "path": "/api/sites/37b2fd882dcb/forecasts/load",
+  "site": "Lahore",
+  "p50": 0.011,
+  "p95": 0.013,
+  "first": 0.013,
+  "bytes": 13747,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/outage",
+  "path": "/api/sites/37b2fd882dcb/forecasts/outage",
+  "site": "Lahore",
+  "p50": 0.014,
+  "p95": 0.017,
+  "first": 0.017,
+  "bytes": 5851,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/scores 30",
+  "path": "/api/sites/37b2fd882dcb/forecasts/scores?days=30",
+  "site": "Lahore",
+  "p50": 0.01,
+  "p95": 0.01,
+  "first": 0.01,
+  "bytes": 2738,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 7",
+  "path": "/api/sites/37b2fd882dcb/outages?days=7",
+  "site": "Lahore",
+  "p50": 0.037,
+  "p95": 0.048,
+  "first": 0.037,
+  "bytes": 19535,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 30",
+  "path": "/api/sites/37b2fd882dcb/outages?days=30",
+  "site": "Lahore",
+  "p50": 0.074,
+  "p95": 0.076,
+  "first": 0.074,
+  "bytes": 20385,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 90",
+  "path": "/api/sites/37b2fd882dcb/outages?days=90",
+  "site": "Lahore",
+  "p50": 0.061,
+  "p95": 0.067,
+  "first": 0.061,
+  "bytes": 20385,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "battery",
+  "path": "/api/sites/37b2fd882dcb/battery",
+  "site": "Lahore",
+  "p50": 0.12,
+  "p95": 0.132,
+  "first": 0.12,
+  "bytes": 17502,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "genset 14",
+  "path": "/api/sites/37b2fd882dcb/genset?days=14",
+  "site": "Lahore",
+  "p50": 0.062,
+  "p95": 0.064,
+  "first": 0.053,
+  "bytes": 1858,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "genset/fuel",
+  "path": "/api/sites/37b2fd882dcb/genset/fuel?limit=200",
+  "site": "Lahore",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.007,
+  "bytes": 11,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "prices",
+  "path": "/api/sites/37b2fd882dcb/prices",
+  "site": "Lahore",
+  "p50": 0.083,
+  "p95": 0.086,
+  "first": 0.083,
+  "bytes": 3056,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "site",
+  "path": "/api/sites/47895916bed4",
+  "site": "RYK farm",
+  "p50": 0.008,
+  "p95": 0.009,
+  "first": 0.009,
+  "bytes": 2216,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "now",
+  "path": "/api/sites/47895916bed4/now",
+  "site": "RYK farm",
+  "p50": 0.127,
+  "p95": 0.132,
+  "first": 0.127,
+  "bytes": 2610,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "overview/chart 24h",
+  "path": "/api/sites/47895916bed4/overview/chart?hours=24",
+  "site": "RYK farm",
+  "p50": 0.015,
+  "p95": 0.025,
+  "first": 0.025,
+  "bytes": 71959,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plan",
+  "path": "/api/sites/47895916bed4/plan",
+  "site": "RYK farm",
+  "p50": 0.017,
+  "p95": 0.018,
+  "first": 0.018,
+  "bytes": 118171,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plans",
+  "path": "/api/sites/47895916bed4/plans",
+  "site": "RYK farm",
+  "p50": 0.017,
+  "p95": 0.018,
+  "first": 0.018,
+  "bytes": 69354,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plans/:id",
+  "path": "/api/sites/47895916bed4/plans/3a4bc8bba13f",
+  "site": "RYK farm",
+  "p50": 0.018,
+  "p95": 0.019,
+  "first": 0.018,
+  "bytes": 117345,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "plan/compare",
+  "path": "/api/sites/47895916bed4/plan/compare",
+  "site": "RYK farm",
+  "p50": 0.043,
+  "p95": 0.045,
+  "first": 0.045,
+  "bytes": 4303,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "overrides",
+  "path": "/api/sites/47895916bed4/overrides",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.008,
+  "first": 0.007,
+  "bytes": 2,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "control",
+  "path": "/api/sites/47895916bed4/control",
+  "site": "RYK farm",
+  "p50": 0.013,
+  "p95": 0.018,
+  "first": 0.018,
+  "bytes": 2579,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "edge",
+  "path": "/api/sites/47895916bed4/edge",
+  "site": "RYK farm",
+  "p50": 0.008,
+  "p95": 0.012,
+  "first": 0.012,
+  "bytes": 201,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/quality 14",
+  "path": "/api/sites/47895916bed4/telemetry/quality?days=14",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.01,
+  "first": 0.007,
+  "bytes": 650,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/quality 30",
+  "path": "/api/sites/47895916bed4/telemetry/quality?days=30",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.008,
+  "first": 0.006,
+  "bytes": 690,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "native",
+  "path": "/api/sites/47895916bed4/native",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.006,
+  "bytes": 387,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings this_month",
+  "path": "/api/sites/47895916bed4/savings?start=2026-11-01&end=2026-11-09",
+  "site": "RYK farm",
+  "p50": 0.028,
+  "p95": 0.031,
+  "first": 0.031,
+  "bytes": 4952,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings last_month",
+  "path": "/api/sites/47895916bed4/savings?start=2026-10-01&end=2026-10-31",
+  "site": "RYK farm",
+  "p50": 0.025,
+  "p95": 0.033,
+  "first": 0.025,
+  "bytes": 3412,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings last_30",
+  "path": "/api/sites/47895916bed4/savings?start=2026-10-11&end=2026-11-09",
+  "site": "RYK farm",
+  "p50": 0.038,
+  "p95": 0.04,
+  "first": 0.038,
+  "bytes": 6653,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "switchback",
+  "path": "/api/sites/47895916bed4/switchback",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.006,
+  "bytes": 27,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "bills",
+  "path": "/api/sites/47895916bed4/bills",
+  "site": "RYK farm",
+  "p50": 0.008,
+  "p95": 0.008,
+  "first": 0.006,
+  "bytes": 2,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "savings/export.csv",
+  "path": "/api/sites/47895916bed4/savings/export.csv?start=2026-11-01&end=2026-11-09",
+  "site": "RYK farm",
+  "p50": 0.012,
+  "p95": 0.013,
+  "first": 0.013,
+  "bytes": 733,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "pilot",
+  "path": "/api/sites/47895916bed4/pilot",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.008,
+  "first": 0.008,
+  "bytes": 524,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "pilot/calendar.ics",
+  "path": "/api/sites/47895916bed4/pilot/calendar.ics",
+  "site": "RYK farm",
+  "p50": 0.006,
+  "p95": 0.006,
+  "first": 0.006,
+  "bytes": 83,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 24h default names",
+  "path": "/api/sites/47895916bed4/telemetry?start=1794139507&end=1794225907",
+  "site": "RYK farm",
+  "p50": 0.019,
+  "p95": 0.024,
+  "first": 0.019,
+  "bytes": 49078,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 7d default names",
+  "path": "/api/sites/47895916bed4/telemetry?start=1793621107&end=1794225907",
+  "site": "RYK farm",
+  "p50": 0.016,
+  "p95": 0.016,
+  "first": 0.016,
+  "bytes": 29857,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 30d default names",
+  "path": "/api/sites/47895916bed4/telemetry?start=1791633907&end=1794225907",
+  "site": "RYK farm",
+  "p50": 0.027,
+  "p95": 0.034,
+  "first": 0.034,
+  "bytes": 67799,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 90d default names",
+  "path": "/api/sites/47895916bed4/telemetry?start=1786449907&end=1794225907",
+  "site": "RYK farm",
+  "p50": 0.019,
+  "p95": 0.021,
+  "first": 0.019,
+  "bytes": 17483,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 7d all names",
+  "path": "/api/sites/47895916bed4/telemetry?start=1793621107&end=1794225907&names=pv_power_w,load_power_w,grid_power_w,battery_power_w,genset_power_w,battery_soc_est_pct,battery_soc_bms_pct,grid_present,battery_temp_c,genset_fuel_l,grid_voltage_v",
+  "site": "RYK farm",
+  "p50": 0.023,
+  "p95": 0.026,
+  "first": 0.023,
+  "bytes": 52908,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry 24h res=raw",
+  "path": "/api/sites/47895916bed4/telemetry?start=1794139507&end=1794225907&names=pv_power_w,load_power_w,grid_power_w,battery_power_w,genset_power_w,battery_soc_est_pct,battery_soc_bms_pct,grid_present,battery_temp_c,genset_fuel_l,grid_voltage_v&res=raw",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.008,
+  "first": 0.007,
+  "bytes": 103,
+  "codes": [
+   422,
+   422,
+   422
+  ]
+ },
+ {
+  "label": "telemetry grid_present 7d 1h",
+  "path": "/api/sites/47895916bed4/telemetry?names=grid_present&res=1h&start=1793621107&end=1794225907",
+  "site": "RYK farm",
+  "p50": 0.009,
+  "p95": 0.011,
+  "first": 0.011,
+  "bytes": 2529,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 7",
+  "path": "/api/sites/47895916bed4/telemetry/heatmap?name=load_power_w&days=7",
+  "site": "RYK farm",
+  "p50": 0.01,
+  "p95": 0.011,
+  "first": 0.01,
+  "bytes": 1528,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 28",
+  "path": "/api/sites/47895916bed4/telemetry/heatmap?name=load_power_w&days=28",
+  "site": "RYK farm",
+  "p50": 0.014,
+  "p95": 0.015,
+  "first": 0.014,
+  "bytes": 1549,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "heatmap load 90",
+  "path": "/api/sites/47895916bed4/telemetry/heatmap?name=load_power_w&days=90",
+  "site": "RYK farm",
+  "p50": 0.014,
+  "p95": 0.014,
+  "first": 0.013,
+  "bytes": 1549,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "telemetry/export.csv 14d",
+  "path": "/api/sites/47895916bed4/telemetry/export.csv?start=1793016307&end=1794225907",
+  "site": "RYK farm",
+  "p50": 0.211,
+  "p95": 0.224,
+  "first": 0.211,
+  "bytes": 2171706,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/pv",
+  "path": "/api/sites/47895916bed4/forecasts/pv",
+  "site": "RYK farm",
+  "p50": 0.009,
+  "p95": 0.01,
+  "first": 0.01,
+  "bytes": 10393,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/load",
+  "path": "/api/sites/47895916bed4/forecasts/load",
+  "site": "RYK farm",
+  "p50": 0.009,
+  "p95": 0.014,
+  "first": 0.009,
+  "bytes": 12020,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/outage",
+  "path": "/api/sites/47895916bed4/forecasts/outage",
+  "site": "RYK farm",
+  "p50": 0.009,
+  "p95": 0.013,
+  "first": 0.013,
+  "bytes": 5088,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "forecasts/scores 30",
+  "path": "/api/sites/47895916bed4/forecasts/scores?days=30",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.009,
+  "first": 0.007,
+  "bytes": 2682,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 7",
+  "path": "/api/sites/47895916bed4/outages?days=7",
+  "site": "RYK farm",
+  "p50": 0.114,
+  "p95": 0.114,
+  "first": 0.105,
+  "bytes": 18415,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 30",
+  "path": "/api/sites/47895916bed4/outages?days=30",
+  "site": "RYK farm",
+  "p50": 0.24,
+  "p95": 0.241,
+  "first": 0.241,
+  "bytes": 18589,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "outages 90",
+  "path": "/api/sites/47895916bed4/outages?days=90",
+  "site": "RYK farm",
+  "p50": 0.222,
+  "p95": 0.223,
+  "first": 0.223,
+  "bytes": 18589,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "battery",
+  "path": "/api/sites/47895916bed4/battery",
+  "site": "RYK farm",
+  "p50": 0.109,
+  "p95": 0.12,
+  "first": 0.12,
+  "bytes": 18621,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "genset 14",
+  "path": "/api/sites/47895916bed4/genset?days=14",
+  "site": "RYK farm",
+  "p50": 0.227,
+  "p95": 0.264,
+  "first": 0.217,
+  "bytes": 8774,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "genset/fuel",
+  "path": "/api/sites/47895916bed4/genset/fuel?limit=200",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.007,
+  "bytes": 11,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ },
+ {
+  "label": "prices",
+  "path": "/api/sites/47895916bed4/prices",
+  "site": "RYK farm",
+  "p50": 0.007,
+  "p95": 0.007,
+  "first": 0.007,
+  "bytes": 2565,
+  "codes": [
+   200,
+   200,
+   200
+  ]
+ }
+]

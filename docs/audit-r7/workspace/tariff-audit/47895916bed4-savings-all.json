@@ -1,0 +1,346 @@
+{
+ "from": "2026-10-10",
+ "to": "2026-11-08",
+ "computed": "2026-11-08T14:44:45+00:00",
+ "days": [
+  {
+   "day": "2026-10-28",
+   "saving_native_rs": 2931.26,
+   "saving_tuned_rs": 2931.26,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 67885.63,
+   "native_cost_rs": 66065.68,
+   "litres_actual": 136.76,
+   "litres_native": 128.51,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": -2268.67,
+    "wear": 448.72,
+    "carry_over": 4751.21
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-10-29",
+   "saving_native_rs": 2035.74,
+   "saving_tuned_rs": 2035.74,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 39230.68,
+   "native_cost_rs": 36444.01,
+   "litres_actual": 73.62,
+   "litres_native": 65.95,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": -3545.48,
+    "wear": 758.81,
+    "carry_over": 4822.41
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-10-30",
+   "saving_native_rs": 2361.13,
+   "saving_tuned_rs": 2361.13,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 44269.82,
+   "native_cost_rs": 42536.43,
+   "litres_actual": 84.35,
+   "litres_native": 78.73,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": -2475.57,
+    "wear": 742.17,
+    "carry_over": 4094.53
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-10-31",
+   "saving_native_rs": 1440.39,
+   "saving_tuned_rs": 1440.39,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 41115.14,
+   "native_cost_rs": 35422.52,
+   "litres_actual": 77.01,
+   "litres_native": 64.25,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": -6178.88,
+    "wear": 486.26,
+    "carry_over": 7133.01
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-11-01",
+   "saving_native_rs": -177.33,
+   "saving_tuned_rs": -177.33,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 47145.0,
+   "native_cost_rs": 52382.69,
+   "litres_actual": 89.28,
+   "litres_native": 102.83,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": 5211.84,
+    "wear": 25.85,
+    "carry_over": -5415.02
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-11-02",
+   "saving_native_rs": 1943.29,
+   "saving_tuned_rs": 1943.29,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 62644.1,
+   "native_cost_rs": 64571.34,
+   "litres_actual": 121.74,
+   "litres_native": 124.52,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": 1671.62,
+    "wear": 255.62,
+    "carry_over": 16.05
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-11-03",
+   "saving_native_rs": 2143.85,
+   "saving_tuned_rs": 2143.85,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 63017.64,
+   "native_cost_rs": 64300.39,
+   "litres_actual": 124.51,
+   "litres_native": 125.74,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": 949.02,
+    "wear": 333.74,
+    "carry_over": 861.09
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-11-04",
+   "saving_native_rs": 1082.77,
+   "saving_tuned_rs": 1082.77,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 59524.06,
+   "native_cost_rs": 60586.28,
+   "litres_actual": 117.56,
+   "litres_native": 119.09,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": 892.57,
+    "wear": 169.64,
+    "carry_over": 20.56
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-11-05",
+   "saving_native_rs": 1186.15,
+   "saving_tuned_rs": 1186.15,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 59020.22,
+   "native_cost_rs": 60148.72,
+   "litres_actual": 117.43,
+   "litres_native": 119.01,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": 895.73,
+    "wear": 232.76,
+    "carry_over": 57.66
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-11-06",
+   "saving_native_rs": 1545.12,
+   "saving_tuned_rs": 1545.12,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 54359.61,
+   "native_cost_rs": 54663.75,
+   "litres_actual": 109.24,
+   "litres_native": 108.7,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": -23.51,
+    "wear": 327.64,
+    "carry_over": 1240.99
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  },
+  {
+   "day": "2026-11-07",
+   "saving_native_rs": 3281.7,
+   "saving_tuned_rs": 3281.7,
+   "fidelity": "confirmed",
+   "actual_cost_rs": 49391.79,
+   "native_cost_rs": 48164.57,
+   "litres_actual": 99.11,
+   "litres_native": 94.55,
+   "peak_kw": 0.0,
+   "peak_import_kwh": 0.0,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": -1803.49,
+    "wear": 576.27,
+    "carry_over": 4508.92
+   },
+   "import_unknown": false,
+   "claim_withheld": null
+  }
+ ],
+ "baselines": {
+  "native": {
+   "saving_rs": 19774.07,
+   "claimed_rs": 19774.07,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": -6674.82,
+    "wear": 4357.48,
+    "carry_over": 22091.41,
+    "mdi": 0.0
+   },
+   "litres_saved": -18.7,
+   "verified_days": 11,
+   "perfect_foresight_rs": 47043.58,
+   "mdi_months": {
+    "2026-10": {
+     "actual_kw": 0.0,
+     "baseline_kw": 0.0,
+     "floor_kw": 0.0
+    },
+    "2026-11": {
+     "actual_kw": 0.0,
+     "baseline_kw": 0.0,
+     "floor_kw": 0.0
+    }
+   },
+   "unserved_kwh_actual": 0.0,
+   "unserved_kwh_baseline": 0.0,
+   "genset_unknown_days": 0,
+   "import_unknown_days": 0
+  },
+  "tuned": {
+   "saving_rs": 19774.07,
+   "claimed_rs": 19774.07,
+   "levers": {
+    "peak_window": 0.0,
+    "offpeak_energy": 0.0,
+    "export": 0.0,
+    "genset": -6674.82,
+    "wear": 4357.48,
+    "carry_over": 22091.41,
+    "mdi": 0.0
+   },
+   "litres_saved": -18.7,
+   "verified_days": 11,
+   "perfect_foresight_rs": null,
+   "mdi_months": {
+    "2026-10": {
+     "actual_kw": 0.0,
+     "baseline_kw": 0.0,
+     "floor_kw": 0.0
+    },
+    "2026-11": {
+     "actual_kw": 0.0,
+     "baseline_kw": 0.0,
+     "floor_kw": 0.0
+    }
+   },
+   "unserved_kwh_actual": 0.0,
+   "unserved_kwh_baseline": 0.0,
+   "genset_unknown_days": 0,
+   "import_unknown_days": 0
+  }
+ },
+ "preliminary": true,
+ "final_conditions": {
+  "verified_days": 11,
+  "verified_days_needed": 28,
+  "native_capture": true,
+  "switchback_weeks": 0.0,
+  "switchback_weeks_needed": 8,
+  "fca_billed": true
+ },
+ "blocked": null,
+ "method": "Counterfactual replay at 1-minute resolution against the native capture and a tuned table, priced on the bearable-cost basis (recoverable GST and adjustable s.235 excluded), with the dated fuel price and the same wear charge on both arms",
+ "fee": {
+  "fee_rs_per_month": 0.0,
+  "verified_saving_rs_per_month": 57561.0,
+  "within_one_third": null,
+  "basis": "claimed saving per scored day x days in the month, plus the month's MDI lever; the smaller of the native and tuned baselines"
+ },
+ "energy": {
+  "import_kwh": 0,
+  "export_kwh": 0,
+  "pv_kwh": 4451.0,
+  "load_kwh": 8563.6,
+  "genset_kwh": 4214.3,
+  "litres": 1518.9,
+  "genset_hours": 232.6,
+  "throughput_kwh": 962.2,
+  "unserved_kwh": 0,
+  "outage_hours": 356.0,
+  "peak_kw": 0,
+  "litres_source": "meter"
+ }
+}

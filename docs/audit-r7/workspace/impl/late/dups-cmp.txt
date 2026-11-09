@@ -1,0 +1,324 @@
+##### role-owner-02 ( orig wp=savings-engine ) high backend/gridlytics/verify.py
+  CT: Headline savings rest on carry-over credit: Faisalabad's whole saving is carry-over on a day its actual cost was higher than native
+  CA: Faisalabad: 'Saving against the native settings Rs 1,901 — Claimed on verified days: Rs 1,901'. The ledger is: Off-peak energy -Rs 4,149, Battery wear Rs 1,666, Carry-over Rs 4,383, giving Rs 1,901. On the only confirmed day (8 Nov) the Days table shows Actual cost Rs 47,391 against Native cost Rs 44,908, so the plan cost Rs 2,483 more and the whole claim is the value put on the energy left in the battery. That battery is then held at 95 % for days ('Hold for outage'). Rahim Yar Khan: Rs 12,581 
+  -> DUP engine-money-live-01 high backend/gridlytics/verify.py
+     T: Daily carry-over credits stored energy at the peak price while the next day's native replay inherits that energy, so a plan that just holds a full battery shows a saving
+     A: The carry-over uses v_end = 0.95 × the day's highest import price − wear = Rs 27.19/kWh in November (Rs 40.02 peak). Next morning the native arm starts with that energy and self-use spends it off-peak (worth 0.95 × 26.98 − 10.83 ≈ Rs 14.8/kWh). Each kWh of end-of-day gap is over-credited by about Rs 12.4. - Faisalabad 8 Nov: the whole month's claim of Rs 1,901 is carry-over +4,384 (204.25 kWh actual against 43.0 kWh native at day end), wear +1,666 and off-peak −4,149. The actual discharged 0.8 k
+  NOTE: Faisalabad's whole saving is carry-over: both replays start at the actual's SoC, the day's end energy is credited at the peak price while the next day's native replay inherits it (verify.py 641-675, 733); Part 8.2 prices carry-over only at switchback block boundaries.
+##### engine-savings-08 ( orig wp=savings-engine ) medium backend/gridlytics/verify.py
+  CT: Off-grid per-day carry-over is noisy: the per-day ledger drifts from a continuous replay by thousands of rupees (known, open)
+  CA: Customers at an off-grid site see a per-day ledger whose sign on a given day is set by the carry-over valuation rather than by fuel burnt; monthly totals can be over- or under-stated by several thousand rupees per 11 days. Documented as open; not fixed.
+  -> DUP engine-money-live-02 high backend/gridlytics/verify.py
+     T: Off-grid farm claims Rs 12,581 this month (Rs 21,349 over 12 days) while burning more diesel than its native settings; the claim is all carry-over
+     A: - November: saving Rs 12,581, of which carry-over is Rs 9,244 (73%), wear Rs 2,839 and genset Rs 497. Diesel saved is −0.3 L. - 28 Oct–8 Nov: claimed Rs 21,349. Carry-over is +30,046, genset −13,972, and 34.6 L more diesel was burnt. - The actual arm burnt more fuel than native on 7 of 12 days and ended the day higher than native on 11 of 12. - v_end is Rs 152–163/kWh: the genset's all-in average cost at its night load ratio (about 0.34), including no-load burn and Rs 400/h run-hour cost. The se
+  NOTE: The off-grid farm claims Rs 12,581 this month, all carry-over, while burning more diesel than native.
+##### flow-savings-pilot-bill-01 ( orig wp=savings-engine ) high None
+  CT: The MDI lever is credited in full for any selected range: one day claims a whole month's demand-charge saving, and sub-ranges double-count
+  CA: Each range takes max(peak) over its own days and multiplies by the full Rs 1,250/kW. Results: 3 Nov alone shows 'Saving against the native settings Rs 41,099' (MDI Rs 42,625), while the day's own row is -Rs 1,526. 8 Nov alone shows MDI -Rs 19,925. 1-4 Nov claims Rs 48,726 and 5-8 Nov claims Rs 35,755: together Rs 84,481, against Rs 43,594 for 1-8 Nov. On 'This month', Rs 41,638 of the Rs 43,594 headline (95%) is a mid-month MDI difference with no 'month not finished' label.
+  -> DUP engine-money-live-03 high backend/gridlytics/verify.py
+     T: The MDI lever changes with the chosen date range: one day can claim a whole month's MDI, and unscored days in the month are ignored
+     A: - Karachi 3 Nov alone: 'Saving against the native settings Rs 41,099'. The day lost Rs 1,526, and MDI +42,625 comes from that day's 839 against 873 kW. The month's real peak so far is 902 kW. - 1–3 Nov shows Rs 53,336, more than the whole month to date (Rs 43,594). - 8 Nov alone shows −Rs 20,415. - 'Last 30 days' shows Rs 90,112: two months of MDI (Rs 94,088) from 12 scored days, whose daily sum is −Rs 3,975. - Faisalabad October: MDI −Rs 30,275 (328.45 actual against 304.23 baseline, from 28–31
+  NOTE: The MDI lever follows the chosen range; the month's actual peak must also come from every day of the month, not only scored days (FSD 26 Oct).
+##### flow-onboarding-01 ( orig wp=tariffs ) high backend/gridlytics/tariffs.py
+  CT: An expired or not-yet-started net-billing or legacy net-metering agreement still earns export credit in the price vector
+  CA: The export credit is identical whatever the dates. With net billing ended 2026-02-28 the summary reads 'Export: up to Rs 8.13/kWh', the same as an agreement valid to 2033. A legacy net-metering agreement that ended 2025-01-01 is still netted at Rs 40.01/kWh, about the import price. An agreement_start of 'banana' also gives Rs 8.13. The optimiser and the savings are therefore priced on export income the site no longer has. The regime_expiring alert even says 'ends on <past date>'.
+  -> DUP engine-money-live-04 high backend/gridlytics/tariffs.py
+     T: Legacy net-metering agreement end date is ignored: exports stay priced at the import rate after expiry instead of the net-billing rate (Rs 8.13)
+     A: - Lahore 24 Dec 2026 and 1 Feb 2027: c_exp is 38.95 and 47.75, the same as before expiry. - The audit site whose agreement ended on 1 Jan 2025 still exports at 26.97/40.01 on 9 Nov 2026. - agreement_start and agreement_end are read only by an alert ('The net metering legacy agreement ends on 2026-12-23'). Pricing ignores them. - An optimiser seeing about 5× the real export value would plan battery and PV exports at peak, and the export lever would be credited at the import rate.
+  NOTE: Legacy net-metering end date ignored in the vectors and in the bill rebuild (tariffs.py 548-553, 607-611): after expiry exports are priced by the regime that follows (net billing Rs 8.13), not at the import rate.
+##### flow-savings-pilot-bill-02 ( orig wp=fleet-overview ) high None
+  CT: Month-to-date saving differs between pages: Fleet and Overview show Rs 1,956 for Karachi, while Savings, the fleet-savings API and the monthly report show Rs 43,594
+  CA: Fleet row and Overview: Rs 1,956. Savings headline: Rs 43,594. GET /api/fleet/savings claimed_rs: 43593.81. _mtd_saving sums only the daily claimed_rs (no MDI lever) and uses the calendar month rather than the billing month. verify.summary, which the Savings page and reports.py:105 use, adds the MDI lever.
+  -> DUP engine-money-live-05 medium backend/gridlytics/routes_sites.py
+     T: Month saving differs between pages: fleet row and site overview say Rs 1,956 for Karachi, the savings page, report and fleet-savings API say Rs 43,594
+     A: - Fleet and overview: Rs 1,956. /api/fleet's mtd_saving_rs sums only the daily claimed_rs (no MDI), using the calendar month and not the billing month. - Savings page, monthly report and /api/fleet/savings: Rs 43,594 (includes MDI 41,637.5). - /api/fleet's summary.mtd_saving_rs = 16,438, while /api/fleet/savings' total_claimed_rs = 58,076. - The sparkline uses saving_rs, not claimed_rs.
+  NOTE: Same Karachi Rs 1,956 (fleet, overview) vs Rs 43,594 (savings, report, fleet-savings API).
+##### pages-D-03 ( orig wp=savings-engine ) medium /home/user/saad-tahir/gridlytics-backend/backend/gridlytics/verify.py
+  CT: MDI lever is taken from month-to-date peaks on the default 'This month' period and shown without a provisional/full-month label (95 % of Karachi's headline claim on day 9)
+  CA: `mdi_by_month` uses the max peaks of whatever days fall in the period (lines 1061-1073), adds it to `saving_rs` for every month touched, and adds it to `claimed_rs` whenever `months[k][3] > 0`, i.e. one confirmed/partial day in the month (1075). The ledger row (levers.ts line 12) and the 'Maximum demand by month' list (savings-ledger.tsx 10-18) carry no provisional/partial-month mark. Period is calendar-month while MDI rows are keyed by billing month (`bill_month`), so with a `reading_day` conne
+  -> DUP engine-money-live-06 medium backend/gridlytics/verify.py
+     T: Month-to-date saving books the whole month's MDI reduction while the daily cost of holding it builds up, overstating Karachi's month
+     A: - Headline Rs 43,594, of which MDI is Rs 41,638 (33 kW × Rs 1,250), booked in full after 8 days. Every day without an outage loses money: 3–8 Nov average −Rs 1,713 a day. The plan cycles 240–420 kWh a day to hold the 902 kW cap; peak +9.2–11.5k, off-peak −7.4–8.8k, wear −2.6–4.6k. - If the remaining 22 days look like 3–8 Nov with no outage, the month ends near +Rs 5,900, not Rs 43,594. - The fee check (Rs 37,508 a month) and the headline both lean on this front-loaded credit. A 1 MW plant's 'per
+  NOTE: Month-to-date books the whole month's MDI reduction while its daily holding cost accrues.
+##### engine-optimiser-14 ( orig wp=savings-engine ) low backend/gridlytics/verify.py
+  CT: Perfect-foresight bound leaves the unserved and MDI terms out of its cost and accepts time-limited solves
+  CA: perfect_foresight_rs can be inflated or deflated, which distorts the capture-ratio KPI.
+  -> DUP engine-money-live-07 medium backend/gridlytics/verify.py
+     T: The 'perfect-foresight upper bound' is below the claimed saving and even negative, so it is not a bound
+     A: - Karachi November: bound Rs 615 against a claim of Rs 43,594. - Karachi 3 Nov: bound −Rs 3,121 against a claim of +Rs 41,099. - Lahore (monitor, actual equals native): bound −Rs 7,314, including −6,327.77 on 6 Nov and −1,816.93 on 1 Nov. - Causes:   - The bound's cost (energy + genset + wear − terminal) leaves out the MDI it pays to cap; the hindsight solve takes the day's month-to-date M0.   - It solves at 15 minutes but is compared with the native arm priced per minute.   - It has a 5 s limit
+  NOTE: Bound below the claim and negative (KHI Nov Rs 615, LHR Nov -Rs 7,314).
+##### flow-savings-pilot-bill-08 ( orig wp=tariffs ) medium None
+  CT: Bills over missing-data days count the gaps as zero import, but the page says the gaps are 'filled from the profile', and the 2% verdict is still given
+  CA: telemetry.filled() turns blank import into 0. The 17-day bill's energy lines are identical to the 15-day bill's (44,830 / 202,023 kWh), but its fixed charge is prorated over 17 days (Rs 638,892 against 563,728), giving -9.25% 'Outside the 2 % check'. The October bill was accepted at 22.6% completeness and rebuilt to Rs 5,840,983, -66.62% 'Outside the 2 % check'. Its fixed charge uses an MDI from the 7 metered days only. Notice text: 'the rebuilt lines fill the gaps from the profile', which does 
+  -> DUP engine-money-live-08 medium frontend/src/features/savings/bills-panel.tsx
+     T: Bill comparison with missing meter data counts the gap as zero, while the page says the gaps were filled from the profile
+     A: - telemetry.filled() turns blank import minutes into 0 kWh. The 17-day bill shows exactly the same energy units as the 15-day full-data bill (44,830 / 202,023 kWh). - The page then shows −9.25% and −66.62% 'Outside the 2% check'. - The notice says: 'Part of the period has no meter data, so the rebuilt lines fill the gaps from the profile', which is false.
+  NOTE: Bill comparison counts missing meter data as zero while the page says the gaps were filled.
+##### frontend-states-formats-01 ( orig wp=savings-ui-crosscut ) medium frontend/src/features/savings/savings-kpis.tsx
+  CT: Gas-engine fuel (MMBtu) is shown as litres of 'Diesel' on Savings, Overview, Plan, Compare, Fuel log and the PDF report
+  CA: Everywhere else the unit is hard-coded to L, and the label says Diesel. savings-kpis.tsx:36-38 shows 'Diesel saved' with litres() and :53 shows 'Diesel burned' with litres(e.litres). savings-ledger.tsx:56 and :87 show 'Diesel saved (Estimated)' in L. savings-days-table.tsx:84 shows 'Litres actual / native'. overview-page.tsx:193 shows litres(n.month.litres) with the suffix '(estimated)'. plan-header.tsx:43 shows 'Diesel (Estimated)' in litres. compare-drawer.tsx:27 shows 'Diesel (Estimated)' wit
+  -> DUP engine-money-live-09 medium frontend/src/features/savings/savings-kpis.tsx
+     T: A captive-gas genset's fuel is shown as diesel litres (the figures are MMBtu of gas)
+     A: - The page says 'Diesel saved 1.9 L', 'Diesel burned 0.0 L', '0.0 L / 1.4 L'. The 1.39 is MMBtu of gas: Rs 5,838 of the Rs 11,087 genset lever at Rs 4,200 each. - The fuel price form label is fixed at 'Price (Rs per L)'.
+  NOTE: Karachi's captive-gas MMBtu shown as diesel litres in savings-kpis.tsx.
+##### engine-tariffs-05 ( orig wp=sites-onboarding ) medium frontend/src/features/sites/onboarding/site-form.ts
+  CT: Tax flags, ICP eligibility and baseline, and Tariff F season cannot be set from the web app; every web-made connection is priced as a sales-tax-registered taxpayer, and strn=false still recovers GST
+  CA: The plan and ledger understate the bearable price of no-STRN commercial sites by about 35%. ICP and Tariff F pricing are unreachable for sites created in the web app. strn and gst_recoverable are independent flags with no consistency check (tariffs.py:470-476). The atl flag is stored and never used.
+  -> DUP engine-money-live-10 medium frontend/src/features/sites/onboarding/site-form.ts
+     T: Connection tax flags and the ICP baseline cannot be set in the web app; every site is priced as a GST-registered filer with no ICP
+     A: - The form edits only the province. - site-form.ts:187 says 'the fields this form does not edit (ICP baseline, tax flags, seasonal multiplier) are kept from the saved connection'. - The backend defaults all flags to True (sites.py:103) and icp.eligible to false. - The bearable-cost basis, the optimiser's prices and every saving therefore assume a registered, ATL industrial filer with no ICP. This is wrong for the very sites (B-2/B-3 with growth) the brief targets, and silently 18–21% low for non
+  NOTE: Tax flags and the ICP baseline cannot be set in the web app.
+##### pages-D-01 ( orig wp=savings-ui-crosscut ) high /home/user/saad-tahir/gridlytics-backend/backend/gridlytics/verify.py
+  CT: Fee card labels a whole-month extrapolation of the claim 'Verified saving a month', names the wrong baseline, and never shows the basis or a Preliminary mark
+  CA: verify.summary scales the claimed rupees per scored day to the whole billing month (`c / n * dim + mdi_c`, line 1113), takes the smaller baseline and averages months, then labels it `verified_saving_rs_per_month`. The FeeCard (fee-card.tsx lines 40-43) prints it as 'Verified saving a month' with the subtitle 'claimed against the native settings, per month in the period' (wrong on both counts: it is the min of native and tuned, and it is extrapolated) and never shows `fee.basis`. The verdict badg
+  -> DUP engine-money-live-12 medium frontend/src/features/savings/fee-card.tsx
+     T: The fee check labels the tuned figure as 'against the native settings' and turns 1 to 4 days into a monthly 'verified saving'
+     A: - Karachi: Rs 37,508 is the tuned figure (−1,101.11 / 8 × 30 + 41,637.5). Native would be Rs 48,974. The tile says 'claimed against the native settings'. - Faisalabad November: Rs 1,719 is tuned (native Rs 7,129). - Faisalabad October (4 days, claimed −Rs 3,264): Rs 87,676 a month. - Faisalabad 28 Oct alone: Rs 173,741 a month. - Farm November: Rs 47,178 a month (see the carry-over finding).
+  NOTE: Fee check labels the tuned figure 'against the native settings' and extrapolates 1-4 days to a month.
+##### pages-D-06 ( orig wp=savings-ui-crosscut ) medium /home/user/saad-tahir/gridlytics-backend/backend/gridlytics/routes_savings.py
+  CT: Savings CSV and the report CSV lack the tariff version, capture version and claim columns; the PDF says the CSV annex dates the tariff versions
+  CA: routes_savings.savings_csv writes day, saving_native_rs, saving_tuned_rs, fidelity, costs, litres, peak only: no claimed_rs, no claim_withheld, no plan id, no tariff or capture version. reports.py 142-155 adds plan_ids but neither version nor claim columns, while the PDF footer (line 159) states 'tariff versions as dated in the CSV annex'. Summing the saving column counts not-applied, pending, native-block and withheld days.
+  -> DUP engine-money-live-13 medium backend/gridlytics/routes_savings.py
+     T: The savings CSV leaves out MDI, the levers, carry-over, the baseline peak and the version ids, so it adds up to a different total than the page
+     A: - The 8 rows add up to Rs 1,956.31; the page shows Rs 43,594. There is no MDI line and no baseline peak_kw, so it cannot be rebuilt. - Per row, native − actual cost does not equal the saving because carry-over is hidden. 2 Nov: 474,096.13 − 475,139.50 = −1,043 against saving +4,748. - There is no tariff version, capture version or plan id.
+  -> DUP flow-reports-alerts-members-keys-04 medium backend/gridlytics/reports.py
+     T: Report CSV has no tariff or capture version though the PDF points to them; its plan_ids are the first four plans by UTC date
+     A: The CSV columns are day, import_kwh, export_kwh, pv_kwh, load_kwh, genset_hours, litres, outage_minutes, peak_kw, saving_native_rs, saving_tuned_rs, fidelity, plan_ids. There is no tariff version and no capture version. plan_ids keeps the first 4 plans whose UTC belief_time date equals the PKT day. For 2026-11-01 it lists the 01:00, 04:00, 07:00 and 10:00 UTC plans. It misses the plans that ran from 00:00 to 05:00 PKT (19:00 and 22:00 UTC the day before), and counts the evening UTC plans under t
+  NOTE: Savings CSV omits MDI, levers, carry-over, baseline peak and version ids; the report CSV has no tariff or capture version and its plan_ids are the first four plans by UTC date (reports.py:152): list plan ids by Karachi day.
+##### role-analyst-14 ( orig wp=fleet-overview ) medium None
+  CT: Fleet 7-day bars rescale each row on its own, so a -Rs 0.09 day draws as a full-height red 'loss' bar
+  CA: Lahore (spark -0.01, 0, 0, 0, -0.09, 0, 0) shows a red dash and a full-height red bar next to 'Rs 0'. Faisalabad's -0.27…+0.15 days don't show, and its single bar looks the same as Karachi's real Rs 4,748 day. The aria-label is only 'Daily saving, last 7 days', with no values.
+  -> DUP engine-money-live-14 low backend/gridlytics/routes_sites.py
+     T: Fleet 7-day sparkline blows up rounding noise: Lahore's −Rs 0.09 draws as a full-height red loss
+     A: - The Lahore row shows a tall red bar for 6 Nov (saving_rs −0.09) and a red dash for 2 Nov (−0.01). Each row is scaled to its own range, so noise looks like a loss. - The spark uses saving_rs, not claimed_rs (0 for the monitor tier).
+  NOTE: Lahore's -Rs 0.09 drawn as a full-height red bar.
+##### pages-D-24 ( orig wp=alerts-reports ) low /home/user/gridlytics-frontend/frontend/src/features/reports/generate-report-dialog.tsx
+  CT: Daily operations sheet asks for a month but renders 'tomorrow's' slot table from the current plan, not the sheet the plan describes
+  CA: The Month field applies to every kind; reports.py 162-172 ignores the period and prints the last day of `plans.current()`'s slots, titled 'Tomorrow's slot table'; the listed row is labelled with the month chosen.
+  -> DUP flow-reports-alerts-members-keys-01 high backend/gridlytics/reports.py
+     T: Daily operations sheet prints the day after tomorrow's partial table as "Tomorrow's slot table", with no date in the PDF
+     A: At 17:11 PKT on 9 Nov the sheet shows only 2026-11-11 00:00-13:15 'hold 20 %'. That is the last, partial day of the 48-hour plan. The PDF has no date column, and its header says '01 November 2026 to 30 November 2026'. An installer keying this into the vendor app would hold the battery all day instead of charging and discharging. The same happens for Faisalabad (2026-11-11 00:00-12:30 hold 95 %).
+  -> DUP flow-reports-alerts-members-keys-19 low frontend/src/features/reports/generate-report-dialog.tsx
+     T: Generate dialog asks for a month for the daily operations sheet and says it will be marked Preliminary
+     A: The dialog shows 'Month: November 2026 - The month is not over: the report will be marked Preliminary.' The sheet ignores the month (the same content for 1999-01 or 2026-10) and is never marked Preliminary (preliminary: null). The list labels these sheets 'November 2026' or 'October 2026'.
+  NOTE: Raises pages-D-24 to high: at 17:11 the sheet printed the 48-hour plan's partial last day (hold 20 % all day) undated as 'Tomorrow's slot table'; print dated day tables (today's remainder and tomorrow, spec line 582), and the dialog asks for a day, not a month, with no Preliminary hint.
+##### frontend-states-formats-05 ( orig wp=alerts-reports ) medium frontend/src/features/reports/reports-page.tsx
+  CT: Reports empty state promises 'Your first monthly report on the 3rd', but nothing generates reports on a schedule
+  CA: The title is 'Your first monthly report on the 3rd', followed by 'Each month's report is generated on the 3rd, once the month's last days are priced.' No report ever arrives on the 3rd, so the page tells the customer something false.
+  -> DUP flow-reports-alerts-members-keys-02 medium frontend/src/features/reports/reports-page.tsx
+     T: No report schedules exist, but the empty Reports page promises an automatic report on the 3rd
+     A: The page says 'Your first monthly report on the 3rd. Each month's report is generated on the 3rd, once the month's last days are priced.' Nothing generates reports: the scheduler runs only the 15-minute tick and the nightly job, and reports.generate is called only from POST /api/reports. Neither /reports nor /settings has a schedules section.
+  NOTE: Empty Reports page promises an automatic report on the 3rd; schedules (UI-14) stay deferred.
+##### pages-D-07 ( orig wp=alerts-reports ) medium /home/user/saad-tahir/gridlytics-backend/backend/gridlytics/reports.py
+  CT: Monthly savings PDF covers a fraction of plan 8.5 (no switchback/carry-over, bill comparison, KPI grid or tuned ledger); no company roll-up report or pilot report although tracker VER-10 is marked done
+  CA: The PDF has: headline table, ledger against native only (not tuned), method sentence, an energy table, daily rows. No switchback section, no carry-over credits, no bill comparison, no KPI grid (MDI by month, reserve adequacy, forecast skill, control health), no assumptions/GST note, no tuned ledger, no company roll-up, no pilot report kind (KINDS line 24 has three kinds), no tier-specific title. Report 'preliminary' sentence omits the switchback-weeks condition.
+  -> DUP flow-reports-alerts-members-keys-03 medium backend/gridlytics/reports.py
+     T: No company (fleet) roll-up report, no pilot report and no browser preview
+     A: The dialog's Site select lists single sites only, so there is no fleet or company report. The API answers kind 'pilot' with 422 'A report is one of monthly_savings, energy_only, daily_operations'. Reports can only be downloaded; there is no in-browser preview.
+  -> DUP flow-reports-alerts-members-keys-05 medium backend/gridlytics/reports.py
+     T: Monthly savings PDF lacks most of the content spec 8.5 lists
+     A: The PDF has the Headline, the Ledger, the Method, Energy, Daily rows and one closing line. Missing: forecast skill, control health, the switchback calendar and carry-over credits, the bill comparison, and outage coverage (only outage hours appear). The page has Switchback and Bill comparison tabs for the same period, so the report omits figures the product already has. The October report spans '01 October to 31 October' but holds data only from 25 Oct, and does not say so.
+  NOTE: No company roll-up or pilot report (pilot kind answers 422), no browser preview (pages-D-25's half), and the PDF lacks forecast skill, control health, switchback and carry-over, bill comparison and outage coverage, and does not state a partial-data period.
+##### founder-console-06 ( orig wp=auth-security ) medium frontend/src/lib/api/client.ts
+  CT: A member left without a seat by the founder's seat limit sees the full app with 'This is not available for your role'
+  CA: The full shell (Fleet, Alerts, Reports, Tariffs, Settings, Members) appears and Fleet says 'This is not available for your role.' /api/meta, /api/fleet and /api/alerts/counts answer 403 code no_seat with the sentence, but client.ts does nothing with the 'notice' step, and QueryState treats every 403 as a role refusal. member_disabled has the same problem.
+  -> DUP flow-reports-alerts-members-keys-06 medium frontend/src/lib/api/client.ts
+     T: Member with no seat or with access switched off sees "This is not available for your role" instead of the reason
+     A: The app shell loads with the sidebar (Fleet, Alerts, Reports, Tariffs, Settings, Members; 'No sites yet'), and every page says 'This is not available for your role.' The person is not told they lack a seat or were switched off, or whom to ask.
+  NOTE: Both no_seat and member_disabled render as 'not available for your role'.
+##### security-roles-07 ( orig wp=auth-security ) low backend/gridlytics/apikeys.py
+  CT: API key scopes: sites:read reaches the current plan and every GET under the site, while plans:read gates only /plans; the edge/partner key kind is not enforced
+  CA: RESOURCES (apikeys.py:42-43) maps ^/api/sites/[^/]+/plans(/|$) to plans and every other /api/sites/{id}/... path to sites. So /plan (routes_plans.py:21) is a sites:read path, and plans:read gates only the history and the signed message. apikeys.fields accepts any kind with any scope (apikeys.py:97-115); kind is stored and never read.
+  -> DUP flow-reports-alerts-members-keys-12 medium backend/gridlytics/apikeys.py
+     T: API key scopes do not match their descriptions: sites:read reads far more than settings; plans:read cannot read the current plan
+     A: The sites:read key gets 200 from /plan (104 kB, every step), /telemetry, /telemetry/days, /battery, /outages, /forecasts/*, /savings, /pilot, /switchback, /overview/chart, /genset and /now: all operational data under the site path. The plans:read key gets 403 out_of_scope on GET /api/sites/{id}/plan (the current plan), but 200 on /plans, /plans/{id} and /plans/current/message. A partner given 'settings' access therefore reads telemetry and plans.
+  NOTE: sites:read reads plans and telemetry; plans:read cannot read /plan.
+##### role-analyst-25 ( orig wp=alerts-reports ) low None
+  CT: Report downloads are not named per site, and the PDF rounds Rs 1,900.5 differently from the page
+  CA: Both downloads are named 'gridlytics-monthly_savings-2026-11.pdf' / '.csv', so the second collides with the first. The PDF headline reads 'Saving Rs 1,900 · Claimed (applied days) Rs 1,901' (saving_rs 1900.5, half-even rounding), while the page shows Rs 1,901 for both.
+  -> DUP flow-reports-alerts-members-keys-15 low backend/gridlytics/routes_reports.py
+     T: Downloaded report file names omit the site, so different sites' reports get the same name
+     A: Both save as 'gridlytics-monthly_savings-2026-11.pdf', so the second overwrites the first or becomes '(1)'. The same applies to every kind.
+  NOTE: Report file names omit the site.
+##### engine-savings-13 ( orig wp=alerts-reports ) low backend/gridlytics/reports.py
+  CT: Report wording: the Preliminary sentence omits two of the four conditions, and the baseline at manual-genset sites includes an assumed operator rule the capture does not record
+  CA: A CFO reading the PDF is told the baseline is purely the inverter's settings and is given an incomplete reason for 'Preliminary'.
+  -> DUP flow-reports-alerts-members-keys-17 low backend/gridlytics/reports.py
+     T: PDF Preliminary note omits the switchback condition the Savings page uses; litres have no 'Estimated' mark and show '-0 L'
+     A: The PDF prints one fixed sentence: 'Fewer than 28 verified days, the month is not over, or a fuel adjustment of the period is not yet billed'. It does not say which condition applies and leaves out the 8-week switchback condition. 'Diesel saved 72 L' has no 'Estimated' (the page shows '72.4 L Estimated'). The farm report shows 'Diesel saved -0 L'.
+  NOTE: The PDF's Preliminary sentence must name the condition that applies, including the 8-week switchback one; litres marked Estimated and no '-0 L' (with pages-D-08).
+##### role-operator-20 ( orig wp=alerts-reports ) low backend/gridlytics/routes_reports.py
+  CT: Operator can download the Monthly savings report (PDF/CSV) although the pages say exporting savings is for an administrator or an analyst
+  CA: The download needs only see_costs, so the operator gets the savings CSV the Savings page tells them they cannot export.
+  -> DUP flow-reports-alerts-members-keys-18 low backend/gridlytics/routes_reports.py
+     T: Operator can download the monthly savings CSV though exporting savings is refused to operators
+     A: (1) 403 'Exporting savings is for an administrator or an analyst'. (2) 200, a CSV with saving_native_rs, saving_tuned_rs and plan_ids. The report route checks only see_costs.
+  NOTE: Report route checks only see_costs, not export.
+##### role-operator-09 ( orig wp=ui-charts-a11y ) medium frontend/src/components/ui/table.tsx
+  CT: Phone (375): data tables hide their key columns behind an unmarked horizontal scroll inside the card
+  CA: Fleet: only Site and Tier show; Now, Next, Alerts and 'Saving, month' are off-screen. Alerts inbox: the alert title is cut, and Site, Opened, State and Assigned are hidden. Reports: Status and the PDF/CSV buttons are hidden. Savings 'Ledger by lever': the money values are cut to 'R' and '-R'. Genset runs: only Start and End. Plan Slots and Control 'The table to key in': SoC target, Grid charge, Gen charge and Intent are hidden. Tariff rate cards: Off-peak, Flat and Fixed are hidden. There is no 
+  -> DUP flow-reports-alerts-members-keys-20 medium frontend/src/features/reports/reports-table.tsx
+     T: At 375 px the Reports, API keys and Members tables push their actions (PDF/CSV, Revoke, Switch off) off-screen
+     A: Reports: only Site, Report and Month fit. The Preliminary badge is cut off, and Generated, Status and the PDF/CSV buttons are off the right edge. Keys: only Name, Key and Kind show; State and Revoke are hidden. Members: Access and 'Switch off' are hidden and the role select is clipped. The page itself reports no overflow, because the scroll is inside the card.
+  NOTE: At 375 px the Reports, API keys and Members tables hide PDF/CSV, Revoke and Switch off.
+##### role-analyst-20 ( orig wp=auth-security ) low None
+  CT: API keys and Audit trail tabs call routes the analyst is refused and read 'The API keys is not available for your role.'
+  CA: 'The API keys is not available for your role.' Both tabs fire 403 GET /api/platform/keys and 403 GET /api/audit?offset=0.
+  -> DUP flow-reports-alerts-members-keys-21 low frontend/src/features/org/keys-tab.tsx
+     T: Role refusal on API keys reads 'The API keys is not available for your role' and does not say who may
+     A: 'The API keys is not available for your role.' and 'The members list is not available for your role.'
+  NOTE: 'The API keys is not available for your role'.
+##### pages-A-13 ( orig wp=shell-nav ) low /home/user/gridlytics-frontend/frontend/src/components/layout/nav.ts
+  CT: "Settings" and "Members" sidebar links are both highlighted on /settings and on /settings?view=members
+  CA: Both links are active on both pages: NavLink's `end` matching compares pathname only, and both `to` values resolve to the path /settings.
+  -> DUP flow-reports-alerts-members-keys-22 low frontend/src/components/layout/sidebar.tsx
+     T: Sidebar highlights both 'Settings' and 'Members' on every Company settings tab
+     A: Both Settings and Members are highlighted on every tab, including API keys and Company.
+  NOTE: Settings and Members both highlighted on every Company settings tab.
+##### frontend-a11y-07 ( orig wp=auth-security ) medium frontend/src/features/org/members-tab.tsx
+  CT: Selects that write or reload on every change: arrow keys on Windows switch company, change member roles and suspend memberships
+  CA: - Members (members-tab.tsx:101-102): the first arrow press immediately PATCHes the member to the adjacent role, e.g. Operator -> Administrator, a privilege escalation never confirmed. The select is then disabled while pending (busy(m), line 72), so focus drops and the intended role cannot be reached. - Company switch (company-switch.tsx:23 -> auth.store.ts:226-230): calls dropCustomerDraft() and window.location.reload() on the first arrow, landing in the wrong company. - Founder users (founder-u
+  -> DUP flow-reports-alerts-members-keys-23 low frontend/src/features/org/members-tab.tsx
+     T: Member role changes, including promotion to Administrator, save on select change with no confirmation
+     A: The PUT is sent immediately on change, and the person becomes an administrator from one mis-click. Only switching off has a confirm dialog.
+  NOTE: Member role select saves on change, including promotion to Administrator.
+##### frontend-a11y-16 ( orig wp=auth-security ) low frontend/src/features/org/new-key-dialog.tsx
+  CT: The one-time API key dialog closes on Escape or an outside click, so the key is lost
+  CA: `onOpenChange={(o) => !o && onDone()}` runs on Escape or overlay click, and the token is gone. The only recovery is to revoke the key and make another.
+  -> DUP flow-reports-alerts-members-keys-24 low frontend/src/features/org/new-key-dialog.tsx
+     T: One-time API key dialog closes on Escape, the overlay or the close button; keys list shows a misleading 'Role on record'
+     A: Escape closes the dialog at once (dialogOpenAfterEscape: 0 in keys-flow), and the key is lost for good; it must be revoked and made again. The list has a 'Role on record' column showing Operator or Administrator for keys that the page says hold no role permission.
+  NOTE: One-time key dialog closes on Escape; the 'Role on record' half was refuted in verification as pages-A-16, so change that column only if the page text contradicts it.
+##### pages-D-16 ( orig wp=alerts-reports ) low /home/user/saad-tahir/gridlytics-backend/backend/gridlytics/alerts.py
+  CT: regime_expiring alert says 'ends on' for an agreement already past; no 'Regime expired' state on the Tariffs page
+  CA: `soon = days <= 60` is true for any negative number, so the title stays 'The legacy net metering agreement ends on 2019-..' forever and no distinct expired state exists; the Tariffs page shows nothing about site regimes or their expiry.
+  -> DUP flow-reports-alerts-members-keys-25 low backend/gridlytics/alerts.py
+     T: Tariff regime alert says 'ends on 2020-01-01' for agreements that ended long ago; the drawer shows raw rule and connection ids
+     A: The title uses 'ends on' with a past date. The two identical rows cannot be told apart. The drawer shows 'Rule: Regime expiring d90fccdc728a' and 'Connection: d90fccdc728a'.
+  NOTE: 'ends on 2020-01-01' for long-ended agreements; the drawer's raw rule and connection ids are role-viewer-17's half.
+##### role-operator-31 ( orig wp=alerts-reports ) low frontend/src/features/alerts/alert-drawer.tsx
+  CT: Alerts wording and handling: 'Today's slot table…' opened yesterday; free-text assignee; truncated State filter; raw 'sigma' rule
+  CA: 'Today's slot table is not marked as applied…' was opened 16 h ago, on the previous day. 'Assign to' is a free-text box ('The person's name, as the team knows them'), so typos create phantom assignees. The State select at 1440 reads 'Needs attention (open or acknov'. The rule is shown as 'Battery sigma high'. The overview strip writes severity 'warning' in lowercase where /alerts writes 'Warning'.
+  -> DUP flow-reports-alerts-members-keys-26 low backend/gridlytics/alerts.py
+     T: Alert assignment is free text for operators and the API stores any string; no member link or notification
+     A: Only an administrator gets a member list; operators, who act on alerts most, type any name. The API stored 'Nobody Real <script>' (200). The assignee is not notified and nothing filters 'assigned to me'.
+  NOTE: Free-text assignee; the API also stores any string: validate against members.
+##### role-operator-10 ( orig wp=savings-ui-crosscut ) medium frontend/src/lib/reasons.ts
+  CT: Off-grid farm is described as a permanent grid outage on Fleet, Overview, Plan, Savings, Genset and Forecasts
+  CA: Grid-outage wording and empty grid KPIs everywhere except the Outages page. This contradicts that page and confuses the farm's operator.
+  -> DUP flow-reports-alerts-members-keys-30 low backend/gridlytics/reports.py
+     T: Off-grid site's energy report shows meaningless grid rows (import 0, peak import 0.0 kW, 'Outage time 168 h')
+     A: 'Grid import 0 kWh', 'Grid export 0 kWh', 'Outage time 168.0 h' (24 h every day) and 'Peak 30-minute import 0.0 kW'. The daily rows show 'Outage h 24.0' every day. The Savings page shows the same ('Outage time 205 h').
+  NOTE: The off-grid farm's energy report prints grid import/export, peak import 0.0 kW and 'Outage time 168 h'.
+##### pages-A-02 ( orig wp=auth-security ) medium /home/user/gridlytics-frontend/frontend/src/features/auth/login-page.tsx
+  CT: Sign-in tells people to ask their company admin for a new password, but only the founder console can set one; there is no forced first-sign-in change and no lockout clearing
+  CA: Only the founder can set a password (and there is no forced change on first sign-in and no lockout clearing anywhere); the sign-in text sends people to an administrator who has no control for it in Members. Not recorded as a deliberate deviation in DESIGN_LOG (the lift entry covers roles and modules only).
+  -> DUP parity-supabase-auth-02 medium frontend/src/features/auth/login-page.tsx
+     T: 'Forgotten your password? Ask your company's administrator' sends people to someone who cannot reset a password, clear a lockout or change a name or email
+     A: The hint names the company administrator (login-page.tsx:71), but an admin has no path. PUT /api/users refuses password, name and email with 'The name, the email address and the password are kept by the sign-in service: change them in My account' (api.py:476). My account changes only the caller's own password, so another member's name or email can be changed nowhere; the email cannot be changed even by the founder (PATCH /api/founder/users accepts only disabled and name). POST /api/users/{id}/pa
+  NOTE: 'Forgotten your password? Ask your company's administrator' names someone with no reset path.
+##### parity-architecture-02 ( late wp=deploy-ci ) high Dockerfile, .dockerignore, .env.production.example, docs/DEPLOY.md (all missing)
+  CT: The API cannot be deployed as the family deploys: no Dockerfile, .dockerignore, .env.production.example, DEPLOY.md, compose or proxy notes, and 27 of the 31 server settings are documented nowhere
+  CA: None of these files exist. The only settings documented anywhere are GRIDLYTICS_SCHEDULER, DATA_DIR, DEMO_DAYS and DEMO_REPLAN_HOURS. Undocumented: AUTH_MODE, HOSTS, CORS_ORIGINS, CORS_ORIGIN_REGEX, LOCAL_JWT_SECRET, TRUST_PROXY, the founder four, the Supabase five, JWKS_TTL, MEMBERSHIP_TTL, JWT_AUDIENCE, the three RATE_* limits, DAILY_BACKUP, RESET_BACKUP, LOGS, DOCS, DB and WEB_DIST. A hosted start with GRIDLYTICS_HOSTS set and no LOCAL_JWT_SECRET is refused by identity.check_startup, and no d
+  -> DUP parity-supabase-auth-06 medium .env.production.example
+     T: No .env.production.example, DEPLOY.md or test_deploy_docs.py: about 30 GRIDLYTICS_* settings are documented nowhere, though the tracker marks PLT-02 done
+     A: The backend reads GRIDLYTICS_AUTH_MODE, the Supabase names, the founder names, MEMBERSHIP_TTL, JWKS_TTL, RATE_USER, RATE_ADDRESS, RATE_PUBLIC and more, with no example file and no deploy guide. Nothing tells a deployer that the service-role key is server-only or that the founder console answers 503 until all four founder secrets are set. The tracker's PLT-02 [x] is not true of the repository, and HANDOFF section 8 lists Docker and DEPLOY as open but not the env example.
+  NOTE: Late-late duplicate: no .env.production.example, DEPLOY.md or test_deploy_docs.py.
+##### parity-architecture-13 ( late wp=deploy-ci ) medium .gitignore
+  CT: The backend .gitignore does not ignore .env, .env.production, .env.founder or platform.secret outside data/, and the launcher reads .env.founder from the backend root as a fallback
+  CA: .env, .env.production, .env.founder, backend/.env and platform.secret are all NOT ignored; only data/ and demo/DEMO_ACCOUNTS.local.md are. For the owner's data folder (gridlytics-backend/data), founder_file() also reads <data>/../.env.founder, which is gridlytics-backend/.env.founder. That file would hold the founder's password hash, TOTP secret and session secret, and `git add -A` would commit it.
+  -> DUP parity-supabase-auth-07 low .gitignore
+     T: Backend .gitignore does not ignore .env files, so a root .env holding the service-role key or founder secrets would be committed
+     A: The ignore list is data/, .scratch/, caches, demo/DEMO_ACCOUNTS.local.md, release/ and *.egg-info only. git check-ignore reports nothing for .env, .env.founder or .env.production, so a deployer's .env with GRIDLYTICS_SUPABASE_SERVICE_ROLE_KEY or GRIDLYTICS_FOUNDER_* would be staged by `git add -A`.
+  NOTE: Late-late duplicate: .env files not ignored in the backend.
+##### parity-architecture-08 ( late wp=docs ) medium THIRD_PARTY_NOTICES.md (both repos)
+  CT: Code derived from Boxlytics (another party) is not recorded in THIRD_PARTY_NOTICES or the DESIGN_LOG: the founder session-token format, the founder store and client, and the founder lists' search
+  CA: Both notices name only solarlytics-backend at c853130 and solarlytics-frontend at d582a5f. The Boxlytics origin appears only in code comments, so a reviewer of the notices would conclude that no Boxlytics construction is used. Plan Part 14 says of Boxlytics: "Patterns only, rewritten; no file copied. The hands-off rule stays."
+  -> DUP parity-supabase-auth-10 low THIRD_PARTY_NOTICES.md
+     T: The reuse of Boxlytics code (founder token format, sha256 founder hash) is not recorded with path and commit as the rules and the plan ask
+     A: THIRD_PARTY_NOTICES lists only solarlytics-backend@c853130. DESIGN_LOG mentions only that 'the founder password accepts Boxlytics' plain sha256 with a warning, as the lifted code did'. No path or commit is recorded for the founder-auth.ts port, and there is no owner confirmation. The provenance is visible only in a module docstring.
+  NOTE: Late-late duplicate: Boxlytics reuse not recorded with path and commit.
+##### parity-architecture-05 ( late wp=auth-security ) medium backend/gridlytics/api.py
+  CT: Every scratch run writes its log into the owner's data folder: api.py logs beside GRIDLYTICS_DB's default (gridlytics-backend/data/logs), and the launcher's --scratch sets only GRIDLYTICS_DATA_DIR
+  CA: The scratch API (pid 183, port 8151) runs with GRIDLYTICS_DATA_DIR=.scratch/data and no GRIDLYTICS_DB. It holds gridlytics-backend/data/logs/gridlytics.log open. That file has 2,128 lines, was last written 9 Nov 12:26 by scratch requests, and holds the scratch run's 13 ERROR entries (7 tick failures, 6 unanswered requests). The scratch data folder has no logs/. Anyone debugging a scratch run must read the owner's folder, and the owner's real log gets mixed with test traffic.
+  -> DUP performance-live-07 medium None
+     T: A --scratch run writes its API log (and probably the default database's daily copy) into the owner's data/ folder
+     A: data/logs/gridlytics.log was modified at 2026-11-09 12:26:55 UTC while only the scratch app was running (231 KB). The scratch run's tick and solve log is therefore in the protected folder; I did not read it, per the audit rules.  backups.daily_all also copies Path(store.DB_PATH) every day (backups.py:86-87). That is code reading only: I did not check it on disk.
+  NOTE: Late-late duplicate; also backups.daily_all copies Path(store.DB_PATH), the default database, every day.
+##### tests-and-perf-05 ( late wp=telemetry-genset-battery ) medium backend/gridlytics/routes_telemetry.py
+  CT: The telemetry series route lets any role request 400 days at 1-minute resolution, a multi-megabyte JSON answer built in Python
+  CA: The route accepts any res with a span of up to 400 days (lines 27-31), and series() honours an explicit res (telemetry.py:438-440). The request builds about 576,000 buckets × 24 series as Python lists (tens of MB of JSON), runs for seconds and holds the telemetry write lock during the fetch. No permission is needed.
+  -> DUP performance-live-13 low None
+     T: Telemetry chart series exceed the spec's cap of about 2,000 points (2,880 points for 2 days at 1 minute and 2,881 for 30 days at 15 minutes)
+     A: 2 d: 1m, 2,880 points. 7 d: 15m, 673. 14 d: 15m, 1,345. 30 d: 15m, 2,881 (135 KB raw for 5 series). 32 d: 1h, 769. 60 d: 1h, 1,441. 90 d: 1h, 2,161.
+  NOTE: Late-late duplicate: series exceed the ~2,000-point cap (2,880 at 2 days / 1 min, 2,881 at 30 days / 15 min).
+##### security-roles-01 ( orig wp=auth-security ) high backend/gridlytics/routes_telemetry.py
+  CT: GET /api/sites/{id}/events returns fuel-log cost_rs to a viewer and to any sites:read API key (money filter skipped)
+  CA: The route returns [{...row, "detail": json.loads(detail)}] raw (lines 190-192). The answer includes {"type":"fuel_log","detail":{"litres":50,"cost_rs":14000,...},"source":"<operator's name>"} for every role and for a partner or edge key. No web page renders /events today, so the leak is reachable through the API with any member's token or a sites:read key.
+  -> DUP tests-and-perf-01 high backend/gridlytics/routes_telemetry.py
+     T: GET /api/sites/{id}/events returns fuel-log rupees (cost_rs) to viewers and API keys; the money tests never look there
+     A: events() (routes_telemetry.py:187-192) has no auth.need and no out(). It returns json.loads(detail) unfiltered. GET /genset/fuel wraps the same rows in out(), and its docstring says cost_rs is money a viewer must not see. test_fix_r3_api.py:441 checks only /genset/fuel. test_api_walk.py lists /events in PAGES but checks only the status code.
+  NOTE: Events route returns fuel-log cost_rs to viewers and keys.
+##### tracker-and-docs-03 ( orig wp=auth-security ) medium backend/gridlytics/money.py
+  CT: The money-filter guarantee is documented against tests that do not exist (test_role_walk.py, optimise/explain.py, money.strip_for)
+  CA: There is no backend/tests/test_role_walk.py, no optimise/explain.py (explain is in optimise.py) and no money.strip_for (auth.py:21 names it; the function is for_reader). The only viewer check (test_the_viewer_gets_no_rupees) reads 5 GET routes and looks for 9 key names. It never reads /events, /pilot, /plans, /control, /switchback, /plan/compare, /battery, /reports or /fleet/savings, so the leak in the finding above went unseen. HANDOFF section 4 also says 'test_api_walk.py walks every page's ro
+  -> DUP tests-and-perf-02 medium backend/tests/test_api_walk.py
+     T: The money-filter test is not the every-route walk Part 10.5 requires; money.py cites a test_role_walk.py that does not exist
+     A: Only /plan, /fleet, /savings, /genset and /sites/{id} are checked, for c_imp, cost_rs, saving_rs, objective_rs, levers, mtd_saving_rs, c_fuel, replacement_cost_per_kwh and fuel_cost_rs. The test does not use money.is_money and covers no keys and no exports. The other 28 GET routes in PAGES are checked for status 200 only. The /events leak (the previous finding) passes the whole suite.
+  NOTE: The money-filter test is not the every-route role walk; test_role_walk.py does not exist.
+##### engine-tariffs-07 ( orig wp=tariffs ) medium backend/tests/test_engine.py
+  CT: No hand-worked golden bill exists: every bill-engine test compares the engine with itself, yet TAR-06 is marked done
+  CA: Self-consistency tests cannot catch a wrong rate, base, ordering or rule, because the vector and the bill share the same code. The defects above, for example the floor, the version boundary and the FCA key, all pass the current suite. The tracker still marks TAR-06 [x].
+  -> DUP tests-and-perf-03 medium backend/tests/test_fix_tariffs.py
+     T: No hand-worked golden bill exists, although TAR-06 and TAR-02 are ticked; every bill test compares the engine with itself
+     A: The tracker marks TAR-06 and TAR-02 [x] (EMS_BUILD_PROGRESS.md:63, 67), but no test pins any rebuilt total_rs or line item to a hand-computed value. A systematic error shared by rebuild() and vectors() passes every test, for example a wrong GST or adder rate, fixed-charge proration or the export credit gross-up, because the tests are self-consistency checks.
+  NOTE: No hand-worked golden bill.
+##### performance-live-03 ( late wp=telemetry-genset-battery ) medium None
+  CT: Every telemetry read takes the telemetry file's write lock (BEGIN IMMEDIATE), so all reads and writes of a company's telemetry run one at a time
+  CA: Thread B's 0.2 ms read waited 1.233 s behind A. The plain WAL read (C) took 0.000 s. - export_csv formats the whole CSV inside the lock (telemetry.py:583-591): the 32-day export (4.5 MB) holds it for 0.47 s. - /now, charts, battery reads, the tick's forecast reads, CSV ingest and every edge batch therefore queue on one lock. A holder longer than busy_timeout (30 s) makes the others fail with 'database is locked'. - During the upload, the telemetry route peaked at 1.26 s against 0.82 s for the ro
+  -> DUP tests-and-perf-04 medium backend/gridlytics/telemetry.py
+     T: Every telemetry read takes SQLite's write lock (BEGIN IMMEDIATE), so the company's readers and edge writers queue behind each other
+     A: Every read holds the one write slot of the company's telemetry file for its fetch. Ticks (about 4 months of minutes per site), the fleet page (latest + first_ts per site, so 2N lock round trips), page polls and edge ingest all run one at a time. A CSV import's single executemany blocks all of them.
+  NOTE: Late-late duplicate: BEGIN IMMEDIATE on every telemetry read.
+##### performance-live-01 ( late wp=storage-perf ) high None
+  CT: Plan rows are never pruned and each stores about 130 KB of JSON: the workspace file grows about 12.5 MB per site per day (4.6 GB per site-year), copied daily x14, and plan-history reads slow down linearly
+  CA: Every 15-minute plan keeps its full steps JSON: 644 B per step x 192 steps, with the keys repeated in every step. - Today: plans are 69.72 MB of the 70.6 MB file (528 rows; avg steps 126,084 B, slots 3,602 B, summary 1,107 B). - Growth: 96 plans per site per day x about 131 KB = about 12.5 MB per site per day, 4.6 GB per site-year, about 228 GB per year at 50 sites, all in one company file. - backups.daily_all copies that file every day and keeps 14 copies (KEEP=14): at 50 sites a 250 GB disk fi
+  -> DUP tests-and-perf-06 medium backend/gridlytics/plans.py
+     T: The plans table grows about 13 MB a day per site with no retention; SELECT * readers pull those blobs; plan_messages has no index
+     A: Growth is about 4.5 GB per site-year in the workspace file, and backups.py keeps 14 daily copies of it. Readers that load the blobs: - plans.history (582-585) SELECT * loads 30 plans' steps for a list that drops them; plan-history.tsx polls every 5 min. - fleet_row calls plans.current, a full 130 KB parse per site, on every 60-s AppShell fleet poll. forecast_issues keeps hourly issues forever (telemetry.py:606-607).
+  NOTE: Late-late duplicate; adds plans.history's SELECT * and the plan_messages/acks indexes.
+##### pr-review-05 ( orig wp=savings-ui-crosscut ) low backend/gridlytics/routes_savings.py
+  CT: Synchronous recompute can now do about twice the work the 62-day cap was set for, and the web app reports only the asked-for days
+  CA: Up to about 124 day replays plus bound solves in one request, and an undercounted toast.
+  -> DUP tests-and-perf-11 medium backend/gridlytics/routes_savings.py
+     T: POST /savings/recompute runs up to 62 days of replays and MILP bound solves synchronously inside one HTTP request
+     A: About 30 days take 30 s to several minutes in one sync handler, with no rate limit. Proxies may time out, and clicking again starts another run. The CPU it burns degrades the concurrent ticks' time-limited plans (HANDOFF trap 1, 8.A.3).
+  NOTE: Recompute runs up to 62 days of replays and bound solves inside one request: run it as a background job (jobs.py), one per site, at low priority beside the ticks.
+##### parity-architecture-09 ( late wp=tests-ci ) medium backend/tests/sibling.py, frontend/src/test/sibling.ts (missing)
+  CT: No cross-repository contract tests (Solarlytics S0a sibling.py and sibling.ts): types, permissions, refusal codes and fixtures are copied by hand from the backend, and served fields are already missing from them
+  CA: Nothing reads the other repository; the API's types are hand-mirrored. Fixtures are a 6 Nov snapshot. Served fields absent from both types/api.ts and the fixtures: - `today.import_completeness` (now); - `steps[].genset_dump_kw`, `steps[].grid_charge_permitted`, `plan.summary.control_release` (plan). Typed but absent from the fixtures: - savings `final_conditions`, `days[].claim_withheld`, `baselines.*.import_unknown_days`; - site `tier_signoff`, `data.off_grid`; - plan `summary.solver.mip_gap`, 
+  -> DUP tests-and-perf-18 low frontend/src/test/fixtures/index.ts
+     T: Web-app fixtures predate rounds 3-5 and the role map is hard-coded, so page tests do not follow the API they claim to mirror
+     A: Tests for the newer fields (plan-round5, settings-round4, savings-unmetered) hand-add them to old fixtures. A page that breaks on the real current shape can pass. A change to the backend permission map will not show up in the UI role tests.
+  NOTE: Late-late duplicate: fixtures predate rounds 3-5 and the role map is hard-coded; re-capture them and check them through sibling.ts.
+##### performance-live-11 ( late wp=storage-perf ) low None
+  CT: The 15-minute tick runs every site of every company in one thread inside the API process; its per-site cost grows with history and a genset site may take three 10 s limits
+  CA: Live ticks: 12:15 took 8 s, 12:30 took 10 s (10 sites each). At 12:30 the AUDIT farm alone solved in 6.91 s on an idle machine (3.5-3.6 s in other runs; limit 10 s).  Copy profile: 12 sites in 8.8 s. Each demo site costs 0.8-0.93 s: - forecast.issue 0.26-0.38 s - battery.state x2 0.23-0.31 s (reads 30 days, so this doubles as data ages) - build_problem 0.14-0.29 s - alerts.evaluate 0.12-0.17 s - solve 0.03-0.30 s At a year of plans, alerts' active_at adds about 3 s per advisory site.  One thread
+  -> DUP tests-and-perf-21 low backend/gridlytics/scheduler.py
+     T: The 15-minute tick runs every company and site one after another in one thread; an overrun silently skips the next tick
+     A: A typical farm-type site takes about 2-12 s per tick (reads plus solve). At about 75 such sites a tick passes 900 s, and APScheduler drops the next run with only a log line, so sites are planned every 30 minutes. Late sites in the list get their plan minutes after the quarter starts. Nothing measures or alerts on this.
+  NOTE: Late-late duplicate: sequential tick; an overrun silently skips the next tick.
+##### performance-live-10 ( late wp=storage-perf ) low None
+  CT: API answers are not compressed: the plan page fetches 173 KB of JSON that gzip makes about 14 KB
+  CA: Raw vs gzip: - /plan 117,377 B vs 10,456 B; /overview/chart 63,002 vs 6,589. - /telemetry 24 h 61,664 vs 13,821; 30 d 72,031 vs 19,939. - /plans 41,448 vs 3,026; /audit 73,975 vs 4,708; export.csv 14 d 2,209,935 vs 407,928.  On the emulated phone, the plan page took 2.5 s (173 KB of API JSON, about 0.8 s of it transfer) and the overview took 2.9 s.
+  -> DUP tests-and-perf-22 low backend/gridlytics/api.py
+     T: Large JSON answers are sent uncompressed (/plan about 140 kB; /overview/chart every 60 s)
+     A: On a 1 Mbps mobile link one /plan takes about 1 s, and each site tab keeps re-downloading roughly 100 kB a minute.
+  NOTE: Late-late duplicate: no gzip on large JSON answers.
+##### performance-live-04 ( late wp=telemetry-genset-battery ) medium None
+  CT: A 23.5 MB CSV upload takes 14 s, raises the API process's memory by 544 MB (23x the file) and stalls other users' requests to about 1 s
+  CA: 200 after 14.16 s. - API RSS went from 212 MB to a 756 MB peak, and was still 357 MB afterwards. - /alerts/counts (8 ms when idle) took 0.98, 1.06, 0.89, 0.74 and 0.44 s during the parse: pure Python holding the GIL in the single worker. - Three concurrent uploads at the 25 MB limit would add about 1.6 GB. - Cause: routes_telemetry.py:66-114 decodes and parses the whole file for the date-window check. telemetry.import_csv then decodes it again into a list of 230k dicts (telemetry.py:283-305) bef
+  -> DUP tests-and-perf-23 low backend/gridlytics/routes_telemetry.py
+     T: A CSV upload is read whole and parsed twice into Python dicts, then written in one locking transaction; the 30 MB check can never trigger
+     A: Peak memory is several hundred MB per upload, and two uploads double it. Every telemetry reader of the company (ticks, pages, edge) waits for the whole write. import_csv's 'larger than 30 MB' refusal (telemetry.py:280) is dead, because the 25 MB body limit refuses first.
+  NOTE: Late-late duplicate: upload read whole and parsed twice, one locking write; the unreachable 30 MB sentence is flow-telemetry-plan-control-25's.

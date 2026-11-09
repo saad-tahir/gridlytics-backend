@@ -1,0 +1,63 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/37b2fd882dcb/savings?view=switchback",
+  "url": "http://127.0.0.1:5295/sites/37b2fd882dcb/savings?view=switchback",
+  "signedIn": true,
+  "loadMs": 2323,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Lahore mall (demo)",
+    "H2: Savings",
+    "H3: Energy in the period",
+    "H2: No switchback calendar yet",
+    "H2: Fee check"
+  ],
+  "buttons": [
+    "Lahore mall (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "Download CSV",
+    "Recompute",
+    "This month",
+    "Last month",
+    "Last 30 days",
+    "Custom",
+    "Counterfactual",
+    "Switchback",
+    "Bill comparison",
+    "Set the fee"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [
+    "Rs 0",
+    "Rs 0",
+    "Rs 1,239",
+    "Rs 0",
+    "Rs 0",
+    "Rs 0"
+  ],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 3 Reports SITE Lahore mall (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Monitor (recommendation only) Administrator 3 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Lahore mall (demo) Savings Lahore mall (demo) DEMO Monitor (recommendation only) Recommendation only Lahore LESCO · A-2(c) Last data: 4 min ago Savings What the plan saved against the inverter's own settings and against the best static table, lever by lever, with the method and the date of every figure. Download CSV Recompute Period This month Last month Last 30 days Custom 1 Nov 2026 to 9 Nov 2026 (Karachi days) Preliminary These figures are preliminary until: 28 verified days (0 so far); 8 weeks of switchback (0 so far); the fuel charges adjustment of every month in the period is billed. Saving against the native settings PRELIMINARY Rs 0 Claimed on verified days: Rs 0 Saving against a tuned table PRELIMINARY -Rs 1,239 the best static table the inverter could hold Diesel saved 0.0 L Estimated, against the native settings Verified days 0 of 28 days whose plan was confirmed applied Method: Counterfactual replay at 1-minute resolution against the native capture and a tuned table, priced on the bearable-cost basis (recoverable GST and adjustable s.235 excluded), with the dated fuel price and the same wear charge on both arms. Computed 9 Nov 2026, 00:40 (Karachi time). Energy in the period Grid import 40,759 kWh Grid export 0.0 kWh Solar 5,820 kWh Load 47,584 kWh Genset energy 1,010 kWh Diesel burned 347 L Metered Genset running 3.4 h Battery throughput 55.8 kWh Unserved energy 0.0 kWh Outage time 3.4 h Peak import 461 kW highest 30-minute demand Counterfactual Switchback Bill comparison No switchback calendar yet The switchback compares blocks of days on the plan with blocks on the inverter's own settings. Paint the calendar in the pilot set-up. Paint the calendar Fee check The fee should stay at or under one third of the verified saving a month. No fee set Fee a month Rs 0 Verified saving a month Rs 0 claimed against the native settings, per month in the period One third of it Rs 0 Fee a month (Rs) Set the fee",
+  "a11yTree": null
+}

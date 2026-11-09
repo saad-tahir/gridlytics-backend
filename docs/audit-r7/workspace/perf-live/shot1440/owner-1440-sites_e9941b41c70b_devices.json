@@ -1,0 +1,56 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/e9941b41c70b/devices",
+  "url": "http://127.0.0.1:5295/sites/e9941b41c70b/devices",
+  "signedIn": true,
+  "loadMs": 2182,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Karachi feed mill (demo)",
+    "H2: Devices and data",
+    "H2: Data sources",
+    "H2: Data quality",
+    "H3: IMPORTS",
+    "H2: Native settings capture",
+    "H3: VERSIONS",
+    "H2: Devices",
+    "H2: Edge device"
+  ],
+  "buttons": [
+    "Karachi feed mill (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "Add a slot",
+    "Save the capture"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Karachi feed mill (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Closed loop Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Karachi feed mill (demo) Devices and data Karachi feed mill (demo) DEMO Closed loop Following plan Karachi K-Electric · B-3 Last data: 10 min ago Devices and data Data sources Telemetry and CSV upload First data First data received at 25 Oct 2026, 00:00 Edge device Never connected CSV uploads None yet Data quality Share of the expected 1-minute readings received each day (Karachi days). 26 100 % Mon 26 Oct 27 100 % Tue 27 Oct 28 100 % Wed 28 Oct 29 100 % Thu 29 Oct 30 100 % Fri 30 Oct 31 100 % Sat 31 Oct 01 100 % Sun 1 Nov 02 100 % Mon 2 Nov 03 100 % Tue 3 Nov 04 100 % Wed 4 Nov 05 100 % Thu 5 Nov 06 100 % Fri 6 Nov 07 100 % Sat 7 Nov 08 100 % Sun 8 Nov 09 72 % Mon 9 Nov IMPORTS No CSV has been imported. Native settings capture What the inverter does on its own, recorded before any control: it is the fallback and the savings baseline. Version 1, captured 8 Nov 2026, 19:40 by demo seed (read_back). Saving makes a new version. How it was captured Typed in from the inverter's screen From a photograph of the screen Read back by the edge device Work mode Self-use Time of use Backup Feed-in first Backup state of charge (%) Grid charging allowed The inverter's time slots (0 of 14) Add a slot Photograph of the settings screen (optional) Save the capture VERSIONS Native capture versions Version Captured By How 1 8 Nov 2026, 19:40 demo seed Read back Devices As set in Site settings; the inverter's brand sets the slot table's layout. Edit in Site settings Devices at the site Device Size Details PV 500 kWp DC, 450 kW AC tilt 15°, azimuth 180°, losses 14 % Inverter Sungrow SC250HX 500 kW AC Battery 500 kWh, 250 kW discharge state of charge 10 % to 95 %, health 100 %, 6,000 warranted cycles Genset 1,000 kW, gas captive tank 0.0 L, at least 2.0 h on and 1.0 h off Edge device The small computer on site that receives signed plans and reads the inverter back. No edge device: plans are delivered as daily slot tables. Without an edge device the read-back is inferred from the site's behaviour; the installer keys each day's table and marks it applied. The site's public key (Ed25519, key 071b90cd) 6YN5Umn3rV7GaD8IyejQYq3wqhAXpT0eRBO/MfYNUXo= The edge device checks every plan message against this key.",
+  "a11yTree": null
+}

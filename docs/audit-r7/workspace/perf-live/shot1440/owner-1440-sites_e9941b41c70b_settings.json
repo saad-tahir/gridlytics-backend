@@ -1,0 +1,56 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/e9941b41c70b/settings",
+  "url": "http://127.0.0.1:5295/sites/e9941b41c70b/settings",
+  "signedIn": true,
+  "loadMs": 2141,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Karachi feed mill (demo)",
+    "H2: Site settings",
+    "H2: Site",
+    "H2: Outages and the genset",
+    "H2: Data source"
+  ],
+  "buttons": [
+    "Karachi feed mill (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "General",
+    "Assets",
+    "Tariff",
+    "Control tier",
+    "Native settings",
+    "Notifications",
+    "Remove",
+    "Save the changes"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Karachi feed mill (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Closed loop Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Karachi feed mill (demo) Site settings Karachi feed mill (demo) DEMO Closed loop Following plan Karachi K-Electric · B-3 Last data: 10 min ago Site settings General Assets Tariff Control tier Native settings Notifications Remove This is a demo site: its figures are illustrative and regenerated nightly. Site Site name Kind of site Office Retail Industrial 1 shift Industrial 2 shift Industrial 3 shift Cold store Tower Hospital School Farm A farm with no grid connection skips the tariff tab. Address City DISCO Not connected to a DISCO IESCO LESCO GEPCO FESCO MEPCO PESCO HESCO SEPCO QESCO TESCO HAZECO K-Electric Latitude The pin sets the sun's path for the PV forecast. Longitude Typical peak load (optional) (kW) The first load forecasts are scaled to it until the site has history. Blank: worked out from the connection or the PV. Outages and the genset Sites on the same feeder or transformer share an outage history, which sharpens the outage forecast. Outage unit Feeder Transformer Feeder or transformer code As printed on the bill Feeder or transformer name How the genset is started No genset, or it is never started for the site Started by hand Starts itself when the grid fails Starts at a battery threshold The product never starts or stops a genset itself; it asks a person. Data source Where the site's minute data comes from. It decides the highest control tier the site can reach. Edge device A Gridlytics edge box reads the inverter and the meter every minute. Needed for closed-loop control and read-back. CSV upload You upload the logger's or the inverter's export. Plans are delivered as daily slot tables to key in. Inverter maker's cloud Read from the vendor's portal. Writes cannot be read back, so control stays advisory. This source reports grid presence (grid_present or the grid voltage) Check the source's point list: an inverter that only reports power cannot tell an outage from a quiet hour. There is no live connection test yet, so this is your confirmation. No data source is recorded for this site yet. Save the changes No changes",
+  "a11yTree": null
+}

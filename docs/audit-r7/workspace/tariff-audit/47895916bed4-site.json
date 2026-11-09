@@ -1,0 +1,145 @@
+{
+ "id": "47895916bed4",
+ "name": "Rahim Yar Khan farm (demo)",
+ "status": "active",
+ "tier_capable": "closed_loop",
+ "tier_allowed": "advisory_writes",
+ "demo_link": "demo",
+ "data": {
+  "name": "Rahim Yar Khan farm (demo)",
+  "address": "Chak 92",
+  "city": "Rahim Yar Khan",
+  "lat": 28.42,
+  "lon": 70.3,
+  "timezone": "Asia/Karachi",
+  "disco": null,
+  "site_type": "farm",
+  "outage_unit": {
+   "kind": "feeder",
+   "code": "",
+   "name": ""
+  },
+  "genset_start_control": "manual",
+  "outage_load_mode": 1,
+  "critical_load_kw": [
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0,
+   8.0
+  ],
+  "voll_rs_per_kwh": 500.0,
+  "reserve_policy": {
+   "p_threshold": 0.2,
+   "min_soc_pct": 20.0
+  },
+  "cycle_cap_per_day": 1.5,
+  "control_mode": "advisory",
+  "enclosure_temp_offset_c": 7.0,
+  "calendar_cost_on": true,
+  "grid_charge_allowed": true,
+  "gen_charge_allowed": true,
+  "notes": "Off-grid tube-well and cold store; tank-level metering.",
+  "load_peak_kw": 42,
+  "off_grid": false,
+  "data_source": null,
+  "twin": {}
+ },
+ "created": "2026-11-08T14:40:56+00:00",
+ "updated": "2026-11-08T14:40:56+00:00",
+ "deleted": null,
+ "tier": "advisory_writes",
+ "connections": [],
+ "assets": {
+  "pv": {
+   "kwp_dc": 80.0,
+   "kw_ac": 70.0,
+   "tilt": 15.0,
+   "azimuth": 180.0,
+   "gamma_pdc": -0.0035,
+   "losses_pct": 14.0,
+   "id": "2d0669dc4aca"
+  },
+  "inverter": {
+   "brand": "voltronic",
+   "model": "Axpert MKS x6",
+   "kw_ac": 66.0,
+   "firmware": "",
+   "id": "aa3037469abc"
+  },
+  "battery": {
+   "nameplate_kwh": 120.0,
+   "soh": 1.0,
+   "p_ch_kw": 40.0,
+   "p_dis_kw": 40.0,
+   "eta_c": 0.95,
+   "eta_d": 0.95,
+   "soc_min": 0.15,
+   "soc_max": 0.95,
+   "replacement_cost_per_kwh": 52000.0,
+   "warranted_cycles": 6000.0,
+   "warranted_depth": 0.8,
+   "id": "6551d6d6d632"
+  },
+  "genset": {
+   "rated_kw": 48.0,
+   "f_min": 0.3,
+   "fuel_kind": "hsd",
+   "a": 0.273,
+   "b": 0.033,
+   "c_start_rs": 1500.0,
+   "c_runhr_rs": 400.0,
+   "c_om_rs_per_kwh": 8.0,
+   "min_up_h": 1.0,
+   "min_down_h": 0.5,
+   "cap_hours_per_day": 24.0,
+   "tank_l": 400.0,
+   "parallel_allowed": false,
+   "id": "0c9621f4cbd3"
+  }
+ },
+ "state": {
+  "active_plan": "5b1703545a5c",
+  "last_tick": "2026-11-08T15:00:00+00:00"
+ },
+ "native": {
+  "site_id": "47895916bed4",
+  "version": 1,
+  "captured_at": "2026-11-08T14:40:56+00:00",
+  "by": "demo seed",
+  "source": "entered",
+  "body": {
+   "source": "entered",
+   "work_mode": "self_use",
+   "backup_soc_pct": 25.0,
+   "grid_charge_allowed": false,
+   "slots": []
+  },
+  "has_photo": false
+ },
+ "tier_signoff": {
+  "tier": "advisory_writes",
+  "signoff": "demo",
+  "by": "demo seed",
+  "at": "2026-11-08T14:40:56+00:00"
+ }
+}

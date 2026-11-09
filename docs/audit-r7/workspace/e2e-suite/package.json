@@ -1,0 +1,1 @@
+{"name":"gridlytics-e2e-proto","private":true,"version":"0.0.0","dependencies":{"@axe-core/playwright":"^4.10.2","@playwright/test":"^1.63.0"}}

@@ -1,0 +1,86 @@
+     Monthly savings report: Rahim Yar Khan farm (demo)
+01 November 2026 to 30 November 2026. Off-grid. Generated 09 Nov 2026 05:33 PKT by Gridlytics.
+
+Preliminary. Fewer than 28 verified days, the month is not over, or a fuel adjustment of the period is not yet
+billed.
+
+
+Headline
+ Against                                                         Saving    Claimed (applied days)       Diesel saved       Verified days
+
+ The inverter's own settings (native capture)                  Rs 12,581                  Rs 12,581                 -0 L              8
+
+ The best static table (tuned baseline)                        Rs 12,581                  Rs 12,581                 -0 L              8
+
+
+
+
+Ledger by lever, against the native capture
+ Lever                                                                                                   Rupees
+
+ Peak-window import avoided                                                                                 Rs 0
+
+ Off-peak energy (charging)                                                                                 Rs 0
+
+ Export credit                                                                                              Rs 0
+
+ Genset fuel and running cost                                                                             Rs 497
+
+ Battery wear                                                                                            Rs 2,839
+
+ Carry-over (stored energy at day end)                                                                   Rs 9,244
+
+ Maximum demand (MDI)                                                                                       Rs 0
+
+ Perfect foresight (not achievable, for reference)                                                      Rs 30,229
+
+Method: Counterfactual replay at 1-minute resolution against the native capture and a tuned table, priced on the
+bearable-cost basis (recoverable GST and adjustable s.235 excluded), with the dated fuel price and the same
+wear charge on both arms.
+
+Energy
+ Quantity                                                                                    Month
+
+ Grid import                                                                                 0 kWh
+
+ Grid export                                                                                 0 kWh
+
+ Solar                                                                                    2,324 kWh
+
+ Load                                                                                     4,700 kWh
+
+ Genset                                                                        2,420 kWh, 133.3 h
+
+ Outage time                                                                                197.5 h
+
+ Unserved critical load                                                                     0.0 kWh
+
+ Peak 30-minute import                                                                       0.0 kW
+
+
+
+
+Daily rows
+ Day             Import kWh     Solar kWh       Outage h    Genset h   Saving vs native      Fidelity
+
+ 2026-11-01                 0             299        24.0       13.5           -Rs 177      confirmed
+
+ 2026-11-02                 0             255        24.0       18.4          Rs 1,943      confirmed
+
+ 2026-11-03                 0             262        24.0       19.0          Rs 2,144      confirmed
+ 2026-11-04           0        221       24.0       18.1         Rs 1,083   confirmed
+
+ 2026-11-05           0        248       24.0       18.2         Rs 1,186   confirmed
+
+ 2026-11-06           0        300       24.0       16.8         Rs 1,545   confirmed
+
+ 2026-11-07           0        370       24.0       14.8         Rs 3,282   confirmed
+
+ 2026-11-08           0        369       24.0       12.2         Rs 1,575   confirmed
+
+ 2026-11-09           0          0        5.5        2.2                -           -
+
+
+Native capture version 1; tariff versions as dated in the CSV annex. Figures are measured against a replay of the
+inverter's own settings on the same day's sun, load and outages.
+

@@ -1,0 +1,64 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/47895916bed4",
+  "url": "http://127.0.0.1:5295/sites/47895916bed4",
+  "signedIn": true,
+  "loadMs": 2862,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Rahim Yar Khan farm (demo)",
+    "H2: Energy flow now",
+    "H2: Now and next",
+    "H2: Actual and plan, 24 hours each side of now",
+    "H2: The next 12 hours",
+    "H2: Alerts"
+  ],
+  "buttons": [
+    "Rahim Yar Khan farm (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "PV",
+    "Load",
+    "Grid",
+    "Battery",
+    "Genset",
+    "SoC",
+    "Plan: load",
+    "Plan: PV",
+    "Plan: SoC",
+    "Reserve"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [
+    "Rs 140",
+    "Rs 12,581"
+  ],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Rahim Yar Khan farm (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Advisory (slot tables) Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Rahim Yar Khan farm (demo) Rahim Yar Khan farm (demo) DEMO Advisory (slot tables) Following plan (table applied) Rahim Yar Khan No DISCO · Off-grid Last data: 11 min ago Energy flow now Reading at 17:14 Site PV 0.2 kW Load 20.9 kW Battery 0.0 kW SoC 36 % Genset 20.7 kW Running Now and next Now (17:15) Genset on Genset requested at 20.9 kW, about Rs 140.30/kWh. Next 09:15 Battery carries outage The grid is down: the battery carries 13.0 kW. 11:00 Charge from PV Charging the battery from surplus solar. 12:15 Idle Nothing to gain from moving energy in this slot. Plan status: Solved within tolerance · forecast stage 1 Grid import today 0.0 kWh Solar today 271 kWh Peak demand today 0.0 kW Outage today 17 h Battery 35.9 % 0.0 kWh usable · trust 54 % Genset this month 137 h 904 L (estimated) Saving this month PRELIMINARY Rs 12,581 against the native settings Import this month 0.0 kWh peak 0.0 kW Actual and plan, 24 hours each side of now Solid lines are what happened; dashed lines are the plan. The red dashed line is the outage reserve. PV Load Grid Battery Genset SoC Plan: load Plan: PV Plan: SoC Reserve The next 12 hours 17:15 Genset on 18:15 Genset on 19:15 Genset on 20:15 Genset on 21:15 Genset on 22:15 Genset on 23:15 Genset on 00:15 Genset on 01:15 Genset on 02:15 Genset on 03:15 Genset on 04:15 Genset on Alerts All alerts warning Battery Estimate uncertainty is 25 points; the plan will ask for a full charge to re-anchor",
+  "a11yTree": null
+}

@@ -1,0 +1,94 @@
+[
+ {
+  "id": "84e2c595bf64",
+  "site_id": "37b2fd882dcb",
+  "connection_id": "d90fccdc728a",
+  "period_start": "2026-10-28",
+  "period_end": "2026-11-06",
+  "real": {
+   "total_rs": 3116734.0,
+   "reference": "Sample bill (demo)"
+  },
+  "rebuilt": {
+   "lines": [
+    {
+     "line": "Energy peak",
+     "units_kwh": 14272.779,
+     "rate": 43.82,
+     "amount_rs": 625433.16
+    },
+    {
+     "line": "Energy off-peak",
+     "units_kwh": 36706.643,
+     "rate": 35.15,
+     "amount_rs": 1290238.49
+    },
+    {
+     "line": "Fixed charges",
+     "billing_demand_kw": 461.32,
+     "mdi_kw": 461.32,
+     "rate": 1250.0,
+     "amount_rs": 192218.4
+    },
+    {
+     "line": "Debt service surcharge (printed as FC or PHL surcharge)",
+     "units_kwh": 50979.421,
+     "rate": 3.23,
+     "amount_rs": 164663.53
+    },
+    {
+     "line": "QTA Q2 CY2026",
+     "units_kwh": 50979.421,
+     "rate": 0.5194,
+     "amount_rs": 26478.71
+    },
+    {
+     "line": "Electricity duty",
+     "rate": 0.015,
+     "amount_rs": 31602.21
+    },
+    {
+     "line": "GST",
+     "rate": 0.18,
+     "amount_rs": 419514.21
+    },
+    {
+     "line": "Income tax (s.235)",
+     "amount_rs": 329567.85
+    },
+    {
+     "line": "Flat fees (PTV, MUCT)",
+     "amount_rs": 60.0
+    }
+   ],
+   "total_rs": 3079776.55,
+   "bearable_rs": 2330694.5,
+   "recovered_taxes_rs": 749082.05,
+   "energy_rs": 2106813.89,
+   "demand_rs": 192218.4,
+   "credits_rs": 0.0,
+   "import_kwh": {
+    "peak": 14272.77854,
+    "off_peak": 36706.642706
+   },
+   "export_kwh": {
+    "peak": 0.0,
+    "off_peak": 0.0
+   },
+   "icp_incremental_kwh": {
+    "peak": 0.0,
+    "off_peak": 0.0
+   },
+   "mdi_kw": 461.32,
+   "schedule_version": "945849328891",
+   "schedule_hash": "59f9484df196b75a",
+   "billing_month": "2026-11",
+   "days": 10,
+   "first_day": "2026-10-28",
+   "last_day": "2026-11-06",
+   "completeness": 1.0
+  },
+  "difference_pct": -1.19,
+  "created": "2026-11-08T14:44:46+00:00"
+ }
+]
