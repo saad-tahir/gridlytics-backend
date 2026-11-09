@@ -899,3 +899,51 @@ def test_a_pilot_report_fills_the_pre_registered_criteria_and_is_titled_by_tier(
     assert not [x for x in world.c["operator"].get("/api/reports").json() if x["kind"] == "pilot"]
     assert world.c["operator"].get(f"/api/reports/{rid}/pdf").status_code == 403
     assert world.c["analyst"].get(f"/api/reports/{rid}/pdf").status_code == 200
+
+
+def test_a_started_pilots_report_reads_from_its_start_and_scores_the_part_15_3_statistic(world, monkeypatch):
+    """pages-D-07: the write-up runs from the pilot's start, says who signed it off, and fills Part 15.3's statistic (the lower 80 % bound of the daily
+    verified saving over the tuned table, times 30) against the fee."""
+    from datetime import date
+    from gridlytics import reports, verify
+    sid, month = world.site, _past_month()
+    days = [_day_row(f"{month}-{d:02d}", saving_tuned_rs=v) for d, v in ((10, 400.0), (11, 420.0), (12, 380.0))]
+    seen = {}
+
+    def summary(site_id, d0, d1, see_fee=False):
+        seen.update(d0=d0, see_fee=see_fee)
+        return _fake_summary(month, days, fee={"fee_rs_per_month": 2000.0, "verified_saving_rs_per_month": 12000.0})
+    monkeypatch.setattr(verify, "summary", summary)
+    with world.use():
+        started = datetime(int(month[:4]), int(month[5:7]), 10, 9, tzinfo=PKT)
+        with store.connect() as con:
+            con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?)",
+                        (sid, json.dumps({"criteria": {"fee_multiple": 3.0}, "signoff": {"name": "Ayesha Khan"}, "amendments": []}),
+                         started.astimezone(timezone.utc).isoformat(), store._now()))
+        store.set_setting(f"fee:{sid}", 2000.0)
+    built = _story(monkeypatch)
+    with world.use():
+        reports.generate("pilot", sid, month, "test")
+    text = built[-1]
+    assert seen == {"d0": f"{month}-10", "see_fee": True}, seen
+    assert f"Started on 10 {date(2000, int(month[5:7]), 1):%B} {month[:4]}, signed off by Ayesha Khan" in text, text
+    fee = next(ln for ln in text.splitlines() if ln.startswith("Verified saving at least"))
+    assert "6.0 times the fee" in fee and "meets it" in fee, fee
+    stat = next(ln for ln in text.splitlines() if ln.startswith("Lower 80 % bound"))
+    # mean 400, sd 20, n 3: 400 - t(0.8, 2) x 20 / sqrt(3) = 400 - 1.0607 x 11.547 = 387.75 a day, x 30 = Rs 11,633 a month, 5.8 times a fee of 2,000
+    assert "Rs 11,633 a month, 5.8 times the fee" in stat and "meets the success gate" in stat, stat
+
+
+def test_an_off_grid_sites_monthly_report_says_there_is_no_grid_to_compare(world, monkeypatch):
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    day = f"{month}-05"
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(day)]), [_tday(day)])
+    built = _story(monkeypatch)
+    with world.use():
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "regime": "off_grid"}, "test", conn_id=conn["id"])
+        reports.generate("monthly_savings", sid, month, "test")
+    text = built[-1]
+    assert "No grid connection: there are no grid outages to carry." in text and "there is no DISCO bill to compare" in text, text
+    assert "off-grid" in text.splitlines()[1], text.splitlines()[1]
