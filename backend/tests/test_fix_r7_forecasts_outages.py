@@ -406,3 +406,29 @@ def test_sites_on_the_same_feeder_pool_their_outage_history(company):
     forecast.issue(new, t0)
     issue = forecast.page(new, "outage")["issue"]
     assert issue["pooled"] == {"sites": 1, "days": 28.0} and issue["days_known"] == 0.0
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-12
+
+def test_a_rural_feeder_without_a_schedule_starts_from_about_ten_hours_a_day_without_grid_flagged_as_a_prior(company):
+    """Plan Part 5.3's cold start without a schedule: about 10 hours a day without grid on QESCO, PESCO and SEPCO feeders (the twin's rural DISCOs, HESCO
+    and TESCO too), flagged as a prior. v1 had only the DISCO's trip prior, about 2 hours a day on QESCO. The prior has the hazard prior's 7 days'
+    weight, so 28 days of the site's own readings leave a fifth of it; an entered schedule replaces it; an urban LESCO feeder keeps its trip prior."""
+    t0 = int(datetime(2026, 11, 9, tzinfo=PKT).timestamp())
+    rural = _grid_site("rural", disco="QESCO")
+    o = forecast.outage(rural, t0)
+    assert 9.0 <= float(np.sum(o["p_down"][:96])) / 4 <= 10.5
+    assert o["shed_prior"] == {"down_hours_day": 10.0, "weight": 1.0}
+    assert float(np.sum(o["p_start"][:96])) > 3  # starts of the assumed shedding blocks, not only the trips
+    urban = forecast.outage(_grid_site("urban", disco="LESCO"), t0)
+    assert urban["shed_prior"] is None and float(np.sum(urban["p_down"][:96])) / 4 < 1
+    seen = _grid_site("rural-seen", disco="QESCO")
+    _write_grid("rural-seen", np.arange(t0 - 28 * 86400, t0, 60), np.ones(28 * 1440))
+    o = forecast.outage(seen, t0)
+    assert o["shed_prior"] == {"down_hours_day": 10.0, "weight": 0.2}
+    assert float(np.sum(o["p_down"][:96])) / 4 < 2.5
+    forecast.set_schedule("rural", [["14:00", "16:00", "daily"]], "manual", "t")
+    assert forecast.outage(rural, t0)["shed_prior"] is None
+    # the stored issue carries the flag for the pages
+    forecast.issue(seen, t0)
+    assert forecast.page(seen, "outage")["issue"]["shed_prior"] == {"down_hours_day": 10.0, "weight": 0.2}

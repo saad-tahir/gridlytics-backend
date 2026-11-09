@@ -32,6 +32,12 @@ K_PRIOR = np.array([0.30, 0.45, 0.70, 0.86, 0.95, 1.00, 1.02])
 MONTH_K = {1: .85, 2: .87, 3: .88, 4: .90, 5: .90, 6: .88, 7: .81, 8: .80, 9: .87, 10: .88, 11: .89, 12: .88}
 DISCO_TRIPS = {"QESCO": 1.6, "PESCO": 1.4, "SEPCO": 1.5, "HESCO": 1.2, "TESCO": 1.5, "MEPCO": 0.8, "GEPCO": 0.6, "FESCO": 0.7, "HAZECO": 0.8,
                "LESCO": 0.35, "IESCO": 0.3, "K-Electric": 0.5}
+#: the cold start of a feeder without an announced schedule (plan Part 5.3: "a hand-entered prior (for example 10 hours a day on QESCO, PESCO and SEPCO
+#: feeders ...) flagged prior on screen"): the hours a day without grid, scheduled shedding included, on the rural DISCOs (the twin's rural set). The
+#: share the trip prior (DISCO_TRIPS) does not cover is spread evenly over the day as blocks of SHED_BLOCK_STEPS (the twin's 2-hour window), with the
+#: hazard prior's 7 days' weight, until a schedule is entered; the issue flags it (`shed_prior`). The urban feeders keep the trip prior alone.
+COLD_START_DOWN_HOURS = {"QESCO": 10.0, "PESCO": 10.0, "SEPCO": 10.0, "HESCO": 10.0, "TESCO": 10.0}
+SHED_BLOCK_STEPS = 8
 #: the observed grid state (outage): the last minute with a grid reading may lag the last whole minute by at most this many minutes and still be taken as
 #: the state now (the newest batch may still be in flight); routes_edge's event re-solve waits on the same rule
 OBSERVED_LAG_MIN = 2
@@ -404,7 +410,7 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     if not conns or conns[0]["data"].get("regime") == "off_grid":
         one = np.ones(steps)
         return {"stage": 0, "p_down": one, "p_start": np.zeros(steps), "dur_steps": np.full(steps, 4), "g": np.zeros(steps), "observed": None,
-                "adherence": None, "adherence_windows": None, "off_grid": True}
+                "adherence": None, "adherence_windows": None, "off_grid": True, "shed_prior": None}
     sched = schedule(site["id"])
     windows = sched["windows"] if sched else []
     h0 = t0 - 28 * 86400
@@ -461,9 +467,18 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
             while j < steps and sched_mask[j]:
                 j += 1
             dur_s[i] = j - i - 1 if j - i - 1 > 0 else dur_steps_u
-    p_down = 1 - (1 - p_down_s) * (1 - p_down_u)
-    p_start = 1 - (1 - sched_start) * (1 - np.concatenate([p_start_u[1:], [p_start_u[-1]]]))
-    dur = np.where(sched_start > p_start_u, dur_s, dur_steps_u).astype(int)
+    # the cold start of a rural feeder without an announced schedule: the shedding its DISCO's trip prior leaves out, evenly over the day in blocks
+    p_down_c, p_start_c, shed_prior = np.zeros(steps), np.zeros(steps), None
+    down_h = COLD_START_DOWN_HOURS.get(disco)
+    if down_h and not windows:
+        trips = prior_day * 75.0 / 1440  # the trip prior's share of the day down (its starts times the default 75-minute length)
+        w = 7 / (max(days_known, 0) + 7)
+        p_down_c = np.full(steps, max(0.0, 1 - (1 - down_h / 24) / (1 - trips)) * w)
+        p_start_c = p_down_c / SHED_BLOCK_STEPS
+        shed_prior = {"down_hours_day": float(down_h), "weight": round(w, 3)}
+    p_down = 1 - (1 - p_down_s) * (1 - p_down_u) * (1 - p_down_c)
+    p_start = 1 - (1 - sched_start) * (1 - np.concatenate([p_start_u[1:], [p_start_u[-1]]])) * (1 - p_start_c)
+    dur = np.where(sched_start > p_start_u, dur_s, np.where(p_start_c > p_start_u, SHED_BLOCK_STEPS, dur_steps_u)).astype(int)
     gvec = np.where(sched_mask & (adherence > 0.9), 0.0, 1.0)
     # an observed outage now: down for its expected remaining duration (to the window's end when inside one). The grid state is read up to the
     # actual issue time; the last known minute may lag the end by OBSERVED_LAG_MIN minutes (a batch still in flight)
@@ -492,7 +507,7 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
             # no announced windows: no adherence to show (the prior has nothing to apply to); windows entered but none seen whole: the prior, 0 trials
             "adherence": round(adherence, 3) if windows else None, "adherence_windows": trials if windows else None, "median_minutes": med_dur, "windows": windows, "off_grid": False,
             "lam_day": round(float(lam_h.sum()), 3), "days_known": round(float(days_own), 1),
-            "pooled": {"sites": pool_sites, "days": round(float(pool_days), 1)}}
+            "pooled": {"sites": pool_sites, "days": round(float(pool_days), 1)}, "shed_prior": shed_prior}
 
 
 # ------------------------------------------------------------------------------------------------ the bundle
@@ -513,7 +528,8 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
         telemetry.save_forecast(site["id"], "outage", t0, o["stage"], VERSION,
                                 {"p_down": _r(o["p_down"]), "p_start": _r(o["p_start"]), "dur_steps": [int(x) for x in o["dur_steps"]], "g": _r(o["g"], 0),
                                  "observed": o.get("observed"), "adherence": o.get("adherence"), "adherence_windows": o.get("adherence_windows"),
-                                 "off_grid": o.get("off_grid"), "days_known": o.get("days_known"), "pooled": o.get("pooled")})
+                                 "off_grid": o.get("off_grid"), "days_known": o.get("days_known"), "pooled": o.get("pooled"),
+                                 "shed_prior": o.get("shed_prior")})
     return {"t0": t0, "pv": p, "load": l, "outage": o}
 
 
