@@ -8,7 +8,7 @@ only module that reads across companies.
   on the server only): its Admin API for accounts, PostgREST for its `companies` and `company_memberships` (supabase/migrations). A company is made in the
   project with the registry's id, and the project's refusals (a second company of one name, a second owner, a name outside 1 to 80 characters, a password
   over 72 characters) are said in the console's words.
-* **Each company's file**, read under `store.use_company(path)`: the member rows (seats, Gridlytics roles, last sign-ins), the work done, the plan. A
+* **Each company's file**, read under `store.use_company(path)`: the member rows (seats, Gridlytics roles, last sign-ins) and the work done. A
   company with no file yet reads as empty, and no file is made by reading it; an old file is migrated (with its backup first) as its members' first request
   would; a file that cannot be read is said so, and left out of the sums.
 
@@ -39,6 +39,8 @@ log = logging.getLogger("gridlytics")
 
 #: The work of a company the overview adds up (decisions-v2 section 4; design E)
 ACTIVITY = ("seen_7", "seen_30", "sites", "plans_month", "plans_30", "days_30", "reports_30")
+#: The dispatch plans the console counts: those of the sites in use, as it counts the sites (audit founder-console-11)
+IN_USE = "site_id IN (SELECT id FROM sites WHERE deleted IS NULL)"
 #: Why a member row is switched off by the founder's change of the membership; a row off for one of these follows the membership back
 MEMBERSHIP_OFF = {"suspended": "membership suspended", "pending": "membership pending", "removed": "membership removed", "archived": "account archived"}
 #: The project's own limit of a password (Supabase Auth refuses one over 72 bytes, bcrypt's); local mode allows 200 characters
@@ -207,17 +209,14 @@ def _set_archived(kind: str, key: str, on: bool) -> None:
 
 # ================================================================================================================ the companies' files
 
-def _plan(cfg_plan=None, invoices=None) -> dict:
-    """Commercial plans and seats billing are not in Gridlytics v1 (plan Part 15.5): every company reads as on no plan."""
-    return {"state": "none", "name": None, "sentence": "No commercial plan in v1"}
-
-
 def read_file(row: dict) -> dict:
-    """What the founder reads of a company's file: its member rows by the sign-in's id, its sites, the plans issued and the work of the last days. Counts
-    only: the founder never reads a company's telemetry or plans (plan Part 10.5). A company with no file yet reads as empty (and none is made)."""
+    """What the founder reads of a company's file: its member rows by the sign-in's id, its sites, the dispatch plans issued and the work of the last days.
+    Counts only: the founder never reads a company's telemetry or plans (plan Part 10.5). A company with no file yet reads as empty (and none is made).
+    Gridlytics v1 has no commercial plan (plan Part 15.5), so nothing here is one: a plan is a dispatch plan, and only those of the sites in use are
+    counted, as `sites` counts them (audit founder-console-11)."""
     path = platformdb.company_file(row)
     if path is None or not path.exists():
-        return {"members": {}, "sites": 0, "sites_closed_loop": 0, "plans_issued": 0, "activity": dict.fromkeys(ACTIVITY, 0), "plan": _plan()}
+        return {"members": {}, "sites": 0, "sites_closed_loop": 0, "plans_issued": 0, "activity": dict.fromkeys(ACTIVITY, 0)}
     now = datetime.now(timezone.utc).replace(microsecond=0)
     month = now.replace(day=1, hour=0, minute=0, second=0).isoformat()
     since7, since30 = (now - timedelta(days=7)).isoformat(), (now - timedelta(days=30)).isoformat()
@@ -232,14 +231,14 @@ def read_file(row: dict) -> dict:
             figures = {"sites": one("SELECT COUNT(*) FROM sites WHERE deleted IS NULL"),
                        "sites_closed_loop": one("SELECT COUNT(*) FROM sites WHERE deleted IS NULL AND tier_capable = 'closed_loop' "
                                                 "AND tier_allowed = 'closed_loop'"),
-                       "plans_issued": one("SELECT COUNT(*) FROM plans")}
-            activity = {"plans_month": one("SELECT COUNT(*) FROM plans WHERE generated_at >= ?", month),
-                        "plans_30": one("SELECT COUNT(*) FROM plans WHERE generated_at >= ?", since30),
+                       "plans_issued": one(f"SELECT COUNT(*) FROM plans WHERE {IN_USE}")}
+            activity = {"plans_month": one(f"SELECT COUNT(*) FROM plans WHERE {IN_USE} AND generated_at >= ?", month),
+                        "plans_30": one(f"SELECT COUNT(*) FROM plans WHERE {IN_USE} AND generated_at >= ?", since30),
                         "days_30": one("SELECT COUNT(*) FROM telemetry_days WHERE day_local >= ?", since30[:10]),
                         "reports_30": one("SELECT COUNT(*) FROM reports WHERE generated_at >= ?", since30)}
     seen = [m["last_seen"] for m in members.values() if m["last_seen"]]
     activity.update(sites=figures["sites"], seen_7=sum(s >= since7 for s in seen), seen_30=sum(s >= since30 for s in seen))
-    return {"members": members, **figures, "activity": activity, "plan": _plan()}
+    return {"members": members, **figures, "activity": activity}
 
 
 def _read_or_none(row: dict) -> dict | None:
@@ -625,8 +624,7 @@ def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None
             "admins": sum(m["role"] == "admin" and not accounts.get(m["user_id"], {}).get("disabled") for m in seated) if seated is not None else None,
             "last_seen": max(seen) if seen else None,
             "sites": read["sites"] if read is not None else None, "sites_closed_loop": read["sites_closed_loop"] if read is not None else None,
-            "plans_issued": read["plans_issued"] if read is not None else None,
-            "plan": read["plan"] if read is not None else None, "archived": row["id"] in shelved}
+            "plans_issued": read["plans_issued"] if read is not None else None, "archived": row["id"] in shelved}
 
 
 def company_view(company_id: str) -> dict:
@@ -661,8 +659,7 @@ def overview() -> dict:
     out = {"companies": {"total": len(rows), "on": len(on), "off": len(rows) - len(on), "archived": len(every_row) - len(rows)},
            "accounts": {"total": len(accounts), "disabled": sum(a["disabled"] for a in accounts), "archived": len(every_account) - len(accounts)},
            "memberships": {s: sum(m["status"] == s for m in every) for s in platformdb.STATUSES},
-           "seats": {"given": sum(r["seats"] for r in on), "taken": 0}, "roles": {}, "activity": dict.fromkeys(ACTIVITY, 0),
-           "plans": {s: 0 for s in ("none", "trial", "active", "due")}, "unread": []}
+           "seats": {"given": sum(r["seats"] for r in on), "taken": 0}, "roles": {}, "activity": dict.fromkeys(ACTIVITY, 0), "unread": []}
     for row in on:
         read = _read_or_none(row)
         if read is None:
@@ -674,7 +671,6 @@ def overview() -> dict:
             out["roles"][m["role"]] = out["roles"].get(m["role"], 0) + 1
         for key in ACTIVITY:
             out["activity"][key] += read["activity"][key]
-        out["plans"][read["plan"]["state"]] = out["plans"].get(read["plan"]["state"], 0) + 1
     return out
 
 

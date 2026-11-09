@@ -547,3 +547,34 @@ def test_an_account_is_archived_disabled_with_its_seats_freed_and_brought_back(f
     _ok(_client().post("/api/local/session", json={"email": "sunia@meow.test", "password": "sunia first password"}))
     actions = [e["action"] for e in _audit()]
     assert actions[:3] == ["changed an account", "brought an account back from the archive", "archived an account"]
+
+
+# ================================================================== batch 3: the console's words
+
+def _plan_row(con, site: str, at: datetime) -> None:
+    t = at.isoformat(timespec="seconds")
+    con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status) VALUES (?,?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, site, t, t, t, t, "a", "active"))
+
+
+def test_the_console_has_no_commercial_plan_and_counts_the_dispatch_plans_of_the_sites_in_use(fdb):
+    """founder-console-11: Gridlytics v1 has no commercial plans, yet every company carried a 'plan' that always read 'No commercial plan in v1', and the
+    overview counted companies by it ('Plans due', 'with no plan') beside the dispatch plans issued. Those plans also counted the plans of deleted sites,
+    which 'Sites' leaves out."""
+    c = _console()
+    cid = _company(c)["company"]["id"]
+    now = datetime.now(timezone.utc)
+    with store.use_company(platformdb.company_file(cid)):
+        kept, gone = (sites.create({"name": n}, "test")["id"] for n in ("Mill A", "Mill B"))
+        with store.connect() as con:
+            for site in (kept, gone):
+                _plan_row(con, site, now - timedelta(minutes=5))
+                _plan_row(con, site, now - timedelta(days=40))
+        sites.delete(gone, "test")
+    box = _ok(c.get("/api/founder/companies"))["companies"][0]
+    assert "plan" not in box and box["sites"] == 1 and box["plans_issued"] == 2
+    view = _ok(c.get("/api/founder/overview"))
+    assert "plans" not in view
+    assert view["activity"]["sites"] == 1 and view["activity"]["plans_30"] == 1
+    month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    assert view["activity"]["plans_month"] == int(now - timedelta(minutes=5) >= month)
