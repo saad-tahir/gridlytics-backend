@@ -192,7 +192,7 @@ def read_file(row: dict) -> dict:
     only: the founder never reads a company's telemetry or plans (plan Part 10.5). A company with no file yet reads as empty (and none is made)."""
     path = platformdb.company_file(row)
     if path is None or not path.exists():
-        return {"members": {}, "sites": 0, "plans_issued": 0, "activity": dict.fromkeys(ACTIVITY, 0), "plan": _plan()}
+        return {"members": {}, "sites": 0, "sites_closed_loop": 0, "plans_issued": 0, "activity": dict.fromkeys(ACTIVITY, 0), "plan": _plan()}
     now = datetime.now(timezone.utc).replace(microsecond=0)
     month = now.replace(day=1, hour=0, minute=0, second=0).isoformat()
     since7, since30 = (now - timedelta(days=7)).isoformat(), (now - timedelta(days=30)).isoformat()
@@ -202,7 +202,12 @@ def read_file(row: dict) -> dict:
         with closing(store._connect()) as con:
             def one(sql: str, *args) -> int:
                 return con.execute(sql, args).fetchone()[0]
-            figures = {"sites": one("SELECT COUNT(*) FROM sites WHERE deleted IS NULL"), "plans_issued": one("SELECT COUNT(*) FROM plans")}
+            # the sites under closed-loop control (capable and allowed: the effective tier is the lower), which switching the company off takes out
+            # of it (audit founder-console-05)
+            figures = {"sites": one("SELECT COUNT(*) FROM sites WHERE deleted IS NULL"),
+                       "sites_closed_loop": one("SELECT COUNT(*) FROM sites WHERE deleted IS NULL AND tier_capable = 'closed_loop' "
+                                                "AND tier_allowed = 'closed_loop'"),
+                       "plans_issued": one("SELECT COUNT(*) FROM plans")}
             activity = {"plans_month": one("SELECT COUNT(*) FROM plans WHERE generated_at >= ?", month),
                         "plans_30": one("SELECT COUNT(*) FROM plans WHERE generated_at >= ?", since30),
                         "days_30": one("SELECT COUNT(*) FROM telemetry_days WHERE day_local >= ?", since30[:10]),
@@ -594,7 +599,8 @@ def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None
             # the Gridlytics administrators who can sign in: a disabled account is not counted (audit founder-console-10)
             "admins": sum(m["role"] == "admin" and not accounts.get(m["user_id"], {}).get("disabled") for m in seated) if seated is not None else None,
             "last_seen": max(seen) if seen else None,
-            "sites": read["sites"] if read is not None else None, "plans_issued": read["plans_issued"] if read is not None else None,
+            "sites": read["sites"] if read is not None else None, "sites_closed_loop": read["sites_closed_loop"] if read is not None else None,
+            "plans_issued": read["plans_issued"] if read is not None else None,
             "plan": read["plan"] if read is not None else None}
 
 

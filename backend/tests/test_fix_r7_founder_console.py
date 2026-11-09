@@ -450,3 +450,21 @@ def test_disabling_a_companys_only_owner_is_refused_unless_the_founder_says_so_a
     # a member is disabled without a word
     sunia = _person(c, "sunia@meow.test", "Sunia Ahmed", cid)
     _ok(c.patch(f"/api/founder/users/{sunia['id']}", json={"disabled": True}))
+
+
+def test_the_companies_list_counts_the_sites_a_switch_off_takes_out_of_closed_loop_control(fdb):
+    """founder-console-05: the Switch off dialog could not say that switching a company off ends its sites' control; the list now counts the sites under
+    closed-loop control (capable and allowed), which the dialog names."""
+    c = _console()
+    cid = _company(c)["company"]["id"]
+    assert _ok(c.get("/api/founder/companies"))["companies"][0]["sites_closed_loop"] == 0          # no file yet: nothing, and none is made
+    with store.use_company(platformdb.company_file(cid)):
+        steered, capable, allowed, gone = (sites.create({"name": n}, "test")["id"] for n in ("Mill A", "Mill B", "Mill C", "Mill D"))
+        for site in (steered, capable, gone):
+            sites.set_tier_capable(site, "closed_loop")
+        for site in (steered, allowed, gone):
+            sites.set_tier_allowed(site, "closed_loop", "test")
+        sites.delete(gone, "test")
+    box = _ok(c.get("/api/founder/companies"))["companies"][0]
+    assert box["sites"] == 3 and box["sites_closed_loop"] == 1
+    assert _ok(c.post(f"/api/founder/companies/{cid}/access", json={"enabled": False}))["company"]["sites_closed_loop"] == 1
