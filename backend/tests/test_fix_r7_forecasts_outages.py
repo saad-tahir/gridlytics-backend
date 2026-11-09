@@ -598,3 +598,33 @@ def test_an_off_grid_site_does_not_learn_its_critical_load_from_the_always_down_
     _write_load("crit-offgrid", ts, np.full(len(ts), 40.0), grid=np.zeros(len(ts)), soc=np.full(len(ts), 0.6))
     f = forecast.load(site, t0)
     assert np.allclose(f["crit"], 8.0) and f["crit_learned_hours"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-06
+
+def test_load_is_scored_on_unshed_minutes_with_the_baseline_over_the_same_slots(company):
+    """Plan Part 5.2 and 5.5: censored samples leave the training set and the baselines, and the model and its baseline are scored over the same slots.
+    The scored day sheds to its backed-up circuits from 14:00 to 16:00 (100 kW to 30 kW: censored); the week before shed from 10:00 to 11:00 and lost
+    its rows from 02:00 to 06:00. The forecast is the full demand, 100 kW, except 150 kW from 02:00 to 06:00, where the baseline has no value. Over the
+    unshed slots both have, the forecast and the baseline are exact. v1 scored the shed slots against the full-demand forecast and the forecast over
+    96 slots against a baseline over 80, so both read about 30 % off."""
+    sid = "load-score"
+    site = _load_site(sid, battery=False)
+    day = date(2026, 11, 4)
+    t0 = _midnight(day)
+    for d0, shed, gap in ((t0, (14, 16), None), (t0 - 7 * 86400, (10, 11), (2, 6))):
+        ts = np.arange(d0 - 8 * 3600, d0 + 86400, 60, dtype=np.int64)
+        h = _local_hour(ts)
+        down = (h >= shed[0]) & (h < shed[1]) & (ts >= d0)
+        keep = np.ones(len(ts), dtype=bool) if gap is None else ~((h >= gap[0]) & (h < gap[1]) & (ts >= d0))
+        _write_load(sid, ts[keep], np.where(down, 30.0, 100.0)[keep], grid=np.where(down, 0.0, 1.0)[keep])
+    h_steps = _local_hour(forecast.step_times(t0))
+    q50 = np.where((h_steps >= 2) & (h_steps < 6), 150.0, 100.0)
+    telemetry.save_forecast(sid, "load", t0, 1, forecast.VERSION, {"q50": [float(x) for x in q50] + [100.0] * 96})
+    rows = forecast.score_day(site, day)
+    head = next(r for r in rows if r["kind"] == "load" and r["horizon_class"] == "day_ahead")
+    assert head["value"] == pytest.approx(0.0, abs=1e-6), head
+    assert head["baseline_value"] == pytest.approx(0.0, abs=1e-6), head
+    for r in rows:
+        if r["kind"] == "load":
+            assert r["value"] == pytest.approx(0.0, abs=1e-6) and r["baseline_value"] == pytest.approx(0.0, abs=1e-6), r

@@ -684,6 +684,19 @@ def _q15(a) -> np.ndarray:
         return np.nanmean(a[: n * 15].reshape(-1, 15), axis=1)
 
 
+#: the hours read before a scored day so the censoring sees an outage that began before local midnight with its reference load (REF_MINUTES before the
+#: loss): the twin's longest outage is 6 hours
+SCORE_LEAD_S = 8 * 3600
+
+
+def _unshed15(site: dict, d0: int) -> np.ndarray:
+    """The 96 15-minute means of a day's load from d0 over its unshed minutes (plan Part 5.2: censored samples leave the scores and the baselines, as
+    they leave the training set): NaN where a step has no uncensored minute. The censoring reads SCORE_LEAD_S before the day."""
+    g = telemetry.minute_grid(site["id"], d0 - SCORE_LEAD_S, d0 + 86400)
+    lo = np.where(censored_minutes(site, g), np.nan, g["load"])
+    return _q15(lo[SCORE_LEAD_S // 60:])
+
+
 def _nrmse(pred: np.ndarray, act: np.ndarray, denom: float) -> float:
     return float(np.sqrt(np.mean((pred - act) ** 2)) / denom)
 
@@ -709,7 +722,8 @@ def _power_scores(site: dict, kind: str, t0: int, g: dict) -> list[dict]:
     times a clearness index known at the issue time: the last hour's before the belief time for 0-2 hours (reported only: the stage-1 blend is that
     model), the same step yesterday for the headline, 2-6 and 6-24 hours, and the same step two days before for 24-48 hours (yesterday's is not yet
     known that far ahead). The model and its baseline are scored over the same slots, so the skill compares like with like.
-    Load: by the day's mean load, against equivalent-day persistence (the same slot a week before)."""
+    Load: over the unshed minutes of the day (censored minutes are the shed demand's lower bound, not the demand the forecast describes), by their mean
+    load, against equivalent-day persistence (the same slot a week before, its own censored minutes left out), the model over the baseline's slots."""
     sid = site["id"]
     if kind == "pv":
         pv_asset = site["assets"]["pv"]
@@ -739,12 +753,12 @@ def _power_scores(site: dict, kind: str, t0: int, g: dict) -> list[dict]:
                 return np.minimum(cs[192:] * float(np.sum(a[m]) / np.sum(c[m])), kw_ac)
             return sp2 if cls == "24-48h" else sp1
     else:
-        act = _q15(g["load"])
+        act = _unshed15(site, t0)
         ok = ~np.isnan(act)
         if not ok.any():
             return []
         denom = max(1e-6, float(np.mean(act[ok])))
-        pers = _q15(telemetry.minute_grid(sid, t0 - 7 * 86400, t0 - 6 * 86400)["load"])
+        pers = _unshed15(site, t0 - 7 * 86400)
 
         def baseline(cls: str | None, b: int) -> np.ndarray | None:
             return pers
@@ -759,8 +773,8 @@ def _power_scores(site: dict, kind: str, t0: int, g: dict) -> list[dict]:
         base = baseline(None, f["belief_time"])
         okp = ok & ~np.isnan(base)
         if okp.sum() >= MIN_SLOTS:
-            if kind == "pv":
-                row["value"] = round(_nrmse(pred[okp], act[okp], denom), 4)
+            # the model and its baseline over the same slots, so the skill compares like with like
+            row["value"] = round(_nrmse(pred[okp], act[okp], denom), 4)
             row["baseline_value"] = round(_nrmse(base[okp], act[okp], denom), 4)
         rows.append(row)
     issues = _issues(sid, kind, t0 - 48 * 3600, t0 + 86400, "q50")
