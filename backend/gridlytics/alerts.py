@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 
+from . import auth
 from . import battery as battery_service
 from . import plans, sites, store, telemetry, twin
 
@@ -19,6 +20,20 @@ STEP_S = 900  # a plan step
 CATEGORIES = ("Data", "Control", "Reserve", "Battery", "Genset", "Forecast", "Tariff", "Savings", "Product")
 SEVERITIES = ("info", "warning", "critical")
 DEFAULT_RULES = {c: {"channels": ["in_app"], "quiet_hours": None, "escalate_after_min": None} for c in CATEGORIES}
+#: The categories every member receives: the energy kind (plan Part 10.5, "a viewer gets ... only energy-category alerts"; R8 2.16, "Viewer sees ...
+#: alerts of the energy kind (outage, genset, data) but no Savings or Product alerts"). The others need a permission: Control, Tariff and Savings alerts
+#: speak of plans, prices and claims (`see_costs`); Product alerts are fee and contract notices (`see_fee`)
+ENERGY_CATEGORIES = ("Data", "Reserve", "Battery", "Genset", "Forecast")
+CATEGORY_NEEDS = {"Control": "see_costs", "Tariff": "see_costs", "Savings": "see_costs", "Product": "see_fee"}
+
+
+def reader_categories() -> tuple[str, ...]:
+    """The categories the current reader receives in the inbox, the counts, a site's Now page and the fleet: every category when nobody reads (the
+    scheduler, a job, a test calling the module), else those the reader's role holds the permission for. An API key holds no role permission, so it
+    gets the energy categories only."""
+    if auth.current.get() is None:
+        return CATEGORIES
+    return tuple(c for c in CATEGORIES if c not in CATEGORY_NEEDS or auth.can(CATEGORY_NEEDS[c]))
 
 
 def _open(site_id: str, rule: str, category: str, severity: str, title: str, detail: dict | None = None) -> None:
@@ -294,8 +309,14 @@ def answer_request(site_id: str, nid: str, outcome: str, by: str) -> dict:
 
 # ------------------------------------------------------------------------------------------------ the inbox
 
+def _in(cats: tuple[str, ...]) -> tuple[str, list]:
+    return f" AND category IN ({','.join('?' * len(cats))})", list(cats)
+
+
 def listing(state: str | None = None, site_id: str | None = None, category: str | None = None, limit: int = 300) -> list[dict]:
-    q, args = "SELECT * FROM alerts WHERE 1=1", []
+    """The inbox, most severe first: only the categories the reader receives (`reader_categories`)."""
+    cond, args = _in(reader_categories())
+    q = "SELECT * FROM alerts WHERE 1=1" + cond
     if state == "active":
         q += " AND state IN ('open','acknowledged')"
     elif state:
@@ -316,18 +337,21 @@ def listing(state: str | None = None, site_id: str | None = None, category: str 
 
 
 def counts() -> dict:
+    """The open and acknowledged alerts by severity and by site, of the categories the reader receives (named in `categories`)."""
+    cats = reader_categories()
+    cond, args = _in(cats)
     with store.connect() as con:
-        rows = con.execute("SELECT severity, COUNT(*) n FROM alerts WHERE state IN ('open','acknowledged') GROUP BY severity").fetchall()
-        by_site = con.execute("SELECT site_id, COUNT(*) n FROM alerts WHERE state IN ('open','acknowledged') GROUP BY site_id").fetchall()
+        rows = con.execute("SELECT severity, COUNT(*) n FROM alerts WHERE state IN ('open','acknowledged')" + cond + " GROUP BY severity", args).fetchall()
+        by_site = con.execute("SELECT site_id, COUNT(*) n FROM alerts WHERE state IN ('open','acknowledged')" + cond + " GROUP BY site_id", args).fetchall()
     out = {r["severity"]: r["n"] for r in rows}
-    return {"total": sum(out.values()), "by_severity": out, "by_site": {r["site_id"]: r["n"] for r in by_site}}
+    return {"total": sum(out.values()), "by_severity": out, "by_site": {r["site_id"]: r["n"] for r in by_site}, "categories": list(cats)}
 
 
 def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "") -> dict:
     with store.connect() as con:
         r = con.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
-        if r is None:
-            raise KeyError(alert_id)
+        if r is None or r["category"] not in reader_categories():
+            raise KeyError(alert_id)               # an alert of a category the reader does not receive is not there for them
         if action == "acknowledge":
             con.execute("UPDATE alerts SET state = 'acknowledged', note = ? WHERE id = ?", (note or f"Acknowledged by {by}", alert_id))
         elif action == "assign":
