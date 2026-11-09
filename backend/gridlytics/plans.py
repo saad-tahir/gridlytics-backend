@@ -180,6 +180,10 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     dur = np.asarray(p_out["dur_steps"][:steps], dtype=int)
     G_max = 0.0 if off_grid else float(conn["data"]["sanctioned_load_kw"]) * 1.25
     regime = (conn or {"data": {}})["data"].get("regime", "none")
+    if regime in tariffs.EXPORT_REGIMES:
+        # the regime billed today (tariffs.regime_on): none outside the agreement (a zero-export site that nets nothing), net billing after
+        # a legacy agreement ends
+        regime = tariffs.regime_on(conn, _local(t0).date())
     X_max = float(conn["data"].get("export_cap_kw", 0)) if regime in ("net_billing", "net_metering_legacy") else 0.0
     mtd = month_to_date(site["id"], None if off_grid else conn, t0) if not off_grid else None
     rest_days = 0.0

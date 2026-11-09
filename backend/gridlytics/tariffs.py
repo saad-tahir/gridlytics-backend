@@ -41,29 +41,67 @@ def _num(x) -> bool:
 
 # ------------------------------------------------------------------------------------------------ versions
 
+_SHIPPED_HASH: dict[int, str] = {}
+
+
+def _shipped_hash(v: dict) -> str:
+    h = _SHIPPED_HASH.get(id(v))
+    if h is None:
+        h = _SHIPPED_HASH[id(v)] = _hash(v["body"])
+    return h
+
+
+def _shipped_todo(con) -> list[tuple[dict, object]]:
+    """The shipped versions a company file lacks, each with the shipped row it corrects (None for one the file has no row for at its start).
+
+    A shipped body that changed since the file was seeded (a correction of shipped data for the same start, such as the debt-service surcharge's
+    category rates) replaces the shipped row of the same start and status. The company's own decisions stand: a start the company versioned itself
+    and the build never shipped, and a shipped row the company has since superseded, approved or closed out of that status, are left alone."""
+    rows = con.execute("SELECT id, kind, key, effective_from, effective_to, status, hash, by FROM tariff_versions ORDER BY created, rowid").fetchall()
+    at: dict[tuple, list] = {}
+    for r in rows:
+        at.setdefault((r["kind"], r["key"], r["effective_from"]), []).append(r)
+    todo: list[tuple[dict, object]] = []
+    for v in tariff_data.SHIPPED:
+        same = at.get((v["kind"], v["key"], v["effective_from"]))
+        if not same:
+            todo.append((v, None))
+            continue
+        shipped = [r for r in same if r["by"] == "shipped"]
+        if not shipped or any(r["hash"] == _shipped_hash(v) for r in shipped):
+            continue
+        old = next((r for r in reversed(shipped) if r["status"] == v["status"]), None)
+        if old is not None:
+            todo.append((v, old))
+    return todo
+
+
 def ensure_shipped() -> None:
-    """Seed the shipped versions and fuel prices into the company's file the first time it is used, and add a shipped version that a newer build ships
-    and the file lacks (matched on kind, key and start; a start the company already holds a version for is never doubled).
+    """Seed the shipped versions and fuel prices into the company's file the first time it is used, add a shipped version that a newer build ships
+    and the file lacks (matched on kind, key and start; a start the company already holds a version for is never doubled), and apply a newer build's
+    correction of a shipped body (`_shipped_todo`): the old shipped row is superseded, as an approved correction for the same start supersedes it.
 
     The cheap check runs unlocked; the seeding runs inside an immediate write transaction that checks again, so callers racing on a fresh file (two
     requests, a request and the scheduler tick) seed it once: the first seeds, the rest find the rows."""
-    wanted = {(v["kind"], v["key"], v["effective_from"]) for v in tariff_data.SHIPPED}
     with store.connect() as con:
-        have = {(r[0], r[1], r[2]) for r in con.execute("SELECT kind, key, effective_from FROM tariff_versions")}
+        todo = _shipped_todo(con)
         fuel = con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is not None
-    if wanted <= have and fuel:
+    if not todo and fuel:
         return
     with store.write_transaction() as con:
-        have = {(r[0], r[1], r[2]) for r in con.execute("SELECT kind, key, effective_from FROM tariff_versions")}
-        for v in tariff_data.SHIPPED:
-            k = (v["kind"], v["key"], v["effective_from"])
-            if k in have:
-                continue
-            have.add(k)
+        for v, old in _shipped_todo(con):
+            vid, effective_to = store.new_id(), None
+            if old is not None:
+                effective_to = old["effective_to"]
+                day_before = (date.fromisoformat(v["effective_from"]) - timedelta(days=1)).isoformat()
+                con.execute("UPDATE tariff_versions SET status = 'superseded', effective_to = ? WHERE id = ?", (day_before, old["id"]))
             con.execute("INSERT INTO tariff_versions (id, kind, key, effective_from, effective_to, known_from, status, supersedes, body, source, hash, "
                         "created, by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (store.new_id(), v["kind"], v["key"], v["effective_from"], None, v["known_from"], v["status"], None, json.dumps(v["body"]),
-                         json.dumps(v["source"]), _hash(v["body"]), store._now(), "shipped"))
+                        (vid, v["kind"], v["key"], v["effective_from"], effective_to, v["known_from"], v["status"], old["id"] if old is not None else None,
+                         json.dumps(v["body"]), json.dumps(v["source"]), _shipped_hash(v), store._now(), "shipped"))
+            if old is not None:
+                store.audit("shipped", "corrected a shipped tariff version", f"{v['kind']}/{v['key']}",
+                            {"version_id": vid, "corrects": old["id"], "effective_from": v["effective_from"]}, con=con)
         if con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is None:
             for kind, day, price in tariff_data.FUEL_PRICES:
                 con.execute("INSERT OR IGNORE INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?)",
@@ -107,6 +145,10 @@ _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 #: Rs/kWh a legacy net-metering export is priced below the import it nets: the bill is indifferent, but equal prices let the optimiser plan
 #: circulating import and export in the same step at no cost (a degenerate plan with impossible flows and an inflated grid cap)
 LEGACY_EXPORT_TIE_BREAK = 0.01
+#: The regimes whose exports earn a credit while the connection's agreement is in force (agreement_start to agreement_end, both inclusive)
+EXPORT_REGIMES = ("net_billing", "net_metering_legacy")
+#: An adder whose key starts with fca or fpa is a fuel charges adjustment: the month's own "fca", or a late or bundled month's under its own key
+_FCA_KEY = re.compile(r"^(fca|fpa)", re.IGNORECASE)
 
 
 def _canonical_day(value, what: str = "The version's start") -> str:
@@ -167,11 +209,15 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
                                  "it is resolved by billing month, so a later start would leave that bill without it")
         exempt = body.get("exempt", [])
         if not isinstance(exempt, list) or not all(isinstance(x, str) for x in exempt):
-            raise ValueError("An adder's exempt is a list of exemptions (for example icp_units, lifeline, prepaid)")
+            raise ValueError("An adder's exempt is a list of exemptions (for example icp_units, lifeline, prepaid, or a tariff category or class)")
+        rates = body.get("category_rates", {})
+        if not isinstance(rates, dict) or not all(isinstance(k, str) and _num(r) and abs(r) <= 100 for k, r in rates.items()):
+            raise ValueError("An adder's category_rates is a map of tariff category or class (for example agricultural) to a rate in Rs/kWh")
     elif kind == "tou":
         seasons = body.get("seasons")
         if not isinstance(seasons, list) or not seasons:
             raise ValueError("A TOU calendar needs seasons, each with months and a peak window")
+        listed: list[int] = []
         for s in seasons:
             months = s.get("months") if isinstance(s, dict) else None
             peak = s.get("peak") if isinstance(s, dict) else None
@@ -179,6 +225,15 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
                 raise ValueError("Each TOU season needs months: a list of month numbers 1 to 12")
             if not isinstance(peak, (list, tuple)) or len(peak) != 2 or not all(isinstance(x, str) and _HHMM.match(x) for x in peak):
                 raise ValueError('Each TOU season needs a peak window: ["HH:MM", "HH:MM"]')
+            if peak[0] == peak[1]:
+                raise ValueError("Each TOU season needs a peak window that is not empty: its start and end differ")
+            listed += months
+        # peak membership is a function of the month for every month (R9 2.3): a month left out would have no peak at all, one listed twice two windows
+        missing, twice = sorted(set(range(1, 13)) - set(listed)), sorted({m for m in listed if listed.count(m) > 1})
+        if missing:
+            raise ValueError(f"A TOU calendar gives every month one season: month {', '.join(map(str, missing))} has none")
+        if twice:
+            raise ValueError(f"A TOU calendar gives every month one season: month {', '.join(map(str, twice))} is in two seasons")
     elif kind == "icp":
         if not _num(body.get("rate")) or body["rate"] < 0:
             raise ValueError("The ICP needs its rate in Rs/kWh")
@@ -193,9 +248,14 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
         if key == "net_billing" and (not _num(body.get("naepp")) or body["naepp"] < 0):
             raise ValueError("Net billing needs the export price naepp in Rs/kWh")
         if key == "net_metering_legacy":
-            sr = body.get("surplus_rate", "off_peak")
-            if not (sr in ("off_peak", "peak") or (_num(sr) and sr >= 0)):
-                raise ValueError('Legacy net metering\'s surplus_rate is "off_peak", "peak" or a rate in Rs/kWh')
+            if "nappp" in body and (not _num(body["nappp"]) or body["nappp"] < 0):
+                raise ValueError("Legacy net metering's nappp is the notified national average power purchase price in Rs/kWh")
+            sr = body.get("surplus_rate", "nappp" if "nappp" in body else "off_peak")
+            if not (sr in ("nappp", "off_peak", "peak") or (_num(sr) and sr >= 0)):
+                raise ValueError('Legacy net metering\'s surplus_rate is "nappp" (the notified national average power purchase price), "off_peak", '
+                                 '"peak" or a rate in Rs/kWh')
+            if sr == "nappp" and "nappp" not in body:
+                raise ValueError('Legacy net metering\'s surplus_rate "nappp" needs the notified rate: nappp in Rs/kWh')
             if body.get("netting", "by_period") != "by_period":
                 raise ValueError("Legacy net metering is modelled with by-period netting only (netting: by_period)")
     elif kind == "tax":
@@ -397,6 +457,42 @@ def adders_for(billing_month: str) -> list[dict]:
     return [{"key": v["key"], "id": v["id"], "name": v["key"], "exempt": [], **v["body"]} for v in best.values()]
 
 
+def is_fca(adder: dict) -> bool:
+    """A fuel charges adjustment (FCA, also printed FPA): an adder whose key starts with fca or fpa. Besides the month's own "fca", NEPRA bundles two
+    months' FCAs on one bill or moves a late one to the next (R9 6.2), and each is stored under its own key ("fca_sep"); every one of them is an FCA."""
+    return bool(_FCA_KEY.match(str(adder.get("key") or "")))
+
+
+def fca_billed(billing_month: str) -> bool:
+    """An FCA (under any key) is on the bill of the billing month: the condition plan 8.5 waits for before a saving is final."""
+    return any(is_fca(a) for a in adders_for(billing_month))
+
+
+def adder_rate(adder: dict, conn: dict | None) -> float | None:
+    """An adder's Rs/kWh for a connection: None when its exemptions name the connection's tariff category or class (for example "agricultural");
+    else its rate for that category, or for that class, from `category_rates` (the debt-service surcharge is 43 paisa for agricultural tube wells,
+    R9 section 7); else its rate. Exemptions that name a consumer kind (lifeline, prepaid, protected, evcs) match no category or class."""
+    cat = str((((conn or {}).get("data") or {}).get("tariff_category")) or "")
+    cls = tariff_data.category_class(cat) if cat else ""
+    exempt = adder.get("exempt") or []
+    if cat and (cat in exempt or cls in exempt):
+        return None
+    rates = adder.get("category_rates") or {}
+    for k in (cat, cls):
+        if k and _num(rates.get(k)):
+            return float(rates[k])
+    return float(adder["rate"])
+
+
+def _charged_on_icp_units(adder: dict, rate: float) -> bool:
+    """An adder is charged on ICP incremental units unless it exempts them (QTA, DSS) or is a negative FCA (SRO 2409(I)/2025: positive FCAs apply to
+    incremental consumption, negative FCAs do not; `negative_exempt_icp: false` keeps one on them where a bill shows it). The bill and the
+    optimiser's ICP price both read this, so they agree."""
+    if "icp_units" in (adder.get("exempt") or []):
+        return False
+    return not (is_fca(adder) and rate < 0 and adder.get("negative_exempt_icp", True))
+
+
 def _reading_day(conn: dict | None) -> int | None:
     rd = ((conn or {}).get("data") or {}).get("reading_day")
     try:
@@ -442,6 +538,72 @@ def icp_rule(on) -> dict | None:
 def prosumer(regime: str, on) -> dict | None:
     v = resolve("prosumer", "net_billing" if regime == "net_billing" else "net_metering_legacy", on)
     return v["body"] if v else None
+
+
+def agreement_window(conn: dict | None) -> tuple[date | None, date | None] | None:
+    """A connection's export agreement as (first day, last day), each None when it was not entered; None when a stored date is not a real date written
+    YYYY-MM-DD."""
+    data = (conn or {}).get("data") or {}
+    days: list[date | None] = []
+    for f in ("agreement_start", "agreement_end"):
+        v = data.get(f)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            days.append(None)
+            continue
+        if not isinstance(v, str) or not _YMD.match(v.strip()):
+            return None
+        try:
+            days.append(date.fromisoformat(v.strip()))
+        except ValueError:
+            return None
+    return days[0], days[1]
+
+
+def agreement_state(conn: dict | None, on: date) -> str | None:
+    """The state on a day of the export agreement of a connection under net billing or legacy net metering: "active", "not_started" (before
+    agreement_start), "ended" (after agreement_end) or "unreadable" (a stored date that is not a real date: exports earn nothing until it is
+    corrected); None under another regime. A date not entered leaves that side open. What the connection is billed under on the day is
+    `regime_on`."""
+    if conn is None or (conn.get("data") or {}).get("regime") not in EXPORT_REGIMES:
+        return None
+    w = agreement_window(conn)
+    if w is None:
+        return "unreadable"
+    start, end = w
+    if start is not None and on < start:
+        return "not_started"
+    if end is not None and on > end:
+        return "ended"
+    return "active"
+
+
+def regime_on(conn: dict | None, on: date) -> str:
+    """The regime a connection is billed under on a day. Its own regime while its agreement is in force (or when it has no export regime). After a
+    legacy net-metering agreement ends, net billing: the site moves to it on expiry (R9 section 8, SRO 547(I)/2026; KE's FAQ: after expiry the
+    surplus is valued at NAEPP), so its exports are credited at the NAEPP and nothing is netted. Before an agreement starts, after a net-billing
+    agreement ends, or with a date that cannot be read: "none", a connection whose export earns nothing (plan 9.3 UI-03: an expired regime's
+    export value falls to zero until a new agreement is entered)."""
+    regime = ((conn or {}).get("data") or {}).get("regime", "none")
+    state = agreement_state(conn, on)
+    if state is None or state == "active":
+        return regime
+    if state == "ended" and regime == "net_metering_legacy":
+        return "net_billing"
+    return "none"
+
+
+def export_credited(conn: dict | None, on: date) -> bool:
+    """Exports earn a credit on the day: the connection is billed under net billing or legacy net metering that day (`regime_on`)."""
+    return regime_on(conn, on) in EXPORT_REGIMES
+
+
+def _regime_minutes(conn: dict, ts: np.ndarray) -> np.ndarray:
+    """The regime each minute (epoch seconds of its start) is billed under, by its Pakistan day (`regime_on`)."""
+    out = np.full(len(ts), "none", dtype=object)
+    day_of = (np.asarray(ts, dtype=np.int64) + 5 * 3600) // 86400  # Pakistan days (UTC+5 all year) since 1970-01-01
+    for k in np.unique(day_of):
+        out[day_of == k] = regime_on(conn, date(1970, 1, 1) + timedelta(days=int(k)))
+    return out
 
 
 def icp_baseline(conn: dict, month: int, year: int, period: str) -> float | None:
@@ -496,10 +658,15 @@ def _seasonal_factor(data: dict, month: int) -> float:
 
 
 def _legacy_surplus_rate(card: dict, pro: dict | None) -> float:
-    """The rate a legacy net-metering surplus is credited at, from the prosumer version (the off-peak rate by default; no duty or tax on it)."""
-    sr = (pro or {}).get("surplus_rate", "off_peak")
+    """The rate a legacy net-metering surplus is credited at, from the prosumer version (no duty or tax on it): the notified NAPPP ("nappp", the
+    shipped default from 2026: NEPRA accounts net-metering exports at it, SRO 1501(I)/2026 para 23), a fixed rate, or the off-peak (or peak) rate of
+    the connection's tariff where a legacy bill shows that (the 2015 practice R9 8.3 reports, unverified)."""
+    pro = pro or {}
+    sr = pro.get("surplus_rate", "nappp" if _num(pro.get("nappp")) else "off_peak")
     if _num(sr):
         return float(sr)
+    if sr == "nappp" and _num(pro.get("nappp")):
+        return float(pro["nappp"])
     return _energy_rate(card, sr == "peak")
 
 
@@ -533,6 +700,11 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     # 2. energy by period
     e_imp = {"peak": float(imp[peak].sum() / 60.0), "off_peak": float(imp[~peak].sum() / 60.0)}
     e_exp = {"peak": float(exp[peak].sum() / 60.0), "off_peak": float(exp[~peak].sum() / 60.0)}
+    # the regime each day is billed under (regime_on): legacy netting takes the exports of days inside a legacy agreement, net billing credits those
+    # of days under net billing (a legacy agreement's days after it ends among them), and an export on any other day earns nothing
+    reg = _regime_minutes(conn, ts)
+    exp_l, exp_nb = np.where(reg == "net_metering_legacy", exp, 0.0), np.where(reg == "net_billing", exp, 0.0)
+    e_exp_l = {"peak": float(exp_l[peak].sum() / 60.0), "off_peak": float(exp_l[~peak].sum() / 60.0)}
     # 3. maximum demand: 30-minute fixed blocks aligned to the hour
     interval = int(data.get("mdi_interval_min", 30))
     mdi = 0.0
@@ -543,12 +715,11 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
         means = sums[counts > 0] / interval
         mdi = float(means.max()) * mdi_scalar if len(means) else 0.0
     sl = float(data["sanctioned_load_kw"])
-    # legacy net metering nets by period first (R9 section 8.3; marked unverified)
-    regime = data.get("regime", "none")
+    # legacy net metering nets by period first (R9 section 8.3; marked unverified), the exports of days inside the agreement only
     surplus_kwh = 0.0
-    if regime == "net_metering_legacy":
+    if bool((reg == "net_metering_legacy").any()):
         for p in ("peak", "off_peak"):
-            net = e_imp[p] - e_exp[p]
+            net = e_imp[p] - e_exp_l[p]
             surplus_kwh += max(0.0, -net)
             e_imp[p] = max(0.0, net)
     # 4. the ICP split per period by monthly totals
@@ -592,23 +763,24 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     total_units = e_imp["peak"] + e_imp["off_peak"]
     adders = 0.0
     for a in adders_for(billing_month):
-        units = total_units
-        if "icp_units" in a.get("exempt", []) or (a["key"] == "fca" and a["rate"] < 0 and a.get("negative_exempt_icp")):
-            units = total_units - inc_total
-        amt = a["rate"] * units
+        rate = adder_rate(a, conn)
+        if rate is None:  # the adder exempts the connection's category or class
+            continue
+        units = total_units if _charged_on_icp_units(a, rate) else total_units - inc_total
+        amt = rate * units
         adders += amt
-        lines.append({"line": a.get("name", a["key"]), "units_kwh": round(units, 3), "rate": a["rate"], "amount_rs": round(amt, 2)})
+        lines.append({"line": a.get("name", a["key"]), "units_kwh": round(units, 3), "rate": rate, "amount_rs": round(amt, 2)})
     # 8. electricity duty on the variable subtotal
     duty = tf["ed"] * (energy + adders)
     lines.append({"line": "Electricity duty", "rate": tf["ed"], "amount_rs": round(duty, 2)})
-    # 9. export credit
-    credit = 0.0
-    exported = e_exp["peak"] + e_exp["off_peak"]
-    if regime == "net_billing":
-        pro = prosumer("net_billing", on) or {"naepp": 0.0}
-        credit = exported * pro["naepp"]
-    elif regime == "net_metering_legacy":
-        credit = surplus_kwh * _legacy_surplus_rate(card, prosumer("net_metering_legacy", on))
+    # 9. export credit: the legacy surplus at its rate, and the exports of days under net billing at the NAEPP
+    credits: list[tuple[str, float, float]] = []  # (line, units, rate)
+    if surplus_kwh > 0:
+        credits.append(("legacy", surplus_kwh, _legacy_surplus_rate(card, prosumer("net_metering_legacy", on))))
+    exported_nb = float(exp_nb.sum() / 60.0)
+    if exported_nb > 0:
+        credits.append(("net_billing", exported_nb, (prosumer("net_billing", on) or {"naepp": 0.0})["naepp"]))
+    credit = sum(u * r for _, u, r in credits)
     # 10. GST (the credit is netted after taxes: DISCO practice, R9 section 13 step 10, to confirm on a prosumer bill)
     gst = tf["gst"] * (energy + fixed + adders + duty)
     lines.append({"line": "GST", "rate": tf["gst"], "amount_rs": round(gst, 2)})
@@ -632,8 +804,11 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
         flat += float(tax.get("muct_ke", 0))
     if flat:
         lines.append({"line": "Flat fees (PTV, MUCT)", "amount_rs": round(flat, 2)})
-    if credit:
-        lines.append({"line": "Export credit", "units_kwh": round(exported if regime == "net_billing" else surplus_kwh, 3), "amount_rs": round(-credit, 2)})
+    for kind, units, rate in credits:
+        if units * rate:
+            # one regime in the period: "Export credit"; a legacy agreement that ends inside it bills its surplus and the net-billing exports apart
+            name = "Export credit" if len(credits) == 1 else ("Export credit (legacy net metering)" if kind == "legacy" else "Export credit (net billing)")
+            lines.append({"line": name, "units_kwh": round(units, 3), "rate": rate, "amount_rs": round(-units * rate, 2)})
     total = max(0.0, bill_amount + s235 + flat - credit)
     recovered = (gst if tf["gst_recoverable"] else 0.0) + (s235 if tf["s235_adjustable"] else 0.0)
     return {"lines": lines, "total_rs": round(total, 2), "bearable_rs": round(total - recovered, 2), "recovered_taxes_rs": round(recovered, 2),
@@ -665,10 +840,17 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     netting case are those of the current billing month, whose steps end at `billing_month_end_step`. `mtd_import` and `rest_net_import` are the
     current billing month's imports per period so far and forecast for the rest; for legacy net metering `mtd_export` and `rest_net_export` are the
     exports alike (left out, the periods are taken to end the month as net imports). A legacy export is priced LEGACY_EXPORT_TIE_BREAK below the
-    import price of its step (the bill prices both alike), so equal prices never make circulating import and export free."""
+    import price of its step (the bill prices both alike), so equal prices never make circulating import and export free; `export_tie_break` holds
+    that amount per step (0 where it does not apply), for the ledger to add back.
+
+    Each day is priced under the regime it is billed under (`regime_on`): an export earns nothing before an agreement starts, after a net-billing
+    agreement ends or with a date that cannot be read (as on a connection without a regime), and earns the NAEPP after a legacy agreement ends (the
+    site moves to net billing). Legacy netting (the surplus credit and the ICP case on net imports) applies only while the legacy agreement is in
+    force on the first step's day."""
     h = 0.25
     out = {"c_imp": np.zeros(steps), "c_exp": np.zeros(steps), "peak": np.zeros(steps, dtype=bool), "month": np.zeros(steps, dtype=int),
-           "local_hour": np.zeros(steps), "grid": np.ones(steps), "icp": {}, "mdi": None, "billing_month": [], "billing_month_end_step": steps}
+           "local_hour": np.zeros(steps), "grid": np.ones(steps), "icp": {}, "mdi": None, "billing_month": [], "billing_month_end_step": steps,
+           "export_tie_break": np.zeros(steps)}
     times = [t0_utc + timedelta(minutes=15 * i) for i in range(steps)]
     locs = [t.astimezone(PKT) for t in times]
     for i, loc in enumerate(locs):
@@ -692,13 +874,15 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     bm0 = bms[0] if bms else billing_month_for(conn, on)
     in_bm0 = [b == bm0 for b in bms]
     out["billing_month_end_step"] = next((i for i, x in enumerate(in_bm0) if not x), steps)
-    adders = {bm: adders_for(bm) for bm in dict.fromkeys(bms or [bm0])}
-    add_all = {bm: sum(a["rate"] for a in ads) for bm, ads in adders.items()}
-    add_icp = {bm: sum(a["rate"] for a in ads if a["key"] == "fca" and a["rate"] > 0) for bm, ads in adders.items()}
+    # each adder at the connection's own rate (its category's, or none where it is exempt); on ICP units only those the bill charges there
+    rated = {bm: [(a, r) for a in adders_for(bm) for r in (adder_rate(a, conn),) if r is not None] for bm in dict.fromkeys(bms or [bm0])}
+    add_all = {bm: sum(r for _, r in ads) for bm, ads in rated.items()}
+    add_icp = {bm: sum(r for a, r in ads if _charged_on_icp_units(a, r)) for bm, ads in rated.items()}
     bm0_day = date(int(bm0[:4]), int(bm0[5:7]), 1)
     icp = icp_rule(bm0_day)
-    regime = data.get("regime", "none")
-    legacy = regime == "net_metering_legacy"
+    # the regime each day is billed under (regime_on): its own inside the agreement, net billing after a legacy agreement ends, else none
+    reg_day = {d: regime_on(conn, d) for d in bm_by_day}
+    legacy = regime_on(conn, on) == "net_metering_legacy"
 
     def q_net(p: str) -> float:
         """The current billing month's total for a period: imports so far plus the forecast rest, net of exports where the bill nets them."""
@@ -720,7 +904,7 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
                          "mtd_kwh": (mtd_import or {}).get(p, 0.0), "q_kwh": q, "rate": (icp["rate"] + add_icp[bm0]) * ef}
     # legacy net metering nets by period (rebuild step 3): a period that ends the month as a net import prices an exported kWh like an imported one,
     # with its adders, duty and taxes; one that ends in surplus moves only the credit, at the bare surplus rate (netted after taxes), both ways
-    naepp = (prosumer("net_billing", on) or {"naepp": 0.0})["naepp"] if regime == "net_billing" else 0.0
+    naepp = (prosumer("net_billing", on) or {"naepp": 0.0})["naepp"] if "net_billing" in reg_day.values() else 0.0
     surplus: dict[str, bool] = {}
     s_rate = 0.0
     if legacy:
@@ -740,15 +924,18 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
             c_imp = (icp["rate"] + add_icp[bm]) * ef
         else:
             c_imp = (_energy_rate(card, pk) + add_all[bm]) * ef
+        regime = reg_day[loc.date()]
         if regime == "net_billing":
             c_exp = naepp
-        elif legacy:
-            # the bill prices both ways alike; the export side sits LEGACY_EXPORT_TIE_BREAK below so the optimiser never plans import and export at once
-            if in_bm0[i] and surplus.get(p):
+        elif regime != "net_metering_legacy":
+            c_exp = 0.0  # no export regime, or no agreement in force that day
+        else:
+            # legacy: the bill prices both ways alike; the export side sits LEGACY_EXPORT_TIE_BREAK below so the optimiser never plans import and
+            # export at once
+            if legacy and in_bm0[i] and surplus.get(p):
                 c_imp = s_rate
             c_exp = c_imp - LEGACY_EXPORT_TIE_BREAK
-        else:
-            c_exp = 0.0
+            out["export_tie_break"][i] = LEGACY_EXPORT_TIE_BREAK
         out["c_imp"][i], out["c_exp"][i] = c_imp, c_exp
     if card["fixed_basis"] == "per_kw_month":
         out["mdi"] = {"rate_rs_per_kw": card["fixed"] * fixed_factor(conn, on) * _seasonal_factor(data, bm0_day.month),

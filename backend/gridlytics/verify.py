@@ -85,7 +85,7 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
     c_exp = np.asarray(vec["c_exp"], dtype=float)
     if _legacy(conn):
         # the optimiser's tie-break (an export priced a hair below the import it nets) is not on the bill: the ledger prices exports as the bill does
-        c_exp = c_exp + tariffs.LEGACY_EXPORT_TIE_BREAK
+        c_exp = c_exp + np.asarray(vec["export_tie_break"], dtype=float)  # only where it was taken off: an export outside the agreement earns nothing
     mdi = vec["mdi"] or {}
     iv = int(conn["data"].get("mdi_interval_min", 30) or 30)
     if iv <= 0 or 1440 % iv:
@@ -1313,8 +1313,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
     today_l = datetime.now(PKT).date()
     sb_days = sum((date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in switchback_blocks(site_id)
                   if date.fromisoformat(b["block_end"]) < today_l)
-    fca_billed = (not on_grid) or all(any(a["key"] == "fca" for a in tariffs.adders_for(mk))
-                                      for mk in _months_between(bill_month(d0) + "-01", bill_month(d1) + "-01"))
+    fca_billed = (not on_grid) or all(tariffs.fca_billed(mk) for mk in _months_between(bill_month(d0) + "-01", bill_month(d1) + "-01"))
     out["preliminary"] = (verified < VERIFIED_DAYS_FOR_FINAL or not native_capture or sb_days < 7 * SWITCHBACK_WEEKS_FOR_FINAL or not fca_billed)
     out["final_conditions"] = {"verified_days": verified, "verified_days_needed": VERIFIED_DAYS_FOR_FINAL, "native_capture": native_capture,
                                "switchback_weeks": round(sb_days / 7, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL, "fca_billed": fca_billed}
