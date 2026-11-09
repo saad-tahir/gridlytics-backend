@@ -7,7 +7,7 @@ from datetime import date
 import numpy as np
 import pytest
 
-from gridlytics import forecast, optimise, plans, sites, store, twin
+from gridlytics import forecast, optimise, plans, sites, store, telemetry, twin
 
 H = 0.25
 
@@ -114,6 +114,27 @@ def test_the_problem_values_lost_load_at_least_at_the_dearest_import_price(compa
     sites_default = _site()
     q = plans.build_problem(sites.full(sites_default), t0, forecast.issue(sites.full(sites_default), t0, save=False), 96)
     assert q["voll"] == pytest.approx(500.0)          # the default, already above every price, is kept
+
+
+def test_a_ticked_plan_never_sheds_with_the_grid_up_nor_imports_above_its_own_cap(company):
+    """The tick end to end, as the wrong-plan guard reads a plan (Part 7.1 step 8: no import above the plan's own MDI cap; the guard is the
+    control-edge package's): a mill whose load jumps from 100 to 300 kW for an hour each afternoon, with the month's peak so far 100 kW. Before,
+    the plan shed four of those steps with the grid up (Rs 95,880 of "unserved" load) and 25 steps imported above its own cap."""
+    sid = _site(load_peak_kw=300)
+    t0 = twin.day_start_utc(date(2026, 11, 1))
+    rows = []
+    for t in range(twin.day_start_utc(date(2026, 10, 18)), t0 + 13 * 3600, 60):
+        load = 300.0 if 15 <= ((t + 5 * 3600) % 86400) / 3600 < 16 else 100.0
+        rows.append((sid, t, "test", 1.0, load * 1000 / 60, 0.0, 0.0, load * 1000))
+    telemetry.write_rows(rows, ("site_id", "ts", "source_id", "grid_present", "grid_import_wh", "grid_export_wh", "pv_power_w", "load_power_w"))
+    out = plans.tick(sid, at=t0 + 13 * 3600, save=False)
+    assert out["status"] == "active"
+    up = [x for x in out["steps"] if x["grid_present"] > 0.5]
+    assert max(x["load_kw"] for x in up) >= 250.0                       # the forecast carries the afternoon hour
+    assert all(x["unserved_kw"] < 0.01 for x in up)
+    assert out["summary"]["breakdown"]["unserved_rs"] == pytest.approx(0.0, abs=0.01)
+    cap = out["summary"]["mdi_cap_kw"]
+    assert all(x["grid_import_kw"] <= cap + 0.05 for x in up)
 
 
 # ------------------------------------------------------------------------------------------------ engine-plans-live-17
