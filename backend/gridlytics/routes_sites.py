@@ -112,8 +112,10 @@ def fleet():
     rows = [fleet_row(s, now, c["by_site"]) for s in sites.listing()]
     online = sum(1 for r in rows if r["last_data"] and now - r["last_data"] < 1800)
     stamps = [r["mtd_saving_rs_computed"] for r in rows if r["mtd_saving_rs_computed"]]
+    # the sum of the sites' figures; None while no site has a scored day this month, never Rs 0 (audit frontend-states-formats-14)
+    figures = [r["mtd_saving_rs"] for r in rows if r["mtd_saving_rs"] is not None]
     return out({"summary": {"sites": len(rows), "online": online, "alerts": c["total"], "critical": c["by_severity"].get("critical", 0),
-                            "mtd_saving_rs": round(sum(r["mtd_saving_rs"] or 0 for r in rows), 0), "mtd_saving_rs_method": MTD_SAVING_METHOD,
+                            "mtd_saving_rs": round(sum(figures), 0) if figures else None, "mtd_saving_rs_method": MTD_SAVING_METHOD,
                             "mtd_saving_rs_computed": max(stamps) if stamps else None,
                             "in_outage": sum(1 for r in rows if r["now"] and r["now"]["grid_present"] == 0 and r["category"] != "Off-grid")},
                 "sites": rows})

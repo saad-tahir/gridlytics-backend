@@ -143,3 +143,14 @@ def test_the_overview_lists_the_genset_start_requests_waiting_for_an_answer(worl
     assert [r["payload"]["start"] for r in waiting] == [t0]
     assert a.post(f"/api/sites/{sid}/genset/requests/{waiting[0]['id']}", json={"outcome": "done"}).status_code == 200
     assert a.get(f"/api/sites/{sid}/now").json()["genset_requests"] == []
+
+
+# ------------------------------------------------------------------------------------------------ frontend-states-formats-14
+
+def test_the_fleet_s_month_saving_is_missing_without_a_scored_day_and_a_real_zero_stays_zero(world):
+    a = world.c["admin"]
+    assert a.get("/api/fleet").json()["summary"]["mtd_saving_rs"] is None      # no site has a scored day this month: missing, not Rs 0
+    with world.use():
+        _put_days(world.site, {today().isoformat(): _day(0.0, 300.0, 300.0, 1500.0)})      # a scored day that saved nothing
+    fleet = a.get("/api/fleet").json()
+    assert _row(fleet, world.site)["mtd_saving_rs"] == 0 and fleet["summary"]["mtd_saving_rs"] == 0
