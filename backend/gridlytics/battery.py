@@ -31,6 +31,14 @@ def full_charge_level(b: dict) -> float:
     return min(FULL_CHARGE, top - 0.01) if top >= UPPER_KNEE - 1e-9 else FULL_CHARGE
 
 
+def anchor_target(b: dict) -> float | None:
+    """The charge the plan asks for to re-anchor the estimate (R6 5.7: a charge-to-full slot when sigma is high): the pack's top of charge where
+    a charge there anchors (`full_charge_level`), else None, since the plan never charges past the pack's own soc_max."""
+    top = float(b.get("soc_max", 0.95))
+    level = full_charge_level(b)
+    return min(top, level + 0.01) if level <= top + 1e-9 else None
+
+
 def state(site: dict, now: int | None = None) -> dict | None:
     b = (site.get("assets") or {}).get("battery")
     if not b:
@@ -44,7 +52,7 @@ def state(site: dict, now: int | None = None) -> dict | None:
            "p_ch_kw": b["p_ch_kw"], "p_dis_kw": b["p_dis_kw"], "soc_min_pct": b["soc_min"] * 100, "soc_max_pct": b["soc_max"] * 100}
     if not known.any():
         return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "usable_kwh": None, "anchor": None, "alerts": [], "waiting_for_anchor": True,
-                "reading_age_min": None, "stale": True}
+                "reading_age_min": None, "stale": True, "anchor_due": False, "anchor_soc_pct": None}
     last = int(np.where(known)[0][-1])
     soc = float(est[last])
     # sigma at now, not at the last reading (round 7, engine-optimiser-07): it froze where the data stopped, so a plan started from a reading
@@ -74,8 +82,19 @@ def state(site: dict, now: int | None = None) -> dict | None:
     bms_now = g["soc_bms"][last]
     if not np.isnan(bms_now) and abs(bms_now - soc) > 0.10:
         alerts.append(("soc_disagreement", f"BMS reads {bms_now * 100:.0f} percent against an estimate of {soc * 100:.0f} percent"))
+    # an anchor is due with sigma over 15 points (R6 5.7) or none in the 30 days read, where the plan can reach one (round 7, engine-optimiser-15:
+    # the alert promised "a full charge to re-anchor" that nothing planned), and only on a reading that is not stale: until readings arrive
+    # again a charge would not be seen
+    target = anchor_target(b)
+    anchor_due = bool(target is not None and (sigma > 15 or anchor_ts is None) and age_min <= STALE_MINUTES)
     if sigma > 15:
-        alerts.append(("sigma_high", f"Estimate uncertainty is {sigma:.0f} points; the plan will ask for a full charge to re-anchor"))
+        if target is not None:
+            text = (f"The battery estimate may be off by up to {sigma:.0f} percentage points; the plan charges the battery to {target * 100:.0f} % "
+                    "once to correct it")
+        else:
+            text = (f"The battery estimate may be off by up to {sigma:.0f} percentage points; a charge to 98 % would correct it, and the battery is "
+                    f"set to stop charging at {float(b['soc_max']) * 100:.0f} %")
+        alerts.append(("sigma_high", text))
     day = slice(max(0, last - 1440), last + 1)
     hot = np.nansum((est[day] > 0.9) & (g["temp"][day] > 35)) / 60.0
     if hot > 2:
@@ -87,4 +106,5 @@ def state(site: dict, now: int | None = None) -> dict | None:
             "sigma_pct": round(sigma, 1), "trust": trust, "usable_kwh": round(usable, 1), "anchor": anchor_ts, "alerts": alerts,
             "throughput_30d_kwh": round(float(disch), 1), "cycles_30d": round(cycles, 2), "cycles_per_day": round(cycles / days_seen, 2),
             "hot_full_hours_24h": round(float(hot), 1), "wear_30d_rs": round(float(disch * optimise.wear_cost(b)), 0), "last_ts": int(g["ts"][last]),
-            "waiting_for_anchor": anchor_ts is None, "reading_age_min": round(age_min, 1), "stale": bool(age_min > STALE_MINUTES)}
+            "waiting_for_anchor": anchor_ts is None, "reading_age_min": round(age_min, 1), "stale": bool(age_min > STALE_MINUTES),
+            "anchor_due": anchor_due, "anchor_soc_pct": round(target * 100, 1) if anchor_due else None}

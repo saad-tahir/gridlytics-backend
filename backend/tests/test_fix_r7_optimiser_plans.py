@@ -952,3 +952,93 @@ def test_a_plan_with_no_battery_reading_says_it_starts_from_an_assumed_state(com
     sid = _battery_site()
     bs = plans.tick(sid, at=twin.day_start_utc(date(2026, 11, 3)) + 12 * 3600, save=False)["summary"]["battery_state"]
     assert bs["soc_pct"] == pytest.approx(50.0) and bs["age_min"] is None and bs["stale"] is True
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-15
+
+def _drifting(sid, soc_max_pct=95.0, bottom=30.0):
+    """An anchor four days ago (a full charge to the pack's top, or the low knee), then four days of shallow cycles (30 to 80 %) that never
+    reach a knee."""
+    start = twin.day_start_utc(date(2026, 11, 1))
+    _daily_cycles(sid, start, 1, top=soc_max_pct, bottom=bottom)
+    _daily_cycles(sid, start + 86400, 4, top=80.0, until=start + 4 * 86400 + 18 * 3600)
+    return start + 4 * 86400 + 18 * 3600
+
+
+def test_sigma_over_15_points_asks_the_plan_for_one_charge_to_the_top_and_the_alert_says_so(company):
+    """The sigma_high alert said "the plan will ask for a full charge to re-anchor", and nothing asked for one. Now the battery service asks
+    for it (R6 5.7) and the plan charges the battery to its top once in the horizon; the alert says that in plain words."""
+    from gridlytics import battery
+    sid = _battery_site()
+    now = _drifting(sid)
+    st = battery.state(sites.full(sid), now)
+    assert st["sigma_pct"] > 15.0 and st["anchor_due"] is True and st["anchor_soc_pct"] == pytest.approx(95.0)
+    text = dict(st["alerts"])["sigma_high"]
+    assert "re-anchor" not in text and "will ask" not in text
+    assert "charges the battery to 95 % once" in text
+    out = plans.tick(sid, at=now, save=False)
+    assert out["status"] == "active"
+    assert out["summary"]["battery_state"]["anchor_soc_pct"] == pytest.approx(95.0)
+    assert max(s["soc_pct"] for s in out["steps"]) >= 95.0 - 0.05
+    t = out["summary"]["battery_state"]["anchor_t"]
+    assert any(s["t"] + 900 == t and s["soc_pct"] >= 95.0 - 0.05 for s in out["steps"])
+
+
+def test_a_pack_set_to_stop_under_the_knee_is_not_asked_to_charge_past_its_top(company):
+    from gridlytics import battery
+    sid = _battery_site(soc_max=0.90)
+    now = _drifting(sid, 90.0, bottom=10.0)                           # anchored at the low knee four days ago
+    st = battery.state(sites.full(sid), now)
+    assert st["sigma_pct"] > 15.0 and st["anchor_due"] is False and st["anchor_soc_pct"] is None
+    text = dict(st["alerts"])["sigma_high"]
+    assert "charges the battery" not in text and "stop charging at 90 %" in text
+    p = plans.build_problem(sites.full(sid), now // 900 * 900, forecast.issue(sites.full(sid), now // 900 * 900, save=False), 96)
+    assert "anchor_soc" not in p["battery"]
+
+
+def test_the_anchor_is_met_at_the_end_of_one_hour_by_the_cheapest_charge_and_never_makes_a_tick_infeasible():
+    p = _problem(peak=(0, 0))                                          # flat prices: nothing else would fill the battery
+    r = optimise.solve(p)
+    assert float(np.max(r["sol"]["E"])) < 150.0
+    p["battery"]["anchor_soc"] = 0.95
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    E = r["sol"]["E"]
+    t = r["anchor"]["step"]
+    assert float(E[t + 1]) >= 190.0 - 1e-6 and r["anchor"]["short_kwh"] == pytest.approx(0.0, abs=1e-6)
+    hour = np.asarray(p["ts"]) // 3600
+    assert t == p["T"] - 1 or hour[t + 1] != hour[t]                  # at the end of a clock hour
+    # on a sunny day without grid charging it is met from the PV surplus
+    p["battery"]["a_grid"] = False
+    p["PV"] = np.where((np.arange(96) >= 40) & (np.arange(96) < 56), 140.0, 0.0)
+    p["PVlo"] = p["PV"] * 0.6
+    r = optimise.solve(p)
+    assert r["status"] == "optimal" and r["anchor"]["short_kwh"] == pytest.approx(0.0, abs=1e-6)
+    assert 40 <= r["anchor"]["step"] < 60
+    # with nothing to charge it, the plan is still made and says how far short it stays
+    p["PV"] = np.zeros(96)
+    p["PVlo"] = np.zeros(96)
+    r = optimise.solve(p)
+    assert r["status"] == "optimal" and r["anchor"]["short_kwh"] == pytest.approx(90.0, abs=0.01)
+
+
+def test_the_first_plan_that_schedules_the_anchor_fixes_when_so_re_planning_never_defers_it(company):
+    """Re-planned every 15 minutes, a charge that costs the same tonight as tomorrow night moved to the later night at every tick (the demo mall
+    was asked for one for days and never charged full). The first active plan's anchor time is kept as a deadline the next plans meet."""
+    sid = _battery_site()
+    now = _drifting(sid)
+    first = plans.tick(sid, at=now)
+    by = sites.full(sid)["state"]["anchor_by"]
+    assert by == first["summary"]["battery_state"]["anchor_t"]
+    later = now + 3 * 3600
+    _daily_cycles(sid, twin.day_start_utc(date(2026, 11, 2)), 4, top=80.0, until=later)  # readings carry on, still on the plateau
+    second = plans.tick(sid, at=later)
+    assert second["summary"]["battery_state"]["anchor_t"] <= by
+    assert sites.full(sid)["state"]["anchor_by"] == by
+    # once the battery is seen at its top the request ends and the deadline goes
+    from gridlytics import battery
+    t_full = later + 3600
+    telemetry.write_rows([(sid, later + 60 * i, "edge", 1.0, 95.0, 95.0, 0.0) for i in range(60)], SOC_COLS)
+    assert battery.state(sites.full(sid), t_full)["anchor_due"] is False
+    plans.tick(sid, at=t_full)
+    assert sites.full(sid)["state"].get("anchor_by") is None

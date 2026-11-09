@@ -292,7 +292,16 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         # age of the reading it read; a reading older than one control period, or none (the plan then starts from an assumed state), is stale
         age = bs.get("reading_age_min")
         p["battery_state"] = {"soc_pct": round(soc * 100, 1), "sigma_pct": bs.get("sigma_pct"), "age_min": age,
-                              "stale": bool(bs.get("stale", True)) if bs.get("soc_pct") is not None else True}
+                              "stale": bool(bs.get("stale", True)) if bs.get("soc_pct") is not None else True,
+                              "anchor_soc_pct": bs.get("anchor_soc_pct") if bs.get("anchor_due") else None}
+        if bs.get("anchor_due") and bs.get("anchor_soc_pct"):
+            # the battery service asks for a charge to the pack's top to re-anchor its estimate (round 7, engine-optimiser-15; R6 5.7). The first
+            # plan that schedules it fixes when (`anchor_by`, kept by tick): re-planned every 15 minutes, a charge that costs the same tonight as
+            # tomorrow night would otherwise move to the later night every time and never happen
+            bat["anchor_soc"] = float(bs["anchor_soc_pct"]) / 100.0
+            by = (site.get("state") or {}).get("anchor_by")
+            if by and int(by) > t0:
+                bat["anchor_by"] = int(by)
         if floor_pct.any():
             # every manual floor (a caller that drops the overrides drops this key), and its two parts
             p["reserve_manual"] = floor_pct / 100.0 * e_nom
@@ -464,7 +473,10 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "outage_now": bundle["outage"].get("observed"), "adherence": bundle["outage"].get("adherence"),
                "icp": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in (p.get("icp") or {}).items()},
                "overrides": p.get("overrides", []), "genset_state_unknown": bool(p.get("genset", {}) and p["genset"].get("unknown")),
-               "battery_state": p.get("battery_state"),
+               # where an anchor charge is asked for, the end of the hour it is planned for and the kWh it stays short of the target
+               "battery_state": ({**p["battery_state"], "anchor_t": (res.get("anchor") or {}).get("t"),
+                                  "anchor_short_kwh": (res.get("anchor") or {}).get("short_kwh")}
+                                 if p.get("battery_state") and p["battery_state"].get("anchor_soc_pct") else p.get("battery_state")),
                "status_label": _status_label(res),
                "solver": {"status": res["status"], "variables": res.get("variables"), "rows": res.get("rows"), "binaries": res.get("binaries"),
                           "relaxed": res.get("relaxed"), "message": res.get("message"), "shed_rule_resolve": res.get("shed_rule_resolve"),
@@ -518,7 +530,15 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
             con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, solve_s, objective_rs, plan_id) VALUES (?,?,?,?,?,?,?,?,?)",
                         (site_id, _iso(t0), started, store._now(), status, reason or res["status"], res["solve_seconds"], res["objective_rs"], plan_id))
         active = plan_id if status == "active" else (None if release else site.get("state", {}).get("active_plan"))
-        sites.put_state(site_id, active_plan=active, last_tick=_iso(t0))
+        # the anchor charge's deadline (see build_problem): set by the first active plan that schedules one, dropped once none is asked for
+        anchor = {}
+        by = (site.get("state") or {}).get("anchor_by")
+        if (p.get("battery") or {}).get("anchor_soc") and res.get("anchor"):
+            if status == "active" and not (by and int(by) > t0):
+                anchor["anchor_by"] = int(res["anchor"]["t"])
+        elif by is not None:
+            anchor["anchor_by"] = None
+        sites.put_state(site_id, active_plan=active, last_tick=_iso(t0), **anchor)
     return {"status": status, "plan_id": plan_id, "objective_rs": res["objective_rs"], "solve_seconds": res["solve_seconds"], "steps": steps_out,
             "slots": compiled, "summary": summary}
 

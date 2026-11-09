@@ -111,6 +111,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     lmode = int(p.get("load_mode", 0))
     W, forced, rm_floor = None, np.zeros(T, dtype=bool), {}
     e_gap_idx, e_gap_price = None, 0.0
+    anchor_a, anchor_ends, anchor_short = None, [], None
     dump_ok = forced
     thr_t: list[int] = []
     thr_w: dict[int, int] = {}
@@ -377,6 +378,25 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 z = z_of[int(hour[t])]
                 m.row([D[t], z], [1, -float(bat["P_dis"])], ub=0, name=f"cut_rec_dis[{t}]")
                 m.row([E[t + 1], z], [1, -(Emin - E0)], lb=E0, name=f"cut_rec_e[{t}]")
+        # the anchor the battery service asks for (round 7, engine-optimiser-15; R6 5.7, Part 4.6): with sigma over 15 points, or no anchor in
+        # the 30 days it read, one charge to the pack's top of charge, held at the end of one clock hour the solver picks (a = 1 there), so a
+        # reading there re-anchors the estimate. The kWh short of it at that hour are priced a rupee above the dearest kWh the horizon could
+        # store, as a start under the cut-off is, so the cheapest charge meets it (a sunny day's PV first) and nothing makes it infeasible
+        if bat.get("anchor_soc") and T:
+            A = min(Emax, float(bat["anchor_soc"]) * En)
+            hour = np.asarray(p["ts"], dtype=np.int64)[:T] // 3600
+            anchor_ends = [t for t in range(T) if t == T - 1 or hour[t + 1] != hour[t]]
+            if bat.get("anchor_by"):
+                # by the time an earlier plan fixed for it (plans.build_problem), where the horizon still reaches it
+                ts_end = np.asarray(p["ts"], dtype=np.int64)[:T] + 900
+                anchor_ends = [t for t in anchor_ends if ts_end[t] <= int(bat["anchor_by"])] or anchor_ends
+            anchor_a = m.var("anchor", len(anchor_ends), 0, 1, 0.0, integer=True)
+            m.row([int(a) for a in anchor_a], [1.0] * len(anchor_ends), lb=1, ub=1, name="anchor_one")
+            dear = float(np.max(np.asarray(p["c_imp"])[:T])) if not off_grid else float(p.get("c_short", voll))
+            anchor_short = m.var("anchor_short", 1, 0, A, dear / bat["eta_c"] + 1.0)[0]
+            for j, t in enumerate(anchor_ends):
+                lb_ = float(e_lb[t + 1])
+                m.row([E[t + 1], int(anchor_a[j]), anchor_short], [1, -(A - lb_), 1], lb=lb_, name=f"anchor[{t}]")
         # reserve (soft, expected value): rows only where the grid is up and an outage may start next, and none where the next step is itself a
         # modelled outage (g = 0): its balance rows already price that outage's shortfall (genset fuel or lost load), which is never charged
         # twice (Part 4.3; round 7, engine-optimiser-09: the step before a scheduled window paid about 0.9 c_short on top)
@@ -692,6 +712,11 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     # a start under the cut-off that ends under it: the kWh short of soc_min at the horizon's end and their price (engine-optimiser-03)
     out["E_gap"] = float(x[e_gap_idx]) if e_gap_idx is not None else 0.0
     out["E_gap_price"] = e_gap_price
+    # the hour end the anchor charge was planned for (the step, and its end as epoch seconds) and the kWh it stays short of it (engine-optimiser-15)
+    out["anchor"] = None
+    if anchor_a is not None:
+        j = int(np.argmax(x[anchor_a]))
+        out["anchor"] = {"step": int(anchor_ends[j]), "t": int(np.asarray(p["ts"])[anchor_ends[j]]) + 900, "short_kwh": round(float(x[anchor_short]), 3)}
     out["E_floor_grid"] = Elo if bat else 0.0
     out["breakdown"] = _breakdown(p, sol, out)
     out["reasons"] = explain(p, sol, out)
