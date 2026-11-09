@@ -193,3 +193,46 @@ def test_the_seven_day_summary_covers_the_last_seven_calendar_days(company):
     assert pv["skill_last7"] is None  # no baseline in the window: no skill
 
 
+# ------------------------------------------------------------------------------------------------ pages-C-01
+
+def test_the_forecast_page_carries_the_past_24_hours_of_actuals_and_the_issue_held_then(company):
+    """The tick re-issues every 15 minutes, so the latest issue's own actuals are 0 or 1 step. The page also answers the 24 hours before the belief
+    time: their 15-minute actuals (available PV: output plus curtailment) and the issue held a day before, so the chart shows how the forecast tracked."""
+    sid = "page-past"
+    site = {"id": sid, "data": {"lat": LAT, "lon": LON}, "assets": {"pv": PLANT}, "connections": [{"id": "c1", "data": {"regime": "none"}}]}
+    now = int(datetime.now(timezone.utc).timestamp())
+    b = forecast.align(now)
+    h0 = b - 86400
+    ts = np.arange(h0 - 3600, now // 60 * 60, 60, dtype=np.int64)
+    down = (ts >= h0 + 6 * 3600) & (ts < h0 + 7 * 3600)  # one hour without grid, 18 hours before the belief time
+    rows = [(sid, int(t), "edge", 2000.0, 0.0 if d else 1.0, 3000.0, 1000.0) for t, d in zip(ts, down)]
+    telemetry.write_rows(rows, ("site_id", "ts", "source_id", "load_power_w", "grid_present", "pv_power_w", "curtail_w"))
+    for kind in ("pv", "load", "outage"):
+        telemetry.save_forecast(sid, kind, h0, 1, "v1.0", {"q50": [1.5] * 192, "q05": [1.0] * 192, "q95": [2.0] * 192, "p_down": [0.25] * 192,
+                                                          "p_start": [0.05] * 192})
+        telemetry.save_forecast(sid, kind, b, 1, "v1.0", {"q50": [2.5] * 192, "p_down": [0.1] * 192, "p_start": [0.01] * 192})
+    load = forecast.page(site, "load")
+    past = load["past"]
+    assert past["t"][0] == h0 and len(past["t"]) == 96 and past["t"][-1] == b - forecast.STEP_S
+    assert past["belief_time"] == h0
+    assert past["q50"] == [1.5] * 96 and past["q05"] == [1.0] * 96
+    assert len(past["actual"]) == 96 and all(v == pytest.approx(2.0) for v in past["actual"])
+    pv = forecast.page(site, "pv")["past"]
+    assert all(v == pytest.approx(4.0) for v in pv["actual"])  # 3 kW produced plus 1 kW curtailed
+    out = forecast.page(site, "outage")["past"]
+    assert out["p_down"] == [0.25] * 96 and out["p_start"] == [0.05] * 96
+    assert out["actual"][24:28] == [1.0] * 4 and out["actual"][:24] == [0.0] * 24
+    # the latest issue's own actuals are unchanged: from its belief time on
+    assert len(load["actual"]) == (now // 60 * 60 - b) // forecast.STEP_S
+
+
+def test_the_past_of_a_site_without_an_older_issue_still_has_its_actuals(company):
+    """A site activated less than a day ago has no issue a day old: the page still answers the past actuals, with no past issue."""
+    sid = "page-young"
+    now = int(datetime.now(timezone.utc).timestamp())
+    b = forecast.align(now)
+    telemetry.write_rows([(sid, int(t), "edge", 1500.0) for t in range(b - 7200, b, 60)], ("site_id", "ts", "source_id", "load_power_w"))
+    telemetry.save_forecast(sid, "load", b, 0, "v1.0", {"q50": [2.5] * 192})
+    past = forecast.page({"id": sid}, "load")["past"]
+    assert past["belief_time"] is None and "q50" not in past
+    assert past["actual"][-8:] == [1.5] * 8 and past["actual"][0] is None

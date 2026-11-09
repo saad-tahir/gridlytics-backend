@@ -454,8 +454,48 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
     return {"t0": t0, "pv": p, "load": l, "outage": o}
 
 
+#: the arrays of an issue the forecast page draws over the 24 hours before the latest issue, per kind
+PAST_KEYS = {"pv": (*QS, "cs"), "load": (*QS, "crit"), "outage": ("p_down", "p_start")}
+PAST_STEPS = 96
+
+
+def _actual15(site_id: str, kind: str, a: int, b: int) -> list:
+    """The page's 15-minute actuals over [a, b): available PV, load, or 1 where the grid was down in the step (None where a step has no reading)."""
+    g = telemetry.minute_grid(site_id, a, b)
+    n = len(g["ts"]) // 15
+    if not n:
+        return []
+    if kind == "outage":
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            v = 1 - np.nanmin(g["grid"][: n * 15].reshape(-1, 15), axis=1)
+    else:
+        v = _q15(available_pv(g) if kind == "pv" else g["load"])
+    return [None if np.isnan(x) else round(float(x), 2) for x in v]
+
+
+def _past(site_id: str, kind: str, t0: int) -> dict:
+    """The 24 hours before a belief time: their 15-minute actuals and, over them, the issue held a day before (the latest at or before the window's
+    start, from the step that falls on it; None past its horizon). `belief_time` is None where no such issue exists (a site younger than a day)."""
+    h0 = t0 - PAST_STEPS * STEP_S
+    out = {"t": [int(x) for x in step_times(h0, PAST_STEPS)], "actual": _actual15(site_id, kind, h0, t0), "belief_time": None}
+    old = telemetry.latest_forecast(site_id, kind, h0)
+    if old is None:
+        return out
+    off = (h0 - int(old["belief_time"])) // STEP_S
+    arrays = {k: old[k] for k in PAST_KEYS.get(kind, ()) if isinstance(old.get(k), list)}
+    if off < STEPS and arrays:
+        out["belief_time"] = int(old["belief_time"])
+        for k, v in arrays.items():
+            seg = list(v[off:off + PAST_STEPS])
+            out[k] = seg + [None] * (PAST_STEPS - len(seg))
+    return out
+
+
 def page(site: dict, kind: str) -> dict:
-    """The latest issue of a kind with the actuals so far (15-minute means) for the forecast page."""
+    """The latest issue of a kind with the actuals so far (15-minute means) for the forecast page, and `past`: the 24 hours before its belief time with
+    their actuals and the issue held a day before over them, so the chart shows how the forecast tracked. The tick re-issues every 15 minutes, so the
+    latest issue's own actuals are at most one step."""
     f = telemetry.latest_forecast(site["id"], kind)
     if f is None:
         return {"kind": kind, "issue": None}
@@ -463,19 +503,10 @@ def page(site: dict, kind: str) -> dict:
     t = step_times(t0)
     now = int(datetime.now(timezone.utc).timestamp())
     t1 = max(t0, min(now // 60 * 60, t0 + STEPS * STEP_S))  # whole minutes only
-    actual = None
-    if kind in ("pv", "load"):
-        g = telemetry.minute_grid(site["id"], t0, t1)
-        col = available_pv(g) if kind == "pv" else g["load"]
-        n = len(col) // 15
-        actual = [None if np.isnan(x) else round(float(x), 2) for x in np.nanmean(col[: n * 15].reshape(-1, 15), axis=1)] if n else []
-    elif kind == "outage":
-        g = telemetry.minute_grid(site["id"], t0, t1)
-        n = len(g["grid"]) // 15
-        actual = [None if np.isnan(x) else round(1 - float(x), 2) for x in np.nanmin(g["grid"][: n * 15].reshape(-1, 15), axis=1)] if n else []
+    actual = _actual15(site["id"], kind, t0, t1) if kind in PAST_KEYS else None
     return {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
             "issue": {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version")}, "actual": actual,
-            "preliminary": f["stage"] == 0}
+            "preliminary": f["stage"] == 0, "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None}
 
 
 def _outage_baselines(site: dict, t0: int) -> dict:
