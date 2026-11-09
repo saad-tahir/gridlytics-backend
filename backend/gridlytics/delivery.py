@@ -298,6 +298,14 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                           "intent": _intent_words(mode, floor, target)})
             if mdi_cap_kw and not held and _translate_mdi(slots[-1], span, battery, float(mdi_cap_kw), lo):
                 slots[-1]["intent"] = _intent_words(mode, slots[-1]["soc_floor_pct"], target)
+        # the safe tail (R6 I1, Part 7.1 step 6): a keyed Deye or Growatt table persists and, with no new plan, repeats; a ring's last program also
+        # runs on round midnight. So a discharging last slot stops at the larger of the reserve the plan holds at the day's end and the fallback
+        # floor (a hold or a charge does not discharge: its level stands)
+        last = slots[-1]
+        tail = _tail_floor(steps[idx[-1]], lo)
+        if last["mode"] in DISCHARGING and last["soc_floor_pct"] < tail:
+            last["soc_floor_pct"] = tail
+            last["intent"] = _intent_words(last["mode"], tail, last["soc_target_pct"])
         days.append({"date": day, "slots": slots})
     out = {"brand": brand, "grammar": gram, "days": days, "fallback": fallback_block(site, fallback_floor_pct, bms_low_pct)}
     # the battery's own limits, for the brands that key a power once for the table, or a power where a slot has none (Deye's self-use program)
@@ -306,7 +314,82 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                      "max_discharge_w": round(b["P_dis"] * 1000) if b.get("P_dis") else None, "battery_v": b.get("V_nom")}
     out["mdi"] = {"cap_kw": round(float(mdi_cap_kw), 1) if mdi_cap_kw else None, "held": held,
                   "not_enforceable": None if held or not mdi_cap_kw else _mdi_not_enforceable(steps, out, battery, site, float(mdi_cap_kw))}
+    out["safety"] = table_safety(out, steps, battery, site)
     return out
+
+
+def _tail_floor(end_step: dict, floor: float) -> float:
+    """The floor a day table's last slot stops at (R6 I1): the larger of the reserve the plan holds at the day's last step and the fallback floor."""
+    return round(float(np.clip(max(floor, float(end_step.get("reserve_pct") or 0.0)), floor, 100.0)), 1)
+
+
+def _midnight(date_local: str) -> int:
+    return int(datetime.fromisoformat(date_local).replace(tzinfo=PKT).timestamp())
+
+
+def table_safety(compiled: dict, steps: list[dict], battery: dict | None, site: dict | None) -> dict:
+    """Whether each day table is safe to repeat with no new plan (Part 7.1 step 6, R6 I1 and I5), as a keyed Deye or Growatt table, or an edge
+    holding its cached plan through a lost link, runs it. Per day: no slot's floor is below the fallback floor; a discharging last slot stops at
+    the reserve the plan holds at the day's end (`tail_floor_pct`); and a whole day's table (tomorrow's, the fallback day) run again over the next
+    day, from the plan's state of charge at the day's end and on the plan's forecast for that day (the same clock time a day or two earlier past
+    the horizon), meets every forecast outage that starts in it with at least the reserve the plan keeps for it there, less 2 points (never more
+    than the plan's own state of charge at that time). `ok` is False on any failure, with the day's `reason`, and the wrong-plan guard refuses
+    the plan (step 8). Today's remainder is checked for its floors and its tail: the plan itself covers it."""
+    floor = float((compiled.get("fallback") or {}).get("min_soc_floor_pct") or 0.0)
+    by_t = {int(st["t"]): st for st in steps}
+    plant = twin.plant_of(site) if site and (battery or {}).get("E_nom") and (site.get("assets") or {}).get("battery") else None
+    days = []
+    for d in compiled.get("days") or []:
+        slots = d["slots"]
+        if not slots:
+            continue
+        last = slots[-1]
+        end_step = by_t.get(int(last["end_ts"]) - 900) or {}
+        rec = {"date": d["date"], "ok": True, "reason": None, "tail_floor_pct": _tail_floor(end_step, floor)}
+        whole = int(slots[0]["start_ts"]) == _midnight(d["date"]) and int(last["end_ts"]) == _midnight(d["date"]) + 86400
+        if min(float(s["soc_floor_pct"]) for s in slots) < floor - 0.05:
+            rec.update(ok=False, reason="floor_below_fallback")
+        elif last["mode"] in DISCHARGING and float(last["soc_floor_pct"]) < rec["tail_floor_pct"] - 0.05:
+            rec.update(ok=False, reason="tail_below_reserve")
+        elif whole and plant is not None and end_step.get("soc_pct") is not None:
+            short = _repeat_short(slots, by_t, plant, float(end_step["soc_pct"]))
+            if short:
+                rec.update(ok=False, reason="reserve_short_on_repeat", **short)
+        days.append(rec)
+    return {"ok": all(r["ok"] for r in days), "days": days}
+
+
+def _repeat_short(slots: list[dict], by_t: dict[int, dict], plant: "twin.Plant", soc_end_pct: float) -> dict | None:
+    """The day's table run again over the 24 hours after it ends (table_safety): the first forecast outage it meets short of the plan's reserve,
+    as {short_at (epoch s), soc_pct, reserve_pct}, else None (also when the forecast for that day is not known)."""
+    w0 = int(slots[-1]["end_ts"])
+    src = []
+    for q in range(w0, w0 + 86400, 900):
+        st = by_t.get(q) or by_t.get(q - 86400) or by_t.get(q - 2 * 86400)
+        if st is None:
+            return None
+        src.append(st)
+    ts = np.arange(w0, w0 + 86400, 60)
+    # what a person keyed runs again by clock time; the plan's genset runs are not in a keyed table, so the operator's own rule runs the set
+    rep = [{**s, "start_ts": int(s["start_ts"]) + 86400, "end_ts": int(s["end_ts"]) + 86400, "genset": None, "genset_runs": None} for s in slots]
+
+    def col(key: str, alt: str | None = None, default: float = 0.0) -> np.ndarray:
+        return np.repeat([float(st[key] if st.get(key) is not None else st.get(alt) if alt and st.get(alt) is not None else default)
+                          for st in src], 15)
+
+    series = {"ts": ts, "pv": col("pv_forecast_kw", "pv_kw"), "load": col("load_kw"), "crit": col("critical_kw", "load_kw"),
+              "grid": col("grid_present", default=1.0), "temp": np.full(len(ts), 30.0)}
+    soc0 = soc_end_pct / 100.0
+    sim = twin.simulate(series, twin.slots_policy(rep, ts), plant, soc0)
+    down = series["grid"] < 0.5
+    for i in np.flatnonzero(down[1:] & ~down[:-1]) + 1:  # where the grid goes down: the next known or likely window
+        st = src[i // 15]
+        reserve = float(st.get("reserve_pct") or 0.0)
+        planned = float(st["soc_start_pct"]) if st.get("soc_start_pct") is not None else 100.0
+        soc = float(sim["soc"][i - 1]) * 100.0
+        if soc < min(reserve, planned) - 2.0:
+            return {"short_at": int(ts[i]), "soc_pct": round(soc, 1), "reserve_pct": round(reserve, 1)}
+    return None
 
 
 def _runs(on: list[dict]) -> list[list[int]]:
@@ -676,7 +759,25 @@ def vendor_table(compiled: dict | None, day_index: int = 0) -> dict:
     day = compiled["days"][min(day_index, len(compiled["days"]) - 1)]
     rows, settings, notes = VENDOR.get(compiled.get("brand"), _generic)(day["slots"], compiled)
     return {"rows": [{k: v for k, v in r.items() if k != "_slots"} for r in rows], "slots": [r["_slots"] for r in rows], "settings": settings,
-            "notes": notes + _mdi_notes(compiled)}
+            "notes": notes + _part_day_notes(day["slots"], compiled) + _mdi_notes(compiled)}
+
+
+def _part_day_notes(slots: list[dict], compiled: dict) -> list[str]:
+    """For a table of part of a day (today's remainder from the tick, or the horizon's last day): what runs round midnight once it is keyed, since a
+    keyed table stays and repeats (Part 7.1 step 6): a ring's last program runs on to its first program's time; other brands keep nothing outside
+    their windows. The table's last slot is made safe to sit in (compile_mode_a's safe tail)."""
+    if not slots:
+        return []
+    out = []
+    first, last = slots[0], slots[-1]
+    ring = BRANDS.get(compiled.get("brand"), BRANDS["other"])["ring"]
+    if first["start"] != "00:00":
+        out.append(f"This table starts at {first['start']}: key tomorrow's table before midnight."
+                   + (f" Until then its last program (from {last['start']}) also runs from midnight to {first['start']}." if ring else ""))
+    if last["end"] != "00:00":
+        out.append(f"This table ends at {last['end']}, where the plan ends: " + ("its last program runs on to midnight." if ring else
+                   "after it the inverter runs its own default mode until the next table."))
+    return out
 
 
 def vendor_view(compiled: dict, day_index: int = 0) -> list[dict]:

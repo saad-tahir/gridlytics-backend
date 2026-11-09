@@ -325,11 +325,14 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
 
 
 def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict]) -> str | None:
-    """The wrong-plan guard (Part 7.1 step 8): replay the compiled table through the twin on the forecast and refuse a plan that crosses the floor,
-    imports in a forecast outage or exceeds its own MDI cap."""
+    """The wrong-plan guard (Part 7.1 step 8): refuse a plan whose compiled table is not safe to repeat (delivery.table_safety, step 6), then
+    replay the compiled table through the twin on the forecast and refuse a plan that crosses the floor, imports in a forecast outage or exceeds
+    its own MDI cap."""
     bat = p.get("battery")
     if not bat:
         return None
+    if (compiled.get("safety") or {}).get("ok") is False:  # Part 7.1 steps 6 and 8: a table that is not safe to repeat is not signed
+        return "unsafe_table"
     T = p["T"]
     ts = np.repeat(p["ts"], 15) + np.tile(np.arange(15) * 60, T)
     series = {"pv": np.repeat(p["PV"], 15), "load": np.repeat(p["L"], 15), "crit": np.repeat(p["Lc"], 15), "grid": np.repeat(p["g"], 15),

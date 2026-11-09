@@ -475,3 +475,81 @@ def test_a_plan_its_signed_message_and_a_release_carry_the_same_block_and_a_rele
     iso = lambda x: datetime.fromisoformat(x.replace("Z", "+00:00")).timestamp()
     assert iso(rel["valid_until"]) - iso(rel["issued_at"]) <= 48 * 3600 + 1                      # U3 3.2: 72 h before (the override's end)
     assert rel["release"]["until"] == sites.overrides(sid)[0]["until_ts"]                       # the override's own end is still said
+
+
+# ------------------------------------------------------------------------------------------------ a table safe to repeat (engine-delivery-08)
+
+def _grid_site(tier: str = "advisory_writes") -> dict:
+    """A grid site with the 1 MWh battery of SMALL (300 kW each way), no genset."""
+    return {"id": "s1", "tier": tier, "data": {}, "native": None,
+            "assets": {"battery": {"nameplate_kwh": 1000, "soc_min": 0.1, "soc_max": 0.95, "p_ch_kw": 300, "p_dis_kw": 300, "eta_c": 0.95,
+                                   "eta_d": 0.95}},
+            "connections": [{"data": {"regime": "net_billing", "sanctioned_load_kw": 800, "export_cap_kw": 0, "mdi_interval_min": 30}}]}
+
+
+def test_the_last_slot_of_each_day_holds_at_least_the_reserve_the_plan_keeps_at_the_days_end():
+    """R6 I1 / Part 7.1 step 6: a table that persists (Deye, Growatt) repeats its last slot with no new plan, so the last slot's floor is at least the
+    larger of the reserve the plan holds at the day's end and the fallback floor. A discharge tail kept its own floor, 30 % here, below a 45 %
+    reserve."""
+    steps = _day_of([("hold_for_outage", 72, 0.0, 0.0), ("discharge_peak_window", 24, 0.0, 100.0)], soc0=90.0)
+    for st in steps[-4:]:
+        st["reserve_pct"] = 45.0                                         # an outage is likely just after midnight
+    comp = delivery.compile_mode_a(steps, "deye", {**SMALL, "E0": 900.0}, 20.0, 10.0, None, site=_grid_site())
+    last = comp["days"][0]["slots"][-1]
+    assert last["mode"] == "discharge" and last["soc_floor_pct"] == 45.0 and last["intent"].endswith("not below 45 %")   # 26.8 before
+    day = comp["safety"]["days"][0]
+    assert comp["safety"]["ok"] is True and day["ok"] is True and day["tail_floor_pct"] == 45.0
+    hold_tail = delivery.compile_mode_a(_day_of([("discharge_peak_window", 8, 0.0, 50.0), ("hold_for_outage", 88, 0.0, 0.0)], soc0=90.0), "deye",
+                                        SMALL, 20.0)
+    assert hold_tail["days"][0]["slots"][-1]["mode"] == "hold"                # a hold or a charge does not discharge: its level is kept
+
+
+def test_a_table_that_would_leave_the_battery_short_of_the_next_outages_reserve_on_repeat_is_not_safe_and_the_guard_refuses_it():
+    """Day 1's table discharges to 20 % by midnight and then holds; the plan's next morning has an outage at 06:00 for which it holds 40 %. If no new
+    plan arrives the table runs again from 20 % and holds there: it is not safe to repeat, so it is not signed (Part 7.1 step 8)."""
+    import numpy as np
+
+    from gridlytics import plans
+    steps = _day_of([("hold_for_outage", 24, 0.0, 0.0), ("hold_for_outage", 48, 0.0, 0.0), ("discharge_peak_window", 24, 0.0, 120.0)], soc0=90.0)
+    for st in steps[24:28]:
+        st.update(grid_present=0.0, reserve_pct=40.0, grid_import_kw=0.0)     # 06:00-07:00: the forecast outage the plan keeps 40 % for
+    comp = delivery.compile_mode_a(steps, "deye", {**SMALL, "E0": 900.0}, 20.0, 10.0, None, site=_grid_site())
+    assert steps[-1]["soc_pct"] < 25.0
+    day = comp["safety"]["days"][0]
+    assert comp["safety"]["ok"] is False and day["ok"] is False and day["reason"] == "reserve_short_on_repeat", day
+    assert day["short_at"] == steps[24]["t"] + 86400 and day["soc_pct"] < 25.0 and day["reserve_pct"] == 40.0
+    # the guard refuses it before anything else (a table without the record, compiled before, is not refused for it)
+    T = 96
+    p = {"battery": {"E0": 900.0, "E_nom": 1000.0, "soc_min": 0.1}, "T": T, "ts": np.array([st["t"] for st in steps]), "PV": np.zeros(T),
+         "L": np.full(T, 400.0), "Lc": np.full(T, 100.0), "g": np.ones(T)}
+    assert plans._guard(_grid_site(), p, comp, steps) == "unsafe_table"
+    assert plans._guard(_grid_site(), p, {k: v for k, v in comp.items() if k != "safety"}, steps) is None
+    # the same day with a night grid charge back to 60 % is safe to repeat
+    safe = _day_of([("charge_from_grid", 24, 100.0, 0.0), ("hold_for_outage", 48, 0.0, 0.0), ("discharge_peak_window", 24, 0.0, 120.0)], soc0=30.0)
+    for st in safe[24:28]:
+        st.update(grid_present=0.0, reserve_pct=40.0, grid_import_kw=0.0)
+    ok = delivery.compile_mode_a(safe, "deye", {**SMALL, "E0": 300.0}, 20.0, 10.0, None, site=_grid_site())
+    assert ok["safety"]["ok"] is True, ok["safety"]
+
+
+def test_no_slot_floor_below_the_fallback_floor_and_a_partial_days_head_runs_its_last_slot_in_the_repeat():
+    comp = delivery.compile_mode_a(_day_of([("discharge_peak_window", 96, 0.0, 10.0)], soc0=60.0)[48:], "deye", SMALL, 20.0, 10.0, None,
+                                   site=_grid_site())
+    assert comp["days"][0]["slots"][0]["start"] == "12:00"                    # today's remainder
+    assert comp["safety"]["ok"] is True and comp["safety"]["days"][0]["reason"] is None
+    bad = {**comp, "days": [{**comp["days"][0], "slots": [{**comp["days"][0]["slots"][0], "soc_floor_pct": 12.0}]}]}
+    assert delivery.table_safety(bad, [], None, None)["days"][0]["reason"] == "floor_below_fallback"
+
+
+def test_a_table_for_part_of_a_day_says_what_runs_round_midnight_until_the_next_is_keyed():
+    """The Control page shows today's table, which starts at the tick: keyed into a Deye ring, its last program ran on from midnight to the same
+    time tomorrow, and nothing said so; a non-ring brand keeps nothing before the first window."""
+    part = [_slot("12:15", "18:00", "charge_grid", 30, 80, ch=50000), _slot("18:00", "22:00", "discharge", 30, 80, dis=100000),
+            _slot("22:00", "00:00", "hold", 30, 30)]
+    deye = _table("deye", part, limits=LIMITS)["notes"]
+    assert any("starts at 12:15" in n and "before midnight" in n and "from midnight to 12:15" in n and "22:00" in n for n in deye), deye
+    growatt = _table("growatt", part)["notes"]
+    assert any("starts at 12:15" in n and "before midnight" in n for n in growatt) and not any("from midnight to 12:15" in n for n in growatt)
+    assert not any("starts at" in n for n in _table("deye", limits=LIMITS)["notes"])         # a whole day says nothing
+    end = _table("other", [_slot("00:00", "06:00", "charge_grid", 30, 80, ch=50000), _slot("06:00", "12:15", "hold", 80, 80)])["notes"]
+    assert any("ends at 12:15" in n for n in end), end
