@@ -260,8 +260,8 @@ class _Registry:
             _same_name(con, platformdb._name(name), company_id)
         platformdb.update_company(company_id, name=name)
 
-    def set_password(self, user_id: str, password: str) -> None:
-        platformdb.set_password(user_id, password)
+    def set_password(self, user_id: str, password: str, one_time: bool = False) -> None:
+        platformdb.set_password(user_id, password, one_time=one_time)
 
     def set_disabled(self, user_id: str, disabled: bool) -> None:
         platformdb.set_account_disabled(user_id, disabled)
@@ -719,10 +719,18 @@ def create_account(email: str, name: str, password: str, company_id: str | None 
 # Each change below returns as soon as it is made, with what the founder's audit says of it: the route writes the audit line before it reads anything back
 # (a view of the project that cannot be reached must not leave a change unaudited), and then has the member row follow (follow_membership)
 
-def set_password(user_id: str, password: str) -> dict:
-    """A new password; the account."""
+def set_password(user_id: str, password: str, *, one_time: bool = False) -> dict:
+    """A new password; the account. In local mode, `one_time` makes the person choose their own at their next sign-in (plan Part 9.3; audit
+    founder-console-08), and the account's sign-in lockout is cleared either way (founder-console-07): the founder's reset lets the person in at once."""
     account = _known(user_id)
-    directory().set_password(user_id, password)
+    d = directory()
+    if d is _REGISTRY:
+        d.set_password(user_id, password, one_time)
+        platformdb.clear_lock(account["email"], user_id, "founder")
+    elif one_time:
+        raise Conflict("With this sign-in service a password cannot be made one-time")
+    else:
+        d.set_password(user_id, password)
     return account
 
 

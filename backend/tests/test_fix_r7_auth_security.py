@@ -288,3 +288,70 @@ def test_sign_in_help_is_never_for_the_owner_oneself_or_a_person_also_in_another
     assert platformdb.check_sign_in("viewer@fix.test", identities.PASSWORD)                                 # nothing changed
     assert a.post("/api/users/no-such-person/password").status_code == 404
     assert a.post(f"/api/users/{owner}/password", json={"password": "my choice of password"}).status_code == 422   # the server makes it
+
+
+# ------------------------------------------------------------------------------------------------ founder-console-07 and founder-console-08
+
+def _founder_world(monkeypatch, tmp_path):
+    """The founder console of test_founder.py, set up with its made-up secrets, on a registry of the test's own; one company and one person in it."""
+    import test_founder as tf
+    from gridlytics import auth, store
+    monkeypatch.delenv("GRIDLYTICS_DATA_DIR", raising=False)
+    monkeypatch.delenv("GRIDLYTICS_TRUST_PROXY", raising=False)
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "founder.db")
+    monkeypatch.setenv("GRIDLYTICS_FOUNDER_USERNAME", "founder")
+    monkeypatch.setenv("GRIDLYTICS_FOUNDER_PASSWORD_HASH", tf._HASH)
+    monkeypatch.setenv("GRIDLYTICS_FOUNDER_TOTP_SECRET", tf.TOTP_SECRET)
+    monkeypatch.setenv("GRIDLYTICS_FOUNDER_SESSION_SECRET", tf.SESSION_SECRET)
+    auth.limiter().reset()
+    c = tf._console()
+    cid = tf._ok(c.post("/api/founder/companies", json={"name": "Meow Mills", "seats": 5, "enabled": True, "owner": tf.OWNER}), 201)["company"]["id"]
+    sunia = tf._ok(c.post("/api/founder/users", json={"email": "sunia@meow.test", "name": "Sunia Ahmed", "password": "sunia first password",
+                                                      "company_id": cid}), 201)["user"]
+    return c, sunia
+
+
+def test_a_password_the_founder_sets_clears_the_lockout(monkeypatch, tmp_path):
+    """founder-console-07: a person locked out by five wrong passwords signs in at once with the password the founder sets (plan Part 9.3: the founder
+    console does across companies what a company's administrator does)."""
+    from gridlytics import auth
+    c, sunia = _founder_world(monkeypatch, tmp_path)
+    for _ in range(auth.MAX_TRIES):
+        assert _sign_in("sunia@meow.test", "a wrong password 1").status_code == 401
+    assert _sign_in("sunia@meow.test", "sunia first password").status_code == 429
+    r = c.post(f"/api/founder/users/{sunia['id']}/password", json={"password": "sunia second password"})
+    assert r.status_code == 200, r.text
+    assert _sign_in("sunia@meow.test", "sunia second password").status_code == 200
+
+
+def test_a_password_the_founder_sets_is_one_time_unless_said_otherwise(monkeypatch, tmp_path):
+    """founder-console-08: the founder's reset is a one-time password: the person signs in with it and must choose their own before anything else opens.
+    The founder can say it is not (one_time false), for an account of OnyxLeaf's own; the audit says which."""
+    import identities
+    from gridlytics import platform as platformdb
+    c, sunia = _founder_world(monkeypatch, tmp_path)
+    assert c.post(f"/api/founder/users/{sunia['id']}/password", json={"password": "sunia second password"}).status_code == 200
+    assert platformdb.account(sunia["id"])["must_change"] is True
+    s = _sign_in("sunia@meow.test", "sunia second password")
+    assert s.status_code == 200, s.text
+    h = identities.headers(s.json()["access_token"])
+    r = _app().get("/api/sites", headers=h)
+    assert r.status_code == 403 and r.json()["code"] == "password_change_required", r.text
+    changed = _app().post("/api/local/password", headers=h, json={"current": "sunia second password", "new": "sunia's own password"})
+    assert changed.status_code == 200, changed.text
+    assert _app().get("/api/sites", headers=identities.headers(changed.json()["access_token"])).status_code == 200
+    # one_time false: a password the person keeps
+    r = c.post(f"/api/founder/users/{sunia['id']}/password", json={"password": "sunia third password", "one_time": False})
+    assert r.status_code == 200 and platformdb.account(sunia["id"])["must_change"] is False, r.text
+    for wrong in ({"password": "sunia third password", "one_time": "yes"}, {"password": "sunia third password", "temporary": True}):
+        r = c.post(f"/api/founder/users/{sunia['id']}/password", json=wrong)
+        assert r.status_code == 422, (wrong, r.text)
+    sets = [e for e in platformdb.list_founder_audit() if e["action"] == "set a password"]
+    assert [e["detail"].get("one_time") for e in sets] == [False, True]                      # newest first
+    assert "sunia" not in json.dumps([e["detail"] for e in sets])
+
+
+def _app():
+    from fastapi.testclient import TestClient
+    from gridlytics import api
+    return TestClient(api.app, raise_server_exceptions=False)

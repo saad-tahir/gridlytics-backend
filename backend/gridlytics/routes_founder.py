@@ -14,7 +14,7 @@
     POST  /api/founder/companies/{id}/backups        {}                    -> {made, backups}
     GET   /api/founder/users                                               -> {users}
     POST  /api/founder/users                         {email, name, password, company_id?, company_role?}  -> 201 {user}
-    POST  /api/founder/users/{id}/password           {password}            -> {user}
+    POST  /api/founder/users/{id}/password           {password, one_time?}  -> {user}
     PATCH /api/founder/users/{id}                    {disabled?, name?}    -> {user}
     POST  /api/founder/users/{id}/memberships        {company_id, company_role}  -> 201 {membership}
     PATCH /api/founder/users/{id}/memberships/{cid}  {company_role?, status?}    -> {membership}
@@ -37,7 +37,7 @@ from contextlib import contextmanager
 from fastapi import APIRouter, Body, Depends, Request
 
 from . import api as _api
-from . import founder, schemas, store_founder
+from . import founder, identity, schemas, store_founder
 from . import platform as platformdb
 
 router = APIRouter()
@@ -316,13 +316,19 @@ def founder_user_new(inp: dict = Body(...)):
 
 @router.post("/api/founder/users/{user_id}/password", dependencies=[Depends(_session)])
 def founder_user_password(user_id: str, inp: dict = Body(...)):
-    """A new password for an account. In local mode every session of the account ends: its refresh tokens, and the access tokens made before now."""
+    """A new password for an account. In local mode every session of the account ends: its refresh tokens, and the access tokens made before now. In local
+    mode it is also a one-time password unless `one_time` is false (plan Part 9.3; audit founder-console-08): the person chooses their own at their next
+    sign-in, before anything else opens; and the account's sign-in lockout is cleared, so the person can sign in with it at once (founder-console-07)."""
     user_id = _id(user_id, "account")
-    _object(inp, {"password"}, "A new password")
+    _object(inp, {"password", "one_time"}, "A new password")
     password = _password(inp.get("password"))
+    local = identity.MODE == "local"
+    one_time = _yes_no(inp.get("one_time", local), "Say whether the person replaces it at their next sign-in: one_time, true or false")
+    if one_time and not local:
+        raise schemas.Refusal(409, "With this sign-in service a password cannot be made one-time: the person changes it under My account", "not_local_mode")
     with _said():
-        account = store_founder.set_password(user_id, password)
-        platformdb.founder_audit("set a password", account["email"])
+        account = store_founder.set_password(user_id, password, one_time=one_time)
+        platformdb.founder_audit("set a password", account["email"], {"one_time": one_time} if local else None)
         return {"user": store_founder.user(user_id)}
 
 
