@@ -1,13 +1,15 @@
 """Round 7 (audit), the Fleet and site Overview: the month-to-date saving is the Savings page's month figure, MDI lever included, with its method and
-computation date (flow-savings-pilot-bill-02, its duplicates role-owner-01, role-operator-01 and role-analyst-02, and pages-A-08)."""
+computation date (flow-savings-pilot-bill-02, its duplicates role-owner-01, role-operator-01 and role-analyst-02, and pages-A-08), and off-grid in the
+fleet is the site's own fact, so a grid site whose connection is not saved yet is not labelled Off-grid and its outage counts (pages-A-03,
+role-viewer-09)."""
 from __future__ import annotations
 
 import json
 from datetime import timedelta
 
-from gridlytics import store
+from gridlytics import sites, store, telemetry
 from gridlytics.routes_common import today
-from test_fix_api import world  # noqa: F401  (world is a fixture)
+from test_fix_api import _now, world  # noqa: F401  (world is a fixture)
 
 
 def _row(fleet: dict, site_id: str) -> dict:
@@ -59,3 +61,22 @@ def test_the_month_to_date_saving_on_fleet_and_overview_is_the_savings_page_s_mo
     # a viewer and a key get none of it: the figure, its method or its date
     for blob in (json.dumps(world.c["viewer"].get(f"/api/sites/{sid}/now").json()), json.dumps(world.c["viewer"].get("/api/fleet").json())):
         assert "saving_rs" not in blob and "saving_rs_method" not in blob and "saving_rs_computed" not in blob
+
+
+# ------------------------------------------------------------------------------------------------ pages-A-03, role-viewer-09
+
+def test_a_grid_site_without_its_connection_yet_is_not_off_grid_in_the_fleet_and_its_outage_counts(world):
+    a, two = world.c["admin"], world.other                 # Secret Site Two: no connection yet, not a farm, no off_grid flag
+    assert _row(a.get("/api/fleet").json(), two)["category"] is None
+    with world.use():
+        telemetry.ingest(two, [{"ts": _now() // 60 * 60 - 120, "grid_present": 0, "pv_power_w": 900}], "edge")
+    assert a.get("/api/fleet").json()["summary"]["in_outage"] == 1      # before: left out as "Off-grid"
+    with world.use():
+        farm = sites.create({"name": "Chak farm", "site_type": "farm"}, "test")["id"]
+        flagged = sites.create({"name": "Island office", "site_type": "office", "off_grid": True}, "test")["id"]
+    fleet = a.get("/api/fleet").json()
+    assert _row(fleet, farm)["category"] == "Off-grid" and _row(fleet, flagged)["category"] == "Off-grid"   # off-grid stays the site's own fact
+    assert _row(fleet, world.site)["category"] == "B-2(b)"
+    assert a.put(f"/api/sites/{two}/connection", json={"regime": "off_grid"}).status_code == 200
+    fleet = a.get("/api/fleet").json()
+    assert _row(fleet, two)["category"] == "Off-grid" and fleet["summary"]["in_outage"] == 0

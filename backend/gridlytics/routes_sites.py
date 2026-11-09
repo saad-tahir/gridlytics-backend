@@ -93,9 +93,12 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
     mtd, computed, spark = _mtd_saving(s["id"])
     days_data = (now - first) / 86400 if first else 0
     conn = (sites.connections(s["id"]) or [None])[0]
-    on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
+    # off-grid is the site's own fact, as tab C and POST /activate read it (_grid_settled): a connection of regime off_grid, or none at a farm or a
+    # site whose data says off_grid. A grid site whose connection is not saved yet has no category yet (null), and its outages count (audit pages-A-03)
+    off_grid = conn["data"].get("regime") == "off_grid" if conn is not None else _grid_settled(s, [])
+    category = "Off-grid" if off_grid else conn["data"]["tariff_category"] if conn is not None else None
     return {"id": s["id"], "name": s["name"], "status": s["status"], "tier": s["tier"], "demo": bool(s.get("demo_link")), "city": s["data"].get("city"),
-            "disco": s["data"].get("disco"), "category": conn["data"]["tariff_category"] if on_grid else "Off-grid",
+            "disco": s["data"].get("disco"), "category": category,
             "control": control_state(s, last, now), "last_data": last["ts"] if last else None, "now": _snapshot(last),
             "next_event": (nn or {}).get("next", [None])[0] if nn and nn.get("next") else None, "open_alerts": counts.get(s["id"], 0),
             "mtd_saving_rs": mtd, "mtd_saving_rs_method": MTD_SAVING_METHOD, "mtd_saving_rs_computed": computed, "spark": spark,
