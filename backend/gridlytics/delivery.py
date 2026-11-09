@@ -28,8 +28,9 @@ CONTRACT = "ems-edge/1.0"
 BRANDS = {
     "deye": {"label": "Deye / Sunsynk", "max_slots": 6, "layout": "six programs (Time of Use)", "ring": True, "min_slot_minutes": 30,
              "fields": ["time", "power_w", "soc_pct", "grid_charge", "gen_charge"], "table_writes_per_day": 3, "mdi_primitive": False},
-    "huawei": {"label": "Huawei SUN2000", "max_slots": 14, "layout": "fourteen TOU periods", "ring": False, "min_slot_minutes": 15,
-               "fields": ["start", "end", "charge_or_discharge"], "table_writes_per_day": 3, "mdi_primitive": True},
+    "huawei": {"label": "Huawei SUN2000", "max_slots": 14, "layout": "fourteen TOU periods (charge or discharge), with a global cut-off and floors",
+               "ring": False, "min_slot_minutes": 15, "fields": ["period", "start", "end", "charge_or_discharge", "days"], "table_writes_per_day": 3,
+               "mdi_primitive": True},
     "growatt": {"label": "Growatt", "max_slots": 3, "layout": "three charge and three discharge windows", "ring": False, "min_slot_minutes": 30,
                 "fields": ["start", "end", "enabled"], "table_writes_per_day": 3, "mdi_primitive": False},
     "sungrow": {"label": "Sungrow", "max_slots": 2, "layout": "two forced-charge windows (emulated)", "ring": False, "min_slot_minutes": 30,
@@ -336,13 +337,75 @@ def _deye(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
     return rows, [], []
 
 
+def _windows(slots: list[dict], kind_of) -> list[dict]:
+    """The brand's windows: runs of adjacent slots of the same kind (`kind_of(slot)`, None for a slot that takes no window), each with its kind,
+    the slots it keys and its first and last slot."""
+    out: list[dict] = []
+    for k, s in enumerate(slots):
+        kind = kind_of(s)
+        if kind is None:
+            continue
+        if out and out[-1]["kind"] == kind and out[-1]["slots"][-1] == k - 1:
+            out[-1]["slots"].append(k)
+            out[-1]["last"] = s
+        else:
+            out.append({"kind": kind, "slots": [k], "first": s, "last": s})
+    return out
+
+
+def _joined(spans: list[str]) -> str:
+    return spans[0] if len(spans) == 1 else ", ".join(spans[:-1]) + " and " + spans[-1]
+
+
+EVERY_DAY = "Every day"
+
+
+def _huawei(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
+    """Huawei SUN2000 with LUNA2000 in TOU mode (R6 3.2): a period is charge or discharge, every day (a day-table must be safe to repeat), and
+    outside every period the battery does not discharge, so a hold (and a solar-only charge, with excess PV set to charge the battery) is a gap,
+    not a period; the last period ends at 23:59. One grid-charge cut-off for the day (the highest grid-charge target), one discharge cut-off (the
+    lowest floor of a discharging slot), the backup SoC at the fallback floor, and the plan's MDI cap as one capacity-control period every day
+    (Huawei's peak-shaving primitive, `mdi_primitive`)."""
+    kind = lambda s: "charge" if s["mode"] == "charge_grid" else "discharge" if s["mode"] in DISCHARGING else None
+    wins = _windows(slots, kind)
+    rows = [{"period": i + 1, "start": w["first"]["start"], "end": _end(w["last"]), "charge_or_discharge": w["kind"], "days": EVERY_DAY,
+             "_slots": w["slots"]} for i, w in enumerate(wins)]
+    charge = [s for s in slots if s["mode"] == "charge_grid"]
+    dis = [s for s in slots if s["mode"] in DISCHARGING]
+    cutoff = max((s["soc_target_pct"] for s in charge), default=None)
+    floor = min((s["soc_floor_pct"] for s in dis), default=None)
+    settings = [_setting("working_mode", "Working mode", "TOU (LUNA2000)"),
+                _setting("charge_from_grid", "Charge from grid", bool(charge)),
+                _setting("grid_charge_cutoff_soc", "Grid-charge cut-off SoC", _pct(cutoff), "%"),
+                _setting("discharge_cutoff_soc", "Discharge cut-off SoC", _pct(floor), "%"),
+                _setting("backup_soc", "Backup power SoC", _pct(_min_floor(compiled)), "%"),
+                _setting("excess_pv_in_tou", "Excess PV energy in TOU", "Charge the battery")]
+    cap = (compiled.get("mdi") or {}).get("cap_kw")
+    if cap:
+        settings.append(_setting("peak_shaving_power_w", "Capacity control: peak power, 00:00 to 23:59 every day", round(cap * 1000), "W"))
+    notes = []
+    gaps = [s for s in slots if kind(s) is None]
+    if gaps:
+        notes.append(f"No period from {_joined([_span(s) for s in gaps])}: outside its periods Huawei does not discharge the battery, so it holds "
+                     "(and charges from surplus solar).")
+    for s in dis:
+        if floor is not None and s["soc_floor_pct"] > floor + 3:
+            notes.append(f"Huawei keeps one discharge cut-off for the day ({floor:.0f} %): the discharge from {_span(s)} is planned to stop at "
+                         f"{s['soc_floor_pct']:.0f} % but will run on to {floor:.0f} %.")
+    for s in charge:
+        if cutoff is not None and s["soc_target_pct"] < cutoff - 3:
+            notes.append(f"Huawei keeps one grid-charge cut-off for the day ({cutoff:.0f} %): the charge from {_span(s)} is planned to stop at "
+                         f"{s['soc_target_pct']:.0f} % but will run on to {cutoff:.0f} %.")
+    return rows, settings, notes
+
+
 def _generic(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
     rows = [{"slot": k + 1, "start": s["start"], "end": s["end"], "mode": s["mode"], "soc_pct": _soc_keyed(s), "_slots": [k]}
             for k, s in enumerate(slots)]
     return rows, [], []
 
 
-VENDOR = {"deye": _deye, "other": _generic}
+VENDOR = {"deye": _deye, "huawei": _huawei, "other": _generic}
 
 
 def vendor_table(compiled: dict | None, day_index: int = 0) -> dict:

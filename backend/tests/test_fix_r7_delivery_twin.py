@@ -165,3 +165,28 @@ def test_a_tick_compiles_for_its_site_so_the_cap_is_held_only_where_something_ho
     assert mdi["cap_kw"] == r["summary"]["mdi_cap_kw"]
     assert all(s["grid_cap_w"] is None for d in r["slots"]["days"] for s in d["slots"])
 
+
+# ------------------------------------------------------------------------------------------------ Huawei's periods (pages-B-04, engine-delivery-05)
+
+def test_huaweis_periods_are_charge_or_discharge_every_day_with_a_hold_as_a_gap_and_the_cut_offs_set_once():
+    """The Huawei rows carried 'hold' (no Huawei period type), a last period ending 00:00 (Huawei refuses it), no days, and none of the global
+    cut-off, floor and capacity-control values Part 7.1 step 4 keys instead of per-slot targets."""
+    t = _table("huawei", mdi={"cap_kw": 300.0, "held": True, "not_enforceable": None})
+    assert all(list(r) == delivery.BRANDS["huawei"]["fields"] for r in t["rows"])
+    assert [(r["start"], r["end"], r["charge_or_discharge"]) for r in t["rows"]] == [("00:00", "05:00", "charge"), ("16:00", "22:30", "discharge"),
+                                                                                      ("22:30", "23:59", "charge")]
+    assert t["slots"] == [[0], [3, 4], [5]] and {r["days"] for r in t["rows"]} == {"Every day"} and [r["period"] for r in t["rows"]] == [1, 2, 3]
+    s = {x["key"]: x["value"] for x in t["settings"]}
+    assert (s["grid_charge_cutoff_soc"], s["discharge_cutoff_soc"], s["backup_soc"], s["peak_shaving_power_w"], s["charge_from_grid"]) == (80, 25, 20,
+                                                                                                                                         300000, True)
+    assert any(n.startswith("No period from 05:00 to 09:00 and 09:00 to 16:00") for n in t["notes"]), t["notes"]
+    assert any("one discharge cut-off for the day (25 %): the discharge from 16:00 to 18:30" in n for n in t["notes"]), t["notes"]
+    assert any("one grid-charge cut-off for the day (80 %): the charge from 22:30 to 23:59" in n for n in t["notes"]), t["notes"]
+
+
+def test_a_whole_day_huawei_period_ends_at_23_59_and_a_day_of_holds_has_no_period():
+    t = _table("huawei", [_slot("00:00", "00:00", "self_use", 30, 90)])
+    assert [(r["start"], r["end"], r["charge_or_discharge"]) for r in t["rows"]] == [("00:00", "23:59", "discharge")]
+    assert "peak_shaving_power_w" not in {x["key"] for x in t["settings"]}                    # no MDI cap on the plan
+    held = _table("huawei", [_slot("00:00", "00:00", "hold", 60, 60)])
+    assert held["rows"] == [] and {x["key"]: x["value"] for x in held["settings"]}["charge_from_grid"] is False
