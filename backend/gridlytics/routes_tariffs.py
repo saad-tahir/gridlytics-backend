@@ -7,10 +7,27 @@ from datetime import date
 
 from fastapi import APIRouter, Body
 
-from . import auth, store, tariff_data, tariffs
+from . import auth, sites, store, tariff_data, tariffs
 from .routes_common import bad, out, parse_day, today
 
 router = APIRouter()
+
+
+def _agreements(on: date) -> list[dict]:
+    """Each connection under net billing or legacy net metering, with its agreement's dates, its state on the day (tariffs.agreement_state:
+    active, not_started, ended or unreadable) and the regime it is billed under that day (`billed_as`, tariffs.regime_on): its own while the
+    agreement is in force, net billing after a legacy agreement ends, else none, whose export earns nothing (plan 9.3 UI-03, "Regime expired")."""
+    rows = []
+    for s in sites.listing():
+        for c in sites.connections(s["id"]):
+            state = tariffs.agreement_state(c, on)
+            if state is None:
+                continue
+            d = c.get("data") or {}
+            rows.append({"site_id": s["id"], "site_name": s["name"], "connection_id": c["id"], "meter_ref": d.get("meter_ref") or "",
+                         "tariff_category": d.get("tariff_category"), "regime": d.get("regime"), "agreement_start": d.get("agreement_start"),
+                         "agreement_end": d.get("agreement_end"), "state": state, "billed_as": tariffs.regime_on(c, on)})
+    return sorted(rows, key=lambda x: (x["site_name"], x["connection_id"]))
 
 
 @router.get("/api/tariffs")
@@ -33,7 +50,8 @@ def tariffs_index(on: str | None = None):
             "tax": (tariffs.resolve("tax", "national", d) or {}).get("body"), "icp": (tariffs.resolve("icp", "national", d) or {}).get("body"),
             "prosumer": {k: (tariffs.resolve("prosumer", k, d) or {}).get("body") for k in ("net_billing", "net_metering_legacy")},
             # pending counts the versions an administrator can approve: a placeholder awaiting its notification is not one (approving it is a 422)
-            "versions": tariffs.provenance(), "pending": sum(1 for v in tariffs.versions() if v["status"] == "pending")}
+            "versions": tariffs.provenance(), "pending": sum(1 for v in tariffs.versions() if v["status"] == "pending"),
+            "agreements": _agreements(d)}
 
 
 @router.get("/api/tariffs/versions")

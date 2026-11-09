@@ -36,6 +36,179 @@ def _agreement(regime: str, category: str = "B-2(b)", start=None, end=None):
     return _conn(category, regime, extra={"agreement_start": start, "agreement_end": end})
 
 
+# ------------------------------------------------------------------------------------------------ flow-onboarding-01: agreement dates
+
+def test_export_earns_nothing_before_the_agreement_starts_or_after_it_ends(company):
+    naepp = tariffs.prosumer("net_billing", NOV)["naepp"]
+    assert max(_vec(_agreement("net_billing", start="2026-03-01", end="2033-02-28"))["c_exp"]) == pytest.approx(naepp)
+    assert max(_vec(_agreement("net_billing", start="2019-03-01", end="2026-02-28"))["c_exp"]) == 0.0       # ended in February
+    assert max(_vec(_agreement("net_billing", start="2027-01-01"))["c_exp"]) == 0.0                          # not started yet
+    assert max(_vec(_agreement("net_billing", start="banana"))["c_exp"]) == 0.0                              # unreadable: not credited
+    assert max(_vec(_agreement("net_billing"))["c_exp"]) == pytest.approx(naepp)                             # no dates entered: in force
+    # an ended legacy agreement moves the site to net billing (engine-money-live-04): nothing netted, imports priced as without a regime, exports at
+    # the NAEPP (before: about the import rate, 39.48 to 48.28 Rs/kWh at A-2(c))
+    ended, none = _vec(_agreement("net_metering_legacy", "A-2(c)", "2018-01-01", "2025-01-01")), _vec(_conn("A-2(c)"))
+    assert np.allclose(ended["c_imp"], none["c_imp"]) and np.allclose(ended["c_exp"], naepp)
+    assert not ended["export_tie_break"].any()
+    assert max(_vec(_agreement("net_metering_legacy", "A-2(c)", "2027-01-01"))["c_exp"]) == 0.0              # a legacy agreement not started
+    assert max(_vec(_agreement("net_metering_legacy", "A-2(c)", end="2026-13-01"))["c_exp"]) == 0.0         # unreadable
+    live = _vec(_agreement("net_metering_legacy", "A-2(c)", "2019-07-01"))
+    assert np.allclose(live["c_exp"], live["c_imp"] - tariffs.LEGACY_EXPORT_TIE_BREAK)
+
+
+def test_a_horizon_across_the_agreements_last_day_stops_the_credit_at_midnight(company):
+    v = _vec(_agreement("net_billing", end=NOV.isoformat()), steps=192)
+    naepp = tariffs.prosumer("net_billing", NOV)["naepp"]
+    assert np.allclose(v["c_exp"][:96], naepp) and np.allclose(v["c_exp"][96:], 0.0)
+    v = _vec(_agreement("net_billing", start=(NOV + timedelta(days=1)).isoformat()), steps=192)
+    assert np.allclose(v["c_exp"][:96], 0.0) and np.allclose(v["c_exp"][96:], naepp)
+    # a legacy agreement whose last day is today: netted at the import rate today, the NAEPP from tomorrow
+    v = _vec(_agreement("net_metering_legacy", "A-2(c)", "2019-07-01", NOV.isoformat()), steps=192)
+    assert np.allclose(v["c_exp"][:96], v["c_imp"][:96] - tariffs.LEGACY_EXPORT_TIE_BREAK) and np.allclose(v["c_exp"][96:], naepp)
+    assert v["export_tie_break"][:96].all() and not v["export_tie_break"][96:].any()
+
+
+def test_the_bill_credits_only_the_exports_inside_the_agreement(company):
+    d0, d1 = date(2026, 11, 1), date(2026, 11, 2)
+    ts = _minutes(d0, 2)
+    imp, exp = np.full(len(ts), 50.0), np.zeros(len(ts))
+    for day in range(2):  # 100 kWh exported at noon each day
+        exp[day * 1440 + 12 * 60:day * 1440 + 13 * 60] = 100.0
+    naepp = tariffs.prosumer("net_billing", d1)["naepp"]
+    for extra, credited_kwh in (({"agreement_end": "2026-11-01"}, 100.0), ({"agreement_start": "2026-11-02"}, 100.0),
+                                ({"agreement_start": "2026-01-01"}, 200.0), ({"agreement_end": "2026-10-31"}, 0.0)):
+        bill = tariffs.rebuild(ts, imp, exp, _conn("B-2(b)", "net_billing", extra=extra), d0, d1)
+        assert bill["credits_rs"] == pytest.approx(credited_kwh * naepp, abs=0.01), extra
+        assert bill["export_kwh"]["off_peak"] == pytest.approx(200.0)  # the metered exports are still reported
+    # an ended legacy agreement bills under net billing: no netting, every export credited at the NAEPP (before: netted at the import rate)
+    ts, imp, exp = _flat_day(NOV)
+    exp[9 * 60:15 * 60] = 400.0
+    ended = tariffs.rebuild(ts, imp, exp, _agreement("net_metering_legacy", "A-2(c)", "2018-01-01", "2025-01-01"), NOV, NOV)
+    plain = tariffs.rebuild(ts, imp, exp, _conn("A-2(c)"), NOV, NOV)
+    assert ended["import_kwh"] == plain["import_kwh"] and ended["credits_rs"] == pytest.approx(2400.0 * naepp, abs=0.01)
+    assert ended["total_rs"] == pytest.approx(plain["total_rs"] - 2400.0 * naepp, abs=0.01)
+    assert [(x["units_kwh"], x["rate"]) for x in ended["lines"] if x["line"].startswith("Export credit")] == [(2400.0, naepp)]
+    # and the bill's marginal export is the vector's: nothing after a net-billing agreement ends, the NAEPP after a legacy one ends
+    assert _bump(_agreement("net_billing", end="2026-02-28"), ts, imp, exp, NOV, NOV, OFF, "exp") == pytest.approx(0.0, abs=0.01)
+    ended_l = _agreement("net_metering_legacy", "A-2(c)", "2018-01-01", "2025-01-01")
+    assert -_bump(ended_l, ts, imp, exp, NOV, NOV, OFF, "exp") == pytest.approx(naepp, abs=0.01)
+    assert _bump(_agreement("net_metering_legacy", "A-2(c)", "2027-01-01"), ts, imp, exp, NOV, NOV, OFF, "exp") == pytest.approx(0.0, abs=0.01)
+
+
+def test_a_legacy_agreement_that_ends_inside_the_bill_nets_its_own_days_and_credits_the_rest_at_the_naepp(company):
+    d0, d1 = date(2026, 11, 1), date(2026, 11, 2)
+    ts = _minutes(d0, 2)
+    imp, exp = np.zeros(len(ts)), np.zeros(len(ts))
+    for day in range(2):  # 100 kWh exported between 12:00 and 13:00 (off-peak) each day, no import
+        exp[day * 1440 + 12 * 60:day * 1440 + 13 * 60] = 100.0
+    conn = _agreement("net_metering_legacy", "A-2(c)", "2019-07-01", "2026-11-01")
+    bill = tariffs.rebuild(ts, imp, exp, conn, d0, d1)
+    nappp, naepp = tariffs.prosumer("net_metering_legacy", d1)["nappp"], tariffs.prosumer("net_billing", d1)["naepp"]
+    credit = {x["line"]: (x["units_kwh"], x["rate"], x["amount_rs"]) for x in bill["lines"] if x["line"].startswith("Export credit")}
+    assert credit == {"Export credit (legacy net metering)": (100.0, nappp, round(-100.0 * nappp, 2)),
+                      "Export credit (net billing)": (100.0, naepp, round(-100.0 * naepp, 2))}
+    assert bill["credits_rs"] == pytest.approx(100.0 * (nappp + naepp), abs=0.01)
+    # an import on the day after the agreement ends is billed in full: it does not net against the legacy day's export
+    imp[1440 + 14 * 60:1440 + 15 * 60] = 80.0  # 80 kWh off-peak on 2 November
+    bill = tariffs.rebuild(ts, imp, exp, conn, d0, d1)
+    assert bill["import_kwh"]["off_peak"] == pytest.approx(80.0)
+    credit = {x["line"]: x["units_kwh"] for x in bill["lines"] if x["line"].startswith("Export credit")}
+    assert credit == {"Export credit (legacy net metering)": 100.0, "Export credit (net billing)": 100.0}
+
+
+def test_the_ledger_prices_an_export_after_a_legacy_agreement_ends_at_the_naepp(company):
+    month, naepp = {"peak": 1000.0, "off_peak": 5000.0}, tariffs.prosumer("net_billing", NOV)["naepp"]
+    ended = verify._minute_prices(_agreement("net_metering_legacy", "A-2(c)", "2018-01-01", "2025-01-01"), NOV, "s", month, {"peak": 0.0, "off_peak": 0.0})
+    assert np.allclose(ended["c_exp"], naepp)  # before: the import price it netted (39.48 to 48.28 Rs/kWh)
+    early = verify._minute_prices(_agreement("net_metering_legacy", "A-2(c)", "2027-01-01"), NOV, "s", month, {"peak": 0.0, "off_peak": 0.0})
+    assert float(np.max(early["c_exp"])) == 0.0  # not started: nothing, and the optimiser's tie-break is not added back
+    live = verify._minute_prices(_agreement("net_metering_legacy", "A-2(c)", "2019-07-01"), NOV, "s", month, {"peak": 0.0, "off_peak": 0.0})
+    assert np.allclose(live["c_exp"], live["c_imp"])  # in force: an export nets the import it displaces
+
+
+def test_a_plan_outside_an_agreement_exports_under_the_regime_billed_that_day(company):
+    from gridlytics import forecast, plans
+    conn = {"tariff_category": "A-2(c)", "sanctioned_load_kw": 500, "regime": "net_billing", "export_cap_kw": 150,
+            "agreement_start": "2021-03-01", "agreement_end": "2026-02-28"}
+    sid = make_site(name="Ended Agreement", conn=conn, genset=False)
+    full = sites.full(sid)
+    cid = full["connections"][0]["id"]
+    t0 = int(datetime(2026, 11, 2, 6, tzinfo=PKT).timestamp())
+
+    def problem():
+        f = sites.full(sid)
+        return plans.build_problem(f, t0, forecast.issue(f, t0, save=False), 96)
+
+    p = problem()  # net billing ended: a zero-export site (before: a 150 kW export cap at 8.13 Rs/kWh)
+    assert p["X_max"] == 0.0 and p["regime"] == "none" and float(np.max(p["c_exp"])) == 0.0
+    sites.put_connection(sid, {**conn, "regime": "net_metering_legacy", "agreement_start": "2018-01-01", "agreement_end": "2025-01-01"}, "t", cid)
+    p = problem()  # legacy ended: net billing, no netting (before: legacy netting at the import rate)
+    assert p["X_max"] == 150.0 and p["regime"] == "net_billing" and np.allclose(p["c_exp"], tariffs.prosumer("net_billing", NOV)["naepp"])
+    sites.put_connection(sid, {**conn, "regime": "net_metering_legacy", "agreement_end": "2033-01-01"}, "t", cid)
+    p = problem()
+    assert p["X_max"] == 150.0 and p["regime"] == "net_metering_legacy"
+
+
+def test_agreement_state_reads_the_dates(company):
+    assert tariffs.agreement_state(_agreement("net_billing", start="2019-03-01", end="2026-02-28"), NOV) == "ended"
+    assert tariffs.agreement_state(_agreement("net_billing", start="2027-01-01"), NOV) == "not_started"
+    assert tariffs.agreement_state(_agreement("net_billing", start="2026-11-02", end="2026-11-02"), NOV) == "active"
+    assert tariffs.agreement_state(_agreement("net_billing", end="banana"), NOV) == "unreadable"
+    assert tariffs.agreement_state(_conn("B-2(b)", "none"), NOV) is None
+    legacy = _agreement("net_metering_legacy", "A-2(c)", "2019-07-01", "2026-11-01")
+    assert [tariffs.regime_on(legacy, d) for d in (date(2019, 6, 30), date(2026, 11, 1), NOV)] == ["none", "net_metering_legacy", "net_billing"]
+    nb = _agreement("net_billing", start="2026-03-01", end="2026-11-01")
+    assert [tariffs.regime_on(nb, d) for d in (date(2026, 2, 28), date(2026, 3, 1), NOV)] == ["none", "net_billing", "none"]
+    assert tariffs.regime_on(_agreement("net_metering_legacy", end="banana"), NOV) == "none"
+    assert tariffs.regime_on(_conn("B-2(b)", "none"), NOV) == "none" and tariffs.regime_on(_conn("B-2(b)", "flat"), NOV) == "flat"
+
+
+def test_the_price_page_shows_no_export_value_outside_the_agreement(world):
+    """The finding's own steps: GET /prices for a connection saved with an ended, a valid and an ended legacy agreement."""
+    a = world.c["admin"]
+    with world.use():
+        cid = sites.connections(world.site)[0]["id"]
+    base = {"tariff_category": "A-2(c)", "sanctioned_load_kw": 400, "export_cap_kw": 100}
+
+    def exp_max(**fields):
+        with world.use():
+            sites.put_connection(world.site, {**base, **fields}, "test", cid)
+        r = a.get(f"/api/sites/{world.site}/prices", params={"day": "2026-11-09"})
+        assert r.status_code == 200, r.text
+        return max(r.json()["c_exp"])
+
+    with world.use():
+        naepp = round(tariffs.prosumer("net_billing", date(2026, 11, 9))["naepp"], 2)
+    assert exp_max(regime="net_billing", agreement_start="2019-03-01", agreement_end="2026-02-28") == 0.0  # before: 8.13
+    assert exp_max(regime="net_billing", agreement_start="2019-03-01", agreement_end="2033-02-28") == naepp
+    assert exp_max(regime="net_metering_legacy", agreement_start="2018-01-01", agreement_end="2025-01-01") == naepp  # before: 40.01
+
+
+def test_the_tariff_library_lists_each_agreement_with_its_state(world):
+    a = world.c["admin"]
+    with world.use():
+        sites.put_connection(world.site, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400, "regime": "net_billing", "agreement_start": "2021-03-01",
+                                          "agreement_end": "2026-02-28", "meter_ref": "M-1"}, "test")
+        sites.put_connection(world.other, {"tariff_category": "A-2(c)", "sanctioned_load_kw": 300, "regime": "net_metering_legacy",
+                                           "agreement_start": "2019-07-01"}, "test")
+        three = sites.create({"name": "Third Mill"}, "test")["id"]
+        sites.put_connection(three, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 300, "regime": "net_billing", "agreement_start": "2027-03-01",
+                                     "agreement_end": "2032-02-28"}, "test")
+    r = a.get("/api/tariffs", params={"on": "2026-11-09"})
+    assert r.status_code == 200, r.text
+    rows = {x["site_name"]: x for x in r.json()["agreements"]}
+    assert set(rows) == {"Mill One", "Secret Site Two", "Third Mill"}       # Mill One's first connection has no export regime and is not listed
+    assert rows["Mill One"]["state"] == "ended" and rows["Mill One"]["agreement_end"] == "2026-02-28" and rows["Mill One"]["regime"] == "net_billing"
+    assert rows["Mill One"]["billed_as"] == "none"
+    assert rows["Secret Site Two"]["state"] == "active" and rows["Secret Site Two"]["agreement_end"] is None
+    assert rows["Secret Site Two"]["billed_as"] == "net_metering_legacy"
+    assert rows["Third Mill"]["state"] == "not_started" and rows["Third Mill"]["site_id"] == three
+    assert r.json()["agreements"] == sorted(r.json()["agreements"], key=lambda x: (x["site_name"], x["connection_id"]))
+    on_feb = {x["site_name"]: x["state"] for x in a.get("/api/tariffs", params={"on": "2026-02-01"}).json()["agreements"]}
+    assert on_feb["Mill One"] == "active"                                    # read on the day asked
+    assert world.c["viewer"].get("/api/tariffs").status_code == 403
+
+
 # ------------------------------------------------------------------------------------------------ engine-tariffs-03: every FCA key
 
 def _icp_conn():

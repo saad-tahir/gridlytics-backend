@@ -85,7 +85,7 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
     c_exp = np.asarray(vec["c_exp"], dtype=float)
     if _legacy(conn):
         # the optimiser's tie-break (an export priced a hair below the import it nets) is not on the bill: the ledger prices exports as the bill does
-        c_exp = c_exp + tariffs.LEGACY_EXPORT_TIE_BREAK
+        c_exp = c_exp + np.asarray(vec["export_tie_break"], dtype=float)  # only where it was taken off: an export outside the agreement earns nothing
     mdi = vec["mdi"] or {}
     iv = int(conn["data"].get("mdi_interval_min", 30) or 30)
     if iv <= 0 or 1440 % iv:
