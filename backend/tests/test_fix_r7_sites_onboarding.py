@@ -18,6 +18,10 @@ a table it cannot hold. A capture now holds at most the slots of the site's inve
 
 flow-onboarding-08: the API activated a site with no data source, or with a grid-presence signal nobody confirmed, and it was then planned although its
 outages could not be seen. Activation now asks for the data source with its grid-presence signal confirmed (tab A), as the wizard does.
+
+flow-onboarding-03: tier_capable was set only by an edge's capabilities message, so a CSV or cloud site stayed at monitor for good although the wizard
+promises slot tables to key in. Saving a CSV or cloud source makes the site capable of advisory writes (a CSV once a file carries the inverter's mode);
+a change back to an edge device takes what the edge last asserted.
 """
 from __future__ import annotations
 
@@ -262,3 +266,39 @@ def test_activation_asks_for_a_data_source_whose_grid_signal_was_confirmed(world
     assert a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}}).status_code == 200
     r = a.post(f"/api/sites/{sid}/activate")
     assert r.status_code == 200 and r.json()["status"] == "active", r.text
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-03
+
+def test_a_csv_or_cloud_source_lets_the_site_reach_advisory_writes(world):
+    a, sid = world.c["admin"], world.site
+    with world.use():
+        sites.capture_native(sid, {"source": "entered"}, "test")
+    assert _site(a, sid)["tier_capable"] == "monitor"
+    # the inverter maker's cloud: plans go as slot tables keyed in by a person (plan 7.6), so advisory writes; it cannot read writes back
+    r = a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}})
+    assert r.status_code == 200 and r.json()["tier_capable"] == "advisory_writes", r.text
+    r = a.put(f"/api/sites/{sid}/tier", json={"tier": "advisory_writes", "signoff": "Installer A"})
+    assert r.status_code == 200 and r.json()["tier"] == "advisory_writes", r.text
+    r = a.put(f"/api/sites/{sid}/tier", json={"tier": "closed_loop", "signoff": "Installer A"})
+    assert r.status_code == 422 and r.json()["code"] == "above_capable", r.text
+    assert r.json()["detail"] == "This site's data source supports advisory writes at most"
+    # a CSV source: advisory writes too, once an imported file carries the inverter's mode (plan 7.5: without it, monitor only)
+    assert a.put(f"/api/sites/{sid}/tier", json={"tier": "monitor"}).status_code == 200
+    r = a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "csv", "grid_signal_confirmed": True}})
+    assert r.json()["tier_capable"] == "advisory_writes"
+    r = a.put(f"/api/sites/{sid}/tier", json={"tier": "advisory_writes", "signoff": "Installer A"})
+    assert r.status_code == 422 and r.json()["code"] == "no_inverter_mode", r.text
+    assert r.json()["detail"].startswith("No imported file of this site carries inverter_mode_active")
+    with world.use():
+        from gridlytics import telemetry
+        telemetry.write_rows([(sid, 1_762_400_000, "csv", 1.0, "self_use")], ("site_id", "ts", "source_id", "grid_present", "inverter_mode_active"))
+    r = a.put(f"/api/sites/{sid}/tier", json={"tier": "advisory_writes", "signoff": "Installer A"})
+    assert r.status_code == 200 and r.json()["tier"] == "advisory_writes", r.text
+    # back to an edge device: what its own capabilities message says (none yet: monitor), so the effective tier falls back
+    r = a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "edge", "grid_signal_confirmed": True}})
+    assert (r.json()["tier_capable"], r.json()["tier"]) == ("monitor", "monitor"), r.text
+    # a site created with a cloud source starts able to reach advisory writes; one created without a source stays at monitor
+    r = a.post("/api/sites", json={"name": "Cloud site", "data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}})
+    assert r.status_code == 200 and (r.json()["tier_capable"], r.json()["tier"]) == ("advisory_writes", "monitor"), r.text
+    assert a.post("/api/sites", json={"name": "No source"}).json()["tier_capable"] == "monitor"

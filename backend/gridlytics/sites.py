@@ -1,7 +1,8 @@
 """Sites, their connections (one per DISCO meter), assets, carried state, overrides, native-settings captures and wizard drafts (plan Part 3.2).
 
 A site's own fields, each connection's and each asset's are strict pydantic models (`SiteFields`, `ConnectionFields`, the asset models): a bad field is a 422
-in one sentence. The control tier is two facts (plan Part 2.3): `tier_capable`, asserted by the data source (an edge's capabilities, or `monitor`), and
+in one sentence. The control tier is two facts (plan Part 2.3): `tier_capable`, asserted by the data source (an edge's capabilities;
+advisory writes for a CSV or cloud source, SOURCE_CAPABLE; else `monitor`), and
 `tier_allowed`, set by an administrator; the effective tier is the lower.
 """
 from __future__ import annotations
@@ -75,6 +76,26 @@ class SiteFields(Strict):
     #: a site without any grid connection (plan Part 9.3), stored for activation and settings
     off_grid: bool = False
     data_source: DataSource | None = None
+
+
+#: The highest tier a source that is not an edge device supports by itself (plan Part 2.3, 7.5 and 7.6; audit flow-onboarding-03: a CSV or cloud site
+#: stayed at monitor for good, although plans reach it as slot tables a person keys in). An edge device's own capabilities message sets its tier.
+SOURCE_CAPABLE = {"csv": "advisory_writes", "oem_cloud": "advisory_writes"}
+
+
+def _source_capable(con, site_id: str, data: dict, before: dict | None) -> str | None:
+    """`tier_capable` as the saved data source sets it, or None to keep the stored one. A CSV or cloud source: SOURCE_CAPABLE. A change to an edge device
+    from another kind: what that site's edge last asserted (its latest capabilities message), else monitor until it reports. No source (a site added
+    before sources were recorded, the demo's), or an edge kept: unchanged."""
+    kind = (data.get("data_source") or {}).get("kind")
+    if kind in SOURCE_CAPABLE:
+        return SOURCE_CAPABLE[kind]
+    old = ((before or {}).get("data_source") or {})
+    if kind == "edge" and isinstance(old, dict) and old.get("kind") in SOURCE_CAPABLE:
+        r = con.execute("SELECT body FROM capabilities WHERE site_id = ? ORDER BY seq DESC LIMIT 1", (site_id,)).fetchone()
+        tier = (json.loads(r["body"]) or {}).get("tier") if r else None
+        return tier if tier in TIERS else "monitor"
+    return None
 
 
 def _stamp_source(data: dict, before: dict | None, by: str) -> None:
@@ -315,8 +336,9 @@ def create(fields: dict, by: str, site_id: str | None = None, demo_link: str | N
     sid = site_id or store.new_id()
     now = _now()
     with store.connect() as con:
+        capable = _source_capable(con, sid, data, None) or "monitor"
         con.execute("INSERT INTO sites (id, name, status, tier_capable, tier_allowed, demo_link, data, created, updated) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (sid, data["name"], "observing", "monitor", "monitor", demo_link, json.dumps(data), now, now))
+                    (sid, data["name"], "observing", capable, "monitor", demo_link, json.dumps(data), now, now))
     store.audit(by, "added a site", data["name"], {"site_id": sid})
     return get(sid)
 
@@ -341,7 +363,9 @@ def update(site_id: str, fields: dict, by: str, if_unchanged=UNCHECKED) -> dict:
         data = check(SiteFields, {**stored, **incoming}).model_dump()
         _stamp_source(data, before, by)
         data = {**data, **carried}
-        con.execute("UPDATE sites SET name = ?, data = ?, updated = ? WHERE id = ?", (data["name"], json.dumps(data), _now(), site_id))
+        capable = _source_capable(con, site_id, data, before) or r["tier_capable"]
+        con.execute("UPDATE sites SET name = ?, data = ?, tier_capable = ?, updated = ? WHERE id = ?",
+                    (data["name"], json.dumps(data), capable, _now(), site_id))
         store.audit(by, "changed a site", data["name"], {"site_id": site_id, "fields": sorted(fields)}, con=con)
     return get(site_id)
 

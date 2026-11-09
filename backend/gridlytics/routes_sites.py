@@ -345,6 +345,13 @@ def asset_delete(site_id: str, role: str):
     return out(sites.full(site_id))
 
 
+def _has_inverter_mode(site_id: str) -> bool:
+    """Whether any minute of the site carries the inverter's mode: a CSV source without the inverter_mode_active column is for monitor only (plan Part 7.5,
+    telemetry.import_csv says so on import), while one with it supports advisory writes (sites.SOURCE_CAPABLE; audit flow-onboarding-03)."""
+    with telemetry.connect() as con:
+        return con.execute("SELECT 1 FROM minute WHERE site_id = ? AND inverter_mode_active IS NOT NULL LIMIT 1", (site_id,)).fetchone() is not None
+
+
 @router.put("/api/sites/{site_id}/tier")
 def tier_put(site_id: str, inp: dict = Body(...)):
     auth.need("change_tier", "Changing the control tier")
@@ -354,6 +361,9 @@ def tier_put(site_id: str, inp: dict = Body(...)):
         raise Refusal(422, "The tier is monitor, advisory_writes or closed_loop", "invalid")
     if sites.TIERS.index(tier) > sites.TIERS.index(s["tier_capable"]):
         raise Refusal(422, f"This site's data source supports {s['tier_capable'].replace('_', ' ')} at most", "above_capable")
+    if tier != "monitor" and ((s.get("data") or {}).get("data_source") or {}).get("kind") == "csv" and not _has_inverter_mode(site_id):
+        raise Refusal(422, "No imported file of this site carries inverter_mode_active, the inverter's mode that the savings comparison needs: until one does, "
+                      "a CSV source supports monitor only", "no_inverter_mode")
     if tier != "monitor" and not sites.native_latest(site_id):
         raise Refusal(422, "Capture the inverter's native settings before control is allowed: they are the fallback and the baseline", "no_capture")
     signoff = str(inp.get("signoff", "") or "")[:200]
