@@ -5,6 +5,12 @@ stored as the intervals it covers (-10); implausible values are reported per fil
 that cannot be read is refused or reported (-14); duplicate times are counted once and reported (-24); a probable time-zone slip is reported
 (frontend-states-formats-06 and flow-telemetry-plan-control-11, the backend's half).
 
+Batch 2, genset litres, runs, fuel cost and cards: litres metered where a meter reads and estimated from the fuel curve where not, never 0 L for an
+unmetered set, with the source named as the Savings page names it (pages-C-03 and its duplicates, the Overview's month label included); runs and outages
+counted in minutes, a blank sample ending neither (pages-C-04); no run signal told apart from no runs (pages-C-05); each run's fuel priced at its own
+day's price (role-owner-07); the KPI row's cost per kWh, hours below the minimum load, month view and daily figures (pages-C-15); the fuel curve's
+measured points and refit (pages-C-16).
+
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
@@ -43,7 +49,8 @@ def world(tmp_path, monkeypatch):
     db = platformdb.company_file(co)
     db.parent.mkdir(parents=True, exist_ok=True)
     owner = identities.client("owner@r7tel.test", None, co, "owner", raise_server_exceptions=False)
-    return types.SimpleNamespace(db=db, owner=owner, use=lambda: store.use_company(db))
+    role = lambda r: identities.client(f"{r}@r7tel.test", r, co, "member", raise_server_exceptions=False)  # noqa: E731
+    return types.SimpleNamespace(db=db, owner=owner, role=role, use=lambda: store.use_company(db))
 
 
 def _local(ts: int) -> str:
@@ -293,3 +300,182 @@ def test_the_upload_route_answers_the_new_fields(world):
     bad = c.post(f"/api/sites/{sid}/telemetry/upload", params={"tz_offset_h": 0},
                  content=_file(("ts", "grid_present", "load_power_w"), [(r[0], "x", 1) for r in rows]), headers={"content-type": "text/csv"})
     assert bad.status_code == 422 and "grid_present" in bad.json()["detail"]
+
+
+# ================================================================================================ batch 2: genset litres, runs, fuel cost and cards
+
+GEN = {"rated_kw": 200.0, "f_min": 0.3, "a": 0.25, "b": 0.03}
+
+
+def _genset_site(name: str = "Genset", **g) -> str:
+    sid = sites.create({"name": name}, "t")["id"]
+    sites.put_asset(sid, "genset", {**GEN, **g}, "t")
+    return sid
+
+
+def _write(sid: str, t0: int, n: int, step: int = 60, **cols) -> None:
+    """n stored rows from t0, `step` seconds apart; each column a value, or a function of the row's index (None: a blank cell)."""
+    names = tuple(cols)
+    rows = [(sid, t0 + i * step, "edge", *[cols[c](i) if callable(cols[c]) else cols[c] for c in names]) for i in range(n)]
+    telemetry.write_rows(rows, ("site_id", "ts", "source_id") + names)
+
+
+def _runs(sid: str, t0: int = T0, t1: int = T0 + 86400) -> dict:
+    return telemetry.genset_runs(sid, t0, t1, sites.assets(sid)["genset"])
+
+
+# ------------------------------------------------------------------------------------------------ pages-C-04: runs and outages in minutes
+
+def test_a_blank_sample_inside_a_genset_run_does_not_end_it(company):
+    """A 1-minute source with one blank row in a 2-hour run: one run of 2 hours (it was two runs, the blank read as off, and two starts)."""
+    sid = _genset_site()
+    t = T0 + 10 * 3600
+    _write(sid, t, 180, grid_present=0, genset_running=lambda i: None if i == 30 else int(i < 120),
+           genset_power_w=lambda i: None if i == 30 else (100000 if i < 120 else 0))
+    runs = _runs(sid)["runs"]
+    assert [(r["start"], r["end"], r["hours"]) for r in runs] == [(t, t + 7200, 2.0)]
+    assert runs[0]["kwh"] == pytest.approx(200.0)  # the blank minute's power is the reading before it
+
+
+@pytest.mark.parametrize("step", [5, 15])
+def test_a_coarse_source_counts_its_genset_minutes_energy_and_load(company, step):
+    """2 hours at 100 kW on a 200 kW set from a 5- or 15-minute source: 200 kWh and a load ratio of 0.5 (it was 40 or 13 kWh, 0.1 or 0.04: every run
+    under the minimum load)."""
+    sid = _genset_site(f"Coarse {step}")
+    run = lambda i: 600 <= i * step < 720  # noqa: E731
+    _write(sid, T0, 1440 // step, step * 60, grid_present=1, genset_running=lambda i: int(run(i)), genset_power_w=lambda i: 100000 if run(i) else 0)
+    runs = _runs(sid)["runs"]
+    assert [(r["start"], r["end"], r["hours"]) for r in runs] == [(T0 + 36000, T0 + 43200, 2.0)]
+    assert runs[0]["kwh"] == pytest.approx(200.0) and runs[0]["load_ratio"] == pytest.approx(0.5) and runs[0]["hours_below_min"] == 0
+
+
+def test_a_blank_grid_reading_does_not_split_an_outage_but_a_long_gap_does(company):
+    sid = _site("Blank outage")
+    t = T0 + 14 * 3600
+    _write(sid, t - 600, 80, grid_present=lambda i: None if i == 40 else int(not 10 <= i < 70))
+    assert [(o["start"], o["minutes"]) for o in telemetry.outages(sid, T0, T0 + 86400)] == [(t, 60)]
+    # 20 minutes without any row inside an outage: unknown for longer than RUN_GAP_S, so two outages
+    t2 = T0 + 18 * 3600
+    _write(sid, t2, 20, grid_present=0)
+    _write(sid, t2 + 40 * 60, 20, grid_present=0)
+    _write(sid, t2 + 60 * 60, 5, grid_present=1)
+    assert [(o["start"], o["minutes"]) for o in telemetry.outages(sid, T0 + 17 * 3600, T0 + 86400)] == [(t2, 20), (t2 + 2400, 20)]
+
+
+@pytest.mark.parametrize("step", [5, 15])
+def test_a_coarse_source_counts_outage_genset_minutes_and_unserved_energy(company, step):
+    """A 60-minute outage carried by the genset with 6 kW unserved, from a 5- or 15-minute source: 60 genset minutes and 6 kWh unserved (it was 12 or
+    4 minutes and 1.2 or 0.4 kWh)."""
+    sid = _genset_site(f"Coarse outage {step}")
+    down = lambda i: 14 * 60 <= i * step < 15 * 60  # noqa: E731
+    _write(sid, T0, 1440 // step, step * 60, grid_present=lambda i: 0 if down(i) else 1, genset_running=lambda i: int(down(i)),
+           genset_power_w=lambda i: 80000 if down(i) else 0, unserved_w=lambda i: 6000 if down(i) else 0)
+    out = telemetry.outages(sid, T0, T0 + 86400)
+    assert [(o["start"], o["minutes"], o["genset_minutes"]) for o in out] == [(T0 + 14 * 3600, 60, 60)]
+    assert out[0]["unserved_kwh"] == pytest.approx(6.0)
+
+
+# ------------------------------------------------------------------------------------------------ pages-C-03: litres metered or estimated, never 0
+
+def _one_run(sid: str, start: int, minutes: int = 60, fuel: float | None = None, power: float | None = 100000.0, **extra) -> None:
+    """A run of `minutes` from `start` between off minutes, during an outage; `fuel` litres a minute (None: no fuel meter), `power` watts (None: none)."""
+    on = lambda i: 10 <= i < 10 + minutes  # noqa: E731
+    cols = {"grid_present": 0, "genset_running": lambda i: int(on(i))}
+    if power is not None:
+        cols["genset_power_w"] = lambda i: power if on(i) else 0.0
+    if fuel is not None:
+        cols["genset_fuel_l"] = lambda i: fuel if on(i) else 0.0
+    _write(sid, start - 600, minutes + 20, **cols, **extra)
+
+
+def test_metered_litres_are_named_metered_as_on_the_savings_page(company):
+    from gridlytics import verify
+    sid = _genset_site("Metered")
+    _one_run(sid, T0 + 10 * 3600, fuel=0.5)
+    res = _runs(sid)
+    r = res["runs"][0]
+    assert (r["litres"], r["litres_metered"], r["litres_curve"], r["litres_source"]) == (30.0, 30.0, 0.0, "meter")
+    used = verify.litres_used(sid, DAY, DAY)
+    assert (used["litres"], used["litres_source"]) == (r["litres"], r["litres_source"])
+
+
+def test_an_unmetered_set_s_litres_come_from_the_fuel_curve_not_zero(company):
+    """No genset_fuel_l column: 60 minutes at 100 kW on a 200 kW set with a = 0.25 and b = 0.03 burn (0.25 x 100 + 0.03 x 200) = 31 L, from the curve
+    (they were 0 L and Rs 0, badged estimated)."""
+    from gridlytics import verify
+    sid = _genset_site("Unmetered")
+    _one_run(sid, T0 + 10 * 3600)
+    r = _runs(sid)["runs"][0]
+    assert (r["litres"], r["litres_metered"], r["litres_curve"], r["litres_source"]) == (31.0, 0.0, 31.0, "curve")
+    used = verify.litres_used(sid, DAY, DAY)
+    assert (used["litres"], used["litres_source"]) == (31.0, "curve")
+
+
+def test_a_run_signal_alone_takes_its_power_from_the_site_s_balance(company):
+    """Only genset_running: during an outage the set carries the load less PV and battery (150 kW here), so 43.5 L from the curve, as Savings reads it."""
+    from gridlytics import verify
+    sid = _genset_site("Flag only")
+    _one_run(sid, T0 + 10 * 3600, power=None, load_power_w=150000, pv_power_w=0, battery_power_w=0)
+    r = _runs(sid)["runs"][0]
+    assert r["kwh"] == pytest.approx(150.0) and r["kwh_estimated"] is True
+    assert (r["litres"], r["litres_source"]) == (43.5, "curve")
+    assert verify.litres_used(sid, DAY, DAY)["litres"] == pytest.approx(43.5)
+
+
+# ------------------------------------------------------------------------------------------------ the genset page's answer
+
+def _pk_day(days_ago: int) -> date:
+    return datetime.now(PKT).date() - timedelta(days=days_ago)
+
+
+def _pk_ts(day: date, hour: int) -> int:
+    return int(datetime(day.year, day.month, day.day, hour, tzinfo=PKT).timestamp())
+
+
+def _route_site(c, name: str, **g) -> str:
+    sid = c.post("/api/sites", json={"name": name}).json()["id"]
+    assert c.put(f"/api/sites/{sid}/assets/genset", json={**GEN, **g}).status_code == 200
+    return sid
+
+
+def test_no_run_signal_is_unknown_and_a_live_signal_with_no_runs_is_zero(world):
+    """pages-C-05: a source that sends no genset reading gives hours, starts and litres as unknown (null), not 0 h / 0 starts / 0 L; once the signal is
+    read and says off, the zeros are facts."""
+    c = world.owner
+    sid = _route_site(c, "Silent")
+    t = _pk_ts(_pk_day(1), 10)
+    with world.use():
+        _write(sid, t, 60, grid_present=1, load_power_w=50000)
+    page = c.get(f"/api/sites/{sid}/genset").json()
+    assert page["signal"] == {"present": False, "last_seen": None, "running": None}
+    k = page["kpis"]
+    assert (k["hours"], k["starts"], k["litres"], k["kwh"], k["litres_source"], k["estimated"]) == (None, None, None, None, None, False)
+    assert k["fuel_cost_rs"] is None and page["runs"] == []
+    with world.use():
+        _write(sid, t + 3600, 60, grid_present=1, genset_running=0)
+    page = c.get(f"/api/sites/{sid}/genset").json()
+    assert page["signal"] == {"present": True, "last_seen": t + 3600 + 59 * 60, "running": False}
+    k = page["kpis"]
+    assert (k["hours"], k["starts"], k["litres"], k["estimated"]) == (0.0, 0, 0.0, False)
+
+
+# ------------------------------------------------------------------------------------------------ pages-A-06 (a duplicate of pages-C-03): the Overview
+
+def test_the_overview_month_names_where_its_litres_came_from(world):
+    """The Overview's 'Genset this month' carries litres_source as the Savings page does (it said "(estimated)" on metered litres), and its litres are
+    the Savings page's (an unmetered set's are no longer 0)."""
+    c = world.owner
+    now = int(datetime.now(timezone.utc).timestamp()) // 60 * 60
+    month0 = _pk_ts(datetime.now(PKT).date().replace(day=1), 0)
+    start = max(month0 + 600, now - 80 * 60)
+    minutes = min(60, (now - start) // 60 - 15)
+    if minutes < 5:
+        pytest.skip("too close to the start of a month for a run this month")
+    metered, unmetered = _route_site(c, "Metered overview"), _route_site(c, "Unmetered overview")
+    with world.use():
+        _one_run(metered, start, minutes=minutes, fuel=0.5)
+        _one_run(unmetered, start, minutes=minutes)
+    m = c.get(f"/api/sites/{metered}/now").json()["month"]
+    assert (m["litres"], m["litres_source"]) == (round(0.5 * minutes, 1), "meter")
+    u = c.get(f"/api/sites/{unmetered}/now").json()["month"]
+    assert (u["litres"], u["litres_source"]) == (round(31.0 * minutes / 60, 1), "curve")

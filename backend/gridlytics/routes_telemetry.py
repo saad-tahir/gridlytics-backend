@@ -292,52 +292,57 @@ def battery_page(site_id: str):
 
 # ------------------------------------------------------------------------------------------------ genset (UI-11)
 
+#: the genset page's period: the last `days` days (1 to GENSET_MAX_DAYS, 14 by default)
+GENSET_MAX_DAYS = 60
+
+
+def _run_kpis(res: dict) -> dict:
+    """The KPI row's energy figures of telemetry.genset_runs' answer; without any genset reading in the period they are unknown (null), not zero."""
+    runs = res["runs"]
+    if not res["signal"]["present"]:
+        return {"hours": None, "starts": None, "kwh": None, "litres": None, "litres_metered": None, "litres_curve": None, "litres_source": None,
+                "estimated": False, "avg_load_ratio": None}
+    hours = sum(r["hours"] for r in runs)
+    curve = sum(r["litres_curve"] for r in runs)
+    source = "curve" if curve > 0 else "meter" if (runs or res["fuel_read"]) else None
+    ratios = [(r["load_ratio"], r["hours"]) for r in runs if r["load_ratio"] is not None]
+    return {"hours": round(hours, 1), "starts": len(runs), "kwh": round(sum(r["kwh"] for r in runs), 1), "litres": round(sum(r["litres"] for r in runs), 1),
+            "litres_metered": round(sum(r["litres_metered"] for r in runs), 1), "litres_curve": round(curve, 1), "litres_source": source,
+            "estimated": source == "curve", "avg_load_ratio": round(sum(lr * h for lr, h in ratios) / hours, 2) if hours and ratios else None}
+
+
 @router.get("/api/sites/{site_id}/genset")
 def genset_page(site_id: str, days: int = 14):
+    """UI-11: the period's KPIs, runs, the fuel curve, the price, the plan's requests and steps, the
+    policy. Litres are metered where a fuel meter reads and from the fuel curve where not (`litres_source` as on the Savings page); without a genset
+    reading in the period (`signal.present` false) the hours, starts and litres are unknown (null), not zero."""
     s = full_or_404(site_id)
     g = (s.get("assets") or {}).get("genset")
     if not g:
         return {"genset": None}
     now = now_ts()
-    days = max(1, min(days, 60))
-    d = telemetry.raw(site_id, now - days * 86400, now, ("genset_running", "genset_power_w", "genset_fuel_l", "grid_present"))
-    runs, cur = [], None
-    for i, t in enumerate(d["ts"]):
-        on = d["genset_running"][i] == 1
-        if on and cur is None:
-            cur = {"start": int(t), "kwh": 0.0, "litres": 0.0, "in_outage": bool(d["grid_present"][i] == 0)}
-        if on and cur:
-            cur["end"] = int(t) + 60
-            cur["kwh"] += float(np.nan_to_num(d["genset_power_w"][i])) / 60000
-            cur["litres"] += float(np.nan_to_num(d["genset_fuel_l"][i]))
-        if not on and cur:
-            runs.append(cur)
-            cur = None
-    if cur:
-        cur["ongoing"] = True
-        runs.append(cur)
+    days = max(1, min(int(days), GENSET_MAX_DAYS))
+    res = telemetry.genset_runs(site_id, now - days * 86400, now, g)
+    runs = res["runs"]
+    from . import tariffs
+    kind = g.get("fuel_kind", "hsd")
     for r in runs:
-        r["hours"] = round((r["end"] - r["start"]) / 3600, 2)
-        r["kwh"], r["litres"] = round(r["kwh"], 1), round(r["litres"], 1)
-        r["load_ratio"] = round(r["kwh"] / max(1e-6, r["hours"] * g["rated_kw"]), 2)
         p = plans.active_at(site_id, r["start"])
         stp = next((x for x in (p or {}).get("steps", []) if x["t"] <= r["start"] < x["t"] + 900), None)
         r["plan_requested"] = bool(stp and stp["genset_on"])
-    from . import tariffs
-    price, src = tariffs.fuel_price(g.get("fuel_kind", "hsd"), today())
-    hours = sum(r["hours"] for r in runs)
-    litres = sum(r["litres"] for r in runs)
-    plan = plans.current(site_id)
-    return out({"genset": g, "control": s["data"].get("genset_start_control"), "kpis": {"hours": round(hours, 1), "litres": round(litres, 1), "starts": len(runs),
-                "avg_load_ratio": round(sum(r["load_ratio"] * r["hours"] for r in runs) / hours, 2) if hours else None,
-                "fuel_cost_rs": round(litres * price, 0), "estimated": True},
-                "fuel_price": {"price_per_l": price, "source": src, "kind": g.get("fuel_kind", "hsd")}, "runs": list(reversed(runs)),
-                "curve": {"a": g["a"], "b": g["b"], "rated_kw": g["rated_kw"],
-                          "points": [{"load_ratio": lr, "litres_per_hour": round(g["a"] * lr * g["rated_kw"] + g["b"] * g["rated_kw"], 2)}
-                                     for lr in (0.25, 0.5, 0.75, 1.0)]},
-                "requests": alerts.requests_for(site_id), "plan": [{"t": x["t"], "genset_kw": x["genset_kw"], "reason": x["reason"]}
-                                                                    for x in (plan or {}).get("steps", []) if x["genset_on"]][:96],
-                "policy": "Gridlytics never starts or stops the genset itself: it asks, with a reason, and records whether the advice was followed."})
+    kpis = _run_kpis(res)
+    price, src = tariffs.fuel_price(kind, today())
+    kpis["fuel_cost_rs"] = round(kpis["litres"] * price, 0) if kpis["litres"] is not None else None
+    answer = {"genset": g, "control": s["data"].get("genset_start_control"), "signal": res["signal"], "kpis": kpis,
+              "fuel_price": {"price_per_l": price, "source": src, "kind": kind},
+              "runs": list(reversed(runs)),
+              "curve": {"a": g["a"], "b": g["b"], "rated_kw": g["rated_kw"],
+                        "points": [{"load_ratio": lr, "litres_per_hour": round(g["a"] * lr * g["rated_kw"] + g["b"] * g["rated_kw"], 2)}
+                                   for lr in (0.25, 0.5, 0.75, 1.0)]},
+              "requests": alerts.requests_for(site_id), "plan": [{"t": x["t"], "genset_kw": x["genset_kw"], "reason": x["reason"]}
+                                                                  for x in (plans.current(site_id) or {}).get("steps", []) if x["genset_on"]][:96],
+              "policy": "Gridlytics never starts or stops the genset itself: it asks, with a reason, and records whether the advice was followed."}
+    return out(answer)
 
 
 @router.post("/api/sites/{site_id}/genset/requests/{nid}")

@@ -655,29 +655,184 @@ def heatmap(site_id: str, name: str, days: int = 28) -> dict:
     return {"series": name, "days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "values": grid}
 
 
+# ------------------------------------------------------------------------------------------------ genset runs and outages, in minutes
+
+#: A genset run or an outage goes on across rows that carry no reading of its signal (a blank cell, a lost row, the minutes between a 5- or 15-minute
+#: source's rows) while two of its readings are at most RUN_GAP_S apart (two of the source's own intervals, when longer): a missing signal is unknown, not
+#: off (plan 7.5, U3 3.7), as the forecaster's outage runs bridge them (forecast.OUTAGE_GAP_MINUTES). A reading that says otherwise (grid up, set off)
+#: ends it. Each row stands for the seconds to the next row, at most the source's own interval, so a coarse source's minutes, energy and litres are
+#: counted in full (audit R7 pages-C-04: they were counted per row, a blank row ended a run or an outage).
+RUN_GAP_S = 15 * 60
+
+
+def sample_seconds(ts) -> int:
+    """The seconds one row of a source stands for: the median gap between its rows (60 for a 1-minute source, 300 for a 5-minute one), from 60 to
+    RUN_GAP_S (as forecast.sample_minutes)."""
+    ts = np.asarray(ts, dtype=np.int64)
+    if len(ts) < 2:
+        return 60
+    return int(min(RUN_GAP_S, max(60, round(float(np.median(np.diff(ts))) / 60) * 60)))
+
+
+def _stretches(ts: np.ndarray, known: np.ndarray, on: np.ndarray, step: int, t1: int) -> list[tuple[int, int, bool]]:
+    """(first row, last row, ongoing) of each stretch of `on` readings: rows without a reading between two `on` readings at most RUN_GAP_S (or two
+    steps) apart continue it, a known not-`on` reading ends it. `ongoing`: nothing has ended it and its last reading is recent (within the gap of t1)."""
+    idx = np.flatnonzero(known & on)
+    if not len(idx):
+        return []
+    offs = np.cumsum(known & ~on)  # known not-on readings up to and including each row
+    gap = max(RUN_GAP_S, 2 * step)
+    brk = (np.diff(ts[idx]) > gap) | (offs[idx[1:]] != offs[idx[:-1]])
+    starts = idx[np.concatenate([[True], brk])]
+    ends = idx[np.concatenate([brk, [True]])]
+    out = []
+    for s, e in zip(starts.tolist(), ends.tolist()):
+        ended = bool(offs[-1] != offs[e]) or int(t1) - int(ts[e]) > gap
+        out.append((s, e, not ended))
+    return out
+
+
+def _spans(ts: np.ndarray, s: int, e: int, step: int) -> tuple[np.ndarray, np.ndarray]:
+    """Seconds each row s..e of a stretch stands for (to the next row; the last row its own interval, at most the next row) and the part of it the
+    row's own reading covers (at most the source's interval: the rest is a gap the stretch bridges)."""
+    dur = np.empty(e - s + 1, dtype=float)
+    dur[:-1] = np.diff(ts[s:e + 1])
+    dur[-1] = min(step, int(ts[e + 1] - ts[e])) if e + 1 < len(ts) else step
+    return dur, np.minimum(dur, step)
+
+
+def _held(a: np.ndarray, both: bool = False) -> np.ndarray:
+    """A stretch's readings with each blank carried from the reading before it (and, with `both`, leading blanks from the first reading)."""
+    a = np.asarray(a, dtype=float).copy()
+    if not len(a):
+        return a
+    pos = np.arange(len(a))
+    last = np.maximum.accumulate(np.where(~np.isnan(a), pos, -1))
+    fill = np.isnan(a) & (last >= 0)
+    a[fill] = a[last[fill]]
+    if both and np.isnan(a[0]) and (~np.isnan(a)).any():
+        a[:int(np.flatnonzero(~np.isnan(a))[0])] = a[~np.isnan(a)][0]
+    return a
+
+
+def _genset_state(d: dict) -> tuple[np.ndarray, np.ndarray]:
+    """(known, running) per row, as the savings' actual arm reads the set (verify._actual_sim): the running flag, else its power, else its litres. A row
+    with none of the three is unknown, not off."""
+    flag, p, fuel = d["genset_running"], d["genset_power_w"], d["genset_fuel_l"]
+    known = ~np.isnan(flag) | ~np.isnan(p) | ~np.isnan(fuel)
+    on = np.where(~np.isnan(flag), flag > 0.5, np.where(~np.isnan(p), p > 0.0, np.nan_to_num(fuel) > 0.0))
+    return known, on & known
+
+
+def _local_day(ts) -> np.ndarray:
+    return (np.asarray(ts, dtype=np.int64) + 5 * 3600) // 86400
+
+
+def _grid_stretches(d: dict, step: int, t1: int) -> list[tuple[int, int, bool]]:
+    grid = d["grid_present"]
+    known = ~np.isnan(grid)
+    return _stretches(d["ts"], known, known & (grid < 0.5), step, t1)
+
+
+#: the columns a genset run reads: the set's own and the grid's (outages); and, only for a run with no output read, the site's balance
+_RUN_COLUMNS = ("genset_running", "genset_power_w", "genset_fuel_l", "grid_present")
+_BALANCE_COLUMNS = ("load_power_w", "pv_power_w", "battery_power_w", "grid_power_w", "grid_import_wh", "grid_export_wh")
+
+
+def genset_runs(site_id: str, t0: int, t1: int, genset: dict) -> dict:
+    """The genset's runs in [t0, t1), oldest first, counted in minutes (see RUN_GAP_S), with their litres as the Savings page reads them
+    (verify.litres_used, plan 8.3: metered where a fuel meter reads, else the fuel curve a x output + b x rating, the output read, else held from the
+    run's last reading, else the site's balance within the set's range). Answers:
+
+    - `signal` {present, last_seen, running}: whether any row of the period read the set (its running flag, power or litres), the last such row and what
+      it said; without one the set's state is unknown, not off (plan 7.5);
+    - `runs[]` {start, end, hours, kwh, kwh_estimated (some output from the balance), litres, litres_metered, litres_curve, litres_source ("meter", or
+      "curve" when any of its litres come from the curve), load_ratio, hours_below_min (hours whose read output was under f_min of the rating),
+      in_outage (it overlapped an outage), ongoing?};
+    - `daily[]` {day, hours, litres}: per Karachi day of the period, null on a day without a genset reading;
+    - `fuel_read`: whether any row read the fuel meter (a period of metered zeros is "meter", not unknown)."""
+    s_kw = float(genset.get("rated_kw") or 0.0)
+    a, b, f_min = float(genset.get("a") or 0.0), float(genset.get("b") or 0.0), float(genset.get("f_min") or 0.0)
+    d = raw(site_id, t0, t1, _RUN_COLUMNS)
+    ts = d["ts"]
+    known, on = _genset_state(d)
+    step = sample_seconds(ts)
+    outs = [(int(ts[s]), int(ts[e]) + int(_spans(ts, s, e, step)[0][-1])) for s, e, _ in _grid_stretches(d, step, t1)]
+    p_kw = d["genset_power_w"] / 1000.0
+    fuel = d["genset_fuel_l"]
+    first_day, last_day = int(_local_day([t0])[0]), int(_local_day([max(t0, t1 - 1)])[0])
+    n_days = last_day - first_day + 1
+    day_hours, day_litres = np.zeros(n_days), np.zeros(n_days)
+    runs = []
+    for s, e, ongoing in _stretches(ts, known, on, step, t1):
+        dur, own = _spans(ts, s, e, step)
+        power = _held(p_kw[s:e + 1], both=True)
+        balanced = np.isnan(power)
+        if balanced.any():
+            # no output read in the run: the load the grid, PV and battery leave over, within the set's range (as verify._actual_sim); the same rows
+            bd = raw(site_id, int(ts[s]), int(ts[e]) + 1, _BALANCE_COLUMNS)
+            grid_kw = np.where(~np.isnan(bd["grid_power_w"]), bd["grid_power_w"] / 1000.0,
+                               (np.nan_to_num(bd["grid_import_wh"]) - np.nan_to_num(bd["grid_export_wh"])) * 3.6 / own)
+            bal = (np.nan_to_num(bd["load_power_w"]) - np.nan_to_num(bd["pv_power_w"]) - np.nan_to_num(bd["battery_power_w"])) / 1000.0
+            est = np.clip(bal - np.nan_to_num(grid_kw), f_min * s_kw, s_kw) if s_kw > 0 else np.zeros(len(bal))
+            power = np.where(balanced, est, power)
+        metered_row = ~np.isnan(fuel[s:e + 1])
+        metered = float(np.nansum(fuel[s:e + 1]))
+        curve_s = dur - np.where(metered_row, own, 0.0)
+        curve_rows = (a * power + b * s_kw) * curve_s / 3600.0
+        curve = float(curve_rows.sum())
+        litres_rows = np.where(metered_row, np.nan_to_num(fuel[s:e + 1]), 0.0) + curve_rows
+        start = int(ts[s])
+        end = int(ts[e]) + int(dur[-1])
+        kwh = float(np.sum(power * dur) / 3600.0)
+        hours = (end - start) / 3600.0
+        below = float(np.sum(dur[~balanced & (power < f_min * s_kw - 1e-9)]) / 3600.0) if s_kw > 0 else 0.0
+        run = {"start": start, "end": end, "hours": round(hours, 2), "kwh": round(kwh, 1), "kwh_estimated": bool(balanced.any()),
+               "litres": round(metered + curve, 1), "litres_metered": round(metered, 1), "litres_curve": round(curve, 1),
+               "litres_source": "curve" if curve > 1e-9 else "meter", "load_ratio": round(kwh / max(1e-6, hours * s_kw), 2) if s_kw > 0 else None,
+               "hours_below_min": round(below, 2), "in_outage": any(os < end and start < oe for os, oe in outs)}
+        if ongoing:
+            run["ongoing"] = True
+        runs.append(run)
+        days = _local_day(ts[s:e + 1]) - first_day
+        ok = (days >= 0) & (days < n_days)
+        np.add.at(day_hours, days[ok], dur[ok] / 3600.0)
+        np.add.at(day_litres, days[ok], litres_rows[ok])
+    seen = set((_local_day(ts[known]) - first_day).tolist())
+    daily = [{"day": date.fromordinal(date(1970, 1, 1).toordinal() + first_day + i).isoformat(),
+              "hours": round(float(day_hours[i]), 2) if i in seen else None, "litres": round(float(day_litres[i]), 1) if i in seen else None}
+             for i in range(n_days)]
+    last = int(np.flatnonzero(known)[-1]) if known.any() else None
+    signal = {"present": last is not None, "last_seen": int(ts[last]) if last is not None else None,
+              "running": bool(on[last]) if last is not None else None}
+    return {"signal": signal, "runs": runs, "daily": daily, "fuel_read": bool((~np.isnan(fuel)).any())}
+
+
 def outages(site_id: str, t0: int, t1: int) -> list[dict]:
-    """Outage intervals from the grid-present flag (a gap in data is not an outage)."""
-    d = raw(site_id, t0, t1, ("grid_present", "battery_soc_est_pct", "battery_soc_bms_pct", "genset_running", "unserved_w"))
+    """Outage intervals from the grid-present flag, counted in minutes (see RUN_GAP_S): a gap in the data is not an outage, and a blank reading does not
+    end one. `genset_minutes` are the minutes the genset's runs (as genset_runs reads them) overlap the outage; `unserved_kwh` holds each reading over the
+    minutes its row stands for."""
+    d = raw(site_id, t0, t1, ("grid_present", "battery_soc_est_pct", "battery_soc_bms_pct", "genset_running", "genset_power_w", "genset_fuel_l",
+                              "unserved_w"))
+    ts = d["ts"]
+    if not len(ts):
+        return []
+    step = sample_seconds(ts)
     soc = np.where(np.isnan(d["battery_soc_est_pct"]), d["battery_soc_bms_pct"], d["battery_soc_est_pct"])  # the BMS where there is no estimate
-    out, cur = [], None
-    for i, t in enumerate(d["ts"]):
-        down = d["grid_present"][i] == 0
-        if down and cur is None:
-            cur = {"start": int(t), "soc_start_pct": None if np.isnan(soc[i]) else round(float(soc[i]), 1),
-                   "genset_minutes": 0, "unserved_kwh": 0.0}
-        if down and cur is not None:
-            cur["end"] = int(t) + 60
-            cur["genset_minutes"] += int(d["genset_running"][i] == 1)
-            cur["unserved_kwh"] += float(np.nan_to_num(d["unserved_w"][i])) / 60000
-        if not down and cur is not None:
-            out.append(cur)
-            cur = None
-    if cur is not None:
-        cur["ongoing"] = True
-        out.append(cur)
-    for o in out:
-        o["minutes"] = (o["end"] - o["start"]) // 60
-        o["unserved_kwh"] = round(o["unserved_kwh"], 2)
+    known, on = _genset_state(d)
+    gen = [(int(ts[s]), int(ts[e]) + int(_spans(ts, s, e, step)[0][-1])) for s, e, _ in _stretches(ts, known, on, step, t1)]
+    out = []
+    for s, e, ongoing in _grid_stretches(d, step, t1):
+        dur, _own = _spans(ts, s, e, step)
+        start, end = int(ts[s]), int(ts[e]) + int(dur[-1])
+        unserved = np.nan_to_num(_held(d["unserved_w"][s:e + 1]))
+        o = {"start": start, "end": end, "minutes": (end - start) // 60,
+             "soc_start_pct": None if np.isnan(soc[s]) else round(float(soc[s]), 1),
+             "genset_minutes": int(sum(max(0, min(end, ge) - max(start, gs)) for gs, ge in gen) // 60),
+             "unserved_kwh": round(float(np.sum(unserved * dur)) / 3.6e6, 2)}
+        if ongoing:
+            o["ongoing"] = True
+        out.append(o)
     return out
 
 
