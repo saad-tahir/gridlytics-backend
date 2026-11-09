@@ -126,6 +126,26 @@ def preliminary_sentence(summ: dict, month_over: bool) -> str:
     return "Preliminary. These figures stay preliminary until " + "; ".join(left) + "."
 
 
+def _short_day(day: str) -> str:
+    """"Fri 6 Nov" for "2026-11-06" (the Savings page's shortDay)."""
+    try:
+        d = date.fromisoformat(str(day)[:10])
+    except ValueError:
+        return str(day)
+    return f"{d:%a} {d.day} {d:%b}"
+
+
+def stale_sentence(stale: list[str]) -> str:
+    """The Savings page's "Recompute needed" notice for verify.summary's chain_stale_days: the days scored before an earlier day was re-scored, whose
+    figures do not add up with the days before them until the period is recomputed; empty when every day is in step."""
+    if not stale:
+        return ""
+    n = len(stale)
+    shown = ", ".join(_short_day(d) for d in stale[:6]) + (f" and {n - 6} more" if n > 6 else "")
+    return (f"Recompute needed: {n} day{'s' if n != 1 else ''} ({shown}) {'were' if n != 1 else 'was'} scored before an earlier day was re-scored, so "
+            f"the totals in this report may not add up until {'they are' if n != 1 else 'it is'} recomputed.")
+
+
 def _genset_assumption(site: dict) -> str:
     """At a site whose genset is started by hand, the native replay's genset is an operator rule the product assumes (twin.simulate), not part of the
     capture (plan 8.2: the genset stream is reported with its fidelity, not claimed as blinded)."""
@@ -213,6 +233,10 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
         prelim = bool(summ["preliminary"] or (p1 >= today))
         if prelim:
             story.append(Paragraph(_text(preliminary_sentence(summ, p1 < today)).replace("Preliminary.", "<b>Preliminary.</b>", 1), styles["Normal"]))
+            story.append(Spacer(1, 3 * mm))
+        stale = stale_sentence(summ.get("chain_stale_days") or []) if kind == "monthly_savings" else ""
+        if stale:  # the page's notice, so a report made while days are out of step does not print totals that do not add up without a word
+            story.append(Paragraph(_text(stale).replace("Recompute needed:", "<b>Recompute needed:</b>", 1), styles["Normal"]))
             story.append(Spacer(1, 3 * mm))
         if kind == "monthly_savings":
             nat, tun = summ["baselines"].get("native", {}), summ["baselines"].get("tuned", {})

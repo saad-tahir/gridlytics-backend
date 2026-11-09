@@ -687,3 +687,30 @@ def test_the_preliminary_sentence_names_the_conditions_that_apply_and_the_method
     prelim = next(ln for ln in text.splitlines() if ln.startswith("Preliminary"))
     assert "native settings" in prelim and "fuel charges adjustment" in prelim and "verified days" not in prelim and "switchback" not in prelim, prelim
     assert "started by hand" not in text                      # an automatic start is the inverter's own, in the capture
+
+
+def test_a_report_made_while_days_are_out_of_step_says_so_and_the_fleet_roll_up_carries_the_flag(world, monkeypatch):
+    """pr-review-06: the report and GET /api/fleet/savings ignored verify.summary's chain_stale_days, so a PDF made while days were out of step printed
+    totals that do not add up with no word of it; the Savings page alone said "Recompute needed"."""
+    from datetime import date
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    d1, d2 = f"{month}-05", f"{month}-06"
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(d1), _day_row(d2)], chain_stale_days=[d1, d2]), [_tday(d1), _tday(d2)])
+    built = _story(monkeypatch)
+    with world.use():
+        reports.generate("monthly_savings", sid, month, "test")
+    text = built[-1]
+    stale = next((ln for ln in text.splitlines() if "Recompute needed" in ln), "")
+    first = date.fromisoformat(d1)
+    assert "2 days" in stale and f"{first:%a} {first.day} {first:%b}" in stale and "may not add up" in stale, text
+    fleet = world.c["admin"].get(f"/api/fleet/savings?month={month}").json()
+    row = next(r for r in fleet["sites"] if r["site_id"] == sid)
+    assert row["chain_stale_days"] == [d1, d2] and fleet["stale_sites"] == 1, fleet
+    # a site whose days are in step says so too
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(d1)]))
+    with world.use():
+        reports.generate("monthly_savings", sid, month, "test")
+    assert "Recompute needed" not in built[-1]
+    fleet = world.c["admin"].get(f"/api/fleet/savings?month={month}").json()
+    assert fleet["sites"][0]["chain_stale_days"] == [] and fleet["stale_sites"] == 0
