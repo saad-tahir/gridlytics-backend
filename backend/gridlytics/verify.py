@@ -1641,19 +1641,24 @@ def delete_bill(site_id: str, bill_id: str, by: str) -> dict:
     return {"id": bill_id, "deleted": True}
 
 
-def _profile_fill(ts: np.ndarray, a: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    """A grid flow's minutes (kW) with the minutes no reading covers filled from the period's own profile: the mean power of the same quarter hour of
-    the day on the same kind of day (Sunday or not), else of that quarter hour on any day, else of every covered minute. A reading covers the
-    minutes up to the next one of its source (a 15-minute source's sample stands for its 15 minutes), so only real gaps are filled; a covered minute
-    without a value stays zero. Returns the filled series, the covered minutes and the kWh the fill added."""
-    known = ~np.isnan(a)
+def _grid_covered(imp: np.ndarray, exp: np.ndarray) -> np.ndarray:
+    """The minutes a grid meter reading covers: a minute with an import or an export reading, and the minutes after it up to its source's next
+    reading (a 15-minute source's reading stands for its 15 minutes; forecast.sample_minutes)."""
+    known = ~np.isnan(imp) | ~np.isnan(exp)
     covered = known.copy()
     for k in range(1, forecast.sample_minutes(known)):
         covered[k:] |= known[:-k]
-    vals = np.where(known, a, 0.0)
+    return covered
+
+
+def _profile_fill(ts: np.ndarray, a: np.ndarray, covered: np.ndarray) -> tuple[np.ndarray, float]:
+    """A grid flow's minutes (kW) with the minutes no reading covers filled from the period's own profile: the mean power of the same quarter hour of
+    the day on the same kind of day (Sunday or not), else of that quarter hour on any day, else of every covered minute. A covered minute without a
+    value for this flow stays zero, as before (a blank export cell beside an import reading). Returns the filled series and the kWh the fill added."""
+    vals = np.where(np.isnan(a), 0.0, a)
     gaps = ~covered
     if not gaps.any() or not covered.any():
-        return vals, covered, 0.0
+        return vals, 0.0
     local = np.asarray(ts, dtype=np.int64) + 5 * 3600
     slot = (local % 86400) // 900
     key = slot * 2 + (((local // 86400 + 3) % 7) == 6)  # 1 Jan 1970 was a Thursday: weekday 6 is Sunday
@@ -1665,21 +1670,22 @@ def _profile_fill(ts: np.ndarray, a: np.ndarray) -> tuple[np.ndarray, np.ndarray
     fill = by_key[key[gaps]]
     out = vals.copy()
     out[gaps] = fill
-    return out, covered, float(fill.sum() / 60.0)
+    return out, float(fill.sum() / 60.0)
 
 
 def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_exclusive: bool = False, power_factor_pct: float | None = None,
                  credit_brought_forward_rs: float = 0.0) -> dict:
     """The connection's bill over [p0, p1] (both billed) rebuilt from telemetry; with period_start_exclusive, p0 is the previous reading date and
     the bill starts the day after it (tariffs.rebuild's convention). Minutes no reading covers are filled from the period's own profile
-    (`_profile_fill`), never counted as zero import; `completeness` is the share of the period's minutes the import readings cover and `filled_kwh`
+    (`_profile_fill`), never counted as zero import; `completeness` is the share of the period's minutes a grid reading covers and `filled_kwh`
     what the fill added, and below BILL_COMPLETENESS_MIN the comparison gives no verdict (`_check`)."""
     first = p0 + timedelta(days=1) if period_start_exclusive else p0
     t0 = twin.day_start_utc(first)
     t1 = twin.day_start_utc(p1) + 86400
     g = telemetry.minute_grid(site_id, t0, t1)
-    imp, covered, filled_imp = _profile_fill(g["ts"], g["imp"])
-    exp, _, filled_exp = _profile_fill(g["ts"], g["exp"])
+    covered = _grid_covered(g["imp"], g["exp"])
+    imp, filled_imp = _profile_fill(g["ts"], g["imp"], covered)
+    exp, filled_exp = _profile_fill(g["ts"], g["exp"], covered)
     out = tariffs.rebuild(g["ts"], imp, exp, conn, p0, p1, period_start_exclusive=period_start_exclusive, power_factor_pct=power_factor_pct,
                           credit_brought_forward_rs=credit_brought_forward_rs)
     out["completeness"] = round(float(covered.mean()) if len(covered) else 0.0, 4)

@@ -720,3 +720,20 @@ def test_bills_can_be_corrected_and_deleted_through_the_api_by_who_enters_them(w
     assert op.delete(f"/api/sites/{world.site}/bills/{bid}").status_code == 200
     assert op.get(f"/api/sites/{world.site}/bills").json() == []
     assert op.delete(f"/api/sites/{world.site}/bills/{bid}").status_code == 404
+
+
+def test_a_blank_export_cell_beside_an_import_reading_is_not_a_gap(company):
+    from gridlytics import telemetry, twin
+    sid = make_site(name="Blank Export Cells")
+    t0 = twin.day_start_utc(date(2026, 10, 2))
+    rows = []
+    for t in range(t0, t0 + 3 * 86400, 900):  # 2 to 4 Oct; export written only between 12:00 and 13:00, blank otherwise
+        local = datetime.fromtimestamp(t, PKT)
+        rows.append((sid, t, "csv", 1.0, 100 * 1000 / 60, 50 * 1000 / 60 if local.hour == 12 else None))
+    telemetry.write_rows(rows, ("site_id", "ts", "source_id", "grid_present", "grid_import_wh", "grid_export_wh"))
+    conn = sites.connections(sid)[0]
+    full = verify.rebuild_bill(sid, conn, date(2026, 10, 2), date(2026, 10, 4))
+    gap = verify.rebuild_bill(sid, conn, date(2026, 10, 1), date(2026, 10, 4))  # 1 Oct has no reading at all
+    assert gap["completeness"] == pytest.approx(0.75, abs=1e-3)
+    assert gap["filled_kwh"]["export"] == pytest.approx(sum(full["export_kwh"].values()) / 3, rel=1e-3)  # one noon hour, not a day of exports
+    assert gap["filled_kwh"]["import"] == pytest.approx(sum(full["import_kwh"].values()) / 3, rel=1e-3)
