@@ -727,3 +727,34 @@ def test_the_last_two_hours_ratio_compares_with_earlier_days_only(company):
     f = forecast.load(site, t0)
     assert f["stage"] == 1
     assert f["q"]["q50"][0] == pytest.approx(130.0, abs=0.5), f["q"]["q50"][:4]
+
+
+# ------------------------------------------------------------------------------------------------ pages-C-06
+
+def _data_days(sid: str, n: int, completeness: float, start: date = date(2026, 9, 1)) -> None:
+    import json as _json
+    with store.connect() as con:
+        for i in range(n):
+            con.execute("INSERT OR REPLACE INTO telemetry_days (site_id, day_local, data) VALUES (?,?,?)",
+                        (sid, (start + timedelta(days=i)).isoformat(), _json.dumps({"completeness": completeness, "load_kwh": 100.0})))
+
+
+def test_a_forecast_stays_preliminary_until_28_verified_days_and_stage_1(company):
+    """Plan Part 9.7 and R8 2.21: "Preliminary" marks every forecast until the site has 28 verified days and the forecast is stage 1. A verified day is
+    a local day with at least half its minutes of data (the share a day needs to be scored). v1 dropped the mark at stage 1, three days in."""
+    sid = "prelim"
+    site = {"id": sid, "data": {}, "connections": [{"id": "c1", "data": {"regime": "none"}}], "assets": {}}
+    telemetry.save_forecast(sid, "load", forecast.align(int(datetime.now(timezone.utc).timestamp())), 1, forecast.VERSION, {"q50": [1.0] * 192})
+    p = forecast.page(site, "load")
+    assert p["stage"] == 1 and p["preliminary"] is True and p["verified_days"] == 0 and p["verified_days_needed"] == 28
+    _data_days(sid, 27, 0.9)
+    _data_days(sid, 5, 0.3, start=date(2026, 10, 1))  # thin days are not verified
+    p = forecast.page(site, "load")
+    assert p["preliminary"] is True and p["verified_days"] == 27
+    _data_days(sid, 1, 0.5, start=date(2026, 10, 10))
+    p = forecast.page(site, "load")
+    assert p["preliminary"] is False and p["verified_days"] == 28
+    # a stage-0 forecast stays Preliminary however many days the site has
+    telemetry.save_forecast(sid, "outage", forecast.align(int(datetime.now(timezone.utc).timestamp())), 0, forecast.VERSION, {"p_down": [0.1] * 192})
+    assert forecast.page(site, "outage")["preliminary"] is True
+    assert forecast.preliminary(sid, 1) == {"preliminary": False, "verified_days": 28, "verified_days_needed": 28}

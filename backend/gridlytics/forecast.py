@@ -3,7 +3,7 @@
 Every issue covers 192 steps of 15 minutes from its belief time, carries seven quantiles (q05 to q95) and its stage, and reads only telemetry before the
 belief time, so a replayed day sees exactly what was known then. Stage 2 models (xgboost) and NWP feeds are later items; until then the PV chain runs on
 the clear-sky model with a climatological clearness distribution (stage 0) and a per-site capacity and clearness fit (stage 1), and every screen marks
-it Preliminary.
+it Preliminary until the site has 28 verified days and the forecast is stage 1 (preliminary()).
 """
 from __future__ import annotations
 
@@ -685,10 +685,34 @@ def _past(site_id: str, kind: str, t0: int) -> dict:
     return out
 
 
+#: "Preliminary" marks a forecast until the site has PRELIMINARY_DAYS verified days and the forecast is stage 1 (plan Part 9.7 and R8 2.21, the design
+#: rules; R8 UI-12: "Forecasts in stage 0 or fewer than 28 days: every figure carries Preliminary"). A verified day is a local day of the site's
+#: telemetry_days with at least VERIFIED_DAY_COMPLETENESS of its minutes of data, the share score_day needs to score a day.
+PRELIMINARY_DAYS = 28
+VERIFIED_DAY_COMPLETENESS = 0.5
+
+
+def verified_days(site_id: str) -> int:
+    """The site's local days with at least VERIFIED_DAY_COMPLETENESS of their minutes of data (telemetry_days, written by the import, the twin and the
+    nightly job)."""
+    with store.connect() as con:
+        r = con.execute("SELECT COUNT(*) FROM telemetry_days WHERE site_id = ? AND json_extract(data, '$.completeness') >= ?",
+                        (site_id, VERIFIED_DAY_COMPLETENESS)).fetchone()
+    return int(r[0])
+
+
+def preliminary(site_id: str, stage: int | None) -> dict:
+    """Whether a forecast (or a plan built on one) of this stage is still Preliminary at the site, with the verified days so far and needed; the plan
+    and the other pages can call it to mark their figures by the same rule."""
+    n = verified_days(site_id)
+    return {"preliminary": stage is None or int(stage) < 1 or n < PRELIMINARY_DAYS, "verified_days": n, "verified_days_needed": PRELIMINARY_DAYS}
+
+
 def page(site: dict, kind: str) -> dict:
     """The latest issue of a kind with the actuals so far (15-minute means) for the forecast page, and `past`: the 24 hours before its belief time with
     their actuals and the issue held a day before over them, so the chart shows how the forecast tracked. The tick re-issues every 15 minutes, so the
-    latest issue's own actuals are at most one step."""
+    latest issue's own actuals are at most one step. `preliminary` follows the design rules (see preliminary()), with `verified_days` and
+    `verified_days_needed` beside it."""
     f = telemetry.latest_forecast(site["id"], kind)
     if f is None:
         return {"kind": kind, "issue": None}
@@ -699,7 +723,7 @@ def page(site: dict, kind: str) -> dict:
     actual = _actual15(site["id"], kind, t0, t1) if kind in PAST_KEYS else None
     return {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
             "issue": {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version")}, "actual": actual,
-            "preliminary": f["stage"] == 0, "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None}
+            **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None}
 
 
 def _outage_baselines(site: dict, t0: int) -> dict:
