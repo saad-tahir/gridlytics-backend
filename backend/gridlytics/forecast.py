@@ -505,7 +505,8 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     return {"stage": 1 if days_known >= 7 else 0, "p_down": np.clip(p_down, 0, 1), "p_start": np.clip(p_start, 0, 1), "dur_steps": dur, "g": gvec,
             "observed": observed,
             # no announced windows: no adherence to show (the prior has nothing to apply to); windows entered but none seen whole: the prior, 0 trials
-            "adherence": round(adherence, 3) if windows else None, "adherence_windows": trials if windows else None, "median_minutes": med_dur, "windows": windows, "off_grid": False,
+            "adherence": round(adherence, 3) if windows else None, "adherence_windows": trials if windows else None, "median_minutes": med_dur,
+            "windows": windows, "off_grid": False,
             "lam_day": round(float(lam_h.sum()), 3), "days_known": round(float(days_own), 1),
             "pooled": {"sites": pool_sites, "days": round(float(pool_days), 1)}, "shed_prior": shed_prior}
 
