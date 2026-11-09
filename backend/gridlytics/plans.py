@@ -311,17 +311,25 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
     out = []
     gen = p.get("genset")
     r_rows, man = res.get("r") or {}, res.get("manual_floor") or {}
+    r_gap = res.get("r_gap") or {}
     dump = s.get("W") if s.get("W") is not None else np.zeros(T)
 
     E_up = float(res.get("E_floor_grid") or 0.0)
 
     def floor_pct(t: int) -> float | None:
-        """The floor the plan holds at step t: soc_min, raised by the reserve row and the manual floor where those rows exist and, with the grid
+        """The floor the plan holds at step t: soc_min, raised by the reserve rows and the manual floor where those rows exist and, with the grid
         up, by the floor the delivered table holds (round 7, engine-delivery-02), never above soc_max (the reserve row's 2-sigma widening can
-        push its target past the band)."""
+        push its target past the band). A reserve row is soft: the plan holds its target less the slack it accepts at the row's price (round 7,
+        engine-plans-live-03: behind an AMF panel a failed start's 30 minutes, priced at one start in twenty, shipped as a 36 % floor the plan
+        never meant to hold)."""
         if not En:
             return None
-        f = bat["soc_min"] * En + (float(res["R"][t]) if t in r_rows else 0.0)
+        held = 0.0
+        if t in r_rows:
+            held = max(held, float(res["R"][t]) - float(r_rows[t]))
+        if t in r_gap:
+            held = max(held, float(res["R_gap"][t]) - float(r_gap[t]))
+        f = bat["soc_min"] * En + held
         if float(p["g"][t]) > 0.5:
             f = max(f, E_up)
         if t in man:

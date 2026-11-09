@@ -335,7 +335,7 @@ def test_an_off_grid_battery_carries_the_load_not_an_outage():
 
 
 def _amf(p):
-    """An auto-start (AMF) genset: the reserve covers two steps, the start delay and a failed start."""
+    """An auto-start (AMF) genset: the reserve covers the panel's start delay, and a failed start's two steps."""
     p["genset"] = {"S": 100.0, "f_min": 0.3, "a": 0.273, "b": 0.033, "c_fuel": 380.0, "c_start": 1500.0, "c_runhr": 400.0, "c_om": 8.0, "UT": 4,
                    "DT": 2, "u_prev": 0, "elapsed": 99, "cap_hours": 24.0, "hours_today": 0.0, "day_index": np.zeros(p["T"], dtype=int),
                    "fuel_available": 1e9, "parallel": False, "control": "auto_on_grid_loss", "hold": np.zeros(p["T"], dtype=bool)}
@@ -564,4 +564,150 @@ def test_build_problem_reads_the_inverters_ac_rating(company):
     full = sites.full(sid)
     p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 96)
     assert p["inverter_kw_ac"] == pytest.approx(50.0)
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-09
+
+def test_no_reserve_row_on_the_step_before_a_modelled_outage():
+    """Part 4.3: the balance rows price a modelled outage (g = 0), so the step before it carries no reserve row as well: before, a scheduled
+    window with adherence above 0.9 was paid twice, the reserve's expected shortfall (about 0.9 x c_short) plus the window's own lost load."""
+    p = _problem(outage=(40, 48))
+    p["Lc"] = np.full(p["T"], 60.0)
+    p["p_start"] = np.zeros(p["T"])
+    p["p_start"][39] = 0.95                                            # forecast.outage: p_start = adherence on the step before the window
+    p["p_start"][20] = 0.05                                            # and an unscheduled chance well before it
+    p["battery"]["E0"] = 30.0
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    assert 39 not in r["r"]
+    assert 20 in r["r"]
+    # the expected shortfall the breakdown reports is only the rows the plan has: step 20's
+    assert r["breakdown"]["expected_shortfall_rs"] == pytest.approx(0.05 * p["c_short"] * r["r"][20], abs=0.01)
+    # and a step whose next step has the grid up keeps its row
+    q = _problem()
+    q["p_start"] = np.zeros(q["T"])
+    q["p_start"][-2] = 0.2
+    q["Lc"] = np.full(q["T"], 60.0)
+    rq = optimise.solve(q)
+    assert q["T"] - 2 in rq["r"]
+
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-06
+
+def _reserve_case(T=96):
+    """One grid-up day with a 20 % chance of an outage starting at step 40, lasting four steps, a 180 kW critical load and no sun."""
+    p = _problem(T=T)
+    p["p_start"] = np.zeros(T)
+    p["p_start"][40] = 0.2
+    p["dur_steps"] = np.full(T, 4)
+    p["Lc"] = np.full(T, 180.0)
+    p["L"] = np.full(T, 200.0)
+    p["Lhi"] = np.full(T, 210.0)
+    return p
+
+
+def test_the_reserve_counts_only_what_the_battery_can_discharge():
+    """Lahore held 115 kWh for a 180 kW critical load on a 50 kW battery: in an hour's outage it can deliver at most 50 kW, so the reserve is
+    the sum of min(Lc - PVlo, P_dis) h / eta_d, not the whole critical load's."""
+    p = _reserve_case()
+    p["battery"]["P_dis"] = 50.0
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    assert float(r["R"][40]) == pytest.approx(4 * 50.0 * H / 0.95, abs=1e-6)        # 52.6 kWh, not min(170, 189.5)
+
+
+def test_the_reserve_counts_only_what_the_inverter_can_pass():
+    """PV and the battery share the inverter's kW AC: in an outage the battery passes what PV leaves of it."""
+    p = _reserve_case()
+    p["inverter_kw_ac"] = 60.0
+    p["PVlo"] = np.full(p["T"], 20.0)
+    p["PV"] = np.full(p["T"], 30.0)
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    assert float(r["R"][40]) == pytest.approx(4 * (60.0 - 20.0) * H / 0.95, abs=1e-6)
+
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-03
+
+def _mall(p_start=0.01, T=96):
+    """Lahore: a 100 kWh / 50 kW battery, a 180 kW critical load and two sets behind an auto-start (AMF) panel; the A-2(c) peak at Rs 48 for
+    the first four hours and a 1 % chance of an outage starting every step."""
+    p = _problem(T=T, peak=(0, 16))
+    p["c_imp"] = np.where(np.asarray(p["peak"]), 48.28, 28.0)
+    p["L"] = np.full(T, 200.0)
+    p["Lhi"] = np.full(T, 210.0)
+    p["Lc"] = np.full(T, 180.0)
+    p["p_start"] = np.full(T, p_start)
+    p["dur_steps"] = np.full(T, 4)
+    p["battery"].update({"E_nom": 100.0, "E0": 95.0, "P_ch": 50.0, "P_dis": 50.0, "sigma0": 0.0})
+    p["genset"] = {"S": 640.0, "f_min": 0.25, "a": 0.273, "b": 0.033, "c_fuel": 280.0, "c_start": 1500.0, "c_runhr": 400.0, "c_om": 8.0, "UT": 2,
+                   "DT": 2, "u_prev": 0, "elapsed": 99, "cap_hours": 24.0, "hours_today": 0.0, "day_index": np.zeros(T, dtype=int),
+                   "fuel_available": 1e9, "parallel": False, "control": "auto_on_grid_loss", "hold": np.zeros(T, dtype=bool)}
+    p["c_short"] = optimise._gen_marginal(p["genset"])
+    return p
+
+
+def test_behind_an_amf_panel_the_battery_is_free_to_shave_the_peak():
+    """The mall's plan bought 65 kWh from the grid at Rs 39.48 and held 95 % for 48 hours with no discharge: its reserve was 30 minutes of
+    the whole critical load priced at diesel cost. Behind an AMF panel the battery bridges only the start delay, and the rest of a failed start
+    (one start in twenty), so the reserve is a few kWh and the battery shaves the peak."""
+    p = _mall()
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    assert r["breakdown"]["discharge_kwh"] > 20.0
+    s, pk = r["sol"], np.asarray(p["peak"])
+    assert float(np.sum(s["D"][pk])) * H > 20.0
+    assert not any(s["C"][t] > 0.1 and s["G"][t] > 0.1 for t in range(p["T"]) if pk[t])     # no grid charging in the peak for the reserve
+    # the start delay's reserve: a minute of what the battery can deliver (50 kW), well under the old 115 kWh
+    assert float(r["R_gap"][20]) == pytest.approx(50.0 * optimise.AMF_START_DELAY_S / 3600 / 0.95, abs=1e-6)
+    assert float(r["R"][20]) == pytest.approx(2 * 50.0 * H / 0.95, abs=1e-6)             # a failed start: 30 minutes, as before
+
+
+def test_the_amf_reserve_prices_the_start_delay_and_a_failed_start_once_each():
+    """Golden: with the battery at its cut-off and nothing to charge it, the expected shortfall is the start delay's reserve at
+    p (1 - p_fail) VoLL plus the failed start's at p p_fail VoLL, one of each on the step with the chance: never the diesel cost of a reserve
+    the panel's start covers."""
+    p = _mall(p_start=0.0)
+    p["p_start"][40] = 0.2
+    p["battery"].update({"E0": 10.0, "a_grid": False})
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    gap = 50.0 * 60 / 3600 / 0.95
+    fail = 2 * 50.0 * H / 0.95
+    assert r["r_gap"][40] == pytest.approx(gap, abs=1e-6)
+    assert r["r"][40] == pytest.approx(fail, abs=1e-6)
+    pf = optimise.AMF_FAIL_TO_START
+    want = 0.2 * (1 - pf) * 500.0 * gap + 0.2 * pf * 500.0 * fail
+    assert r["breakdown"]["expected_shortfall_rs"] == pytest.approx(round(want, 2), abs=0.01)
+    assert want == pytest.approx(214.91, abs=0.01)                    # 83.33 for the delay, 131.58 for a failed start
+
+
+def test_the_amf_reserve_reason_says_what_it_covers():
+    p = _mall(p_start=0.05)
+    p["c_imp"] = np.full(p["T"], 28.0)                                 # nothing to shave: the battery sits on its reserve
+    p["battery"].update({"E0": 12.0, "c_cyc": 40.0})
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    held = [x for x in r["reasons"] if x["reason"] in ("hold_for_outage", "charge_for_reserve")]
+    assert held
+    for x in held:
+        d = x["detail"]
+        assert d["cover"] in ("start_delay", "failed_start")
+        if d["cover"] == "start_delay":
+            assert d["seconds"] == optimise.AMF_START_DELAY_S
+        else:
+            assert d["p_fail"] == pytest.approx(optimise.AMF_FAIL_TO_START)
+            assert d["hours"] == pytest.approx(0.5)
+
+
+def test_the_reserve_floor_shipped_is_the_reserve_the_plan_holds():
+    """The mall's steps said reserve 95 % while the plan held its battery for a reserve the AMF panel covers. A step's reserve_pct is the
+    reserve the plan holds (its row's target less the slack it accepts at that row's price), so the table and Mode B never ask for a floor
+    above the planned state of charge, and an outage that starts at the planned state of charge is not "below the planned reserve"."""
+    p = _mall()
+    r = optimise.solve(p)
+    steps = plans._steps_out(p, r, {"outage": {"p_down": np.zeros(p["T"])}})
+    for s in steps:
+        assert s["reserve_pct"] <= s["soc_pct"] + 0.1
+    assert min(s["reserve_pct"] for s in steps) < 20.0                # no 95 % floor through the peak
 

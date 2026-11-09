@@ -23,6 +23,12 @@ EPS_CURTAIL = 0.05     # Rs/kWh: keep PV unless export is capped and the battery
 EPS_CHARGE = 0.001     # Rs/kWh: a tie-break against charging and discharging at once
 EPS_ORDER = 0.002      # Rs/kWh across the horizon: of two steps alike, discharge the earlier and charge the later (round 7: ties split by turns
                        # read as 0 / full / 0 / full runs, "Peak discharge" and "Wear > saving" alternating at one price)
+#: Behind an auto-start (AMF) panel the battery bridges only the panel's start delay (mains-fail confirmation, crank, warm-up and transfer: a minute at
+#: most) and, when the set fails to start, the critical load until someone starts it by hand (two steps, the cover the reserve kept before). One
+#: start in twenty fails (a set exercised weekly fails 1 to 5 % of its starts; the pessimistic end). Round 7, engine-plans-live-03
+AMF_START_DELAY_S = 60
+AMF_FAIL_TO_START = 0.05
+AMF_FAILED_START_STEPS = 2
 SURPLUS_ROWS = True    # solve's grid-down rows on the set's surplus and the battery; a switch only for the tests that check they cut no plan off
 REASONS = ("hold_for_outage", "charge_from_pv", "charge_from_grid", "discharge_peak_window", "mdi_cap", "genset_on", "genset_off", "icp_flat_price",
            "terminal_value", "export_capped", "wear_margin_too_small", "forecast_guard", "operator_hold", "carry_outage", "self_consumption", "idle",
@@ -354,21 +360,49 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                     m.row([E[t + 1], y], [1, -(Elo - lb_)], lb=lb_, name=f"floor_rec_e[{t}]")
                 if b_ == T:
                     rec_last = y_of[int(hour[T - 1])]
-        # reserve (soft, expected value): rows only where the grid is up and an outage may start next
+        # reserve (soft, expected value): rows only where the grid is up and an outage may start next, and none where the next step is itself a
+        # modelled outage (g = 0): its balance rows already price that outage's shortfall (genset fuel or lost load), which is never charged
+        # twice (Part 4.3; round 7, engine-optimiser-09: the step before a scheduled window paid about 0.9 c_short on top)
         sig = bat.get("sigma0", 0.0)
+        band = (bat["soc_max"] - bat["soc_min"]) * En
         R = np.zeros(T)
+        R_gap = np.zeros(T)                              # behind an AMF panel: the start delay's reserve (R is then the failed start's)
         R_steps = np.zeros(T, dtype=int)  # the steps of outage each reserve covers (two at most behind an AMF panel), for explain's detail
-        r_idx = {}
+        r_idx, r_gap_idx, r_price, r_gap_price = {}, {}, {}, {}
         c_short = p["c_short"]
-        deficit = np.maximum(0.0, Lc - PVlo) * H / bat["eta_d"]
+        amf = bool(gen and gen["control"] == "auto_on_grid_loss")
+        # what the battery can deliver in a step of an outage: the critical load less PV, never above its discharge power, nor above what the
+        # inverter's kW AC leaves after PV (round 7, engine-plans-live-06: Lahore held 115 kWh for a 180 kW load on a 50 kW battery, of which
+        # it could deliver 25 kWh in the 30 minutes the reserve covered)
+        out_kw = np.minimum(np.maximum(0.0, Lc - PVlo), float(bat["P_dis"]))
+        if inv_ac is not None:
+            out_kw = np.minimum(out_kw, np.maximum(0.0, inv_ac - np.minimum(PVlo, Lc)))
+        deficit = out_kw * H / bat["eta_d"]
         for t in range(T):
-            d_ = int(dur[t]) if not (gen and gen["control"] == "auto_on_grid_loss") else min(int(dur[t]), 2)
+            d_ = min(int(dur[t]), AMF_FAILED_START_STEPS) if amf else int(dur[t])
             R_steps[t] = d_
-            R[t] = min((bat["soc_max"] - bat["soc_min"]) * En, float(deficit[t + 1:t + 1 + d_].sum())) + 2 * sig * En
+            R[t] = min(band, float(deficit[t + 1:t + 1 + d_].sum())) + 2 * sig * En
+            if amf and t + 1 < T:
+                R_gap[t] = min(band, float(out_kw[t + 1]) * AMF_START_DELAY_S / 3600 / bat["eta_d"]) + 2 * sig * En
         for t in range(T):
-            if g[t] > 0.5 and p_start[t] >= 0.01 and R[t] > 0:
-                r = m.var(f"r{t}", 1, 0, np.inf, p_start[t] * c_short)[0]
+            if not (g[t] > 0.5 and p_start[t] >= 0.01 and (t + 1 >= T or g[t + 1] > 0.5)):
+                continue
+            if amf:
+                # behind an AMF panel a shortfall is lost load, in the start delay of every start and over a failed start's 30 minutes:
+                # the delay's reserve at p (1 - p_fail) VoLL and the failed start's at p p_fail VoLL, so each kWh short is priced once at
+                # its expected cost (round 7, engine-plans-live-03: before, 30 minutes of the whole critical load at the set's diesel cost)
+                if R_gap[t] > 0:
+                    r_gap_price[t] = float(p_start[t]) * (1.0 - AMF_FAIL_TO_START) * voll
+                    rg = m.var(f"r_gap{t}", 1, 0, np.inf, r_gap_price[t])[0]
+                    r_gap_idx[t] = rg
+                    m.row([E[t + 1], rg], [1, 1], lb=Emin + R_gap[t], name=f"reserve_gap[{t}]")
+                price = float(p_start[t]) * AMF_FAIL_TO_START * voll
+            else:
+                price = float(p_start[t]) * c_short
+            if R[t] > 0:
+                r = m.var(f"r{t}", 1, 0, np.inf, price)[0]
                 r_idx[t] = r
+                r_price[t] = price
                 m.row([E[t + 1], r], [1, 1], lb=Emin + R[t], name=f"reserve[{t}]")
         # A battery-inverter sheds load only once the battery is at its cut-off, so where a row on E stands for an operator's floor during an
         # outage, load shed in that outage counts as if the battery had carried it (`shed_kwh`): shedding never keeps a floor, which it would
@@ -617,6 +651,11 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     out["R"] = R if bat else np.zeros(T)
     out["R_steps"] = R_steps if bat else np.zeros(T, dtype=int)
     out["r"] = {t: float(x[i]) for t, i in r_idx.items()} if bat else {}
+    # behind an AMF panel: the start delay's reserve and slack (R and r are then the failed start's), and each row's price per kWh short
+    out["R_gap"] = R_gap if bat else np.zeros(T)
+    out["r_gap"] = {t: float(x[i]) for t, i in r_gap_idx.items()} if bat else {}
+    out["r_price"] = dict(r_price) if bat else {}
+    out["r_gap_price"] = dict(r_gap_price) if bat else {}
     out["manual_floor"] = dict(rm_floor)
     out["M"] = [float(x[i]) for i in M_idx]
     out["v_end"] = v_end if bat else 0.0
@@ -827,7 +866,10 @@ def _breakdown(p: dict, s: dict, out: dict) -> dict:
     if p.get("mdi") and out.get("M"):
         mdi = float(p["mdi"]["rate"] * (out["M"][0] - max(p["mdi"]["M0"], p["mdi"]["floor"])))
     unserved = float(np.sum(H * p["voll"] * s["U"]))
-    reserve = float(sum(np.asarray(p["p_start"])[t] * p["c_short"] * r for t, r in out.get("r", {}).items()))
+    # each reserve row's slack at its own price (p c_short; behind an AMF panel the start delay's and the failed start's, round 7)
+    prices = out.get("r_price") or {}
+    reserve = float(sum(prices.get(t, np.asarray(p["p_start"])[t] * p["c_short"]) * r for t, r in out.get("r", {}).items()))
+    reserve += float(sum((out.get("r_gap_price") or {}).get(t, 0.0) * r for t, r in (out.get("r_gap") or {}).items()))
     # the credit the objective takes: v_end times E_use, the energy above the floor the next peak can use and never above its cap (round 7,
     # engine-delivery-02; before, every kWh above the cut-off was credited, past the cap)
     terminal = -float(out.get("v_end", 0.0) * out.get("E_use", 0.0)) if bat else 0.0
@@ -853,12 +895,16 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
     icp = p.get("icp") or {}
     c_imp, p_start, ts = np.asarray(p["c_imp"], dtype=float), np.asarray(p["p_start"], dtype=float), np.asarray(p["ts"], dtype=np.int64)
     Cs, Ds, Es = np.asarray(s["C"], dtype=float), np.asarray(s["D"], dtype=float), np.asarray(s["E"], dtype=float)
-    rows = out.get("r") or {}                       # the steps that carry a reserve row (p_start >= 0.01 with the grid up)
+    # the steps that carry a reserve row (p_start >= 0.01 with the grid up); behind an AMF panel also the start delay's rows (R_gap)
+    rows = set(out.get("r") or {}) | set(out.get("r_gap") or {})
+    R_gap = np.asarray(out.get("R_gap", np.zeros(T)), dtype=float)
+    R_top = np.maximum(np.asarray(R, dtype=float), R_gap)
+    amf = bool(gen and gen.get("control") == "auto_on_grid_loss")
     tol = 0.02 * En
 
     def binds(k: int) -> bool:
         """The reserve row of step k holds the battery: its energy after the step is at or under the reserve it asks for."""
-        return k in rows and float(Es[k + 1]) <= Emin + float(R[k]) + tol
+        return k in rows and float(Es[k + 1]) <= Emin + float(R_top[k]) + tol
 
     def reserve_window(t: int, stop_at_charge: bool) -> int | None:
         """The last step whose reserve row binds the energy the battery holds after step t: from t on, while the grid is up and until the
@@ -878,7 +924,16 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
         the rows ask for, never above the battery's usable band."""
         k0 = next(k for k in range(t, last + 1) if binds(k))
         chance = 1.0 - float(np.prod(1.0 - np.clip(p_start[t:last + 1], 0.0, 1.0)))
-        kwh = min(float(R[k0]), (bat["soc_max"] - bat["soc_min"]) * En)
+        band = (bat["soc_max"] - bat["soc_min"]) * En
+        if amf:
+            # behind an AMF panel (round 7, engine-plans-live-03): the energy up to the start delay's reserve is held for the delay of every
+            # start; above it, for a failed start (one start in AMF_FAIL_TO_START)
+            if k0 in (out.get("r_gap") or {}) and float(Es[t + 1]) <= Emin + float(R_gap[k0]) + tol:
+                return {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "cover": "start_delay", "seconds": AMF_START_DELAY_S,
+                        "hours": round(AMF_START_DELAY_S / 3600, 3), "kwh": round(min(float(R_gap[k0]), band), 1)}
+            return {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "cover": "failed_start", "p_fail": AMF_FAIL_TO_START,
+                    "hours": round(int(R_steps[k0]) * H, 2), "kwh": round(min(float(R[k0]), band), 1)}
+        kwh = min(float(R[k0]), band)
         return {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "hours": round(int(R_steps[k0]) * H, 2), "kwh": round(kwh, 1)}
 
     def next_discharge(t: int) -> int | None:
