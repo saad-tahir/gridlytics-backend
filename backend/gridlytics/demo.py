@@ -107,7 +107,17 @@ DEMO_SITES = [
      "tier": "advisory_writes", "native": {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 25}, "schedule": [], "marks": "same_day"},
 ]
 
-_lock = threading.Lock()
+#: The demo build's lock, one per company file (audit security-roles-15: one lock for the process made a build in one company refuse another's with
+#: "already being built", which also told it of the other company's build)
+_locks: dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _lock_for(db) -> threading.Lock:
+    """The demo build lock of a company file (store.db_path() of the company)."""
+    key = os.path.normcase(os.path.abspath(str(db)))
+    with _locks_guard:
+        return _locks.setdefault(key, threading.Lock())
 
 
 def status() -> dict:
@@ -406,10 +416,11 @@ def load(by: str, days: int | None = None, background: bool = True) -> dict:
     """Create the demo sites in the current company and build their history (in a background thread unless asked otherwise)."""
     if demo_sites():
         return {"state": "ready", "message": "The demo sites are already here"}
-    if not _lock.acquire(blocking=False):
+    db = store.db_path()
+    lock = _lock_for(db)
+    if not lock.acquire(blocking=False):
         return {"state": "running", "message": "The demo is already being built"}
     days = int(days or os.environ.get("GRIDLYTICS_DEMO_DAYS", "21"))
-    db = store.db_path()
     _set_status(state="running", progress=0, total=days * len(DEMO_SITES), started=store._now(), message="Creating the demo sites")
 
     def run():
@@ -431,7 +442,7 @@ def load(by: str, days: int | None = None, background: bool = True) -> dict:
             with store.use_company(db):
                 _set_status(state="failed", message=f"{type(exc).__name__}: {exc}", trace=traceback.format_exc()[-2000:])
         finally:
-            _lock.release()
+            lock.release()
 
     if background:
         threading.Thread(target=run, name="demo-build", daemon=True).start()

@@ -259,3 +259,24 @@ def test_the_genset_run_covering_a_midnight_outage_runs_on_with_it(company, monk
     demo._simulate_span(sites.full(sid), t0 - 3600, t0 + 3600, None)
     g = telemetry.raw(sid, t0 - 120, t0 + 120, ("grid_present", "genset_running"))
     assert list(g["grid_present"]) == [0, 0, 0, 0] and list(g["genset_running"]) == [1, 1, 1, 1]
+
+
+# ------------------------------------------------------------------------------------------------ the build lock is per company (security-roles-15)
+
+def test_one_companys_demo_build_neither_blocks_nor_shows_in_anothers(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(tmp_path))
+    a, b = tmp_path / "companies" / "a.db", tmp_path / "companies" / "b.db"
+    a.parent.mkdir(parents=True)
+    monkeypatch.setattr(demo, "create_sites", lambda by, **k: [])
+    monkeypatch.setattr(demo, "DEMO_SITES", [])
+    with store.use_company(a):
+        held = demo._lock_for(store.db_path())
+    assert held.acquire(blocking=False)                                      # company A's build is running
+    try:
+        with store.use_company(a):
+            assert demo.load("t", 2, background=False)["message"] == "The demo is already being built"
+        with store.use_company(b):
+            st = demo.load("t", 2, background=False)                         # before: refused, "already being built", by A's build
+            assert st["state"] == "ready" and demo.status()["state"] == "ready"
+    finally:
+        held.release()
