@@ -440,3 +440,76 @@ def test_a_forwarded_header_the_server_does_not_trust_is_said_once_in_the_log(wo
             c.post("/api/local/session", json={"email": "viewer@fix.test", "password": "a wrong password 1"}, headers={"X-Forwarded-For": f"198.51.100.{n}"})
     said = [r.getMessage() for r in caplog.records if "GRIDLYTICS_TRUST_PROXY" in r.getMessage()]
     assert len(said) == 1 and "forwarded-allow-ips" in said[0], said
+
+
+# ------------------------------------------------------------------------------------------------ role-analyst-32 (UI-18 My account: sessions and notifications)
+
+def _signed_in_from(email: str, address: str, agent: str) -> dict:
+    import identities
+    from fastapi.testclient import TestClient
+    from gridlytics import api
+    c = TestClient(api.app, raise_server_exceptions=False, client=(address, 50000))
+    r = c.post("/api/local/session", json={"email": email, "password": identities.PASSWORD}, headers={"User-Agent": agent})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_my_account_lists_my_open_sessions_and_signs_out_the_others(world):
+    """UI-18: My account shows the person's open sessions (where and when each started, when it was last renewed, this device marked) and signs out one, or
+    every other; the access tokens of a session signed out end with it (security-roles-09). Nobody reads or ends another person's sessions."""
+    import identities
+    anon = world.anon
+    office = _signed_in_from("analyst@fix.test", "10.0.0.7", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0 Safari/537.36")
+    phone = _signed_in_from("analyst@fix.test", "10.0.0.8", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Safari/604.1")
+    laptop = _signed_in_from("analyst@fix.test", "10.0.0.9", "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) Firefox/131.0")
+    other = _signed_in_from("operator@fix.test", "10.0.0.10", "curl/8.0")
+    h = {k: identities.headers(s["access_token"], world.company) for k, s in (("office", office), ("phone", phone), ("laptop", laptop), ("other", other))}
+    r = anon.get("/api/local/sessions", headers=h["office"])
+    assert r.status_code == 200, r.text
+    listed = r.json()["sessions"]
+    assert len(listed) == 3 and sorted(s["address"] for s in listed) == ["10.0.0.7", "10.0.0.8", "10.0.0.9"]
+    mine = next(s for s in listed if s["current"])
+    assert mine["address"] == "10.0.0.7" and "Chrome" in mine["device"] and [s["current"] for s in listed].count(True) == 1
+    assert all(isinstance(s[k], (int, float)) for s in listed for k in ("started", "last_active", "ends")) and set(mine) == {
+        "id", "current", "started", "last_active", "ends", "address", "device"}
+    # sign out the phone by its id; a session of another person's is not found
+    phone_id = next(s["id"] for s in listed if s["address"] == "10.0.0.8")
+    other_id = next(s["id"] for s in anon.get("/api/local/sessions", headers=h["other"]).json()["sessions"])
+    assert anon.post("/api/local/sessions/end", headers=h["office"], json={"id": other_id}).status_code == 404
+    assert anon.get("/api/sites", headers=h["other"]).status_code == 200
+    for wrong in ({}, {"id": 5}, {"id": phone_id, "x": 1}):
+        assert anon.post("/api/local/sessions/end", headers=h["office"], json=wrong).status_code == 422, wrong
+    r = anon.post("/api/local/sessions/end", headers=h["office"], json={"id": phone_id})
+    assert r.status_code == 200 and r.json() == {"ended": 1}, r.text
+    assert anon.get("/api/sites", headers=h["phone"]).status_code == 401
+    assert anon.post("/api/local/refresh", json={"refresh_token": phone["refresh_token"]}).status_code == 401
+    # every other session: the laptop ends, this device stays, the other person is untouched
+    r = anon.post("/api/local/sessions/end-others", headers=h["office"])
+    assert r.status_code == 200 and r.json() == {"ended": 1}, r.text
+    assert anon.get("/api/sites", headers=h["laptop"]).status_code == 401
+    assert anon.get("/api/sites", headers=h["office"]).status_code == 200 and anon.get("/api/sites", headers=h["other"]).status_code == 200
+    assert [s["address"] for s in anon.get("/api/local/sessions", headers=h["office"]).json()["sessions"]] == ["10.0.0.7"]
+    # a renewal keeps where the session started and moves when it was last active
+    renewed = anon.post("/api/local/refresh", json={"refresh_token": office["refresh_token"]}).json()
+    again = anon.get("/api/local/sessions", headers=identities.headers(renewed["access_token"], world.company)).json()["sessions"]
+    assert len(again) == 1 and again[0]["current"] and again[0]["address"] == "10.0.0.7" and again[0]["id"] == mine["id"]
+    assert anon.get("/api/local/sessions").status_code == 401
+
+
+def test_my_account_keeps_my_notification_choices(world):
+    """UI-18: notification preferences. Each person chooses, in their company, the kinds of alert they follow and whether they want them by email too;
+    kept per person, any role, never a key's."""
+    a, v = world.c["admin"], world.c["viewer"]
+    first = v.get("/api/platform/notifications")
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["categories"][:3] == ["Data", "Control", "Reserve"] and body["follow"] == body["categories"] and body["email"] is False
+    r = v.put("/api/platform/notifications", json={"follow": ["Data", "Genset"], "email": True})
+    assert r.status_code == 200 and (r.json()["follow"], r.json()["email"]) == (["Data", "Genset"], True), r.text
+    assert (v.get("/api/platform/notifications").json()["follow"], a.get("/api/platform/notifications").json()["follow"]) == (
+        ["Data", "Genset"], body["categories"])                                          # the viewer's own, not the administrator's
+    for wrong in ({"follow": ["Weather"]}, {"follow": "Data"}, {"email": "yes"}, {"follow": [], "sms": True}, []):
+        r = v.put("/api/platform/notifications", json=wrong)
+        assert r.status_code == 422 and len(r.json()["detail"].split()) >= 3, (wrong, r.text)
+    assert v.put("/api/platform/notifications", json={"follow": []}).json() == {**body, "follow": [], "email": True}
+    assert world.anon.get("/api/platform/notifications", headers=world.key(["sites:read"])).status_code == 403

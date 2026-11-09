@@ -593,7 +593,8 @@ def test_the_local_routes_are_mounted_through_program_routes(issued):
     from gridlytics import routes_local
     mine = {(r.path, m) for r in routes_local.router.routes for m in r.methods}
     assert mine == {("/api/local/session", "POST"), ("/api/local/refresh", "POST"), ("/api/local/logout", "POST"), ("/api/local/context", "GET"),
-                    ("/api/local/password", "POST")}
+                    ("/api/local/password", "POST"), ("/api/local/sessions", "GET"), ("/api/local/sessions/end", "POST"),
+                    ("/api/local/sessions/end-others", "POST")}
     # stage B4a mounts them, in local mode (the mode of the tests), as the program's other routes are
     assert {(r.path, m) for r in api.app.routes if getattr(r, "path", "").startswith("/api/local") for m in r.methods} == mine
     assert routes_local in api.PROGRAM_ROUTES

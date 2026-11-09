@@ -35,7 +35,7 @@ from pathlib import Path
 
 from . import auth, identity, store
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 #: An access token's life (Supabase's default, decisions-v2 section 1)
 ACCESS_MINUTES = 60
 #: A refresh token not used for this long has ended; a session ends this many days after its sign-in, however used (the cookie sessions' rules)
@@ -138,6 +138,11 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
         # a one-time password an administrator or the founder issued (plan Part 9.3; audit pages-A-02): the person chooses their own at the next sign-in.
         # _connect() has copied the file to backup/ before this runs
         con.execute("ALTER TABLE accounts ADD COLUMN must_change INTEGER NOT NULL DEFAULT 0")
+    if version < 3:
+        # where and when a session started, carried from token to token (UI-18 My account's sessions; audit role-analyst-32): the address and the browser
+        # of the sign-in, never shown to anyone but the person
+        for column, kind in (("started", "REAL"), ("address", "TEXT NOT NULL DEFAULT ''"), ("agent", "TEXT NOT NULL DEFAULT ''")):
+            con.execute(f"ALTER TABLE refresh_tokens ADD COLUMN {column} {kind}")
     con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -497,20 +502,26 @@ class Renewed(Exception):
     window that sent it takes the session the other one stored."""
 
 
-def _add_refresh(con: sqlite3.Connection, user_id: str, family: str, session_ends: float) -> str:
+#: The most of a browser's User-Agent kept for a session (My account shows it to the person)
+AGENT_CHARS = 200
+
+
+def _add_refresh(con: sqlite3.Connection, user_id: str, family: str, session_ends: float, started: float | None = None, address: str = "",
+                 agent: str = "") -> str:
     token = secrets.token_urlsafe(32)
     now = _clock()
-    con.execute("INSERT INTO refresh_tokens (token_hash, user_id, family, created, expires, session_ends) VALUES (?,?,?,?,?,?)",
-                (auth.token_hash(token), user_id, family, now, min(now + REFRESH_HOURS * 3600, session_ends), session_ends))
+    con.execute("INSERT INTO refresh_tokens (token_hash, user_id, family, created, expires, session_ends, started, address, agent) VALUES (?,?,?,?,?,?,?,?,?)",
+                (auth.token_hash(token), user_id, family, now, min(now + REFRESH_HOURS * 3600, session_ends), session_ends,
+                 started if started is not None else now, (address or "")[:64], " ".join(str(agent or "").split())[:AGENT_CHARS]))
     return token
 
 
-def new_refresh(user_id: str) -> str:
-    """The refresh token of a new session of an account (a sign-in), kept as its hash. The tokens of sessions past their last day go: nothing can renew
-    them, so the table holds a week of sessions, not every one ever made."""
+def new_refresh(user_id: str, address: str = "", agent: str = "") -> str:
+    """The refresh token of a new session of an account (a sign-in), kept as its hash, with the address and the browser (`agent`, its User-Agent) it was
+    made from. The tokens of sessions past their last day go: nothing can renew them, so the table holds a week of sessions, not every one ever made."""
     with _write() as con:
         con.execute("DELETE FROM refresh_tokens WHERE session_ends < ?", (_clock(),))
-        return _add_refresh(con, user_id, uuid.uuid4().hex, _clock() + SESSION_DAYS * 86400)
+        return _add_refresh(con, user_id, uuid.uuid4().hex, _clock() + SESSION_DAYS * 86400, address=address, agent=agent)
 
 
 def rotate_refresh(token: str) -> tuple[dict, str] | None:
@@ -536,7 +547,8 @@ def rotate_refresh(token: str) -> tuple[dict, str] | None:
             a = con.execute("SELECT * FROM accounts WHERE id = ?", (r["user_id"],)).fetchone()
             if a is not None and not a["disabled"]:
                 con.execute("UPDATE refresh_tokens SET used = ? WHERE token_hash = ?", (now, r["token_hash"]))
-                return _account(a), _add_refresh(con, a["id"], r["family"], r["session_ends"])
+                return _account(a), _add_refresh(con, a["id"], r["family"], r["session_ends"], r["started"] if r["started"] is not None else r["created"],
+                                                 r["address"], r["agent"])
     if raced:
         raise Renewed()
     return None
@@ -579,6 +591,33 @@ def session_ended(session: str | None) -> bool:
         return False
     with _read() as con:
         return con.execute("SELECT 1 FROM refresh_tokens WHERE family = ? AND revoked = 1 LIMIT 1", (family,)).fetchone() is not None
+
+
+def open_sessions(user_id: str) -> list[dict]:
+    """An account's open sessions, the last renewed first (UI-18 My account; audit role-analyst-32): each session's id, when it started, when it was last
+    renewed (`last_active`), when it ends unless renewed again (`ends`), all in unix seconds, and the address and browser it was signed in from. A session
+    is open while its newest refresh token is unused, not revoked and not past its time."""
+    now = _clock()
+    with _read() as con:
+        rows = con.execute("SELECT * FROM refresh_tokens WHERE user_id = ? AND revoked = 0 AND used IS NULL AND expires > ? AND session_ends > ? "
+                           "ORDER BY created DESC", (user_id, now, now)).fetchall()
+    out, seen = [], set()
+    for r in rows:
+        if r["family"] in seen or _family(r["family"]) is None:
+            continue
+        seen.add(r["family"])
+        out.append({"id": str(uuid.UUID(r["family"])), "started": r["started"] if r["started"] is not None else r["created"], "last_active": r["created"],
+                    "ends": r["expires"], "address": r["address"], "device": r["agent"]})
+    return out
+
+
+def end_other_sessions(user_id: str, keep: str | None) -> int:
+    """Every session of an account but the one `keep` names (the device asking) ends, and their access tokens with them: how many open ones ended."""
+    family = _family(keep) or ""
+    ended = sum(1 for s in open_sessions(user_id) if _family(s["id"]) != family)
+    with _write() as con:
+        con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0 AND family != ?", (user_id, family))
+    return ended
 
 
 def end_session_id(user_id: str, session: str | None) -> bool:

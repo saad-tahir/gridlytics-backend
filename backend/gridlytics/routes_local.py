@@ -7,6 +7,9 @@
                                                    access token sent, when one is
     GET  /api/local/context                     -> {profile, memberships, pending_invites_for_email}, the shape of Supabase's get_my_context
     POST /api/local/password  {current, new}    -> {changed: true, ...a new session}; every other session ends, and a one-time password is replaced
+    GET  /api/local/sessions                    -> {sessions: [{id, current, started, last_active, ends, address, device}]}, the person's open sessions
+    POST /api/local/sessions/end  {id}          -> {ended: 1}; one of the person's sessions ends (404 for an id that is not one of theirs)
+    POST /api/local/sessions/end-others         -> {ended: n}; every session of the person's but this one ends
 
 `expires_at` is in unix seconds. A refresh token travels only in a JSON body, never in a path or a query, which the access log keeps. The access token is
 identity.issue_local's (stage B1), signed with GRIDLYTICS_LOCAL_JWT_SECRET, for one hour.
@@ -70,6 +73,16 @@ def _person(request: Request) -> dict:
     return found
 
 
+def _agent(request: Request) -> str:
+    """The browser a session is signed in from, as its User-Agent says (My account shows it to the person: UI-18)."""
+    return request.headers.get("user-agent") or ""
+
+
+def _session_of(request: Request) -> str | None:
+    """The id of the session the request's access token belongs to (its `session_id`: platform.session_id)."""
+    return (getattr(getattr(request.state, "identity", None), "claims", None) or {}).get("session_id")
+
+
 def _refresh_token(inp: dict, needed: bool) -> str | None:
     token = inp.get("refresh_token")
     if (token is None and needed) or (token is not None and (not isinstance(token, str) or not 1 <= len(token) <= 200)):
@@ -100,7 +113,7 @@ def local_session(request: Request, inp: dict = Body(...)):
             auth.check_password(password, _dummy_hash)
         raise schemas.Refusal(401, _WRONG, "invalid_credentials")
     platformdb.record(platformdb.SIGNED_IN, email, address, account["id"])
-    return _session(account, platformdb.new_refresh(account["id"]))
+    return _session(account, platformdb.new_refresh(account["id"], address, _agent(request)))
 
 
 @router.post("/api/local/refresh")
@@ -158,4 +171,35 @@ def local_password(request: Request, inp: dict = Body(...)):
         _api._fail("The new password must be different from the current one")
     account = platformdb.set_password(me["id"], new)
     platformdb.record("changed their password", me["email"], address, me["id"])
-    return {"changed": True, **_session(account, platformdb.new_refresh(me["id"]))}
+    return {"changed": True, **_session(account, platformdb.new_refresh(me["id"], address, _agent(request)))}
+
+
+# ------------------------------------------------------------------------------------------------ the person's sessions (UI-18 My account; audit role-analyst-32)
+
+@router.get("/api/local/sessions")
+def local_sessions(request: Request):
+    """The signed-in person's open sessions, the last renewed first, the one of this request marked `current`: where (address, browser) and when each
+    started, when it was last renewed, and when it ends unless renewed again (unix seconds)."""
+    me = _person(request)
+    mine = _session_of(request)
+    return {"sessions": [{**s, "current": s["id"] == mine} for s in platformdb.open_sessions(me["id"])]}
+
+
+@router.post("/api/local/sessions/end")
+def local_session_end(request: Request, inp: dict = Body(...)):
+    """Sign out one of the person's sessions, by its id: its refresh tokens and its access tokens end at once. This device's own is ended by signing out."""
+    me = _person(request)
+    if set(inp) != {"id"} or not isinstance(inp.get("id"), str):
+        _api._fail("Send the id of the session to sign out, and nothing else")
+    if not platformdb.end_session_id(me["id"], inp["id"]):
+        raise schemas.Refusal(404, "That is not one of your open sessions", "not_found")
+    return {"ended": 1}
+
+
+@router.post("/api/local/sessions/end-others")
+def local_sessions_end_others(request: Request, inp: dict | None = Body(None)):
+    """Sign out every session of the person's but this one (UI-18): their refresh tokens and access tokens end at once; this device stays signed in."""
+    me = _person(request)
+    if inp:
+        _api._fail("Send nothing: every session but this one is signed out")
+    return {"ended": platformdb.end_other_sessions(me["id"], _session_of(request))}

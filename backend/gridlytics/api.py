@@ -125,7 +125,8 @@ PUBLIC_POSTS: set[str] = set()
 LOCAL_POSTS = {"/api/local/session", "/api/local/refresh", "/api/local/logout"}
 if identity.MODE == "local":
     PUBLIC_POSTS |= LOCAL_POSTS
-IDENTITY_PATHS = {"/api/auth/state", "/api/local/context", "/api/local/password", "/api/local/logout", "/api/local/refresh"}
+IDENTITY_PATHS = {"/api/auth/state", "/api/local/context", "/api/local/password", "/api/local/logout", "/api/local/refresh", "/api/local/sessions",
+                  "/api/local/sessions/end", "/api/local/sessions/end-others"}
 FOUNDER_PREFIX = "/api/founder/"
 #: A machine key reaches only its own site: the path's site id, when the path names one, must be the key's (plan Part 10.5)
 _SITE_IN_PATH = re.compile(r"^/api/(?:sites|edge)/([^/]+)")
