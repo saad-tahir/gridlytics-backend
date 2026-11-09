@@ -262,6 +262,10 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     base_served = np.where(g > 0.5, L, served_g0)
     u_dep = (g < 0.5) & (lmode == 1) & bool(gen) & (not off_grid)
     U_ub = np.where(u_dep, L, base_served)
+    # With the grid up a site cannot shed load on command (no Mode A or Mode B primitive does it; the meter simply imports), so a grid-up step
+    # may leave unserved only the load beyond what the connection and PV can carry: never load shed to hold the MDI or dodge a price, which a VoLL
+    # under the cost of the alternative made cheap (round 7, engine-optimiser-01: Rs 250 per kW-block against Rs 1,250 per kW of MDI)
+    U_ub = np.where(g > 0.5, np.maximum(0.0, L - float(p["G_max"]) - PV), U_ub)
     # in the threshold repair (the genset fixed, off-grid) a shortfall the tank leaves costs the same VoLL whenever it is shed, so a tie-break
     # (a ten-thousandth of VoLL, falling over the horizon) sheds it as late as it can be: after the battery has carried what it can, as the
     # battery-inverter does on site, not earlier with the battery above its cut-off
@@ -770,11 +774,12 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
         d = {}
         if hold[t]:
             r = "operator_hold"
+        elif U > 0.1:
+            # load the plan cannot serve: in an outage, at a site without a grid, or (the grid up) beyond the connection and PV
+            r = "unserved"
+            d = {"kw": round(U, 1), "grid": "up" if g[t] >= 0.5 else ("none" if p.get("off_grid") else "down")}
         elif g[t] < 0.5:
-            if U > 0.1:
-                r = "unserved"
-                d = {"kw": round(U, 1)}
-            elif P > 0.1:
+            if P > 0.1:
                 r = "genset_on"
                 d = {"kw": round(P, 1), "rs_per_kwh": round(_gen_marginal(gen), 1) if gen else None}
             elif D > 0.1:

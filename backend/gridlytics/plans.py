@@ -201,7 +201,9 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     p = {"T": steps, "ts": ts, "L": L, "Lhi": np.maximum(Lhi, L), "Lc": np.minimum(Lc, L), "PV": PV, "PVlo": np.minimum(PVlo, PV), "g": g,
          "p_start": p_start, "dur_steps": dur, "c_imp": vec["c_imp"], "c_exp": vec["c_exp"], "peak": vec["peak"], "in_month": in_month,
          "G_max": G_max, "X_max": X_max, "off_grid": off_grid, "load_mode": int(d.get("outage_load_mode", 0)),
-         "voll": float(d.get("voll_rs_per_kwh", 500)), "reserve_threshold": float((d.get("reserve_policy") or {}).get("p_threshold", 0.2)),
+         # lost load is never valued under the dearest import price of the horizon (round 7, engine-optimiser-01): a VoLL the site saved under it
+         # (the setting accepts 0) made a manual floor's slack and an outage's shortfall cheaper than the grid
+         "voll": max(float(d.get("voll_rs_per_kwh", 500)), float(np.max(vec["c_imp"])) if len(vec["c_imp"]) else 0.0), "reserve_threshold": float((d.get("reserve_policy") or {}).get("p_threshold", 0.2)),
          "icp": vec["icp"], "regime": regime}
     if vec["mdi"] and mtd:
         month_end = int(vec["billing_month_end_step"]) if "billing_month_end_step" in vec else (int(np.argmin(in_month)) if not in_month.all() else steps)
