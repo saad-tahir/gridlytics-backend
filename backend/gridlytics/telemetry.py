@@ -159,6 +159,8 @@ EARLIEST_TS = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
 AHEAD_S = 86400
 #: one CSV upload spans at most this many days: the import aggregates every day it fills
 UPLOAD_MAX_DAYS = 400
+#: the words loggers write for an on/off signal (grid_present, genset_running), read as 1 and 0 in a CSV
+FLAG_WORDS = {"on": "1", "off": "0", "true": "1", "false": "0", "yes": "1", "no": "0"}
 #: a CSV's rows are at most this many minutes apart (an hourly logger); rows further apart are refused, as no minute between them can be filled
 STEP_MAX_MIN = 60
 
@@ -320,7 +322,9 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
                file_name: str | None = None) -> dict:
     """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
     `duplicates` the rows dropped, both in the notes); rows 2 to 60 minutes apart are stored as the minutes each covers (`step_min`, `minutes`; see
-    ingest), rows further apart are refused; gaps over 5 minutes (or over the step) are reported.
+    ingest), rows further apart are refused; gaps over 5 minutes (or over the step) are reported. A file in which no row's grid_present (or
+    grid_voltage_v) can be read is refused; on and off, true and false, yes and no are read as 1 and 0. What may make the import wrong is listed in
+    `warnings` (also at the end of `log`), and the import's `status` is then "done_with_warnings", not "done".
 
     The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
     nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
@@ -356,6 +360,10 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         except (ValueError, TypeError, OverflowError):
             bad_ts += 1
             continue
+        for flag in ("grid_present", "genset_running"):
+            word = str(rec.get(flag) or "").strip().lower()
+            if word in FLAG_WORDS:
+                rec[flag] = FLAG_WORDS[word]
         if str(rec.get("genset_running") or "").strip() == "":
             rec.pop("genset_running", None)
         records.append(rec)
@@ -374,6 +382,21 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     if duplicates:
         log.append(f"{duplicates:,} row{'s repeat' if duplicates != 1 else ' repeats'} a minute that a later row of the file also gives: the last row "
                    f"of each minute was kept")
+    # grid_present is what the product sees outages by: a file in which no row's grid signal can be read is refused, and unreadable cells are a warning
+    warnings: list[str] = []
+    known = unreadable_grid = 0
+    for r in records:
+        grid, bad = _num(r.get("grid_present"))
+        if grid is not None or _num(r.get("grid_voltage_v"))[0] is not None:
+            known += 1
+        elif bad:
+            unreadable_grid += 1
+    if not known:
+        raise ValueError("No row's grid_present (or grid_voltage_v) can be read: write grid_present as 1 for grid on and 0 for grid off (on and off "
+                         "are read too) and upload again; the product cannot see outages without it")
+    if unreadable_grid:
+        warnings.append(f"{unreadable_grid:,} grid_present cell{'s' if unreadable_grid != 1 else ''} could not be read (1 is grid on, 0 is grid off): "
+                        f"the grid is stored as unknown in those minutes, so an outage in them is not seen")
     # the logger's interval: the most common step between rows, in whole minutes (the shorter on a tie). A 5- or 15-minute row is stored as the minutes it
     # starts (up to the next row), so its energy, the day's peak and its outage minutes are counted in full (audit R7)
     starts = [r["ts"] // 60 for r in records]
@@ -395,6 +418,8 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     if res.get("unreadable_cells"):
         log.append(f"{res['unreadable_cells']} cells were not finite numbers (text such as N/A, NaN or inf) or were beyond any meter's range "
                    f"(over a billion), and were stored as missing")
+    log += warnings  # the imports row keeps them with the notes; the answer also lists them apart
+    status = "done_with_warnings" if warnings else "done"
     digest = hashlib.sha256(content).hexdigest()[:16]
     first, last = records[0]["ts"], records[-1]["ts"]
     name = _file_name(file_name)
@@ -403,12 +428,12 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         iid = store.new_id()
         con.execute("INSERT INTO imports (id, site_id, source, file_hash, rows, gaps, status, log, created, from_ts, to_ts, file_name) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (iid, site_id, "csv", digest, len(records), gaps, "done", json.dumps(log), store._now(), first, last, name))
+                    (iid, site_id, "csv", digest, len(records), gaps, status, json.dumps(log), store._now(), first, last, name))
     filled_to = (r["ts"] // 60 * 60 + 60 * (n - 1) for r, n in zip(records, spans))  # a coarse row's last minute may fall on the next day
     for day in _local_days([r["ts"] for r in records] + list(filled_to)):  # only the days that received rows, not every day between the first and the last
         aggregate_day(site_id, day)
     return {"id": iid, "rows": len(records), "skipped": res["skipped"], "gaps": gaps, "log": log, "duplicates": duplicates, "minutes": res["accepted"],
-            "step_min": step, "overlap": res["overlap"],
+            "step_min": step, "overlap": res["overlap"], "warnings": warnings, "status": status,
             "from": datetime.fromtimestamp(first, timezone.utc).isoformat(), "to": datetime.fromtimestamp(last, timezone.utc).isoformat(),
             "from_ts": first, "to_ts": last, "file_name": name}
 

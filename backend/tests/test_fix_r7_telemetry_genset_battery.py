@@ -165,3 +165,36 @@ def test_rows_more_than_an_hour_apart_are_refused(company):
     with pytest.raises(ValueError, match="120 minutes apart"):
         telemetry.import_csv(sid, body, 5, now=NOW)
     assert telemetry.first_ts(sid) is None  # nothing stored
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-14: grid_present
+
+def test_grid_present_written_as_on_and_off_is_read(company):
+    sid = _site("Words")
+    rows = [(_local(T0 + 9 * 3600 + 60 * i), "OFF" if 10 <= i < 25 else "On", 50000) for i in range(60)]
+    res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), rows), 5, now=NOW)
+    assert not res["warnings"]
+    assert _day(sid)["outage_minutes"] == 15
+
+
+def test_a_file_whose_grid_present_cannot_be_read_is_refused(company):
+    sid = _site("Unreadable")
+    rows = [(_local(T0 + 9 * 3600 + 60 * i), "N/A", 50000) for i in range(60)]
+    with pytest.raises(ValueError, match="grid_present"):
+        telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), rows), 5, now=NOW)
+    blank = [(_local(T0 + 9 * 3600 + 60 * i), None, 50000) for i in range(60)]
+    with pytest.raises(ValueError, match="grid_present"):
+        telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), blank), 5, now=NOW)
+    assert telemetry.first_ts(sid) is None
+    # the grid voltage stands in where it can be read
+    volts = [(_local(T0 + 9 * 3600 + 60 * i), "N/A", 230, 50000) for i in range(60)]
+    res = telemetry.import_csv(sid, _file(("ts", "grid_present", "grid_voltage_v", "load_power_w"), volts), 5, now=NOW)
+    assert res["rows"] == 60
+
+
+def test_some_unreadable_grid_present_cells_are_a_warning(company):
+    sid = _site("Partly")
+    rows = [(_local(T0 + 9 * 3600 + 60 * i), "?" if i < 10 else 1, 50000) for i in range(60)]
+    res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), rows), 5, now=NOW)
+    assert any(w.startswith("10 grid_present cells could not be read") for w in res["warnings"]), res["warnings"]
+    assert res["status"] == "done_with_warnings" and telemetry.imports(sid)[0]["status"] == "done_with_warnings"
