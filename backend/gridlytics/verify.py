@@ -2224,10 +2224,9 @@ def switchback_result(site_id: str) -> dict:
     weeks = _switchback_weeks(blocks, today)
     out = {"blocks": blocks, "days": len(y), "carry_over_credits": credits, "arm_days": arm_days, "min_days_per_arm": SWITCHBACK_MIN_DAYS_PER_ARM,
            "excluded_days": excluded, "switchback_weeks": round(weeks, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL}
-    if tier == "monitor":  # it only recommends: its plan days are recommendation_only, never the plan in control
-        return {**out, "result": None, "result_withheld": "monitor_tier"}
     if min(arm_days.values()) < SWITCHBACK_MIN_DAYS_PER_ARM:
-        return {**out, "result": None, "result_withheld": "too_few_days"}
+        # a monitor-tier site only recommends: its plan days are recommendation_only, never the plan in control, so it never gets a result
+        return {**out, "result": None, "result_withheld": "monitor_tier" if tier == "monitor" else "too_few_days"}
     X, y = np.array(X), np.array(y)
     yn, yp = y[a == "native"], y[a == "plan"]
     unadj = float(np.mean(yn) - np.mean(yp))
