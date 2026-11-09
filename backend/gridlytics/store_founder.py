@@ -820,17 +820,9 @@ def remove_membership(user_id: str, company_id: str) -> tuple[dict, dict]:
 # ================================================================================================================ backups, per company
 
 def _backups_here() -> list[dict]:
-    """The current company's copies, newest first, each `modified` in UTC with its offset (list_backups gives the server's local time with none, which a
-    browser in another zone would misread, R-408)."""
-    out = []
-    for b in backups.list_backups():
-        try:
-            at = (backups.folder() / b["name"]).stat().st_mtime
-        except FileNotFoundError:               # pruned while being listed
-            continue
-        out.append({"name": b["name"], "kind": b["kind"], "modified": datetime.fromtimestamp(at, timezone.utc).isoformat(timespec="seconds"),
-                    "bytes": b["bytes"]})
-    return out
+    """The current company's copies, newest first (backups.list_backups): each with the telemetry copy and the signing keys taken with it, the sizes, and
+    `modified` in UTC with its offset (R-408)."""
+    return backups.list_backups()
 
 
 def _file(company_id: str):

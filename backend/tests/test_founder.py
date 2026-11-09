@@ -724,7 +724,9 @@ def test_backups_are_per_company_and_reachable_only_by_the_founder(fdb):
     first = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))
     assert first["made"] and first["made"].startswith(cid) and [b["name"] for b in first["backups"]] == [first["made"]]
     backup = first["backups"][0]
-    assert set(backup) == {"name", "kind", "modified", "bytes"} and backup["kind"] == "manual" and backup["bytes"] > 0
+    # a copy is the workspace, its telemetry and its signing keys (round 7, audit founder-console-12)
+    assert set(backup) == {"name", "kind", "modified", "bytes", "workspace_bytes", "telemetry", "telemetry_bytes", "keys"}
+    assert backup["kind"] == "manual" and backup["bytes"] > 0
     assert datetime.fromisoformat(backup["modified"]).utcoffset().total_seconds() == 0
     for _ in range(backups.KEEP_MANUAL + 1):
         made_now = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))

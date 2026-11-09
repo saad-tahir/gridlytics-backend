@@ -1,5 +1,6 @@
-"""Round 7 (the end-to-end audit), the founder console: a short session secret is refused, and its session ends on the server. One test per audit
-finding; the finding's id is in each test's docstring."""
+"""Round 7 (the end-to-end audit), the founder console: its session ends on the server, a short session secret is refused, and a company's backups are
+listed, copied, pruned and restored as one set (workspace, telemetry and signing keys), with a restore script that exists. One test per audit finding;
+the finding's id is in each test's docstring."""
 from __future__ import annotations
 
 import hashlib
@@ -8,16 +9,19 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from gridlytics import founder
+from gridlytics import backups, delivery, founder, sites, store, telemetry
 from gridlytics import platform as platformdb
-from test_founder import (PASSWORD, SESSION_SECRET, _audit, _client, _code, _ok, _sentence, clock, fdb)  # noqa: F401  (fixtures)
+from test_founder import (PASSWORD, SESSION_SECRET, _audit, _client, _code, _company, _console, _ok, _sentence, clock, fdb)  # noqa: F401  (fixtures)
 
 REPO = Path(__file__).resolve().parents[2]
+SCRIPT = REPO / "scripts" / "restore_backup.py"
 
 
 def _headers(token: str) -> dict:
@@ -152,3 +156,164 @@ def test_a_new_password_seen_first_by_a_sign_in_ends_the_old_sessions_but_not_th
     fresh = _ok(c.post("/api/founder/login/code", json={"challenge": challenge, "code": _code()}))["token"]
     assert _ok(c.get("/api/founder/session", headers=_headers(fresh)))["authenticated"]
     assert c.get("/api/founder/session", headers=_headers(old)).status_code == 401
+
+
+# ================================================================== the backups: one set per copy
+
+def _company_with_data(c) -> tuple[str, Path]:
+    """A company whose file holds a site, its telemetry a minute of data, and its keys folder a signing key."""
+    cid = _company(c)["company"]["id"]
+    path = platformdb.company_file(cid)
+    with store.use_company(path):
+        site = sites.create({"name": "Mill A"}, "test")["id"]
+        telemetry.write_rows([(site, 1_800_000_000, 12_000.0)], columns=("site_id", "ts", "pv_power_w"))
+        delivery.public_key(site)
+    return cid, path
+
+
+def _site_names(path: Path) -> list[str]:
+    with store.use_company(path):
+        return [s["name"] for s in sites.listing()]
+
+
+def _minutes(path: Path) -> int:
+    with closing(sqlite3.connect(store.telemetry_path(path))) as con:
+        return con.execute("SELECT COUNT(*) FROM minute").fetchone()[0]
+
+
+def _keys(path: Path) -> list[str]:
+    folder = platformdb.data_dir() / "keys" / path.stem
+    return sorted(f.name for f in folder.iterdir()) if folder.exists() else []
+
+
+def test_a_copy_lists_its_telemetry_its_keys_and_their_whole_size_and_is_pruned_as_one(fdb):
+    """founder-console-12: the list hid each copy's telemetry file (and its size), and the telemetry copies were never pruned."""
+    c = _console()
+    cid, path = _company_with_data(c)
+    listed = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))["backups"]
+    assert len(listed) == 1
+    one = listed[0]
+    folder = backups.folder(path)
+    workspace, tele = folder / one["name"], folder / one["telemetry"]
+    assert one["telemetry"] == one["name"].replace(f"{cid}-", f"{cid}-telemetry-", 1) and tele.is_file()
+    assert one["workspace_bytes"] == workspace.stat().st_size and one["telemetry_bytes"] == tele.stat().st_size
+    assert one["bytes"] == one["workspace_bytes"] + one["telemetry_bytes"]
+    assert one["keys"] == 1 and len(_keys(path)) == 1
+    assert datetime.fromisoformat(one["modified"]).utcoffset().total_seconds() == 0
+    # the manual copies beyond KEEP_MANUAL go with their telemetry and their keys
+    for _ in range(backups.KEEP_MANUAL):
+        _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))
+    left = {f.name for f in folder.iterdir()}
+    assert one["name"] not in left and one["telemetry"] not in left and not any(n.endswith(one["name"][len(cid) + 1:-3]) for n in left)
+    assert len([n for n in left if "-telemetry-" in n]) == backups.KEEP_MANUAL
+    assert len([n for n in left if "-keys-" in n]) == backups.KEEP_MANUAL
+
+
+def test_the_backup_list_says_its_times_in_utc(fdb):
+    """frontend-states-formats-17: backups.list_backups wrote the server's local time with no zone, which a browser reads as UTC."""
+    c = _console()
+    cid, path = _company_with_data(c)
+    _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))
+    with store.use_company(path):
+        listed = backups.list_backups()
+    assert listed and all(datetime.fromisoformat(b["modified"]).utcoffset().total_seconds() == 0 for b in listed)
+
+
+def test_a_restore_puts_back_the_workspace_its_telemetry_and_its_keys_together(fdb):
+    """founder-console-01: backups.restore put back only the workspace file, leaving telemetry (and the signing keys) out of step with it."""
+    c = _console()
+    cid, path = _company_with_data(c)
+    copy = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))["made"]
+    key_before = _keys(path)
+    # after the copy: another site, more telemetry, and the signing key lost (a folder moved without it)
+    with store.use_company(path):
+        site = sites.create({"name": "Mill B"}, "test")["id"]
+        telemetry.write_rows([(site, 1_800_000_060 + 60 * i, 9_000.0) for i in range(5)], columns=("site_id", "ts", "pv_power_w"))
+    for f in (platformdb.data_dir() / "keys" / path.stem).iterdir():
+        f.unlink()
+    assert _site_names(path) == ["Mill A", "Mill B"] or sorted(_site_names(path)) == ["Mill A", "Mill B"]
+    assert _minutes(path) == 6 and _keys(path) == []
+    with store.use_company(path):
+        done = backups.restore(copy)
+    assert _site_names(path) == ["Mill A"] and _minutes(path) == 1 and _keys(path) == key_before
+    assert done["workspace"] == copy and done["telemetry"] == copy.replace(f"{cid}-", f"{cid}-telemetry-", 1) and done["keys"] == 1
+    # the files as they were are kept first, as one set too
+    with store.use_company(path):
+        points = [b for b in backups.list_backups() if b["kind"] == "restore point"]
+    assert [p["name"] for p in points] == [done["restore_point"]] and points[0]["telemetry"]
+    with closing(sqlite3.connect(backups.folder(path) / points[0]["telemetry"])) as con:
+        assert con.execute("SELECT COUNT(*) FROM minute").fetchone()[0] == 6
+    # a telemetry copy, or a name of no copy, is not restored
+    with store.use_company(path):
+        for name in (done["telemetry"], "nothing.db", "../platform.db"):
+            with pytest.raises(FileNotFoundError):
+                backups.restore(name)
+
+
+def test_a_copy_made_with_no_telemetry_restores_an_empty_telemetry_file(fdb):
+    """founder-console-01: a copy taken before the company had telemetry leaves no later minute behind when it is put back."""
+    c = _console()
+    cid = _company(c)["company"]["id"]
+    path = platformdb.company_file(cid)
+    with store.use_company(path):
+        site = sites.create({"name": "Mill A"}, "test")["id"]
+    copy = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))["backups"][0]
+    assert copy["telemetry"] is None and copy["telemetry_bytes"] == 0 and copy["keys"] == 0
+    with store.use_company(path):
+        telemetry.write_rows([(site, 1_800_000_000, 1.0)], columns=("site_id", "ts", "pv_power_w"))
+        backups.restore(copy["name"])
+    assert _minutes(path) == 0
+
+
+def _script(data: Path, *args: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "GRIDLYTICS_DATA_DIR": str(data)}
+    return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=str(REPO), env=env, capture_output=True, text=True, timeout=180)
+
+
+def test_the_restore_script_the_backups_page_names_exists_and_restores_a_company(fdb):
+    """founder-console-01: the Backups page said to run scripts/restore_backup.py, which did not exist."""
+    assert SCRIPT.is_file()
+    c = _console()
+    cid, path = _company_with_data(c)
+    made = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))
+    copy, when = made["made"], made["backups"][0]["modified"]
+    with store.use_company(path):
+        sites.create({"name": "Mill B"}, "test")
+    data = platformdb.data_dir()
+    listed = _script(data, "--company", cid)
+    assert listed.returncode == 0, listed.stderr
+    assert copy in listed.stdout and "Pakistan time" in listed.stdout and "MB" in listed.stdout
+    pkt = datetime.fromisoformat(when).astimezone(timezone(timedelta(hours=5)))          # the copy's time in Pakistan time, as the page says it
+    assert pkt.strftime("%Y-%m-%d %H:%M") in listed.stdout
+    companies = _script(data)
+    assert companies.returncode == 0 and cid in companies.stdout and "Boxlytics Internal" in companies.stdout
+    done = _script(data, "--company", "Boxlytics Internal", copy)
+    assert done.returncode == 0, done.stderr
+    assert "telemetry" in done.stdout and "restore point" in done.stdout
+    assert _site_names(path) == ["Mill A"] and _minutes(path) == 1
+    for args in (("--company", cid, "no-such-copy.db"), ("--company", "No such company")):
+        refused = _script(data, *args)
+        assert refused.returncode == 2 and refused.stderr.strip() and "Traceback" not in refused.stderr, refused.stderr
+
+
+def test_the_restore_script_refuses_while_the_launcher_holds_the_data_folder(fdb):
+    """founder-console-01: restoring under a running server would put files back under its feet; the launcher's lock on the folder refuses it."""
+    c = _console()
+    cid, path = _company_with_data(c)
+    copy = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))["made"]
+    data = platformdb.data_dir()
+    key = hashlib.sha256(os.path.normcase(str(data.resolve())).encode("utf-8")).hexdigest()[:20]
+    lock = open(Path(tempfile.gettempdir()) / f"gridlytics-data-{key}.lock", "a+b")
+    try:
+        try:                                                                       # as the launcher takes it (start_local.hold)
+            import msvcrt
+        except ImportError:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        refused = _script(data, "--company", cid, copy)
+    finally:
+        lock.close()
+    assert refused.returncode == 2 and "stop" in refused.stderr.lower(), refused.stderr
