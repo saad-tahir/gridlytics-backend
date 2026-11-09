@@ -532,3 +532,36 @@ def test_a_ticked_plan_never_plans_grid_up_energy_under_the_delivered_floor(comp
     assert min(x["soc_pct"] for x in up) >= 20.0 - 0.05
     assert min(s["soc_floor_pct"] for d in out["slots"]["days"] for s in d["slots"]) >= 20.0
 
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-09 (engine half)
+
+def test_the_dispatch_stays_within_the_inverters_ac_rating():
+    """PV to AC plus battery discharge, less charge, stays within the inverter's kW AC both ways: before, a 50 kW inverter passed PV 163 kW and
+    a 76 kW charge, and the plan counted on it."""
+    q = _problem(peak=(40, 56))
+    q["PV"] = np.zeros(q["T"])
+    q["PV"][20:40] = 163.0
+    q["PVlo"] = np.minimum(q["PVlo"], q["PV"])
+    q["inverter_kw_ac"] = 50.0
+    q["battery"]["E0"] = 20.0
+    rq = optimise.solve(q)
+    assert rq["status"] == "optimal"
+    s = rq["sol"]
+    ac = (q["PV"] - s["K"]) + s["D"] - s["C"]
+    assert float(np.max(ac)) <= 50.0 + 1e-6
+    assert float(np.min(ac)) >= -50.0 - 1e-6
+    assert float(np.max(s["D"][40:56])) <= 50.0 + 1e-6
+    assert float(np.max(s["U"])) < 1e-6                                # the grid carries what the inverter cannot
+
+
+def test_build_problem_reads_the_inverters_ac_rating(company):
+    sid = _site()
+    full = sites.full(sid)
+    t0 = twin.day_start_utc(date(2026, 11, 3))
+    p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 96)
+    assert p.get("inverter_kw_ac") is None                             # no inverter on record: no limit
+    sites.put_asset(sid, "inverter", {"brand": "deye", "kw_ac": 50}, "t")
+    full = sites.full(sid)
+    p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 96)
+    assert p["inverter_kw_ac"] == pytest.approx(50.0)
+

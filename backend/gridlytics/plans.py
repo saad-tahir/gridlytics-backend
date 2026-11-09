@@ -223,7 +223,9 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
          # lost load is never valued under the dearest import price of the horizon (round 7, engine-optimiser-01): a VoLL the site saved under it
          # (the setting accepts 0) made a manual floor's slack and an outage's shortfall cheaper than the grid
          "voll": max(float(d.get("voll_rs_per_kwh", 500)), float(np.max(vec["c_imp"])) if len(vec["c_imp"]) else 0.0), "reserve_threshold": float((d.get("reserve_policy") or {}).get("p_threshold", 0.2)),
-         "icp": vec["icp"], "regime": regime}
+         "icp": vec["icp"], "regime": regime,
+         # PV and the battery reach the AC side through the inverter: its kW AC bounds both, and the reserve (round 7, engine-plans-live-06)
+         "inverter_kw_ac": (float(a["inverter"]["kw_ac"]) if (a.get("inverter") or {}).get("kw_ac") else None)}
     if vec["mdi"] and mtd:
         month_end = int(vec["billing_month_end_step"]) if "billing_month_end_step" in vec else (int(np.argmin(in_month)) if not in_month.all() else steps)
         p["mdi"] = {"rate": vec["mdi"]["rate_rs_per_kw"], "M0": mtd["M0"], "floor": vec["mdi"]["floor_kw"], "n_mdi": vec["mdi"]["interval_steps"],

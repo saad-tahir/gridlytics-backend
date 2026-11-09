@@ -267,7 +267,10 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     # With the grid up a site cannot shed load on command (no Mode A or Mode B primitive does it; the meter simply imports), so a grid-up step
     # may leave unserved only the load beyond what the connection and PV can carry: never load shed to hold the MDI or dodge a price, which a VoLL
     # under the cost of the alternative made cheap (round 7, engine-optimiser-01: Rs 250 per kW-block against Rs 1,250 per kW of MDI)
-    U_ub = np.where(g > 0.5, np.maximum(0.0, L - float(p["G_max"]) - PV), U_ub)
+    # (PV reaches the AC side only through the inverter: never more than its kW AC, round 7)
+    inv_ac = float(p["inverter_kw_ac"]) if p.get("inverter_kw_ac") else None
+    pv_ac = np.minimum(PV, inv_ac) if inv_ac is not None else PV
+    U_ub = np.where(g > 0.5, np.maximum(0.0, L - float(p["G_max"]) - pv_ac), U_ub)
     # in the threshold repair (the genset fixed, off-grid) a shortfall the tank leaves costs the same VoLL whenever it is shed, so a tie-break
     # (a ten-thousandth of VoLL, falling over the horizon) sheds it as late as it can be: after the battery has carried what it can, as the
     # battery-inverter does on site, not earlier with the battery above its cut-off
@@ -507,6 +510,17 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 vals.append(-(L[t] - Lc[t]))
                 m.row([U[t], u[t]], [1, -(L[t] - Lc[t])], ub=Lc[t], name=f"unserved_cap[{t}]")
         m.row(cols, vals, rhs, rhs, f"balance[{t}]")
+    # ---------------------------------------------------------------- the inverter's AC rating
+    if inv_ac is not None:
+        # PV reaches the AC side and the battery discharges through the same inverter, and grid or genset charging comes back through it: the
+        # net flow (PV - K) + D - C stays within its kW AC both ways (round 7, flow-onboarding-09's engine half: a 50 kW inverter passed PV 163 kW
+        # and a 76 kW charge)
+        for t in range(T):
+            cols, vals = [K[t]], [-1.0]
+            if bat:
+                cols += [D[t], C[t]]
+                vals += [1.0, -1.0]
+            m.row(cols, vals, lb=-inv_ac - float(PV[t]), ub=inv_ac - float(PV[t]), name=f"inverter_ac[{t}]")
     # ---------------------------------------------------------------- MDI
     mdi = p.get("mdi")
     M_idx = []
