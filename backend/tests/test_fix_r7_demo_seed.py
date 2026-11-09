@@ -55,6 +55,15 @@ def _marks(sid: str) -> list[tuple]:
         return [tuple(r) for r in con.execute("SELECT day_local, plan_id, by, method FROM applied WHERE site_id = ? ORDER BY day_local", (sid,))]
 
 
+# ------------------------------------------------------------------------------------------------ the farm is off grid (engine-plans-live-20)
+
+def test_the_demo_farm_records_that_it_is_off_grid(company):
+    ids = demo.create_sites("t")
+    farm = next(sites.full(i) for i in ids if "farm" in sites.full(i)["name"].lower())
+    assert farm["connections"] == [] and farm["data"]["off_grid"] is True        # before: False, at a site with no grid connection
+    assert all(sites.full(i)["data"]["off_grid"] is False for i in ids if i != farm["id"])
+
+
 # ------------------------------------------------------------------------------------------------ outages run past midnight (role-operator-29)
 
 def test_an_outage_running_at_midnight_goes_on_into_the_next_day(company):

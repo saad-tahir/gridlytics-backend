@@ -78,7 +78,7 @@ DEMO_SITES = [
     {"key": "farm",
      "site": {"name": "Rahim Yar Khan farm (demo)", "city": "Rahim Yar Khan", "address": "Chak 92", "lat": 28.42, "lon": 70.3, "disco": None,
               "site_type": "farm", "genset_start_control": "manual", "outage_load_mode": 1, "critical_load_kw": [8.0] * 24, "control_mode": "advisory",
-              "notes": "Off-grid tube-well and cold store; tank-level metering."},
+              "off_grid": True, "notes": "Off-grid tube-well and cold store; tank-level metering."},
      "extra": {"load_peak_kw": 42, "twin": {}},
      "connection": None,
      "assets": {"pv": {"kwp_dc": 80, "kw_ac": 70}, "inverter": {"brand": "voltronic", "model": "Axpert MKS x6", "kw_ac": 66},
