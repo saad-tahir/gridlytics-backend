@@ -676,12 +676,16 @@ def _record_send(site_id: str, plan_id: str, msg: dict) -> None:
 def _release_message(site_id: str, rel: dict, record: bool = True) -> dict:
     """A signed release while control is paused or released to native: the same keys as a plan message, no slots and no steps, and a
     `release` block; the edge runs the inverter's native settings until the override ends and a fresh plan is issued (Part 7.3)."""
-    site = sites.get(site_id) or {"data": {}}
+    site = sites.full(site_id) or {"data": {}}
     floor = float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
+    bms_low = ((site.get("assets") or {}).get("battery") or {}).get("soc_min", 0.1) * 100
     now = store._now()
+    # at most 48 h after issue, as every message (U3 3.2; the override's own end is in `release.until`): the edge then runs on_expiry, native too
+    until = min(datetime.fromisoformat(rel["until"].replace("Z", "+00:00")), datetime.fromisoformat(now.replace("Z", "+00:00")) + timedelta(hours=48))
     body = {"contract": delivery.CONTRACT, "type": "release", "plan_id": None, "site_id": site_id, "issued_at": now, "valid_from": now,
-            "valid_until": rel["until"], "timezone": "Asia/Karachi", "mode": "b" if site["data"].get("control_mode") == "mode_b" else "a",
-            "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": floor, "revert_after_hours": delivery.FALLBACK_HOURS},
+            "valid_until": until.isoformat(timespec="seconds"), "timezone": "Asia/Karachi",
+            "mode": "b" if site["data"].get("control_mode") == "mode_b" else "a",
+            "fallback": delivery.fallback_block(site, floor, bms_low),
             "mode_a": {"days": []}, "mode_b": None,
             "notes": {"reason": {"control_paused": "Control paused", "released_to_native": "Released to native"}[rel["reason"]]},
             "release": {"reason": rel["reason"], "until": rel["until"], "by": rel["author"]}}

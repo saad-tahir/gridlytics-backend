@@ -419,3 +419,59 @@ def test_compare_with_native_burns_the_plans_genset_hours_not_the_whole_slots(wo
     arms = world.c["admin"].get(f"/api/sites/{world.site}/plan/compare").json()["compare"]
     assert 28.0 <= arms["plan"]["litres"] <= 36.0, arms["plan"]           # 50 L before: the set ran through the whole outage
 
+
+# ------------------------------------------------------------------------------------------------ the fallback block (pages-B-13, engine-delivery-14, tracker-and-docs-05)
+
+def _export_site(sid: str = "s1", version: int | None = 2, regime: str = "net_billing", cap_kw: float = 50.0) -> dict:
+    return {"id": sid, "tier": "advisory_writes", "assets": {}, "data": {},
+            "connections": [{"data": {"regime": regime, "sanctioned_load_kw": 400, "export_cap_kw": cap_kw, "mdi_interval_min": 30}}],
+            "native": {"version": version, "body": {"work_mode": "self_use", "backup_soc_pct": 20.0}} if version else None}
+
+
+def test_the_mode_a_fallback_block_has_no_revert_timer_and_names_the_capture_and_the_export_floor():
+    """Part 7.1 step 6 and DLV-03 (marked done): on_expiry, min_soc_floor_pct, max_export_w_floor and native_settings_ref, and no revert timer (a
+    keyed Deye or Growatt table persists; the 1,800-second revert is Mode B's). The block was {on_expiry, min_soc_floor_pct, revert_after_hours: 3}."""
+    steps = _day_of([("hold_for_outage", 96, 0.0, 0.0)])
+    fb = delivery.compile_mode_a(steps, "deye", SMALL, 20.0, 10.0, None, site=_export_site())["fallback"]
+    assert fb == {"on_expiry": "inverter_native", "on_link_loss_after_s": 300, "min_soc_floor_pct": 20.0, "max_export_w_floor": 50_000,
+                  "native_settings_ref": "s1:v2"}
+    bare = delivery.compile_mode_a(steps, "growatt", SMALL, 25.0)["fallback"]                    # no site: nothing licensed, no capture known
+    assert "revert_after_hours" not in bare and bare["max_export_w_floor"] == 0 and bare["native_settings_ref"] is None
+    gross = delivery.compile_mode_a(steps, "deye", SMALL, 20.0, 10.0, None, site=_export_site(regime="gross_metering", version=None))["fallback"]
+    assert gross["max_export_w_floor"] == 0 and gross["native_settings_ref"] is None              # export only at a licensed connection
+    assert not hasattr(delivery, "FALLBACK_HOURS")
+
+
+def test_the_fallback_floor_is_never_below_the_bms_low_cap_plus_two_or_ten_and_no_slot_is_below_it():
+    """R6 I2: max(BMS low cap + 2, the owner's reserve, 10). A reserve of 5 % gave a fallback floor of 5 while the slots were clamped to 12."""
+    steps = _day_of([("hold_for_outage", 40, 0.0, 0.0), ("discharge_peak_window", 56, 0.0, 15.0)], soc0=40.0)
+    comp = delivery.compile_mode_a(steps, "deye", SMALL, 5.0, 10.0)
+    assert comp["fallback"]["min_soc_floor_pct"] == 12.0
+    assert min(s["soc_floor_pct"] for d in comp["days"] for s in d["slots"]) >= 12.0
+    low = delivery.compile_mode_a(steps, "deye", SMALL, 5.0, 3.0)
+    assert low["fallback"]["min_soc_floor_pct"] == 10.0                                         # never below 10
+    assert min(s["soc_floor_pct"] for d in low["days"] for s in d["slots"]) >= 10.0             # 5 before: below the block's own floor
+
+
+def test_a_plan_its_signed_message_and_a_release_carry_the_same_block_and_a_release_runs_at_most_48_hours(company):
+    from datetime import datetime
+
+    from test_fix_optimiser import _until
+
+    from gridlytics import plans, sites
+    sid = sites.create({"name": "Net-billing mill", "disco": "LESCO", "critical_load_kw": [20.0] * 24}, "t")["id"]
+    sites.put_connection(sid, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400, "regime": "net_billing", "export_cap_kw": 50}, "t")
+    sites.put_asset(sid, "pv", {"kwp_dc": 200, "kw_ac": 180}, "t")
+    sites.put_asset(sid, "battery", {"nameplate_kwh": 200, "p_ch_kw": 100, "p_dis_kw": 100}, "t")
+    sites.capture_native(sid, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 20}, "t")
+    r = plans.tick(sid, steps=96)
+    assert r["status"] == "active"
+    fb = r["slots"]["fallback"]
+    assert "revert_after_hours" not in fb and fb["max_export_w_floor"] == 50_000 and fb["native_settings_ref"] == f"{sid}:v1"
+    assert plans.signed_message(sid, record=False)["fallback"] == fb
+    sites.add_override(sid, {"kind": "force_native", "until": _until(72), "reason": "test"}, "t")
+    rel = plans.signed_message(sid, record=False)
+    assert rel["type"] == "release" and rel["fallback"] == fb
+    iso = lambda x: datetime.fromisoformat(x.replace("Z", "+00:00")).timestamp()
+    assert iso(rel["valid_until"]) - iso(rel["issued_at"]) <= 48 * 3600 + 1                      # U3 3.2: 72 h before (the override's end)
+    assert rel["release"]["until"] == sites.overrides(sid)[0]["until_ts"]                       # the override's own end is still said

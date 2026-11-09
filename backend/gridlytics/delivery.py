@@ -45,7 +45,43 @@ BRANDS = {
     "other": {"label": "Generic", "max_slots": 6, "layout": "generic six-slot table", "ring": False, "min_slot_minutes": 30,
               "fields": ["slot", "start", "end", "mode", "soc_pct"], "table_writes_per_day": 3, "mdi_primitive": False},
 }
-FALLBACK_HOURS = 3
+#: R6 I6: after this many seconds without the cloud (five missed 60-second heartbeats) the edge flags the site unattended and keeps executing the
+#: cached plan to its valid_until; only then does it fall back
+LINK_LOSS_AFTER_S = 300
+#: R6 I2's lowest absolute floor (per cent)
+FLOOR_MIN_PCT = 10.0
+
+
+def fallback_floor(fallback_floor_pct: float, bms_low_pct: float = 10.0) -> float:
+    """The absolute floor of a plan's fallback block and of every slot (R6 I2, Part 7.1 step 5): the larger of the BMS low cap + 2, the reserve the
+    owner set and 10 %."""
+    return float(max(bms_low_pct + 2, fallback_floor_pct, FLOOR_MIN_PCT))
+
+
+def export_floor_w(site: dict | None) -> int:
+    """The export cap that holds in every slot and in fallback (R6 I3), in W: the licensed export limit at a net-billing or legacy net-metering
+    connection (build_problem's X_max), else 0."""
+    conns = (site or {}).get("connections") or []
+    d = (conns[0].get("data") or {}) if conns else {}
+    return int(round(float(d.get("export_cap_kw") or 0.0) * 1000)) if d.get("regime") in ("net_billing", "net_metering_legacy") else 0
+
+
+def native_ref(site: dict | None) -> str | None:
+    """The native-settings capture the fallback restores, "site_id:vN" (`sites.native_settings_ref` names (site_id, version), Part 3.2); None
+    before a capture."""
+    nat = (site or {}).get("native") or {}
+    return f"{site['id']}:v{nat['version']}" if site and site.get("id") and nat.get("version") is not None else None
+
+
+def fallback_block(site: dict | None, fallback_floor_pct: float, bms_low_pct: float = 10.0) -> dict:
+    """The fallback block of a plan or a release (Part 7.1 step 6, U3 3.4, R6 I2 to I4 and I6): on expiry the inverter's native settings (the
+    capture `native_settings_ref` names), never below `min_soc_floor_pct` and never exporting above `max_export_w_floor`; after
+    `on_link_loss_after_s` without the cloud an edge keeps executing the cached plan to its valid_until. No revert timer: a keyed Deye or Growatt
+    table persists and repeats daily (Part 7.1 step 6 makes the table itself safe to repeat), and the 1,800-second revert belongs to Mode B's
+    volatile setpoints (`mode_b`'s refresh block). Part 7.1's opening line still says 'revert after 3 hours'; step 6 and DLV-03 are the rule."""
+    return {"on_expiry": "inverter_native", "on_link_loss_after_s": LINK_LOSS_AFTER_S,
+            "min_soc_floor_pct": fallback_floor(fallback_floor_pct, bms_low_pct), "max_export_w_floor": export_floor_w(site),
+            "native_settings_ref": native_ref(site)}
 
 
 def cap_held(brand: str, tier: str | None) -> bool:
@@ -124,7 +160,7 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
     for i, s in enumerate(steps):
         by_day.setdefault(datetime.fromtimestamp(s["t"], PKT).date().isoformat(), []).append(i)
     days = []
-    lo = max(bms_low_pct + 2, fallback_floor_pct)
+    lo = fallback_floor(fallback_floor_pct, bms_low_pct)  # no slot below the fallback block's own floor (step 5)
     for day, idx in by_day.items():
         runs = []
         for i in idx:
@@ -263,8 +299,7 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
             if mdi_cap_kw and not held and _translate_mdi(slots[-1], span, battery, float(mdi_cap_kw), lo):
                 slots[-1]["intent"] = _intent_words(mode, slots[-1]["soc_floor_pct"], target)
         days.append({"date": day, "slots": slots})
-    out = {"brand": brand, "grammar": gram, "days": days, "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": fallback_floor_pct,
-                                                                       "revert_after_hours": FALLBACK_HOURS}}
+    out = {"brand": brand, "grammar": gram, "days": days, "fallback": fallback_block(site, fallback_floor_pct, bms_low_pct)}
     # the battery's own limits, for the brands that key a power once for the table, or a power where a slot has none (Deye's self-use program)
     b = battery or {}
     out["limits"] = {"max_charge_w": round(b["P_ch"] * 1000) if b.get("P_ch") else None,
