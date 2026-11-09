@@ -95,3 +95,32 @@ def test_an_operator_saves_the_equipment_without_the_money_settings_it_cannot_se
     # a figure other than the form's default is a change, and a change is still an administrator's
     r = op.put(f"/api/sites/{sid}/assets/battery", json={"nameplate_kwh": 220, "p_ch_kw": 100, "p_dis_kw": 100, "replacement_cost_per_kwh": 40000})
     assert r.status_code == 403 and "administrator" in r.json()["detail"]
+
+
+# ------------------------------------------------------------------------------------------------ role-viewer-19
+
+def _saving_day(saving: float, litres: float) -> dict:
+    return {"saving_rs": saving, "claimed_rs": saving, "levers": {"peak_window": saving}, "fidelity": "confirmed", "litres_saved": litres,
+            "actual": {"cost_rs": 30000.0, "litres": 40.0, "peak_kw": 180.0}, "baseline": {"cost_rs": 30000.0 + saving, "litres": 40.0 + litres},
+            "peak_kw_actual": 180.0, "peak_kw_baseline": 190.0, "mdi_rate": 0.0, "unserved_kwh_actual": 0.0, "unserved_kwh_baseline": 0.0}
+
+
+def test_a_viewer_reads_the_litres_saved_and_the_verified_days_but_no_rupee(world):
+    from gridlytics import money, store
+    sid = world.site
+    with world.use(), store.connect() as con:
+        for day, (saving, litres) in {"2026-11-02": (4321.0, 12.5), "2026-11-03": (2345.0, 7.5)}.items():
+            for base in ("native", "tuned"):
+                con.execute("INSERT OR REPLACE INTO savings_days (site_id, day_local, baseline, data, computed) VALUES (?,?,?,?,?)",
+                            (sid, day, base, json.dumps(_saving_day(saving, litres)), store._now()))
+    url = f"/api/sites/{sid}/savings?start=2026-11-01&end=2026-11-05"
+    mine = world.c["admin"].get(url).json()
+    assert mine["baselines"]["native"]["saving_rs"] == 6666.0
+    seen = world.c["viewer"].get(url).json()
+    assert seen["hidden_for_role"] is True
+    native = seen["baselines"]["native"]
+    assert (native["litres_saved"], native["verified_days"]) == (20.0, 2)
+    assert seen["final_conditions"]["verified_days"] == 2
+    assert [(d["day"], d["litres_actual"], d["litres_native"]) for d in seen["days"]] == [("2026-11-02", 40.0, 52.5), ("2026-11-03", 40.0, 47.5)]
+    assert {k for k in _keys(seen) if money.is_money(k)} == set()
+    assert not {4321.0, 2345.0, 6666.0, 30000.0} & {v for d in seen["days"] for v in d.values()} and "6666" not in json.dumps(seen)
