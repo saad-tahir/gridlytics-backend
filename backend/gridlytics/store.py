@@ -6,7 +6,8 @@ telemetry file beside its workspace file, `<stem>-telemetry.db` (`telemetry_path
 
 The context functions, the WAL-once rule, the copy before a migration and BEGIN IMMEDIATE under one lock are lifted from solarlytics-backend at c853130
 (store.py lines 33-131, 475-526, 956-990, 1402-1420; DESIGN_LOG first section). The schema is Gridlytics' own: version 1 holds the four tables the lifted
-package needs (members, role_presets, api_keys, audit) and the EMS tables of plan Part 3.2; version 2 adds reports.preliminary.
+package needs (members, role_presets, api_keys, audit) and the EMS tables of plan Part 3.2; version 2 adds reports.preliminary; version 5 (round 7)
+reports.generated_by.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ DEFAULT_ORG = "default"
 _ORG: ContextVar[str] = ContextVar("gridlytics_org", default=DEFAULT_ORG)
 _DB: ContextVar[Path | None] = ContextVar("gridlytics_db", default=None)
 _ACTOR: ContextVar[dict | None] = ContextVar("gridlytics_actor", default=None)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 _lock = threading.Lock()
 
 
@@ -205,6 +206,9 @@ _V1 = [
 
 #: Version 2 (round 3): a report keeps whether its figures were preliminary when it was made (NULL for a report made before, and for the daily sheet)
 _V2_COLUMNS = (("reports", "preliminary", "INTEGER"),)
+#: Version 5 (round 7, audit pages-D-25; 3 and 4 are other round-7 packages', renumbered when they are merged): a report keeps who generated it
+#: ('' for a report made before)
+_V5_COLUMNS = (("reports", "generated_by", "TEXT NOT NULL DEFAULT ''"),)
 
 
 def _migrate(con: sqlite3.Connection, version: int) -> None:
@@ -213,6 +217,10 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
             con.execute(sql)
     if version < 2:
         for table, column, kind in _V2_COLUMNS:
+            if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    if version < 5:
+        for table, column, kind in _V5_COLUMNS:
             if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 

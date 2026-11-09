@@ -1132,3 +1132,35 @@ def test_only_the_newest_copies_of_a_report_are_kept(world, monkeypatch):
         acts = [r["detail"] for r in store.list_audit() if r["action"].startswith("generated a")]
         assert any(d.get("replaced") == [made[1]["id"]] for d in acts), acts
 
+
+# ------------------------------------------------------------------------------------------------ pages-D-25
+
+def test_each_report_says_who_generated_it(world):
+    sid, month = world.site, _past_month()
+    r = world.c["analyst"].post("/api/reports", json={"kind": "energy_only", "site_id": sid, "period": month})
+    assert r.status_code == 200 and r.json()["generated_by"] == "Analyst", r.text
+    rows = world.c["viewer"].get("/api/reports").json()
+    assert [x["generated_by"] for x in rows] == ["Analyst"], rows
+    with world.use():
+        acts = [x["detail"] for x in store.list_audit() if x["action"].startswith("generated a")]
+    assert acts and acts[0]["report"] == r.json()["id"], acts
+
+
+def test_a_workspace_file_of_schema_2_gains_the_reports_generated_by_column(tmp_path, monkeypatch):
+    import sqlite3
+    from contextlib import closing
+    from gridlytics import reports
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(tmp_path))
+    path = tmp_path / "old.db"
+    with closing(sqlite3.connect(path)) as con, con:
+        for sql in store._V1:
+            con.execute(sql)
+        con.execute("ALTER TABLE reports ADD COLUMN preliminary INTEGER")
+        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, status, preliminary) VALUES "
+                    "('r1','s','energy_only','2026-10','2026-11-02T10:00:00+00:00','h','done',0)")
+        con.execute("PRAGMA user_version = 2")
+    with store.use_company(path):
+        rows = reports.listing()
+        with store.connect() as con:
+            assert con.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION > 2
+    assert rows[0]["generated_by"] == "" and rows[0]["preliminary"] is False, rows     # not recorded before

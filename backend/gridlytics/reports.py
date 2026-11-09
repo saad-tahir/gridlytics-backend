@@ -965,9 +965,10 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     csv_path.write_text(doc.buf.getvalue(), encoding="utf-8", newline="")  # the csv writer ends rows with CRLF already: no blank line between rows
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()[:16]
     with store.connect() as con:
-        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?)", (rid, site_id, kind, period, store._now(), h, str(pdf_path), str(csv_path), "done",
-                                                     None if prelim is None else int(prelim)))
+        # who generated it, for the list's "By" column (audit pages-D-25)
+        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary, generated_by) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rid, site_id, kind, period, store._now(), h, str(pdf_path), str(csv_path), "done",
+                                                       None if prelim is None else int(prelim), str(by or "")[:120]))
     replaced = _prune(kind, site_id, period)
     store.audit(by, f"generated a {kind.replace('_', ' ')} report", site_id, {"period": period, "report": rid, **({"replaced": replaced} if replaced else {})})
     return get(rid)
@@ -1000,8 +1001,9 @@ def _prune(kind: str, site_id: str, period: str) -> list[str]:
 def _row_out(r) -> dict:
     """A report row as the API answers it (never its files' paths). `preliminary` is what the PDF said: true or false for a monthly report, null for the
     daily operations sheet; a monthly report made before it was kept (schema version 2) reads true when its month was not over when it was made, else
-    null (not known)."""
+    null (not known). `generated_by` is who generated it, "" for a report made before it was kept (schema version 5)."""
     d = {k: v for k, v in dict(r).items() if k not in ("pdf_path", "csv_path")}
+    d["generated_by"] = d.get("generated_by") or ""
     p = d.get("preliminary")
     if p is not None:
         d["preliminary"] = bool(p)
