@@ -304,3 +304,44 @@ def test_only_an_administrator_loads_the_demo_sites(world, monkeypatch):
         r = world.c[role].post("/api/demo")
         assert r.status_code == 403, (role, r.text)                          # before: an operator loaded them (edit_sites)
     assert world.c["admin"].post("/api/demo").status_code == 200 and len(calls) == 1
+
+
+# ------------------------------------------------------------------------------------------------ the account seed (tracker-and-docs-21)
+
+def test_the_seed_names_only_templates_the_repository_holds_and_they_are_a_valid_list(capsys):
+    with pytest.raises(SystemExit):
+        seed_demo.main(["--help"])
+    named = set(re.findall(r"demo/[\w.-]+\.csv", seed_demo.__doc__ + capsys.readouterr().out))
+    assert named >= {"demo/companies.template.csv", "demo/users.template.csv"}
+    missing = [n for n in named if not (seed_demo.ROOT / n).is_file()]
+    assert missing == []                                                     # before: neither template was in the repository
+    companies, people = seed_demo.read_list(seed_demo.ROOT / "demo/companies.template.csv", seed_demo.ROOT / "demo/users.template.csv")
+    assert companies and {p["company_role"] for p in people} >= {"owner", "member"}
+    assert {p["role"] for p in people if p["company_role"] != "owner"} == {"operator", "analyst", "viewer"}
+
+
+def test_running_the_seed_again_keeps_what_the_first_run_made(tmp_path, monkeypatch):
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(tmp_path))
+    out = tmp_path / "ACCOUNTS.md"
+    first = seed_demo.seed(out=out)
+    text = out.read_text(encoding="utf-8")
+    env = (tmp_path / seed_demo.ENV_NAME).read_text(encoding="utf-8")
+    companies = sorted((c["id"], c["name"], c["seats"]) for c in platformdb.list_companies())
+    accounts = sorted((a["id"], a["email"]) for a in (platformdb.account_by_email(p["email"]) for p in seed_demo.DEMO_PEOPLE))
+    assert len(first["accounts"]) == len(seed_demo.DEMO_PEOPLE) and len(companies) == len(seed_demo.DEMO_COMPANIES)
+    again = seed_demo.seed(out=out)
+    assert again["accounts"] == [] and again["memberships"] == [] and not any(c["made"] for c in again["companies"])
+    assert sorted(again["kept"]) == sorted(p["email"] for p in seed_demo.DEMO_PEOPLE) and again["unknown"] == []
+    assert sorted((c["id"], c["name"], c["seats"]) for c in platformdb.list_companies()) == companies
+    assert sorted((a["id"], a["email"]) for a in (platformdb.account_by_email(p["email"]) for p in seed_demo.DEMO_PEOPLE)) == accounts
+    pw = lambda t: sorted(re.findall(r"^\|.*?\| `([^`|]+@[^`|]+)` \| `([^`|]+)` \|", t, re.M))
+    assert pw(out.read_text(encoding="utf-8")) == pw(text) and len(pw(text)) == len(seed_demo.DEMO_PEOPLE)  # the same passwords listed again
+    assert (tmp_path / seed_demo.ENV_NAME).read_text(encoding="utf-8") == env                            # the founder's login kept
+    # the demo sites already in the demo company are kept, not built a second time
+    row = next(c for c in platformdb.list_companies() if c["name"] == seed_demo.DEMO_COMPANIES[0]["name"])
+    with store.use_company(platformdb.company_file(row)):
+        made = demo.create_sites("t")
+    monkeypatch.setattr(demo, "load", lambda *a, **k: pytest.fail("the demo sites were built again"))
+    seed_demo.load_demo_sites(2)
+    with store.use_company(platformdb.company_file(row)):
+        assert sorted(s["id"] for s in demo.demo_sites()) == sorted(made)

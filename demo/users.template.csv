@@ -1,0 +1,5 @@
+email,name,company,company_role,role
+owner@example.com,Company Owner,Your Company,owner,
+operator@example.com,Site Operator,Your Company,member,operator
+analyst@example.com,Energy Analyst,Your Company,member,analyst
+viewer@example.com,Plant Viewer,Your Company,member,viewer
