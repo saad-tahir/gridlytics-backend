@@ -51,6 +51,11 @@ def sample_minutes(known) -> int:
     return int(min(STEP_S // 60, max(1, round(float(np.median(np.diff(idx)))))))
 
 
+def _local_midnight(ts: int) -> int:
+    """The start (UTC epoch seconds) of the Pakistan-time day that holds ts."""
+    return int((int(ts) + 5 * 3600) // 86400 * 86400 - 5 * 3600)
+
+
 def step_times(t0: int, steps: int = STEPS) -> np.ndarray:
     return t0 + STEP_S * np.arange(steps, dtype=np.int64)
 
@@ -71,14 +76,17 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
     lat, lon = site["data"].get("lat", 31.5), site["data"].get("lon", 74.3)
     months = solar.local_month(t)
     cs = _mean15(lambda x: solar.pv_power(x, lat, lon, pv_asset, 1.0, months), t)
-    # history: the last 14 days of measured PV against the clear-sky model, by day
-    h0 = t0 - 14 * 86400
+    # history: the 14 whole local days before t0's own day, measured PV against the clear-sky model, by day. The slices run from local midnight to
+    # local midnight, so every tick of a day fits the same days; 24-hour blocks from the tick's time of day would mix one day's afternoon with the
+    # next day's morning and pull the ratio and the fan towards the mean through the day. The grid runs on to t0 for the last hour's blend below.
+    h0 = _local_midnight(t0) - 14 * 86400
     g = telemetry.minute_grid(site["id"], h0, t0)
     days_ok, k_days, pr = 0, [], None
+    fit = slice(0, 14 * 1440)
     iv = sample_minutes(g["present"])  # sample counts in minutes of data, so a 5- or 15-minute source qualifies as a 1-minute one does
-    if g["present"].sum() * iv > 3 * 600:
-        csm = solar.pv_power(g["ts"], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"]))
-        pvm = g["pv"]
+    if g["present"][fit].sum() * iv > 3 * 600:
+        csm = solar.pv_power(g["ts"][fit], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"][fit]))
+        pvm = g["pv"][fit]
         for d in range(14):
             sl = slice(d * 1440, (d + 1) * 1440)
             ok = ~np.isnan(pvm[sl]) & (csm[sl] > 0.2 * pv_asset["kw_ac"])
