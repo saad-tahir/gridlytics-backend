@@ -110,6 +110,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     bat, gen = p.get("battery"), p.get("genset")
     lmode = int(p.get("load_mode", 0))
     W, forced, rm_floor = None, np.zeros(T, dtype=bool), {}
+    e_gap_idx, e_gap_price = None, 0.0
     dump_ok = forced
     thr_t: list[int] = []
     thr_w: dict[int, int] = {}
@@ -360,6 +361,22 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                     m.row([E[t + 1], y], [1, -(Elo - lb_)], lb=lb_, name=f"floor_rec_e[{t}]")
                 if b_ == T:
                     rec_last = y_of[int(hour[T - 1])]
+        # a start under the cut-off itself (E0 < soc_min, after native operation or an outage) recovers once too, as EMHASS's single-recovery rows
+        # do (R2 3.5; round 7, engine-optimiser-04): z = 1 once the battery is back at soc_min, monotone over the whole horizon (grid up or down:
+        # the BMS keeps a battery under its cut-off from discharging), one per clock hour; while z = 0 there is no discharge, so the state of
+        # charge only moves towards the band, and from then on soc_min binds. Before, min(soc_min, E0) bounded every step, so a plan starting
+        # at 5 % could discharge to 5 % again in the evening peak, and Mode B was told it may
+        if E0 < Emin - 1e-9:
+            hour = np.asarray(p["ts"], dtype=np.int64)[:T] // 3600
+            keys = list(dict.fromkeys(int(h) for h in hour))
+            zv = m.var("cut_rec", len(keys), 0, 1, 0.0, integer=True)
+            z_of = {k: int(zv[j]) for j, k in enumerate(keys)}
+            for j in range(1, len(keys)):
+                m.row([zv[j], zv[j - 1]], [1, -1], lb=0, name=f"cut_rec_order[{j}]")
+            for t in range(T):
+                z = z_of[int(hour[t])]
+                m.row([D[t], z], [1, -float(bat["P_dis"])], ub=0, name=f"cut_rec_dis[{t}]")
+                m.row([E[t + 1], z], [1, -(Emin - E0)], lb=E0, name=f"cut_rec_e[{t}]")
         # reserve (soft, expected value): rows only where the grid is up and an outage may start next, and none where the next step is itself a
         # modelled outage (g = 0): its balance rows already price that outage's shortfall (genset fuel or lost load), which is never charged
         # twice (Part 4.3; round 7, engine-optimiser-09: the step before a scheduled window paid about 0.9 c_short on top)
@@ -493,16 +510,27 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         term = p.get("terminal") or {}
         v_end = max(0.0, bat["eta_d"] * term.get("c_next", 0.0) - c_cyc - term.get("c_cal_hold", 0.0))
         E_use = m.var("E_use", 1, 0, bat["P_dis"] * term.get("H_peak", 4.0) + term.get("R_next", 0.0), -v_end)[0]
+        # the terminal value values stored energy, it imposes no floor (round 7, engine-optimiser-03): E_use >= 0 made E[T] >= soc_min a hard
+        # row, so a battery that started under its cut-off with nothing to recharge it (grid charging off and no PV surplus, or a charge block
+        # to the horizon's end) made the tick infeasible, and the relaxed retry too. Such a start ends under the cut-off only by `E_gap`, priced
+        # a rupee above the dearest kWh the horizon could store (EMHASS's soft terminal condition, R2 3.5), so it recovers whenever anything
+        # can recharge it, and with nothing to it holds what it has, with no credit
+        tail = []
+        if E0 < Emin - 1e-9:
+            dear = float(np.max(np.asarray(p["c_imp"])[:T])) if (T and not off_grid) else float(p.get("c_short", voll))
+            e_gap_price = dear / bat["eta_c"] + 1.0
+            e_gap_idx = m.var("E_gap", 1, 0, Emin - E0, e_gap_price)[0]
+            tail = [e_gap_idx]
         # the next peak uses only the energy above the floor the table holds with the grid up (round 7, engine-delivery-02); a horizon that
         # ends in an outage keeps the cut-off, and one that ends in a run still under the floor counts above the floor once it is recovered
         if T and g[T - 1] > 0.5 and Elo > Emin + 1e-9:
             if rec_last is None:
-                m.row([E_use, E[T]], [1, -1], ub=-Elo, name="terminal")
+                m.row([E_use, E[T]] + tail, [1, -1] + [-1] * len(tail), ub=-Elo, name="terminal")
             else:
-                m.row([E_use, E[T], rec_last], [1, -1, Elo - Emin], ub=-Emin, name="terminal")
+                m.row([E_use, E[T], rec_last] + tail, [1, -1, Elo - Emin] + [-1] * len(tail), ub=-Emin, name="terminal")
                 m.row([E_use, rec_last], [1, -float(m.ub[E_use])], ub=0, name="terminal_recovered")
         else:
-            m.row([E_use, E[T]], [1, -1], ub=-Emin, name="terminal")
+            m.row([E_use, E[T]] + tail, [1, -1] + [-1] * len(tail), ub=-Emin, name="terminal")
     # ---------------------------------------------------------------- the set's surplus and the battery, with the grid down
     if gen and bat and SURPLUS_ROWS and gen_surplus.any() and not thr_t:
         # Two rows the balance implies on a grid-down step (no import, no export) once the set's state is 0 or 1, written out because the
@@ -661,6 +689,9 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     out["v_end"] = v_end if bat else 0.0
     # the energy the terminal value credits (the next peak's use, above the grid-up floor and under its cap), and that floor in kWh
     out["E_use"] = float(x[E_use]) if bat else 0.0
+    # a start under the cut-off that ends under it: the kWh short of soc_min at the horizon's end and their price (engine-optimiser-03)
+    out["E_gap"] = float(x[e_gap_idx]) if e_gap_idx is not None else 0.0
+    out["E_gap_price"] = e_gap_price
     out["E_floor_grid"] = Elo if bat else 0.0
     out["breakdown"] = _breakdown(p, sol, out)
     out["reasons"] = explain(p, sol, out)
@@ -873,6 +904,8 @@ def _breakdown(p: dict, s: dict, out: dict) -> dict:
     # the credit the objective takes: v_end times E_use, the energy above the floor the next peak can use and never above its cap (round 7,
     # engine-delivery-02; before, every kWh above the cut-off was credited, past the cap)
     terminal = -float(out.get("v_end", 0.0) * out.get("E_use", 0.0)) if bat else 0.0
+    # and a start under the cut-off that ends under it pays for the kWh short of it (round 7, engine-optimiser-03)
+    terminal += float(out.get("E_gap_price", 0.0) * out.get("E_gap", 0.0)) if bat else 0.0
     return {"energy_rs": round(energy, 2), "genset_rs": round(genset, 2), "wear_rs": round(wear, 2), "mdi_rise_rs": round(mdi, 2),
             "unserved_rs": round(unserved, 2), "expected_shortfall_rs": round(reserve, 2), "terminal_credit_rs": round(terminal, 2),
             "litres": round(float(np.sum(s["F"])), 2), "import_kwh": round(float(np.sum(s["G"]) * H), 2), "export_kwh": round(float(np.sum(s["X"]) * H), 2),

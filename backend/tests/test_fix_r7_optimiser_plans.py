@@ -802,3 +802,59 @@ def test_genset_off_is_named_at_the_sites_threshold_with_its_chance():
     p["reserve_threshold"] = 0.2
     r = optimise.solve(p)
     assert r["reasons"][10]["reason"] == "idle"
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-03, engine-optimiser-04
+
+def _under_cut_off(p, E0=10.0):
+    """A battery that starts under its own cut-off: 5 % against soc_min 10 % (after native operation or an outage)."""
+    p["battery"]["E0"] = E0
+    return p
+
+
+def test_a_start_under_the_cut_off_that_nothing_can_recharge_is_planned_never_infeasible():
+    """The terminal row forced E[T] >= soc_min, so a battery under its cut-off with no charge source (grid charging off and no sun, or a charge
+    block to the horizon's end) made every tick infeasible, and the relaxed retry too: it holds what it has instead, with no terminal credit."""
+    p = _under_cut_off(_problem())
+    p["battery"]["a_grid"] = False
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    assert float(np.max(r["sol"]["D"])) < 1e-6
+    assert float(np.min(r["sol"]["E"])) >= 10.0 - 1e-6
+    assert r["E_use"] == pytest.approx(0.0, abs=1e-6)
+    # golden: the end state under the cut-off is the terminal term, 10 kWh short at a rupee over the dearest stored kWh (Rs 60 / 0.95)
+    assert r["breakdown"]["terminal_credit_rs"] == pytest.approx(10.0 * (60.0 / 0.95 + 1.0), abs=0.05)
+    blocked = _under_cut_off(_problem())
+    blocked["battery"]["charge_block"] = np.ones(blocked["T"], dtype=bool)
+    r = optimise.solve_with_policy(blocked)
+    assert r["status"] == "optimal" and r["relaxed"] is False
+    assert float(np.max(r["sol"]["D"])) < 1e-6
+
+
+def test_a_start_under_the_cut_off_recovers_to_it_once_and_the_band_binds_from_then_on():
+    """min(soc_min, E0) was every step's lower bound, so a plan starting at 5 % charged off-peak and discharged into the evening peak down to
+    5 % again (Mode B was then told it may). As EMHASS's single recovery (R2 3.5): until the battery is back at soc_min it does not discharge,
+    and from then on soc_min binds."""
+    p = _under_cut_off(_problem())
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    E, D = r["sol"]["E"], r["sol"]["D"]
+    assert float(np.sum(D[72:88])) > 1.0                               # it still discharges in the peak
+    back = next(t for t in range(p["T"] + 1) if E[t] >= 20.0 - 1e-6)
+    assert all(D[t] < 1e-6 for t in range(back))                      # no discharge before it is back at the cut-off
+    assert float(np.min(E[back:])) >= 20.0 - 1e-6                     # and never under it again
+    assert float(E[-1]) >= 20.0 - 1e-6
+    from gridlytics import delivery
+    steps = plans._steps_out(p, r, {"outage": {"p_down": np.zeros(p["T"])}})
+    floors = [b["soc_floor_pct"] for b in delivery.mode_b(steps)["steps"]]
+    assert min(floors[back:]) >= 10.0 - 1e-9                          # Mode B is never told to go under the cut-off once it is back
+
+
+def test_a_start_under_the_cut_off_recovers_even_where_cycling_does_not_pay():
+    """At flat prices nothing pays for a cycle, yet a battery left under its cut-off is recharged to it (the end state under the cut-off is priced
+    above the dearest kWh the horizon could store), and without a peak it then holds there."""
+    p = _under_cut_off(_problem(peak=(0, 0)))
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    assert float(r["sol"]["E"][-1]) >= 20.0 - 1e-6
+    assert float(np.max(r["sol"]["D"])) < 1e-6
