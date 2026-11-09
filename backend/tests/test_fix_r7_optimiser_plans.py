@@ -976,6 +976,10 @@ def test_sigma_over_15_points_asks_the_plan_for_one_charge_to_the_top_and_the_al
     text = dict(st["alerts"])["sigma_high"]
     assert "re-anchor" not in text and "will ask" not in text
     assert "charges the battery to 95 % once" in text
+    # the problem says it is asked for; only a live tick puts it to the solve (a past day's hindsight bound, verify._bound, never)
+    t0 = now // 900 * 900
+    p = plans.build_problem(sites.full(sid), t0, forecast.issue(sites.full(sid), t0, save=False), 96)
+    assert p["battery_state"]["anchor_soc_pct"] == pytest.approx(95.0) and "anchor_soc" not in p["battery"]
     out = plans.tick(sid, at=now, save=False)
     assert out["status"] == "active"
     assert out["summary"]["battery_state"]["anchor_soc_pct"] == pytest.approx(95.0)

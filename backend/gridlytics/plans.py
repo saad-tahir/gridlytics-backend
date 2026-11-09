@@ -294,14 +294,6 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         p["battery_state"] = {"soc_pct": round(soc * 100, 1), "sigma_pct": bs.get("sigma_pct"), "age_min": age,
                               "stale": bool(bs.get("stale", True)) if bs.get("soc_pct") is not None else True,
                               "anchor_soc_pct": bs.get("anchor_soc_pct") if bs.get("anchor_due") else None}
-        if bs.get("anchor_due") and bs.get("anchor_soc_pct"):
-            # the battery service asks for a charge to the pack's top to re-anchor its estimate (round 7, engine-optimiser-15; R6 5.7). The first
-            # plan that schedules it fixes when (`anchor_by`, kept by tick): re-planned every 15 minutes, a charge that costs the same tonight as
-            # tomorrow night would otherwise move to the later night every time and never happen
-            bat["anchor_soc"] = float(bs["anchor_soc_pct"]) / 100.0
-            by = (site.get("state") or {}).get("anchor_by")
-            if by and int(by) > t0:
-                bat["anchor_by"] = int(by)
         if floor_pct.any():
             # every manual floor (a caller that drops the overrides drops this key), and its two parts
             p["reserve_manual"] = floor_pct / 100.0 * e_nom
@@ -448,6 +440,20 @@ def _keep_observed_outage(site_id: str, t0: int, now: int, bundle: dict, prior: 
     return {**bundle, "outage": {**out, "g": g_old[:n], "p_down": np.maximum(np.asarray(out["p_down"], dtype=float), pd_old[:n]), "observed": old}}
 
 
+def _ask_anchor(site: dict, p: dict, t0: int) -> None:
+    """The charge to the pack's top the battery service asks for to re-anchor its estimate (round 7, engine-optimiser-15; R6 5.7), put to a live
+    tick's problem (a hindsight solve of a past day, verify._bound, builds the problem without it). The first active plan that schedules it fixes
+    when (`anchor_by` in the site's state): re-planned every 15 minutes, a charge that costs the same tonight as tomorrow night would otherwise
+    move to the later night every time and never happen."""
+    bat, bs = p.get("battery"), p.get("battery_state") or {}
+    if not bat or not bs.get("anchor_soc_pct"):
+        return
+    bat["anchor_soc"] = float(bs["anchor_soc_pct"]) / 100.0
+    by = (site.get("state") or {}).get("anchor_by")
+    if by and int(by) > t0:
+        bat["anchor_by"] = int(by)
+
+
 def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = True, time_limit: float = 10.0) -> dict:
     site = sites.full(site_id)
     if site is None:
@@ -462,6 +468,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     # a pause or a release to native is read before the solve, so a failed solve while one is in force still ends the pre-pause plan
     release = control_release(site_id, t0)
     p = build_problem(site, t0, bundle, steps)
+    _ask_anchor(site, p, t0)
     res = optimise.solve_with_policy(p, time_limit=time_limit)
     if res.get("sol") is not None and len(res["sol"]["G"]) != p["T"]:
         p = optimise.shorten(p, len(res["sol"]["G"]))  # the relaxed retry solved a shorter horizon: steps, slots and the guard follow it
@@ -530,7 +537,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
             con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, solve_s, objective_rs, plan_id) VALUES (?,?,?,?,?,?,?,?,?)",
                         (site_id, _iso(t0), started, store._now(), status, reason or res["status"], res["solve_seconds"], res["objective_rs"], plan_id))
         active = plan_id if status == "active" else (None if release else site.get("state", {}).get("active_plan"))
-        # the anchor charge's deadline (see build_problem): set by the first active plan that schedules one, dropped once none is asked for
+        # the anchor charge's deadline (see _ask_anchor): set by the first active plan that schedules one, dropped once none is asked for
         anchor = {}
         by = (site.get("state") or {}).get("anchor_by")
         if (p.get("battery") or {}).get("anchor_soc") and res.get("anchor"):
