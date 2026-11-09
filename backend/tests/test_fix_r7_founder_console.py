@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,7 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import identities
-from gridlytics import backups, delivery, founder, identity, sites, store, telemetry
+from gridlytics import backups, delivery, founder, identity, sites, store, store_members, telemetry
 from gridlytics import platform as platformdb
 from test_founder import (OWNER, PASSWORD, SESSION_SECRET, _audit, _client, _code, _company, _console, _ok, _sentence, clock, fdb)  # noqa: F401  (fixtures)
 
@@ -468,3 +469,81 @@ def test_the_companies_list_counts_the_sites_a_switch_off_takes_out_of_closed_lo
     box = _ok(c.get("/api/founder/companies"))["companies"][0]
     assert box["sites"] == 3 and box["sites_closed_loop"] == 1
     assert _ok(c.post(f"/api/founder/companies/{cid}/access", json={"enabled": False}))["company"]["sites_closed_loop"] == 1
+
+
+def test_a_company_is_archived_with_a_last_copy_and_brought_back(fdb):
+    """founder-console-13: a test company or a departed customer could not be removed, only switched off, and stayed in every list and count for good.
+    Archiving switches it off, takes a last copy of its files, and leaves it out of the overview's figures; it is listed as archived (the page hides it
+    until asked), cannot be switched on while archived, and can be brought back. Nothing of its data is deleted."""
+    c = _console()
+    cid, path = _company_with_data(c)
+    owner = platformdb.account_by_email(OWNER["email"])
+    _company(c, "Development", {"email": "dev@localhost", "name": "Local Tester", "password": "dev first password 1"})
+    for body in ({}, {"archived": "yes"}, {"archived": True, "note": "x"}):
+        r = c.post(f"/api/founder/companies/{cid}/archive", json=body)
+        assert r.status_code == 422 and _sentence(r), (body, r.text)
+    assert c.post(f"/api/founder/companies/{uuid.uuid4()}/archive", json={"archived": True}).status_code == 404
+    done = _ok(c.post(f"/api/founder/companies/{cid}/archive", json={"archived": True}))
+    company = done["company"]
+    assert company["archived"] is True and company["enabled"] is False and company["disabled_reason"] == "Archived"
+    copies = _ok(c.get(f"/api/founder/companies/{cid}/backups"))["backups"]
+    assert done["made"] == copies[0]["name"] and copies[0]["kind"] == "before archiving" and copies[0]["telemetry"] and copies[0]["keys"] == 1
+    assert _site_names(path) == ["Mill A"]                                                    # nothing of its data is gone
+    r = _as(owner).get("/api/sites")
+    assert r.status_code == 403 and r.json()["code"] == "company_disabled"
+    r = c.post(f"/api/founder/companies/{cid}/access", json={"enabled": True})
+    assert r.status_code == 409 and "archive" in r.json()["detail"] and _sentence(r)
+    rows = {x["name"]: x for x in _ok(c.get("/api/founder/companies"))["companies"]}
+    assert rows["Boxlytics Internal"]["archived"] is True and rows["Development"]["archived"] is False
+    view = _ok(c.get("/api/founder/overview"))
+    assert view["companies"] == {"total": 1, "on": 1, "off": 0, "archived": 1}
+    # archiving it again changes nothing and makes no second copy
+    assert _ok(c.post(f"/api/founder/companies/{cid}/archive", json={"archived": True}))["made"] is None
+    back = _ok(c.post(f"/api/founder/companies/{cid}/archive", json={"archived": False}))["company"]
+    assert back["archived"] is False and back["enabled"] is False
+    _ok(c.post(f"/api/founder/companies/{cid}/access", json={"enabled": True}))
+    _ok(_as(owner).get("/api/sites"))
+    actions = [e["action"] for e in _audit()]
+    assert actions.index("brought a company back from the archive") < actions.index("archived a company")
+    assert actions.count("archived a company") == 1
+    assert _audit()[actions.index("archived a company")]["detail"] == {"switched_off": True, "copy": done["made"]}
+
+
+def test_an_account_is_archived_disabled_with_its_seats_freed_and_brought_back(fdb):
+    """founder-console-13: a departed person's account could only be disabled, and kept its seats and its place in every list. Archiving disables it,
+    frees its seats in its companies and leaves it out of the overview's figures; it cannot be enabled while archived, and can be brought back."""
+    c = _console()
+    made = _company(c, seats=2)
+    cid, owner = made["company"]["id"], made["owner"]
+    _ok(_as(owner).get("/api/sites"))
+    sunia = _person(c, "sunia@meow.test", "Sunia Ahmed", cid)
+    _ok(_as(sunia).get("/api/sites"))
+    assert _ok(c.get("/api/founder/companies"))["companies"][0]["seats_taken"] == 2
+    for body in ({}, {"archived": 1}, {"archived": True, "leave_without_owner": "yes"}, {"archived": True, "name": "x"}):
+        r = c.post(f"/api/founder/users/{sunia['id']}/archive", json=body)
+        assert r.status_code == 422 and _sentence(r), (body, r.text)
+    assert c.post(f"/api/founder/users/{uuid.uuid4()}/archive", json={"archived": True}).status_code == 404
+    user = _ok(c.post(f"/api/founder/users/{sunia['id']}/archive", json={"archived": True}))["user"]
+    assert user["archived"] is True and user["disabled"] is True
+    assert _as(sunia).get("/api/sites").status_code == 401
+    assert _ok(c.get("/api/founder/companies"))["companies"][0]["seats_taken"] == 1                  # her seat is free
+    with store.use_company(platformdb.company_file(cid)):
+        assert store_members.member(sunia["id"])["disabled_reason"] == "account archived"
+    r = c.patch(f"/api/founder/users/{sunia['id']}", json={"disabled": False})
+    assert r.status_code == 409 and "archive" in r.json()["detail"] and _sentence(r)
+    view = _ok(c.get("/api/founder/overview"))
+    assert view["accounts"] == {"total": 1, "disabled": 0, "archived": 1} and view["memberships"]["active"] == 1
+    users = {u["email"]: u for u in _ok(c.get("/api/founder/users"))["users"]}
+    assert users["sunia@meow.test"]["archived"] is True and users[OWNER["email"]]["archived"] is False
+    # the company's only owner is not archived without the founder saying so, as for disabling
+    r = c.post(f"/api/founder/users/{owner['id']}/archive", json={"archived": True})
+    assert r.status_code == 409 and "only owner" in r.json()["detail"]
+    # brought back: still disabled until enabled, its rows back under the seat rule; enabled, she signs in again and takes a seat
+    back = _ok(c.post(f"/api/founder/users/{sunia['id']}/archive", json={"archived": False}))["user"]
+    assert back["archived"] is False and back["disabled"] is True
+    with store.use_company(platformdb.company_file(cid)):
+        assert store_members.member(sunia["id"])["disabled_reason"] == "no seat"
+    _ok(c.patch(f"/api/founder/users/{sunia['id']}", json={"disabled": False}))
+    _ok(_client().post("/api/local/session", json={"email": "sunia@meow.test", "password": "sunia first password"}))
+    actions = [e["action"] for e in _audit()]
+    assert actions[:3] == ["changed an account", "brought an account back from the archive", "archived an account"]

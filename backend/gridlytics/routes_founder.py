@@ -10,6 +10,7 @@
     POST  /api/founder/companies                     {name, seats, enabled, owner}  -> 201 {company, owner, membership}
     PATCH /api/founder/companies/{id}                {name?, seats?}       -> {company}
     POST  /api/founder/companies/{id}/access         {enabled, reason?}    -> {company}
+    POST  /api/founder/companies/{id}/archive        {archived}            -> {company, made}
     GET   /api/founder/companies/{id}/members                              -> {members}
     GET   /api/founder/companies/{id}/backups                              -> {backups}
     POST  /api/founder/companies/{id}/backups        {}                    -> {made, backups}
@@ -17,6 +18,7 @@
     POST  /api/founder/users                         {email, name, password, company_id?, company_role?}  -> 201 {user}
     POST  /api/founder/users/{id}/password           {password}            -> {user}
     PATCH /api/founder/users/{id}                    {disabled?, name?, leave_without_owner?}  -> {user}
+    POST  /api/founder/users/{id}/archive            {archived, leave_without_owner?}  -> {user}
     POST  /api/founder/users/{id}/memberships        {company_id, company_role}  -> 201 {membership}
     PATCH /api/founder/users/{id}/memberships/{cid}  {company_role?, status?}    -> {membership}  (with gridlytics_role and last_seen there now)
     DELETE /api/founder/users/{id}/memberships/{cid}                       -> {removed: true}
@@ -266,12 +268,30 @@ def founder_company_access(company_id: str, inp: dict = Body(...)):
     reason = inp.get("reason", "")
     if not isinstance(reason, str) or len(reason) > 200:
         _api._fail("The reason is text of at most 200 characters")
-    if platformdb.company(company_id) is None:
+    held = platformdb.company(company_id)
+    if held is None:
         _missing("company")
+    if enabled and company_id in store_founder.archived("company"):
+        raise schemas.Refusal(409, f"{held['name']} is archived: bring it back from the archive first")
     row = platformdb.update_company(company_id, enabled=enabled, disabled_reason="" if enabled else reason)
     platformdb.founder_audit(f"switched Gridlytics {'on' if enabled else 'off'}", row["name"], {} if enabled else {"reason": row["disabled_reason"]})
     with _said():
         return {"company": store_founder.company_view(company_id)}
+
+
+@router.post("/api/founder/companies/{company_id}/archive", dependencies=[Depends(_session)])
+def founder_company_archive(company_id: str, inp: dict = Body(...)):
+    """Archive a company, or bring it back (audit founder-console-13): archived, Gridlytics is switched off for it and a last copy of its files is made
+    (`made`, its name; null when it had no file or was archived already); nothing is deleted. It cannot be switched on while archived; brought back, it
+    stays off until switched on."""
+    company_id = _id(company_id, "company")
+    _object(inp, {"archived"}, "Archiving a company")
+    on = _yes_no(inp.get("archived"), "Say whether the company is archived: archived, true or false")
+    with _said():
+        row, detail = store_founder.archive_company(company_id, on)
+        if detail is not None:
+            platformdb.founder_audit("archived a company" if on else "brought a company back from the archive", row["name"], detail)
+        return {"company": store_founder.company_view(company_id), "made": (detail or {}).get("copy")}
 
 
 @router.get("/api/founder/companies/{company_id}/members", dependencies=[Depends(_session)])
@@ -360,6 +380,23 @@ def founder_user_change(user_id: str, inp: dict = Body(...)):
             changes["left_without_owner"] = left
         if changes:
             platformdb.founder_audit("changed an account", after["email"], changes)
+        return {"user": store_founder.user(user_id)}
+
+
+@router.post("/api/founder/users/{user_id}/archive", dependencies=[Depends(_session)])
+def founder_user_archive(user_id: str, inp: dict = Body(...)):
+    """Archive an account, or bring it back (audit founder-console-13): archived, it is disabled (its sessions end) and its seats are freed; a company's
+    only owner who can sign in is refused (409) unless leave_without_owner is true, as for disabling. It cannot be enabled while archived; brought back,
+    it stays disabled until enabled."""
+    user_id = _id(user_id, "account")
+    _object(inp, {"archived", "leave_without_owner"}, "Archiving an account")
+    on = _yes_no(inp.get("archived"), "Say whether the account is archived: archived, true or false")
+    alone = _yes_no(inp.get("leave_without_owner", False), "Say whether a company may be left without an owner who can sign in: true or false")
+    with _said():
+        before, detail = store_founder.archive_account(user_id, on, alone)
+        if detail is not None:
+            platformdb.founder_audit("archived an account" if on else "brought an account back from the archive", before["email"], detail)
+            store_founder.follow_archive(user_id, on)
         return {"user": store_founder.user(user_id)}
 
 

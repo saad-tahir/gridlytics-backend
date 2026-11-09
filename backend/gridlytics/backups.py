@@ -109,7 +109,7 @@ def list_backups() -> list[dict]:
             continue
         tag = m.group(2)
         kind = ("daily" if tag == "daily" else "before a schema change" if tag.startswith("schema-v") else "manual" if tag == "manual"
-                else "before a reset" if tag == "before-reset" else "restore point")
+                else "before a reset" if tag == "before-reset" else "before archiving" if tag == "before-archive" else "restore point")
         telemetry_name, keys_name = companions(f.name)
         telemetry_bytes = _size(folder() / telemetry_name)
         out.append({"name": f.name, "kind": kind, "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="seconds"),

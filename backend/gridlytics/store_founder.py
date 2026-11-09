@@ -40,7 +40,7 @@ log = logging.getLogger("gridlytics")
 #: The work of a company the overview adds up (decisions-v2 section 4; design E)
 ACTIVITY = ("seen_7", "seen_30", "sites", "plans_month", "plans_30", "days_30", "reports_30")
 #: Why a member row is switched off by the founder's change of the membership; a row off for one of these follows the membership back
-MEMBERSHIP_OFF = {"suspended": "membership suspended", "pending": "membership pending", "removed": "membership removed"}
+MEMBERSHIP_OFF = {"suspended": "membership suspended", "pending": "membership pending", "removed": "membership removed", "archived": "account archived"}
 #: The project's own limit of a password (Supabase Auth refuses one over 72 bytes, bcrypt's); local mode allows 200 characters
 PROJECT_PASSWORD_BYTES = 72
 #: A ban that does not end, as the Admin API takes one; "none" lifts it
@@ -178,6 +178,31 @@ def signed_out(digest: str) -> bool:
     with platformdb._read() as con:
         return con.execute("SELECT 1 FROM account_events WHERE email = ? AND event = ? AND json_extract(detail, '$.session') = ? LIMIT 1",
                            (WHO, SIGNED_OUT, digest)).fetchone() is not None
+
+
+# ================================================================================================================ the founder's archive
+
+#: The record's word for the founder's archive (audit founder-console-13): {kind: "company" or "account", id, archived}, the last one of an id holding
+ARCHIVE = "founder archive"
+#: The founder's note on a company switched off by its archive, when it had none
+ARCHIVED_NOTE = "Archived"
+
+
+def archived(kind: str) -> set[str]:
+    """The ids of the companies or accounts (`kind`) the founder has archived and not brought back. Nothing is deleted by an archive: a company is switched
+    off with a last copy, an account disabled with its seats freed, and both are left out of the overview's figures and, until asked, the console's lists."""
+    state: dict[str, bool] = {}
+    with platformdb._read() as con:
+        for (detail,) in con.execute("SELECT detail FROM account_events WHERE email = ? AND event = ? AND json_extract(detail, '$.kind') = ? ORDER BY id",
+                                     (WHO, ARCHIVE, kind)):
+            held = json.loads(detail)
+            state[held["id"]] = bool(held["archived"])
+    return {key for key, on in state.items() if on}
+
+
+def _set_archived(kind: str, key: str, on: bool) -> None:
+    with platformdb._write() as con:
+        _event(con, ARCHIVE, "", {"kind": kind, "id": key, "archived": on})
 
 
 # ================================================================================================================ the companies' files
@@ -587,7 +612,7 @@ def _membership_view(m: dict, names: dict) -> dict:
     return {"company_id": m["company_id"], "company_name": names.get(m["company_id"], ""), "company_role": m["role"], "status": m["status"]}
 
 
-def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None) -> dict:
+def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None, shelved: set[str] = frozenset()) -> dict:
     # the owner shown is one who can sign in when there is one; a disabled one is marked (audit founder-console-10)
     owners = [accounts[m["user_id"]] for m in mine if m["role"] == "owner" and m["status"] == "active" and m["user_id"] in accounts]
     owner = next((a for a in owners if not a["disabled"]), owners[0] if owners else None)
@@ -601,7 +626,7 @@ def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None
             "last_seen": max(seen) if seen else None,
             "sites": read["sites"] if read is not None else None, "sites_closed_loop": read["sites_closed_loop"] if read is not None else None,
             "plans_issued": read["plans_issued"] if read is not None else None,
-            "plan": read["plan"] if read is not None else None}
+            "plan": read["plan"] if read is not None else None, "archived": row["id"] in shelved}
 
 
 def company_view(company_id: str) -> dict:
@@ -611,22 +636,30 @@ def company_view(company_id: str) -> dict:
     d = directory()
     mine = d.memberships(company_id=company_id)
     accounts = {a["id"]: a for a in (d.accounts() if mine else [])}
-    return _company_view(row, mine, accounts, _read_or_none(row))
+    return _company_view(row, mine, accounts, _read_or_none(row), archived("company"))
 
 
 def companies() -> list[dict]:
+    """Every company, the archived ones too, each saying whether it is (the console hides them until asked)."""
     d = directory()
-    every, accounts = d.memberships(), {a["id"]: a for a in d.accounts()}
-    return [_company_view(row, [m for m in every if m["company_id"] == row["id"]], accounts, _read_or_none(row)) for row in platformdb.list_companies()]
+    every, accounts, shelved = d.memberships(), {a["id"]: a for a in d.accounts()}, archived("company")
+    return [_company_view(row, [m for m in every if m["company_id"] == row["id"]], accounts, _read_or_none(row), shelved)
+            for row in platformdb.list_companies()]
 
 
 def overview() -> dict:
-    rows = platformdb.list_companies()
+    """The registry's and the files' figures; the archived companies and accounts, and their memberships, are only counted as archived (audit
+    founder-console-13)."""
+    shelved, gone = archived("company"), archived("account")
+    every_row = platformdb.list_companies()
+    rows = [r for r in every_row if r["id"] not in shelved]
     d = directory()
-    accounts, every = d.accounts(), d.memberships()
+    every_account = d.accounts()
+    accounts = [a for a in every_account if a["id"] not in gone]
+    every = [m for m in d.memberships() if m["company_id"] not in shelved and m["user_id"] not in gone]
     on = [r for r in rows if r["enabled"]]
-    out = {"companies": {"total": len(rows), "on": len(on), "off": len(rows) - len(on)},
-           "accounts": {"total": len(accounts), "disabled": sum(a["disabled"] for a in accounts)},
+    out = {"companies": {"total": len(rows), "on": len(on), "off": len(rows) - len(on), "archived": len(every_row) - len(rows)},
+           "accounts": {"total": len(accounts), "disabled": sum(a["disabled"] for a in accounts), "archived": len(every_account) - len(accounts)},
            "memberships": {s: sum(m["status"] == s for m in every) for s in platformdb.STATUSES},
            "seats": {"given": sum(r["seats"] for r in on), "taken": 0}, "roles": {}, "activity": dict.fromkeys(ACTIVITY, 0),
            "plans": {s: 0 for s in ("none", "trial", "active", "due")}, "unread": []}
@@ -663,9 +696,9 @@ def company_members(company_id: str) -> list[dict]:
     return sorted(out, key=lambda x: (x["name"].lower(), x["email"]))
 
 
-def account_view(account: dict, mine: list[dict], names: dict, reads: dict | None = None) -> dict:
-    """An account as the console shows it, never with a password or its hash; with `reads` (each company's file, read once), each membership carries the
-    person's Gridlytics role and last sign-in there."""
+def account_view(account: dict, mine: list[dict], names: dict, reads: dict | None = None, gone: set[str] | None = None) -> dict:
+    """An account as the console shows it, never with a password or its hash, saying whether it is archived; with `reads` (each company's file, read
+    once), each membership carries the person's Gridlytics role and last sign-in there."""
     out = []
     for m in mine:
         view = _membership_view(m, names)
@@ -674,6 +707,7 @@ def account_view(account: dict, mine: list[dict], names: dict, reads: dict | Non
             view.update(gridlytics_role=held["role"] if held else None, last_seen=held["last_seen"] if held else None)
         out.append(view)
     return {**{k: account[k] for k in ("id", "email", "name", "disabled", "created")},
+            "archived": account["id"] in (gone if gone is not None else archived("account")),
             "memberships": sorted(out, key=lambda v: v["company_name"].lower())}
 
 
@@ -683,7 +717,8 @@ def users() -> list[dict]:
     names = {r["id"]: r["name"] for r in rows}
     every = d.memberships()
     reads = {r["id"]: _read_or_none(r) for r in rows if any(m["company_id"] == r["id"] for m in every)}
-    return [account_view(a, [m for m in every if m["user_id"] == a["id"]], names, reads) for a in d.accounts()]
+    gone = archived("account")
+    return [account_view(a, [m for m in every if m["user_id"] == a["id"]], names, reads, gone) for a in d.accounts()]
 
 
 def user(user_id: str) -> dict:
@@ -751,8 +786,8 @@ def _owner_stays(user_id: str, company_id: str, role: str | None = None, status:
 
 
 def follow_membership(company_id: str, user_id: str, status: str) -> None:
-    """The person's member row in the company's file after the founder's change of the membership (`status`, or "removed"): switched off while it is not
-    active, given back to the seat rule when it is again. Nothing when the file or the row is not made yet (the first request makes the row)."""
+    """The person's member row in the company's file after the founder's change of the membership (`status`, or "removed", or "archived" for the
+    account's archive): switched off while it is not active, given back to the seat rule when it is again. Nothing when the file or the row is not made yet (the first request makes the row)."""
     path = platformdb.company_file(company_id)
     if path is None or not path.exists():
         return
@@ -845,6 +880,8 @@ def update_account(user_id: str, disabled: bool | None = None, name: str | None 
     if before is None:
         raise NotFound("No such account")
     after, left = dict(before), []
+    if disabled is False and before["disabled"] and user_id in archived("account"):
+        raise Conflict(f"{before['name']}'s account is archived: bring it back from the archive first")
     if disabled and not before["disabled"]:
         left = owned_alone(user_id)
         if left and not leave_without_owner:
@@ -882,6 +919,62 @@ def remove_membership(user_id: str, company_id: str) -> tuple[dict, dict]:
     before = _owner_stays(user_id, company_id, removing=True)
     directory().remove_membership(user_id, company_id)
     return account, before
+
+
+def archive_company(company_id: str, on: bool) -> tuple[dict, dict | None]:
+    """Archive a company (`on`) or bring it back (audit founder-console-13): archived, it is switched off (its note "Archived" when it had none) and a last
+    copy of its files is made (kind "before archiving", never pruned), and nothing of it is deleted; brought back, it stays off until switched on. The
+    company's row now, and what the founder's audit says (None when nothing changed: it was archived, or not, already)."""
+    row = platformdb.company(company_id)
+    if row is None:
+        raise NotFound("No such company")
+    if (company_id in archived("company")) == on:
+        return row, None
+    if not on:
+        _set_archived("company", company_id, False)
+        if row["disabled_reason"] == ARCHIVED_NOTE:
+            row = platformdb.update_company(company_id, disabled_reason="")
+        return row, {}
+    switched = row["enabled"]
+    if switched:
+        row = platformdb.update_company(company_id, enabled=False, disabled_reason=row["disabled_reason"] or ARCHIVED_NOTE)
+    elif not row["disabled_reason"]:
+        row = platformdb.update_company(company_id, disabled_reason=ARCHIVED_NOTE)
+    with store.use_company(_file(company_id)):
+        made = store.backup("before-archive")
+    _set_archived("company", company_id, True)
+    return row, {"switched_off": switched, "copy": made.name if made else None}
+
+
+def archive_account(user_id: str, on: bool, leave_without_owner: bool = False) -> tuple[dict, dict | None]:
+    """Archive an account (`on`) or bring it back (audit founder-console-13): archived, it is disabled (its sessions end), its member rows are switched off
+    so its seats are free, and nothing of it is deleted; a company's only owner who can sign in is refused as for disabling (update_account) unless
+    `leave_without_owner`. Brought back, it stays disabled until enabled, and its rows go back to its memberships' statuses (an active one to the seat
+    rule). The account before, and what the founder's audit says (None when nothing changed)."""
+    d = directory()
+    before = d.account(user_id)
+    if before is None:
+        raise NotFound("No such account")
+    if (user_id in archived("account")) == on:
+        return before, None
+    detail = {}
+    if on:
+        left = owned_alone(user_id) if not before["disabled"] else []
+        if left and not leave_without_owner:
+            raise Conflict(f"{before['name']} is the only owner of {_and(left)} who can sign in, so nobody could manage its members, keys and tariffs: "
+                           "make another member its owner first, or confirm that it is left without one")
+        if not before["disabled"]:
+            d.set_disabled(user_id, True)
+        detail = {"disabled": not before["disabled"], **({"left_without_owner": left} if left else {})}
+    _set_archived("account", user_id, on)
+    return before, detail
+
+
+def follow_archive(user_id: str, on: bool) -> None:
+    """The account's member rows after its archive (`on`) or its return: switched off ("account archived"), or each given back to its membership's
+    status (follow_membership)."""
+    for m in directory().memberships(user_id=user_id):
+        follow_membership(m["company_id"], user_id, "archived" if on else m["status"])
 
 
 # ================================================================================================================ backups, per company

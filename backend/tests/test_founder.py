@@ -195,6 +195,7 @@ def test_every_founder_route_but_the_login_needs_the_session_whatever_else_the_r
             ("GET", "/api/founder/overview"),
             ("GET", "/api/founder/companies"), ("POST", "/api/founder/companies"), ("PATCH", "/api/founder/companies/{company_id}"),
             ("POST", "/api/founder/companies/{company_id}/access"), ("GET", "/api/founder/companies/{company_id}/members"),
+            ("POST", "/api/founder/companies/{company_id}/archive"), ("POST", "/api/founder/users/{user_id}/archive"),
             ("GET", "/api/founder/companies/{company_id}/backups"), ("POST", "/api/founder/companies/{company_id}/backups"),
             ("GET", "/api/founder/users"), ("POST", "/api/founder/users"), ("POST", "/api/founder/users/{user_id}/password"),
             ("PATCH", "/api/founder/users/{user_id}"), ("POST", "/api/founder/users/{user_id}/memberships"),
@@ -586,7 +587,7 @@ def test_an_account_is_made_with_a_first_password_reset_disabled_and_enabled(fdb
     cid = _company(c)["company"]["id"]
     made = _ok(c.post("/api/founder/users", json={"email": "Sunia@Meow.test", "name": "Sunia Ahmed", "password": "sunia first password",
                                                    "company_id": cid, "company_role": "member"}), 201)["user"]
-    assert made["email"] == "sunia@meow.test" and made["disabled"] is False and set(made) == {"id", "email", "name", "disabled", "created", "memberships"}
+    assert made["email"] == "sunia@meow.test" and made["disabled"] is False and set(made) == {"id", "email", "name", "disabled", "created", "archived", "memberships"}
     assert made["memberships"] == [{"company_id": cid, "company_name": "Boxlytics Internal", "company_role": "member", "status": "active"}]
     for body, words in (({"email": "sunia@meow.test", "name": "Sunia", "password": "another password 1"}, "account"),
                         ({"email": "x@meow.test", "name": "X", "password": "x first password", "company_id": str(uuid.uuid4())}, "company"),
@@ -769,6 +770,8 @@ def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_
              ("POST", "/api/founder/companies"): {"name": "Walk", "seats": 5, "enabled": True, "owner": {"user_id": uid}},
              ("PATCH", "/api/founder/companies/{company_id}"): {"name": "Walked", "seats": 4},
              ("POST", "/api/founder/companies/{company_id}/access"): {"enabled": True, "reason": ""},
+             ("POST", "/api/founder/companies/{company_id}/archive"): {"archived": False},
+             ("POST", "/api/founder/users/{user_id}/archive"): {"archived": False, "leave_without_owner": False},
              ("POST", "/api/founder/companies/{company_id}/backups"): {},
              ("POST", "/api/founder/users"): {"email": "walk@meow.test", "name": "Walk", "password": "walk first password"},
              ("POST", "/api/founder/users/{user_id}/password"): {"password": "a walk password 1"},
