@@ -11,6 +11,9 @@ counted in minutes, a blank sample ending neither (pages-C-04); no run signal to
 day's price (role-owner-07); the KPI row's cost per kWh, hours below the minimum load, month view and daily figures (pages-C-15); the fuel curve's
 measured points and refit (pages-C-16).
 
+Batch 3, CSV mapping, refusals, data quality and series: today's completeness is counted over the minutes elapsed so far, not the whole day
+(role-viewer-07, and its duplicate role-analyst-09).
+
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
@@ -570,3 +573,59 @@ def test_the_overview_month_names_where_its_litres_came_from(world):
     assert (m["litres"], m["litres_source"]) == (round(0.5 * minutes, 1), "meter")
     u = c.get(f"/api/sites/{unmetered}/now").json()["month"]
     assert (u["litres"], u["litres_source"]) == (round(31.0 * minutes / 60, 1), "curve")
+
+
+# ================================================================================================ batch 3: CSV mapping, refusals, data quality and series
+
+# ------------------------------------------------------------------------------------------------ role-viewer-07: today's completeness so far
+
+def test_today_s_completeness_counts_the_minutes_elapsed_so_far(company):
+    """The audit's case: at 12:24 Karachi time every minute since midnight is present, and the quality strip said 51 % (red), the share of all 1,440
+    minutes. Today is now counted up to QUALITY_GRACE_S ago and marked in progress, so a healthy feed is 100 %; a feed that stopped at 06:00 falls with
+    the day; past days keep the whole day's share."""
+    sid = _site("Quality today")
+    today = date.fromisoformat(DAY)
+    now = T0 + 12 * 3600 + 24 * 60
+    yesterday = T0 - 86400
+    _write(sid, yesterday, 1440 // 2, grid_present=1)  # half of yesterday
+    _write(sid, T0, (now - T0) // 60, grid_present=1)  # every minute so far today
+    for d in (today - timedelta(days=1), today):
+        telemetry.aggregate_day(sid, d)
+    assert _day(sid)["completeness"] < 0.6  # the stored day row: the share of the whole day
+    q = {r["day"]: r for r in telemetry.quality_days(sid, today - timedelta(days=3), today, now)}
+    assert q[DAY]["completeness"] == 1.0 and q[DAY]["in_progress"] is True
+    assert q["2026-11-04"]["completeness"] == 0.5 and not q["2026-11-04"].get("in_progress")
+    # a feed that stopped at 06:00: by 12:00 half of today's elapsed minutes are missing
+    sid2 = _site("Stopped feed")
+    _write(sid2, T0, 6 * 60, grid_present=1)
+    telemetry.aggregate_day(sid2, today)
+    q2 = {r["day"]: r for r in telemetry.quality_days(sid2, today, today, T0 + 12 * 3600 + telemetry.QUALITY_GRACE_S)}
+    assert q2[DAY]["completeness"] == 0.5
+    # a feed that has sent nothing yet today, after earlier days: today shows 0 % so far rather than no square at all
+    sid3 = _site("Silent today")
+    _write(sid3, yesterday, 60, grid_present=1)
+    telemetry.aggregate_day(sid3, today - timedelta(days=1))
+    q3 = {r["day"]: r for r in telemetry.quality_days(sid3, today - timedelta(days=1), today, now)}
+    assert (q3[DAY]["completeness"], q3[DAY]["in_progress"]) == (0.0, True)
+    # just after midnight, before the grace has passed, a silent feed is not yet counted against
+    q4 = {r["day"]: r for r in telemetry.quality_days(sid3, today, today, T0 + 300)}
+    assert DAY not in q4
+
+
+def test_the_quality_route_counts_today_so_far(world, monkeypatch):
+    """GET /telemetry/quality answers today's share over the minutes elapsed so far, with in_progress."""
+    from gridlytics import routes_telemetry
+    c = world.owner
+    sid = c.post("/api/sites", json={"name": "Route quality"}).json()["id"]
+    now = T0 + 12 * 3600 + 24 * 60
+    monkeypatch.setattr(routes_telemetry, "now_ts", lambda: now)
+    monkeypatch.setattr(routes_telemetry, "today", lambda: date.fromisoformat(DAY))
+    with world.use():
+        _write(sid, T0, (now - T0) // 60, grid_present=1)
+        telemetry.aggregate_day(sid, date.fromisoformat(DAY))
+    q = c.get(f"/api/sites/{sid}/telemetry/quality", params={"days": 14})
+    assert q.status_code == 200, q.text
+    last = q.json()["days"][-1]
+    assert (last["day"], last["completeness"], last["in_progress"]) == (DAY, 1.0, True)
+    viewer = world.role("viewer").get(f"/api/sites/{sid}/telemetry/quality")
+    assert viewer.status_code == 200 and viewer.json()["days"][-1]["completeness"] == 1.0

@@ -50,11 +50,12 @@ def heatmap(site_id: str, name: str = "load_power_w", days: int = 28):
 def quality(site_id: str, days: int = 14):
     site_or_404(site_id)
     t = today()
-    rows = telemetry.days(site_id, (t - timedelta(days=days)).isoformat(), t.isoformat())
+    # today's share is of the minutes elapsed so far, marked in_progress (role-viewer-07), not of the whole day
+    rows = telemetry.quality_days(site_id, t - timedelta(days=days), t, now_ts())
     first = telemetry.first_ts(site_id)
     # telemetry.imports adds the range and file-name columns to an older workspace file before reading them, and always gives log as a list
     imports = telemetry.imports(site_id)
-    return {"days": [{"day": r["day"], "completeness": r.get("completeness")} for r in rows], "first_data": first, "imports": imports}
+    return {"days": rows, "first_data": first, "imports": imports}
 
 
 #: An upload's rows must lie between this day and a day from now, and one file may span at most UPLOAD_MAX_DAYS: the import aggregates every day it covers,

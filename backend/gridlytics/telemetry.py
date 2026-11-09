@@ -906,6 +906,38 @@ def days(site_id: str, d0: str, d1: str) -> list[dict]:
     return out
 
 
+#: today's share of minutes is counted from Karachi midnight up to this long ago: a source that sends its minutes in batches is not counted missing for the
+#: minutes still on their way
+QUALITY_GRACE_S = 900
+
+
+def quality_days(site_id: str, d0: date, d1: date, now: int) -> list[dict]:
+    """Each stored day's completeness from d0 to d1 (local days, inclusive), for the data-quality strips (role-viewer-07). A past day's share is of its
+    1,440 minutes; today's is of the minutes elapsed so far (from midnight to QUALITY_GRACE_S ago, at least one), marked `in_progress`, so a healthy
+    feed is 100 % at noon instead of 50 %, and a feed that stopped falls as the day goes on. A site with earlier data that has sent nothing yet today
+    shows today at 0 % once the grace has passed."""
+    out = [{"day": r["day"], "completeness": r.get("completeness")} for r in days(site_id, d0.isoformat(), d1.isoformat())]
+    now = int(now)
+    day = datetime.fromtimestamp(now, PKT).date()
+    if not d0 <= day <= d1:
+        return out
+    t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    upto = (now - QUALITY_GRACE_S) // 60 * 60
+    row = next((r for r in out if r["day"] == day.isoformat()), None)
+    if row is None:
+        first = first_ts(site_id)
+        if first is None or first >= t0 or upto <= t0:
+            return out
+        row = {"day": day.isoformat()}
+        out.append(row)
+    upto = max(upto, t0 + 60)
+    with connect() as con:
+        n = con.execute("SELECT COUNT(*) FROM minute WHERE site_id = ? AND ts >= ? AND ts < ?", (site_id, t0, upto)).fetchone()[0]
+    row["completeness"] = round(min(1.0, n / ((upto - t0) // 60)), 4)
+    row["in_progress"] = True
+    return out
+
+
 _FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
 
 
