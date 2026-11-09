@@ -198,3 +198,57 @@ def test_some_unreadable_grid_present_cells_are_a_warning(company):
     res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), rows), 5, now=NOW)
     assert any(w.startswith("10 grid_present cells could not be read") for w in res["warnings"]), res["warnings"]
     assert res["status"] == "done_with_warnings" and telemetry.imports(sid)[0]["status"] == "done_with_warnings"
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-13: plausibility
+
+def _solar(ts: int, peak: float) -> float:
+    h = ((ts + 5 * 3600) % 86400) / 3600
+    return round(max(0.0, peak * np.sin(np.pi * (h - 6.5) / 11)) if 6.5 <= h <= 17.5 else 0.0, 3)
+
+
+def test_kilowatts_in_watt_columns_are_reported(company):
+    """The audit's C2 file: a day of load and PV in kW under the *_w names. Both columns are named in the warnings, and the import is marked done with
+    warnings, never plain done; the same day in watts has no warning."""
+    sid = _site("Units")
+    rows = [(_local(T0 + 60 * i), 1, 250, _solar(T0 + 60 * i, 150)) for i in range(1440)]
+    res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w", "pv_power_w"), rows), 5, now=NOW)
+    text = " ".join(res["warnings"])
+    assert "load_power_w" in text and "pv_power_w" in text and "kW" in text, res["warnings"]
+    assert res["status"] == "done_with_warnings" and telemetry.imports(sid)[0]["status"] == "done_with_warnings"
+    assert all(w in res["log"] for w in res["warnings"])  # the quality page's imports row shows them too
+    good = [(_local(T0 + 86400 + 60 * i), 1, 250000, _solar(T0 + 86400 + 60 * i, 150000)) for i in range(1440)]
+    ok = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w", "pv_power_w"), good), 5, now=NOW)
+    assert ok["warnings"] == [] and ok["status"] == "done" and telemetry.imports(sid)[0]["status"] == "done"
+
+
+def test_impossible_values_are_stored_as_missing_and_reported(company):
+    """The audit's C10 file: load -50 kW, a state of charge of 150 %, PV -2 kW. Those cells are stored as missing and each kind is reported; a small
+    negative PV reading at night (an inverter's standby draw) is kept as read without a warning."""
+    sid = _site("Range")
+    t = T0 + 2 * 3600  # 02:00, night
+    rows = []
+    for i in range(60):
+        load = -50000 if i < 5 else 80000
+        soc = 150 if i == 10 else -3 if i == 11 else 60
+        pv = -2000 if i == 20 else -20
+        rows.append((_local(t + 60 * i), 1, load, soc, pv))
+    res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w", "battery_soc_bms_pct", "pv_power_w"), rows), 5, now=NOW)
+    w = " | ".join(res["warnings"])
+    assert "5 load_power_w cells were below -500 W" in w, w
+    assert "1 pv_power_w cell was below -500 W" in w, w
+    assert "2 battery_soc_bms_pct cells were outside 0 to 100 %" in w, w
+    d = telemetry.raw(sid, t, t + 3600, ("load_power_w", "battery_soc_bms_pct", "pv_power_w"))
+    assert np.all(np.isnan(d["load_power_w"][:5])) and np.all(d["load_power_w"][5:] == 80000)
+    assert np.isnan(d["battery_soc_bms_pct"][10]) and np.isnan(d["battery_soc_bms_pct"][11]) and d["battery_soc_bms_pct"][12] == 60
+    assert np.isnan(d["pv_power_w"][20]) and d["pv_power_w"][21] == -20
+    day = _day(sid)
+    assert day["max_soc"] == 60.0 and day["min_soc"] == 60.0
+    assert day["load_kwh"] == pytest.approx(80 * 55 / 60, abs=0.01)
+
+
+def test_a_state_of_charge_given_as_a_fraction_is_reported(company):
+    sid = _site("Fraction")
+    rows = [(_local(T0 + 8 * 3600 + 60 * i), 1, 80000, round(0.4 + 0.004 * i, 3)) for i in range(120)]
+    res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w", "battery_soc_bms_pct"), rows), 5, now=NOW)
+    assert any("battery_soc_bms_pct never goes above 1" in w for w in res["warnings"]), res["warnings"]

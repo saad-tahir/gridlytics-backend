@@ -318,12 +318,73 @@ def imports(site_id: str, limit: int = 20) -> list[dict]:
     return out
 
 
+#: plausibility of a CSV's readings (audit R7): a negative PV or load reading down to this is kept as read (an inverter's standby draw at night, a
+#: meter's noise); below it the cell is stored as missing and counted
+NEGATIVE_TOLERANCE_W = 500.0
+#: a load column, or a PV column between 10:00 and 14:00 Karachi time, whose largest reading over at least an hour stays under this many watts probably
+#: holds kW: the product serves commercial and industrial sites, whose load and midday PV run to tens of kW at least
+KW_SUSPECT_W = 1000.0
+_MIDDAY_H = (10, 14)
+_WHY_NOT_NEGATIVE = {"pv_power_w": "a solar array does not draw power beyond an inverter's standby",
+                     "load_power_w": "a load does not feed power back"}
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return f"{n:,} {one if n == 1 else many}"
+
+
+def _check_values(records: list[dict], spans: list[int]) -> list[str]:
+    """The file's implausible readings, as warnings: PV or load below -NEGATIVE_TOLERANCE_W and a BMS state of charge outside 0 to 100 % are stored as
+    missing (the cells are blanked here, before ingest); a load or midday PV column that never reaches KW_SUSPECT_W, and a state of charge that never
+    goes above 1, are kept as read and named, as a unit slip (kW for W, a fraction for percent) the person must check."""
+    below = {c: 0 for c in _WHY_NOT_NEGATIVE}
+    top = {c: [0.0, 0] for c in _WHY_NOT_NEGATIVE}  # the largest magnitude read, and the minutes it was read over
+    soc_out, soc_top, soc_minutes = 0, None, 0
+    for r, span in zip(records, spans):
+        hour = (r["ts"] + 5 * 3600) % 86400 // 3600
+        for c in _WHY_NOT_NEGATIVE:
+            x = _num(r.get(c))[0]
+            if x is None:
+                continue
+            if x < -NEGATIVE_TOLERANCE_W:
+                r[c] = ""
+                below[c] += 1
+            elif c != "pv_power_w" or _MIDDAY_H[0] <= hour < _MIDDAY_H[1]:
+                top[c][0] = max(top[c][0], abs(x))
+                top[c][1] += span
+        x = _num(r.get("battery_soc_bms_pct"))[0]
+        if x is not None and not 0 <= x <= 100:
+            r["battery_soc_bms_pct"] = ""
+            soc_out += 1
+        elif x is not None:
+            soc_top = x if soc_top is None else max(soc_top, x)
+            soc_minutes += span
+    out = []
+    for c, n in below.items():
+        if n:
+            out.append(f"{_plural(n, f'{c} cell was', f'{c} cells were')} below -{NEGATIVE_TOLERANCE_W:,.0f} W ({_WHY_NOT_NEGATIVE[c]}) and "
+                       f"{'was' if n == 1 else 'were'} stored as missing")
+    if soc_out:
+        out.append(f"{_plural(soc_out, 'battery_soc_bms_pct cell was', 'battery_soc_bms_pct cells were')} outside 0 to 100 % and "
+                   f"{'was' if soc_out == 1 else 'were'} stored as missing")
+    if soc_top is not None and 0 < soc_top <= 1 and soc_minutes >= 60:
+        out.append("battery_soc_bms_pct never goes above 1 in this file: it may hold the state of charge as a fraction (0 to 1) where percent "
+                   "(0 to 100) is expected; the values were stored as read")
+    for c, (peak, minutes) in top.items():
+        if minutes >= 60 and 0 < peak < KW_SUSPECT_W:
+            where = " between 10:00 and 14:00 Karachi time" if c == "pv_power_w" else ""
+            out.append(f"{c} never reaches {KW_SUSPECT_W:,.0f} W{where} in this file (at most {peak:,.1f}): the column may hold kW where watts are "
+                       f"expected; the values were stored as read")
+    return out
+
+
 def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
                file_name: str | None = None) -> dict:
     """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
     `duplicates` the rows dropped, both in the notes); rows 2 to 60 minutes apart are stored as the minutes each covers (`step_min`, `minutes`; see
     ingest), rows further apart are refused; gaps over 5 minutes (or over the step) are reported. A file in which no row's grid_present (or
-    grid_voltage_v) can be read is refused; on and off, true and false, yes and no are read as 1 and 0. What may make the import wrong is listed in
+    grid_voltage_v) can be read is refused; on and off, true and false, yes and no are read as 1 and 0. Implausible readings are checked
+    (_check_values: impossible cells stored as missing, probable unit slips named). What may make the import wrong is listed in
     `warnings` (also at the end of `log`), and the import's `status` is then "done_with_warnings", not "done".
 
     The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
@@ -410,6 +471,7 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         log.append(f"Rows are {step} minutes apart: each row was stored as the {step} minutes it starts, its readings held over them and its energy "
                    f"({', '.join(INTERVAL_ENERGY)}) spread evenly")
     gaps = sum(1 for a, b in zip(starts, starts[1:]) if b - a > max(5, step))
+    warnings += _check_values(records, spans)
     res = ingest(site_id, records, "csv", now=now, count_overlap=True, spans=spans, step_min=step)
     res["skipped"] += bad_ts
     if res["overlap"]:
