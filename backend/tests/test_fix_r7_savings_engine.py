@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timedelta, timezone
 
+import numpy as np
 import pytest
 from test_fix_api import world  # noqa: F401 (a fixture)
 from test_fix_r2_savings import NIGHT_CHARGER, D, P
@@ -798,3 +799,61 @@ def test_the_recompute_route_answers_the_later_days_it_rescored(world, monkeypat
     r = world.c["analyst"].post(f"/api/sites/{world.site}/savings/recompute", json={"start": "2026-10-12", "end": "2026-10-13"})
     assert r.status_code == 200 and r.json() == {"days": 2, "rescored_days": ["2026-10-14"], "restated_days": ["2026-10-14"]}
     assert seen["by"] and seen["by"] != "system"
+
+
+# ------------------------------------------------------------------------------------------------ engine-savings-03, brief-vs-build-10: the tuned
+# ------------------------------------------------------------------------------------------------ baseline's HOMER cycle charging at genset sites
+
+def _off_grid_plant(**kw) -> twin.Plant:
+    """The demo farm's plant: 120 kWh (40 kW each way), a 48 kW set at a 30 % minimum under manual start, off grid."""
+    p = twin.Plant(e_nom=120.0, soc_min=0.15, soc_max=0.95, p_ch=40.0, p_dis=40.0, g_max=0.0, gen_kw=48.0, gen_fmin=0.3, gen_control="manual",
+                   gen_min_run=60, load_mode=1)
+    for k, v in kw.items():
+        setattr(p, k, v)
+    return p
+
+
+def test_cycle_charging_runs_the_set_near_its_rating_and_stops_at_the_set_point():
+    # HOMER's cycle charging (plan 8.1): a running set charges the battery near its rating and stops at the set point. Before, the twin had no such
+    # rule: the operator's rule followed the load (a 20 kW load on a 48 kW set charges nothing) and ran the set from the lights going out all day
+    ts = twin.minutes_of(D)
+    n = len(ts)
+    series = {"ts": ts, "pv": np.zeros(n), "load": np.full(n, 20.0), "crit": np.full(n, 8.0), "grid": np.zeros(n)}
+    pol = twin.table_policy([{"start": "00:00", "mode": "self_use", "soc_floor_pct": 25.0, "soc_target_pct": 100.0, "grid_charge": False}], ts)
+    plant = _off_grid_plant()
+    op = twin.simulate(series, pol, plant, 0.15)
+    cc = twin.simulate(series, {**pol, "cycle_soc": np.full(n, 0.8)}, plant, 0.15)
+    assert op["gen"][30] == pytest.approx(20.0) and op["gen_on"][10:].all()  # the operator's rule: the load, and the set never stops
+    assert cc["gen"][30] == pytest.approx(48.0) and cc["bat"][30] == pytest.approx(-28.0)  # the rating: the load and 28 kW into the battery
+    stop = int(np.argmax(~cc["gen_on"][10:])) + 10
+    assert cc["soc"][stop - 1] >= 0.8 - 1e-9 and cc["soc"][stop - 2] < 0.8  # it stops at the set point
+    # golden: started as the lights go out (minute 10 of the outage), 78 kWh (15 % to 80 % of 120) at 28 kW x 0.95 takes 176 minutes
+    assert int(np.argmax(cc["gen_on"])) == 9 and stop - 9 == 176
+    assert cc["soc"].max() == pytest.approx(0.8, abs=0.005) and cc["gen_on"].sum() < 0.6 * op["gen_on"].sum()
+    # a soc_threshold controller stops at the set point too, instead of its own level
+    th = twin.simulate(series, {**pol, "cycle_soc": np.full(n, 0.6)}, _off_grid_plant(gen_control="soc_threshold", gen_soc_on=0.25), 0.2)
+    assert th["soc"].max() == pytest.approx(0.6, abs=0.005)
+    # off (NaN) or without a battery the rule changes nothing
+    assert np.array_equal(twin.simulate(series, {**pol, "cycle_soc": np.full(n, np.nan)}, plant, 0.15)["gen"], op["gen"])
+
+
+def test_the_tuned_baseline_at_a_genset_site_is_fitted_with_cycle_charging_and_claims_must_beat_it(company):
+    # Before: the tuned fit searched static tables only and the tuned arm ran the operator's genset rule, so at the off-grid farm, where a table's
+    # modes do not apply in an outage, the tuned arm was the native arm minute for minute and "claims must beat the tuned baseline" protected nothing
+    sid = _farm("Farm tuned r7")
+    _run(sid, [LEAD] + DAYS[:1], lambda s, ts: twin.native_policy(s, ts))  # the farm ran its own settings
+    rows = verify.compute_day(sid, DAYS[0], with_bound=False, forward=False)
+    rule = rows["tuned"]["tuned_rule"]
+    assert rule["cycle_soc_pct"] in verify.CYCLE_SET_POINTS
+    n, t = rows["native"]["baseline"], rows["tuned"]["baseline"]
+    assert t["genset_hours"] < n["genset_hours"] - 1.0 and t["cost_rs"] < n["cost_rs"]
+    # the actual arm ran native: about nothing saved against native, and a loss against the better rule
+    assert rows["tuned"]["saving_rs"] < rows["native"]["saving_rs"] - 1_000.0
+    assert verify.summary(sid, DAYS[0].isoformat(), DAYS[0].isoformat())["baselines"]["tuned"]["cycle_charge_soc_pct"] == rule["cycle_soc_pct"]
+    # the rule is the cheapest on its window of the best table alone and the table with each set point
+    site = {**sites.full(sid), "native": verify.native_for_day(sid, DAYS[0])}
+    assert verify.fit_tuned(site, DAYS[0]) == rule
+    # a site with no genset fits the table alone
+    grid = make_site(name="No genset tuned r7", genset=False)
+    twin_day(grid, D, 0.5)
+    assert verify.compute_day(grid, D, with_bound=False, forward=False)["tuned"]["tuned_rule"]["cycle_soc_pct"] is None

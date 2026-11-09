@@ -597,6 +597,10 @@ def native_for_day(site_id: str, day: date) -> dict | None:
 
 TUNED_VARIANTS = [(fp, hb, gc) for fp in (20, 40) for hb in (False, True) for gc in (0, 80)]
 
+#: HOMER cycle charging's set points (state of charge, %) the tuned fit tries at a genset site with a battery (plan 8.1: "at genset sites additionally
+#: HOMER-style cycle charging with a set-point SoC (the genset runs near rated output and charges to the set point)"; round 7, audit engine-savings-03)
+CYCLE_SET_POINTS = (60.0, 80.0, 95.0)
+
 
 def tuned_table(site: dict, variant: tuple, peak_window: tuple[int, int]) -> list[dict]:
     fp, hold_before, gc = variant
@@ -612,14 +616,32 @@ def tuned_table(site: dict, variant: tuple, peak_window: tuple[int, int]) -> lis
     return sorted(rows, key=lambda r: r["start"])
 
 
+def tuned_policy(rule: dict, ts: np.ndarray) -> dict:
+    """The tuned baseline's per-minute policy (fit_tuned's rule): its static table, and at a genset site its cycle-charging set point, if any."""
+    pol = twin.table_policy(rule["table"], ts)
+    if rule.get("cycle_soc_pct") is not None:
+        pol["cycle_soc"] = np.full(len(ts), float(rule["cycle_soc_pct"]) / 100.0)
+    return pol
+
+
+def _cycles(plant: twin.Plant) -> bool:
+    """Whether the tuned fit tries cycle charging: a genset someone or something starts, and a battery for it to charge."""
+    return plant.gen_kw > 0 and plant.gen_control != "none" and plant.e_nom > 0
+
+
 def _tuned_key(site: dict, day: date) -> str:
-    """The tuned table's cache key: per month and per native capture (its backup floor shapes the table)."""
-    return f"tuned:{site['id']}:{day.strftime('%Y-%m')}:v{(site.get('native') or {}).get('version', 0)}"
+    """The tuned rule's cache key: per month and per native capture (its backup floor shapes the table); `cc` since the rule carries cycle charging
+    (round 7: a table cached before is fitted again)."""
+    return f"tuned:{site['id']}:{day.strftime('%Y-%m')}:v{(site.get('native') or {}).get('version', 0)}:cc"
 
 
-def fit_tuned(site: dict, day: date) -> list[dict]:
-    """The best static table on the observation window (the 7 days before the month starts, else the first 7 measured days), cached per month and
-    capture."""
+def fit_tuned(site: dict, day: date) -> dict:
+    """The tuned baseline's rule, {"table", "cycle_soc_pct"}: the best static table on the observation window (the 7 days before the month starts,
+    else the first 7 measured days), cached per month and capture. At a genset site with a battery (plan 8.1) the best table is then tried with HOMER
+    cycle charging at each of CYCLE_SET_POINTS (twin.simulate's `cycle_soc`: a running set charges the battery near its rating and stops at the set
+    point), and the cheapest of these on the window is the rule; `cycle_soc_pct` is None where the table alone is cheapest or there is no genset.
+    Before (round 7, audit engine-savings-03), the tuned arm ran the operator's genset rule, so at an off-grid site, where the table's modes do not
+    apply, it was the native arm minute for minute."""
     key = _tuned_key(site, day)
     held = store.get_setting(key)
     if held:
@@ -630,14 +652,14 @@ def fit_tuned(site: dict, day: date) -> list[dict]:
     plant = twin.plant_of(site)
     month0 = day.replace(day=1)
     cands = [month0 - timedelta(days=i) for i in range(1, 8)]
-    best, best_cost = None, None
     inputs = [(d, *_replay_inputs(site, d)) for d in cands]
     inputs = [x for x in inputs if x[1] is not None]
     if not inputs:
         inputs = [(d, *_replay_inputs(site, d)) for d in (day - timedelta(days=i) for i in range(0, 7))]
         inputs = [x for x in inputs if x[1] is not None]
+    plain = {"table": tuned_table(site, (20, False, 0), window), "cycle_soc_pct": None}
     if not inputs or not (site.get("assets") or {}).get("battery"):
-        return tuned_table(site, (20, False, 0), window)
+        return plain
     on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
     month_t: dict = {}
     prepared = []
@@ -649,19 +671,54 @@ def fit_tuned(site: dict, day: date) -> list[dict]:
         if on_grid and mk not in month_t:
             month_t[mk] = month_totals(site["id"], conn, d)
         tot = month_t.get(mk) or {}
-        prepared.append((d, series, _minute_prices(conn, d, site["id"], tot.get("import"), tot.get("export")), soc0))
+        pr = _minute_prices(conn, d, site["id"], tot.get("import"), tot.get("export"))
+        prepared.append((d, series, pr, soc0, _terminal_value(site, d, series, pr)[1]))
     if not prepared:
-        return tuned_table(site, (20, False, 0), window)
-    for v in TUNED_VARIANTS:
-        table = tuned_table(site, v, window)
+        return plain
+
+    def window_cost(rule: dict) -> float:
+        """The rule's cost over the window, each day's stored-energy change valued at its v_end as the ledger values it (round 7: priced at 0, a rule
+        that ends the day fuller paid for the energy and got nothing for it, and one that drains the battery got it free; part of audit
+        engine-money-live-11)."""
         total = 0.0
-        for d, series, pr, soc0 in prepared:
-            sim = twin.simulate(series, twin.table_policy(table, series["ts"]), plant, soc0)
-            total += price_arm(site, sim, pr, d, sim["soc"][-1] * plant.e_nom, 0.0)["cost_rs"]
+        for d, series, pr, soc0, v_end in prepared:
+            sim = twin.simulate(series, tuned_policy(rule, series["ts"]), plant, soc0)
+            e_end = float(sim["soc"][-1]) * plant.e_nom
+            total += price_arm(site, sim, pr, d, e_end, v_end)["cost_rs"] - v_end * (e_end - soc0 * plant.e_nom)
+        return total
+
+    best, best_cost = None, None
+    for v in TUNED_VARIANTS:
+        rule = {"table": tuned_table(site, v, window), "cycle_soc_pct": None}
+        total = window_cost(rule)
         if best_cost is None or total < best_cost:
-            best, best_cost = table, total
+            best, best_cost = rule, total
+    if _cycles(plant):
+        for sp in sorted({min(p, plant.soc_max * 100.0) for p in CYCLE_SET_POINTS}):
+            rule = {"table": best["table"], "cycle_soc_pct": round(sp, 1)}
+            total = window_cost(rule)
+            if total < best_cost:
+                best, best_cost = rule, total
     store.set_setting(key, best)
     return best
+
+
+def _terminal_value(site: dict, day: date, series: dict, pr: dict) -> tuple[float, float]:
+    """What the ledger values a kWh left in the battery at the day's end at: (c_next, v_end). c_next is the day's dearest import price on a grid
+    connection, else the genset's all-in cost per kWh (off grid at its night load ratio, night_load_ratio; 75 % load elsewhere); v_end is what a kWh
+    stored is worth after the discharge loss and the wear, never below zero."""
+    conn = (site.get("connections") or [None])[0]
+    on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
+    a = site.get("assets") or {}
+    b, gen_asset = a.get("battery"), a.get("genset")
+    c_next = float(np.max(pr["c_imp"])) if on_grid else 0.0
+    if gen_asset and (c_next == 0.0):
+        price, _ = tariffs.fuel_price(gen_asset.get("fuel_kind", "hsd"), day)
+        c_next = optimise._gen_marginal({"S": gen_asset["rated_kw"], "a": gen_asset["a"], "b": gen_asset["b"], "c_fuel": price,
+                                         "c_om": gen_asset["c_om_rs_per_kwh"], "c_runhr": gen_asset["c_runhr_rs"]},
+                                        night_load_ratio(gen_asset, series) if not on_grid else 0.75)
+    v_end = max(0.0, (b["eta_d"] * c_next - optimise.wear_cost(b)) if b else 0.0)
+    return c_next, v_end
 
 
 def night_load_ratio(gen_asset: dict, series: dict) -> float:
@@ -1123,13 +1180,7 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
     imp_unknown = on_grid and (float(act["g"].get("imp_completeness", 1.0)) < 0.5 or unresolved_share > GRID_UNRESOLVED_MAX)
     f_act = {**act["f"], "imp": g_imp, "exp": g_exp, "bat": g_bat} if on_grid else act["f"]
     actual = _actual_sim(f_act, act["g"], plant if gen_asset else None)
-    c_next = float(np.max(pr["c_imp"])) if conn and conn["data"].get("regime") != "off_grid" else 0.0
-    if gen_asset and (c_next == 0.0):
-        price, _ = tariffs.fuel_price(gen_asset.get("fuel_kind", "hsd"), day)
-        c_next = optimise._gen_marginal({"S": gen_asset["rated_kw"], "a": gen_asset["a"], "b": gen_asset["b"], "c_fuel": price,
-                                         "c_om": gen_asset["c_om_rs_per_kwh"], "c_runhr": gen_asset["c_runhr_rs"]},
-                                        night_load_ratio(gen_asset, series) if not on_grid else 0.75)
-    v_end = max(0.0, (b["eta_d"] * c_next - optimise.wear_cost(b)) if b else 0.0)
+    c_next, v_end = _terminal_value(site, day, series, pr)
     # the actual arm's battery flow where its power is blank (_masked_charge): read as zero, its discharge went unworn while each baseline's was worn,
     # and on the masked minutes its charge went unbilled while each baseline's was billed. On the masked minutes each arm's charge beyond PV, and its
     # wear, is priced only where that flow is known; elsewhere it stands in for the actual arm's discharge and wear, and where it is unknown the wear
@@ -1158,7 +1209,8 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
     arms = {"actual": price_arm(site, masked_actual, pr, day, e_end_actual, v_end, gen_before=gen_before)}
     # each baseline's replay starts from its own end state of the day before (its chain), or from the actual arm's state where the chain restarts
     starts = _chain_starts(site_id, day)
-    policies = {"native": twin.native_policy(site, series["ts"]), "tuned": twin.table_policy(fit_tuned(site, day), series["ts"])}
+    tuned_rule = fit_tuned(site, day)
+    policies = {"native": twin.native_policy(site, series["ts"]), "tuned": tuned_policy(tuned_rule, series["ts"])}
     e_start_actual = soc0 * plant.e_nom
     # minutes the replays ran over unread inputs: a day after one that claims nothing restarts when there were any (_chain_starts), and a day with
     # unread load or PV over more than REPLAY_UNREAD_MAX of its minutes claims nothing
@@ -1281,6 +1333,8 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
                       "month_totals_projected": projected, "price_basis": basis, "inputs_completeness": round(float(act["g"]["completeness"]), 4)}
         if base in handovers:
             rows[base]["handover"] = handovers[base]
+    # the tuned baseline's rule (round 7, audit engine-savings-03): its table and, at a genset site, its cycle-charging set point
+    rows["tuned"]["tuned_rule"] = tuned_rule
     if with_bound and b:
         # the hindsight solve prices every minute: it is held against the native arm priced the same way
         native_cost = (price_arm(site, sims["native"], pr, day, 0.0, 0.0, gen_before=befores["native"])["cost_rs"] if unresolved.any()
@@ -1977,6 +2031,11 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                                                      "provisional": not mdi_info[k]["closed"]} for k, v in months.items()},
                                   "unserved_kwh_actual": round(unserved_a, 1), "unserved_kwh_baseline": round(unserved_b, 1),
                                   "genset_unknown_days": gen_unknown_days, "import_unknown_days": imp_unknown_days}
+        if base == "tuned":
+            # round 7 (audit engine-savings-03): the tuned rule of the period's last scored day, its cycle-charging set point None where it has none
+            rule = next((by["tuned"].get("tuned_rule") for _, by in sorted(days.items(), reverse=True) if (by.get("tuned") or {}).get("tuned_rule")),
+                        None)
+            out["baselines"][base]["cycle_charge_soc_pct"] = (rule or {}).get("cycle_soc_pct")
     for day, by in sorted(days.items()):
         n = by.get("native", {})
         t = by.get("tuned") or {}
