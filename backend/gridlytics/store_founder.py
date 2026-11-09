@@ -685,12 +685,29 @@ def user(user_id: str) -> dict:
     return account_view(found, d.memberships(user_id=user_id), {r["id"]: r["name"] for r in platformdb.list_companies()})
 
 
+def _member_row(company_id: str, user_id: str) -> dict | None:
+    """The person's member row in the company's file; None before their first request there, or when the file is not made or cannot be read."""
+    path = platformdb.company_file(company_id)
+    if path is None or not path.exists():
+        return None
+    try:
+        with store.use_company(path), store.use_org(store.DEFAULT_ORG):
+            return store_members.member(user_id)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        log.warning("the founder console could not read the file of company %s: %s", company_id, exc)
+        return None
+
+
 def membership_view(user_id: str, company_id: str) -> dict:
+    """A membership as the membership routes answer it, with the person's Gridlytics role and last sign-in there now (null before the first sign-in), so
+    the console says what a change of the company role gave (audit founder-console-16)."""
     held = directory().memberships(company_id=company_id, user_id=user_id)
     if not held:
         raise NotFound("No such membership")
     row = platformdb.company(company_id) or {"name": ""}
-    return _membership_view(held[0], {company_id: row["name"]})
+    member = _member_row(company_id, user_id)
+    return {**_membership_view(held[0], {company_id: row["name"]}), "gridlytics_role": member["role"] if member else None,
+            "last_seen": member["last_seen"] if member else None}
 
 
 # ================================================================================================================ the founder's changes
@@ -740,6 +757,23 @@ def follow_membership(company_id: str, user_id: str, status: str) -> None:
                 store_members.update_member(user_id, disabled=True, disabled_reason=MEMBERSHIP_OFF[status], by="founder")
         elif held["disabled"] and held["disabled_reason"] in MEMBERSHIP_OFF.values():
             store_members.update_member(user_id, disabled=True, disabled_reason=NO_SEAT, by="founder")
+
+
+def follow_roles(company_id: str) -> None:
+    """Every member row in the company's file given the company role its membership has now, and the Gridlytics role that gives (companies.role_follows),
+    at the founder's change rather than at each person's next request: the console shows the role the person has now, not the one before the change
+    (audit founder-console-16), and an owner who handed the ownership over in the project reads as what they became. A row of a membership that is gone,
+    and a role set in Gridlytics, are left as they are; nothing when the file is not made yet."""
+    path = platformdb.company_file(company_id)
+    if path is None or not path.exists():
+        return
+    from .companies import role_follows
+    held = {m["user_id"]: m["role"] for m in directory().memberships(company_id=company_id)}
+    with store.use_company(path), store.use_org(store.DEFAULT_ORG):
+        for member in store_members.members():
+            changes = role_follows(member, held[member["user_id"]]) if member["user_id"] in held else {}
+            if changes:
+                store_members.update_member(member["user_id"], **changes, by="founder")
 
 
 def create_company(name: str, seats: int, enabled: bool, owner: dict) -> tuple[dict, dict]:

@@ -340,6 +340,12 @@ def _person(c, email: str, name: str, cid: str, company_role: str = "member") ->
                                                    "company_id": cid, "company_role": company_role}), 201)["user"]
 
 
+def _role_on_users(c, user_id: str, cid: str) -> str | None:
+    """The Gridlytics role the founder's Users page shows for the person in the company."""
+    user = next(u for u in _ok(c.get("/api/founder/users"))["users"] if u["id"] == user_id)
+    return next(m for m in user["memberships"] if m["company_id"] == cid)["gridlytics_role"]
+
+
 def test_the_founders_answers_carry_the_gridlytics_role_and_not_the_lifted_name(fdb):
     """founder-console-18: every membership and member carried 'solarlytics_role' beside 'gridlytics_role', kept for a console page that no longer read it."""
     c = _console()
@@ -381,3 +387,30 @@ def test_a_company_admin_is_a_gridlytics_administrator_and_a_role_set_in_gridlyt
     _ok(c.patch(f"/api/founder/users/{owner['id']}/memberships/{cid}", json={"company_role": "admin"}))
     me = next(u for u in _ok(_as(owner).get("/api/users")) if u["id"] == owner["id"])
     assert (me["role"], me["role_source"], me["company_role"]) == ("admin", "default", "admin")
+
+
+def test_the_users_page_shows_the_gridlytics_role_a_company_role_change_gives_at_once(fdb):
+    """founder-console-16: after the founder made an owner a member again, Users still read 'Administrator' until the person's next request, because the
+    member row in the company's file followed the membership only then. The founder's change now reaches the row at once."""
+    c = _console()
+    made = _company(c)
+    cid, owner = made["company"]["id"], made["owner"]
+    _ok(_as(owner).get("/api/sites"))
+    maaz = _person(c, "maaz@meow.test", "Maaz Ali", cid)
+    _ok(_as(maaz).get("/api/sites"))
+    assert _role_on_users(c, maaz["id"], cid) == "viewer"
+    _ok(c.patch(f"/api/founder/users/{maaz['id']}/memberships/{cid}", json={"company_role": "owner"}))
+    assert _role_on_users(c, maaz["id"], cid) == "admin"
+    answer = _ok(c.patch(f"/api/founder/users/{maaz['id']}/memberships/{cid}", json={"company_role": "member"}))["membership"]
+    assert answer["company_role"] == "member" and answer["gridlytics_role"] == "viewer"                 # no request of his in between
+    assert _role_on_users(c, maaz["id"], cid) == "viewer"
+    members = {m["user_id"]: m for m in _ok(c.get(f"/api/founder/companies/{cid}/members"))["members"]}
+    assert members[maaz["id"]]["gridlytics_role"] == "viewer"
+    # a membership added again with another company role is followed at once too
+    _ok(c.delete(f"/api/founder/users/{maaz['id']}/memberships/{cid}"))
+    added = _ok(c.post(f"/api/founder/users/{maaz['id']}/memberships", json={"company_id": cid, "company_role": "admin"}), 201)["membership"]
+    assert added["gridlytics_role"] == "admin" and _role_on_users(c, maaz["id"], cid) == "admin"
+    # someone who has not signed in yet has no row: the answer says so (null), and nothing is made
+    sunia = _person(c, "sunia@meow.test", "Sunia Ahmed", cid)
+    answer = _ok(c.patch(f"/api/founder/users/{sunia['id']}/memberships/{cid}", json={"company_role": "admin"}))["membership"]
+    assert answer["gridlytics_role"] is None and _role_on_users(c, sunia["id"], cid) is None

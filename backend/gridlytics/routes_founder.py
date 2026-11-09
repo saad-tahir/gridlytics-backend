@@ -18,7 +18,7 @@
     POST  /api/founder/users/{id}/password           {password}            -> {user}
     PATCH /api/founder/users/{id}                    {disabled?, name?}    -> {user}
     POST  /api/founder/users/{id}/memberships        {company_id, company_role}  -> 201 {membership}
-    PATCH /api/founder/users/{id}/memberships/{cid}  {company_role?, status?}    -> {membership}
+    PATCH /api/founder/users/{id}/memberships/{cid}  {company_role?, status?}    -> {membership}  (with gridlytics_role and last_seen there now)
     DELETE /api/founder/users/{id}/memberships/{cid}                       -> {removed: true}
     GET   /api/founder/audit?offset=                                       -> {entries}
 
@@ -384,6 +384,7 @@ def founder_membership_new(user_id: str, inp: dict = Body(...)):
         account = store_founder.add_membership(user_id, company_id, role)
         platformdb.founder_audit("added a membership", account["email"], {"company": platformdb.company(company_id)["name"], "company_role": role})
         store_founder.follow_membership(company_id, user_id, "active")
+        store_founder.follow_roles(company_id)
         return {"membership": store_founder.membership_view(user_id, company_id)}
 
 
@@ -404,6 +405,9 @@ def founder_membership_change(user_id: str, company_id: str, inp: dict = Body(..
         if status is not None:
             # also when the status was already this one: a member row a failed follow-up left behind is set right by sending the status again
             store_founder.follow_membership(company_id, user_id, status)
+        if role is not None:
+            # the Gridlytics role the company role gives, now, not at the person's next request (audit founder-console-16)
+            store_founder.follow_roles(company_id)
         return {"membership": store_founder.membership_view(user_id, company_id)}
 
 
