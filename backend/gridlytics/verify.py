@@ -794,9 +794,21 @@ def _unread_minutes(g: dict, on_grid: bool) -> int:
     return int(np.sum(out))
 
 
-def _expected_start(prev: dict | None, switch: bool, earlier: bool) -> dict:
+#: Fidelities of a day whose actual arm was not the plan: a recommendation (monitor), a switchback native block, a table not applied (or control
+#: not in force) and a mark telemetry has not confirmed. The first plan day after one restarts its chain from the measured state ("arm_change")
+NOT_PLAN_ARM = ("recommendation_only", "native_block", "not_applied", "pending")
+
+
+def _plan_arm(tier: str | None, arm: str | None) -> bool:
+    """Whether a day's actual arm can be the plan, before its fidelity is known: not a monitor site (it only recommends) and not a switchback native
+    block. Its stored row says the same: a fidelity other than recommendation_only and native_block."""
+    return tier != "monitor" and arm != "native"
+
+
+def _expected_start(prev: dict | None, switch: bool, earlier: bool, plan_arm: bool = True) -> dict:
     """Where a baseline's replay starts on a day, given that baseline's stored row of the day before (`prev`, None where there is none), whether
-    the day opens a switchback block of the other arm (`switch`), and whether any day before it is stored (`earlier`). See _chain_starts."""
+    the day opens a switchback block of the other arm (`switch`), whether any day before it is stored (`earlier`), and whether the day's own arm
+    can be the plan (`plan_arm`, _plan_arm). See _chain_starts."""
     if switch:
         return {"from": "actual", "reset": "switchback"}
     if not prev:
@@ -804,6 +816,8 @@ def _expected_start(prev: dict | None, switch: bool, earlier: bool) -> dict:
     end = (prev.get("chain") or {}).get("end") or {}
     if not end.get("state"):
         return {"from": "actual", "reset": "no_state"}
+    if plan_arm and prev.get("fidelity") in NOT_PLAN_ARM:
+        return {"from": "actual", "reset": "arm_change"}
     if not _claims(prev) and int(end.get("unread_min") or 0) > 0:
         return {"from": "actual", "reset": "unread_inputs"}
     return {"from": "previous_day", "reset": None, "state": end["state"], "v_rs_per_kwh": float(end.get("v_rs_per_kwh") or 0.0)}
@@ -818,19 +832,25 @@ def _chain_starts(site_id: str, day: date) -> dict[str, dict]:
       _unread_minutes): the replay counted a blank load or PV as zero, so its end state is not native's own, and the day's own share of that error
       is not claimed while the next day's would be. Chained on, a 19:00-23:00 dropout on a withheld farm day raised the next two days' claims by
       Rs 1,140 (round 6 verifier, seed 7). The next day's claim then rests on nothing the dropout hid: it is the claim it makes with that day not
-      scored. A day that claims nothing on fully read inputs (a monitor site, a table not applied, a day withheld for its grid meter, battery or
-      genset alone) keeps the chain: native's replay of it is valid, so the days around it claim what they claim on complete data;
+      scored. A day withheld for its grid meter, battery or genset alone, on read load and PV, keeps the chain: native's replay of it is valid, so
+      the days around it claim what they claim on complete data;
+    - on a day whose arm can be the plan (_plan_arm) after a day the plan did not run (NOT_PLAN_ARM: a monitor day, a table not applied or control
+      not in force, an unconfirmed mark), "arm_change": the inverter ran native there, so the gap between native's replay and the real battery is
+      the replay's drift, not the plan's doing, and chained on it would be credited or debited at v_end in the first claim (round 7, audit
+      pr-review-03). Days the plan did not run chain among themselves (native against native);
     - on the first day of a switchback block whose arm differs from the day before's ("switchback", plan 8.2): each block's baseline is native from
       the block's measured start, so a plan block's last day carries the hand-over credit at v_end, and a native block, where the inverter ran
       native, scores about zero. A switchback site is held to that segmented replay (DESIGN_LOG, round 6)."""
     prev = day - timedelta(days=1)
-    switch = (arm_on(site_id, day) == "native") != (arm_on(site_id, prev) == "native")
+    arm = arm_on(site_id, day)
+    switch = (arm == "native") != (arm_on(site_id, prev) == "native")
+    plan_arm = _plan_arm((sites.get(site_id) or {}).get("tier", "monitor"), arm)
     with store.connect() as con:
         rows = {r["baseline"]: json.loads(r["data"]) for r in
                 con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, prev.isoformat()))}
         earlier = bool(rows) or con.execute("SELECT 1 FROM savings_days WHERE site_id = ? AND day_local < ? LIMIT 1",
                                             (site_id, prev.isoformat())).fetchone() is not None
-    return {base: _expected_start(rows.get(base), switch, earlier) for base in ("native", "tuned")}
+    return {base: _expected_start(rows.get(base), switch, earlier, plan_arm) for base in ("native", "tuned")}
 
 
 def _same_state(a: dict | None, b: dict | None) -> bool:
@@ -1343,8 +1363,11 @@ def _chain_stale(site_id: str, days: dict[str, dict]) -> list[str]:
             continue
         prev = days.get(prev_day) or (prev_rows if prev_day == before else {})
         switch = (_arm_in(blocks, day[:10]) == "native") != (_arm_in(blocks, prev_day) == "native")
-        # `earlier` only names a restart's reason, and every restart from the actual arm's state gives the same figures
-        if any(not _start_matches(row.get("chain"), _expected_start(prev.get(base), switch, earlier=True)) for base, row in days[day].items()):
+        # `earlier` only names a restart's reason, and every restart from the actual arm's state gives the same figures; whether the day's arm could be
+        # the plan is read from its own row (a recommendation or a native block could not)
+        if any(not _start_matches(row.get("chain"), _expected_start(prev.get(base), switch, earlier=True,
+                                                                     plan_arm=row.get("fidelity") not in ("recommendation_only", "native_block")))
+               for base, row in days[day].items()):
             stale.append(day)
     return stale
 

@@ -124,3 +124,42 @@ def test_a_demo_day_under_a_pause_claims_nothing(company):
     assert r["fidelity"] == "not_applied" and r["claimed_rs"] == 0.0 and r["control"]["released_min"] == 1440
     # the demo has no edge: its telemetry and events say nothing about an edge, so only the plan in force counts
     assert r["control"]["edge_fallback_min"] == 0 and r["control"]["edge_unheard_min"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ pr-review-03: the chain restarts where the plan takes over
+
+def test_the_first_plan_day_after_days_the_plan_did_not_run_restarts_from_the_measured_state(company):
+    # an active site at tier monitor (a recommendation: the inverter ran its own settings), then raised to closed loop. The monitor day's native
+    # replay drifts from the battery that really ran native; chained into the first claiming day, that drift was credited or debited at v_end in a
+    # claim. A switchback block's first day already restarts for this reason (plan 8.2); an activation is the same change of arm
+    sid = _farm("Farm activation r7")
+    _run(sid, [LEAD] + DAYS, _night_runs)
+    sites.set_tier_allowed(sid, "monitor", "t", "test")
+    first = verify.compute_day(sid, DAYS[0], with_bound=False)["native"]
+    assert first["fidelity"] == "recommendation_only" and first["claimed_rs"] == 0.0
+    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
+    rows = [verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS[1:]]
+    # before: chained from the monitor day (from "previous_day", its start gap valued at the monitor day's v_end)
+    assert rows[0]["chain"]["from"] == "actual" and rows[0]["chain"]["reset"] == "arm_change" and rows[0]["chain"]["start"]["gap_kwh"] == 0.0
+    assert rows[0]["fidelity"] == "confirmed" and rows[1]["chain"]["from"] == "previous_day"  # the plan's own days chain on
+    # the first plan day claims what it claims with the monitor day not scored at all: nothing the plan did not run rests in it
+    with store.connect() as con:
+        con.execute("DELETE FROM savings_days WHERE site_id = ? AND day_local = ?", (sid, DAYS[0].isoformat()))
+    gap = verify.compute_day(sid, DAYS[1], with_bound=False, forward=False)["native"]
+    assert gap["chain"]["reset"] == "first_day" and gap["claimed_rs"] == pytest.approx(rows[0]["claimed_rs"], abs=0.01)
+    sites.set_tier_allowed(sid, "monitor", "t", "test")
+    verify.compute_day(sid, DAYS[0], with_bound=False, forward=False)
+    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
+    span = (DAYS[0].isoformat(), DAYS[2].isoformat())
+    assert verify.summary(sid, *span)["chain_stale_days"] == []  # a restart from the measured state is never out of step
+    # a closed-loop day paused all day (not applied: the inverter ran native) restarts the next plan day too
+    t1 = twin.day_start_utc(DAYS[1])
+    _override(sid, "pause_control", t1 - 60, t1 + 86400)
+    paused, after = (verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS[1:])
+    assert paused["fidelity"] == "not_applied" and after["chain"]["reset"] == "arm_change"
+    assert verify.summary(sid, *span)["chain_stale_days"] == []
+    # two days in a row the plan did not run chain between them (native against native), and only the plan's first day restarts
+    _clear(sid, "overrides")
+    sites.set_tier_allowed(sid, "monitor", "t", "test")
+    a, b = (verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS[:2])
+    assert b["fidelity"] == "recommendation_only" and b["chain"]["from"] == "previous_day"

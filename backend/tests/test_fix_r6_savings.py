@@ -313,27 +313,26 @@ def test_a_day_withheld_on_a_read_load_keeps_the_chain_and_the_days_around_it_cl
         assert r["claimed_rs"] == pytest.approx(f["claimed_rs"], abs=0.01)
 
 
-def test_a_day_whose_fidelity_claims_nothing_keeps_the_chain_and_a_later_dropout_on_it_is_stale(company):
+def test_a_day_withheld_on_read_inputs_keeps_the_chain_and_a_later_dropout_on_it_is_stale(company):
+    # a day that claims nothing on fully read load and PV keeps the chain when the plan ran on it: here a day withheld for its battery's and genset's
+    # data alone (round 7, audit pr-review-03: a day the plan did not run, a monitor day or a table not applied, now restarts the next plan day's
+    # chain from the measured state; test_fix_r7_savings_engine)
     sid = _farm("Farm unclaimed r6")
     _run(sid, [LEAD] + DAYS, _night_runs)
     ref = [verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS]
-    # the first day scored while the site is at tier monitor: a recommendation, which claims nothing, on fully read inputs
-    sites.set_tier_allowed(sid, "monitor", "t", "test")
+    cols = ("battery_power_w", "battery_soc_est_pct", "battery_soc_bms_pct", "genset_running", "genset_power_w", "genset_fuel_l")
+    assert _blank_evening(sid, DAYS[0], cols=cols) == 240
     first = verify.compute_day(sid, DAYS[0], with_bound=False)["native"]
-    assert first["fidelity"] == "recommendation_only" and first["claimed_rs"] == 0.0
-    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
+    assert first["claim_withheld"] == "battery_flow_unknown" and first["claimed_rs"] == 0.0 and first["chain"]["end"]["unread_min"] == 0
     rows = [_rows(sid, d)["native"] for d in DAYS[1:]]
     assert rows[0]["chain"]["from"] == "previous_day" and rows[0]["chain"]["start"]["state"] == first["chain"]["end"]["state"]
     for r, f in zip(rows, ref[1:]):
         assert r["claimed_rs"] == pytest.approx(f["claimed_rs"], abs=0.01)
     span = (DAYS[0].isoformat(), DAYS[2].isoformat())
-    s = verify.summary(sid, *span)
-    assert s["chain_stale_days"] == [] and s["baselines"]["native"]["saving_rs"] == pytest.approx(_continuous(sid, DAYS, ref[-1]["actual"]["v_end"]), abs=3.0)
-    # a dropout found later on the unclaimed day, re-scored on its own: the second day still chains from it, so the summary names it
+    assert verify.summary(sid, *span)["chain_stale_days"] == []
+    # a dropout found later on the withheld day, re-scored on its own: the second day still chains from it, so the summary names it
     assert _blank_evening(sid, DAYS[0], 20.0, 22.0) == 120
-    sites.set_tier_allowed(sid, "monitor", "t", "test")
     verify.compute_day(sid, DAYS[0], with_bound=False, forward=False)
-    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
     assert verify.summary(sid, *span)["chain_stale_days"] == [DAYS[1].isoformat()]
     verify.compute_range(sid, DAYS[0], DAYS[0])  # forward: the second day restarts from the measured state
     assert _rows(sid, DAYS[1])["native"]["chain"]["reset"] == "unread_inputs"
