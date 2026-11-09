@@ -30,6 +30,15 @@ Batch 3, the control actions and the control state:
 - an operator may resume from the hold or the release an operator may place; a pause stays an administrator's (audit flow-telemetry-plan-control-22);
 - the hold, release and pause chips name their end, with its day when it is not today (audit flow-telemetry-plan-control-23).
 
+Batch 4, the advisory tier:
+- a demo site's chip says its real state: "Table not confirmed today" with nothing marked, "Edge offline" at a closed-loop site with no data (audit
+  role-owner-08 and its duplicates);
+- the write meter counts the Karachi day (audit pages-B-06);
+- the table that reaches the inverter is issued once a day by the nightly job and re-issued only when the twin prices it Rs 500 better, the day's
+  writes allow it and the last issue is an hour old (a hold or a resume at once); GET /control and the edge's message carry the issued table, the
+  meter counts table writes, never pulls (audit pages-B-02, engine-delivery-09, brief-vs-build-06, flow-telemetry-plan-control-16);
+- the "it took" card on today's keyed table, 30 minutes after its first discharge slot in the peak (audit pages-B-08).
+
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
