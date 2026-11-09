@@ -37,8 +37,14 @@ SEQ_MAX = contract.SEQ_MAX
 TS_EARLIEST = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
 TS_AHEAD_S = 86400
 
-#: Events that put the site in an unknown state: control pauses until a person resumes it (U3's names for them act alike: contract.event_meaning)
-PAUSE_EVENTS = ("readback_mismatch", "local_override", "template_change")
+#: Events that put the site in an unknown state: control pauses until a person resumes it (U3's names for them act alike: contract.event_meaning). A
+#: firmware change may move the register map under the template as a template change does (R6 C8): the cloud stops writing until a person resumes
+PAUSE_EVENTS = ("readback_mismatch", "local_override", "template_change", "firmware_change")
+#: Events with which the edge says it stopped running the plan, and the event that ends each state (R6 E18, 4.4): kept in the site's state
+#: (`edge_reports`, the newest report by its ts wins) for the control state, and read from the events table for the day's fidelity
+#: (plans.edge_fidelity)
+REPORT_EVENTS = {"control_disabled": ("disabled", True), "control_enabled": ("disabled", False),
+                 "fallback_engaged": ("fallback", True), "fallback_cleared": ("fallback", False)}
 PAUSE_REASON = "Edge reported an unknown device state"
 
 #: Event re-solves (plan Part 2.4, OPT-15: an outage event re-solves within a minute). The tick reads the grid state from telemetry, and only the whole
@@ -327,7 +333,7 @@ def edge_heartbeat(site_id: str, inp: dict = Body(...)):
     _key_only()
     site_or_404(site_id)
     msg = _check(delivery.Heartbeat, inp, site_id)
-    _put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump())
+    _put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump(), edge_heartbeat_at=now_ts())
     warn = None
     if abs(msg.clock_offset_s) >= 900:
         warn = "clock_offset_900s: control demoted until the clock is set"
@@ -378,11 +384,33 @@ def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Body(...)
         except Exception:
             log.exception("could not start the event re-solve for site %s", site_id)
             resolve = "failed"
+    reports = [e for e in msg.events if e.type in REPORT_EVENTS]
+    if reports:
+        try:
+            _state_change(site_id, lambda cur: (_merge_reports(cur.get("edge_reports"), reports), None))
+        except Exception:
+            log.exception("could not record the edge's control reports for site %s", site_id)
     answer = {"ack": msg.seq, "stored": len(msg.events), "resolve": resolve}
     unknown = msg.unknown_types()
     if unknown:
         answer["unknown_types"] = unknown       # stored; a newer edge's event types never void its batch (1.x adds optional things only)
     return answer
+
+
+def _merge_reports(held, events) -> dict | None:
+    """The site's `edge_reports` after an events batch: per state (disabled, fallback) the newest report by its ts, {on, at, cause}; a report older than
+    the one held (sent late) changes nothing. None when nothing changes."""
+    cur = dict(held) if isinstance(held, dict) else {}
+    changed = False
+    for e in sorted(events, key=_event_minute):
+        key, on = REPORT_EVENTS[e.type]
+        at = _event_minute(e)
+        if at < int((cur.get(key) or {}).get("at", -1)):
+            continue
+        cause = e.detail.get("cause") or e.detail.get("reason")
+        cur[key] = {"on": on, "at": at, "cause": str(cause)[:120] if on and cause else None}
+        changed = True
+    return {"edge_reports": cur} if changed else None
 
 
 def _merge_pending(held, cands: list[tuple[int, int, str]], now: int) -> dict:
@@ -483,4 +511,6 @@ def edge_status(site_id: str):
     last = st.get("edge_last_seen")
     return out({"last_seen": last, "online": bool(last and now_ts() - last < 300), "heartbeat": st.get("edge_heartbeat"),
                 "capabilities": json.loads(cap["body"]) if cap else None, "acks": [{**dict(a), "body": json.loads(a["body"])} for a in acks],
-                "sent": [dict(r) for r in sent], "public_key": delivery.public_key(site_id) if auth.can("edit_sites") else None})
+                "sent": [dict(r) for r in sent], "public_key": delivery.public_key(site_id) if auth.can("edit_sites") else None,
+                # what the edge reports when it is not running the plan in force (audit engine-delivery-12)
+                "reports": plans.edge_view(site_id)})

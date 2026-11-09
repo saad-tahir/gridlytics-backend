@@ -46,6 +46,11 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
         return {"key": "hold", "label": f"Hold until {until}", "until": kinds["reserve"]["until_ts"]}
     if tier == "closed_loop" and age is not None and age > 5 and not site.get("demo_link"):
         return {"key": "edge_offline", "label": "Edge offline"}
+    if tier == "closed_loop":
+        # what the edge itself reports (a fallback, control it disabled, the plan refused or applied in part) comes before "Following plan"
+        edge = plans.edge_view(site["id"], now)
+        if edge:
+            return edge
     if tier == "monitor":
         return {"key": "recommendation", "label": "Recommendation only"}
     if tier == "advisory_writes":

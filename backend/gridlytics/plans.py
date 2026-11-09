@@ -880,3 +880,103 @@ def _checked(body: dict) -> dict:
     delivery.PlanMessage.model_validate(body)
     return body
 
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): what the edge reports
+
+#: A heartbeat speaks for the edge for this long (the edge sends one a minute; five minutes is the edge-offline mark)
+HEARTBEAT_FRESH_S = 300
+#: The heartbeat states in which the edge does not run the cloud's plan, as a control state
+_EDGE_STATES = {"disabled": ("edge_disabled", "Edge disabled control"),
+                "fallback": ("edge_fallback", "Edge on fallback: the inverter runs its own settings"),
+                "native": ("edge_fallback", "Edge on fallback: the inverter runs its own settings"),
+                "released": ("edge_released", "Edge released the inverter to its own settings"),
+                "hold": ("edge_hold", "Edge holding the battery")}
+#: The events with which the edge says it does not run the plan, and the events that end each state (R6 E18, 4.4)
+_OFF_EVENTS = {"control_disabled": ("disabled", True), "control_enabled": ("disabled", False),
+               "fallback_engaged": ("fallback", True), "fallback_cleared": ("fallback", False), "plan_rejected": ("rejected", None)}
+
+
+def edge_view(site_id: str, now: int | None = None) -> dict | None:
+    """What the edge itself reports when it is not running the plan in force (audit engine-delivery-12), as a control state {key, label}, else None:
+    control it disabled (a control_disabled event not yet followed by control_enabled, or a fresh heartbeat saying so), a fallback (fallback_engaged
+    not yet cleared, or a fresh heartbeat in fallback or native), a release or hold of its own, or the plan in force refused (a rejected or expired
+    ack) or applied in part (a partial ack, or a primitive clamped, failed or refused). A heartbeat older than HEARTBEAT_FRESH_S says nothing."""
+    from . import contract
+
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    st = sites.state(site_id)
+    reports = st.get("edge_reports") or {}
+    off = reports.get("disabled") or {}
+    if off.get("on"):
+        return {"key": "edge_disabled", "label": "Edge disabled control" + (f": {off['cause']}" if off.get("cause") else "")}
+    beat, at = st.get("edge_heartbeat") or {}, st.get("edge_heartbeat_at")
+    state = beat.get("control_state") if at is not None and now - int(at) <= HEARTBEAT_FRESH_S else None
+    if (reports.get("fallback") or {}).get("on") and state not in contract.FOLLOWING_STATES:
+        state = "fallback"
+    if state in _EDGE_STATES:
+        key, label = _EDGE_STATES[state]
+        return {"key": key, "label": label}
+    plan = current(site_id, now)
+    if plan is None:
+        return None
+    with store.connect() as con:
+        r = con.execute("SELECT body FROM acks WHERE site_id = ? AND plan_id = ? ORDER BY received_at DESC, rowid DESC LIMIT 1",
+                        (site_id, plan["id"])).fetchone()
+    if r is None:
+        return None
+    outcome, codes = contract.ack_outcome(json.loads(r["body"]))
+    why = f" ({', '.join(codes)})" if codes else ""
+    if outcome == "rejected":
+        return {"key": "edge_refused", "label": f"Edge refused the plan{why}"}
+    if outcome == "expired":
+        return {"key": "edge_fallback", "label": "Edge reports the plan ran out: the inverter runs its own settings"}
+    if outcome == "partial":
+        return {"key": "edge_partial", "label": f"Edge applied part of the plan{why}"}
+    return None
+
+
+def edge_fidelity(site_id: str, day: date) -> str:
+    """A closed-loop day's fidelity from what the edge reported (audit engine-delivery-12; R6 C13: acks and events feed the fidelity), not 'confirmed'
+    by construction: 'not_applied' when at any time of the Pakistan-time day control was disabled or the edge was on fallback (a report before the day
+    counts until the event that ends it), or the edge rejected a plan or reported one expired; 'partial' when it applied a plan in part; else
+    'confirmed'."""
+    from . import contract
+
+    t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    t1 = t0 + 86400
+    with store.connect() as con:
+        evs = con.execute(f"SELECT ts, type FROM events WHERE site_id = ? AND type IN ({','.join('?' * len(_OFF_EVENTS))})",
+                          (site_id, *_OFF_EVENTS)).fetchall()
+        acks = con.execute("SELECT body, received_at FROM acks WHERE site_id = ? AND received_at >= ? AND received_at < ?",
+                           (site_id, _iso_utc(t0 - 86400), _iso_utc(t1 + 86400))).fetchall()
+    on = {"disabled": False, "fallback": False}
+    for at, kind in sorted((contract.epoch(e["ts"]), e["type"]) for e in evs if contract.epoch(e["ts"]) is not None):
+        if at >= t1:
+            break
+        if at >= t0 and any(on.values()):
+            return "not_applied"                      # in that state when the day began
+        key, state = _OFF_EVENTS[kind]
+        if key == "rejected":
+            if at >= t0:
+                return "not_applied"
+            continue
+        if at >= t0 and state:
+            return "not_applied"
+        on[key] = state
+    if any(on.values()):
+        return "not_applied"                          # in that state since before the day began, or from within it
+    partial = False
+    for a in acks:
+        at = contract.epoch(a["received_at"])
+        if at is None or not t0 <= at < t1:
+            continue
+        outcome, _ = contract.ack_outcome(json.loads(a["body"]))
+        if outcome in ("rejected", "expired"):
+            return "not_applied"
+        partial |= outcome == "partial"
+    return "partial" if partial else "confirmed"
+
+
+def _iso_utc(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat(timespec="seconds")
+

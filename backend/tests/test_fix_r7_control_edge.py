@@ -641,3 +641,97 @@ def test_a_device_that_reports_no_primitives_gets_the_table_unchanged_and_too_ma
         plans.signed_message(sid)
     assert "3 slots" in str(no.value) and "2" in str(no.value)
 
+
+# ------------------------------------------------------------------------------------------------ engine-delivery-12 (batch 2)
+
+def _control(w, sid: str) -> dict:
+    from gridlytics import routes_sites
+    with w.use():
+        return routes_sites.control_state(sites.get(sid), {"ts": _now()}, _now())
+
+
+def test_a_firmware_or_template_change_pauses_control_under_either_name(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    for n, kind in enumerate(("firmware_change", "firmware_change_detected", "template_change_detected")):
+        r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_env(n + 1, events=[{"ts": _iso(_now()), "type": kind}]))
+        assert r.status_code == 200, r.text
+        with world.use():
+            assert [o["kind"] for o in sites.overrides(sid)] == ["pause_control"] * (n + 1), kind
+
+
+def test_the_control_state_says_what_the_edge_reports(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    pid = _fake_plan(world)
+    with world.use():
+        _closed_loop(sid)
+    assert _control(world, sid)["key"] == "following"
+    beat = lambda n, state: world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json=_env(n, uptime_s=60, control_state=state))
+    assert beat(1, "fallback").status_code == 200
+    c = _control(world, sid)
+    assert c["key"] == "edge_fallback" and "own settings" in c["label"], c
+    beat(2, "executing")
+    assert _control(world, sid)["key"] == "following"
+    beat(3, "disabled")
+    assert _control(world, sid)["key"] == "edge_disabled"
+    beat(4, "following_plan")
+    # control disabled by the edge (a fault): shown until the edge says it is enabled again
+    ev = lambda n, kind, at, **d: world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_env(n, events=[{"ts": _iso(at), "type": kind, "detail": d}]))
+    assert ev(1, "control_disabled", _now() - 60, cause="inverter fault").status_code == 200
+    c = _control(world, sid)
+    assert c["key"] == "edge_disabled" and "inverter fault" in c["label"], c
+    ev(2, "control_disabled", _now() - 3600)                       # an older report sent late does not change it
+    ev(3, "control_enabled", _now() - 30)
+    assert _control(world, sid)["key"] == "following"
+    # the edge refused the plan in force, or applied part of it
+    ack = lambda n, status, **k: world.anon.post(f"/api/edge/{sid}/ack", headers=kh, json=_env(n, plan_id=pid, status=status, **k))
+    assert ack(1, "rejected", reason="CAPS_STALE").status_code == 200
+    c = _control(world, sid)
+    assert c["key"] == "edge_refused" and "CAPS_STALE" in c["label"], c
+    assert world.c["viewer"].get(f"/api/sites/{sid}/edge").json()["reports"] == c          # the edge card says it too
+    ack(2, "partial", per_device=[{"device_id": "inv1", "status": "partial", "rejected": [{"primitive": "gen_charge_allowed", "reason": "NOT_SUPPORTED"}]}])
+    c = _control(world, sid)
+    assert c["key"] == "edge_partial" and "NOT_SUPPORTED" in c["label"], c
+    ack(3, "applied")
+    assert _control(world, sid)["key"] == "following"
+    # an ack for another plan says nothing of the plan in force
+    world.anon.post(f"/api/edge/{sid}/ack", headers=kh, json=_env(4, plan_id="older", status="rejected"))
+    assert _control(world, sid)["key"] == "following"
+    # a heartbeat older than five minutes no longer speaks for the edge
+    with world.use():
+        sites.put_state(sid, edge_heartbeat={"control_state": "fallback"}, edge_heartbeat_at=_now() - 600)
+    assert _control(world, sid)["key"] == "following"
+
+
+def test_a_closed_loop_day_the_edge_did_not_follow_claims_nothing(company):
+    from test_fix_savings import make_site, twin_day
+    from gridlytics import verify
+    day = date(2026, 10, 14)
+    sid = make_site(name="Closed", tier="closed_loop", control="none", genset=False)
+    twin_day(sid, day, 0.6, seed=3)
+    assert verify.compute_day(sid, day, with_bound=False)["native"]["fidelity"] == "confirmed"
+    assert plans.edge_fidelity(sid, day) == "confirmed"
+    noon = int(datetime(2026, 10, 14, 12, tzinfo=PKT).timestamp())
+
+    def event(kind, at):
+        with store.connect() as con:
+            con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)", (sid, _iso(at), kind, "edge", "{}"))
+
+    event("fallback_engaged", noon)
+    assert plans.edge_fidelity(sid, day) == "not_applied"
+    r = verify.compute_day(sid, day, with_bound=False)["native"]
+    assert r["fidelity"] == "not_applied" and r["claimed_rs"] == 0.0
+    # still in fallback the next day until the edge clears it; the day after claims again
+    assert plans.edge_fidelity(sid, day + timedelta(days=1)) == "not_applied"
+    event("fallback_cleared", noon + 86400 + 3600)
+    assert plans.edge_fidelity(sid, day + timedelta(days=1)) == "not_applied"
+    assert plans.edge_fidelity(sid, day + timedelta(days=2)) == "confirmed"
+    # a plan the edge rejected that day, or applied in part
+    with store.connect() as con:
+        con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
+                    ("a1", sid, "p", "partial", json.dumps({"status": "partial"}), _iso(noon + 2 * 86400)))
+    assert plans.edge_fidelity(sid, day + timedelta(days=2)) == "partial"
+    with store.connect() as con:
+        con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
+                    ("a2", sid, "p", "rejected", json.dumps({"status": "rejected"}), _iso(noon + 2 * 86400 + 60)))
+    assert plans.edge_fidelity(sid, day + timedelta(days=2)) == "not_applied"
+
