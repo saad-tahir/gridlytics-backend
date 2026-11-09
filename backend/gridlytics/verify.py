@@ -686,7 +686,7 @@ def night_load_ratio(gen_asset: dict, series: dict) -> float:
 
 # ------------------------------------------------------------------------------------------------ chained baseline replays (HANDOFF 8.A.1)
 
-#: how many later days a scored day walks to re-score those whose chain no longer starts where the day before ends (_recompute_forward); a day
+#: how many later days a scored day walks to re-score those whose chain no longer starts where the day before ends (_walk_forward); a day
 #: beyond them keeps its old start and the summary lists it in `chain_stale_days` until it is recomputed
 FORWARD_MAX_DAYS = 62
 
@@ -976,29 +976,85 @@ def _start_matches(chain: dict | None, expect: dict) -> bool:
     return _same_state(s.get("state"), expect["state"]) and abs(float(s.get("v_rs_per_kwh") or 0.0) - expect["v_rs_per_kwh"]) <= 1e-9
 
 
-def _recompute_forward(site_id: str, day: date) -> list[str]:
+#: the audit lines of re-scoring (round 7, audit pr-review-02): a recompute's, with each day it re-scored, and the forward walk's after a day scored
+RECOMPUTED = "recomputed savings days"
+WALKED = "re-scored later savings days"
+
+
+def _stored_rows(site_id: str, day: date) -> dict[str, tuple[dict, str]]:
+    """A day's stored rows by baseline, each with when it was computed."""
+    with store.connect() as con:
+        return {r["baseline"]: (json.loads(r["data"]), r["computed"]) for r in
+                con.execute("SELECT baseline, data, computed FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, day.isoformat()))}
+
+
+def _restate(site_id: str, day: date, before: dict[str, tuple[dict, str]], why: str, by: str) -> bool:
+    """After a day is re-scored: whether its claim changed in a billing month that had already closed when the day was last scored (round 7, audit
+    pr-review-02). Such a change restates a closed month (its report, its fee check): the rows keep `restated`, a list of {at, why, by,
+    claimed_rs_before, claimed_rs_after}, carried through later re-scores, and summary() lists the period's restated days. A day re-scored while
+    its month is open, or at the month's settle when it was last scored open, is no restatement."""
+    if not before:
+        return False
+    conn = (sites.connections(site_id) or [None])[0]
+    _, p1 = tariffs.billing_period_for(conn, day)
+    closed_at = datetime(p1.year, p1.month, p1.day, tzinfo=PKT) + timedelta(days=1)
+    month_closed = p1 < _today()
+    out = False
+    now = store._now()
+    with store.connect() as con:
+        for base, (a, _) in _stored_rows(site_id, day).items():
+            b, computed = before.get(base, (None, None))
+            hist = list((b or {}).get("restated") or [])
+            try:
+                was_final = bool(computed) and datetime.fromisoformat(computed) >= closed_at
+            except (TypeError, ValueError):
+                was_final = False
+            if (b is not None and month_closed and was_final
+                    and abs(float(b.get("claimed_rs") or 0.0) - float(a.get("claimed_rs") or 0.0)) > 0.005):
+                hist.append({"at": now, "why": why, "by": by, "claimed_rs_before": b.get("claimed_rs"), "claimed_rs_after": a.get("claimed_rs")})
+                out = True
+            if hist:
+                a["restated"] = hist
+                con.execute("UPDATE savings_days SET data = ? WHERE site_id = ? AND day_local = ? AND baseline = ?",
+                            (json.dumps(a), site_id, day.isoformat(), base))
+    return out
+
+
+def _rescored(day: date, why: str, before: dict[str, tuple[dict, str]], after: dict, restated: bool) -> dict:
+    """One re-scored day for the audit trail: why, and its claim against the native settings before and after."""
+    return {"day": day.isoformat(), "why": why, "claimed_rs_before": ((before.get("native") or ({}, None))[0]).get("claimed_rs"),
+            "claimed_rs_after": (after.get("native") or {}).get("claimed_rs"), "restated": restated}
+
+
+def _walk_forward(site_id: str, day: date, by: str = "system") -> list[dict]:
     """Walk the stored days after `day` in order, up to the first day with no row (the chain restarts there) or FORWARD_MAX_DAYS, and re-score each
-    whose chain no longer starts where the day before's row now ends (_start_matches; a day that still matches is only read). A day keeps its
-    perfect-foresight bound only where it had one. Returns the days re-scored."""
-    done: list[str] = []
+    whose chain (or native block hand-over replay) no longer starts where the day before's row now ends (_start_matches, _handover_matches; a
+    day that still matches is only read). A day keeps its perfect-foresight bound only where it had one. Returns each day re-scored (_rescored),
+    a restatement of a closed month marked on its rows (_restate)."""
+    done: list[dict] = []
     d = day
     for _ in range(FORWARD_MAX_DAYS):
         d = d + timedelta(days=1)
-        with store.connect() as con:
-            rows = {r["baseline"]: json.loads(r["data"]) for r in
-                    con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, d.isoformat()))}
-        if not rows:
+        before = _stored_rows(site_id, d)
+        if not before:
             break
+        rows = {b: r for b, (r, _) in before.items()}
         expect = _chain_starts(site_id, d)
         if all(_start_matches(rows[b].get("chain"), expect[b]) and _handover_matches(rows[b], expect[b].get("handover")) for b in rows if b in expect):
             continue
-        if compute_day(site_id, d, with_bound="perfect_foresight_rs" in (rows.get("native") or {}), forward=False) is None:
+        new = _score_day(site_id, d, with_bound="perfect_foresight_rs" in (rows.get("native") or {}))
+        if new is None:
             break
-        done.append(d.isoformat())
+        done.append(_rescored(d, "chain", before, new, _restate(site_id, d, before, "chain", by)))
     return done
 
 
-def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool = True) -> dict | None:
+def _recompute_forward(site_id: str, day: date, by: str = "system") -> list[str]:
+    """_walk_forward, the days it re-scored."""
+    return [x["day"] for x in _walk_forward(site_id, day, by)]
+
+
+def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool = True, by: str = "system") -> dict | None:
     """Score a day against the native and the tuned baseline and store its rows (one per baseline).
 
     Each baseline's replay is chained (_chain_starts): it starts from that baseline's own end state of the day before, so the days of a chain add up
@@ -1009,13 +1065,19 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
     load forecast is a later item). Its carry-over lever is the change of the valued gap in stored energy over the day: v_end x (actual - baseline end
     energy) less the day before's v_end x (actual - baseline start energy), which is zero where the chain restarts from the actual arm's state. A
     run of the genset across midnight is one start on each arm. The row stores the chain's start and end (`chain`), and with `forward` the stored
-    later days whose chain started from this day's old end are re-scored (_recompute_forward), and the day's billing month, once over, and the month
-    before it are settled: their days re-scored where their prices, native capture or data changed since (_settle_months; the nightly job scores
-    yesterday this way, so a month is re-scored at its end and after an FCA or late data)."""
+    later days whose chain started from this day's old end are re-scored (_walk_forward: one audit line, WALKED, with each day's claim before and
+    after), and the day's billing month, once over, and the month before it are settled: their days re-scored where their prices, native capture
+    or data changed since (_settle_months; the nightly job scores yesterday this way, so a month is re-scored at its end and after an FCA or late
+    data). A re-score that changes a claim of a closed month is marked on the rows (_restate). `by`: who asked, for the audit trail."""
+    before = _stored_rows(site_id, day)
     rows = _score_day(site_id, day, with_bound)
+    if rows is not None:
+        _restate(site_id, day, before, "recompute", by)
     if forward:
         if rows is not None:
-            _recompute_forward(site_id, day)
+            walked = _walk_forward(site_id, day, by)
+            if walked:
+                store.audit(by, WALKED, site_id, {"after_day": day.isoformat(), "days": walked})
         _settle_months(site_id, day)
     return rows
 
@@ -1271,7 +1333,8 @@ def _settle_month(site_id: str, conn: dict | None, p0: date, p1: date) -> list[d
     on month totals projected from the days so far, so its ICP case can flip once the month ends; an FCA, a tariff version or a fuel price can be
     approved after it (its price digest changes); a native capture can come to stand for it; late telemetry can fill its gaps. A row from before
     the digest is re-scored where its ICP case or MDI rate differs. The days are walked in order, so a day whose chain an earlier re-score moved is
-    re-scored too, then the stored days after the month (_recompute_forward). Each re-scored day is audited with its claim before and after."""
+    re-scored too, then the stored days after the month (_walk_forward, `then` in the same audit line). Each re-scored day is audited with its
+    claim before and after, and marked where it restates a claim made after the month closed (_restate: an FCA approved later, say)."""
     with store.connect() as con:
         rows: dict[str, dict] = {}
         for r in con.execute("SELECT day_local, baseline, data FROM savings_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? "
@@ -1302,12 +1365,15 @@ def _settle_month(site_id: str, conn: dict | None, p0: date, p1: date) -> list[d
                else "late_data" if late else "chain" if moved else None)
         if why is None:
             continue
+        before = _stored_rows(site_id, d)
         new = _score_day(site_id, d, with_bound="perfect_foresight_rs" in (by.get("native") or {}))
         if new is not None:
-            done.append({"day": day, "why": why, "claimed_rs_before": row.get("claimed_rs"), "claimed_rs_after": new["native"]["claimed_rs"]})
+            done.append({"day": day, "why": why, "claimed_rs_before": row.get("claimed_rs"), "claimed_rs_after": new["native"]["claimed_rs"],
+                         "restated": _restate(site_id, d, before, why, "system")})
     if done:
-        _recompute_forward(site_id, p1)
-        store.audit("system", "re-scored a closed month's savings days", site_id, {"billing_period": [p0.isoformat(), p1.isoformat()], "days": done})
+        then = _walk_forward(site_id, p1)
+        store.audit("system", "re-scored a closed month's savings days", site_id, {"billing_period": [p0.isoformat(), p1.isoformat()], "days": done,
+                                                                                    "then": then})
     return done
 
 
@@ -1545,18 +1611,32 @@ def confirm_applied(site: dict, day: date, applied: dict, act: dict, plant: twin
     return {"class": cls, "fidelity": score, **detail}
 
 
-def compute_range(site_id: str, d0: date, d1: date) -> int:
+def compute_range_detail(site_id: str, d0: date, d1: date, by: str = "system") -> dict:
     """Score the days d0..d1 in order, each baseline's chain carried from one to the next, then re-score the stored days after d1 whose chain the
-    range moved (_recompute_forward). Returns the days d0..d1 scored."""
+    range moved (_walk_forward). One audit line (RECOMPUTED) lists every day re-scored, why ("recompute", "chain"), and its claim before and
+    after; a closed month's changed claims are marked (_restate). Returns {"days": the days d0..d1 scored, "rescored_days": the later days the
+    walk re-scored, "restated_days": the days whose claim changed in a closed month} (round 7, audit pr-review-02: before, the answer counted the
+    range only, and nothing recorded what the walk rewrote)."""
     n = 0
+    entries: list[dict] = []
     d = d0
     while d <= d1:
-        if compute_day(site_id, d, forward=False):
+        before = _stored_rows(site_id, d)
+        new = _score_day(site_id, d)
+        if new is not None:
             n += 1
+            entries.append(_rescored(d, "recompute", before, new, _restate(site_id, d, before, "recompute", by)))
         d += timedelta(days=1)
-    if d1 >= d0:
-        _recompute_forward(site_id, d1)
-    return n
+    walked = _walk_forward(site_id, d1, by) if d1 >= d0 else []
+    entries += walked
+    if entries:
+        store.audit(by, RECOMPUTED, site_id, {"start": d0.isoformat(), "end": d1.isoformat(), "days": entries})
+    return {"days": n, "rescored_days": [x["day"] for x in walked], "restated_days": [x["day"] for x in entries if x["restated"]]}
+
+
+def compute_range(site_id: str, d0: date, d1: date, by: str = "system") -> int:
+    """compute_range_detail, the count of the days d0..d1 scored."""
+    return compute_range_detail(site_id, d0, d1, by)["days"]
 
 
 def _months_between(d0: str, d1: str) -> list[str]:
@@ -1927,6 +2007,15 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "mdi_provisional": not mdi_info[bill_month(day)]["closed"],
                             # scored while its billing month was open: its ICP case rests on projected month totals until the month is settled
                             "month_totals_projected": bool(n.get("month_totals_projected"))})
+    # round 7 (audit pr-review-02): the period's days whose claim was re-scored after their billing month closed, each with its latest change (a
+    # report of that month made before `at` shows the old figures)
+    out["restated_days"] = []
+    for day, by in sorted(days.items()):
+        hist = (by.get("native") or {}).get("restated") or (by.get("tuned") or {}).get("restated")
+        if hist:
+            last = hist[-1]
+            out["restated_days"].append({"day": day, "at": last.get("at"), "why": last.get("why"), "times": len(hist),
+                                         "claimed_rs_before": last.get("claimed_rs_before"), "claimed_rs_after": last.get("claimed_rs_after")})
     verified = out["baselines"].get("native", {}).get("verified_days", 0)
     # plan 8.5: "Preliminary" until 8 weeks of switchback have run and the FCA of every month in the period has been billed
     sb_weeks = _switchback_weeks(blocks, today)

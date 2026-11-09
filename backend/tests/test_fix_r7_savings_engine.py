@@ -7,8 +7,9 @@ import json
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
+from test_fix_api import world  # noqa: F401 (a fixture)
 from test_fix_r2_savings import NIGHT_CHARGER, D, P
-from test_fix_r6_savings import DAYS, LEAD, _blank_evening, _continuous, _farm, _night_runs, _run
+from test_fix_r6_savings import DAYS, LEAD, _blank_evening, _continuous, _farm, _night_runs, _rows, _run
 from test_fix_savings import _put_rows, company, make_site, twin_day  # noqa: F401 (company is a fixture)
 
 from gridlytics import sites, store, tariffs, telemetry, twin, verify
@@ -714,3 +715,85 @@ def test_the_off_grid_farms_eleven_day_ledger_tracks_the_continuous_replay_and_i
     end = rows[-1]["chain"]["end"]["carry_rs"]
     assert n["carry_over_provisional_rs"] == pytest.approx(end, abs=0.01)
     assert n["claimed_rs"] == pytest.approx(cont - end, abs=5.0) and n["levers_claimed_rs"]["carry_over"] == pytest.approx(0.0, abs=0.05)
+
+
+# ------------------------------------------------------------------------------------------------ pr-review-02: a re-score is audited, answered and
+# ------------------------------------------------------------------------------------------------ marked where it changes a closed month
+
+RECOMPUTED = "recomputed savings days"
+WALKED = "re-scored later savings days"
+
+
+def _audits(sid: str, action: str) -> list[dict]:
+    with store.connect() as con:
+        return [json.loads(r["detail"]) | {"actor": r["actor"]} for r in
+                con.execute("SELECT actor, detail FROM audit WHERE action = ? AND target = ? ORDER BY rowid", (action, sid))]
+
+
+def test_a_recompute_answers_audits_and_marks_every_day_it_rescores_in_a_closed_month(company):
+    # Round 6's forward walk re-scores the later days whose chain start moved, up to 62 of them and across closed months. Before: the recompute
+    # answered {"days": 1}, wrote no audit line, and nothing marked the closed month's days whose claims it rewrote (a report of that month
+    # kept its old figures)
+    sid = _farm("Farm restated r7")
+    _run(sid, [LEAD] + DAYS, _night_runs)
+    first = {d.isoformat(): {b: r["claimed_rs"] for b, r in verify.compute_day(sid, d, with_bound=False).items()} for d in DAYS}
+    assert _audits(sid, WALKED) == []  # scoring days in order re-scores nothing
+    # a dropout found later on the first day (October is over): it now claims nothing, and the day after it restarts from the measured state
+    _blank_evening(sid, DAYS[0])
+    out = verify.compute_range_detail(sid, DAYS[0], DAYS[0], by="analyst@example.test")
+    assert out["days"] == 1 and out["rescored_days"] == [DAYS[1].isoformat(), DAYS[2].isoformat()]
+    assert verify.compute_range(sid, DAYS[0], DAYS[0]) == 1  # the old answer's figure
+    rows = {d.isoformat(): _rows(sid, d) for d in DAYS}
+    now = {d: r["native"] for d, r in rows.items()}
+    changed = [d for d in rows if any(abs(rows[d][b]["claimed_rs"] - first[d][b]) > 0.005 for b in rows[d])]
+    assert changed and out["restated_days"] == changed
+    # one audit line for the recompute: each day it re-scored, why, and its claim before and after
+    a = _audits(sid, RECOMPUTED)[0]
+    assert a["actor"] == "analyst@example.test" and (a["start"], a["end"]) == (DAYS[0].isoformat(), DAYS[0].isoformat())
+    assert [(x["day"], x["why"]) for x in a["days"]] == [(DAYS[0].isoformat(), "recompute"), (DAYS[1].isoformat(), "chain"), (DAYS[2].isoformat(), "chain")]
+    for x in a["days"]:
+        assert x["claimed_rs_before"] == pytest.approx(first[x["day"]]["native"], abs=0.01) and x["claimed_rs_after"] == now[x["day"]]["claimed_rs"]
+        assert x["restated"] is (x["day"] in changed)
+    # the rows say so, and the summary lists them for the month's reports
+    for d in changed:
+        r = now[d]["restated"][-1]
+        assert r["claimed_rs_before"] == pytest.approx(first[d]["native"], abs=0.01) and r["claimed_rs_after"] == now[d]["claimed_rs"]
+        assert r["by"] == "analyst@example.test" and r["why"] == ("recompute" if d == DAYS[0].isoformat() else "chain")
+    s = verify.summary(sid, DAYS[0].isoformat(), DAYS[-1].isoformat())
+    assert [x["day"] for x in s["restated_days"]] == changed and all(x["at"] for x in s["restated_days"])
+    # the nightly scoring of a day whose later days moved writes its own audit line (here the third day's stored start is off)
+    with store.connect() as con:
+        for b, data in _rows(sid, DAYS[2]).items():
+            data["chain"]["start"]["state"]["soc"] += 0.01
+            con.execute("UPDATE savings_days SET data = ? WHERE site_id = ? AND day_local = ? AND baseline = ?", (json.dumps(data), sid, DAYS[2].isoformat(), b))
+    verify.compute_day(sid, DAYS[1], with_bound=False)
+    walks = _audits(sid, WALKED)
+    assert len(walks) == 1 and walks[0]["actor"] == "system" and walks[0]["after_day"] == DAYS[1].isoformat()
+    assert [(x["day"], x["why"], x["restated"]) for x in walks[0]["days"]] == [(DAYS[2].isoformat(), "chain", False)]
+    assert len(_rows(sid, DAYS[2])["native"].get("restated") or []) == (1 if DAYS[2].isoformat() in changed else 0)  # its marks carried through
+
+
+def test_a_rescore_in_a_month_not_over_is_no_restatement(company, monkeypatch):
+    monkeypatch.setattr(verify, "_today", lambda: date(2026, 10, 20))  # October is still open
+    sid = _farm("Farm open month r7")
+    _run(sid, [LEAD] + DAYS, _night_runs)
+    for d in DAYS:
+        verify.compute_day(sid, d, with_bound=False)
+    _blank_evening(sid, DAYS[0])
+    out = verify.compute_range_detail(sid, DAYS[0], DAYS[0])
+    assert out["rescored_days"] and out["restated_days"] == []
+    assert not any(_rows(sid, d)["native"].get("restated") for d in DAYS)
+    assert verify.summary(sid, DAYS[0].isoformat(), DAYS[-1].isoformat())["restated_days"] == []
+
+
+def test_the_recompute_route_answers_the_later_days_it_rescored(world, monkeypatch):
+    seen = {}
+
+    def detail(site_id, d0, d1, by="system"):
+        seen["by"] = by
+        return {"days": 2, "rescored_days": ["2026-10-14"], "restated_days": ["2026-10-14"]}
+
+    monkeypatch.setattr(verify, "compute_range_detail", detail)
+    r = world.c["analyst"].post(f"/api/sites/{world.site}/savings/recompute", json={"start": "2026-10-12", "end": "2026-10-13"})
+    assert r.status_code == 200 and r.json() == {"days": 2, "rescored_days": ["2026-10-14"], "restated_days": ["2026-10-14"]}
+    assert seen["by"] and seen["by"] != "system"

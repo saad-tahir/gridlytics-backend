@@ -52,8 +52,8 @@ def recompute(site_id: str, inp: dict = Body(default={})):
     d1 = parse_day(inp.get("end"), t - timedelta(days=1))
     if (d1 - d0).days > 62:
         raise Refusal(422, "Recompute at most 62 days at a time", "invalid")
-    n = verify.compute_range(site_id, d0, d1)
-    return {"days": n}
+    # round 7 (audit pr-review-02): the later days the forward walk re-scored, and those whose claim changed in a closed month, beside the count
+    return verify.compute_range_detail(site_id, d0, d1, by=auth.actor())
 
 
 @router.get("/api/sites/{site_id}/savings/export.csv")
