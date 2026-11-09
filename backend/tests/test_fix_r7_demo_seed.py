@@ -64,6 +64,59 @@ def test_the_demo_farm_records_that_it_is_off_grid(company):
     assert all(sites.full(i)["data"]["off_grid"] is False for i in ids if i != farm["id"])
 
 
+# ------------------------------------------------------------------------------------------------ the data source and the edge (role-owner-15)
+
+def test_every_demo_site_records_the_data_source_its_tier_rests_on(company):
+    ids = demo.create_sites("t")
+    for sid in ids:
+        s = sites.full(sid)
+        src = s["data"].get("data_source")
+        # before: no source at all ('No data source is recorded for this site yet') beside 'The data source supports Closed loop'
+        assert src and src["kind"] in sites.DATA_SOURCE_KINDS and src["grid_signal_confirmed"] is True, s["name"]
+        with store.connect() as con:
+            cap = con.execute("SELECT body FROM capabilities WHERE site_id = ?", (sid,)).fetchone()
+        native = sites.native_latest(sid)
+        if src["kind"] == "edge":
+            # the edge asserts its own tier in its capabilities message (plan Part 2.3), and reads the native settings back
+            assert cap is not None and json.loads(cap["body"])["tier"] == s["tier_capable"] == "closed_loop", s["name"]
+            assert native["source"] == "read_back"
+        else:
+            # a cloud source has no write path: its plans reach the site as tables a person keys in (advisory writes at most)
+            assert cap is None and s["tier_capable"] == "advisory_writes", s["name"]
+            assert native["source"] != "read_back", s["name"]                      # before: the mall's 'Read back' with no edge to read it
+    tiers = {sites.full(i)["name"]: sites.full(i)["tier"] for i in ids}
+    assert tiers == {"Faisalabad textile mill (demo)": "advisory_writes", "Lahore mall (demo)": "monitor", "Karachi feed mill (demo)": "closed_loop",
+                     "Rahim Yar Khan farm (demo)": "advisory_writes"}
+
+
+def test_the_closed_loop_demo_sites_edge_is_the_twin_and_reports_as_it_runs(world, monkeypatch):
+    from gridlytics import routes_edge
+
+    now = int(time.time()) // 60 * 60
+    with world.use():
+        mill = _demo("feedmill")
+        plan = {"id": "plan-edge", "valid_until": _iso(now + 86400), "slots": {"days": []}, "steps": []}
+        demo._simulate_span(sites.full(mill), now - 1800, now, plan)
+        demo._simulate_span(sites.full(mill), now - 1800, now, plan)                # the same plan again: acknowledged once
+        st = sites.state(mill)
+        with store.connect() as con:
+            acks = [tuple(r) for r in con.execute("SELECT plan_id, status FROM acks WHERE site_id = ?", (mill,))]
+        farm = _demo("farm")
+    assert st["edge_last_seen"] == now and st["edge_heartbeat"]["control_state"] == "following_plan"
+    assert st["edge_heartbeat"]["active_plan"] == "plan-edge" and acks == [("plan-edge", "applied")]
+    e = world.c["operator"].get(f"/api/sites/{mill}/edge").json()
+    # before: last_seen null ('No edge device: plans are delivered as daily slot tables') at a closed-loop site
+    assert e["last_seen"] == now and e["online"] is True and e["capabilities"]["tier"] == "closed_loop"
+    assert [a["plan_id"] for a in e["acks"]] == ["plan-edge"] and e["heartbeat"]["control_state"] == "following_plan"
+    # the twin reports when the 15-minute schedule runs it, so ten minutes on its edge is still online
+    monkeypatch.setattr(routes_edge, "now_ts", lambda: now + 600)
+    assert world.c["operator"].get(f"/api/sites/{mill}/edge").json()["online"] is True
+    monkeypatch.setattr(routes_edge, "now_ts", lambda: now + 3600)
+    assert world.c["operator"].get(f"/api/sites/{mill}/edge").json()["online"] is False
+    # a site with a cloud source has no edge, and the twin reports none for it
+    assert world.c["operator"].get(f"/api/sites/{farm}/edge").json()["last_seen"] is None
+
+
 # ------------------------------------------------------------------------------------------------ outages run past midnight (role-operator-29)
 
 def test_an_outage_running_at_midnight_goes_on_into_the_next_day(company):

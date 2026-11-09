@@ -6,6 +6,7 @@ compiled to the brand's slot table, except on the native blocks of the switchbac
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -14,7 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 
-from . import alerts, forecast, plans, sites, store, telemetry, twin, verify
+from . import alerts, delivery, forecast, plans, sites, store, telemetry, twin, verify
 
 PKT = timezone(timedelta(hours=5))
 DEMO_LINK = "demo"
@@ -29,6 +30,12 @@ HISTORY_STEPS = 192
 REPLAN_HOURS = 3
 #: the wall clock the twin is held behind (the tests move it)
 _clock = time.time
+#: What a data source other than an edge lets a site reach (plan Part 2.3: an edge asserts its own tier in its capabilities message; a cloud or CSV
+#: source has no write path, so its plans reach the site as slot tables a person keys in, as onboarding records it)
+SOURCE_TIER = {"oem_cloud": "advisory_writes", "csv": "advisory_writes"}
+#: How long the closed-loop demo site's edge counts as online after its last report: the edge is the twin, which reports when the 15-minute schedule
+#: runs it (scheduler.tick_company: advance), where a real edge's heartbeat comes every minute
+EDGE_FRESH_S = 20 * 60
 
 
 def _clock_minute() -> int:
@@ -36,12 +43,17 @@ def _clock_minute() -> int:
     return int(_clock()) // 60 * 60
 
 
+def _iso(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat(timespec="seconds")
+
+
 DEMO_SITES = [
     {"key": "textile",
      "site": {"name": "Faisalabad textile mill (demo)", "city": "Faisalabad", "address": "Jhang Road industrial area", "lat": 31.42, "lon": 73.08,
               "disco": "FESCO", "site_type": "industrial_2_shift", "outage_unit": {"kind": "feeder", "code": "411205", "name": "Jhang Road Industrial"},
               "genset_start_control": "manual", "outage_load_mode": 0, "critical_load_kw": [70.0] * 24, "control_mode": "mode_a",
-              "notes": "Two-shift spinning; manual genset start; switchback calendar running."},
+              "notes": "Two-shift spinning; manual genset start; switchback calendar running.",
+              "data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}},
      "extra": {"load_peak_kw": 330, "twin": {"windows": [["14:00", "16:00"]], "adherence": 0.8, "trips_per_day": 0.8, "trip_minutes": 70,
                                              "unconfirmed_alert": True}},
      "connection": {"meter_ref": "FS-24-11-0042", "tariff_category": "B-2(b)", "sanctioned_load_kw": 500, "regime": "none"},
@@ -54,19 +66,20 @@ DEMO_SITES = [
      "site": {"name": "Lahore mall (demo)", "city": "Lahore", "address": "Gulberg III", "lat": 31.51, "lon": 74.35, "disco": "LESCO", "site_type": "retail",
               "outage_unit": {"kind": "feeder", "code": "113307", "name": "Gulberg Commercial"}, "genset_start_control": "auto_on_grid_loss",
               "outage_load_mode": 1, "critical_load_kw": [180.0] * 24, "control_mode": "advisory",
-              "notes": "Two 400 kVA gensets behind an auto-start panel; legacy net metering agreement from 2019."},
+              "notes": "Two 400 kVA gensets behind an auto-start panel; legacy net metering agreement from 2019.",
+              "data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}},
      "extra": {"load_peak_kw": 420, "twin": {"windows": [], "trips_per_day": 0.45, "trip_minutes": 55}},
      "connection": {"meter_ref": "LH-19-07-7781", "tariff_category": "A-2(c)", "sanctioned_load_kw": 650, "regime": "net_metering_legacy",
                     "export_cap_kw": 180, "agreement_start": "2019-07-01", "agreement_end": None},
      "assets": {"pv": {"kwp_dc": 200, "kw_ac": 180}, "inverter": {"brand": "huawei", "model": "SUN2000-100KTL x2", "kw_ac": 200},
                 "battery": {"nameplate_kwh": 100, "p_ch_kw": 50, "p_dis_kw": 50},
                 "genset": {"rated_kw": 640, "f_min": 0.25, "fuel_kind": "hsd", "min_up_h": 0.5, "tank_l": 4000}},
-     "tier": "monitor", "native": {"source": "read_back", "work_mode": "self_use", "backup_soc_pct": 30}, "schedule": [], "bill": True},
+     "tier": "monitor", "native": {"source": "photo", "work_mode": "self_use", "backup_soc_pct": 30}, "schedule": [], "bill": True},
     {"key": "feedmill",
      "site": {"name": "Karachi feed mill (demo)", "city": "Karachi", "address": "SITE area", "lat": 24.9, "lon": 67.0, "disco": "K-Electric",
               "site_type": "industrial_3_shift", "outage_unit": {"kind": "feeder", "code": "", "name": "SITE-11"}, "genset_start_control": "manual",
               "outage_load_mode": 1, "critical_load_kw": [250.0] * 24, "control_mode": "mode_b",
-              "notes": "1 MW gas engine on captive gas; zero export."},
+              "notes": "1 MW gas engine on captive gas; zero export.", "data_source": {"kind": "edge", "grid_signal_confirmed": True}},
      "extra": {"load_peak_kw": 900, "twin": {"windows": [], "trips_per_day": 0.5, "trip_minutes": 80}},
      "connection": {"meter_ref": "KE-B3-55120", "disco_group": "ke", "tariff_category": "B-3", "sanctioned_load_kw": 1500, "regime": "none",
                     "tax": {"province": "sindh"}},
@@ -74,11 +87,13 @@ DEMO_SITES = [
                 "battery": {"nameplate_kwh": 500, "p_ch_kw": 250, "p_dis_kw": 250},
                 "genset": {"rated_kw": 1000, "f_min": 0.4, "fuel_kind": "gas_captive", "a": 0.0085, "b": 0.0010, "c_start_rs": 4000,
                            "c_runhr_rs": 1500, "c_om_rs_per_kwh": 6.0, "min_up_h": 2.0, "min_down_h": 1.0, "tank_l": 0}},
-     "tier": "closed_loop", "native": {"source": "read_back", "work_mode": "self_use", "backup_soc_pct": 25}, "schedule": []},
+     "tier": "closed_loop", "native": {"source": "read_back", "work_mode": "self_use", "backup_soc_pct": 25}, "schedule": [],
+     "edge": {"edge_version": "twin 1.0 (demo)", "tier": "closed_loop"}},
     {"key": "farm",
      "site": {"name": "Rahim Yar Khan farm (demo)", "city": "Rahim Yar Khan", "address": "Chak 92", "lat": 28.42, "lon": 70.3, "disco": None,
               "site_type": "farm", "genset_start_control": "manual", "outage_load_mode": 1, "critical_load_kw": [8.0] * 24, "control_mode": "advisory",
-              "off_grid": True, "notes": "Off-grid tube-well and cold store; tank-level metering."},
+              "off_grid": True, "notes": "Off-grid tube-well and cold store; tank-level metering.",
+              "data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}},
      "extra": {"load_peak_kw": 42, "twin": {}},
      "connection": None,
      "assets": {"pv": {"kwp_dc": 80, "kw_ac": 70}, "inverter": {"brand": "voltronic", "model": "Axpert MKS x6", "kw_ac": 66},
@@ -104,15 +119,33 @@ def demo_sites() -> list[dict]:
     return [s for s in sites.listing() if s.get("demo_link") == DEMO_LINK]
 
 
-def create_sites(by: str) -> list[str]:
+def _record_source(site_id: str, spec: dict, since: int) -> None:
+    """The tier the demo site's data source supports (audit role-owner-15: every demo site said 'The data source supports Closed loop' with no source
+    recorded, and the closed-loop mill had no edge). The mill's edge is the twin: its capabilities message asserts the tier, as an edge's does
+    (routes_edge.edge_caps), dated from when its history starts; a cloud source supports what SOURCE_TIER says."""
+    edge = spec.get("edge")
+    if edge:
+        body = {"contract": delivery.CONTRACT, "seq": 1, "sent_at": _iso(since), "edge_version": edge["edge_version"], "clock_synced": True,
+                "tier": edge["tier"], "devices": []}
+        with store.connect() as con:
+            con.execute("INSERT OR REPLACE INTO capabilities (site_id, seq, received_at, body) VALUES (?,?,?,?)", (site_id, 1, _iso(since), json.dumps(body)))
+        sites.set_tier_capable(site_id, edge["tier"])
+        sites.put_state(site_id, edge_boot=int(since))
+    else:
+        sites.set_tier_capable(site_id, SOURCE_TIER[spec["site"]["data_source"]["kind"]])
+
+
+def create_sites(by: str, since: int | None = None) -> list[str]:
+    """The four demo sites, active, each with its data source and the tier it supports; `since` is when the history starts (the edge's first
+    report), now by default."""
     ids = []
     today = datetime.now(PKT).date()
+    since = int(since if since is not None else _clock_minute())
     for spec in DEMO_SITES:
         s = sites.create(spec["site"], by, demo_link=DEMO_LINK)
         sid = s["id"]
         data = {**s["data"], **spec["extra"]}
         with store.connect() as con:
-            import json
             con.execute("UPDATE sites SET data = ?, status = 'active' WHERE id = ?", (json.dumps(data), sid))
         if spec["connection"]:
             conn = dict(spec["connection"])
@@ -121,7 +154,7 @@ def create_sites(by: str) -> list[str]:
             sites.put_connection(sid, conn, by)
         for role, fields in spec["assets"].items():
             sites.put_asset(sid, role, fields, by)
-        sites.set_tier_capable(sid, "closed_loop")
+        _record_source(sid, spec, since)
         sites.set_tier_allowed(sid, spec["tier"], by, "demo")
         sites.capture_native(sid, spec["native"], by)
         if spec["schedule"]:
@@ -236,7 +269,31 @@ def _simulate_span(site: dict, t_from: int, t_to: int, plan: dict | None) -> int
         t = end
     if t_to > t_from:
         store.set_setting(key, {"t": int(t_to), "elapsed": elapsed0, "outage": outage0, "rescue": rescue0})
+        if ((site.get("data") or {}).get("data_source") or {}).get("kind") == "edge":
+            _edge_report(site, t_from, t_to, plan)
     return written
+
+
+def _edge_report(site: dict, t_from: int, t_to: int, plan: dict | None) -> None:
+    """The twin as the closed-loop demo site's edge (plan Part 2.5: the edge is Product 2, or the twin; audit role-owner-15: the mill showed 'No edge
+    device' and 'Never connected' beside native settings 'Read back by the edge device'). After each span it runs: a heartbeat saying whether it runs
+    the plan, and an 'applied' acknowledgement (the read-back) the first time it runs a plan. Stamped with the span's end, never after now."""
+    sid = site["id"]
+    last = int(t_to) - 60
+    following = (plan is not None and site.get("tier") == "closed_loop" and verify.arm_on(sid, datetime.fromtimestamp(last, PKT).date()) != "native"
+                 and not _released(sid, np.array([last])).any())
+    boot = int(sites.state(sid).get("edge_boot") or t_from)
+    beat = {"contract": delivery.CONTRACT, "seq": int(t_to) // 60, "sent_at": _iso(t_to), "uptime_s": max(0, int(t_to) - boot),
+            "active_plan": plan["id"] if following else None, "valid_until": plan.get("valid_until") if following else None,
+            "control_state": "following_plan" if following else "native", "queue_depth": 0, "clock_offset_s": 0.0}
+    sites.put_state(sid, edge_last_seen=int(t_to), edge_heartbeat=beat, edge_heartbeat_at=int(t_to), edge_boot=boot)
+    if not following:
+        return
+    with store.connect() as con:
+        if con.execute("SELECT 1 FROM acks WHERE site_id = ? AND plan_id = ? LIMIT 1", (sid, plan["id"])).fetchone() is None:
+            body = {"contract": delivery.CONTRACT, "seq": int(t_from) // 60, "sent_at": _iso(t_from), "plan_id": plan["id"], "status": "applied", "items": []}
+            con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
+                        (store.new_id(), sid, plan["id"], "applied", json.dumps(body), _iso(t_from)))
 
 
 def _replan_seconds() -> int:
@@ -300,7 +357,8 @@ def load(by: str, days: int | None = None, background: bool = True) -> dict:
     def run():
         try:
             with store.use_company(db):
-                ids = create_sites(by)
+                start = datetime.fromtimestamp(_clock_minute(), PKT).date() - timedelta(days=days)   # build_history's first day
+                ids = create_sites(by, since=twin.day_start_utc(start))
                 done = [0]
                 for sid in ids:
                     def prog(i, n, sid=sid):

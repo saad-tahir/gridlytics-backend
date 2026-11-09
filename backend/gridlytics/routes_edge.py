@@ -19,7 +19,7 @@ import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException
 from pydantic import ValidationError
 
-from . import auth, delivery, forecast, money, plans, sites, store, telemetry
+from . import auth, delivery, demo, forecast, money, plans, sites, store, telemetry
 from .routes_common import full_or_404, now_ts, out, put_state, site_or_404, state_change
 from .schemas import Refusal
 
@@ -426,6 +426,7 @@ def edge_status(site_id: str):
         acks = con.execute("SELECT plan_id, status, body, received_at FROM acks WHERE site_id = ? ORDER BY received_at DESC LIMIT 20", (site_id,)).fetchall()
         sent = con.execute("SELECT plan_id, key_id, sent_at FROM plan_messages WHERE site_id = ? ORDER BY sent_at DESC LIMIT 20", (site_id,)).fetchall()
     last = st.get("edge_last_seen")
-    return out({"last_seen": last, "online": bool(last and now_ts() - last < 300), "heartbeat": st.get("edge_heartbeat"),
+    fresh = demo.EDGE_FRESH_S if s.get("demo_link") else 300                   # a demo site's edge is the twin, run every 15 minutes
+    return out({"last_seen": last, "online": bool(last and now_ts() - last < fresh), "heartbeat": st.get("edge_heartbeat"),
                 "capabilities": json.loads(cap["body"]) if cap else None, "acks": [{**dict(a), "body": json.loads(a["body"])} for a in acks],
                 "sent": [dict(r) for r in sent], "public_key": delivery.public_key(site_id) if auth.can("edit_sites") else None})
