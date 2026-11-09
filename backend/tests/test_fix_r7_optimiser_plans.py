@@ -700,6 +700,38 @@ def test_the_amf_reserve_reason_says_what_it_covers():
             assert d["hours"] == pytest.approx(0.5)
 
 
+def test_a_reserve_reason_says_how_much_of_it_is_the_state_of_charge_margin():
+    """With the state of charge uncertain (sigma), every reserve row is widened by 2 sigma E_nom (Part 4.3). Behind an AMF panel that margin is
+    nearly all of the start delay's reserve: "Keeping 10.9 kWh in reserve to carry the load for up to 60 seconds" read as 650 kW for a minute.
+    The detail gives the margin apart (`margin_kwh`), never above the reserve it names."""
+    p = _mall(p_start=0.05)
+    p["c_imp"] = np.full(p["T"], 28.0)
+    p["battery"].update({"E0": 21.0, "c_cyc": 40.0, "sigma0": 0.05})
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    held = [x["detail"] for x in r["reasons"] if x["reason"] in ("hold_for_outage", "charge_for_reserve")]
+    assert held
+    gap = 50.0 * optimise.AMF_START_DELAY_S / 3600 / 0.95
+    for d in held:
+        assert d["margin_kwh"] == pytest.approx(min(2 * 0.05 * 100.0, d["kwh"]), abs=0.05)
+        assert d["margin_kwh"] <= d["kwh"] + 1e-9
+        if d["cover"] == "start_delay":
+            assert d["kwh"] - d["margin_kwh"] == pytest.approx(gap, abs=0.1)     # the delay itself: under a kWh
+    # without the uncertainty there is no margin
+    p["battery"].update({"E0": 12.0, "sigma0": 0.0})
+    r = optimise.solve(p)
+    held = [x["detail"] for x in r["reasons"] if x["reason"] in ("hold_for_outage", "charge_for_reserve")]
+    assert held and all(d["margin_kwh"] == 0.0 for d in held)
+    # nor on a grid-tied reserve's detail without an AMF panel
+    q = _reserve_case()
+    q["battery"].update({"E0": 140.0, "sigma0": 0.05, "c_cyc": 40.0})        # at the reserve: 20 + 4 x 100 x 0.25 / 0.95 + 20 = 145.3 kWh
+    q["c_imp"] = np.full(q["T"], 28.0)
+    rq = optimise.solve(q)
+    hq = [x["detail"] for x in rq["reasons"] if x["reason"] in ("hold_for_outage", "charge_for_reserve")]
+    assert hq and all("cover" not in d for d in hq)
+    assert all(d["margin_kwh"] == pytest.approx(min(2 * 0.05 * 200.0, d["kwh"]), abs=0.05) for d in hq)
+
+
 def test_the_reserve_floor_shipped_is_the_reserve_the_plan_holds():
     """The mall's steps said reserve 95 % while the plan held its battery for a reserve the AMF panel covers. A step's reserve_pct is the
     reserve the plan holds (its row's target less the slack it accepts at that row's price), so the table and Mode B never ask for a floor

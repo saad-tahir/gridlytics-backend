@@ -900,6 +900,7 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
     R_gap = np.asarray(out.get("R_gap", np.zeros(T)), dtype=float)
     R_top = np.maximum(np.asarray(R, dtype=float), R_gap)
     amf = bool(gen and gen.get("control") == "auto_on_grid_loss")
+    margin = 2 * float(bat.get("sigma0", 0.0)) * En if bat else 0.0   # every reserve row's widening for the SoC estimate (Part 4.3)
     tol = 0.02 * En
 
     def binds(k: int) -> bool:
@@ -929,12 +930,18 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
             # behind an AMF panel (round 7, engine-plans-live-03): the energy up to the start delay's reserve is held for the delay of every
             # start; above it, for a failed start (one start in AMF_FAIL_TO_START)
             if k0 in (out.get("r_gap") or {}) and float(Es[t + 1]) <= Emin + float(R_gap[k0]) + tol:
-                return {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "cover": "start_delay", "seconds": AMF_START_DELAY_S,
-                        "hours": round(AMF_START_DELAY_S / 3600, 3), "kwh": round(min(float(R_gap[k0]), band), 1)}
-            return {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "cover": "failed_start", "p_fail": AMF_FAIL_TO_START,
-                    "hours": round(int(R_steps[k0]) * H, 2), "kwh": round(min(float(R[k0]), band), 1)}
-        kwh = min(float(R[k0]), band)
-        return {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "hours": round(int(R_steps[k0]) * H, 2), "kwh": round(kwh, 1)}
+                d = {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "cover": "start_delay", "seconds": AMF_START_DELAY_S,
+                     "hours": round(AMF_START_DELAY_S / 3600, 3), "kwh": round(min(float(R_gap[k0]), band), 1)}
+            else:
+                d = {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "cover": "failed_start", "p_fail": AMF_FAIL_TO_START,
+                     "hours": round(int(R_steps[k0]) * H, 2), "kwh": round(min(float(R[k0]), band), 1)}
+        else:
+            d = {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "hours": round(int(R_steps[k0]) * H, 2),
+                 "kwh": round(min(float(R[k0]), band), 1)}
+        # the part of it that is the state of charge's uncertainty (2 sigma E_nom, Part 4.3), never above the reserve named: behind an AMF panel
+        # it is nearly all of the start delay's reserve, which read as hundreds of kW for a minute (round 7, engine-plans-live-03)
+        d["margin_kwh"] = round(min(margin, d["kwh"]), 1)
+        return d
 
     def next_discharge(t: int) -> int | None:
         return next((k for k in range(t + 1, T) if Ds[k] > 0.1), None)
@@ -954,6 +961,7 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
         if last is not None:
             det = reserve_detail(t, last)
             det["kwh"] = round(min(float(det["kwh"]), E1 - Emin), 1)  # the reserve the battery holds, never above what it holds
+            det["margin_kwh"] = round(min(float(det["margin_kwh"]), det["kwh"]), 1)
             return "hold_for_outage", det
         nc = next((k for k in range(t + 1, T) if Cs[k] > 0.1), None)
         use = next_discharge(t)
