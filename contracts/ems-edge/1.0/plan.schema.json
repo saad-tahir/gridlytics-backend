@@ -1,8 +1,54 @@
 {
   "$defs": {
+    "ApplyPolicy": {
+      "additionalProperties": false,
+      "description": "U3 5.4's mode_a.apply_policy: the edge writes a table only when it changed, at most this many a day, within the local window.",
+      "properties": {
+        "apply_window_local": {
+          "anyOf": [
+            {
+              "maxLength": 20,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Apply Window Local"
+        },
+        "max_table_writes_per_day": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Max Table Writes Per Day",
+          "type": "integer"
+        },
+        "write_if_changed_only": {
+          "default": true,
+          "title": "Write If Changed Only",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_table_writes_per_day"
+      ],
+      "title": "ApplyPolicy",
+      "type": "object"
+    },
     "ModeA": {
       "additionalProperties": false,
       "properties": {
+        "apply_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApplyPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "days": {
           "items": {
             "$ref": "#/$defs/PlanDay"
@@ -180,6 +226,30 @@
         "device_id"
       ],
       "title": "Target",
+      "type": "object"
+    },
+    "WriteBudget": {
+      "additionalProperties": false,
+      "description": "R6 3.6's write budget: the table and event writes a day the cloud plans for (at most the edge's cap).",
+      "properties": {
+        "event_writes_per_day": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Event Writes Per Day",
+          "type": "integer"
+        },
+        "table_writes_per_day": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Table Writes Per Day",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "table_writes_per_day",
+        "event_writes_per_day"
+      ],
+      "title": "WriteBudget",
       "type": "object"
     }
   },
@@ -406,6 +476,17 @@
         }
       ],
       "title": "Valid Until"
+    },
+    "write_budget": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WriteBudget"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

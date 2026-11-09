@@ -156,7 +156,17 @@ def plan_solve(site_id: str):
         demo.advance(site_id)
     r = plans.tick(site_id)
     store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"]})
+    _issue(site_id)
     return out({"status": r["status"], "plan_id": r.get("plan_id"), "reason": r.get("reason"), "solve_seconds": r.get("solve_seconds")})
+
+
+def _issue(site_id: str, force: str | None = None) -> None:
+    """After a solve, today's table as the scheduler's tick issues it (plans.issue_tables; a hold or a resume issues it at once). A failure is logged:
+    the solve and the action stand."""
+    try:
+        plans.issue_tables(site_id, force=force)
+    except Exception:
+        log.exception("issuing the table failed for site %s", site_id)
 
 
 @router.post("/api/sites/{site_id}/plan/apply")
@@ -201,22 +211,27 @@ def plan_compare(site_id: str):
 
 @router.get("/api/sites/{site_id}/control")
 def control(site_id: str, day: int = 0):
+    """The control plane. Where the plan reaches the inverter as a Mode A table (the advisory tier and closed loop), `compiled` and `vendor_view` are
+    the table issued for each day (Part 7.1 step 7: the nightly table, re-issued only when worth a write), the plan in force's draft where none is
+    issued yet; `issued` says per day which plan's table it is and when and why it was issued (null at the monitor tier and at a Mode B site), and
+    `reissue` the plan in force's re-issue when it was held back (below the gain, the day's writes used, or the last issue under an hour old).
+    `budget.used_today` counts the Karachi day's table writes (plans.writes_used), never the edge's pulls."""
     s = full_or_404(site_id)
     p = plans.current(site_id)
     comp = (p or {}).get("slots")
+    issued = None
+    if comp and plans.issues_tables(s):
+        comp, issued = plans.issued_view(site_id, comp)
     brand = ((s.get("assets") or {}).get("inverter") or {}).get("brand", "other")
     from .routes_sites import control_state
     from . import telemetry
-    with store.connect() as con:
-        # the sends of the Karachi day: a stored stamp is UTC, so its first ten characters are not the local date before 05:00 (audit pages-B-06)
-        writes_today = con.execute("SELECT COUNT(*) FROM plan_messages WHERE site_id = ? AND sent_at >= ? AND sent_at < ?",
-                                   (site_id, *plans.karachi_day_bounds(today()))).fetchone()[0]
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "tier_capable", "tier_allowed")}, "control": control_state(s, telemetry.latest(site_id), now_ts()),
                 "brand": brand, "grammar": delivery.BRANDS.get(brand, delivery.BRANDS["other"]), "compiled": comp,
                 "vendor_view": [delivery.vendor_view(comp, i) for i in range(len((comp or {}).get("days", [])))] if comp else [],
                 "plan_id": (p or {}).get("id"), "applied": plans.applied_rows(site_id), "overrides": sites.overrides(site_id),
-                "budget": {"table_writes_per_day": delivery.BRANDS.get(brand, delivery.BRANDS["other"])["table_writes_per_day"], "used_today": writes_today},
-                "native": sites.native_latest(site_id), "fallback": (comp or {}).get("fallback")})
+                "budget": {"table_writes_per_day": plans.table_budget(s), "used_today": plans.writes_used(site_id, today(), s)},
+                "native": sites.native_latest(site_id), "fallback": (comp or {}).get("fallback"),
+                "issued": issued, "reissue": plans.reissue_held(site_id, (p or {}).get("id"), today()) if issued is not None else None})
 
 
 @router.post("/api/sites/{site_id}/control/{action}")
@@ -284,6 +299,7 @@ def _resolve_now(site_id: str, action: str) -> dict:
         return {"status": "failed", "plan_id": None,
                 "reason": f"The re-solve after {_AFTER[action]} failed ({type(exc).__name__}); the next scheduled tick tries again"}
     store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"], "after": action})
+    _issue(site_id, force=action if action in ("hold", "resume") else None)
     return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": r.get("reason")}
 
 

@@ -51,3 +51,8 @@ the edge pulls its plan with GET `/api/sites/{site_id}/plans/current/message` (`
   a flag it cannot write is dropped and a limit held to its range, and `capabilities_fit` says what was changed. A table with more slots than the
   device's slot model holds is not signed (409 `caps_mismatch`).
 - `supersedes` names the last other plan sent to the site's edge.
+- Each day's slots are the table issued for that day (plan Part 7.1 step 7): the nightly table after the 23:00 solve, re-issued during the day only
+  when a newer plan is worth Rs 500 more, the day's table writes allow it and the last issue is an hour old, or at once for a hold or a resume. So
+  `plan_id` is the plan in force while a day's slots can be an earlier plan's. `mode_a.apply_policy` is U3's (`write_if_changed_only` true,
+  `max_table_writes_per_day` 4, `apply_window_local` "00:05-23:50") and `write_budget` R6 3.6's (`table_writes_per_day` the brand's, at most 4,
+  and `event_writes_per_day` 2).

@@ -312,8 +312,22 @@ class PlanDay(_Strict):
     slots: list[PlanSlot] = Field(max_length=96)
 
 
+class ApplyPolicy(_Strict):
+    """U3 5.4's mode_a.apply_policy: the edge writes a table only when it changed, at most this many a day, within the local window."""
+    write_if_changed_only: bool = True
+    max_table_writes_per_day: int = Field(ge=0, le=100)
+    apply_window_local: Annotated[str, Field(max_length=20)] | None = None
+
+
+class WriteBudget(_Strict):
+    """R6 3.6's write budget: the table and event writes a day the cloud plans for (at most the edge's cap)."""
+    table_writes_per_day: int = Field(ge=0, le=100)
+    event_writes_per_day: int = Field(ge=0, le=100)
+
+
 class ModeA(_Strict):
     days: list[PlanDay] = Field(max_length=4)
+    apply_policy: ApplyPolicy | None = None
 
 
 class Target(_Strict):
@@ -349,6 +363,7 @@ class PlanMessage(_Strict):
     mode: Literal["a", "b"]
     fallback: dict | None = None
     mode_a: ModeA
+    write_budget: WriteBudget | None = None
     mode_b: dict | None = None
     notes: dict = Field(default_factory=dict)
     release: dict | None = None

@@ -1057,12 +1057,19 @@ def _tier(sid: str, tier: str) -> None:
     sites.set_tier_allowed(sid, tier, "t", "test")
 
 
-def _today_plan(sid: str, day: date, status: str = "active") -> str:
-    """A plan row with a table for `day` (a hold, a discharge from 18:00 to 22:00, a hold), valid for a day from now."""
-    pid = store.new_id()
+def _day_table(day: date, discharge_from: int = 18) -> list[dict]:
+    """A day's table: a hold, a discharge from `discharge_from` to 22:00, a hold to midnight."""
     t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
-    slots = [{"start": f"{a:02d}:00", "end": f"{b % 24:02d}:00", "start_ts": t0 + a * 3600, "end_ts": t0 + b * 3600, "mode": m, "soc_floor_pct": 20.0,
-              "soc_target_pct": 20.0, "grid_charge": False, "export_allowed": False} for a, b, m in ((0, 18, "hold"), (18, 22, "discharge"), (22, 24, "hold"))]
+    return [{"start": f"{a:02d}:00", "end": f"{b % 24:02d}:00", "start_ts": t0 + a * 3600, "end_ts": t0 + b * 3600, "mode": m, "soc_floor_pct": 20.0,
+             "soc_target_pct": 20.0, "max_discharge_w": 50_000 if m == "discharge" else None, "max_charge_w": None, "grid_charge": False,
+             "gen_charge": False, "grid_cap_w": None, "export_allowed": False, "genset": None, "intent": m}
+            for a, b, m in ((0, discharge_from, "hold"), (discharge_from, 22, "discharge"), (22, 24, "hold"))]
+
+
+def _today_plan(sid: str, day: date, status: str = "active", discharge_from: int = 18) -> str:
+    """A plan row with a table for `day` (_day_table), valid for a day from now; an active one supersedes the active plan of before."""
+    pid = store.new_id()
+    slots = _day_table(day, discharge_from)
     with store.connect() as con:
         if status == "active":
             con.execute("UPDATE plans SET status = 'superseded' WHERE site_id = ? AND status = 'active'", (sid,))
@@ -1117,3 +1124,144 @@ def test_the_write_meter_counts_a_karachi_day(world):
         _sent(sid, at(today, 9, 0), {today.isoformat(): "hold"})
     budget = world.c["admin"].get(f"/api/sites/{sid}/control").json()["budget"]
     assert budget["used_today"] == 2, budget                               # 1 before: the 00:30 send was counted on yesterday's date
+
+
+# ------------------------------------------------------------------------------------------------ batch 4: pages-B-02 (engine-delivery-09, brief-vs-build-06, flow-telemetry-plan-control-16)
+
+def _pkt(day: date, h: int = 0, m: int = 0) -> int:
+    return int(datetime(day.year, day.month, day.day, h, m, tzinfo=PKT).timestamp())
+
+
+def test_the_table_to_key_is_issued_once_a_day_and_re_issued_only_when_worth_it(world, monkeypatch):
+    """Advisory tier (plan Part 7.1 step 7): the nightly job issues the day's table; a later plan re-issues it only when it is worth Rs 500 more, the
+    day's table writes are not used up and the last issue is an hour old. GET /control serves the issued table (not each quarter's draft), counts
+    the day's tables against the brand's writes, keeps the re-issue held back, hides its rupees from a viewer, says which table each mark keyed,
+    and asks for a new key after a re-issue."""
+    sid, day = world.site, datetime.now(PKT).date()
+    at = lambda h, m=0: _pkt(day, h, m)  # noqa: E731
+    gains = iter([200.0, 900.0, 900.0, 900.0, 900.0, 900.0])
+    monkeypatch.setattr(plans, "reissue_gain", lambda *a: next(gains))
+    with world.use():
+        _tier(sid, "advisory_writes")
+        nightly = _today_plan(sid, day, discharge_from=18)
+        issue = plans.issue_nightly(sid, at(0) - 3600 + 300)                     # the 23:05 job the night before: the next day's table
+        assert issue["reason"] == "nightly" and issue["plan_id"] == nightly and issue["day_local"] == day.isoformat()
+        assert plans.issue_nightly(sid, at(0) - 3600 + 600) is None             # once a night
+        later, decide = [], []
+        for start, t in zip((19, 17, 16, 15, 14), (at(10), at(10, 15), at(10, 30), at(11, 30), at(12, 45))):
+            later.append(_today_plan(sid, day, discharge_from=start))
+            decide.append(plans.issue_tables(sid, t))
+        # before: every quarter's plan replaced the table to key in, and nothing was counted against the writes
+        assert [d["blocked"] for d in decide] == ["below_threshold", None, "too_soon", None, "budget_used"], decide
+        assert [i["reason"] for i in plans.issued_tables(sid, day.isoformat())] == ["nightly", "event", "event"]
+        current = _today_plan(sid, day, discharge_from=13)                          # this quarter's draft differs again
+        assert plans.issue_tables(sid, at(13))["blocked"] == "budget_used"
+        with store.connect() as con:                                             # the table issued at 10:15 was keyed at 10:20
+            con.execute("INSERT INTO applied (id, site_id, plan_id, day_local, by, method, created) VALUES (?,?,?,?,?,?,?)",
+                        ("m1", sid, later[1], day.isoformat(), "Installer", "installer_keyed", _iso(at(10, 20))))
+    c = world.c["admin"].get(f"/api/sites/{sid}/control").json()
+    assert c["plan_id"] == current
+    assert c["issued"] == [{"day": day.isoformat(), "plan_id": later[3], "issued_at": _iso(at(11, 30)), "reason": "event", "gain_rs": 900.0}]
+    assert c["compiled"]["days"][0]["slots"][1]["start"] == "15:00"            # the issued table, not the draft's 13:00
+    assert c["vendor_view"] and c["budget"] == {"table_writes_per_day": 3, "used_today": 3}
+    assert {k: c["reissue"][k] for k in ("plan_id", "day", "gain_rs", "issued", "blocked")} == \
+        {"plan_id": current, "day": day.isoformat(), "gain_rs": 900.0, "issued": False, "blocked": "budget_used"}
+    # the table was re-issued after the 10:20 mark: what the inverter runs is the earlier one
+    assert c["control"] == {"key": "unconfirmed", "label": "New table issued: key it in and mark it"}
+    (m1,) = c["applied"]
+    assert m1["table"] == {"issued_at": _iso(at(10, 15)), "reason": "event", "superseded": True}
+    v = world.c["viewer"].get(f"/api/sites/{sid}/control").json()
+    assert v["issued"][0]["plan_id"] == later[3] and "gain_rs" not in json.dumps(v)
+    r = world.c["operator"].post(f"/api/sites/{sid}/plan/apply", json={"plan_id": later[3], "day": day.isoformat()})
+    assert r.status_code == 200, r.text
+    c = world.c["admin"].get(f"/api/sites/{sid}/control").json()
+    keyed = next(a for a in c["applied"] if a["plan_id"] == later[3])
+    assert c["control"]["key"] == "following" and keyed["table"] == {"issued_at": _iso(at(11, 30)), "reason": "event", "superseded": False}
+    assert c["budget"]["used_today"] == 3                                      # the issued table keyed: no further write
+
+
+def test_a_re_issue_is_priced_by_replaying_both_tables_through_the_twin(company):
+    """The gain of a re-issue: both tables replayed on the plan's forecast, the energy bill and the critical load left unserved priced; a table
+    the same as the issued one is never re-issued."""
+    sid = _site(genset=False)
+    site, day = sites.full(sid), datetime.now(PKT).date()
+    t0 = _pkt(day)
+    steps = [{"t": t0 + 900 * i, "pv_forecast_kw": 0.0, "load_kw": 100.0, "critical_kw": 20.0, "grid_present": 1.0,
+              "c_imp": 60.0 if 72 <= i < 88 else 30.0, "c_exp": 0.0, "soc_start_pct": 90.0} for i in range(96)]
+    hold = [{**_day_table(day)[0], "end": "00:00", "end_ts": t0 + 86400}]
+    plan = {"id": "p", "steps": steps, "slots": {"days": [{"date": day.isoformat(), "slots": _day_table(day)}]}}
+    gain = plans.reissue_gain(site, plan, hold, day.isoformat())
+    assert 5000 < gain < 10000, gain                                           # about 140 kWh discharged in the peak at Rs 60
+    assert abs(plans.reissue_gain(site, plan, _day_table(day), day.isoformat())) < 1
+    # an outage at 20:00: a table that drains the battery by 18:00 leaves the critical load unserved, priced at the value of lost load
+    out = [{**s, "grid_present": 0.0 if 80 <= i < 88 else 1.0, "c_imp": 30.0} for i, s in enumerate(steps)]
+    drained = _day_table(day, discharge_from=8)
+    plan = {"id": "p", "steps": out, "slots": {"days": [{"date": day.isoformat(), "slots": hold}]}}
+    assert plans.reissue_gain(site, plan, drained, day.isoformat()) > 500
+
+
+def test_a_hold_issues_the_table_at_once_and_nothing_is_issued_under_a_release_or_at_monitor(world):
+    sid, op = world.site, world.c["operator"]
+    day = datetime.now(PKT).date().isoformat()
+    with world.use():
+        _tier(sid, "advisory_writes")
+        first = plans.tick(sid)
+        assert plans.issue_tables(sid)["reason"] == "first"
+    r = op.post(f"/api/sites/{sid}/control/hold", json={"hours": 2, "soc_pct": 80})
+    assert r.status_code == 200, r.text
+    with world.use():
+        rows = plans.issued_tables(sid, day)
+        # a hold needs the table now, whatever the gain, the budget or the spacing say
+        assert [(i["reason"], i["plan_id"]) for i in rows] == [("first", first["plan_id"]), ("hold", r.json()["resolve"]["plan_id"])], rows
+    assert r.json()["issued"][0]["plan_id"] == r.json()["resolve"]["plan_id"]
+    assert op.post(f"/api/sites/{sid}/control/release", json={"hours": 1}).status_code == 200
+    with world.use():
+        assert plans.issue_tables(sid) is None and len(plans.issued_tables(sid, day)) == 2
+        _tier(sid, "monitor")
+    assert world.c["admin"].post(f"/api/sites/{sid}/control/resume", json={}).status_code == 200
+    with world.use():
+        assert plans.issue_tables(sid) is None and len(plans.issued_tables(sid, day)) == 2     # the monitor tier writes nothing
+
+
+def test_the_edge_is_sent_the_issued_table_and_the_meter_counts_table_changes_not_pulls(world, monkeypatch):
+    """Closed loop: the edge gets the table issued for the day (the plan in force's id, the other fields its own) with U3's apply_policy and R6's
+    write budget, and the meter counts the sends that changed the table, not the pulls."""
+    sid, day = world.site, datetime.now(PKT).date()
+    with world.use():
+        _tier(sid, "closed_loop")
+        _today_plan(sid, day, discharge_from=18)
+        assert plans.issue_tables(sid)["reason"] == "first"
+        for _ in range(3):
+            m = plans.signed_message(sid)
+        assert m["mode_a"]["apply_policy"] == {"write_if_changed_only": True, "max_table_writes_per_day": 4, "apply_window_local": "00:05-23:50"}
+        assert m["write_budget"] == {"table_writes_per_day": 3, "event_writes_per_day": 2}
+        assert plans.writes_used(sid, day) == 1                                 # three pulls of one table (3 before)
+        p2 = _today_plan(sid, day, discharge_from=16)
+        monkeypatch.setattr(plans, "reissue_gain", lambda *a: 200.0)
+        assert plans.issue_tables(sid)["blocked"] == "below_threshold"
+        m = plans.signed_message(sid)
+        assert m["plan_id"] == p2 and m["mode_a"]["days"][0]["slots"][1]["start"] == "18:00"      # the issued table, not p2's 16:00
+        assert plans.writes_used(sid, day) == 1
+        monkeypatch.setattr(plans, "reissue_gain", lambda *a: 900.0)
+        monkeypatch.setattr(plans, "REISSUE_SPACING_S", 0)
+        assert plans.issue_tables(sid)["issued"] is True
+        for _ in range(2):
+            m = plans.signed_message(sid)
+        assert m["mode_a"]["days"][0]["slots"][1]["start"] == "16:00"
+        assert plans.writes_used(sid, day) == 2
+    assert world.c["admin"].get(f"/api/sites/{sid}/control").json()["budget"]["used_today"] == 2
+
+
+def test_the_scheduler_issues_the_days_table_after_its_tick_and_tomorrows_at_23_05(company, monkeypatch):
+    from gridlytics import alerts, scheduler
+    sid = _site(genset=False)
+    _tier(sid, "advisory_writes")
+    sites.set_status(sid, "active")
+    monkeypatch.setattr(alerts, "evaluate", lambda *a, **k: None)
+    assert scheduler.tick_company(company) == {"sites": 1, "failed": 0}
+    today = datetime.now(PKT).date()
+    (first,) = plans.issued_tables(sid, today.isoformat())
+    assert first["reason"] == "first" and first["plan_id"] == plans.current(sid)["id"]
+    scheduler.nightly_tables_company(company)
+    (nightly,) = plans.issued_tables(sid, (today + timedelta(days=1)).isoformat())
+    assert nightly["reason"] == "nightly" and scheduler.NIGHTLY_TABLES_AT == (23, 5)

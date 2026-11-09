@@ -7,7 +7,7 @@ telemetry file beside its workspace file, `<stem>-telemetry.db` (`telemetry_path
 The context functions, the WAL-once rule, the copy before a migration and BEGIN IMMEDIATE under one lock are lifted from solarlytics-backend at c853130
 (store.py lines 33-131, 475-526, 956-990, 1402-1420; DESIGN_LOG first section). The schema is Gridlytics' own: version 1 holds the four tables the lifted
 package needs (members, role_presets, api_keys, audit) and the EMS tables of plan Part 3.2; version 2 adds reports.preliminary; version 3 (round 7)
-adds edge_seen and keeps every capabilities message (`_V3`).
+adds edge_seen and keeps every capabilities message (`_V3`); version 4 (round 7) adds table_issues, the Mode A tables issued to the inverter (`_V4`).
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ DEFAULT_ORG = "default"
 _ORG: ContextVar[str] = ContextVar("gridlytics_org", default=DEFAULT_ORG)
 _DB: ContextVar[Path | None] = ContextVar("gridlytics_db", default=None)
 _ACTOR: ContextVar[dict | None] = ContextVar("gridlytics_actor", default=None)
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _lock = threading.Lock()
 
 
@@ -221,6 +221,15 @@ _V3 = [
     "ALTER TABLE capabilities_v3 RENAME TO capabilities",
 ]
 
+#: Version 4 (round 7, audit pages-B-02): the Mode A tables issued to the inverter (keyed in by a person at the advisory tier, written by the edge at
+#: closed loop), one row per issue: the nightly table, a day's first, a re-issue worth its write, a hold's or a resume's (plans.issue_tables, plan
+#: Part 7.1 step 7)
+_V4 = [
+    """CREATE TABLE IF NOT EXISTS table_issues (id TEXT PRIMARY KEY, site_id TEXT NOT NULL, day_local TEXT NOT NULL, plan_id TEXT NOT NULL,
+        issued_at TEXT NOT NULL, reason TEXT NOT NULL, gain_rs REAL)""",
+    "CREATE INDEX IF NOT EXISTS table_issues_day ON table_issues (site_id, day_local, issued_at)",
+]
+
 
 def _migrate(con: sqlite3.Connection, version: int) -> None:
     if version < 1:
@@ -232,6 +241,9 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
     if version < 3:
         for sql in _V3:
+            con.execute(sql)
+    if version < 4:
+        for sql in _V4:
             con.execute(sql)
 
 

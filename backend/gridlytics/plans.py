@@ -744,10 +744,23 @@ def mark_applied(site_id: str, plan_id: str, day_local: str, by: str, method: st
 
 
 def applied_rows(site_id: str, limit: int = 30) -> list[dict]:
+    """The applied log, newest first. Each row says which table was keyed (`table`, round 7: audit pages-B-02): the issue of its plan for its day
+    ({issued_at, reason, superseded: a later issue for the day names another plan}), None when that plan's table was never issued for the day."""
     with store.connect() as con:
         rows = con.execute("SELECT id, plan_id, day_local, by, method, confirmation, fidelity, created FROM applied WHERE site_id = ? ORDER BY created DESC LIMIT ?",
                            (site_id, limit)).fetchall()
-    return [dict(r) for r in rows]
+        days = sorted({r["day_local"] for r in rows})
+        issues = con.execute("SELECT plan_id, day_local, issued_at, reason FROM table_issues WHERE site_id = ? AND day_local IN "
+                             f"({','.join('?' * len(days))}) ORDER BY issued_at, rowid", (site_id, *days)).fetchall() if days else []
+    out = []
+    for r in rows:
+        d = dict(r)
+        day = [i for i in issues if i["day_local"] == d["day_local"]]
+        mine = [i for i in day if i["plan_id"] == d["plan_id"]]
+        d["table"] = ({"issued_at": mine[0]["issued_at"], "reason": mine[0]["reason"], "superseded": day[-1]["plan_id"] != d["plan_id"]}
+                      if mine else None)
+        out.append(d)
+    return out
 
 
 def _no_money(body: dict) -> dict:
@@ -802,8 +815,13 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
     if plan is None:
         return None
     caps = delivery.latest_capabilities(site_id)
+    full = sites.full(site_id)
+    compiled = plan.get("slots") or {}
+    if plan["mode"] == "a" and issues_tables(full):
+        # the table issued for each day, not each quarter's draft: the nightly table, re-issued only when worth a write (Part 7.1 step 7)
+        compiled, _ = issued_view(site_id, compiled)
     days = [{"date": d["date"], "slots": [{k: v for k, v in s.items() if k not in ("intent",)} for s in d["slots"]]}
-            for d in (plan.get("slots") or {}).get("days", [])]
+            for d in compiled.get("days", [])]
     try:
         # only what the target inverter can write (R6 C1): the plan page keeps the optimiser's table, the message carries what was fitted
         days, fit = delivery.fit_to_capabilities(days, caps)
@@ -811,7 +829,8 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
         raise CapsMismatch(str(exc)) from None
     body = {"contract": delivery.CONTRACT, "type": "plan", "plan_id": plan["id"], "site_id": site_id, "issued_at": plan["generated_at"],
             "valid_from": plan["valid_from"], "valid_until": plan["valid_until"], "timezone": "Asia/Karachi", "mode": plan["mode"],
-            "fallback": (plan.get("slots") or {}).get("fallback"), "mode_a": {"days": days},
+            "fallback": (plan.get("slots") or {}).get("fallback"), "mode_a": {"days": days, "apply_policy": write_policy(full)[0]},
+            "write_budget": write_policy(full)[1],
             "mode_b": delivery.mode_b(plan["steps"]) if plan["mode"] == "b" else None,
             "notes": {"reason": plan["summary"].get("status_label")}, **_edge_envelope(site_id, plan["id"], caps)}
     if fit:
@@ -819,7 +838,7 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
     if clock and clock["level"] == "widen":
         # the inverter clock is more than 300 s off: every discharge slot starts 15 minutes early and ends 15 minutes late (R6 C10)
         grammar = (plan.get("slots") or {}).get("grammar") or {}
-        body["mode_a"] = {"days": delivery.widen_peak_slots(days, CLOCK_WIDEN_MIN, int(grammar.get("min_slot_minutes") or 15))}
+        body["mode_a"] = {**body["mode_a"], "days": delivery.widen_peak_slots(days, CLOCK_WIDEN_MIN, int(grammar.get("min_slot_minutes") or 15))}
         body["clock"] = {"offset_s": clock["offset_s"], "widened_min": CLOCK_WIDEN_MIN}
     msg = delivery.sign(site_id, _checked(_no_money(body)))
     if record:
@@ -1049,3 +1068,231 @@ def karachi_day_bounds(day: date) -> tuple[str, str]:
     (audit pages-B-06)."""
     lo = datetime(day.year, day.month, day.day, tzinfo=PKT).astimezone(timezone.utc)
     return lo.isoformat(timespec="seconds"), (lo + timedelta(days=1)).isoformat(timespec="seconds")
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the table issued to the inverter
+
+#: Plan Part 7.1 step 7 and R6 4.5 (audit pages-B-02): the Mode A table that reaches the inverter (keyed in by a person at the advisory tier, written by
+#: the edge at closed loop) is issued once a day, by the nightly job after the 23:00 solve (scheduler, 23:05) for the next day; a day that began with
+#: none (a new site, a pause, a missed nightly job) takes the table of its first plan in force. A later plan re-issues today's table only when it is
+#: worth REISSUE_GAIN_RS more over the plan's horizon, the day's table writes are under the brand's budget and the last issue is REISSUE_SPACING_S
+#: old; a hold or a resume issues it at once (the budget card's "unless a hold or release needs it").
+REISSUE_GAIN_RS = 500.0
+REISSUE_SPACING_S = 3600
+#: U3 5.4's apply_policy (the edge's own cap of table writes a day, written only on a change, never across midnight) and R6 3.6's write budget, of
+#: which the cloud uses the brand's table_writes_per_day (at most the edge's cap)
+EDGE_TABLE_WRITE_CAP = 4
+EVENT_WRITES_PER_DAY = 2
+APPLY_WINDOW_LOCAL = "00:05-23:50"
+#: why a table was issued: the nightly job, a day's first, a later plan worth its write (event), a hold or a resume
+ISSUE_REASONS = ("nightly", "first", "event", "hold", "resume")
+
+
+def issues_tables(site: dict | None) -> bool:
+    """Whether a site's plan reaches its inverter as an issued Mode A table: a person keys it at the advisory tier, the edge writes it at closed loop
+    (unless the site runs Mode B setpoints). Nothing is written at the monitor tier."""
+    if not site:
+        return False
+    tier = site.get("tier", "monitor")
+    return tier == "advisory_writes" or (tier == "closed_loop" and (site.get("data") or {}).get("control_mode") != "mode_b")
+
+
+def table_budget(site: dict | None) -> int:
+    """The table writes a day the cloud uses at a site: its inverter brand's (delivery.BRANDS), at most the edge's cap."""
+    brand = (((site or {}).get("assets") or {}).get("inverter") or {}).get("brand", "other")
+    return min(int(delivery.BRANDS.get(brand, delivery.BRANDS["other"])["table_writes_per_day"]), EDGE_TABLE_WRITE_CAP)
+
+
+def issued_tables(site_id: str, day_local: str) -> list[dict]:
+    """The tables issued for a Karachi day, oldest first: {id, plan_id, day_local, issued_at, reason, gain_rs}."""
+    with store.connect() as con:
+        rows = con.execute("SELECT id, plan_id, day_local, issued_at, reason, gain_rs FROM table_issues WHERE site_id = ? AND day_local = ? "
+                           "ORDER BY issued_at, rowid", (site_id, day_local)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def issued_for(site_id: str, day_local: str) -> dict | None:
+    """The table to write for a Karachi day: its latest issue, else None (none issued yet: the plan in force's table is a draft)."""
+    rows = issued_tables(site_id, day_local)
+    return rows[-1] if rows else None
+
+
+def _write_issue(site_id: str, day_local: str, plan_id: str, reason: str, at: int, gain_rs: float | None = None) -> dict:
+    row = {"id": store.new_id(), "plan_id": plan_id, "day_local": day_local, "issued_at": _iso(at), "reason": reason, "gain_rs": gain_rs}
+    with store.connect() as con:
+        con.execute("INSERT INTO table_issues (id, site_id, day_local, plan_id, issued_at, reason, gain_rs) VALUES (?,?,?,?,?,?,?)",
+                    (row["id"], site_id, day_local, plan_id, row["issued_at"], reason, gain_rs))
+    return row
+
+
+def _day_slots(plan: dict | None, day_local: str) -> list[dict] | None:
+    """A plan's compiled slots for one Karachi day, else None."""
+    return next((d["slots"] for d in ((plan or {}).get("slots") or {}).get("days") or [] if d.get("date") == day_local), None)
+
+
+def _table_key(slots: list[dict] | None) -> str:
+    """A day's table as the inverter holds it: its slots without their epoch stamps (the same ring on two days is the same table) or the intent words."""
+    return json.dumps([{k: v for k, v in s.items() if k not in ("start_ts", "end_ts", "intent")} for s in slots or []], sort_keys=True, default=str)
+
+
+def reissue_gain(site: dict, plan: dict, issued_slots: list[dict], day_local: str) -> float:
+    """What the plan's table for `day_local` saves over the issued one, in rupees: both replayed through the twin on the plan's own forecast over its
+    horizon from its starting state of charge, with the plan's other days behind each (so the energy either leaves in the battery is priced on the
+    days after); priced as the compare drawer prices energy (import less export credit), plus the critical load left unserved at the site's value
+    of lost load, so a table that no longer holds the reserve for a forecast outage is worth re-issuing."""
+    steps = plan.get("steps") or []
+    if not steps:
+        return 0.0
+    ts = np.repeat([int(s["t"]) for s in steps], 15) + np.tile(np.arange(15) * 60, len(steps))
+
+    def rep(k: str, default: float = 0.0) -> np.ndarray:
+        return np.repeat([float(default if s.get(k) is None else s[k]) for s in steps], 15)
+
+    series = {"ts": ts, "pv": rep("pv_forecast_kw"), "load": rep("load_kw"), "crit": rep("critical_kw"), "grid": rep("grid_present", 1.0),
+              "temp": np.full(len(ts), 30.0)}
+    c_imp, c_exp = rep("c_imp"), rep("c_exp")
+    voll = float((site.get("data") or {}).get("voll_rs_per_kwh", 500.0))
+    plant = twin.plant_of(site)
+    soc0 = float(steps[0].get("soc_start_pct") or 50.0) / 100.0
+    later = [s for d in (plan.get("slots") or {}).get("days") or [] if d.get("date") != day_local for s in d.get("slots") or []]
+
+    def cost(day_slots: list[dict]) -> float:
+        sim = twin.simulate(series, twin.slots_policy(list(day_slots) + later, ts), plant, soc0)
+        return float((c_imp * sim["imp"] - c_exp * sim["exp"] + voll * sim["unserved"]).sum() / 60)
+
+    return cost(issued_slots) - cost(_day_slots(plan, day_local) or [])
+
+
+def writes_used(site_id: str, day: date, site: dict | None = None) -> int:
+    """The table writes of a Karachi day (audit pages-B-02, pages-B-06), never the edge's pulls:
+    - advisory tier: the distinct tables issued for the day or marked applied for it (each is a table a person keys in);
+    - closed loop: the most of the tables issued for the day, the day's sends that changed the table the inverter runs (the day's table at the send;
+      a repeat pull of the same table is not a write, a release is one) and the count the edge itself reports in the day's acks (writes_used_today);
+    - monitor tier: none."""
+    site = site if site is not None else sites.full(site_id)
+    tier = (site or {}).get("tier", "monitor")
+    if tier == "monitor":
+        return 0
+    d = day.isoformat()
+    with store.connect() as con:
+        issued = {r[0] for r in con.execute("SELECT plan_id FROM table_issues WHERE site_id = ? AND day_local = ?", (site_id, d)).fetchall()}
+        if tier == "advisory_writes":
+            marked = {r[0] for r in con.execute("SELECT plan_id FROM applied WHERE site_id = ? AND day_local = ?", (site_id, d)).fetchall()}
+            return len(issued | marked)
+        lo, hi = karachi_day_bounds(day)
+        prev = con.execute("SELECT body, sent_at FROM plan_messages WHERE site_id = ? AND sent_at < ? ORDER BY sent_at DESC, rowid DESC LIMIT 1",
+                           (site_id, lo)).fetchone()
+        sent = con.execute("SELECT body, sent_at FROM plan_messages WHERE site_id = ? AND sent_at >= ? AND sent_at < ? ORDER BY sent_at, rowid",
+                           (site_id, lo, hi)).fetchall()
+        acks = con.execute("SELECT body FROM acks WHERE site_id = ? AND received_at >= ? AND received_at < ?", (site_id, lo, hi)).fetchall()
+
+    def written(r) -> str:
+        try:
+            body = json.loads(r["body"])
+        except (TypeError, ValueError):
+            return ""
+        if body.get("type") == "release":
+            return "release"
+        on = _local(_ts(r["sent_at"])).date().isoformat()
+        return _table_key(next((x.get("slots") for x in (body.get("mode_a") or {}).get("days") or [] if x.get("date") == on), None))
+
+    changes, last = 0, written(prev) if prev else None
+    for r in sent:
+        k = written(r)
+        if k != last:
+            changes, last = changes + 1, k
+    edge = 0
+    for a in acks:
+        try:
+            body = json.loads(a["body"])
+        except (TypeError, ValueError):
+            continue
+        for dev in body.get("per_device") or []:
+            edge = max(edge, int((dev.get("writes_used_today") or {}).get("tou_table") or 0))
+    return max(len(issued), changes, edge)
+
+
+def issue_nightly(site_id: str, now: int | None = None) -> dict | None:
+    """The nightly job (scheduler, 23:05 Pakistan time, after the 23:00 solve): the next day's table from the plan in force, when it has one, none is
+    issued for that day yet and no pause or release is in force at its start. Returns the issue, else None."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    site = sites.full(site_id)
+    if not issues_tables(site):
+        return None
+    nxt = _local(now).date() + timedelta(days=1)
+    plan = current(site_id, now)
+    if plan is None or _day_slots(plan, nxt.isoformat()) is None or issued_for(site_id, nxt.isoformat()) is not None:
+        return None
+    if control_release(site_id, int(datetime(nxt.year, nxt.month, nxt.day, tzinfo=PKT).timestamp())) is not None:
+        return None
+    return _write_issue(site_id, nxt.isoformat(), plan["id"], "nightly", now)
+
+
+def issue_tables(site_id: str, now: int | None = None, force: str | None = None) -> dict | None:
+    """After a solve (each scheduler tick, a manual re-solve, a control action): today's table.
+    - None issued for today: the plan in force's table is issued ('first').
+    - The plan in force has another table: `force` ('hold' or 'resume', a control action that needs the table now) issues it at once; otherwise it
+      is re-issued ('event') only when reissue_gain reaches REISSUE_GAIN_RS, writes_used is under table_budget and the last issue is
+      REISSUE_SPACING_S old. The decision is kept in the site's state (`table_reissue`) for GET /control.
+    Returns {plan_id, day, reason (when issued), gain_rs, issued, blocked: below_threshold, budget_used, too_soon or None, at}; None when nothing was
+    in question: no table is issued below the advisory tier or at a Mode B site, nor while no plan is in force (a pause, a release, a native-block
+    day, a plan past its valid_until), and the plan in force's table is the issued one."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    site = sites.full(site_id)
+    if not issues_tables(site) or control_release(site_id, now) is not None:
+        return None
+    plan = current(site_id, now)
+    day = _local(now).date()
+    today = day.isoformat()
+    slots = _day_slots(plan, today)
+    if plan is None or slots is None:
+        return None
+    cur = issued_for(site_id, today)
+    old = _day_slots(get(site_id, cur["plan_id"]), today) if cur else None
+    out = {"plan_id": plan["id"], "day": today, "gain_rs": None, "issued": True, "blocked": None, "at": _iso(now)}
+    if cur is None or old is None:
+        # nothing issued for today yet (or the issued plan is no longer readable): the day's first table
+        _write_issue(site_id, today, plan["id"], "first", now)
+        return {**out, "reason": "first"}
+    if cur["plan_id"] == plan["id"] or _table_key(old) == _table_key(slots):
+        return None
+    if force in ("hold", "resume"):
+        _write_issue(site_id, today, plan["id"], force, now)
+        return {**out, "reason": force}
+    gain = round(reissue_gain(site, plan, old, today), 0)
+    since = now - (_ts(cur["issued_at"]) or 0)
+    blocked = ("below_threshold" if gain < REISSUE_GAIN_RS else "budget_used" if writes_used(site_id, day, site) >= table_budget(site)
+               else "too_soon" if since < REISSUE_SPACING_S else None)
+    out = {**out, "gain_rs": gain, "issued": blocked is None, "blocked": blocked}
+    if blocked is None:
+        _write_issue(site_id, today, plan["id"], "event", now, gain)
+        out["reason"] = "event"
+    sites.put_state(site_id, table_reissue=out)
+    return out
+
+
+def issued_view(site_id: str, compiled: dict) -> tuple[dict, list[dict]]:
+    """The compiled table as it reaches the inverter: each day from the plan issued for it (the plan in force's draft where none is issued yet), and
+    per day its issue: {day, plan_id (None for a draft), issued_at, reason, gain_rs}."""
+    days, info = [], []
+    for d in compiled.get("days") or []:
+        iss = issued_for(site_id, d["date"])
+        slots = _day_slots(get(site_id, iss["plan_id"]), d["date"]) if iss else None
+        days.append({**d, "slots": slots} if slots is not None else d)
+        info.append({"day": d["date"], "plan_id": iss["plan_id"], "issued_at": iss["issued_at"], "reason": iss["reason"], "gain_rs": iss["gain_rs"]}
+                    if slots is not None else {"day": d["date"], "plan_id": None})
+    return {**compiled, "days": days}, info
+
+
+def reissue_held(site_id: str, plan_id: str | None, day: date) -> dict | None:
+    """The plan in force's re-issue decision for today when it was held back (GET /control's `reissue`), else None."""
+    st = sites.state(site_id).get("table_reissue") or {}
+    if not plan_id or st.get("plan_id") != plan_id or st.get("day") != day.isoformat() or st.get("issued"):
+        return None
+    return {k: st.get(k) for k in ("plan_id", "day", "gain_rs", "issued", "blocked", "at")}
+
+
+def write_policy(site: dict | None) -> tuple[dict, dict]:
+    """The plan message's U3 5.4 mode_a.apply_policy and R6 3.6 write_budget (audit engine-delivery-09)."""
+    return ({"write_if_changed_only": True, "max_table_writes_per_day": EDGE_TABLE_WRITE_CAP, "apply_window_local": APPLY_WINDOW_LOCAL},
+            {"table_writes_per_day": table_budget(site), "event_writes_per_day": EVENT_WRITES_PER_DAY})

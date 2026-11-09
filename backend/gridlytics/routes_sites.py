@@ -77,8 +77,14 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
     if tier == "monitor":
         return {"key": "recommendation", "label": "Recommendation only"}
     if tier == "advisory_writes":
+        day = today().isoformat()
         with store.connect() as con:
-            ok = con.execute("SELECT 1 FROM applied WHERE site_id = ? AND day_local = ?", (site["id"], today().isoformat())).fetchone()
+            marks = con.execute("SELECT plan_id, created FROM applied WHERE site_id = ? AND day_local = ?", (site["id"], day)).fetchall()
+        ok = bool(marks)
+        issued = plans.issued_for(site["id"], day) if ok else None
+        if issued and issued["plan_id"] not in {m["plan_id"] for m in marks} and issued["issued_at"] > max(m["created"] for m in marks):
+            # today's table was issued again after the mark (round 7, audit pages-B-02): what the inverter runs is the table keyed before it
+            return {"key": "unconfirmed", "label": "New table issued: key it in and mark it"}
         return {"key": "following" if ok else "unconfirmed", "label": "Following plan (table applied)" if ok else "Table not confirmed today"}
     return {"key": "following", "label": "Following plan"}
 
