@@ -306,3 +306,68 @@ def test_deye_keys_self_use_at_the_batterys_power_a_hold_at_none_and_an_export_w
                                                                        (150000, 25, True), (30000, 60, False)]
     old = _table("deye", BUSY)                                                               # a table compiled before its limits were carried
     assert old["rows"][3]["power_w"] is None and any("rated discharge power" in n for n in old["notes"])
+
+
+# ------------------------------------------------------------------------------------------------ batch 2: the slot-count reduction (engine-delivery-04)
+
+def _day_of(runs: list[tuple[str, int, float, float]], soc0: float = 50.0, e_nom: float = 1000.0) -> list[dict]:
+    """Plan steps for one local day from (reason, quarters, charge kW, discharge kW) runs at a 400 kW load with no PV, the state of charge following
+    the flows (a 1 MWh battery)."""
+    from test_fix_r3_optimiser import _steps_for
+    day = [(reason, ch, dis) for reason, n, ch, dis in runs for _ in range(n)]
+    assert len(day) == 96
+    steps, soc = _steps_for(day), soc0
+    for st in steps:
+        st["soc_start_pct"] = round(soc, 2)
+        soc += (st["charge_kw"] * 0.95 - st["discharge_kw"] / 0.95) * 0.25 / e_nom * 100
+        st["soc_pct"] = round(soc, 2)
+    return steps
+
+
+def _shape(comp: dict, day: int = 0) -> list[tuple[str, str, str]]:
+    return [(s["start"], s["end"], s["mode"]) for s in comp["days"][day]["slots"]]
+
+
+SMALL = {"E_nom": 1000.0, "soc_min": 0.1, "soc_max": 0.95}
+
+
+def test_the_slot_count_reduction_merges_equal_neighbours_again_so_no_planned_charge_is_dropped():
+    """The audit's probe day: grid charge 00-02 at 10 kW, discharge 02-06 at 5 kW, grid charge 06-07 at 5 kW, discharge 07-24 at 10 kW. Sungrow's two
+    slots came out as one discharge split in two, [00:00-06:00 discharge, 06:00-00:00 discharge]: the planned grid charge was gone. Voltronic's three
+    wasted one on two adjacent discharge slots."""
+    steps = _day_of([("charge_from_grid", 8, 10.0, 0.0), ("discharge_peak_window", 16, 0.0, 5.0), ("charge_from_grid", 4, 5.0, 0.0),
+                     ("discharge_peak_window", 68, 0.0, 10.0)], soc0=60.0)
+    assert _shape(delivery.compile_mode_a(steps, "sungrow", SMALL, 20.0)) == [("00:00", "02:00", "charge_grid"), ("02:00", "00:00", "discharge")]
+    assert _shape(delivery.compile_mode_a(steps, "voltronic", SMALL, 20.0)) == [("00:00", "02:00", "charge_grid"), ("02:00", "00:00", "discharge")]
+    for brand, g in delivery.BRANDS.items():
+        modes = [s["mode"] for s in delivery.compile_mode_a(steps, brand, SMALL, 20.0)["days"][0]["slots"]]
+        assert len(modes) <= g["max_slots"] and all(a != b for a, b in zip(modes, modes[1:])), (brand, modes)   # never two equal neighbours
+
+
+def test_a_two_slot_day_keeps_the_evening_discharge_after_its_charges_merge():
+    """Sungrow compiled [00:00-10:00 charge_grid, 10:00-00:00 charge_grid] for a plan that discharges 100 kW at 19:00-20:00: the two charge runs were
+    never merged, so the discharge was the run to drop."""
+    steps = _day_of([("charge_from_grid", 24, 100.0, 0.0), ("hold_for_outage", 16, 0.0, 0.0), ("charge_from_grid", 16, 50.0, 0.0),
+                     ("hold_for_outage", 20, 0.0, 0.0), ("discharge_peak_window", 4, 0.0, 100.0), ("hold_for_outage", 16, 0.0, 0.0)], soc0=20.0)
+    comp = delivery.compile_mode_a(steps, "sungrow", SMALL, 20.0)
+    assert _shape(comp) == [("00:00", "19:00", "charge_grid"), ("19:00", "00:00", "discharge")]
+    assert comp["days"][0]["slots"][1]["max_discharge_w"] == 100_000
+
+
+def test_a_short_planned_discharge_is_widened_to_the_brands_minimum_not_folded_into_a_hold():
+    """Faisalabad's Deye table read '07:15-00:00 Hold' while Overview announced the 17:00 MDI discharge and the 18:00 peak discharge: each was a
+    single quarter, shorter than Deye's 30-minute slot, and folded into the hold beside it. A short run that moves energy now takes a quarter from
+    a neighbour that moves none and keeps its planned start."""
+    steps = _day_of([("hold_for_outage", 68, 0.0, 0.0), ("discharge_mdi", 1, 0.0, 40.0), ("hold_for_outage", 3, 0.0, 0.0),
+                     ("discharge_peak_window", 1, 0.0, 60.0), ("hold_for_outage", 23, 0.0, 0.0)], soc0=90.0)
+    comp = delivery.compile_mode_a(steps, "deye", SMALL, 20.0)
+    assert _shape(comp) == [("00:00", "17:00", "hold"), ("17:00", "17:30", "discharge"), ("17:30", "18:00", "hold"),
+                            ("18:00", "18:30", "discharge"), ("18:30", "00:00", "hold")]
+    dis = [s for s in comp["days"][0]["slots"] if s["mode"] == "discharge"]
+    assert [s["max_discharge_w"] for s in dis] == [40_000, 60_000]
+    assert [s["soc_floor_pct"] for s in dis] == [round(steps[68]["soc_pct"], 1), round(steps[72]["soc_pct"], 1)]   # where the plan's discharge stops
+    # a run that moves no energy still folds into a neighbour, and a short run with no neighbour long enough to give a quarter still folds
+    steps = _day_of([("hold_for_outage", 95, 0.0, 0.0), ("discharge_peak_window", 1, 0.0, 60.0)], soc0=90.0)
+    assert _shape(delivery.compile_mode_a(steps, "deye", SMALL, 20.0)) == [("00:00", "23:30", "hold"), ("23:30", "00:00", "discharge")]
+    steps = _day_of([("idle", 1, 0.0, 0.0), ("discharge_peak_window", 95, 0.0, 5.0)], soc0=90.0)
+    assert _shape(delivery.compile_mode_a(steps, "deye", SMALL, 20.0)) == [("00:00", "00:00", "discharge")]

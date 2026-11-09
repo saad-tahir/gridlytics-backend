@@ -159,23 +159,65 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                 return cands[0]
             return k - 1 if runs[k - 1]["energy"] >= runs[k + 1]["energy"] else k + 1
 
+        def moved(a: int, b: int) -> float:
+            return sum(abs(steps[i]["discharge_kw"]) + abs(steps[i]["charge_kw"]) for i in range(a, b))
+
+        def widen(k: int) -> bool:
+            # a short run that moves energy (a single-quarter MDI or peak discharge) is widened to the brand's minimum with quarters taken from a
+            # neighbour that stays long enough and moves less in them, the later one first so the run keeps its planned start: folded whole into
+            # a hold beside it, the planned discharge vanished from the table (Faisalabad's Deye day read '07:15-00:00 Hold'). The run's floor still
+            # stops it where the plan's discharge does, so it moves no more energy than planned
+            r = runs[k]
+            need = min_steps - (r["end"] - r["start"])
+            if r["energy"] <= 0.0:
+                return False
+            best = None
+            for j in (k + 1, k - 1):
+                if not 0 <= j < len(runs) or runs[j]["end"] - runs[j]["start"] - need < min_steps:
+                    continue
+                a, b = (runs[j]["start"], runs[j]["start"] + need) if j == k + 1 else (runs[j]["end"] - need, runs[j]["end"])
+                if moved(a, b) < r["energy"] and (best is None or moved(a, b) < best[1]):
+                    best = (j, moved(a, b))
+            if best is None:
+                return False
+            j = best[0]
+            if j == k + 1:
+                r["end"] += need
+                runs[j]["start"] += need
+            else:
+                r["start"] -= need
+                runs[j]["end"] -= need
+            for x in (r, runs[j]):
+                x.update(floor=min(intents[i]["floor"] for i in range(x["start"], x["end"])),
+                         target=max(intents[i]["target"] for i in range(x["start"], x["end"])), energy=moved(x["start"], x["end"]))
+            return True
+
+        def coalesce():
+            # adjacent runs of one mode become one run (a merge keeps the absorbing run's mode, so it can leave two equal neighbours)
+            k = 1
+            while k < len(runs):
+                if runs[k]["mode"] == runs[k - 1]["mode"]:
+                    merge(k, k - 1)
+                else:
+                    k += 1
+
         changed = True
         while changed and len(runs) > 1:
             changed = False
             for k, r in enumerate(runs):
                 if r["end"] - r["start"] < min_steps:
-                    merge(k, neighbour(k))
+                    if not widen(k):
+                        merge(k, neighbour(k))
                     changed = True
                     break
-        k = 1
-        while k < len(runs):
-            if runs[k]["mode"] == runs[k - 1]["mode"]:
-                merge(k, k - 1)
-            else:
-                k += 1
+        coalesce()
+        # the least energy is dropped until the day fits, merging equal neighbours after every drop: without it two equal runs stayed apart and took
+        # two of the brand's slots, and the next drop took a planned charge or discharge instead (Sungrow's two slots came out as one discharge split
+        # in two, the night's grid charge gone; another day as two charge slots, the evening discharge gone)
         while len(runs) > gram["max_slots"]:
             k = min(range(len(runs)), key=lambda j: runs[j]["energy"])
             merge(k, neighbour(k))
+            coalesce()
         slots = []
         for r in runs:
             s0, s1 = steps[r["start"]], steps[r["end"] - 1]
