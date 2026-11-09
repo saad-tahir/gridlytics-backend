@@ -20,7 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import platform as platformdb
-from . import store
+from . import store, twin
 
 PKT = timezone(timedelta(hours=5))
 CONTRACT = "ems-edge/1.0"
@@ -42,6 +42,13 @@ BRANDS = {
               "fields": ["start", "mode", "soc_pct"], "table_writes_per_day": 3, "mdi_primitive": False},
 }
 FALLBACK_HOURS = 3
+
+
+def cap_held(brand: str, tier: str | None) -> bool:
+    """Whether something on site holds a slot's grid import cap (`grid_cap_w`, the plan's MDI cap): the brand's own peak-shaving primitive (Huawei's
+    capacity control) or an edge at the closed-loop tier. A table a person keys into a Deye, Growatt, Sungrow, Solis or Voltronic holds none
+    (Part 7.1 step 4, 7.6)."""
+    return bool(BRANDS.get(brand, BRANDS["other"])["mdi_primitive"]) or tier == "closed_loop"
 
 
 # ------------------------------------------------------------------------------------------------ the compiler
@@ -97,10 +104,17 @@ DISCHARGING = ("discharge", "export", "self_use")
 
 
 def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback_floor_pct: float, bms_low_pct: float = 10.0,
-                   mdi_cap_kw: float | None = None) -> dict:
+                   mdi_cap_kw: float | None = None, *, site: dict | None = None) -> dict:
     """Slots per local day: merge equal intents, fold runs shorter than the brand's minimum into a neighbour, then drop the least valuable
-    boundaries (the smallest energy moved) until the day fits the brand's slot count."""
+    boundaries (the smallest energy moved) until the day fits the brand's slot count.
+
+    `site` (plans.tick passes it) says what the table runs on. A slot carries `grid_cap_w` only where something on site holds it (`cap_held`: the
+    brand's peak-shaving primitive, or an edge at the closed-loop tier), so that no twin replay (the guard, the compare drawer, the demo, the fidelity
+    check) shaves a peak the device cannot. Where nothing holds the plan's MDI cap, it is translated into what a person can key (`_translate_mdi`),
+    and the demand the keyed table reaches is replayed on the plan's forecast and reported as `mdi.not_enforceable` (Part 7.1 step 4). Without a
+    site the cap is held, as v1 assumed everywhere."""
     gram = BRANDS.get(brand, BRANDS["other"])
+    held = True if site is None else cap_held(brand, site.get("tier"))
     intents = step_intents(steps, battery)
     by_day: dict[str, list[int]] = {}
     for i, s in enumerate(steps):
@@ -190,14 +204,75 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                           "charge_end": datetime.fromtimestamp(charge_end, PKT).strftime("%H:%M") if charge_end else None,
                           # a charging slot never imports above the plan's MDI cap: its mean rate runs through the morning peak that sets the month's
                           # maximum demand, which the plan's own night-only charging never touched; other slots shave to the higher of the two
-                          "grid_cap_w": (round((mdi_cap_kw if mode.startswith("charge") else max(grid_cap, mdi_cap_kw)) * 1000) if mdi_cap_kw
-                                         else (round(grid_cap * 1000) if mode == "charge_grid" else None)),
+                          # (only where something on site holds a cap: a keyed slot-only table has no such setting)
+                          "grid_cap_w": None if not held else (
+                              round((mdi_cap_kw if mode.startswith("charge") else max(grid_cap, mdi_cap_kw)) * 1000) if mdi_cap_kw
+                              else (round(grid_cap * 1000) if mode == "charge_grid" else None)),
                           "gen_charge": False, "export_allowed": mode == "export",
                           "genset": any(st["genset_on"] for st in steps[r["start"]:r["end"]]) or None,
                           "intent": _intent_words(mode, floor, target)})
+            if mdi_cap_kw and not held and _translate_mdi(slots[-1], span, battery, float(mdi_cap_kw), lo):
+                slots[-1]["intent"] = _intent_words(mode, slots[-1]["soc_floor_pct"], target)
         days.append({"date": day, "slots": slots})
-    return {"brand": brand, "grammar": gram, "days": days, "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": fallback_floor_pct,
-                                                                        "revert_after_hours": FALLBACK_HOURS}}
+    out = {"brand": brand, "grammar": gram, "days": days, "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": fallback_floor_pct,
+                                                                       "revert_after_hours": FALLBACK_HOURS}}
+    out["mdi"] = {"cap_kw": round(float(mdi_cap_kw), 1) if mdi_cap_kw else None, "held": held,
+                  "not_enforceable": None if held or not mdi_cap_kw else _mdi_not_enforceable(steps, out, battery, site, float(mdi_cap_kw))}
+    return out
+
+
+def _translate_mdi(slot: dict, span: list[dict], battery: dict | None, cap_kw: float, lo: float) -> bool:
+    """Part 7.1 step 4 for a table a person keys into a device with no peak-shaving primitive: a discharging slot is given the room to keep the grid
+    under the plan's MDI cap at the high load quantile. Its need per grid-up step is max(0, Lhi - PVlo - cap); a discharge slot's `max_discharge_w`
+    is raised to at least the slot's largest need (Deye keys it as the slot's power), and the floor is lowered so that the energy sum(need) h / eta_d
+    lies above it at the slot's start, never below the clamp or the outage reserve the plan holds in the slot (the floor wins; what is left over is
+    `mdi.not_enforceable`). An export slot keeps its power (it discharges at it whatever the load, so more would only export more), and a hold or
+    charge slot cannot discharge on such a device at all. Deviation from the plan's max(0, Lhi - cap): the low PV quantile is subtracted, as the
+    optimiser's MDI rows count net import, so a sunny day's need is not keyed as a discharge that empties the battery before the evening. True when
+    the slot changed."""
+    if not battery or not battery.get("E_nom") or slot["mode"] not in DISCHARGING:
+        return False
+    need = [max(0.0, float(st.get("load_hi_kw", st["load_kw"])) - float(st.get("pv_lo_kw", st.get("pv_kw", 0.0))) - cap_kw)
+            if st.get("grid_present", 1.0) >= 0.5 else 0.0 for st in span]
+    peak = max(need, default=0.0)
+    if peak <= 0.0:
+        return False
+    if slot["mode"] == "discharge":
+        slot["max_discharge_w"] = max(slot["max_discharge_w"] or 0, round(peak * 1000))
+    start = span[0].get("soc_start_pct")
+    if start is not None:
+        e_need_pct = sum(need) * 0.25 / float(battery.get("eta_d", 0.95)) / float(battery["E_nom"]) * 100.0
+        reserve = max((float(st.get("reserve_pct") or 0.0) for st in span), default=0.0)
+        # lowered, never raised: down to the energy the need takes from the slot's start, but no lower than the clamp or the reserve
+        slot["soc_floor_pct"] = round(min(slot["soc_floor_pct"], max(lo, reserve, float(start) - e_need_pct)), 1)
+    slot["mdi_shave_kw"] = round(peak, 1)
+    return True
+
+
+def _mdi_not_enforceable(steps: list[dict], compiled: dict, battery: dict | None, site: dict | None, cap_kw: float) -> dict | None:
+    """Where nothing on site holds the plan's MDI cap: the demand the table reaches as keyed. The table is replayed through the twin on the plan's
+    forecast (no slot carries a cap, so the twin shaves nothing), the plan's own high-load margin is added (max(0, Lhi - L) on grid-up minutes, as
+    the optimiser's MDI rows add it), and the import is averaged over each demand block of the connection's MDI interval. The highest block, with
+    the cap and the rise, when it is above the cap by more than half a kW; else None."""
+    if not battery or not site or not steps:
+        return None
+    ts = np.repeat([int(st["t"]) for st in steps], 15) + np.tile(np.arange(15) * 60, len(steps))
+    rep = lambda key, alt=None: np.repeat([float(st.get(key, st.get(alt, 0.0)) if alt else st.get(key, 0.0)) for st in steps], 15)
+    series = {"ts": ts, "pv": rep("pv_forecast_kw", "pv_kw"), "load": rep("load_kw"), "crit": rep("critical_kw", "load_kw"),
+              "grid": rep("grid_present"), "temp": np.full(len(ts), 30.0)}
+    slots = [s for d in compiled["days"] for s in d["slots"]]
+    e_nom = float(battery.get("E_nom") or 0.0)
+    soc0 = float(battery["E0"]) / e_nom if battery.get("E0") is not None and e_nom else float(steps[0].get("soc_start_pct") or 50.0) / 100.0
+    sim = twin.simulate(series, twin.slots_policy(slots, ts), twin.plant_of(site), soc0)
+    margin = np.maximum(0.0, rep("load_hi_kw", "load_kw") - series["load"])
+    flow = np.where(series["grid"] > 0.5, sim["imp"] + margin, 0.0)
+    conns = site.get("connections") or []
+    minutes = int(((conns[0].get("data") or {}) if conns else {}).get("mdi_interval_min") or 30)
+    blocks = ts // (minutes * 60)
+    peak = max(float(flow[blocks == b].mean()) for b in np.unique(blocks))
+    if peak - cap_kw <= 0.5:
+        return None
+    return {"cap_kw": round(cap_kw, 1), "keyed_peak_kw": round(peak, 1), "rise_kw": round(peak - cap_kw, 1)}
 
 
 def _intent_words(mode: str, floor: float, target: float) -> str:
@@ -237,6 +312,19 @@ def _min_floor(compiled: dict) -> float:
     return float((compiled.get("fallback") or {}).get("min_soc_floor_pct") or 20.0)
 
 
+def _kw(x: float) -> str:
+    return f"{x:,.0f} kW" if abs(x) >= 100 else f"{x:.1f} kW"
+
+
+def _mdi_notes(compiled: dict) -> list[str]:
+    """The sentence for a plan's MDI cap that nothing on site holds (`mdi.not_enforceable`): what the table reaches as keyed."""
+    m = (compiled.get("mdi") or {}).get("not_enforceable")
+    if not m:
+        return []
+    return [f"This inverter has no demand (MDI) limit the table can set, so the plan's {_kw(m['cap_kw'])} cap cannot be held: as keyed, the demand "
+            f"can reach about {_kw(m['keyed_peak_kw'])}, {_kw(m['rise_kw'])} above it."]
+
+
 def _soc_keyed(s: dict) -> int:
     """The state of charge a per-slot SoC field keys: a charging slot's target (it charges up to it), any other slot's floor (it stops there)."""
     return round(s["soc_target_pct"] if s["mode"].startswith("charge") else s["soc_floor_pct"])
@@ -266,7 +354,7 @@ def vendor_table(compiled: dict | None, day_index: int = 0) -> dict:
     day = compiled["days"][min(day_index, len(compiled["days"]) - 1)]
     rows, settings, notes = VENDOR.get(compiled.get("brand"), _generic)(day["slots"], compiled)
     return {"rows": [{k: v for k, v in r.items() if k != "_slots"} for r in rows], "slots": [r["_slots"] for r in rows], "settings": settings,
-            "notes": notes}
+            "notes": notes + _mdi_notes(compiled)}
 
 
 def vendor_view(compiled: dict, day_index: int = 0) -> list[dict]:

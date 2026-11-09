@@ -445,7 +445,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     steps_out = _steps_out(p, res, bundle)
     fallback_floor = float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
     bms_low = ((site.get("assets") or {}).get("battery") or {}).get("soc_min", 0.1) * 100
-    compiled = delivery.compile_mode_a(steps_out, brand, p.get("battery"), fallback_floor, bms_low, res["M"][0] if res.get("M") else None)
+    compiled = delivery.compile_mode_a(steps_out, brand, p.get("battery"), fallback_floor, bms_low, res["M"][0] if res.get("M") else None, site=site)
     guard = _guard(site, p, compiled, steps_out)
     summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(res["M"][0], 1) if res.get("M") else None,
                     "v_end": round(res.get("v_end", 0.0), 2), "guard": guard})
