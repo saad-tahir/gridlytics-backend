@@ -1803,13 +1803,12 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "month_totals_projected": bool(n.get("month_totals_projected"))})
     verified = out["baselines"].get("native", {}).get("verified_days", 0)
     # plan 8.5: "Preliminary" until 8 weeks of switchback have run and the FCA of every month in the period has been billed
-    sb_days = sum((date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in switchback_blocks(site_id)
-                  if date.fromisoformat(b["block_end"]) < today)
+    sb_weeks = _switchback_weeks(switchback_blocks(site_id), today)
     fca_billed = (not on_grid) or all(any(a["key"] == "fca" for a in tariffs.adders_for(mk))
                                       for mk in _months_between(bill_month(d0) + "-01", bill_month(d1) + "-01"))
-    out["preliminary"] = (verified < VERIFIED_DAYS_FOR_FINAL or not native_capture or sb_days < 7 * SWITCHBACK_WEEKS_FOR_FINAL or not fca_billed)
+    out["preliminary"] = (verified < VERIFIED_DAYS_FOR_FINAL or not native_capture or sb_weeks < SWITCHBACK_WEEKS_FOR_FINAL or not fca_billed)
     out["final_conditions"] = {"verified_days": verified, "verified_days_needed": VERIFIED_DAYS_FOR_FINAL, "native_capture": native_capture,
-                               "switchback_weeks": round(sb_days / 7, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL, "fca_billed": fca_billed}
+                               "switchback_weeks": round(sb_weeks, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL, "fca_billed": fca_billed}
     out["blocked"] = None if native_capture else "Capture the inverter's native settings first: the baseline is what the inverter did on its own"
     out["method"] = ("Counterfactual replay at 1-minute resolution against the native capture and a tuned table, priced on the bearable-cost basis "
                      "(recoverable GST and adjustable s.235 excluded), with the dated fuel price and the same wear charge on both arms")
@@ -1899,12 +1898,58 @@ def _curtailed_by_day(site_id: str, d0: str, d1: str) -> dict[str, float]:
     return {datetime.fromtimestamp(int(b), PKT).date().isoformat(): float(v or 0.0) * 24 / 1000 for b, v in zip(s["ts"], s["series"]["curtail_w"])}
 
 
+#: plan 8.2 / VER-08: a switchback figure needs at least this many priced days on each arm, so the 5-coefficient adjustment (intercept, arm, PV,
+#: load, outage hours) is fitted with at least 7 degrees of freedom; the pilot's own rule (6 days on each arm) and the panel's text say the same
+SWITCHBACK_MIN_DAYS_PER_ARM = 6
+#: plan 8.2: "the two estimates (counterfactual and switchback) must agree within 15 percent of the switchback saving or Rs 300 a day, whichever
+#: is larger; a disagreement is a finding, not a rounding"
+AGREEMENT_SHARE = 0.15
+AGREEMENT_FLOOR_RS_PER_DAY = 300.0
+
+
+def _switchback_weeks(blocks: list[dict], today: date) -> float:
+    """Weeks of switchback run: the days of the blocks that have ended (plan 8.5's "Preliminary until 8 weeks of switchback have run")."""
+    days = sum((date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in blocks
+               if date.fromisoformat(b["block_end"]) < today)
+    return days / 7
+
+
+def _fit(X: np.ndarray, y: np.ndarray) -> tuple[float, float | None, int]:
+    """The arm's coefficient of a least-squares fit (column 1), its standard error (None without a degree of freedom) and the degrees of freedom.
+    A covariate that does not vary (no outage in any day) is left out, so it takes no degree of freedom."""
+    keep = [0, 1] + [j for j in range(2, X.shape[1]) if np.ptp(X[:, j]) > 1e-9]
+    X = X[:, keep]
+    coef, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
+    df = int(len(y) - rank)
+    if df <= 0:
+        return float(coef[1]), None, df
+    resid = y - X @ coef
+    cov = float(resid @ resid) / df * np.linalg.pinv(X.T @ X)
+    return float(coef[1]), float(np.sqrt(max(cov[1, 1], 0.0))), df
+
+
+def _lower_80(est: float, se: float | None, df: float) -> float | None:
+    """The one-sided lower 80 percent confidence bound of an estimate (Student's t; plan Part 15.3's statistic)."""
+    if se is None or df <= 0:
+        return None
+    from scipy.stats import t as student_t
+    return est - float(student_t.ppf(0.8, df)) * se
+
+
 def switchback_result(site_id: str) -> dict:
     """Mean daily cost on plan blocks against native blocks, unadjusted and adjusted by a regression on PV kWh (available), load kWh (served plus
-    unserved) and outage hours, with the carry-over credit of every plan-to-native boundary added to the plan's saving and shown beside it."""
+    unserved) and outage hours, with the carry-over credit of every plan-to-native boundary added to the plan's saving and shown beside it.
+
+    Round 7 (audit flow-savings-pilot-bill-03, engine-savings-12, role-analyst-01): a plan day is evidence for the plan only while the plan was in
+    control (a claiming fidelity: a recommendation at a monitor tier, a table not applied or control paused ran the inverter's own settings), and a
+    day withheld for missing data is evidence for neither arm (its actual cost is not known). No figure until each arm has SWITCHBACK_MIN_DAYS_PER_ARM
+    such days (`result_withheld`: "too_few_days", or "monitor_tier" where the plan never controls). The result carries the adjustment's standard
+    error, degrees of freedom and lower 80 percent bound, is Preliminary until 8 weeks of switchback have run, and holds the counterfactual saving
+    per plan day beside the switchback's (`agreement`: within 15 % of the switchback saving or Rs 300 a day, whichever is larger)."""
     blocks = switchback_blocks(site_id)
     if not blocks:
-        return {"blocks": [], "result": None}
+        return {"blocks": [], "result": None, "result_withheld": "no_calendar"}
+    tier = (sites.get(site_id) or {}).get("tier", "monitor")
     d0, d1 = blocks[0]["block_start"], max(b["block_end"] for b in blocks)
     tdays = {d["day"]: d for d in telemetry.days(site_id, d0, d1)}
     curtailed = _curtailed_by_day(site_id, d0, d1)
@@ -1913,33 +1958,67 @@ def switchback_result(site_id: str) -> dict:
                            (site_id, d0, d1)).fetchall()
     by_day = {r["day_local"]: json.loads(r["data"]) for r in rows}
     credits = _carry_over_credits(blocks, by_day)
-    X, y, arms = [], [], []
+    X, y, arms, cf = [], [], [], []
+    excluded = {"plan_not_in_control": 0, "withheld": 0}
     for day in sorted(by_day):
-        arm = next((b["arm"] for b in sorted(blocks, key=lambda b: (-int(b.get("locked") or 0), b["block_start"]))
-                    if b["block_start"] <= day <= b["block_end"]), None)
+        arm = _arm_in(blocks, day)
         t = tdays.get(day)
-        if arm is None or t is None or by_day[day].get("import_unknown"):  # an unmetered day's grid cost reads zero: it is no evidence for either arm
+        r = by_day[day]
+        if arm is None or t is None:
+            continue
+        if _day_withheld(r):  # an unmetered day's grid cost reads zero, an unseen genset run's fuel is missing: no evidence for either arm
+            excluded["withheld"] += 1
+            continue
+        if arm == "plan" and r.get("fidelity") not in CLAIMING:  # the inverter ran its own settings: no evidence for the plan
+            excluded["plan_not_in_control"] += 1
             continue
         pv = float(t.get("pv_kwh") or 0.0) + curtailed.get(day, 0.0)
         load = float(t.get("load_kwh") or 0.0) + float(t.get("unserved_kwh") or 0.0)
         X.append([1.0, 1.0 if arm == "plan" else 0.0, pv, load, (t.get("outage_minutes") or 0) / 60])
-        y.append(by_day[day]["actual"]["cost_rs"])
+        y.append(r["actual"]["cost_rs"])
         arms.append(arm)
-    if len(set(arms)) < 2 or len(y) < 6:
-        return {"blocks": blocks, "result": None, "days": len(y), "carry_over_credits": credits}
-    X, y = np.array(X), np.array(y)
+        if arm == "plan":
+            cf.append(float(r.get("saving_rs") or 0.0))
     a = np.array(arms)
-    unadj = float(np.mean(y[a == "native"]) - np.mean(y[a == "plan"]))
-    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-    adj = float(-coef[1])
-    plan_days = int(np.sum(a == "plan"))
+    arm_days = {"plan": int(np.sum(a == "plan")), "native": int(np.sum(a == "native"))}
+    today = _today()
+    weeks = _switchback_weeks(blocks, today)
+    out = {"blocks": blocks, "days": len(y), "carry_over_credits": credits, "arm_days": arm_days, "min_days_per_arm": SWITCHBACK_MIN_DAYS_PER_ARM,
+           "excluded_days": excluded, "switchback_weeks": round(weeks, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL}
+    if tier == "monitor":  # it only recommends: its plan days are recommendation_only, never the plan in control
+        return {**out, "result": None, "result_withheld": "monitor_tier"}
+    if min(arm_days.values()) < SWITCHBACK_MIN_DAYS_PER_ARM:
+        return {**out, "result": None, "result_withheld": "too_few_days"}
+    X, y = np.array(X), np.array(y)
+    yn, yp = y[a == "native"], y[a == "plan"]
+    unadj = float(np.mean(yn) - np.mean(yp))
+    se_un = float(np.sqrt(np.var(yn, ddof=1) / len(yn) + np.var(yp, ddof=1) / len(yp)))
+    # Welch-Satterthwaite degrees of freedom for the difference of the two means
+    vn, vp = np.var(yn, ddof=1) / len(yn), np.var(yp, ddof=1) / len(yp)
+    df_un = float((vn + vp) ** 2 / (vn ** 2 / (len(yn) - 1) + vp ** 2 / (len(yp) - 1))) if (vn + vp) > 0 else 0.0
+    coef_plan, se_adj, df = _fit(X, y)
+    adj = -coef_plan
+    plan_days = arm_days["plan"]
     credit = float(sum(c["credit_rs"] for c in credits))
     per_day = credit / plan_days if plan_days else 0.0
-    return {"blocks": blocks, "days": len(y), "carry_over_credits": credits,
-            "result": {"saving_rs_per_day_unadjusted": round(unadj + per_day, 2), "saving_rs_per_day_adjusted": round(adj + per_day, 2),
-                       "plan_days": plan_days, "native_days": int(np.sum(a == "native")), "carry_over_credit_rs": round(credit, 2),
+    sb_adj, sb_un = adj + per_day, unadj + per_day
+    cf_day = float(np.mean(cf)) if cf else 0.0
+    tol = max(AGREEMENT_SHARE * abs(sb_adj), AGREEMENT_FLOOR_RS_PER_DAY)
+    lo_adj, lo_un = _lower_80(sb_adj, se_adj, df), _lower_80(sb_un, se_un if se_un > 0 else None, df_un)
+    reasons = (["under_8_weeks"] if weeks < SWITCHBACK_WEEKS_FOR_FINAL else [])
+    return {**out, "result_withheld": None,
+            "result": {"saving_rs_per_day_unadjusted": round(sb_un, 2), "saving_rs_per_day_adjusted": round(sb_adj, 2),
+                       "plan_days": plan_days, "native_days": arm_days["native"], "carry_over_credit_rs": round(credit, 2),
                        "carry_over_rs_per_plan_day": round(per_day, 2), "saving_rs_per_day_unadjusted_before_carry_over": round(unadj, 2),
-                       "saving_rs_per_day_adjusted_before_carry_over": round(adj, 2)}}
+                       "saving_rs_per_day_adjusted_before_carry_over": round(adj, 2),
+                       "std_error_rs_per_day_adjusted": None if se_adj is None else round(se_adj, 2), "degrees_of_freedom": df,
+                       "lower_80_rs_per_day_adjusted": None if lo_adj is None else round(lo_adj, 2),
+                       "std_error_rs_per_day_unadjusted": round(se_un, 2),
+                       "lower_80_rs_per_day_unadjusted": None if lo_un is None else round(lo_un, 2),
+                       "preliminary": bool(reasons), "preliminary_reasons": reasons,
+                       "agreement": {"counterfactual_rs_per_day": round(cf_day, 2), "switchback_rs_per_day": round(sb_adj, 2),
+                                     "difference_rs_per_day": round(sb_adj - cf_day, 2), "tolerance_rs_per_day": round(tol, 2),
+                                     "agrees": bool(abs(sb_adj - cf_day) <= tol)}}}
 
 
 # ------------------------------------------------------------------------------------------------ bill truth (Part 8.2 layer 3)

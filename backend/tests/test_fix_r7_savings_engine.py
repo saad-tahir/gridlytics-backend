@@ -464,3 +464,83 @@ def test_a_day_scored_mid_month_is_rescored_once_the_month_closes_and_after_a_la
     row2 = _stored(sid, D)[0]
     assert D in scored and row2["price_basis"] != row["price_basis"] and len(_rescore_audits(sid)) == 2
     assert _rescore_audits(sid)[1]["days"][0]["why"] == "prices" and row2["claimed_rs"] != row["claimed_rs"]
+
+
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-03, engine-savings-12,
+# ------------------------------------------------------------------------------------------------ role-analyst-01: the switchback result
+
+def _calendar(sid: str, blocks: list[tuple[str, str, str]]) -> None:
+    with store.connect() as con:
+        for a, b, arm in blocks:
+            con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,1)", (sid, a, b, arm))
+
+
+def _sb_day(sid: str, day: str, cost: float, saving: float, i: int, fidelity: str = "confirmed", withheld: str | None = None) -> dict:
+    """A priced day of a switchback calendar: its telemetry totals (the regression's covariates, varied by `i`) and its native row."""
+    with store.connect() as con:
+        con.execute("INSERT OR REPLACE INTO telemetry_days (site_id, day_local, data) VALUES (?,?,?)",
+                    (sid, day, json.dumps({"pv_kwh": 1000.0 + 37 * (i % 5), "load_kwh": 5000.0 + 53 * (i % 3), "outage_minutes": 30 * (i % 4),
+                                           "unserved_kwh": 0.0})))
+    r = _day(_lv(peak_window=saving), fidelity=fidelity, withheld=withheld)
+    r["actual"] = {"cost_rs": cost, "e_end_kwh": 100.0, "v_end": 30.0}
+    r["baseline"] = {"cost_rs": cost + saving, "e_end_kwh": 100.0, "v_end": 30.0}
+    return r
+
+
+def test_the_switchback_gives_no_figure_until_both_arms_have_six_days_of_the_plan_in_control(company):
+    # Faisalabad (audit): one plan day, a Sunday at Rs 47k, against seven native weekdays at Rs 120-150k gave "Rs 71,256 a day" (adjusted Rs 22,572)
+    # with no Preliminary mark: the gate was 6 days in total with both arms present, and a 5-coefficient regression was fitted on 8 days
+    sid = make_site(name="Switchback r7 minimum")
+    _calendar(sid, [("2026-10-01", "2026-10-01", "plan"), ("2026-10-02", "2026-10-08", "native")])
+    rows = {"2026-10-01": _sb_day(sid, "2026-10-01", 47_391.0, 1_901.0, 0)}
+    rows.update({f"2026-10-{d:02d}": _sb_day(sid, f"2026-10-{d:02d}", 120_000.0 + 4_000 * (d % 4), 0.0, d) for d in range(2, 9)})
+    _put_rows(sid, {d: {"native": r} for d, r in rows.items()})
+    sb = verify.switchback_result(sid)
+    assert sb["result"] is None and sb["result_withheld"] == "too_few_days"  # before: a figure from 1 plan day
+    assert sb["arm_days"] == {"plan": 1, "native": 7} and sb["min_days_per_arm"] == 6
+    # six days on each arm: a figure, with its uncertainty, Preliminary until 8 weeks of switchback, and the counterfactual beside it
+    _calendar(sid, [("2026-10-09", "2026-10-13", "plan")])
+    for i, d in enumerate(range(9, 14)):
+        rows[f"2026-10-{d:02d}"] = _sb_day(sid, f"2026-10-{d:02d}", 119_000.0 + 3_000 * (i % 3), 1_000.0, d)
+    _put_rows(sid, {d: {"native": r} for d, r in rows.items()})
+    sb = verify.switchback_result(sid)
+    r = sb["result"]
+    assert sb["arm_days"] == {"plan": 6, "native": 7} and r["plan_days"] == 6 and r["native_days"] == 7
+    plan = [rows["2026-10-01"]] + [rows[f"2026-10-{d:02d}"] for d in range(9, 14)]
+    native = [rows[f"2026-10-{d:02d}"] for d in range(2, 9)]
+    mean = lambda xs: sum(x["actual"]["cost_rs"] for x in xs) / len(xs)  # noqa: E731
+    assert r["saving_rs_per_day_unadjusted"] == pytest.approx(mean(native) - mean(plan), abs=0.01)
+    assert r["degrees_of_freedom"] == 13 - 5 and r["std_error_rs_per_day_adjusted"] > 0.0
+    assert r["lower_80_rs_per_day_adjusted"] < r["saving_rs_per_day_adjusted"]
+    assert r["preliminary"] is True and "under_8_weeks" in r["preliminary_reasons"] and sb["switchback_weeks"] < 8
+    # plan 8.2 and VER-08: the counterfactual and the switchback agree within 15 % of the switchback saving or Rs 300 a day, whichever is larger
+    ag = r["agreement"]
+    cf = sum(x["saving_rs"] for x in plan) / 6
+    assert ag["counterfactual_rs_per_day"] == pytest.approx(cf, abs=0.01)
+    assert ag["switchback_rs_per_day"] == r["saving_rs_per_day_adjusted"]
+    assert ag["tolerance_rs_per_day"] == pytest.approx(max(0.15 * abs(r["saving_rs_per_day_adjusted"]), 300.0), abs=0.01)
+    assert ag["agrees"] is (abs(r["saving_rs_per_day_adjusted"] - cf) <= ag["tolerance_rs_per_day"]) and ag["agrees"] is False
+
+
+def test_a_plan_day_the_plan_did_not_control_or_a_withheld_day_is_no_switchback_evidence(company):
+    sid = make_site(name="Switchback r7 evidence")
+    _calendar(sid, [("2026-09-01", "2026-09-07", "plan"), ("2026-09-08", "2026-09-14", "native")])
+    rows = {}
+    for i in range(14):
+        d = (date(2026, 9, 1) + timedelta(days=i)).isoformat()
+        plan = i < 7
+        fid = "not_applied" if i == 2 else "confirmed"  # control paused: the inverter ran its own settings on a plan day
+        withheld = "genset_unknown" if i in (4, 10) else None  # the genset may have run unseen: the day's actual cost is not known
+        rows[d] = _sb_day(sid, d, (9_000.0 if plan else 10_000.0) + 11 * (i % 3), 1_000.0 if plan else 0.0, i, fidelity=fid, withheld=withheld)
+    _put_rows(sid, {d: {"native": r} for d, r in rows.items()})
+    sb = verify.switchback_result(sid)
+    # before: 14 days, the paused day counted as the plan's and the withheld days as known costs
+    assert sb["arm_days"] == {"plan": 5, "native": 6} and sb["excluded_days"] == {"plan_not_in_control": 1, "withheld": 2}
+    assert sb["result"] is None and sb["result_withheld"] == "too_few_days"
+    # a monitor-tier site only recommends: its plan days are recommendation_only, so the switchback gives no result there at all
+    mon = make_site(name="Switchback r7 monitor", tier="monitor")
+    _calendar(mon, [("2026-09-01", "2026-09-07", "plan"), ("2026-09-08", "2026-09-14", "native")])
+    _put_rows(mon, {d: {"native": {**_sb_day(mon, d, r["actual"]["cost_rs"], 0.0, i, fidelity="recommendation_only" if i < 7 else "native_block")}}
+                    for i, (d, r) in enumerate(sorted(rows.items()))})
+    sb = verify.switchback_result(mon)
+    assert sb["result"] is None and sb["result_withheld"] == "monitor_tier" and sb["arm_days"]["plan"] == 0
