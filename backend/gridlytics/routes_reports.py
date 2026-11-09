@@ -1,7 +1,8 @@
 """Reports (UI-14): generate, list and download; a viewer may generate and read the energy-only report only.
 
 Who generates what (auth.PERMISSIONS): the monthly savings report is `export` (it carries money), the energy-only report `energy_report` (every member, a
-viewer included: it carries no money), the daily operations sheet `run_jobs`, the company roll-up and the pilot report `export`. Each listed row says
+viewer included: it carries no money), the daily operations sheet `run_jobs` (its period is a day, YYYY-MM-DD, today's by default; every other kind's a
+month), the company roll-up and the pilot report `export`. Each listed row says
 whether its figures were `preliminary`. The company roll-up covers every site (no site_id; its row keeps an empty one). The pilot report carries the
 fee (its fee multiple), so a role without `see_fee` neither lists nor downloads it.
 """
@@ -41,7 +42,8 @@ def generate(inp: dict = Body(...)):
     if kind not in reports.COMPANY_KINDS:  # the company roll-up covers every site
         site_id = str(inp.get("site_id", ""))
         site_or_404(site_id)
-    period = str(inp.get("period") or today().strftime("%Y-%m"))
+    # the daily operations sheet is for a day (audit pages-D-24), today's by default; the other kinds for a month, this one by default
+    period = str(inp.get("period") or (today().isoformat() if kind == "daily_operations" else today().strftime("%Y-%m")))
     try:
         return reports.generate(kind, site_id, period, auth.actor())
     except ValueError as exc:

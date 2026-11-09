@@ -947,3 +947,94 @@ def test_an_off_grid_sites_monthly_report_says_there_is_no_grid_to_compare(world
     text = built[-1]
     assert "No grid connection: there are no grid outages to carry." in text and "there is no DISCO bill to compare" in text, text
     assert "off-grid" in text.splitlines()[1], text.splitlines()[1]
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-24 (and flow-reports-alerts-members-keys-01, -19)
+
+def _day_words(d) -> str:
+    return f"{d:%A} {d.day} {d:%B %Y}"
+
+
+def _slot(start: str, end: str, mode: str, floor: float, target: float) -> dict:
+    return {"start": start, "end": end, "mode": mode, "soc_floor_pct": floor, "soc_target_pct": target, "intent": f"{mode} {floor:.0f}-{target:.0f}"}
+
+
+def _put_plan(sid: str, pid: str, belief: int, days: dict, status: str = "active") -> None:
+    """A plan row made at `belief` (epoch seconds) whose compiled table holds `days` ({"YYYY-MM-DD": [slot, ...]})."""
+    from gridlytics import plans
+    slots = {"brand": "deye", "days": [{"date": d, "slots": s} for d, s in days.items()], "fallback": {"on_expiry": "inverter_native"}}
+    with store.connect() as con:
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, summary, steps, slots) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (pid, sid, plans._iso(belief), plans._iso(belief), plans._iso(belief), plans._iso(belief + 172800),
+                                                       "A", status, "{}", "[]", json.dumps(slots)))
+
+
+def test_todays_daily_sheet_prints_the_dated_tables_of_today_and_tomorrow_not_the_plans_partial_last_day(world, monkeypatch):
+    """flow-reports-alerts-members-keys-01: the sheet printed `days[-1:]`, the 48-hour plan's partial last day (the day after tomorrow, "hold 20 %"
+    until 13:15), undated, as "Tomorrow's slot table", under a header of the whole month."""
+    sid = world.site
+    today = datetime.now(PKT).date()
+    tomorrow, after = today + timedelta(days=1), today + timedelta(days=2)
+    with world.use():
+        _put_plan(sid, "p-now", _now() - 600, {
+            today.isoformat(): [_slot("17:15", "00:00", "discharge", 20, 20)],
+            tomorrow.isoformat(): [_slot("00:00", "17:45", "charge_grid", 20, 95), _slot("17:45", "00:00", "discharge", 20, 95)],
+            after.isoformat(): [_slot("00:00", "13:15", "hold", 20, 20)]})
+    built = _story(monkeypatch)
+    r = world.c["operator"].post("/api/reports", json={"kind": "daily_operations", "site_id": sid})   # no period: today's sheet
+    assert r.status_code == 200, r.text
+    row = r.json()
+    assert row["period"] == today.isoformat() and row["preliminary"] is None, row
+    text = built[-1]
+    head = text.splitlines()[1]
+    assert f"For {_day_words(today)}." in head and " to " not in head, head                       # the day, not "01 November 2026 to 30 November 2026"
+    assert f"Today, {_day_words(today)}: the rest of the day" in text, text
+    assert f"Tomorrow, {_day_words(tomorrow)}: the table to key in" in text, text
+    assert "00:00 | 17:45 | Charge from grid | 20 | 95" in text and "17:45 | 00:00 | Discharge | 20 | 95" in text, text
+    assert "13:15" not in text and after.isoformat() not in text and "Hold" not in text, text      # the day after tomorrow is not printed
+    assert "charge_grid |" not in text, text                                                      # the mode in words
+    csv_text = world.c["operator"].get(f"/api/reports/{row['id']}/csv").text
+    dates = {line.split(",")[0] for line in csv_text.splitlines()[1:]}
+    assert dates == {today.isoformat(), tomorrow.isoformat()}, csv_text
+    named = world.c["operator"].get(f"/api/reports/{row['id']}/pdf").headers["content-disposition"]
+    assert f"daily-operations-{today.isoformat()}.pdf" in named, named
+
+
+def test_a_past_days_sheet_prints_the_plan_in_force_at_its_start_and_what_happened(world, monkeypatch):
+    sid = world.site
+    today = datetime.now(PKT).date()
+    day = today - timedelta(days=3)
+    start = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    with world.use():
+        _put_plan(sid, "p-eve", start - 900, {
+            (day - timedelta(days=1)).isoformat(): [_slot("23:45", "00:00", "self_use", 20, 90)],
+            day.isoformat(): [_slot("00:00", "06:00", "charge_grid", 20, 90), _slot("06:00", "00:00", "self_use", 30, 90)],
+            (day + timedelta(days=1)).isoformat(): [_slot("00:00", "23:45", "self_use", 20, 90)]}, status="superseded")
+        _put_plan(sid, "p-noon", start + 12 * 3600, {day.isoformat(): [_slot("12:00", "00:00", "hold", 55, 55)]}, status="superseded")
+        _put_plan(sid, "p-now", _now() - 600, {today.isoformat(): [_slot("17:15", "00:00", "export", 40, 40)]})
+    monkeypatch.setattr(telemetry, "days", lambda site_id, d0, d1: [_tday(day.isoformat(), outage_minutes=90, genset_hours=1.5)] if d0 <= day.isoformat() <= d1 else [])
+    built = _story(monkeypatch)
+    r = world.c["analyst"].post("/api/reports", json={"kind": "daily_operations", "site_id": sid, "period": day.isoformat()})
+    assert r.status_code == 200, r.text
+    text = built[-1]
+    assert f"For {_day_words(day)}." in text.splitlines()[1], text
+    assert f"{_day_words(day)}: the table as planned at the start of the day" in text, text
+    assert "06:00 | 00:00 | Self-use | 30 | 90" in text and "Hold" not in text and "Export" not in text, text   # the plan in force then, not later ones
+    assert "Tomorrow" not in text, text
+    assert "What happened that day" in text and "1.5 h" in text and "1,200 kWh" in text, text
+
+
+def test_a_daily_sheet_is_asked_for_a_day_today_or_before_and_says_when_no_plan_was_in_force(world, monkeypatch):
+    sid = world.site
+    a = world.c["admin"]
+    today = datetime.now(PKT).date()
+    for period, words in ((today.strftime("%Y-%m"), "is for a day"), ("2026-02-30", "not a day of the calendar"),
+                          ((today + timedelta(days=1)).isoformat(), "today or a day before")):
+        r = a.post("/api/reports", json={"kind": "daily_operations", "site_id": sid, "period": period})
+        assert r.status_code == 422 and words in r.json()["detail"], (period, r.text)
+    assert a.get("/api/reports").json() == []
+    built = _story(monkeypatch)
+    r = a.post("/api/reports", json={"kind": "daily_operations", "site_id": sid, "period": today.isoformat()})
+    assert r.status_code == 200, r.text
+    assert "No plan was in force" in built[-1] and "Start | End" not in built[-1], built[-1]
+

@@ -819,23 +819,113 @@ def _pilot(doc: _Doc, site: dict, p0: date, p1: date, today: date, inputs: dict)
     return prelim, start
 
 
-def _daily_sheet(doc: _Doc, site: dict) -> None:
-    plan = plans.current(site["id"])
-    doc.h2("Tomorrow's slot table, in the vendor's layout")
-    comp = (plan or {}).get("slots") or {"days": []}
+#: The Mode A slot modes in words, as the Plan page's slot table says them (slot-words.ts)
+MODE_WORDS = {"hold": "Hold", "charge_grid": "Charge from grid", "charge_pv_only": "Charge from solar only", "discharge": "Discharge",
+              "self_use": "Self-use", "export": "Export", "backup": "Backup"}
+
+
+def day_words(d: date) -> str:
+    """"Monday 9 November 2026"."""
+    return f"{d:%A} {d.day} {d:%B %Y}"
+
+
+def sheet_day(period: str | None, today: date) -> date:
+    """The day a daily operations sheet is for: "YYYY-MM-DD", today or a day before it (audit pages-D-24: the sheet was asked for a month, which it
+    ignored)."""
+    text = str(period or "")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise ValueError("The daily operations sheet is for a day: give it as YYYY-MM-DD")
+    try:
+        day = date.fromisoformat(text)
+    except ValueError:
+        raise ValueError("That day is not a day of the calendar") from None
+    if day > today:
+        raise ValueError("The daily operations sheet is for today or a day before: today's sheet carries tomorrow's table")
+    return day
+
+
+def period_bounds(kind: str, period: str, today: date) -> tuple[date, date]:
+    """The first and last day a report of this kind covers: the day of a daily operations sheet, else the month ("YYYY-MM"). Raises ValueError."""
+    if kind not in KINDS:
+        raise ValueError(f"A report is one of {', '.join(KINDS)}")
+    if kind == "daily_operations":
+        day = sheet_day(period, today)
+        return day, day
+    try:
+        return _period(period)
+    except (ValueError, IndexError):
+        raise ValueError("The period is a month as YYYY-MM") from None
+
+
+def _slot_table(doc: _Doc, day: dict | None, heading: str) -> None:
+    """One day of the plan's compiled table, dated in its heading, in the vendor's layout; its rows in the CSV under the day's date."""
+    doc.h2(heading)
+    slots = (day or {}).get("slots") or []
+    if not slots:
+        doc.p("The plan holds no table for this day.")
+        return
     rows = [["Start", "End", "Mode", "Floor %", "Target %", "What it does"]]
-    doc.csv.writerow(["date", "start", "end", "mode", "soc_floor_pct", "soc_target_pct", "intent"])
-    for d in comp["days"][-1:]:
-        for s in d["slots"]:
-            rows.append([s["start"], s["end"], s["mode"], f"{s['soc_floor_pct']:.0f}", f"{s['soc_target_pct']:.0f}", s["intent"]])
-            doc.csv.writerow([d["date"], s["start"], s["end"], s["mode"], s["soc_floor_pct"], s["soc_target_pct"], s["intent"]])
+    for s in slots:
+        rows.append([s["start"], s["end"], MODE_WORDS.get(s["mode"], str(s["mode"]).replace("_", " ").capitalize()), f"{s['soc_floor_pct']:.0f}",
+                     f"{s['soc_target_pct']:.0f}", s["intent"]])
+        doc.csv.writerow([day["date"], s["start"], s["end"], s["mode"], s["soc_floor_pct"], s["soc_target_pct"], s["intent"]])
     doc.table(rows)
+    if slots[-1]["end"] != "00:00":
+        doc.p(f"The plan reaches only to {slots[-1]['end']} of this day; the next plan carries the table on.")
+
+
+def _what_happened(doc: _Doc, site: dict, day: date) -> None:
+    """A past day's measured energy, genset running and outages (R8 2.14: the daily sheet sets the plan beside what happened); the grid's rows only
+    at a site with a grid connection."""
+    doc.h2("What happened that day")
+    rows = telemetry.days(site["id"], day.isoformat(), day.isoformat())
+    if not rows:
+        doc.p("No data was received for the day.")
+        return
+    d, grid = rows[0], _on_grid(site)
+    table = [["Imported from the grid", num(d.get("import_kwh"), unit=" kWh")], ["Sent to the grid", num(d.get("export_kwh"), unit=" kWh")]] if grid else []
+    table += [["Solar", num(d.get("pv_kwh"), unit=" kWh")], ["Load", num(d.get("load_kwh"), unit=" kWh")]]
+    if (site.get("assets") or {}).get("genset"):
+        table.append(["Genset", f"{num(d.get('genset_kwh'), unit=' kWh')}, running {num(d.get('genset_hours'), '.1f', ' h')}"])
+    if grid:
+        table.append(["Grid outages", num(d.get("outage_minutes"), ".1f", " h", scale=60)])
+    table += [["Load not served", num(d.get("unserved_kwh"), ".1f", " kWh")], ["Highest demand", num(d.get("peak_kw"), unit=" kW")]]
+    doc.table(table)
+
+
+def _daily_sheet(doc: _Doc, site: dict, day: date, today: date, now_ts: int) -> None:
+    """The daily operations sheet of `day` (audit pages-D-24 and flow-reports-alerts-members-keys-01: it printed the 48-hour plan's partial last
+    day, undated, as tomorrow's table). Today's sheet prints the plan in force now as two dated day-tables, today's remainder and tomorrow (plan
+    Part 7.1 step 6), tomorrow's being the one to key in; a past day's prints the day's table as the plan in force at its start had it, then what
+    happened that day."""
+    doc.csv.writerow(["date", "start", "end", "mode", "soc_floor_pct", "soc_target_pct", "intent"])
+    ref = now_ts if day >= today else int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    plan = plans.active_at(site["id"], ref)
+    if plan is None:
+        doc.p("No plan was in force " + ("now" if day >= today else "at the start of the day") + ": the site had no plan yet, or control was paused "
+              "or released to the inverter's own settings, so this sheet has no table.")
+    else:
+        try:
+            made = datetime.fromisoformat(str(plan.get("generated_at"))).astimezone(PKT)
+            doc.p(f"From the plan in force {'now' if day >= today else 'at the start of the day'}, made at {made:%H:%M} on {day_words(made.date())}.")
+        except (TypeError, ValueError):
+            pass
+        days = {d.get("date"): d for d in ((plan.get("slots") or {}).get("days") or [])}
+        if day >= today:
+            nxt = day + timedelta(days=1)
+            _slot_table(doc, days.get(day.isoformat()), f"Today, {day_words(day)}: the rest of the day")
+            _slot_table(doc, days.get(nxt.isoformat()), f"Tomorrow, {day_words(nxt)}: the table to key in, in the vendor's layout")
+        else:
+            _slot_table(doc, days.get(day.isoformat()), f"{day_words(day)}: the table as planned at the start of the day")
+    if day < today:
+        _what_happened(doc, site, day)
 
 
 def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     """Render a report as PDF and CSV and keep its row. A company kind (COMPANY_KINDS) covers every site and is kept with an empty site_id."""
-    if kind not in KINDS:
-        raise ValueError(f"A report is one of {', '.join(KINDS)}")
+    now = datetime.now(PKT)
+    today = now.date()
+    p0, p1 = period_bounds(kind, period, today)
     site = None
     if kind in COMPANY_KINDS:
         site_id = ""
@@ -843,13 +933,8 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
         site = sites.full(site_id)
         if site is None:
             raise KeyError(site_id)
-    try:
-        p0, p1 = _period(period)
-    except (ValueError, IndexError):
-        raise ValueError("The period is a month as YYYY-MM") from None
     rid = store.new_id()
     doc = _Doc()
-    today = datetime.now(PKT).date()
     title = TITLES[kind]
     if kind == "pilot" and site and site.get("tier") == "monitor":
         title = "Counterfactual-only report"  # R8 2.14: the pilot report needs advisory or closed loop
@@ -857,7 +942,7 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     # <img> tag there would make the server read a local file or fetch a URL into the report (plan Part 2.8: untrusted text is never rendered as markup)
     doc.title(f"{title}: {site['name']}" if site else title)
     sub_at = len(doc.story)
-    made = f"Generated {datetime.now(PKT):%d %b %Y %H:%M} PKT by Gridlytics."
+    made = f"Generated {now:%d %b %Y %H:%M} PKT by Gridlytics."
     inputs = {"kind": kind, "site": site_id, "period": period}
     prelim, start = None, p0
     if kind == "company_rollup":
@@ -869,10 +954,10 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     elif kind in ("monthly_savings", "energy_only"):
         prelim = _monthly(doc, site, kind, p0, p1, today, inputs)
     else:
-        _daily_sheet(doc, site)
+        _daily_sheet(doc, site, p0, today, int(now.timestamp()))
     if site:
-        doc.story[sub_at:sub_at] = [Paragraph(_text(f"{start:%d %B %Y} to {p1:%d %B %Y}. {_connection_words(site)} {made}"), doc.styles["Normal"]),
-                                    Spacer(1, 4 * mm)]
+        span = f"For {day_words(p0)}." if kind == "daily_operations" else f"{start:%d %B %Y} to {p1:%d %B %Y}."
+        doc.story[sub_at:sub_at] = [Paragraph(_text(f"{span} {_connection_words(site)} {made}"), doc.styles["Normal"]), Spacer(1, 4 * mm)]
     pdf_path = _dir() / f"{rid}.pdf"
     csv_path = _dir() / f"{rid}.csv"
     SimpleDocTemplate(str(pdf_path), pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
