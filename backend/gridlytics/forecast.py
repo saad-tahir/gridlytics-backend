@@ -311,18 +311,6 @@ def _window_mask(windows: list, ts: np.ndarray) -> np.ndarray:
     return m
 
 
-def _hold(a: np.ndarray, n: int) -> np.ndarray:
-    """A minute series with each known value carried over at most the next n unknown minutes."""
-    if n <= 0 or not len(a):
-        return a
-    pos = np.arange(len(a))
-    last = np.maximum.accumulate(np.where(~np.isnan(a), pos, -1))
-    fill = np.isnan(a) & (last >= 0) & (pos - last <= n)
-    out = a.copy()
-    out[fill] = a[last[fill]]
-    return out
-
-
 #: the schedule adherence's prior, Beta(8, 2) (plan Part 5.3): 8 kept windows in 10
 ADHERENCE_PRIOR = (8.0, 10.0)
 #: a window occurrence is a trial only when its known grid samples cover at least this share of its minutes (a logger that was off says nothing)
@@ -363,6 +351,30 @@ def _adherence(windows: list, grid: np.ndarray, ts: np.ndarray) -> float:
     return (ADHERENCE_PRIOR[0] + kept) / (ADHERENCE_PRIOR[1] + n)
 
 
+def _outage_events(grid: np.ndarray, ts: np.ndarray, windows: list) -> dict:
+    """The unscheduled outages of a minute grid for the hazard: `counts`, starts by local hour, and `durs`, their lengths in minutes. An outage is a run
+    of _outage_runs (the censoring's runs: unknown minutes up to OUTAGE_GAP_MINUTES and grid-up flickers of up to FLICKER_MINUTES samples inside an
+    outage continue it), so a lost row is not a restoration and a 5- or 15-minute source's outage is one event; its length runs to its last grid-down
+    sample plus the source's interval. A run starting at the grid's first known sample began before it (not a start); one still running at the end
+    (its last sample within OUTAGE_GAP_MINUTES of it) is a start whose length is not known yet. A run starting inside an announced window is
+    scheduled and left out."""
+    known = ~np.isnan(grid)
+    counts = np.zeros(24)
+    durs: list[int] = []
+    kidx = np.flatnonzero(known)
+    if not len(kidx):
+        return {"counts": counts, "durs": durs}
+    iv = sample_minutes(known)
+    in_win = _window_mask(windows, ts) if windows else np.zeros(len(grid), dtype=bool)
+    for s, e in _outage_runs(grid):
+        if s == kidx[0] or in_win[s]:
+            continue
+        counts[int(((int(ts[s]) + 5 * 3600) % 86400) // 3600)] += 1
+        if not (e == kidx[-1] and len(grid) - 1 - e <= OUTAGE_GAP_MINUTES):
+            durs.append(int(e - s + iv))
+    return {"counts": counts, "durs": durs}
+
+
 def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> dict:
     """P(down) per step from t0. The hazard and adherence read history before t0 only; the observed grid state reads the telemetry up to `now`
     (the actual issue time, when later than t0), so a grid loss inside the current quarter is seen by a re-solve or refresh at once."""
@@ -380,18 +392,8 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     known = ~np.isnan(grid)
     iv = sample_minutes(known)
     days_known = known.sum() * iv / 1440  # days of grid readings, not of 1-minute rows (the hazard divides by it)
-    # events in history: each reading holds for the source's own interval, so a 5- or 15-minute source's outage is one event of its full length, not
-    # one start per sample
-    down = _hold(grid, iv - 1) == 0
-    starts = np.where(down[1:] & ~down[:-1])[0] + 1
-    ends = np.where(~down[1:] & down[:-1])[0] + 1
-    in_win = _window_mask(windows, g["ts"]) if windows else np.zeros(len(grid), dtype=bool)
-    unsched_starts = [s for s in starts if not in_win[s]]
-    durs = []
-    for s in unsched_starts:
-        e = ends[ends > s]
-        if len(e):
-            durs.append(int(e[0] - s))
+    ev = _outage_events(grid, g["ts"], windows)
+    durs = ev["durs"]
     med_dur = float(np.median(durs)) if len(durs) >= 3 else 75.0
     kept, trials = _adherence_trials(windows, grid, g["ts"])
     adherence = (ADHERENCE_PRIOR[0] + kept) / (ADHERENCE_PRIOR[1] + trials)
@@ -401,10 +403,7 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     prior_h = np.ones(24)
     prior_h[17:23] = 2.5
     prior_h = prior_h / prior_h.sum() * prior_day
-    counts = np.zeros(24)
-    hrs = ((g["ts"][unsched_starts] + 5 * 3600) % 86400) // 3600 if unsched_starts else []
-    for h in hrs:
-        counts[int(h)] += 1
+    counts = ev["counts"]
     lam_h = (counts + prior_h * 7) / (max(days_known, 0) + 7)
     hours = ((t + 5 * 3600) % 86400) // 3600
     lam = lam_h[hours]  # starts per hour at each step
@@ -439,9 +438,7 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     obs_known = np.where(~np.isnan(obs_grid))[0]
     observed = None
     if len(obs_known) and len(obs_grid) - 1 - obs_known[-1] <= OBSERVED_LAG_MIN and obs_grid[obs_known[-1]] == 0:
-        k = int(obs_known[-1])
-        while k > 0 and obs_grid[k - 1] == 0:
-            k -= 1
+        k = int(_outage_runs(obs_grid)[-1][0])  # the outage's first grid-down sample, across lost rows and flickers as in the history
         elapsed = len(obs_grid) - k
         cur = (len(obs_grid) - len(grid)) // 15  # whole steps of the horizon already passed at the issue time
         if sched_mask[min(cur, steps - 1)]:

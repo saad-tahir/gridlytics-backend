@@ -329,3 +329,41 @@ def test_without_an_announced_schedule_the_outage_issue_has_no_adherence_and_a_s
     forecast.issue(site, t0)
     issue = forecast.page(site, "outage")["issue"]
     assert issue["adherence"] == pytest.approx(0.8) and issue["adherence_windows"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-08
+
+def test_a_gap_in_the_readings_does_not_split_an_outage_in_the_hazard_or_the_observed_outage(company):
+    """28 days of 1-minute grid readings with a 2-hour outage (10:00-12:00) every day whose logger lost 3 minutes of rows halfway (10:58-11:00). Each
+    outage is one start of 120 minutes, as the censoring's outage runs already bridge such gaps: lam_day = (28 + 0.35 x 7) / 35 = 0.87 on LESCO's
+    prior. v1 read the unknown minutes as grid up, so it counted two starts a day of about an hour each (lam_day 1.67, median 58.5 minutes). Today the
+    grid has been down since 10:00 with a gap at 10:30-10:32: at 11:00 the observed outage started at 10:00, 60 minutes ago, not at 10:33."""
+    sid = "gap-runs"
+    site = _grid_site(sid)
+    t0 = int(datetime(2026, 11, 9, tzinfo=PKT).timestamp())
+    ts = np.arange(t0 - 28 * 86400, t0 + 11 * 3600, 60, dtype=np.int64)
+    dayn, minute = _local(ts)
+    grid = np.where((minute >= 10 * 60) & (minute < 12 * 60), 0.0, 1.0)
+    grid[(ts < t0) & (minute >= 10 * 60 + 58) & (minute < 11 * 60 + 1)] = np.nan
+    grid[(ts >= t0) & (minute >= 10 * 60 + 30) & (minute < 10 * 60 + 33)] = np.nan
+    _write_grid(sid, ts, grid)
+    o = forecast.outage(site, t0)
+    assert (o["median_minutes"], o["lam_day"]) == (120.0, pytest.approx((28 + 0.35 * 7) / 35, abs=0.01))
+    now = t0 + 11 * 3600
+    obs = forecast.outage(site, forecast.align(now), now=now + 30)["observed"]
+    assert obs is not None and obs["since"] == t0 + 10 * 3600 and obs["elapsed_min"] == 60
+
+
+def test_an_outage_running_at_the_end_of_the_history_counts_as_a_start_but_not_as_a_length(company):
+    """The hazard counts the outage the tick is inside of as a start, but its length is not known yet: it does not enter the median (28 days of
+    90-minute outages at 22:30, the last one still running at midnight minus 30 minutes)."""
+    sid = "gap-open"
+    site = _grid_site(sid)
+    t0 = int(datetime(2026, 11, 9, 23, 0, tzinfo=PKT).timestamp())
+    ts = np.arange(t0 - 28 * 86400, t0, 60, dtype=np.int64)
+    _, minute = _local(ts)
+    grid = np.where(minute >= 22 * 60 + 30, 0.0, np.where(minute < 30, 0.0, 1.0))  # 22:30 to 00:30
+    _write_grid(sid, ts, grid)
+    o = forecast.outage(site, t0)
+    assert o["median_minutes"] == 120.0
+    assert o["lam_day"] == pytest.approx((28 + 0.35 * 7) / 35, abs=0.01)
