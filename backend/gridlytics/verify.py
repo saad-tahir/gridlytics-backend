@@ -136,9 +136,10 @@ def price_arm(site: dict, sim: dict, pr: dict, day: date, e_end_kwh: float, v_en
 def _balance_fill(g: dict, on_grid: bool, has_bat: bool, has_gen: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """A blank PV or load reading closed from the minute's energy balance (PV + import + battery discharge + genset = served load + export) where
     every other flow of the minute was read (the genset's power, or its running flag reading off; no grid flow off grid): the replays run on what the
-    site had, not on a zero. Where both are blank the balance still gives their difference exactly, and the PV is drawn across the gap. Counted as zero, a PV blank at noon made native's replay buy or burn for the whole array (+Rs 660 on a farm day for 5
-    minutes, +Rs 1,370 at a grid site for 15) and a load blank made it serve nothing (round 7, audit pr-review-11). Returns the PV and the load in
-    kW (NaN where still unread) and which minutes were filled."""
+    site had, not on a zero. Where both are blank the balance still gives their difference exactly, and the PV is drawn across the gap. Counted as
+    zero, a PV blank at noon made native's replay buy or burn for the whole array (+Rs 660 on a farm day for 5 minutes, +Rs 1,370 at a grid site for
+    15) and a load blank made it serve nothing (round 7, audit pr-review-11). Returns the PV and the load in kW (NaN where still unread) and which
+    minutes were filled."""
     n = len(g["ts"])
     zero = np.zeros(n)
     pv, load = np.asarray(g["pv"], dtype=float), np.asarray(g["load"], dtype=float)
