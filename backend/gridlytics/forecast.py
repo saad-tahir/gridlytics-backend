@@ -351,6 +351,27 @@ def _adherence(windows: list, grid: np.ndarray, ts: np.ndarray) -> float:
     return (ADHERENCE_PRIOR[0] + kept) / (ADHERENCE_PRIOR[1] + n)
 
 
+#: the outage model pools the history of the company's other sites on the same feeder or transformer (plan Part 3 `sites.outage_unit`: "the key the
+#: outage model pools on"), at most this many of them; a unit without a code is not pooled (a name alone may be a placeholder)
+POOL_MAX_SITES = 20
+
+
+def _pool_key(site: dict) -> tuple | None:
+    data = site.get("data") or {}
+    unit = data.get("outage_unit") or {}
+    code = str(unit.get("code") or "").strip().casefold()
+    return (str(data.get("disco") or ""), str(unit.get("kind") or "feeder"), code) if code else None
+
+
+def _feeder_peers(site: dict) -> list[str]:
+    """The ids of the other sites of the company on the site's feeder or transformer (same DISCO, kind and code), at most POOL_MAX_SITES."""
+    key = _pool_key(site)
+    if key is None:
+        return []
+    from . import sites as sites_mod
+    return sorted(r["id"] for r in sites_mod.listing() if r["id"] != site["id"] and _pool_key(r) == key)[:POOL_MAX_SITES]
+
+
 def _outage_events(grid: np.ndarray, ts: np.ndarray, windows: list) -> dict:
     """The unscheduled outages of a minute grid for the hazard: `counts`, starts by local hour, and `durs`, their lengths in minutes. An outage is a run
     of _outage_runs (the censoring's runs: unknown minutes up to OUTAGE_GAP_MINUTES and grid-up flickers of up to FLICKER_MINUTES samples inside an
@@ -391,11 +412,27 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     grid = g["grid"]
     known = ~np.isnan(grid)
     iv = sample_minutes(known)
-    days_known = known.sum() * iv / 1440  # days of grid readings, not of 1-minute rows (the hazard divides by it)
+    days_own = known.sum() * iv / 1440  # days of grid readings, not of 1-minute rows (the hazard divides by it)
     ev = _outage_events(grid, g["ts"], windows)
-    durs = ev["durs"]
-    med_dur = float(np.median(durs)) if len(durs) >= 3 else 75.0
+    counts, durs = ev["counts"].copy(), list(ev["durs"])
     kept, trials = _adherence_trials(windows, grid, g["ts"])
+    # the other sites on the feeder are sensors of the same outages (plan Part 5.3): their history over the same 28 days adds to the counts, the
+    # lengths, the adherence trials and the days the hazard divides by, so the rate is per site-day and a new site starts from its feeder
+    pool_sites, pool_days = 0, 0.0
+    for pid in _feeder_peers(site):
+        pg = telemetry.minute_grid(pid, h0, t0)["grid"]
+        pk = ~np.isnan(pg)
+        if not pk.any():
+            continue
+        pev = _outage_events(pg, g["ts"], windows)
+        counts += pev["counts"]
+        durs += pev["durs"]
+        pk_kept, pk_trials = _adherence_trials(windows, pg, g["ts"])
+        kept, trials = kept + pk_kept, trials + pk_trials
+        pool_sites += 1
+        pool_days += pk.sum() * sample_minutes(pk) / 1440
+    days_known = days_own + pool_days
+    med_dur = float(np.median(durs)) if len(durs) >= 3 else 75.0
     adherence = (ADHERENCE_PRIOR[0] + kept) / (ADHERENCE_PRIOR[1] + trials)
     # unscheduled start hazard by local hour (starts per hour), shrunk to the DISCO prior with 7 days' weight
     disco = site["data"].get("disco") or "LESCO"
@@ -403,7 +440,6 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     prior_h = np.ones(24)
     prior_h[17:23] = 2.5
     prior_h = prior_h / prior_h.sum() * prior_day
-    counts = ev["counts"]
     lam_h = (counts + prior_h * 7) / (max(days_known, 0) + 7)
     hours = ((t + 5 * 3600) % 86400) // 3600
     lam = lam_h[hours]  # starts per hour at each step
@@ -455,7 +491,8 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
             "observed": observed,
             # no announced windows: no adherence to show (the prior has nothing to apply to); windows entered but none seen whole: the prior, 0 trials
             "adherence": round(adherence, 3) if windows else None, "adherence_windows": trials if windows else None, "median_minutes": med_dur, "windows": windows, "off_grid": False,
-            "lam_day": round(float(lam_h.sum()), 3)}
+            "lam_day": round(float(lam_h.sum()), 3), "days_known": round(float(days_own), 1),
+            "pooled": {"sites": pool_sites, "days": round(float(pool_days), 1)}}
 
 
 # ------------------------------------------------------------------------------------------------ the bundle
@@ -476,7 +513,7 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
         telemetry.save_forecast(site["id"], "outage", t0, o["stage"], VERSION,
                                 {"p_down": _r(o["p_down"]), "p_start": _r(o["p_start"]), "dur_steps": [int(x) for x in o["dur_steps"]], "g": _r(o["g"], 0),
                                  "observed": o.get("observed"), "adherence": o.get("adherence"), "adherence_windows": o.get("adherence_windows"),
-                                 "off_grid": o.get("off_grid")})
+                                 "off_grid": o.get("off_grid"), "days_known": o.get("days_known"), "pooled": o.get("pooled")})
     return {"t0": t0, "pv": p, "load": l, "outage": o}
 
 

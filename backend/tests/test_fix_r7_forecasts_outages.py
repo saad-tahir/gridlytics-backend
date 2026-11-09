@@ -367,3 +367,42 @@ def test_an_outage_running_at_the_end_of_the_history_counts_as_a_start_but_not_a
     o = forecast.outage(site, t0)
     assert o["median_minutes"] == 120.0
     assert o["lam_day"] == pytest.approx((28 + 0.35 * 7) / 35, abs=0.01)
+
+
+# ------------------------------------------------------------------------------------------------ brief-vs-build-09, pages-C-08 (role-analyst-19)
+
+def _feeder_site(name: str, code: str, disco: str = "FESCO", unit_name: str = "Jhang Road Industrial") -> dict:
+    from gridlytics import sites
+    sid = sites.create({"name": name, "disco": disco, "outage_unit": {"kind": "feeder", "code": code, "name": unit_name}}, "test")["id"]
+    sites.put_connection(sid, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400}, "test")
+    return sites.full(sid)
+
+
+def test_sites_on_the_same_feeder_pool_their_outage_history(company):
+    """A site on feeder 411205 with 28 days of readings (the grid lost 18:00-19:30 every day, and inside the announced 14:00-16:00 window every day)
+    and a new site on the same feeder with none: the new site's hazard, median length and adherence are learnt from its neighbour's outages
+    (lam_day = (28 + 0.7 x 7) / 35 on FESCO's prior, 90 minutes, 36 / 38 kept), and its issue says so (`pooled`) with its own history in days
+    (`days_known`). A site on another feeder, or with a feeder name but no code, stays on the DISCO's prior. v1 read only each site's own history."""
+    old = _feeder_site("Old mill", "411205")
+    new = _feeder_site("New mill", " 411205 ")
+    other = _feeder_site("Other mill", "999999", unit_name="Elsewhere")
+    nocode = _feeder_site("No code mill", "", unit_name="SITE-11")
+    t0 = int(datetime(2026, 11, 9, tzinfo=PKT).timestamp())
+    ts = np.arange(t0 - 28 * 86400, t0, 60, dtype=np.int64)
+    _, minute = _local(ts)
+    down = ((minute >= 18 * 60) & (minute < 19 * 60 + 30)) | ((minute >= 14 * 60) & (minute < 16 * 60))
+    _write_grid(old["id"], ts, np.where(down, 0.0, 1.0))
+    forecast.set_schedule(new["id"], [["14:00", "16:00", "daily"]], "manual", "t")
+    o = forecast.outage(new, t0)
+    assert o["pooled"] == {"sites": 1, "days": 28.0} and o["days_known"] == 0.0
+    assert o["lam_day"] == pytest.approx((28 + 0.7 * 7) / 35, abs=0.01)
+    assert o["median_minutes"] == 90.0 and o["stage"] == 1
+    assert (o["adherence"], o["adherence_windows"]) == (pytest.approx(36 / 38, abs=1e-3), 28)
+    for s in (other, nocode):
+        o = forecast.outage(s, t0)
+        assert o["pooled"] == {"sites": 0, "days": 0.0} and o["stage"] == 0
+        assert o["lam_day"] == pytest.approx(0.7, abs=0.01)
+    # the stored issue carries the sample size and the pooling, for the model card
+    forecast.issue(new, t0)
+    issue = forecast.page(new, "outage")["issue"]
+    assert issue["pooled"] == {"sites": 1, "days": 28.0} and issue["days_known"] == 0.0
