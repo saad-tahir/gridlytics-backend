@@ -239,6 +239,9 @@ def site_activate(site_id: str):
     elif any((c.get("data") or {}).get("tariff_category") not in tariff_data.CARDS_279 for c in s.get("connections") or []):
         # a connection stored before the category was checked (audit flow-onboarding-07): the tick could price nothing and the site never planned
         missing.append("the tariff category of each grid connection (tab C)")
+    elif any(sites.group_problem((c.get("data") or {}).get("disco_group"), (s.get("data") or {}).get("disco")) for c in s.get("connections") or []):
+        # the site's DISCO changed after its connection was saved: it would be priced with the other DISCO's peak windows (audit flow-onboarding-02)
+        missing.append("the DISCO group of each grid connection, to match the site's DISCO (tab C)")
     if missing:
         raise Refusal(422, "Add " + " and ".join(missing) + " before activating", "incomplete")
     sites.set_status(site_id, "active")

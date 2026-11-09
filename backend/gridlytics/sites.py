@@ -134,6 +134,43 @@ class TaxFlags(Strict):
     province: Literal["punjab", "sindh", "kp", "balochistan", "ict"] = "punjab"
 
 
+#: The province of each DISCO's customers, for the electricity duty (R9 sections 7 and 8.4), the usual one first: K-Electric serves Karachi (Sindh) and
+#: Hub and Lasbela (Balochistan); IESCO serves Islamabad (ICT) and the Rawalpindi circle (Punjab)
+DISCO_PROVINCES = {"IESCO": ("ict", "punjab"), "LESCO": ("punjab",), "GEPCO": ("punjab",), "FESCO": ("punjab",), "MEPCO": ("punjab",), "PESCO": ("kp",),
+                   "HESCO": ("sindh",), "SEPCO": ("sindh",), "QESCO": ("balochistan",), "TESCO": ("kp",), "HAZECO": ("kp",),
+                   "K-Electric": ("sindh", "balochistan")}
+
+
+def group_for_disco(disco: str | None) -> str:
+    """The time-of-use calendar a DISCO's customers are billed on (R9 section 2): K-Electric's own, or the one of the other DISCOs."""
+    return "ke" if disco == "K-Electric" else "xwdisco"
+
+
+def _from_disco(fields, disco: str | None):
+    """A connection's DISCO group and province, where the save leaves them out, from the site's DISCO (audit flow-onboarding-02: a K-Electric site took
+    the other DISCOs' peak windows and Punjab's duty by default). A site with no DISCO keeps ConnectionFields' defaults."""
+    if not disco or disco not in DISCO_PROVINCES or not isinstance(fields, dict):
+        return fields
+    out = dict(fields)
+    out.setdefault("disco_group", group_for_disco(disco))
+    tax = out.get("tax")
+    if tax is None:
+        out["tax"] = {"province": DISCO_PROVINCES[disco][0]}
+    elif isinstance(tax, dict) and "province" not in tax:
+        out["tax"] = {**tax, "province": DISCO_PROVINCES[disco][0]}
+    return out
+
+
+def group_problem(group: str | None, disco: str | None) -> str | None:
+    """The sentence when a connection's DISCO group contradicts the site's DISCO (the DISCO group is not printed on the bill, so it follows the DISCO),
+    else None; a site with no DISCO may use either."""
+    if not disco or group == group_for_disco(disco):
+        return None
+    if disco == "K-Electric":
+        return "This site's DISCO is K-Electric: its connection uses K-Electric's time-of-use windows"
+    return f"This site's DISCO is {disco}: its connection uses the other DISCOs' time-of-use windows, not K-Electric's"
+
+
 class ConnectionFields(Strict):
     meter_ref: str = Field("", max_length=40)
     disco_group: Literal[DISCO_GROUPS] = "xwdisco"
@@ -412,11 +449,17 @@ def connections(site_id: str) -> list[dict]:
 
 def put_connection(site_id: str, fields: dict, by: str, conn_id: str | None = None, if_unchanged=UNCHECKED) -> dict:
     """Saves the connection `conn_id` (or a new one). `if_unchanged` is checked against that connection's stored fields (none stored: None) in the
-    write's own transaction."""
-    data = check(ConnectionFields, fields).model_dump()
+    write's own transaction. The DISCO group and the province follow the site's DISCO where the save leaves them out, and a group that contradicts the
+    DISCO is refused (audit flow-onboarding-02)."""
     cid = conn_id or store.new_id()
     now = _now()
     with store.write_transaction() as con:
+        site = con.execute("SELECT data FROM sites WHERE id = ?", (site_id,)).fetchone()
+        disco = (json.loads(site["data"]) or {}).get("disco") if site else None
+        data = check(ConnectionFields, _from_disco(fields, disco)).model_dump()
+        problem = group_problem(data["disco_group"], disco)
+        if problem:
+            raise ValueError(problem)
         held = con.execute("SELECT data FROM connections WHERE id = ? AND site_id = ?", (conn_id, site_id)).fetchone() if conn_id else None
         check_unchanged(json.loads(held["data"]) if held else None, if_unchanged, "The grid connection")
         if held:

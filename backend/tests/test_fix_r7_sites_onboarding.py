@@ -386,3 +386,47 @@ def test_a_save_that_keeps_the_kind_of_source_never_lowers_what_the_site_can_rea
     with world.use():
         sites.set_tier_capable(sid, "monitor")
     assert op.put(f"/api/sites/{sid}", json={"notes": "Logger export weekly"}).json()["tier_capable"] == "advisory_writes"
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-02
+
+def test_a_k_electric_sites_connection_takes_its_own_time_of_use_windows_and_province(world):
+    a, sid = world.c["admin"], world.site
+    ke = a.post("/api/sites", json={"name": "Karachi mill", "city": "Karachi", "disco": "K-Electric"}).json()["id"]
+    # a connection saved without a DISCO group or a province took the other DISCOs' windows and Punjab's duty: they now follow the site's DISCO
+    r = a.put(f"/api/sites/{ke}/connection", json={"tariff_category": "B-2(b)", "sanctioned_load_kw": 300})
+    assert r.status_code == 200, r.text
+    conn = r.json()["connections"][0]
+    assert (conn["data"]["disco_group"], conn["data"]["tax"]["province"]) == ("ke", "sindh")
+    # so 15 December's peak is K-Electric's 18:00 to 22:00, not the other DISCOs' 17:00 to 21:00
+    peak = a.get(f"/api/sites/{ke}/prices", params={"day": "2026-12-15"}).json()["peak"]
+    assert [i for i, p in enumerate(peak) if p] == list(range(72, 88))
+    # the other DISCOs' group on a K-Electric site is refused in a sentence, and K-Electric's on a FESCO site
+    r = a.put(f"/api/sites/{ke}/connection", json={"id": conn["id"], "tariff_category": "B-2(b)", "sanctioned_load_kw": 300, "disco_group": "xwdisco"})
+    assert r.status_code == 422 and r.json()["code"] == "invalid", r.text
+    assert r.json()["detail"] == "This site's DISCO is K-Electric: its connection uses K-Electric's time-of-use windows"
+    held = _site(a, sid)["connections"][0]
+    r = a.put(f"/api/sites/{sid}/connection", json={"id": held["id"], "tariff_category": "B-2(b)", "disco_group": "ke", "tax": {"province": "sindh"}})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == "This site's DISCO is FESCO: its connection uses the other DISCOs' time-of-use windows, not K-Electric's"
+    assert _site(a, sid)["connections"][0]["data"]["disco_group"] == "xwdisco"
+    # a province that is given is kept (K-Electric's Hub customers pay Balochistan's duty); tax flags sent without one take the DISCO's
+    r = a.put(f"/api/sites/{ke}/connection", json={"id": conn["id"], "tariff_category": "B-2(b)", "sanctioned_load_kw": 300, "tax": {"province": "balochistan"}})
+    assert r.json()["connections"][0]["data"]["tax"]["province"] == "balochistan", r.text
+    r = a.put(f"/api/sites/{ke}/connection", json={"id": conn["id"], "tariff_category": "B-2(b)", "sanctioned_load_kw": 300, "tax": {"atl": False}})
+    assert r.json()["connections"][0]["data"]["tax"] == {**conn["data"]["tax"], "atl": False, "province": "sindh"}, r.text
+    # a site with no DISCO keeps the defaults, and may use either group
+    other = world.other
+    r = a.put(f"/api/sites/{other}/connection", json={"tariff_category": "A-2(c)", "sanctioned_load_kw": 50, "disco_group": "ke", "tax": {"province": "sindh"}})
+    assert r.status_code == 200 and r.json()["connections"][0]["data"]["disco_group"] == "ke", r.text
+    # a site whose DISCO was changed after its connection was saved is not activated with the other DISCO's windows
+    with world.use():
+        sites.put_asset(sid, "inverter", {"kw_ac": 100}, "test")
+    assert a.put(f"/api/sites/{sid}", json={"disco": "K-Electric", "data_source": {"kind": "csv", "grid_signal_confirmed": True}}).status_code == 200
+    r = a.post(f"/api/sites/{sid}/activate")
+    assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
+    assert r.json()["detail"] == "Add the DISCO group of each grid connection, to match the site's DISCO (tab C) before activating"
+    r = a.put(f"/api/sites/{sid}/connection", json={"id": held["id"], "tariff_category": "B-2(b)", "sanctioned_load_kw": 400})
+    assert r.json()["connections"][0]["data"]["disco_group"] == "ke", r.text
+    assert a.post(f"/api/sites/{sid}/activate").status_code == 200
+
