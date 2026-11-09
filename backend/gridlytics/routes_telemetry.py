@@ -186,10 +186,12 @@ def export(site_id: str, start: str | None = None, end: str | None = None):
 
 @router.get("/api/sites/{site_id}/events")
 def events(site_id: str, limit: int = 200):
+    """The site's events, newest first. A fuel log's detail carries what the fuel cost (cost_rs), so the answer goes through the money filter: a viewer and
+    a machine key read the litres, never the rupees (audit security-roles-01)."""
     site_or_404(site_id)
     with store.connect() as con:
         rows = con.execute("SELECT * FROM events WHERE site_id = ? ORDER BY ts DESC LIMIT ?", (site_id, max(1, min(limit, 1000)))).fetchall()
-    return [{**dict(r), "detail": json.loads(r["detail"])} for r in rows]
+    return out([{**dict(r), "detail": json.loads(r["detail"])} for r in rows])
 
 
 # ------------------------------------------------------------------------------------------------ outages (UI-07)
