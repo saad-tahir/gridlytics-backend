@@ -13,8 +13,8 @@ router = APIRouter()
 
 @router.get("/api/sites/{site_id}/forecasts/scores")
 def scores(site_id: str, days: int = 30):
-    full_or_404(site_id)
-    return forecast.scores(site_id, max(1, min(days, 120)))
+    s = full_or_404(site_id)
+    return forecast.scores(site_id, max(1, min(days, 120)), site=s)
 
 
 @router.get("/api/sites/{site_id}/forecasts/{kind}")
@@ -35,4 +35,5 @@ def refresh(site_id: str):
     # through the same protection as plans.tick
     prior = plans._saved_outage(site_id, t0)
     b = plans._keep_observed_outage(site_id, t0, now, forecast.issue(s, now), prior, True)
+    # a kind that does not apply (no PV, an off-grid site's outages) has no stage: null
     return {"belief_time": b["t0"], "stages": {"pv": b["pv"]["stage"], "load": b["load"]["stage"], "outage": b["outage"]["stage"]}}

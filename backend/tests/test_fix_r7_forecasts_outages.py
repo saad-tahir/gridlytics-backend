@@ -758,3 +758,59 @@ def test_a_forecast_stays_preliminary_until_28_verified_days_and_stage_1(company
     telemetry.save_forecast(sid, "outage", forecast.align(int(datetime.now(timezone.utc).timestamp())), 0, forecast.VERSION, {"p_down": [0.1] * 192})
     assert forecast.page(site, "outage")["preliminary"] is True
     assert forecast.preliminary(sid, 1) == {"preliminary": False, "verified_days": 28, "verified_days_needed": 28}
+
+
+# ------------------------------------------------------------------------------------------------ pages-C-12
+
+def test_a_site_without_pv_has_no_pv_forecast_and_an_off_grid_site_no_outage_forecast(company):
+    """A site without PV gets no PV issue (the optimiser still reads zeros) and its page says so; an off-grid site's outage page says it does not
+    apply, though the issue the plan reads (always down) is still saved. v1 answered a stage-0 zero fan, "Preliminary" forever, and a stage-0 outage
+    card about the feeder's prior."""
+    t0 = forecast.align(int(datetime.now(timezone.utc).timestamp()))
+    site = _load_site("no-pv")
+    b = forecast.issue(site, t0)
+    assert b["pv"]["stage"] is None and b["pv"]["not_applicable"] == "no_pv" and not np.any(b["pv"]["q"]["q50"])
+    assert telemetry.latest_forecast("no-pv", "pv") is None and telemetry.latest_forecast("no-pv", "load") is not None
+    p = forecast.page(site, "pv")
+    assert p["issue"] is None and p["not_applicable"] == "no_pv" and p["preliminary"] is False
+    assert forecast.page(site, "load")["not_applicable"] is None
+    farm = _load_site("farm", crit=8)
+    farm["connections"] = [{"id": "c1", "data": {"regime": "off_grid"}}]
+    farm["assets"]["pv"] = PLANT
+    b = forecast.issue(farm, t0)
+    assert b["outage"]["stage"] is None and b["outage"]["off_grid"] is True
+    assert telemetry.latest_forecast("farm", "outage")["off_grid"] is True  # the plan's protection still reads it
+    p = forecast.page(farm, "outage")
+    assert p["issue"] is None and p["not_applicable"] == "off_grid" and p["preliminary"] is False
+    assert forecast.page(farm, "pv")["not_applicable"] is None
+
+
+def test_an_off_grid_site_s_always_down_grid_is_not_scored_and_its_old_rows_are_left_out(company):
+    """An off-grid site's outage forecast and its grid are both always down, so the Brier score and its baseline are 0 every day: meaningless. The day
+    is not scored, and a summary for the site leaves out rows stored before."""
+    farm = _load_site("farm-scores", crit=8)
+    farm["connections"] = [{"id": "c1", "data": {"regime": "off_grid"}}]
+    day = datetime.now(PKT).date() - timedelta(days=1)
+    t0 = _midnight(day)
+    ts = np.arange(t0, t0 + 86400, 60, dtype=np.int64)
+    _write_load("farm-scores", ts, np.full(len(ts), 40.0), grid=np.zeros(len(ts)))
+    telemetry.save_forecast("farm-scores", "outage", t0, 0, forecast.VERSION, {"p_down": [1.0] * 192, "off_grid": True})
+    assert not [r for r in forecast.score_day(farm, day) if r["kind"] == "outage"]
+    with store.connect() as con:
+        con.execute("INSERT INTO forecast_scores (site_id, kind, day_local, horizon_class, metric, value, baseline_value) VALUES (?,?,?,?,?,?,?)",
+                    ("farm-scores", "outage", day.isoformat(), "day_ahead", "brier", 0.0, 0.0))
+    assert "outage" in forecast.scores("farm-scores")["summary"]
+    s = forecast.scores("farm-scores", site=farm)
+    assert "outage" not in s["summary"] and "outage" not in s["days"]
+
+
+def test_the_plan_s_forecast_stage_leaves_out_a_kind_that_does_not_apply(api_world):
+    """The refresh answers no PV stage for a site without PV, and the plan's forecast stage is the load's alone: a PV stage of 0 for ever would keep
+    every plan at stage 0."""
+    from gridlytics import plans
+    w = api_world
+    r = w.c["analyst"].post(f"/api/sites/{w.site}/forecasts/refresh")
+    assert r.status_code == 200 and r.json()["stages"]["pv"] is None and r.json()["stages"]["load"] == 0
+    with w.use():
+        out = plans.tick(w.site, save=False)
+    assert out["summary"]["stage"] == 0 and "pv" not in out["summary"]["stages"] and out["summary"]["stages"]["load"] == 0

@@ -62,6 +62,22 @@ def _local_midnight(ts: int) -> int:
     return int((int(ts) + 5 * 3600) // 86400 * 86400 - 5 * 3600)
 
 
+def off_grid(site: dict) -> bool:
+    """A site without a grid connection (none, or an off-grid regime): its grid always reads 0."""
+    conns = site.get("connections") or []
+    return not conns or conns[0]["data"].get("regime") == "off_grid"
+
+
+def not_applicable(site: dict, kind: str) -> str | None:
+    """Why a forecast kind does not apply to a site, or None: "no_pv" for PV at a site without PV, "off_grid" for outages at an off-grid site. Such a
+    kind has no stage, no page and no score (the optimiser still reads its bundle: zeros, or the grid always down)."""
+    if kind == "pv" and not (site.get("assets") or {}).get("pv"):
+        return "no_pv"
+    if kind == "outage" and off_grid(site):
+        return "off_grid"
+    return None
+
+
 def step_times(t0: int, steps: int = STEPS) -> np.ndarray:
     return t0 + STEP_S * np.arange(steps, dtype=np.int64)
 
@@ -87,7 +103,7 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
     t = step_times(t0, steps)
     if not pv_asset:
         z = np.zeros(steps)
-        return {"stage": 0, "cs": z, "q": {q: z for q in QS}, "pr": None, "note": "No PV on this site"}
+        return {"stage": None, "cs": z, "q": {q: z for q in QS}, "pr": None, "note": "No PV on this site", "not_applicable": "no_pv"}
     lat, lon = site["data"].get("lat", 31.5), site["data"].get("lon", 74.3)
     months = solar.local_month(t)
     cs = _mean15(lambda x: solar.pv_power(x, lat, lon, pv_asset, 1.0, months), t)
@@ -290,8 +306,7 @@ def critical_profile(site: dict, g: dict) -> tuple[np.ndarray, int]:
     prof = np.asarray(twin.critical_share(site), dtype=float).copy()
     assets = site.get("assets") or {}
     bat = assets.get("battery")
-    conns = site.get("connections") or []
-    if not bat or not conns or conns[0]["data"].get("regime") == "off_grid" or not len(g.get("ts", [])):
+    if not bat or off_grid(site) or not len(g.get("ts", [])):
         return prof, 0
     n = len(g["ts"])
     lo = np.asarray(g["load"], dtype=float)
@@ -517,10 +532,9 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     """P(down) per step from t0. The hazard and adherence read history before t0 only; the observed grid state reads the telemetry up to `now`
     (the actual issue time, when later than t0), so a grid loss inside the current quarter is seen by a re-solve or refresh at once."""
     t = step_times(t0, steps)
-    conns = site.get("connections") or []
-    if not conns or conns[0]["data"].get("regime") == "off_grid":
+    if off_grid(site):
         one = np.ones(steps)
-        return {"stage": 0, "p_down": one, "p_start": np.zeros(steps), "dur_steps": np.full(steps, 4), "g": np.zeros(steps), "observed": None,
+        return {"stage": None, "not_applicable": "off_grid", "p_down": one, "p_start": np.zeros(steps), "dur_steps": np.full(steps, 4), "g": np.zeros(steps), "observed": None,
                 "adherence": None, "adherence_windows": None, "off_grid": True, "shed_prior": None}
     sched = schedule(site["id"])
     windows = sched["windows"] if sched else []
@@ -635,11 +649,13 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
     t0 = align(t0)
     p, l, o = pv(site, t0), load(site, t0), outage(site, t0, now=now)
     if save:
-        telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION, {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr")})
+        if p["stage"] is not None:  # a site without PV has no PV issue
+            telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION, {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr")})
         telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION, {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"]),
                                                                            "crit_learned_hours": l.get("crit_learned_hours"), "crit_zero": l.get("crit_zero"),
                                                                            "calendar": l.get("calendar")})
-        telemetry.save_forecast(site["id"], "outage", t0, o["stage"], VERSION,
+        # an off-grid site's issue (always down, no stage) is still saved: the plan's same-quarter protection reads it
+        telemetry.save_forecast(site["id"], "outage", t0, o["stage"] or 0, VERSION,
                                 {"p_down": _r(o["p_down"]), "p_start": _r(o["p_start"]), "dur_steps": [int(x) for x in o["dur_steps"]], "g": _r(o["g"], 0),
                                  "observed": o.get("observed"), "adherence": o.get("adherence"), "adherence_windows": o.get("adherence_windows"),
                                  "off_grid": o.get("off_grid"), "days_known": o.get("days_known"), "pooled": o.get("pooled"),
@@ -713,9 +729,12 @@ def page(site: dict, kind: str) -> dict:
     their actuals and the issue held a day before over them, so the chart shows how the forecast tracked. The tick re-issues every 15 minutes, so the
     latest issue's own actuals are at most one step. `preliminary` follows the design rules (see preliminary()), with `verified_days` and
     `verified_days_needed` beside it."""
+    na = not_applicable(site, kind)
+    if na:
+        return {"kind": kind, "issue": None, "not_applicable": na, "stage": None, "preliminary": False}
     f = telemetry.latest_forecast(site["id"], kind)
     if f is None:
-        return {"kind": kind, "issue": None}
+        return {"kind": kind, "issue": None, "not_applicable": None}
     t0 = f["belief_time"]
     t = step_times(t0)
     now = int(datetime.now(timezone.utc).timestamp())
@@ -723,7 +742,7 @@ def page(site: dict, kind: str) -> dict:
     actual = _actual15(site["id"], kind, t0, t1) if kind in PAST_KEYS else None
     return {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
             "issue": {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version")}, "actual": actual,
-            **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None}
+            **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None, "not_applicable": None}
 
 
 def _outage_baselines(site: dict, t0: int) -> dict:
@@ -731,10 +750,9 @@ def _outage_baselines(site: dict, t0: int) -> dict:
     windows times the adherence; never down without a schedule) and a 28-day climatology of the share of slots down per local hour."""
     t = step_times(t0, 96)
     h = telemetry.minute_grid(site["id"], t0 - 28 * 86400, t0)
-    conns = site.get("connections") or []
     sched = schedule(site["id"])
     windows = sched["windows"] if sched else []
-    if not conns or conns[0]["data"].get("regime") == "off_grid":
+    if off_grid(site):
         p_sched = np.ones(96)
     elif windows:
         p_sched = _window_mask(windows, t + 450) * _adherence(windows, h["grid"], h["ts"])
@@ -901,10 +919,9 @@ def score_day(site: dict, day) -> list[dict]:
     if g["completeness"] < 0.5:
         return []
     out = []
-    pv_asset = (site.get("assets") or {}).get("pv")
     for kind in ("pv", "load", "outage"):
-        if kind == "pv" and not pv_asset:
-            continue
+        if not_applicable(site, kind):
+            continue  # no PV, or an off-grid site's always-down grid: nothing to score (a Brier of 0 against 0 says nothing)
         if kind in ("pv", "load"):
             out += _power_scores(site, kind, t0, g)
             continue
@@ -950,10 +967,11 @@ def _window(rows: list[dict]) -> dict:
             "skill": _skill(float(np.mean([r["value"] for r in paired])), mean_b) if paired else None}
 
 
-def scores(site_id: str, days: int = 30) -> dict:
+def scores(site_id: str, days: int = 30, site: dict | None = None) -> dict:
     """The scored days of the last `days` calendar days (Pakistan time) and their summary. `days` holds each kind's day-ahead rows (one per day and
     metric) with their skill; `summary` gives per kind the mean over the last 7 and the last `days` calendar days (`last7`, `last30`; `n7` and `n` days
-    scored in each), the baseline's means and the skill against it, and the same per horizon class (`horizons`, plan Part 5.5's classes in order)."""
+    scored in each), the baseline's means and the skill against it, and the same per horizon class (`horizons`, plan Part 5.5's classes in order).
+    With the site, the kinds that do not apply to it (not_applicable) are left out, rows stored before included."""
     today = datetime.now(PKT).date()
     since = (today - timedelta(days=days)).isoformat()
     since7 = (today - timedelta(days=7)).isoformat()
@@ -961,7 +979,10 @@ def scores(site_id: str, days: int = 30) -> dict:
         rows = con.execute("SELECT * FROM forecast_scores WHERE site_id = ? AND day_local >= ? ORDER BY day_local", (site_id, since)).fetchall()
     head: dict = {}
     by_class: dict = {}
+    skip = {k for k in ("pv", "load", "outage") if site is not None and not_applicable(site, k)}
     for r in rows:
+        if r["kind"] in skip:
+            continue
         x = {"day": r["day_local"], "metric": r["metric"], "value": r["value"], "baseline": r["baseline_value"], "horizon_class": r["horizon_class"],
              "skill": _skill(r["value"], r["baseline_value"])}
         if r["horizon_class"] == "day_ahead":
