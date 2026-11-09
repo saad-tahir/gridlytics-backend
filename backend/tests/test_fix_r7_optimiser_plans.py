@@ -858,3 +858,61 @@ def test_a_start_under_the_cut_off_recovers_even_where_cycling_does_not_pay():
     assert r["status"] == "optimal"
     assert float(r["sol"]["E"][-1]) >= 20.0 - 1e-6
     assert float(np.max(r["sol"]["D"])) < 1e-6
+
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-02, flow-telemetry-plan-control-09
+
+SOC_COLS = ("site_id", "ts", "source_id", "grid_present", "battery_soc_est_pct", "battery_soc_bms_pct", "battery_power_w")
+
+
+def _battery_site(soc_max=0.95, **extra):
+    sid = sites.create({"name": "Pack", "disco": "FESCO", "critical_load_kw": [50.0] * 24, "genset_start_control": "none", **extra}, "t")["id"]
+    sites.put_connection(sid, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400}, "t")
+    sites.put_asset(sid, "battery", {"nameplate_kwh": 200, "p_ch_kw": 100, "p_dis_kw": 100, "soc_max": soc_max}, "t")
+    return sid
+
+
+def _daily_cycles(sid, start, days, top, bottom=30.0, est=True, bms_off=0.0):
+    """Minute rows of a pack that charges from `bottom` to `top` percent over 08:00-12:00 local, holds there to 14:00, and discharges back to
+    `bottom` by midnight, every day (the estimate column, or the BMS alone with est=False)."""
+    rows = []
+    for i in range(days * 1440):
+        m = i % 1440                                                   # minutes after local midnight (start is a local midnight)
+        if m < 480:
+            soc, kw = bottom, 0.0
+        elif m < 720:
+            soc, kw = bottom + (top - bottom) * (m - 480) / 240, -(top - bottom) * 2.0 / 4
+        elif m < 840:
+            soc, kw = top, 0.0
+        else:
+            soc, kw = top - (top - bottom) * (m - 840) / 600, (top - bottom) * 2.0 / 10
+        rows.append((sid, start + 60 * i, "edge", 1.0, soc if est else None, soc + bms_off, kw * 1000))
+    telemetry.write_rows(rows, SOC_COLS)
+
+
+def test_a_charge_to_the_packs_own_top_of_charge_re_anchors_the_estimate(company):
+    """Anchors needed 98 %, but every pack stopped at its soc_max of 95 %, so a full charge never anchored: sigma climbed 0.19 points an hour
+    to its cap, and the reserve's 2-sigma widening (up to 30 % of the pack) kept the mill's battery full through every peak. A charge to the
+    pack's own top (on the upper knee, 95 % or more) is now the full-charge anchor."""
+    from gridlytics import battery
+    sid = _battery_site()
+    start = twin.day_start_utc(date(2026, 11, 3))
+    _daily_cycles(sid, start, 3, top=95.0)
+    now = start + 2 * 86400 + 18 * 3600                               # 18:00 on the third day, four hours after the charge ended
+    st = battery.state(sites.full(sid), now)
+    assert st["waiting_for_anchor"] is False
+    assert abs(st["anchor"] - (start + 2 * 86400 + 14 * 3600)) <= 15 * 60   # the charge's end at the top, that afternoon
+    assert st["sigma_pct"] < 4.0                                       # 1 + 0.19 x 4 h + 2 x throughput / E_nom
+    assert "sigma_high" not in [a[0] for a in st["alerts"]]
+    p = plans.build_problem(sites.full(sid), now // 900 * 900, forecast.issue(sites.full(sid), now // 900 * 900, save=False), 96)
+    assert p["battery"]["sigma0"] < 0.04                               # so the plan's reserve widens by a few points, not 30 %
+
+
+def test_a_top_of_charge_under_the_upper_knee_is_no_anchor(company):
+    """On the LFP plateau the state of charge cannot be read (R6 5.2): a pack set to stop at 90 % has no full-charge anchor there."""
+    from gridlytics import battery
+    sid = _battery_site(soc_max=0.90)
+    start = twin.day_start_utc(date(2026, 11, 3))
+    _daily_cycles(sid, start, 3, top=90.0)
+    st = battery.state(sites.full(sid), start + 2 * 86400 + 18 * 3600)
+    assert st["waiting_for_anchor"] is True and st["anchor"] is None

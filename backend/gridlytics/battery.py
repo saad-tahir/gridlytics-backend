@@ -1,8 +1,8 @@
 """The battery state service, method v1 (plan Part 4.6): the estimate and its uncertainty, a trust score, wear prices and the seven alerts.
 
 Coulomb counting between anchors with the BMS as a trust-weighted prior is the edge's job where an edge exists; from cloud telemetry v1 takes the
-estimate column when a source sends one and the BMS value otherwise, and grows sigma with the hours and throughput since the last anchor (a full charge
-above 98 percent or the low knee), which is what the optimiser's reserve widening reads.
+estimate column when a source sends one and the BMS value otherwise, and grows sigma with the hours and throughput since the last anchor (a full charge,
+`full_charge_level`, or the low knee), which is what the optimiser's reserve widening reads.
 """
 from __future__ import annotations
 
@@ -11,6 +11,21 @@ from datetime import datetime, timezone
 import numpy as np
 
 from . import optimise, telemetry
+
+#: R6 5.3's full-charge anchors (A1, A3) on cloud data: the estimate at 98 % or more
+FULL_CHARGE = 0.98
+#: the upper knee of an LFP pack (R6 5.2: about 3.40 V per cell under low current, SoC 95 to 100), where the voltage reads the state of charge
+UPPER_KNEE = 0.95
+
+
+def full_charge_level(b: dict) -> float:
+    """The estimate at which a charge anchors sigma: 98 %, or a point under the pack's own top of charge (soc_max) where that lies on the upper
+    knee. A pack that stops at its soc_max ends its charge there and its BMS re-reads the state of charge on the knee; every demo pack and most
+    real ones stop at 95 %, so a 98 % rule alone never anchored them, sigma climbed 0.19 points an hour to its cap, and the reserve's 2-sigma
+    widening (up to 30 % of the pack) kept the battery full through every peak (round 7, engine-plans-live-02). A top of charge on the plateau
+    (under 95 %) is no anchor: the state of charge cannot be read there."""
+    top = float(b.get("soc_max", 0.95))
+    return min(FULL_CHARGE, top - 0.01) if top >= UPPER_KNEE - 1e-9 else FULL_CHARGE
 
 
 def state(site: dict, now: int | None = None) -> dict | None:
@@ -28,7 +43,7 @@ def state(site: dict, now: int | None = None) -> dict | None:
         return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "usable_kwh": None, "anchor": None, "alerts": [], "waiting_for_anchor": True}
     last = int(np.where(known)[0][-1])
     soc = float(est[last])
-    anchors = np.where(known & ((est >= 0.98) | (est <= b["soc_min"] + 0.02)))[0]
+    anchors = np.where(known & ((est >= full_charge_level(b) - 1e-9) | (est <= b["soc_min"] + 0.02)))[0]
     if len(anchors):
         a = int(anchors[-1])
         hours = (last - a) / 60.0
