@@ -6,7 +6,8 @@ telemetry file beside its workspace file, `<stem>-telemetry.db` (`telemetry_path
 
 The context functions, the WAL-once rule, the copy before a migration and BEGIN IMMEDIATE under one lock are lifted from solarlytics-backend at c853130
 (store.py lines 33-131, 475-526, 956-990, 1402-1420; DESIGN_LOG first section). The schema is Gridlytics' own: version 1 holds the four tables the lifted
-package needs (members, role_presets, api_keys, audit) and the EMS tables of plan Part 3.2; version 2 adds reports.preliminary.
+package needs (members, role_presets, api_keys, audit) and the EMS tables of plan Part 3.2; version 2 adds reports.preliminary; version 3 (round 7)
+adds edge_seen and keeps every capabilities message (`_V3`).
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ DEFAULT_ORG = "default"
 _ORG: ContextVar[str] = ContextVar("gridlytics_org", default=DEFAULT_ORG)
 _DB: ContextVar[Path | None] = ContextVar("gridlytics_db", default=None)
 _ACTOR: ContextVar[dict | None] = ContextVar("gridlytics_actor", default=None)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _lock = threading.Lock()
 
 
@@ -206,6 +207,20 @@ _V1 = [
 #: Version 2 (round 3): a report keeps whether its figures were preliminary when it was made (NULL for a report made before, and for the daily sheet)
 _V2_COLUMNS = (("reports", "preliminary", "INTEGER"),)
 
+#: Version 3 (round 7, audit engine-delivery-03): the edge messages stored, by (site, stream, sequence, digest of the content), so a message is a
+#: duplicate only when the same message was stored before (a reset counter, or a batch below the last sequence that was never stored, is stored); and
+#: the capabilities table keeps every message (U3 5.3: the history matters in a savings dispute) with its sent_at in epoch seconds, keyed by its
+#: digest as well as its sequence (a row stored before keeps digest '')
+_V3 = [
+    """CREATE TABLE IF NOT EXISTS edge_seen (site_id TEXT NOT NULL, stream TEXT NOT NULL, seq INTEGER NOT NULL, digest TEXT NOT NULL,
+        received_at TEXT NOT NULL, PRIMARY KEY (site_id, stream, seq, digest))""",
+    """CREATE TABLE capabilities_v3 (site_id TEXT NOT NULL, seq INTEGER NOT NULL, digest TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL,
+        sent_ts INTEGER, body TEXT NOT NULL, PRIMARY KEY (site_id, seq, digest))""",
+    "INSERT INTO capabilities_v3 (site_id, seq, digest, received_at, sent_ts, body) SELECT site_id, seq, '', received_at, NULL, body FROM capabilities",
+    "DROP TABLE capabilities",
+    "ALTER TABLE capabilities_v3 RENAME TO capabilities",
+]
+
 
 def _migrate(con: sqlite3.Connection, version: int) -> None:
     if version < 1:
@@ -215,6 +230,9 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
         for table, column, kind in _V2_COLUMNS:
             if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    if version < 3:
+        for sql in _V3:
+            con.execute(sql)
 
 
 def backup(tag: str) -> Path | None:

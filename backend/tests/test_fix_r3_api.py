@@ -363,7 +363,7 @@ def test_a_workspace_file_of_schema_1_gains_the_reports_preliminary_column(tmp_p
     with store.use_company(path):
         rows = {r["id"]: r for r in reports.listing()}
         with store.connect() as con:
-            assert con.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 2
+            assert con.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION >= 2
     assert rows["r1"]["preliminary"] is True and rows["r2"]["preliminary"] is None    # October not over when made; September unknown
     assert list((tmp_path / "backup").glob("old-*-schema-v1.db"))                     # the copy before the migration
 

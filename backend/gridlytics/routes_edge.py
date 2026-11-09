@@ -1,13 +1,16 @@
 """The ems-edge/1.0 HTTPS path (plan Part 7.3 and 7.5): telemetry batches, heartbeats, events, acks and capabilities from a site-bound API key.
 
 The guard has already checked the key, its scope and that the site in the path is the key's own (403 wrong_site otherwise); a person's session never
-reaches these routes (the guard refuses it with 403 key_required, and each route checks again). Idempotent by (site, stream, sequence): a repeated
-sequence is acknowledged and not written twice. A sequence counts as received only once its batch is stored, so a batch that fails is never later
-acknowledged as a duplicate; an events batch claims its sequence in the transaction that stores it. A malformed batch (an unknown or repeated column, a
+reaches these routes (the guard refuses it with 403 key_required, and each route checks again). Idempotent by (site, stream, sequence, content): a
+message is acknowledged as a duplicate, and not written twice, only when the same message (the same sequence and the same digest of its content, sent_at
+and msg_id aside) was stored before (`edge_seen`). A batch below the last sequence that was never stored (a retry after a later batch went through) is
+stored, and so is a counter that restarted (a replaced box, a reboot that lost it). A message counts as received only once it is stored, so a batch
+that fails is never later acknowledged as a duplicate; an events batch is marked in the transaction that stores it. A malformed batch (an unknown or repeated column, a
 ts outside 2015 to a day from now) is refused with 422 every time it is sent. An outage event re-solves the plan once telemetry shows it (OPT-15).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -80,16 +83,32 @@ def _key_only(detail: str = "The edge paths take the site's API key") -> dict:
     return user
 
 
-def _seq_last(site_id: str, stream: str) -> int:
-    """The last sequence the telemetry file records for the stream (-1 for none)."""
-    with telemetry.connect() as con:
-        r = con.execute("SELECT last FROM seq WHERE site_id = ? AND stream = ?", (site_id, stream)).fetchone()
-    return int(r["last"]) if r else -1
+#: How long a stored message's sequence and digest are kept: well past the edge's 7-day store-and-forward (U3 5.1), so every retry it can still send
+#: is recognised. Older rows are pruned now and then (one message in SEEN_PRUNE_EVERY)
+SEEN_KEEP_DAYS = 30
+SEEN_PRUNE_EVERY = 64
 
 
-def _seq_check(site_id: str, stream: str, seq: int) -> bool:
-    """True when the sequence is new for the stream (nothing is recorded here: `telemetry.next_seq` records it once the message is stored)."""
-    return seq > _seq_last(site_id, stream)
+def _digest(msg) -> str:
+    """The digest of an edge message's content: the whole message but sent_at and msg_id, which an edge may stamp again on a retry. Two messages of a
+    stream with the same sequence and digest are the same message (audit engine-delivery-03)."""
+    body = msg.model_dump(exclude={"sent_at", "msg_id"})
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def _was_stored(con, site_id: str, stream: str, seq: int, digest: str) -> bool:
+    """Whether this very message (stream, sequence and digest) was stored before."""
+    return con.execute("SELECT 1 FROM edge_seen WHERE site_id = ? AND stream = ? AND seq = ? AND digest = ?",
+                       (site_id, stream, seq, digest)).fetchone() is not None
+
+
+def _mark_stored(con, site_id: str, stream: str, seq: int, digest: str) -> None:
+    """Records the message as stored, in the caller's transaction (the one that stored it, where there is one)."""
+    con.execute("INSERT OR IGNORE INTO edge_seen (site_id, stream, seq, digest, received_at) VALUES (?,?,?,?,?)",
+                (site_id, stream, seq, digest, store._now()))
+    if seq % SEEN_PRUNE_EVERY == 0:
+        old = (datetime.now(timezone.utc) - timedelta(days=SEEN_KEEP_DAYS)).isoformat(timespec="seconds")
+        con.execute("DELETE FROM edge_seen WHERE site_id = ? AND stream = ? AND received_at < ?", (site_id, stream, old))
 
 
 def _state_change(site_id: str, change) -> tuple[dict, object]:
@@ -274,11 +293,14 @@ def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(.
     if "grid_present" not in msg.columns and "grid_voltage_v" not in msg.columns:
         raise Refusal(422, "Every batch carries grid_present (or grid_voltage_v)", "SCHEMA")
     _check_times(msg)
-    if not _seq_check(site_id, "telemetry", msg.seq):
-        return {"ack": msg.seq, "duplicate": True}
+    digest = _digest(msg)
+    with store.connect() as con:
+        if _was_stored(con, site_id, "telemetry", msg.seq, digest):
+            return {"ack": msg.seq, "duplicate": True}
     records = [dict(zip(msg.columns, row)) for row in msg.rows]
     res = telemetry.ingest(site_id, records, "edge")
-    telemetry.next_seq(site_id, "telemetry", msg.seq)
+    with store.connect() as con:
+        _mark_stored(con, site_id, "telemetry", msg.seq, digest)
     answer = {"ack": msg.seq, **res}
     # an outage event waiting for this batch (the minute that shows the grid lost or back) re-solves now; the batch is stored either way. The pending
     # re-solve is read now, after the batch is stored, not from the state at the request's start: an event stored meanwhile is the one that decides
@@ -317,30 +339,23 @@ def _pause_in(con, site_id: str) -> None:
 
 @router.post("/api/edge/{site_id}/events")
 def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Body(...)):
-    """An event batch, stored once. The sequence is claimed in the same workspace-file transaction (BEGIN IMMEDIATE) that stores the events and any
-    pause they call for, so two identical batches sent at once, or a retry after a failure, never store the events or the pause twice; a batch that
-    fails stores nothing and is stored when sent again. An outage starting or ending re-solves the plan (OPT-15)."""
+    """An event batch, stored once. The message is marked stored (`edge_seen`) in the same workspace-file transaction (BEGIN IMMEDIATE) that stores
+    the events and any pause they call for, so two identical batches sent at once, or a retry after a failure, never store the events or the pause
+    twice; a batch that fails stores nothing and is stored when sent again. An outage starting or ending re-solves the plan (OPT-15)."""
     _key_only()
     site = site_or_404(site_id)
     msg = _check(delivery.EventBatch, inp)
     _seen(site_id)
-    floor = _seq_last(site_id, "events")      # the sequence the telemetry file recorded before the claim moved into the workspace file
-    claim = f"edge_seq:{site_id}:events"
+    digest = _digest(msg)
     with store.write_transaction() as con:
-        r = con.execute("SELECT value FROM settings WHERE key = ?", (claim,)).fetchone()
-        if msg.seq <= max(floor, int(json.loads(r["value"])) if r else -1):
+        if _was_stored(con, site_id, "events", msg.seq, digest):
             return {"ack": msg.seq, "duplicate": True}
         for e in msg.events:
             con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)", (site_id, e.ts, e.type, "edge", json.dumps(e.detail)))
-        con.execute("INSERT INTO settings (key, value, updated) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
-                    "updated = excluded.updated", (claim, json.dumps(msg.seq), store._now()))
+        _mark_stored(con, site_id, "events", msg.seq, digest)
         # read-back mismatch, a local override or a template change put the site in unknown state: pause control until a person resumes it
         if any(e.type in PAUSE_EVENTS for e in msg.events):
             _pause_in(con, site_id)
-    try:
-        telemetry.next_seq(site_id, "events", msg.seq)    # kept in step for any reader of the telemetry file's sequences; the claim above decides
-    except Exception:
-        log.warning("could not record the events sequence of site %s in the telemetry file", site_id, exc_info=True)
     resolve = None
     outs = [e for e in msg.events if e.type in RESOLVE_EVENTS]
     if outs and site.get("status") == "active":
@@ -378,9 +393,13 @@ def edge_ack(site_id: str, inp: dict = Body(...)):
     site_or_404(site_id)
     msg = _check(delivery.Ack, inp)
     _seen(site_id)
-    with store.connect() as con:
+    digest = _digest(msg)
+    with store.write_transaction() as con:
+        if _was_stored(con, site_id, "ack", msg.seq, digest):
+            return {"ack": msg.seq, "duplicate": True}
         con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
                     (store.new_id(), site_id, msg.plan_id, msg.status, json.dumps(msg.model_dump()), store._now()))
+        _mark_stored(con, site_id, "ack", msg.seq, digest)
     return {"ack": msg.seq}
 
 
@@ -389,12 +408,23 @@ def edge_caps(site_id: str, inp: dict = Body(...)):
     _key_only()
     site_or_404(site_id)
     msg = _check(delivery.Capabilities, inp)
-    with store.connect() as con:
-        con.execute("INSERT OR REPLACE INTO capabilities (site_id, seq, received_at, body) VALUES (?,?,?,?)",
-                    (site_id, msg.seq, store._now(), json.dumps(msg.model_dump())))
-    sites.set_tier_capable(site_id, msg.tier)
     _seen(site_id)
-    return {"ack": msg.seq, "tier_capable": msg.tier}
+    digest = _digest(msg)
+    sent = _row_time(msg.sent_at)
+    sent = int(sent) if sent is not None and math.isfinite(sent) else now_ts()
+    with store.write_transaction() as con:
+        if _was_stored(con, site_id, "capabilities", msg.seq, digest):
+            cur = con.execute("SELECT tier_capable FROM sites WHERE id = ?", (site_id,)).fetchone()
+            return {"ack": msg.seq, "duplicate": True, "tier_capable": cur["tier_capable"] if cur else None}
+        con.execute("INSERT OR REPLACE INTO capabilities (site_id, seq, digest, received_at, sent_ts, body) VALUES (?,?,?,?,?,?)",
+                    (site_id, msg.seq, digest, store._now(), sent, json.dumps(msg.model_dump())))
+        _mark_stored(con, site_id, "capabilities", msg.seq, digest)
+        # the newest message by its sent_at is the current one, whatever its sequence (a counter that restarted sends 0 on boot); a late retry of an
+        # older message is kept for the record and sets nothing
+        newer = con.execute("SELECT 1 FROM capabilities WHERE site_id = ? AND sent_ts > ? LIMIT 1", (site_id, sent)).fetchone()
+    if newer is None:
+        sites.set_tier_capable(site_id, msg.tier)
+    return {"ack": msg.seq, "tier_capable": (sites.get(site_id) or {}).get("tier_capable", msg.tier)}
 
 
 def _without_money(site_id: str, msg: dict) -> dict:
@@ -430,7 +460,8 @@ def edge_status(site_id: str):
     s = full_or_404(site_id)
     st = s.get("state") or {}
     with store.connect() as con:
-        cap = con.execute("SELECT * FROM capabilities WHERE site_id = ? ORDER BY seq DESC LIMIT 1", (site_id,)).fetchone()
+        cap = con.execute("SELECT * FROM capabilities WHERE site_id = ? ORDER BY sent_ts IS NULL, sent_ts DESC, received_at DESC LIMIT 1",
+                          (site_id,)).fetchone()
         acks = con.execute("SELECT plan_id, status, body, received_at FROM acks WHERE site_id = ? ORDER BY received_at DESC LIMIT 20", (site_id,)).fetchall()
         sent = con.execute("SELECT plan_id, key_id, sent_at FROM plan_messages WHERE site_id = ? ORDER BY sent_at DESC LIMIT 20", (site_id,)).fetchall()
     last = st.get("edge_last_seen")

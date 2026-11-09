@@ -9,6 +9,18 @@ Batch 1, what reaches the device:
 - on a day in a native block of the switchback calendar the live site runs its native settings: the tick holds the plan, the edge gets a release,
   the pages say so (audit engine-savings-01, brief-vs-build-01, flow-savings-pilot-bill-05).
 
+Batch 2, the edge protocol:
+- a message is a duplicate only when the same message (its stream, sequence and content) was stored before: a batch below the high-water mark that
+  was never stored is stored, a reset counter is stored, and the newest capabilities message is the current one (audit engine-delivery-03);
+- the models take U3's own contract: the envelope, its event names, unknown event types, partial acks, heartbeat states, the telemetry shape, and the
+  plan message carries supersedes, capabilities_seq, targets and msg_id (audit engine-delivery-11);
+- the contract is exported as JSON Schema files pinned by a drift test, the capabilities name each device's writable primitives, and the signed
+  plan carries only what the device can write (audit brief-vs-build-12, tracker-and-docs-04);
+- what the edge reports is acted on: rejected or partial acks, control_disabled, firmware_change and the heartbeat's state show in the control
+  state, pause control where they leave the device unknown, and a closed-loop day the edge did not follow claims nothing (audit engine-delivery-12);
+- the clock-offset ladder is real: clock_unsynced at 120 s, the peak slots widened by 15 minutes at 300 s, control demoted until the offset is under
+  120 s at 900 s (audit engine-delivery-10).
+
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
@@ -18,7 +30,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 import pytest
 
-from gridlytics import delivery, forecast, plans, sites, store
+from gridlytics import delivery, forecast, plans, sites, store, telemetry
 from test_fix_api import _fake_plan, world  # noqa: F401  (world is a fixture)
 from test_fix_optimiser import _now_t0, _site, _until
 
@@ -335,3 +347,100 @@ def test_the_plan_and_control_pages_say_a_native_block_day(world):
     ctl = a.get(f"/api/sites/{sid}/control").json()["control"]
     assert ctl["key"] == "native_block" and plans._ts(ctl["until"]) is not None
     assert "native" in ctl["label"].lower()
+
+
+# ------------------------------------------------------------------------------------------------ engine-delivery-03 (batch 2)
+
+def _env(seq: int, sent_at: str = "2026-11-06T10:00:00Z", **body) -> dict:
+    return {"contract": "ems-edge/1.0", "seq": seq, "sent_at": sent_at, **body}
+
+
+def _tel(seq: int, minute: int, pv: float = 900.0, **env) -> dict:
+    return _env(seq, columns=["ts", "grid_present", "pv_power_w"], rows=[[minute, 1, pv]], **env)
+
+
+def test_a_batch_below_the_mark_that_was_never_stored_is_stored_and_a_true_repeat_is_a_duplicate(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    m = _now() // 60 * 60 - 600
+    # seq 10 timed out before it was stored; seq 11 went through; the retry of 10 comes after it
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_tel(11, m + 60))
+    assert r.status_code == 200 and r.json()["accepted"] == 1, r.text
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_tel(10, m, pv=700.0))
+    assert r.status_code == 200 and r.json().get("accepted") == 1 and not r.json().get("duplicate"), r.text
+    with world.use():
+        assert telemetry.minute_grid(sid, m, m + 60)["pv"][0] == pytest.approx(0.7)
+    # the same message again (a lost answer): acknowledged, not written twice
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_tel(10, m, pv=700.0))
+    assert r.json() == {"ack": 10, "duplicate": True}, r.text
+    # a retry sent at a later time is the same message: sent_at and msg_id do not make it a new one
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_tel(10, m, pv=700.0, sent_at="2026-11-06T10:05:00Z"))
+    assert r.json().get("duplicate") is True, r.text
+
+
+def test_a_reset_sequence_is_stored_not_acknowledged_as_a_duplicate(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    m = _now() // 60 * 60 - 900
+    assert world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_tel(48213, m)).json()["accepted"] == 1
+    gap = {"ts": _iso(m), "type": "data_gap"}
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_env(5532, events=[gap]))
+    assert r.json()["stored"] == 1, r.text
+    # the box was replaced (or lost its counter): it starts again at 0; its readings and its safety events are stored
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_tel(0, m + 60))
+    assert r.status_code == 200 and r.json().get("accepted") == 1 and not r.json().get("duplicate"), r.text
+    mismatch = {"ts": _iso(m + 60), "type": "readback_mismatch", "detail": {"primitive": "soc_floor_pct"}}
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_env(0, events=[mismatch]))
+    assert r.status_code == 200 and r.json().get("stored") == 1 and not r.json().get("duplicate"), r.text
+    # its retry, sent again later, is the same message: one pause, one stored event
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_env(0, sent_at="2026-11-06T10:09:00Z", events=[mismatch]))
+    assert r.json().get("duplicate") is True, r.text
+    with world.use():
+        assert [o["kind"] for o in sites.overrides(sid)] == ["pause_control"]
+        with store.connect() as con:
+            assert con.execute("SELECT count(*) FROM events WHERE site_id = ? AND type = 'readback_mismatch'", (sid,)).fetchone()[0] == 1
+
+
+def test_an_ack_is_stored_once_however_often_it_is_sent(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    ack = _env(3, plan_id="p1", status="applied")
+    assert world.anon.post(f"/api/edge/{sid}/ack", headers=kh, json=ack).json() == {"ack": 3}
+    assert world.anon.post(f"/api/edge/{sid}/ack", headers=kh, json=ack).json() == {"ack": 3, "duplicate": True}
+    with world.use(), store.connect() as con:
+        assert con.execute("SELECT count(*) FROM acks WHERE site_id = ?", (sid,)).fetchone()[0] == 1
+
+
+def test_the_newest_capabilities_message_is_current_whatever_its_sequence(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    url = f"/api/edge/{sid}/capabilities"
+    assert world.anon.post(url, headers=kh, json=_env(17, "2026-11-06T00:00:10Z", edge_version="p2-0.4.2", tier="closed_loop")).status_code == 200
+    # the edge restarted its counter: the boot message (seq 0) is the current one, and the old one stays in the history
+    r = world.anon.post(url, headers=kh, json=_env(0, "2026-11-07T00:00:10Z", edge_version="p2-0.4.3", tier="advisory_writes"))
+    assert r.status_code == 200 and r.json()["tier_capable"] == "advisory_writes", r.text
+    # a late retry of an older message is stored for the record but does not set the tier
+    r = world.anon.post(url, headers=kh, json=_env(16, "2026-11-05T00:00:10Z", edge_version="p2-0.4.1", tier="closed_loop"))
+    assert r.status_code == 200 and r.json()["tier_capable"] == "advisory_writes", r.text
+    with world.use():
+        assert sites.get(sid)["tier_capable"] == "advisory_writes"
+        with store.connect() as con:
+            assert con.execute("SELECT count(*) FROM capabilities WHERE site_id = ?", (sid,)).fetchone()[0] == 3
+    e = world.c["admin"].get(f"/api/sites/{sid}/edge").json()
+    assert e["capabilities"]["edge_version"] == "p2-0.4.3" and e["capabilities"]["seq"] == 0
+    # the same boot message again is a duplicate (and a second reset to 0 with new content is stored)
+    assert world.anon.post(url, headers=kh, json=_env(0, "2026-11-07T00:00:10Z", edge_version="p2-0.4.3", tier="advisory_writes")).json()["duplicate"]
+
+
+def test_a_schema_2_file_keeps_its_capabilities_history_when_migrated(tmp_path, monkeypatch):
+    import sqlite3
+    from contextlib import closing
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(tmp_path))
+    path = tmp_path / "old.db"
+    with closing(sqlite3.connect(path)) as con, con:
+        for sql in store._V1:
+            con.execute(sql)
+        con.execute("ALTER TABLE reports ADD COLUMN preliminary INTEGER")
+        con.execute("INSERT INTO capabilities (site_id, seq, received_at, body) VALUES ('s', 4, '2026-11-01T00:00:00+00:00', '{\"seq\": 4}')")
+        con.execute("PRAGMA user_version = 2")
+    with store.use_company(path), store.connect() as con:
+        assert con.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+        rows = [dict(r) for r in con.execute("SELECT site_id, seq, digest, sent_ts, body FROM capabilities")]
+        assert rows == [{"site_id": "s", "seq": 4, "digest": "", "sent_ts": None, "body": '{"seq": 4}'}]
+        assert con.execute("SELECT count(*) FROM edge_seen").fetchone()[0] == 0
