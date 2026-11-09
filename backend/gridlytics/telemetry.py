@@ -378,6 +378,26 @@ def _check_values(records: list[dict], spans: list[int]) -> list[str]:
     return out
 
 
+#: 20:00 to 05:00 Karachi time is dark all year in Pakistan (sunset by about 19:20, sunrise from about 05:00)
+_NIGHT_H = (20, 5)
+
+
+def _zone_warning(records: list[dict], spans: list[int]) -> str | None:
+    """A probable time-zone slip (frontend-states-formats-06): PV above 5 % of the file's largest reading (and above KW_SUSPECT_W) for half an hour or
+    more between 20:00 and 05:00 Karachi time. A local-time file read as UTC puts the afternoon's PV after 20:00; a UTC file read as Karachi time puts the
+    morning's before 05:00."""
+    pv = [(r["ts"], x, span) for r, span in zip(records, spans) if (x := _num(r.get("pv_power_w"))[0]) is not None]
+    top = max((x for _, x, _ in pv), default=0.0)
+    if top < KW_SUSPECT_W:
+        return None
+    bar = max(KW_SUSPECT_W, 0.05 * top)
+    night = sum(span for t, x, span in pv if x > bar and not _NIGHT_H[1] <= (t + 5 * 3600) % 86400 // 3600 < _NIGHT_H[0])
+    if night < 30:
+        return None
+    return (f"pv_power_w is above {bar / 1000:,.1f} kW for {night:,} minutes between 20:00 and 05:00 Karachi time, when there is no sun: the times in "
+            f"the file may be in another zone than the one chosen (UTC or Karachi time)")
+
+
 def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
                file_name: str | None = None) -> dict:
     """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
@@ -472,6 +492,9 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
                    f"({', '.join(INTERVAL_ENERGY)}) spread evenly")
     gaps = sum(1 for a, b in zip(starts, starts[1:]) if b - a > max(5, step))
     warnings += _check_values(records, spans)
+    zone = _zone_warning(records, spans)
+    if zone:
+        warnings.append(zone)
     res = ingest(site_id, records, "csv", now=now, count_overlap=True, spans=spans, step_min=step)
     res["skipped"] += bad_ts
     if res["overlap"]:

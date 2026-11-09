@@ -252,3 +252,44 @@ def test_a_state_of_charge_given_as_a_fraction_is_reported(company):
     rows = [(_local(T0 + 8 * 3600 + 60 * i), 1, 80000, round(0.4 + 0.004 * i, 3)) for i in range(120)]
     res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w", "battery_soc_bms_pct"), rows), 5, now=NOW)
     assert any("battery_soc_bms_pct never goes above 1" in w for w in res["warnings"]), res["warnings"]
+
+
+# ------------------------------------------------------------------------------------------------ frontend-states-formats-06 / flow-telemetry-plan-control-11
+
+def test_solar_power_at_night_reports_a_probable_time_zone_slip(company):
+    """A logger's local-time file (PV 06:30-17:30) read as UTC puts PV at 21:00 Karachi time; read as Karachi time it does not. The slip is reported, in
+    the other direction too (a UTC file read as Karachi time puts PV before dawn)."""
+    sid = _site("Zone")
+    local_rows = [(_local(T0 + 60 * i), 1, 200000, _solar(T0 + 60 * i, 150000)) for i in range(1440)]
+    body = _file(("ts", "grid_present", "load_power_w", "pv_power_w"), local_rows)
+    wrong = telemetry.import_csv(sid, body, 0, now=NOW)
+    assert any("Karachi time" in w and "zone" in w for w in wrong["warnings"]), wrong["warnings"]
+    sid2 = _site("Zone right")
+    right = telemetry.import_csv(sid2, body, 5, now=NOW)
+    assert right["warnings"] == []
+    utc_rows = [(datetime.fromtimestamp(T0 + 60 * i, timezone.utc).replace(tzinfo=None).isoformat(), 1, 200000, _solar(T0 + 60 * i, 150000))
+                for i in range(1440)]
+    sid3 = _site("Zone other way")
+    other = telemetry.import_csv(sid3, _file(("ts", "grid_present", "load_power_w", "pv_power_w"), utc_rows), 5, now=NOW)
+    assert any("zone" in w for w in other["warnings"]), other["warnings"]
+
+
+# ------------------------------------------------------------------------------------------------ the route's answer
+
+def test_the_upload_route_answers_the_new_fields(world):
+    c = world.owner
+    sid = c.post("/api/sites", json={"name": "Route"}).json()["id"]
+    start = (int(datetime.now(timezone.utc).timestamp()) // 86400 - 2) * 86400
+    rows = []
+    for i in range(32):
+        ts = datetime.fromtimestamp(start + 900 * (i // 2), timezone.utc).isoformat()
+        rows.append((ts, 1, 250))  # every 15 minutes, twice, in kW
+    up = c.post(f"/api/sites/{sid}/telemetry/upload", params={"tz_offset_h": 0, "file_name": "x.csv"},
+                content=_file(("ts", "grid_present", "load_power_w"), rows), headers={"content-type": "text/csv"})
+    assert up.status_code == 200, up.text
+    body = up.json()
+    assert (body["rows"], body["duplicates"], body["step_min"], body["minutes"], body["overlap"]) == (16, 16, 15, 240, 0)
+    assert body["status"] == "done_with_warnings" and any("load_power_w" in w for w in body["warnings"])
+    bad = c.post(f"/api/sites/{sid}/telemetry/upload", params={"tz_offset_h": 0},
+                 content=_file(("ts", "grid_present", "load_power_w"), [(r[0], "x", 1) for r in rows]), headers={"content-type": "text/csv"})
+    assert bad.status_code == 422 and "grid_present" in bad.json()["detail"]
