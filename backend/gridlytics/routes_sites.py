@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 from fastapi import APIRouter, Body, Header, HTTPException
 
-from . import alerts, auth, battery, delivery, plans, sites, store, store_members, tariff_data, tariffs, telemetry
+from . import alerts, auth, battery, delivery, plans, sites, store, store_members, tariff_data, tariffs, telemetry, verify
 from .routes_common import PKT, bad, full_or_404, now_ts, out, put_state, site_or_404, today
 from .schemas import Refusal
 
@@ -63,20 +63,26 @@ def _snapshot(last: dict | None) -> dict | None:
             "genset_running": last.get("genset_running"), "mode": last.get("inverter_mode_active")}
 
 
-def _mtd_saving(site_id: str) -> tuple[float | None, list]:
+#: How the month-to-date saving on Fleet and Overview is worked out (plan 9.7: every money figure with its method and computation date): the
+#: counterfactual replay against the native capture, as the Savings page's ledger (verify.summary)
+MTD_SAVING_METHOD = "counterfactual"
+
+
+def _mtd_saving(site_id: str) -> tuple[float | None, str | None, list]:
+    """The month's claimed saving against the native settings, exactly as the Savings page's "This month" reads it (verify.summary from the 1st to
+    today: the claimed days plus the month's MDI lever), when its days were computed, and the last 7 scored days for the sparkline. The figure is None
+    while no day of the month is scored, never a zero (audit flow-savings-pilot-bill-02: the daily claims alone left out the MDI lever, so Fleet and
+    Overview read Rs 1,956 where Savings read Rs 43,594)."""
     t = today()
+    summ = verify.summary(site_id, t.replace(day=1).isoformat(), t.isoformat())
+    scored = any(d.get("saving_native_rs") is not None for d in summ["days"])
+    claimed = (summ["baselines"].get("native") or {}).get("claimed_rs")
+    mtd = round(claimed, 0) if scored and claimed is not None else None
     with store.connect() as con:
         rows = con.execute("SELECT day_local, data FROM savings_days WHERE site_id = ? AND baseline = 'native' AND day_local >= ? ORDER BY day_local",
                            (site_id, (t - timedelta(days=40)).isoformat())).fetchall()
-    month = t.strftime("%Y-%m")
-    mtd = None
-    spark = []
-    for r in rows:
-        d = json.loads(r["data"])
-        if r["day_local"].startswith(month):
-            mtd = (mtd or 0.0) + d.get("claimed_rs", 0.0)
-        spark.append({"day": r["day_local"], "saving_rs": d.get("saving_rs")})
-    return (round(mtd, 0) if mtd is not None else None), spark[-7:]
+    spark = [{"day": r["day_local"], "saving_rs": json.loads(r["data"]).get("saving_rs")} for r in rows]
+    return mtd, (summ["computed"] or None) if scored else None, spark[-7:]
 
 
 def fleet_row(s: dict, now: int, counts: dict) -> dict:
@@ -84,7 +90,7 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
     first = telemetry.first_ts(s["id"])
     plan = plans.current(s["id"])
     nn = plans.now_and_next(plan, now)
-    mtd, spark = _mtd_saving(s["id"])
+    mtd, computed, spark = _mtd_saving(s["id"])
     days_data = (now - first) / 86400 if first else 0
     conn = (sites.connections(s["id"]) or [None])[0]
     on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
@@ -92,7 +98,8 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
             "disco": s["data"].get("disco"), "category": conn["data"]["tariff_category"] if on_grid else "Off-grid",
             "control": control_state(s, last, now), "last_data": last["ts"] if last else None, "now": _snapshot(last),
             "next_event": (nn or {}).get("next", [None])[0] if nn and nn.get("next") else None, "open_alerts": counts.get(s["id"], 0),
-            "mtd_saving_rs": mtd, "spark": spark, "collecting_day": None if days_data >= 14 else int(days_data) + 1 if first else 0}
+            "mtd_saving_rs": mtd, "mtd_saving_rs_method": MTD_SAVING_METHOD, "mtd_saving_rs_computed": computed, "spark": spark,
+            "collecting_day": None if days_data >= 14 else int(days_data) + 1 if first else 0}
 
 
 @router.get("/api/fleet")
@@ -101,8 +108,10 @@ def fleet():
     c = alerts.counts()
     rows = [fleet_row(s, now, c["by_site"]) for s in sites.listing()]
     online = sum(1 for r in rows if r["last_data"] and now - r["last_data"] < 1800)
+    stamps = [r["mtd_saving_rs_computed"] for r in rows if r["mtd_saving_rs_computed"]]
     return out({"summary": {"sites": len(rows), "online": online, "alerts": c["total"], "critical": c["by_severity"].get("critical", 0),
-                            "mtd_saving_rs": round(sum(r["mtd_saving_rs"] or 0 for r in rows), 0),
+                            "mtd_saving_rs": round(sum(r["mtd_saving_rs"] or 0 for r in rows), 0), "mtd_saving_rs_method": MTD_SAVING_METHOD,
+                            "mtd_saving_rs_computed": max(stamps) if stamps else None,
                             "in_outage": sum(1 for r in rows if r["now"] and r["now"]["grid_present"] == 0 and r["category"] != "Off-grid")},
                 "sites": rows})
 
@@ -407,7 +416,7 @@ def site_now(site_id: str):
     td = next((d for d in tdays if d["day"] == t.isoformat()), None)
     if td is None and last:
         td = telemetry.aggregate_day(site_id, t)
-    mtd, spark = _mtd_saving(site_id)
+    mtd, computed, spark = _mtd_saving(site_id)
     a = s.get("assets") or {}
     caps = {"pv_kw": (a.get("pv") or {}).get("kw_ac"), "battery_kw": (a.get("battery") or {}).get("p_dis_kw"), "genset_kw": (a.get("genset") or {}).get("rated_kw"),
             "grid_kw": (s["connections"][0]["data"]["sanctioned_load_kw"] if s.get("connections") else None)}
@@ -418,7 +427,8 @@ def site_now(site_id: str):
                 "stage": (plan or {}).get("summary", {}).get("stage"), "today": td,
                 "month": {"import_kwh": sum_("import_kwh"), "pv_kwh": sum_("pv_kwh"), "genset_hours": sum_("genset_hours"), "litres": sum_("litres"),
                           "outage_hours": round(sum((d.get("outage_minutes") or 0) for d in tdays) / 60, 1),
-                          "peak_kw": max([d.get("peak_kw") or 0 for d in tdays] or [0]), "saving_rs": mtd},
+                          "peak_kw": max([d.get("peak_kw") or 0 for d in tdays] or [0]), "saving_rs": mtd,
+                          "saving_rs_method": MTD_SAVING_METHOD, "saving_rs_computed": computed},
                 "spark": spark, "battery": {k: (bs or {}).get(k) for k in ("soc_pct", "sigma_pct", "trust", "usable_kwh")} if bs else None,
                 "alerts": alerts.listing("active", site_id)[:5], "last_data": last["ts"] if last else None,
                 "first_data": telemetry.first_ts(site_id)})
