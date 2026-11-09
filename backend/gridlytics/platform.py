@@ -12,6 +12,10 @@ In local mode (GRIDLYTICS_AUTH_MODE, the default) the backend is the sign-in ser
 PBKDF2 hash; a membership gives it a company role (owner, admin or member) and a status (pending, active or suspended) in one company; the founder switches
 Gridlytics on or off per company. A session is a one-hour access token (identity.issue_local) and a refresh token, kept only as its hash, replaced at every
 use, ending 12 hours unused and 7 days after the sign-in (auth.SESSION_HOURS, auth.SESSION_DAYS).
+
+Until PLT-11 brings email (plan Part 9.3), a person who forgot their password is helped by a company's administrator or the founder: they issue a one-time
+password (`set_password(..., one_time=True)`, the account's `must_change`), with which only the sign-in's own paths answer until the person chooses their
+own, and they clear a sign-in lockout (`clear_lock`).
 """
 
 from __future__ import annotations
@@ -28,9 +32,9 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import auth, store
+from . import auth, identity, store
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 #: An access token's life (Supabase's default, decisions-v2 section 1)
 ACCESS_MINUTES = 60
 #: A refresh token not used for this long has ended; a session ends this many days after its sign-in, however used (the cookie sessions' rules)
@@ -48,6 +52,11 @@ INDEX_TABLES = ("share_index", "api_key_index")
 #: The record's words for a refused and a good sign-in: the lockout counts the first, from the last of the second
 REFUSED = "sign-in refused"
 SIGNED_IN = "signed in"
+#: The record's word for a lockout an administrator or the founder cleared (plan Part 9.3; audit pages-A-02): the refusals before it stop counting, from
+#: every address
+LOCK_CLEARED = "lockout cleared"
+#: What a person signed in with a one-time password is told by every path but the sign-in's own (api.IDENTITY_PATHS), until they choose their own
+ONE_TIME = "You signed in with a one-time password: choose your own password first, under My account"
 #: The shape of an email address, as the workspace's users have it, but with a domain that may be a single name: the decisions' demo user is dev@localhost
 _EMAIL = re.compile(r"[^@\s]{1,64}@[^@\s.][^@\s]{0,189}")
 _lock = threading.Lock()
@@ -122,6 +131,10 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
         con.execute("CREATE INDEX IF NOT EXISTS account_events_email ON account_events(email, event, at)")
         for table in INDEX_TABLES:
             con.execute(f"CREATE TABLE IF NOT EXISTS {table} (token_hash TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id))")
+    if version < 2:
+        # a one-time password an administrator or the founder issued (plan Part 9.3; audit pages-A-02): the person chooses their own at the next sign-in.
+        # _connect() has copied the file to backup/ before this runs
+        con.execute("ALTER TABLE accounts ADD COLUMN must_change INTEGER NOT NULL DEFAULT 0")
     con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -266,7 +279,7 @@ def _account(r) -> dict | None:
     if r is None:
         return None
     return {"id": r["id"], "email": r["email"], "name": r["name"], "disabled": bool(r["disabled"]), "created": r["created"], "updated": r["updated"],
-            "sessions_from": r["sessions_from"]}
+            "sessions_from": r["sessions_from"], "must_change": bool(r["must_change"])}
 
 
 def _email(email) -> str:
@@ -333,25 +346,32 @@ def check_sign_in(email: str, password: str) -> dict | None:
     return _account(r)
 
 
-def signed_in(account_id: str, iat: int | None = None) -> dict | None:
+def signed_in(account_id: str, iat: int | None = None, *, one_time_ok: bool = False) -> dict | None:
     """The account an access token names, while it may act: it exists, it is not disabled, and the token (`iat`, its issue time in unix seconds) is not
-    older than the account's last password change or disabling. Local revocation is immediate (addendum item 17): stage B3 asks this on every request."""
+    older than the account's last password change or disabling. Local revocation is immediate (addendum item 17): stage B3 asks this on every request.
+    An account signed in with a one-time password (`must_change`, plan Part 9.3) is refused 403 `password_change_required` (identity.Refused) unless
+    `one_time_ok`: only the sign-in's own paths (the context, the password change) take it."""
     found = account(account_id) if isinstance(account_id, str) else None
     if found is None or found["disabled"]:
         return None
     if iat is not None and (not isinstance(iat, (int, float)) or iat < found["sessions_from"]):
         return None
+    if found["must_change"] and not one_time_ok:
+        raise identity.Refused(403, "password_change_required", ONE_TIME)
     return found
 
 
-def set_password(account_id: str, password: str) -> dict | None:
-    """A new password for an account (the founder's reset, or the person's own change): every session of the account ends, its refresh tokens and the
-    access tokens made before now."""
+def set_password(account_id: str, password: str, *, one_time: bool = False) -> dict | None:
+    """A new password for an account (the founder's reset, an administrator's one-time password, or the person's own change): every session of the account
+    ends, its refresh tokens and the access tokens made before now. `one_time`: a password someone else chose for the person (plan Part 9.3), which they
+    must replace at their next sign-in; any other set, the person's own change above all, clears the mark."""
     if (problem := password_problem(password)):
         raise ValueError(problem)
+    if not isinstance(one_time, bool):
+        raise ValueError("One-time must be yes or no")
     with _write() as con:
-        con.execute("UPDATE accounts SET password = ?, updated = ?, sessions_from = ? WHERE id = ?",
-                    (auth.hash_password(password), _now(), int(_clock()), account_id))
+        con.execute("UPDATE accounts SET password = ?, updated = ?, sessions_from = ?, must_change = ? WHERE id = ?",
+                    (auth.hash_password(password), _now(), int(_clock()), int(one_time), account_id))
         con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?", (account_id,))
     return account(account_id)
 
@@ -454,14 +474,15 @@ def company_members(company_id: str) -> list[dict]:
 def context(user_id: str) -> dict | None:
     """What Supabase's `get_my_context` gives a signed-in person, from the registry: the profile, every membership with its company, and no pending
     invitations (people are added by the founder, never invited). Every company the founder made is `verified`; `enabled` says whether Gridlytics is on
-    for it. None for an account that does not exist or is disabled."""
-    found = signed_in(user_id)
+    for it. None for an account that does not exist or is disabled. `must_change_password` (Gridlytics' own, plan Part 9.3): signed in with a one-time
+    password, so nothing but the password change opens until the person chooses their own."""
+    found = signed_in(user_id, one_time_ok=True)
     if found is None:
         return None
     first, *last = found["name"].split(None, 1)
     profile = {"id": found["id"], "email": found["email"], "name": found["name"], "first_name": first, "last_name": last[0] if last else None, "avatar_url": None,
                "is_super_admin": False, "assignment_status": "none", "requested_company_name": None, "created_at": found["created"],
-               "updated_at": found["updated"]}
+               "updated_at": found["updated"], "must_change_password": found["must_change"]}
     return {"profile": profile, "memberships": [{k: v for k, v in m.items() if k not in ("user_id", "company_id")} for m in memberships(user_id)],
             "pending_invites_for_email": []}
 
@@ -563,8 +584,9 @@ def events(email: str, limit: int = 200) -> list[dict]:
 
 def lock_wait(email: str, address: str | None, refused: str = REFUSED, cleared: str = SIGNED_IN, tries: int | None = None) -> int:
     """Seconds before an account may be tried again from an address (0 when it may now). `tries` refusals within LOCK_MINUTES stop it for LOCK_MINUTES from
-    the last of them; a good sign-in from the address clears the count (R-235: the count outlived a success, and the wait ran from each new try). With
-    `address` None, the refusals from every address together (the founder's code step, R-271)."""
+    the last of them; a good sign-in from the address clears the count (R-235: the count outlived a success, and the wait ran from each new try), and so
+    does a lockout an administrator or the founder cleared, from every address (`clear_lock`, plan Part 9.3). With `address` None, the refusals from every
+    address together (the founder's code step, R-271)."""
     if not email or not db_path().exists():
         return 0
     tries = tries or auth.MAX_TRIES
@@ -572,10 +594,18 @@ def lock_wait(email: str, address: str | None, refused: str = REFUSED, cleared: 
     where, args = ("email = ?", [email.strip().lower()]) if address is None else ("email = ? AND address = ?", [email.strip().lower(), address])
     with _read() as con:
         last_good = con.execute(f"SELECT MAX(at) FROM account_events WHERE {where} AND event = ?", (*args, cleared)).fetchone()[0] or 0
+        last_good = max(last_good, con.execute("SELECT MAX(at) FROM account_events WHERE email = ? AND event = ?",
+                                               (email.strip().lower(), LOCK_CLEARED)).fetchone()[0] or 0)
         times = [r[0] for r in con.execute(f"SELECT at FROM account_events WHERE {where} AND event = ? AND at > ? ORDER BY at DESC LIMIT ?",
                                            (*args, refused, last_good, tries))]
     left = times[0] + window - _clock() if len(times) == tries and times[0] - times[-1] < window else 0
     return max(1, round(left)) if left > 0 else 0
+
+
+def clear_lock(email: str, account_id: str, by: str) -> None:
+    """An administrator or the founder clears an account's sign-in lockout (plan Part 9.3; audit pages-A-02): the refusals recorded before now stop
+    counting, from every address."""
+    record(LOCK_CLEARED, email, "", account_id, {"by": by})
 
 
 # ------------------------------------------------------------------------------------------------ the founder's audit (decisions-v2 section 4)

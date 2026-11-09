@@ -205,3 +205,86 @@ def test_a_grant_is_kept_in_the_company_file_and_a_key_never_holds_one(world, tm
         assert auth.can("see_costs") is False
     finally:
         auth.current.reset(token)
+
+
+# ------------------------------------------------------------------------------------------------ pages-A-02 (parity-supabase-auth-02)
+
+def _sign_in(email: str, password: str, address: str = "testclient"):
+    from fastapi.testclient import TestClient
+    from gridlytics import api
+    return TestClient(api.app, raise_server_exceptions=False, client=(address, 50000)).post("/api/local/session", json={"email": email, "password": password})
+
+
+def test_an_administrator_issues_a_one_time_password_that_opens_only_the_password_change(world):
+    """Plan Part 9.3: until email exists, an administrator issues a one-time password with a forced change at the next sign-in. Every session of the account
+    ends; with it only the sign-in's own paths answer, until the person chooses their own; the trail says so and never holds the password."""
+    import identities
+    from gridlytics import platform as platformdb
+    from gridlytics import store
+    a, anon = world.c["admin"], world.anon
+    op = _member(world, "operator@fix.test")["id"]
+    old = _sign_in("operator@fix.test", identities.PASSWORD).json()
+    r = a.post(f"/api/users/{op}/password")
+    assert r.status_code == 200, r.text
+    one_time = r.json()["password"]
+    assert len(one_time) == 19 and platformdb.password_problem(one_time) is None and r.json()["user_id"] == op
+    assert platformdb.check_sign_in("operator@fix.test", identities.PASSWORD) is None                     # the old password is gone
+    assert anon.post("/api/local/refresh", json={"refresh_token": old["refresh_token"]}).status_code == 401  # and every session with it
+    s = _sign_in("operator@fix.test", one_time)
+    assert s.status_code == 200, s.text
+    h = identities.headers(s.json()["access_token"], world.company)
+    r = anon.get("/api/sites", headers=h)
+    assert r.status_code == 403 and r.json()["code"] == "password_change_required" and "one-time password" in r.json()["detail"], r.text
+    assert anon.get("/api/local/context", headers=h).json()["profile"]["must_change_password"] is True
+    state = anon.get("/api/auth/state", headers=h)
+    assert state.status_code == 200 and state.json()["refusal"]["code"] == "password_change_required", state.text
+    changed = anon.post("/api/local/password", headers=h, json={"current": one_time, "new": "the operator's own password"})
+    assert changed.status_code == 200, changed.text
+    h = identities.headers(changed.json()["access_token"], world.company)
+    assert anon.get("/api/sites", headers=h).status_code == 200
+    assert anon.get("/api/local/context", headers=h).json()["profile"]["must_change_password"] is False
+    with world.use():
+        trail = store.list_audit()
+    assert any(e["action"] == "issued a one-time password" and e["target"] == "operator@fix.test" for e in trail)
+    assert one_time not in json.dumps(trail)
+
+
+def test_an_administrator_clears_a_sign_in_lockout(world):
+    from gridlytics import auth
+    import identities
+    a = world.c["admin"]
+    an = _member(world, "analyst@fix.test")["id"]
+    for _ in range(auth.MAX_TRIES):
+        assert _sign_in("analyst@fix.test", "a wrong password 1").status_code == 401
+    assert _sign_in("analyst@fix.test", identities.PASSWORD).status_code == 429
+    r = world.c["operator"].post(f"/api/users/{an}/unlock")
+    assert r.status_code == 403 and "administrator" in r.json()["detail"], r.text
+    r = a.post(f"/api/users/{an}/unlock")
+    assert r.status_code == 200 and r.json() == {"cleared": True}, r.text
+    assert _sign_in("analyst@fix.test", identities.PASSWORD).status_code == 200
+    # a one-time password clears the lockout as well: the person can sign in with it at once
+    for _ in range(auth.MAX_TRIES):
+        assert _sign_in("analyst@fix.test", "a wrong password 1").status_code == 401
+    one_time = a.post(f"/api/users/{an}/password").json()["password"]
+    assert _sign_in("analyst@fix.test", one_time).status_code == 200
+
+
+def test_sign_in_help_is_never_for_the_owner_oneself_or_a_person_also_in_another_company(world):
+    import identities
+    from gridlytics import platform as platformdb
+    a = world.c["admin"]                                                           # the company's owner
+    second = identities.client("second@fix.test", "admin", world.company, "admin", raise_server_exceptions=False)
+    owner, me, viewer = (_member(world, e)["id"] for e in ("admin@fix.test", "second@fix.test", "viewer@fix.test"))
+    assert world.c["operator"].post(f"/api/users/{viewer}/password").status_code == 403
+    r = second.post(f"/api/users/{owner}/password")
+    assert r.status_code == 409 and r.json()["code"] == "owner" and "OnyxLeaf" in r.json()["detail"], r.text
+    assert second.post(f"/api/users/{owner}/unlock").status_code == 409
+    r = second.post(f"/api/users/{me}/password")
+    assert r.status_code == 422 and "My account" in r.json()["detail"], r.text
+    elsewhere = identities.company("Elsewhere", own_file=True)
+    platformdb.add_membership(viewer, elsewhere["id"], "member", "active")
+    r = a.post(f"/api/users/{viewer}/password")
+    assert r.status_code == 409 and r.json()["code"] == "other_company" and "OnyxLeaf" in r.json()["detail"], r.text
+    assert platformdb.check_sign_in("viewer@fix.test", identities.PASSWORD)                                 # nothing changed
+    assert a.post("/api/users/no-such-person/password").status_code == 404
+    assert a.post(f"/api/users/{owner}/password", json={"password": "my choice of password"}).status_code == 422   # the server makes it

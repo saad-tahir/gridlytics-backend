@@ -5,7 +5,7 @@
                                                    renewed it a moment ago
     POST /api/local/logout    {refresh_token}   -> {signed_out: true}; the session of that token ends
     GET  /api/local/context                     -> {profile, memberships, pending_invites_for_email}, the shape of Supabase's get_my_context
-    POST /api/local/password  {current, new}    -> {changed: true, ...a new session}; every other session ends
+    POST /api/local/password  {current, new}    -> {changed: true, ...a new session}; every other session ends, and a one-time password is replaced
 
 `expires_at` is in unix seconds. A refresh token travels only in a JSON body, never in a path or a query, which the access log keeps. The access token is
 identity.issue_local's (stage B1), signed with GRIDLYTICS_LOCAL_JWT_SECRET, for one hour.
@@ -56,11 +56,11 @@ def _locked(email: str, address: str) -> None:
 
 def _person(request: Request) -> dict:
     """The signed-in person's account, from the identity the guard checked; 401 when there is none, or the account is disabled or its sessions were ended
-    after the token was made."""
+    after the token was made. A person signed in with a one-time password (plan Part 9.3) is let in here: these are the paths that change it."""
     identity = getattr(request.state, "identity", None)
     iat = (getattr(identity, "claims", None) or {}).get("iat")
     # A token without its issue time could never be told from one made before a password change: refused
-    found = platformdb.signed_in(getattr(identity, "user_id", None), iat) if identity is not None and iat is not None else None
+    found = platformdb.signed_in(getattr(identity, "user_id", None), iat, one_time_ok=True) if identity is not None and iat is not None else None
     if found is None:
         raise HTTPException(status_code=401, detail="Sign in first")
     return found

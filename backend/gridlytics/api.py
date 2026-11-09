@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -542,6 +543,62 @@ def users_edit(user_id: str, request: Request = None, inp: dict = Body(...)):
     store.audit(by, "changed a user", before["email"], {**fields, **({"role_before": before["role"]} if "role" in fields else {}),
                                                         **({"grants_before": before["grants"]} if "grants" in fields else {})})
     return _member_out(made)
+
+
+# ------------------------------------------------------------------------------------------------ an administrator helps a member sign in (plan Part 9.3)
+
+#: The letters of a one-time password: none reads as another (0 and o, 1 and l and i), so it can be read out on the phone. Four groups of four: 19 characters
+#: with the dashes (a password needs 10), about 79 bits
+_ONE_TIME_LETTERS = "abcdefghjkmnpqrstuvwxyz23456789"
+
+
+def _one_time_password() -> str:
+    return "-".join("".join(secrets.choice(_ONE_TIME_LETTERS) for _ in range(4)) for _ in range(4))
+
+
+def _helped(user_id: str, doing: str, inp) -> dict:
+    """The account an administrator may help sign in until PLT-11 brings email (plan Part 9.3; audit pages-A-02): in local mode, an active member of this
+    company and of no other (an administrator here never takes over a person's access to another company: OnyxLeaf does that); never the company's owner,
+    whose password OnyxLeaf resets; never oneself (My account changes one's own). The request carries no body: the server makes the password."""
+    auth.need("manage_users", doing)
+    if inp:
+        _fail("Send nothing: Gridlytics makes the one-time password and shows it once")
+    company = auth.company.get()
+    held = platformdb.membership(user_id, company["id"]) if company is not None and isinstance(user_id, str) and len(user_id) <= 64 else None
+    found = platformdb.account(user_id) if held is not None and held["status"] == "active" else None
+    if found is None:
+        raise HTTPException(status_code=404, detail="No such user")
+    if identity.MODE != "local":
+        raise Refusal(409, "With this sign-in service a forgotten password is reset by email: ask OnyxLeaf", "not_local_mode")
+    if user_id == (auth.current.get() or {}).get("id"):
+        _fail("Change your own password in My account")
+    if held["role"] == "owner":
+        raise Refusal(409, "The company's owner asks OnyxLeaf for a new password or to clear a lockout", "owner")
+    if any(m["company_id"] != company["id"] for m in platformdb.memberships(user_id)):
+        raise Refusal(409, f"{found['name']} is also in another company: OnyxLeaf gives them a new password or clears their lockout", "other_company")
+    return found
+
+
+@app.post("/api/users/{user_id}/password")
+def users_password(user_id: str, inp: dict | None = Body(None)):
+    """A one-time password for a member (plan Part 9.3; audit pages-A-02): every session of the account ends, its sign-in lockout is cleared, and the
+    password is in this answer only (kept as its hash, never in an audit line). Until the person chooses their own, only the sign-in's own paths answer
+    (platform.signed_in)."""
+    found = _helped(user_id, "Giving a member a one-time password", inp)
+    password = _one_time_password()
+    platformdb.set_password(found["id"], password, one_time=True)
+    platformdb.clear_lock(found["email"], found["id"], auth.actor())
+    store.audit(auth.actor(), "issued a one-time password", found["email"])
+    return {"password": password, "user_id": found["id"]}
+
+
+@app.post("/api/users/{user_id}/unlock")
+def users_unlock(user_id: str, inp: dict | None = Body(None)):
+    """Clear a member's sign-in lockout (plan Part 9.3): the refused tries recorded before now stop counting, from every address."""
+    found = _helped(user_id, "Clearing a member's sign-in lockout", inp)
+    platformdb.clear_lock(found["email"], found["id"], auth.actor())
+    store.audit(auth.actor(), "cleared a sign-in lockout", found["email"])
+    return {"cleared": True}
 
 
 @app.get("/api/audit")
