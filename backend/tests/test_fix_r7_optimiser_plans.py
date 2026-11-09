@@ -114,3 +114,42 @@ def test_the_problem_values_lost_load_at_least_at_the_dearest_import_price(compa
     sites_default = _site()
     q = plans.build_problem(sites.full(sites_default), t0, forecast.issue(sites.full(sites_default), t0, save=False), 96)
     assert q["voll"] == pytest.approx(500.0)          # the default, already above every price, is kept
+
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-17
+
+def _sawtooth(x, on=0.1):
+    """Steps that do nothing between two steps that act (0 / full / 0 / full): the alternation the 30-minute rows left free."""
+    act = np.asarray(x) > on
+    return [t for t in range(1, len(act) - 1) if act[t - 1] and not act[t] and act[t + 1]]
+
+
+def test_each_steps_import_stays_under_the_plans_own_mdi_cap_and_grid_charging_is_smooth():
+    """Mode A slots carry grid_cap_w = M and the device shaves every instant above it, so a step importing above the plan's cap (the 30-minute
+    rows held only the block's mean) throttles the charging the plan counted on: Karachi's charge ran 65.6 / 0 / 188.6 / 0 / 118.1 kW, 962 kW
+    against a 902 kW cap."""
+    p = _mdi(_problem())
+    p["battery"]["E0"] = 20.0
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    G, M = r["sol"]["G"], r["M"][0]
+    extra = np.maximum(0.0, np.asarray(p["Lhi"]) - np.asarray(p["L"]))
+    assert float(np.max(G - M)) <= 1e-6                 # the plan's own import, step by step
+    assert float(np.max(G + extra - M)) <= 1e-6         # and under the upper load quantile, as the 30-minute rows already were
+    assert not _sawtooth(r["sol"]["C"][:72])
+
+
+def test_a_peak_discharge_held_to_the_cap_under_the_upper_load_does_not_alternate():
+    """The AUDIT site: 18:00 Peak discharge, 18:15 Wear > saving, 18:30 Peak discharge, all at Rs 40.02. The 30-minute row under the upper load
+    quantile let one step of each block discharge for both."""
+    p = _mdi(_problem(), M0=140.0)
+    p["L"], p["Lhi"] = p["L"].copy(), p["Lhi"].copy()
+    p["L"][72:88], p["Lhi"][72:88] = 150.0, 175.0
+    p["c_imp"] = np.full(p["T"], 40.0)                 # one price all day: only the cap decides when the battery works
+    p["battery"]["E0"] = 190.0
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    G, M = r["sol"]["G"], r["M"][0]
+    extra = np.maximum(0.0, np.asarray(p["Lhi"]) - np.asarray(p["L"]))
+    assert float(np.max(G + extra - M)) <= 1e-6
+    assert not _sawtooth(r["sol"]["D"])

@@ -472,6 +472,12 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             elapsed = mdi["G_elapsed"] * mdi["n_elapsed"] if steps[0] == 0 and mdi.get("n_elapsed") else 0.0
             m.row(list(G[steps]) + [target], [1.0] * len(steps) + [-n_blk], ub=-elapsed, name=f"mdi[{bid}]")
             m.row(list(G[steps]) + [target], [1.0] * len(steps) + [-n_blk], ub=-elapsed - float(extra[steps].sum()), name=f"mdi_hi[{bid}]")
+            # and step by step: every Mode A slot carries grid_cap_w = M and the device shaves each instant above it, so a step that imports above
+            # the cap while its block's mean stays under it (0 / full / 0 / full charging, or one step of each block discharging for both) is a
+            # plan the device throttles. Under the upper load quantile as the block rows are (round 7, engine-plans-live-17)
+            for t in steps:
+                if g[t] > 0.5:
+                    m.row([G[t], target], [1.0, -1.0], ub=-float(extra[t]), name=f"mdi_step[{t}]")
     # ---------------------------------------------------------------- ICP, the uncertain middle case
     icp = p.get("icp") or {}
     # legacy net metering nets each period's exports against its imports before the ICP case is decided (tariffs.vectors decides it on the net), so
