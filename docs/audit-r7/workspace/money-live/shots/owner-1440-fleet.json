@@ -1,0 +1,50 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/fleet",
+  "url": "http://127.0.0.1:5295/fleet",
+  "signedIn": true,
+  "loadMs": 2353,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Fleet · Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Fleet",
+    "H2: Sites"
+  ],
+  "buttons": [
+    "AUDIT KE feed mill operator 375",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "All",
+    "Needs attention",
+    "In outage"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [
+    "Rs 0",
+    "Rs 1,901",
+    "Rs 1,956",
+    "Rs 0",
+    "Rs 12,581"
+  ],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE AUDIT KE feed mill operator 375 Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Monitor (recommendation only) Administrator 6 Fleet Which sites need attention, what each one is doing now, and the month's saving so far. Add a site Sites online 0 of 14 data in the last 30 minutes · demo sites left out Open alerts 3 at your sites In an outage now 0 Saving this month PRELIMINARY Rs 0 against each site's native settings · demo sites left out Sites All Needs attention In outage Site Tier and control Now Next Alerts Saving, month 7 days AUDIT KE feed mill operator 375 Karachi · K-Electric · B-3 Last data: none yet Monitor (recommendation only) Recommendation only No reading 17:15 Idle 0 – – AUDIT api empty category GEPCO Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 0 – – AUDIT api expired agreement IESCO · B-2(b) Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 0 – – AUDIT api no source LESCO Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 0 – – AUDIT api numeric string Off-grid Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 0 – – AUDIT api unconfirmed LESCO · A-2(c) Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 2 – – AUDIT double click operator Off-grid Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 0 – – AUDIT farm owner 375 Rahim Yar Khan · Off-grid Last data: none yet Monitor (recommendation only) Recommendation only No reading 10:15 Battery carries outage 0 – – AUDIT flow-tpc brands Lahore · LESCO · B-2(b) Last data: 17 h ago Collecting data: day 8 of 14 Monitor (recommendation only) Recommendation only PV 0.0 kW Load 141 kW Grid 141 kW SoC 40 % 17:15 Idle 1 – – AUDIT operator onboarding Multan · MEPCO · Off-grid Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 0 – – AUDIT savings-pilot flow Karachi · K-Electric · B-3 Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 0 – – AUDIT savings-pilot past calendar Faisalabad · FESCO · B-2(b) Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 0 – – AUDIT unsaved edits owner Off-grid Last data: none yet Monitor (recommendation only) Recommendation only No reading No plan yet 0 – – AUDIT wizard owner 1440 Faisalabad · FESCO · B-2(b) Last data: none yet Monitor (recommendation only) Recommendation only No reading 18:00 Peak discharge 0 – – Faisalabad textile mill (demo) DEMO Faisalabad · FESCO · B-2(b) Last data: 3 h ago Advisory (slot tables) Following plan (table applied) PV 55.7 kW Load 313 kW Grid 257 kW SoC 95 % 17:15 Idl",
+  "a11yTree": null
+}

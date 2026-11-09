@@ -1,0 +1,15 @@
+alerts-reports web-typecheck=ok
+auth-security web-typecheck=ok
+control-edge web-typecheck=ok
+delivery-twin web-typecheck=ok
+demo-seed web-typecheck=unchanged
+fleet-overview web-typecheck=ok
+forecasts-outages web-typecheck=ok
+founder-console web-typecheck=ok
+optimiser-plans web-typecheck=ok
+savings-engine web-typecheck=ok
+shell-nav web-typecheck=ok
+sites-onboarding web-typecheck=ok
+tariffs web-typecheck=ok
+telemetry-genset-battery web-typecheck=ok
+ui-charts-a11y web-typecheck=ok

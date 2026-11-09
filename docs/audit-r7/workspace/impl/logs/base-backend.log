@@ -1,0 +1,51 @@
+....................s.s................................................. [ 14%]
+........................................................................ [ 28%]
+........................................................................ [ 42%]
+........................................................................ [ 56%]
+..............s......................................................... [ 70%]
+...........................sss.s........................................ [ 84%]
+.....................................................s.................. [ 98%]
+.......                                                                  [100%]
+=============================== warnings summary ===============================
+../../../saad-tahir/gridlytics-backend/.scratch/venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /home/user/saad-tahir/gridlytics-backend/.scratch/venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+../../../saad-tahir/gridlytics-backend/.scratch/venv/lib/python3.12/site-packages/starlette/testclient.py:53
+  /home/user/saad-tahir/gridlytics-backend/.scratch/venv/lib/python3.12/site-packages/starlette/testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+backend/tests/test_api_walk.py::test_every_page_answers_for_every_role[owner@onyxleaf.demo]
+backend/tests/test_api_walk.py::test_the_owner_solves_reports_holds_and_resumes
+backend/tests/test_fix_data.py::test_the_load_forecast_leaves_out_outage_minutes_where_only_backup_was_served
+backend/tests/test_fix_r2_data.py::test_the_load_forecast_censors_shed_outages_across_lost_rows_flickers_and_coarse_sources[1-lost_minute]
+backend/tests/test_fix_r2_data.py::test_the_load_forecast_censors_shed_outages_across_lost_rows_flickers_and_coarse_sources[1-flicker]
+backend/tests/test_fix_r2_data.py::test_the_load_forecast_censors_shed_outages_across_lost_rows_flickers_and_coarse_sources[2-None]
+backend/tests/test_fix_r2_data.py::test_the_load_forecast_censors_shed_outages_across_lost_rows_flickers_and_coarse_sources[5-None]
+backend/tests/test_fix_r3_data.py::test_a_coarse_source_with_eight_hours_shed_daily_stays_at_stage_1[5]
+backend/tests/test_fix_r3_data.py::test_a_coarse_source_with_eight_hours_shed_daily_stays_at_stage_1[15]
+  /home/user/wt/base/gridlytics-backend/backend/gridlytics/forecast.py:213: RuntimeWarning: Mean of empty slice
+    lo15 = np.nanmean(lo[: len(lo) // 15 * 15].reshape(-1, 15), axis=1)
+
+backend/tests/test_api_walk.py::test_every_page_answers_for_every_role[owner@onyxleaf.demo]
+  /home/user/wt/base/gridlytics-backend/backend/gridlytics/forecast.py:518: RuntimeWarning: Mean of empty slice
+    pers = np.nanmean(prev.reshape(96, 15), axis=1)
+
+backend/tests/test_engine.py::test_a_tick_writes_an_active_plan_from_telemetry_alone
+  /home/user/wt/base/gridlytics-backend/backend/gridlytics/forecast.py:448: RuntimeWarning: Mean of empty slice
+    actual = [None if np.isnan(x) else round(float(x), 2) for x in np.nanmean(col[: n * 15].reshape(-1, 15), axis=1)] if n else []
+
+backend/tests/test_fix_r2_data.py::test_a_day_whose_minutes_overflow_is_stored_finite_and_never_re_aggregated_on_read
+  /home/user/saad-tahir/gridlytics-backend/.scratch/venv/lib/python3.12/site-packages/numpy/_core/_methods.py:132: RuntimeWarning: overflow encountered in reduce
+    ret = umr_sum(arr, axis, dtype, out, keepdims, where=where)
+
+backend/tests/test_fix_r2_data.py::test_a_day_whose_minutes_overflow_is_stored_finite_and_never_re_aggregated_on_read
+  /home/user/saad-tahir/gridlytics-backend/.scratch/venv/lib/python3.12/site-packages/numpy/_core/_methods.py:49: RuntimeWarning: overflow encountered in reduce
+    return umr_sum(a, axis, dtype, out, keepdims, initial, where)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+503 passed, 8 skipped, 15 warnings in 202.31s (0:03:22)
+
+real	3m23.122s
+user	3m3.583s
+sys	0m9.210s

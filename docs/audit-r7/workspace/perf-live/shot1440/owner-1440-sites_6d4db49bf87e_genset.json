@@ -1,0 +1,64 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/6d4db49bf87e/genset",
+  "url": "http://127.0.0.1:5295/sites/6d4db49bf87e/genset",
+  "signedIn": true,
+  "loadMs": 2295,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Faisalabad textile mill (demo)",
+    "H2: Genset",
+    "H2: Advice",
+    "H3: Requests",
+    "H3: The plan's next runs",
+    "H2: Runs",
+    "H2: Fuel curve",
+    "H2: Fuel price",
+    "H2: Policy",
+    "H2: Fuel log",
+    "H2: Fuel logged"
+  ],
+  "buttons": [
+    "Faisalabad textile mill (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "Log fuel"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [
+    "Rs 60,663",
+    "Rs 382",
+    "Rs 382",
+    "Rs,"
+  ],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Faisalabad textile mill (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Advisory (slot tables) Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Faisalabad textile mill (demo) Genset Faisalabad textile mill (demo) DEMO Advisory (slot tables) Following plan (table applied) Faisalabad FESCO · B-2(b) Last data: 9 min ago Genset Run hours, 14 days 6.4 h 6 starts Fuel, 14 days 159 L Estimated from the fuel curve Starts 6 over 14 days Average load 33 % of 200 kW rated Fuel cost, 14 days Rs 60,663 litres × Rs 382.25/L, price of 6 Nov 2026 Advice A request arrives up to two hours before each run the plan wants; answer it so the savings count what really happened. Requests No requests. The next one comes before the plan's next run. The plan's next runs The plan does not ask for the genset in the next 48 hours. Runs The last 14 days, newest first, in Karachi time. Genset runs Start End Hours Energy Litres (estimated) Load Grid Plan asked 7 Nov 2026, 14:19 16:14 1.9 h 115 kWh 44.0 L 30 % Outage No 7 Nov 2026, 05:54 07:00 1.1 h 75.0 kWh 27.7 L 34 % Outage No 5 Nov 2026, 23:33 6 Nov 2026, 00:00 0.5 h 31.5 kWh 11.6 L 35 % Outage No 2 Nov 2026, 20:55 22:09 1.2 h 86.3 kWh 31.7 L 35 % Outage No 27 Oct 2026, 22:28 28 Oct 2026, 00:00 1.5 h 107 kWh 39.4 L 35 % Outage No 27 Oct 2026, 20:02 20:12 0.2 h 11.7 kWh 4.3 L 34 % Outage No Fuel curve Litres an hour = 0.273 × load kW + 0.033 × 200 kW rated. Fuel without a meter is estimated from it. 25 % 50 % 75 % 100 % 0 L 20 L 40 L 60 L 80 L 25 %: 20.3 L/h 50 %: 33.9 L/h 75 %: 47.6 L/h 100 %: 61.2 L/h Fuel price What a litre costs in the plan and the fuel-cost figures. Rs 382.25/L Hsd · OGRA · read 6 Nov 2026 OGRA daily HSD notifications as reported by APP, Dawn and Business Recorder Secondary source Where it comes from Policy Gridlytics never starts or stops the genset itself: it asks, with a reason, and records whether the advice was followed. Start control at this site: manual. Fuel log Fills and dips as they happen; they check the curve's estimates. The tank holds 1,500 L. Litres Cost (Rs, optional) Day Note (optional) Log fuel Fuel logged Newest first, as logged above. No fuel logged yet. 0 L",
+  "a11yTree": null
+}

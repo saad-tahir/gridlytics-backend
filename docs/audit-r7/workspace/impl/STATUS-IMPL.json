@@ -1,0 +1,2659 @@
+{
+ "savings-engine": {
+  "key": "savings-engine",
+  "stage": 1,
+  "title": "Savings engine and pilot set-up (verify.py, the pilot and switchback routes, features/pilot)",
+  "batches_total": 7,
+  "batches_done": [
+   1,
+   2
+  ],
+  "review": null,
+  "findings": {
+   "engine-savings-02": {
+    "status": "implemented",
+    "summary": "Closed-loop and demo days were 'confirmed' by construction. compute_day now runs verify._control per minute: the override history (pause_control/force_native, to its end or to when it was cleared), the stored ticks by plans.active_at's rules (no plan made, the one in force past valid_until, a held or failed tick of a release; a guard hold or a failed solve keeps the plan before it in force), and at a closed-loop site's own edge (not the demo) the fallback_engaged/cleared and control_disabled/enabled events plus minutes with no telemetry row. At least 95 % of minutes under the plan is confirmed",
+    "reason": "",
+    "commits": [
+     "3d4c5e4 (backend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_a_closed_loop_day_claims_only_while_control_was_in_force",
+     "backend/tests/test_fix_r7_savings_engine.py::test_a_demo_day_under_a_pause_claims_nothing",
+     "backend/tests/test_fix_r7_savings_engine.py::test_a_closed_loop_edge_not_heard_for_two_hours_is_partial_and_its_claim_withheld"
+    ]
+   },
+   "pr-review-03": {
+    "status": "implemented",
+    "summary": "_expected_start now restarts from the measured state (reset 'arm_change') on a day whose arm can be the plan (_plan_arm: not monitor, not a switchback native block) after a day the plan did not run (NOT_PLAN_ARM: recommendation_only, native_block, not_applied incl. control not in force, pending). Days the plan did not run still chain among themselves, and days withheld for data on read inputs keep the chain. _chain_starts and _chain_stale pass the same rule, so the restart is never reported stale. This amends round 6's DESIGN_LOG rule that a monitor or not-applied day keeps the chain (same rea",
+    "reason": "",
+    "commits": [
+     "a3dd614 (backend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_the_first_plan_day_after_days_the_plan_did_not_run_restarts_from_the_measured_state",
+     "backend/tests/test_fix_r6_savings.py::test_a_day_withheld_on_read_inputs_keeps_the_chain_and_a_later_dropout_on_it_is_stale"
+    ]
+   },
+   "pr-review-11": {
+    "status": "implemented",
+    "summary": "Measured first: replays counted a blank PV/load as zero, so 5 min of blank PV at noon over-claimed a farm day by Rs 663 and 15 min at a grid site by Rs 1,366 (load blanks under-claimed). verify._balance_fill now takes a blank PV or load from the minute's balance where the other flows were read; when both are blank, the net is exact and the PV is interpolated across the gap. The measured cases now move by Rs 0. A day whose load or daylight PV stays unread for more than 5 % of its minutes (REPLAY_UNREAD_MAX = GRID_UNRESOLVED_MAX) claims nothing (claim_withheld 'inputs_unread', row field inputs_u",
+    "reason": "",
+    "commits": [
+     "b2198fb (backend)",
+     "5789b40 (backend, r4 test tolerance)",
+     "8503c19 (backend, docstring reflow)",
+     "32c2ad5 (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_a_blank_pv_or_load_is_closed_from_the_balance_and_a_day_the_balance_cannot_close_is_withheld",
+     "backend/tests/test_fix_r7_savings_engine.py::test_a_closed_loop_edge_not_heard_for_two_hours_is_partial_and_its_claim_withheld",
+     "frontend/src/features/savings/savings-withheld.test.tsx"
+    ]
+   },
+   "engine-savings-06": {
+    "status": "partial",
+    "summary": "Also covers pages-D-02 (a duplicate). verify.summary per baseline now has `claimed_rs` as the headline: the claiming days, less the provisional carry-over, plus the claimed MDI. New fields: `levers_claimed_rs` (the claim by lever, sums to claimed_rs); `saving_rs`/`levers` over every day whose saving is known (a withheld day's partial levers add to no total; before, golden 2,820 vs now 2,020); counts claiming_days, withheld_days and unclaimed_days. The fee check uses the same claim. Day rows: saving null on a withheld day, plus claimed_native_rs, claimed_tuned_rs, claims, not_claimed_reason, le",
+    "reason": "The CSV and PDF columns (claimed, withheld reason) are in files other packages own: routes_savings.savings_csv (stage 2) and reports.py (alerts-reports). The API now carries every field they need.",
+    "commits": [
+     "dea4533 (backend)",
+     "359590b (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_the_headline_is_the_claim_and_a_withheld_days_partial_levers_add_to_no_total",
+     "frontend/src/features/savings/savings-claim.test.tsx"
+    ]
+   },
+   "role-owner-02": {
+    "status": "implemented",
+    "summary": "A claiming day's carry-over credit (its end gap at v_end) is now provisional while no later day has been scored: verify.summary leaves it out of claimed_rs and levers_claimed_rs.carry_over and reports it as carry_over_provisional_rs (per day: carry_over_provisional and carry_over_provisional_native_rs). Once the next day is scored, chained from it or restarting at a switchback block (plan 8.2's hand-over at v_end), the credit enters the claim. Golden: a claim of 2,000 with a last-day 300 credit reads 1,700 + 300 provisional, and 2,000 once day 5 is scored. The Faisalabad case (whole claim = la",
+    "reason": "",
+    "commits": [
+     "dea4533 (backend)",
+     "359590b (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_a_carry_over_credit_is_claimed_once_a_later_day_has_used_the_stored_energy",
+     "backend/tests/test_fix_r7_savings_engine.py::test_the_headline_is_the_claim_and_a_withheld_days_partial_levers_add_to_no_total",
+     "frontend/src/features/savings/savings-claim.test.tsx"
+    ]
+   },
+   "flow-savings-pilot-bill-01": {
+    "status": "implemented",
+    "summary": "The MDI lever no longer depends on the chosen date range. The new verify._mdi_month works out each billing month's lever from every day of that month so far. A day with telemetry but no savings row (for example a native observation day; Faisalabad's 26 Oct, part of dup engine-money-live-03) counts its measured peak on both arms. Each day of the billing month carries 1/days of the lever and adds it wherever the day's own saving counts, so sub-ranges add up to the whole and a one-day range gets one day's share. The fee check scales each month's claimed rate, MDI shares included, to the full mont",
+    "reason": "",
+    "commits": [
+     "1afd7c5 (backend)",
+     "287433e (web app)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_the_mdi_lever_is_the_billing_months_and_a_range_gets_its_days_share",
+     "backend/tests/test_fix_savings.py::test_the_mdi_lever_respects_the_billing_floor_and_the_mdi_interval (updated)"
+    ]
+   },
+   "pages-D-03": {
+    "status": "implemented",
+    "summary": "Backend: a month that has not ended yet only books the share of its lever for the days so far. That claimed amount is flagged as provisional (baselines.*.mdi_provisional_rs, mdi_months[month].provisional, per-day mdi_provisional) until the billing month is over. This also covers the duplicate engine-money-live-06, where the lever is now spread over the month and marked. Web app, as a minimal edit of features/savings: the ledger's 'Maximum demand (MDI)' row says how much of the claimed MDI comes from a month not over yet. The month list now reads 'Nov 2026: 902 kW actual, 935 kW baseline; month",
+    "reason": "",
+    "commits": [
+     "1afd7c5 (backend)",
+     "287433e (web app)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_a_month_not_over_books_its_scored_days_share_of_the_mdi_lever_marked_provisional",
+     "frontend/src/features/savings/savings-mdi.test.tsx"
+    ]
+   },
+   "engine-savings-04": {
+    "status": "implemented",
+    "summary": "A withheld day adds its MDI share to no total and to no claim. Before, m[3] counted any confirmed or partial day, withheld days included, so one such day put the whole month's lever into the claim. In the month's peaks, a withheld day (genset_unknown, import_unknown, battery_flow_unknown, inputs_unread) now gives its measured actual peak to both arms and its replayed baseline peak to neither. A peak cut by an unseen genset run can therefore no longer be credited to the plan; such a day can only pull the lever towards zero. A month whose every day is withheld now claims 0 (before: 62,500 in the",
+    "reason": "",
+    "commits": [
+     "1afd7c5"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_a_withheld_day_claims_no_mdi_share_and_its_replayed_peak_credits_nothing"
+    ]
+   },
+   "engine-savings-05": {
+    "status": "implemented",
+    "summary": "Each month's MDI lever is priced at that month's own rate and floor: those stored on the month's last scored day. That is the tariff version in force latest in the month, which matches the bill taking the version in force at its end. The old single last-day rate for every month is gone. A scored day now also stores the schedule version its rates came from (tariff_version, from _minute_prices), and mdi_months[month] carries rate_rs_per_kw and tariff_version. The test covers both orders of an off-season and an in-season Tariff F month, and a tariff change inside a month.",
+    "reason": "",
+    "commits": [
+     "1afd7c5"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_each_months_mdi_lever_is_priced_at_that_months_own_rate"
+    ]
+   },
+   "engine-savings-10": {
+    "status": "implemented",
+    "summary": "compute_day's scoring moved into _score_day. With forward=True (the nightly job, the demo), compute_day now also runs _settle_months: it settles the day's billing month once it is over, plus the month before. Each month is settled only when its fingerprint has changed; the fingerprint covers tariff versions, fuel prices, connection data, native captures and telemetry_days totals, and is stored as a setting per site and month. Settling walks the month's stored days in order and re-scores a day when: its price digest (minute prices, MDI terms, ICP case and fuel on the realised month totals) diff",
+    "reason": "",
+    "commits": [
+     "838a7af"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_savings_engine.py::test_a_day_scored_mid_month_is_rescored_once_the_month_closes_and_after_a_later_fca"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 3,
+    "theme": "Carry-over, re-scoring and the switchback method",
+    "ids": [
+     "flow-savings-pilot-bill-03",
+     "engine-savings-08",
+     "brief-vs-build-11",
+     "pr-review-02",
+     "engine-savings-11"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Tuned baseline, the perfect-foresight bound, legacy rows and tests",
+    "ids": [
+     "engine-savings-03",
+     "engine-optimiser-14",
+     "pr-review-04",
+     "pr-review-09"
+    ]
+   },
+   {
+    "batch": 5,
+    "theme": "Pilot record integrity: request model, start, sign-off, pinned baseline, amendments",
+    "ids": [
+     "pages-D-04",
+     "flow-savings-pilot-bill-09",
+     "flow-savings-pilot-bill-12",
+     "flow-savings-pilot-bill-30",
+     "pages-D-17",
+     "pages-D-19"
+    ]
+   },
+   {
+    "batch": 6,
+    "theme": "Pilot start gates and the switchback calendar: tier, draw, rules, labels, export",
+    "ids": [
+     "flow-savings-pilot-bill-11",
+     "pages-D-11",
+     "security-roles-06",
+     "flow-savings-pilot-bill-25",
+     "flow-savings-pilot-bill-24",
+     "role-operator-18",
+     "security-roles-14"
+    ]
+   },
+   {
+    "batch": 7,
+    "theme": "Late: tuned baseline never worse than native; switchback checks from the server",
+    "ids": [
+     "engine-money-live-11",
+     "parity-architecture-23"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/savings-engine",
+   "head": "838a7af",
+   "commits": [
+    "838a7af R7 savings-engine: a billing month is re-scored once it closes, and again after an FCA, a tariff or fuel price, a native capture or late data reaches it (audit engine-savings-10)",
+    "1afd7c5 R7 savings-engine: the MDI lever is the billing month's, from every day of it, at its own rate, a day's share where the day's saving counts, provisional until the month ends (audit flow-savings-pilot-bill-01, pages-D-03, engine-savings-04, engine-savings-05)",
+    "8503c19 R7 savings-engine: reflow the balance-fill docstring to the line length (audit pr-review-11)",
+    "dea4533 R7 savings-engine: the summary's headline is the claim, a withheld day adds to no total, and unused carry-over is provisional (audit engine-savings-06, pages-D-02, role-owner-02)",
+    "5789b40 R7 savings-engine: an r4 test allows for the rounding of the stored end energies (found running audit pr-review-11)",
+    "b2198fb R7 savings-engine: blank PV or load is closed from the balance for the replays, and a day the balance cannot close claims nothing (audit pr-review-11)",
+    "a3dd614 R7 savings-engine: the first plan day after days the plan did not run restarts its chain from the measured state (audit pr-review-03)",
+    "3d4c5e4 R7 savings-engine: a closed-loop or demo day claims only while a plan was in control (audit engine-savings-02)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/savings-engine",
+   "head": "287433e",
+   "commits": [
+    "287433e R7 savings-engine: the ledger marks the MDI of a month not over yet as provisional and labels each billing month (audit pages-D-03, flow-savings-pilot-bill-01)",
+    "359590b R7 savings-engine: the Savings tiles and ledger lead with the claim, with every scored day and the provisional carry-over beneath it (audit engine-savings-06, pages-D-02, role-owner-02)",
+    "32c2ad5 R7 savings-engine: a day withheld for blank load or solar readings says so (audit pr-review-11)"
+   ],
+   "dirty": []
+  }
+ },
+ "tariffs": {
+  "key": "tariffs",
+  "stage": 1,
+  "title": "Tariffs: price vector, bill rebuild and comparison, goldens, Tariffs page and draft dialog",
+  "batches_total": 4,
+  "batches_done": [],
+  "review": null,
+  "findings": {},
+  "remaining_batches": [
+   {
+    "batch": 1,
+    "theme": "Price vector correctness",
+    "ids": [
+     "flow-onboarding-01",
+     "engine-tariffs-03",
+     "engine-tariffs-04",
+     "engine-tariffs-11",
+     "engine-tariffs-12"
+    ]
+   },
+   {
+    "batch": 2,
+    "theme": "Bill rebuild and bill comparison",
+    "ids": [
+     "engine-tariffs-01",
+     "engine-tariffs-02",
+     "engine-tariffs-08",
+     "pages-D-10",
+     "flow-savings-pilot-bill-08",
+     "engine-tariffs-10",
+     "flow-savings-pilot-bill-23"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Golden bills, schedule expiry, Tariffs page and the draft dialog",
+    "ids": [
+     "engine-tariffs-07",
+     "engine-tariffs-06",
+     "role-analyst-16",
+     "role-owner-25",
+     "role-operator-22",
+     "role-viewer-21"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Late: fuel price before the first entry; seeding check on every lookup",
+    "ids": [
+     "engine-money-live-15",
+     "tests-and-perf-25"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/tariffs",
+   "head": "007060f",
+   "commits": [
+    "007060f WIP (interrupted, unreviewed): tariffs, batch 1 (Price vector correctness; audit flow-onboarding-01, engine-tariffs-03, engine-tariffs-04, engine-tariffs-11, engine-tariffs-12)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/tariffs",
+   "head": "332a72f",
+   "commits": [
+    "332a72f WIP (interrupted, unreviewed): tariffs, batch 1 (Price vector correctness; audit flow-onboarding-01, engine-tariffs-03, engine-tariffs-04, engine-tariffs-11, engine-tariffs-12)"
+   ],
+   "dirty": []
+  }
+ },
+ "delivery-twin": {
+  "key": "delivery-twin",
+  "stage": 1,
+  "title": "Delivery compile, vendor tables and the twin (delivery.py compile half, twin.py, slot wording)",
+  "batches_total": 3,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "role-operator-02": {
+    "status": "implemented",
+    "summary": "Every brand that keys a SoC per row now keys a charging slot's target, not its floor (delivery._soc_keyed; Sungrow target_soc is the slot's soc_target_pct). GET /control adds vendor_slots (the compiled slots each row keys), vendor_settings (values keyed once) and vendor_notes; the vendor table shows each row's intent from its slots, so the SoC column and the intent agree. Also covers the duplicates role-analyst-03 and flow-telemetry-plan-control-05.",
+    "reason": "",
+    "commits": [
+     "45fe026 (backend)",
+     "af5aad3 (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_delivery_twin.py::test_a_grid_charge_row_keys_the_slots_target_not_its_floor_at_every_brand_that_keys_a_soc_per_row",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_the_table_says_which_slot_each_row_keys_so_its_intent_can_stand_beside_it",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_the_control_page_gets_each_rows_slots_the_values_keyed_once_and_the_notes",
+     "frontend/src/features/devices/vendor-table.test.tsx"
+    ]
+   },
+   "pages-B-03": {
+    "status": "implemented",
+    "summary": "A slot carries grid_cap_w only where something on site holds it (delivery.cap_held: the brand's peak-shaving primitive, Huawei, or an edge at the closed-loop tier); plans.tick passes the site to compile_mode_a. Elsewhere the MDI cap is translated per Part 7.1 step 4 (_translate_mdi: discharge slots get max_discharge_w raised to the need and the floor lowered, never below the clamp or reserve; mdi_shave_kw recorded), so no twin replay of the stored table shaves a peak the device cannot. The compiled table (and plan.slots) carries mdi {cap_kw, held, not_enforceable}, where not_enforceable is the",
+    "reason": "",
+    "commits": [
+     "742a8c6 (backend)",
+     "af5aad3 (frontend)",
+     "c940d92 (frontend docs)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_delivery_twin.py::test_a_slot_only_brand_keyed_by_a_person_gets_the_mdi_cap_as_discharge_room_and_floor_not_as_a_cap_it_cannot_hold",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_the_cap_stays_on_the_slots_where_the_brand_or_an_edge_holds_it_and_where_no_site_is_given",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_a_replay_of_a_table_nothing_holds_the_cap_for_does_not_peak_shave",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_the_compiled_table_reports_the_demand_a_keyed_table_reaches_above_a_cap_nothing_holds",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_a_tick_compiles_for_its_site_so_the_cap_is_held_only_where_something_holds_it",
+     "frontend/src/features/devices/vendor-table.test.tsx"
+    ]
+   },
+   "pages-B-04": {
+    "status": "implemented",
+    "summary": "Huawei's table is charge or discharge periods only, every day (days column), a hold or solar-only charge left as a gap (with a note), the last period ending 23:59 not 00:00, adjacent same-kind slots merged into one period; the grid-charge cut-off (highest grid-charge target), discharge cut-off (lowest discharging floor), backup SoC, working mode, excess-PV setting and the MDI cap as a capacity-control peak power are keyed once as settings, with notes where one global cut-off cannot keep a slot's own value. Also covers duplicate engine-delivery-05.",
+    "reason": "",
+    "commits": [
+     "b9b2cc2 (backend)",
+     "af5aad3 (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_delivery_twin.py::test_huaweis_periods_are_charge_or_discharge_every_day_with_a_hold_as_a_gap_and_the_cut_offs_set_once",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_a_whole_day_huawei_period_ends_at_23_59_and_a_day_of_holds_has_no_period",
+     "frontend/src/features/devices/vendor-table.test.tsx"
+    ]
+   },
+   "pages-B-05": {
+    "status": "implemented",
+    "summary": "Sungrow (two forced-charge windows with target_soc; EMS mode, Max/Min SoC, backup reserve, power limits keyed once), Growatt (three Battery First and three Grid First windows with enable, Load First between them, global stop/min SoCs and grid-charge flag), Voltronic (source-priority changes SUB/SBU and SNU/OSO with back-to-utility SoC), Solis (charge and discharge slots with power and current_a) and other each render in the vendor's own layout; every brand's row keys are exactly its grammar.fields in order; notes say what each brand cannot hold. The compiled table carries the battery limits fo",
+    "reason": "",
+    "commits": [
+     "8afb123 (backend)",
+     "af5aad3 (frontend)",
+     "c940d92 (frontend docs)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_delivery_twin.py::test_every_brands_rows_are_exactly_its_grammars_fields",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_sungrow_keys_its_forced_charge_windows_with_their_targets_and_says_what_self_consumption_cannot_hold",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_growatt_has_three_battery_first_and_three_grid_first_windows_with_load_first_between_them",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_voltronic_keys_its_source_priorities_at_each_change_and_solis_its_charge_and_discharge_slots",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_the_compiled_table_carries_the_batterys_limits_for_the_brands_that_key_them_once",
+     "frontend/src/features/devices/vendor-table.test.tsx"
+    ]
+   },
+   "engine-delivery-07": {
+    "status": "implemented",
+    "summary": "Deye rows now key self-use at the slot's or the battery's rated discharge power (not 0, which made it a hold), a hold at power 0, and an export slot with the new sell flag (grammar fields program, time, power_w, soc_pct, grid_charge, gen_charge, sell). The MDI half (peak-shaving value or mdi_not_enforceable) is handled by pages-B-03: Deye has no cap primitive, so its discharge slots get the translated room and the compiled table reports not_enforceable.",
+    "reason": "",
+    "commits": [
+     "ecf3c97 (backend)",
+     "af5aad3 (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_delivery_twin.py::test_deye_keys_self_use_at_the_batterys_power_a_hold_at_none_and_an_export_with_its_sell_flag",
+     "frontend/src/features/devices/vendor-table.test.tsx"
+    ]
+   },
+   "flow-telemetry-plan-control-18": {
+    "status": "implemented",
+    "summary": "Deye's table always keys all six programs of its ring covering 24 h: where the plan needs fewer slots, the longest stretch is split on a quarter-hour mark and the split program repeats its slot's settings (delivery._ring), with a note saying so, so no program keeps a stale value.",
+    "reason": "",
+    "commits": [
+     "ecf3c97 (backend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_delivery_twin.py::test_deye_keys_all_six_programs_of_its_ring_repeating_a_slots_settings_where_the_plan_needs_fewer"
+    ]
+   },
+   "flow-onboarding-23": {
+    "status": "implemented",
+    "summary": "Growatt's grammar now says 'three Battery First and three Grid First windows, Load First between them' with max_slots 6 (was 3, contradicting its own layout text), and the compiler fits a Growatt day into three windows of each priority (self-use/discharge runs Load First and take no window). The onboarding card, the capabilities card and the plan Slots view read the grammar, so their count and layout text now agree; Solis' 'three charge and three discharge slots' with 6 was already consistent.",
+    "reason": "",
+    "commits": [
+     "8afb123 (backend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_delivery_twin.py::test_growatt_has_three_battery_first_and_three_grid_first_windows_with_load_first_between_them",
+     "backend/tests/test_fix_r7_delivery_twin.py::test_the_compiler_fits_a_growatt_day_into_three_windows_of_each_priority"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "Mode A compile: slot reduction, genset runs in the slots, safe tail, fallback block",
+    "ids": [
+     "engine-delivery-04",
+     "flow-telemetry-plan-control-04",
+     "engine-delivery-08",
+     "brief-vs-build-07",
+     "pages-B-13"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Twin fidelity and the compare with native",
+    "ids": [
+     "engine-delivery-15",
+     "engine-delivery-16",
+     "engine-delivery-19",
+     "engine-delivery-20",
+     "engine-delivery-21",
+     "pages-B-14",
+     "engine-plans-live-10"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/delivery-twin",
+   "head": "ecf3c97",
+   "commits": [
+    "ecf3c97 R7 delivery-twin: Deye's table keys all six programs of its ring (repeating a slot's settings where the plan needs fewer), self-use at the battery's power instead of 0, a hold at 0, and the sell flag on an export (audit engine-delivery-07, flow-telemetry-plan-control-18)",
+    "8afb123 R7 delivery-twin: Sungrow, Growatt, Voltronic and Solis tables in the vendor's own layout with their global settings and notes, every brand's rows exactly its grammar's fields, and Growatt's 3 plus 3 windows (audit pages-B-05, engine-delivery-06, tracker-and-docs-06, flow-onboarding-23)",
+    "b9b2cc2 R7 delivery-twin: Huawei's table is charge or discharge periods every day, a hold as a gap, the last period ending 23:59, with the grid-charge and discharge cut-offs, the backup SoC and the capacity-control cap keyed once (audit pages-B-04, engine-delivery-05)",
+    "742a8c6 R7 delivery-twin: a slot carries the MDI cap only where the brand or an edge holds it; elsewhere the cap becomes discharge room and floors, and the compiled table reports the demand the keyed table reaches (audit pages-B-03)",
+    "45fe026 R7 delivery-twin: the table to key in carries a charge slot's target, not its floor, and GET /control says which slots each row keys, with the values keyed once and the notes (audit role-operator-02, role-analyst-03, flow-telemetry-plan-control-05)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/delivery-twin",
+   "head": "c940d92",
+   "commits": [
+    "c940d92 R7 delivery-twin: record what the vendor tables still need, the battery's nominal voltage for Solis currents and the Plan page's line on the MDI cap a keyed table cannot hold (audit pages-B-05, pages-B-03)",
+    "af5aad3 R7 delivery-twin: the table to key in shows the values each brand keeps once, the sentences on what it cannot hold (the MDI cap included), and each row's intent from the slots it keys, in the vendor's columns for every brand (audit role-operator-02, pages-B-03, pages-B-04, pages-B-05, engine-delivery-07)"
+   ],
+   "dirty": []
+  }
+ },
+ "control-edge": {
+  "key": "control-edge",
+  "stage": 1,
+  "title": "Control and edge: what reaches the device, control state and actions, advisory budget, edge protocol, keys",
+  "batches_total": 6,
+  "batches_done": [
+   1,
+   2
+  ],
+  "review": null,
+  "findings": {
+   "flow-telemetry-plan-control-03": {
+    "status": "implemented",
+    "summary": "Only a closed-loop site's edge now gets a plan. Below closed loop, plans.signed_message raises the new plans.NotClosedLoop: nothing is signed, sent or recorded in plan_messages, so a monitor site no longer shows 'Table writes today 1 of 3'. The key-only route GET /sites/:id/plans/current/message answers 409 not_closed_loop with a one-sentence reason, for example \"The site's control tier is monitor, so no plan is sent to its edge: the plan is a recommendation\". This covers its duplicate engine-plans-live-11. The gate also covers advisory_writes. Plan Part 2.3 sends signed plans to closed loop o",
+    "reason": "",
+    "commits": [
+     "backend 391956a",
+     "frontend e2c81ec"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_a_site_below_closed_loop_sends_its_edge_no_plan[monitor]",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_site_below_closed_loop_sends_its_edge_no_plan[advisory_writes]",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_closed_loop_site_sends_its_edge_the_signed_plan",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_edge_route_refuses_a_plan_below_closed_loop_and_serves_it_at_closed_loop",
+     "backend/tests/test_api_walk.py::test_an_edge_key_reaches_only_its_own_site (updated)"
+    ]
+   },
+   "engine-delivery-01": {
+    "status": "implemented",
+    "summary": "plans._guard can now refuse a plan, following Part 7.1 step 8 and R6 C2. A refused plan is held and the previous one stays in force. The guard returns the first rule broken: slot_floor_below_fallback (a slot floor under the fallback's minimum state of charge); replayed_soc_below_floor (with the grid up, the table replayed through the twin discharges the battery under the fallback floor; tolerance 5 points); unserved_in_outage (in forecast outages the replay leaves more critical load unserved than the plan did, by more than max(2 kWh, 5 % of the outage's critical energy)); mdi_cap_exceeded (see",
+    "reason": "",
+    "commits": [
+     "backend adcf87f",
+     "frontend 97c550c"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_the_guard_passes_a_table_that_keeps_every_rule",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_slot_floor_under_the_fallback",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_table_that_drains_the_battery_under_the_fallback_floor_with_the_grid_up",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_table_that_leaves_critical_load_unserved_in_a_forecast_outage",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_plan_that_sheds_load_with_the_grid_up",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_genset_slot_where_the_grid_is_expected_present",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_an_export_slot_where_nothing_may_be_exported",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_tick_passes_the_solves_mdi_cap_to_the_guard",
+     "frontend/src/features/plan/plan-held.test.tsx (Round 7: says the guard's reason ... in words)"
+    ]
+   },
+   "engine-plans-live-05": {
+    "status": "implemented",
+    "summary": "The guard now checks the plan's MDI cap (mdi_cap_exceeded). tick passes the solve's res to _guard, which is a one-line edit in tick, a function optimiser-plans owns. For each MDI block the guard takes the plan's own grid draw, adds back any load the plan sheds with the grid up (the meter reads that load), and adds the first block's minutes already elapsed, as the MILP row does. It refuses when the block mean exceeds res['M'] by more than 1 kW, using M2 after the billing month's end. This catches plans that meet their MDI only by shedding load the site cannot shed (the 02f1e98208e1 case). A sin",
+    "reason": "",
+    "commits": [
+     "backend adcf87f",
+     "frontend 97c550c"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_the_guard_refuses_a_plan_whose_own_grid_draw_exceeds_its_mdi_cap",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_tick_passes_the_solves_mdi_cap_to_the_guard"
+    ]
+   },
+   "engine-delivery-24": {
+    "status": "implemented",
+    "summary": "A plan past its valid_until is no longer in force. plans.current(site_id, now=None) returns None once valid_until has passed, and plans.active_at returns None for any instant at or after the plan's valid_until. held_info answers {reason: 'plan_expired', until: null, plan_id, since: valid_until}, and GET /plan passes 'since' through. signed_message returns None and the edge route answers 404 plan_expired. GET /control answers compiled: null, so no expired table is offered for keying in. The Plan page says 'The last plan ran out on <Pakistan date and time> ... the inverter runs its fallback, its",
+    "reason": "",
+    "commits": [
+     "backend 924509d",
+     "frontend 7839a9b"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_a_plan_past_its_valid_until_is_not_in_force_nor_served",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_plan_and_control_pages_and_the_edge_see_an_expired_plan_as_no_plan",
+     "frontend/src/features/plan/plan-held.test.tsx (Round 7: says the last plan ran out ...)"
+    ]
+   },
+   "engine-savings-01": {
+    "status": "implemented",
+    "summary": "On a native-block day of the switchback calendar the live site now runs its native settings, which also covers duplicates brief-vs-build-01 and flow-savings-pilot-bill-05. plans.control_release falls back to a new plans.switchback_release when no person's pause or release is in force; a person's pause or release still comes first. switchback_release reads verify.arm_on for the Pakistan-time day, as verify.compute_day and the demo do, and returns {reason: 'switchback_native', kind: 'switchback', until: midnight PKT after the block's last day, author: 'switchback calendar', override_id: null}. t",
+    "reason": "",
+    "commits": [
+     "backend b413a37",
+     "frontend d2dc48f"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_a_native_block_day_releases_the_live_site_to_its_native_settings",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_plan_block_day_runs_the_plan_and_a_persons_pause_comes_before_the_calendar",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_plan_and_control_pages_say_a_native_block_day",
+     "frontend/src/features/plan/plan-held.test.tsx (Round 7: says a native block of the switchback calendar ...; reads a native-block control chip as no plan in force)"
+    ]
+   },
+   "engine-delivery-03": {
+    "status": "implemented",
+    "summary": "A message now counts as a duplicate only when the exact same message was stored before. The cloud records each stored message by site, stream, sequence and a content digest (sent_at and msg_id are left out of the digest) in a new edge_seen table. Telemetry and events used to keep a high-water mark per site; that is replaced by this check. So a batch below the last sequence that was never stored is now stored, and so is a counter that restarted at 0. Acks are stored once (a retry is answered duplicate). The capabilities table keeps every message, and the newest by sent_at is the current one: it",
+    "reason": "",
+    "commits": [
+     "b3794f6",
+     "bed9414",
+     "68ac74f (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_a_batch_below_the_mark_that_was_never_stored_is_stored_and_a_true_repeat_is_a_duplicate",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_reset_sequence_is_stored_not_acknowledged_as_a_duplicate",
+     "backend/tests/test_fix_r7_control_edge.py::test_an_ack_is_stored_once_however_often_it_is_sent",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_newest_capabilities_message_is_current_whatever_its_sequence",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_schema_2_file_keeps_its_capabilities_history_when_migrated"
+    ]
+   },
+   "engine-delivery-11": {
+    "status": "implemented",
+    "summary": "The message models moved to a new module, gridlytics/contract.py (delivery.py still exposes them under the same names). They now accept U3 section 5's own contract. Envelope: msg_type, msg_id, site_id and edge_id are optional; a site_id that is not the key's site gets 403 wrong_site, and a msg_type sent to the wrong path gets 422. Events: U3's names (override_local, *_detected, edge_reboot, installer_session_start/end) are stored as sent and acted on like ours, and a per-event source is stored as edge:<device>. An unknown event type is stored and listed in unknown_types; it no longer refuses t",
+    "reason": "",
+    "commits": [
+     "d765908",
+     "68ac74f (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_every_u3_section_5_example_validates",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_u3_telemetry_shape_is_stored",
+     "backend/tests/test_fix_r7_control_edge.py::test_an_envelope_naming_another_site_is_refused",
+     "backend/tests/test_fix_r7_control_edge.py::test_u3_event_names_act_and_an_unknown_type_does_not_void_the_batch",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_partial_ack_and_u3_heartbeat_states_are_taken",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_signed_plan_carries_the_u3_envelope_and_names_what_it_supersedes"
+    ]
+   },
+   "brief-vs-build-12": {
+    "status": "implemented",
+    "summary": "Also covers its duplicate tracker-and-docs-04. Capabilities devices are now typed: Device, Primitive (values, min, max, step, persistence, writes_per_day_max), SlotModel and ModeB, plus U3's edge block, whose control_tier counts as the tier. Before signing, delivery.fit_to_capabilities fits the plan to the first inverter that names its primitives. A grid-charge, generator-charge or export flag the device cannot write is dropped. Power limits are held to battery_power_w's range, and SoC floors and targets to their primitive's range. The message gets capabilities_fit saying what changed. A day w",
+    "reason": "",
+    "commits": [
+     "d765908",
+     "68ac74f (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_the_published_schema_files_are_the_contract_models",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_export_script_writes_the_files_and_its_check_finds_a_drift",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_signed_plan_carries_only_what_the_device_can_write",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_device_that_reports_no_primitives_gets_the_table_unchanged_and_too_many_slots_are_not_signed"
+    ]
+   },
+   "engine-delivery-12": {
+    "status": "partial",
+    "summary": "The cloud now acts on what the edge reports. A firmware change pauses control the way a template change does, under either event name. control_disabled/control_enabled and fallback_engaged/fallback_cleared are kept in the site's state (edge_reports), and a report sent late cannot overwrite a newer one. The heartbeat's received time is stored, and a heartbeat counts for 5 minutes. Under a closed-loop site, routes_sites.control_state now checks plans.edge_view before showing 'Following plan'. The new keys are edge_disabled (with its cause), edge_fallback (from a fallback report or a fresh heartb",
+    "reason": "Not done: R6 C5's optimiser half, where a partial or rejected ack feeds the achieved values back into the next solve. That needs tick and build_problem, which belong to optimiser-plans. C6's demotion after two mismatches in 24 h and C8's move to advisory are already covered more strictly: the first read-back mismatch, template change or firmware change pauses control until a person resumes it.",
+    "commits": [
+     "6ac1b75",
+     "9a6becf (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_a_firmware_or_template_change_pauses_control_under_either_name",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_control_state_says_what_the_edge_reports",
+     "backend/tests/test_fix_r7_control_edge.py::test_a_closed_loop_day_the_edge_did_not_follow_claims_nothing",
+     "frontend/src/features/devices/edge-card.test.tsx"
+    ]
+   },
+   "engine-delivery-10": {
+    "status": "implemented",
+    "summary": "The clock-offset ladder now acts. routes_edge._clock_update takes the edge's offset from the heartbeat and the inverter's from telemetry's inverter_clock_offset_s (R6 C10 b), and moves the site along the ladder on the worst of the two (plans.clock_level). Over 120 s a clock_unsynced event (source cloud) is raised once while it lasts. Over 300 s the signed plan starts every discharge or export slot 15 minutes early and ends it 15 minutes late (delivery.widen_peak_slots). The slots beside it give up that time, and one squeezed under the brand's shortest slot is merged into the discharge slot. Th",
+    "reason": "",
+    "commits": [
+     "b90c344",
+     "0865937",
+     "2101bfe (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_control_edge.py::test_a_widened_table_starts_each_discharge_slot_15_minutes_early_and_ends_it_15_minutes_late",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_clock_offset_ladder_warns_widens_and_demotes_until_the_clock_is_set",
+     "backend/tests/test_fix_r7_control_edge.py::test_the_inverters_own_clock_offset_counts_too",
+     "frontend/src/features/devices/edge-card.test.tsx"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 3,
+    "theme": "Control actions and the control state: validation, immediacy, held-state wording, times with a day",
+    "ids": [
+     "pages-B-01",
+     "flow-telemetry-plan-control-15",
+     "pages-B-15",
+     "flow-telemetry-plan-control-21",
+     "flow-telemetry-plan-control-22",
+     "flow-telemetry-plan-control-23"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Advisory tier: stable daily table, write budget, confirmation, honest chip",
+    "ids": [
+     "pages-B-02",
+     "pages-B-08",
+     "role-owner-08",
+     "pages-B-06",
+     "role-owner-36"
+    ]
+   },
+   {
+    "batch": 5,
+    "theme": "Control page: overrides UI, closed-loop panel, fallback test, edge card",
+    "ids": [
+     "flow-telemetry-plan-control-17",
+     "role-operator-11",
+     "flow-telemetry-plan-control-19",
+     "frontend-states-formats-16"
+    ]
+   },
+   {
+    "batch": 6,
+    "theme": "Edge message hardening and signing keys",
+    "ids": [
+     "engine-delivery-13",
+     "security-roles-11",
+     "engine-delivery-22",
+     "engine-delivery-23"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/control-edge",
+   "head": "0865937",
+   "commits": [
+    "0865937 R7 control-edge: the heartbeat's clock warning names the worst offset, the inverter's own included (audit engine-delivery-10)",
+    "b90c344 R7 control-edge: the clock-offset ladder acts as the heartbeat says: clock_unsynced is raised over 120 s, the plan message widens every discharge slot by 15 minutes each side over 300 s and the control state asks for the inverter clock to be set, and over 900 s control is demoted until the offset is under 120 s; the inverter's own clock offset counts too (audit engine-delivery-10)",
+    "bed9414 R7 control-edge: the round-3 retry test sends the same message twice, as a retry does, now that a duplicate is the same message and not the same sequence (audit engine-delivery-03)",
+    "6ac1b75 R7 control-edge: act on what the edge reports: a fallback, control it disabled, a plan refused or applied in part shows in the control state and on the edge answer, a firmware change pauses control like a template change, and a closed-loop day the edge did not follow claims nothing (audit engine-delivery-12)",
+    "d765908 R7 control-edge: the edge routes take U3's own contract (envelope, event names, unknown types, partial acks, heartbeat states, telemetry shape); the contract is published as JSON Schema files from the models with an export script and a drift test; the capabilities name each device's writable primitives and the signed plan carries only what the inverter can write, with supersedes, capabilities_seq, targets and msg_id (audit engine-delivery-11, brief-vs-build-12, tracker-and-docs-04)",
+    "b3794f6 R7 control-edge: an edge message is a duplicate only when the same message was stored before: a batch below the last sequence or from a restarted counter is stored, acks are stored once, and the newest capabilities message is the current one (audit engine-delivery-03)",
+    "b413a37 R7 control-edge: put the live site on its native settings on a switchback native-block day: the tick holds the plan and the edge gets a release (audit engine-savings-01, brief-vs-build-01, flow-savings-pilot-bill-05)",
+    "924509d R7 control-edge: a plan past its valid_until is not in force, not served to the edge and not keyed in; held says plan_expired (audit engine-delivery-24)",
+    "adcf87f R7 control-edge: give the wrong-plan guard rules that can refuse a plan: fallback floor, unserved critical load, the plan's own MDI cap, grid-up shedding, genset and export slots (audit engine-delivery-01, engine-plans-live-05)",
+    "391956a R7 control-edge: send a plan only to a closed-loop site's edge; below it the message route refuses with not_closed_loop (audit flow-telemetry-plan-control-03, engine-plans-live-11)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/control-edge",
+   "head": "2101bfe",
+   "commits": [
+    "2101bfe R7 control-edge: the edge card says what the clock offset does (discharge slots sent wider, control demoted) and asks for the inverter clock to be set; the edge answer's clock is typed (audit engine-delivery-10)",
+    "9a6becf R7 control-edge: the edge card says when the edge is not running the plan in force (a fallback, control it disabled, the plan refused or applied in part), and the control state's new keys are typed (audit engine-delivery-12)",
+    "68ac74f R7 control-edge: record the edge protocol's new rules and the plan message's U3 envelope in the API contract (audit engine-delivery-03, engine-delivery-11, brief-vs-build-12)",
+    "d2dc48f R7 control-edge: say a switchback native-block day as no plan in force, until the block ends (audit engine-savings-01, brief-vs-build-01, flow-savings-pilot-bill-05)",
+    "7839a9b R7 control-edge: say when the last plan ran out and that the inverter runs its fallback (audit engine-delivery-24)",
+    "97c550c R7 control-edge: say the wrong-plan guard's new reasons in words (audit engine-delivery-01, engine-plans-live-05)",
+    "e2c81ec R7 control-edge: say that only a closed-loop site's edge is sent a plan (audit flow-telemetry-plan-control-03, engine-plans-live-11)"
+   ],
+   "dirty": []
+  }
+ },
+ "optimiser-plans": {
+  "key": "optimiser-plans",
+  "stage": 1,
+  "title": "Optimiser and plan building (optimise.py, battery.py, plans.build_problem and tick) and the plan page",
+  "batches_total": 7,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "engine-optimiser-01": {
+    "status": "implemented",
+    "summary": "Fixes engine-plans-live-01 too. On a grid-up step, U may now only take load beyond what the connection (G_max) and PV can carry: U_ub = max(0, L - G_max - PV). So the plan imports and prices the MDI rise instead of shedding real load. explain() names any unserved step 'unserved' with detail grid up, down or none (it used to say idle, self_consumption or mdi_cap). build_problem raises a VoLL saved below the horizon's dearest import price to that price, which closes the 'VoLL 0 makes floors and shortfall free' hole on the engine side. The web app's unserved sentence follows detail.grid. The audi",
+    "reason": "",
+    "commits": [
+     "backend bc94f47",
+     "backend 155e48f",
+     "frontend 278dea7"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_the_plan_never_sheds_load_with_the_grid_up_to_hold_its_mdi",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_a_voll_of_zero_never_sheds_with_the_grid_up",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_only_load_beyond_the_connection_and_pv_is_unserved_with_the_grid_up_and_it_is_named",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_the_problem_values_lost_load_at_least_at_the_dearest_import_price",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_a_ticked_plan_never_sheds_with_the_grid_up_nor_imports_above_its_own_cap",
+     "frontend/src/lib/reasons.test.ts (unserved sentences)"
+    ]
+   },
+   "flow-telemetry-plan-control-02": {
+    "status": "implemented",
+    "summary": "Fixes engine-plans-live-04 and engine-plans-live-13 too. A grid charge that is not cheaper than the price its energy is used at, and that binding reserve rows hold, is now the new reason charge_for_reserve. Its detail carries rs_per_kwh, p, within_h, hours and kwh. p is the chance of an outage starting over the hold's whole window, not one step's p. hours is two steps behind an AMF panel, taken from solve's new R_steps. kwh is never above the usable band. charge_from_grid now carries use_t and use_rs_per_kwh. The web app sentence names the price paid and when the energy is used, and mentions a",
+    "reason": "",
+    "commits": [
+     "backend 011a971",
+     "frontend 71cedf0"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_grid_charging_in_the_peak_for_the_reserve_is_named_for_the_reserve_and_never_cheaper",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_no_grid_charging_in_the_peak_without_a_reserve_row",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_off_peak_grid_charging_names_the_price_and_the_time_the_energy_is_used_at",
+     "frontend/src/lib/reasons.test.ts (charge_from_grid / charge_for_reserve sentences)"
+    ]
+   },
+   "flow-telemetry-plan-control-08": {
+    "status": "implemented",
+    "summary": "Fixes engine-plans-live-14 too. A grid-up step with energy above the floor that neither charges nor discharges is now named from the solution's own figures, in this order:\n- hold_for_outage: a reserve row binds from this step on, before the battery next charges or discharges. This also covers steps whose own p_start is under 0.01, so a held peak no longer flips with 'Wear > saving'. kwh is never above what the battery holds, p is the chance over the window, and hours is 0.5 h behind an AMF panel.\n- save_for_later (new): the energy is discharged later, before the next charge. Detail use_t, use_",
+    "reason": "",
+    "commits": [
+     "backend 74a8c1a",
+     "frontend 55eb5ab"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_a_battery_held_through_the_peak_for_the_reserve_says_so_on_every_step_without_flipping",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_a_peak_step_whose_energy_is_spent_later_says_when_not_wear",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_wear_is_named_only_where_a_positive_price_gap_is_smaller_than_the_wear_cost",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_an_off_grid_battery_carries_the_load_not_an_outage",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_the_reserve_behind_an_amf_panel_says_it_covers_two_steps",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_a_discharge_at_one_price_is_one_run_not_peak_discharge_and_wear_by_turns",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_a_step_saved_for_later_compiles_as_a_hold_like_the_no_flow_reasons_it_replaces",
+     "frontend/src/lib/reasons.test.ts (hold/save/wear/carry sentences)",
+     "frontend/src/features/plan/reasons-legend.test.tsx"
+    ]
+   },
+   "engine-plans-live-17": {
+    "status": "implemented",
+    "summary": "Every Mode A slot carries grid_cap_w = M, and the device shaves each instant above it, but the MDI rows only bounded each 30-minute block's mean. So a step could import above the cap (Karachi: 962 kW against 902), and charging ran 65.6/0/188.6/0 kW. Each grid-up step now gets its own row, G[t] + (Lhi[t] - L[t]) <= M (M2 after the month's end), under the upper load quantile as the block rows are. Planned import now stays at or under the plan's own cap step by step. Grid charging and peak shaving under a binding cap are smooth instead of alternating. The tick-level test also checks that no step ",
+    "reason": "",
+    "commits": [
+     "backend 42f349f",
+     "backend 155e48f"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_each_steps_import_stays_under_the_plans_own_mdi_cap_and_grid_charging_is_smooth",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_a_peak_discharge_held_to_the_cap_under_the_upper_load_does_not_alternate",
+     "backend/tests/test_fix_r7_optimiser_plans.py::test_a_ticked_plan_never_sheds_with_the_grid_up_nor_imports_above_its_own_cap"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "SoC floors, inverter limits and the outage reserve",
+    "ids": [
+     "engine-delivery-02",
+     "engine-plans-live-03",
+     "engine-plans-live-06",
+     "engine-plans-live-12",
+     "engine-optimiser-09"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Battery state, uncertainty and infeasible starts",
+    "ids": [
+     "engine-plans-live-02",
+     "flow-telemetry-plan-control-09",
+     "engine-optimiser-07",
+     "engine-optimiser-03",
+     "engine-optimiser-04",
+     "brief-vs-build-03",
+     "engine-optimiser-15"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "MDI month handling and the cost breakdown",
+    "ids": [
+     "engine-optimiser-02",
+     "engine-plans-live-08",
+     "engine-optimiser-12",
+     "engine-optimiser-13",
+     "engine-optimiser-10"
+    ]
+   },
+   {
+    "batch": 5,
+    "theme": "Genset and off-grid dispatch",
+    "ids": [
+     "engine-optimiser-05",
+     "engine-optimiser-06",
+     "engine-plans-live-15",
+     "engine-optimiser-11",
+     "engine-plans-live-16"
+    ]
+   },
+   {
+    "batch": 6,
+    "theme": "Battery life and solve limits: cycle cap, derating, time-limited plans",
+    "ids": [
+     "brief-vs-build-04",
+     "brief-vs-build-05",
+     "engine-optimiser-08",
+     "engine-plans-live-19"
+    ]
+   },
+   {
+    "batch": 7,
+    "theme": "Plan page: table flags, slot table a11y, re-solve feedback, slot wording",
+    "ids": [
+     "pages-B-07",
+     "frontend-a11y-04",
+     "frontend-a11y-12",
+     "frontend-states-formats-07",
+     "frontend-a11y-23",
+     "flow-telemetry-plan-control-26"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/optimiser-plans",
+   "head": "a0c5387",
+   "commits": [
+    "a0c5387 R7 optimiser-plans: the reserve policy's threshold decides the reserve beyond the horizon and the genset-off reason, and its floor holds before a likely outage (audit engine-plans-live-12)",
+    "35a1524 R7 optimiser-plans: the outage reserve counts what the battery and inverter can deliver, covers only the start delay and a failed start behind an AMF panel, and is never priced before a modelled outage (audit engine-plans-live-03, engine-plans-live-06, engine-optimiser-09)",
+    "551a36b R7 optimiser-plans: keep PV to AC, battery discharge and charging within the inverter's kW AC (audit flow-onboarding-09, engine half)",
+    "d62b705 R7 optimiser-plans: hold the delivered table's SoC floor on every grid-up step, recover to it once after an outage, and credit only the energy above it (audit engine-delivery-02, flow-telemetry-plan-control-06)",
+    "155e48f R7 optimiser-plans: test a ticked plan against the guard's checks: no grid-up shed, no import above its own cap (audit engine-optimiser-01, engine-plans-live-17)",
+    "74a8c1a R7 optimiser-plans: derive the hold, later-use, wear and terminal reasons from the plan's own figures, and break ties by order (audit flow-telemetry-plan-control-08, engine-plans-live-14)",
+    "011a971 R7 optimiser-plans: name grid charging for the outage reserve and price where charged energy is used (audit flow-telemetry-plan-control-02, engine-plans-live-04, engine-plans-live-13)",
+    "42f349f R7 optimiser-plans: hold every step's import under the plan's own MDI cap, so grid charging and peak shaving no longer alternate (audit engine-plans-live-17)",
+    "bc94f47 R7 optimiser-plans: no load shed with the grid up, and lost load valued at least at the dearest import price (audit engine-optimiser-01, engine-plans-live-01)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/optimiser-plans",
+   "head": "657b128",
+   "commits": [
+    "657b128 WIP (interrupted, unreviewed): optimiser-plans, batch 2 (SoC floors, inverter limits and the outage reserve; audit engine-delivery-02, engine-plans-live-03, engine-plans-live-06, engine-plans-live-12, engine-optimiser-09)",
+    "58a74eb R7 optimiser-plans: contract: the plan holds the delivered table's floor with the grid up, and the terminal credit counts only energy above it (audit engine-delivery-02, flow-telemetry-plan-control-06)",
+    "55eb5ab R7 optimiser-plans: reason sentences and the legend give the plan's own figures, never \"a likely outage\" (audit flow-telemetry-plan-control-08, engine-plans-live-14)",
+    "71cedf0 R7 optimiser-plans: name grid charging for the outage reserve, and never call peak grid charging cheaper (audit flow-telemetry-plan-control-02, engine-plans-live-04, engine-plans-live-13)",
+    "278dea7 R7 optimiser-plans: say where unserved load comes from, never an outage with the grid up (audit engine-optimiser-01, engine-plans-live-01)"
+   ],
+   "dirty": []
+  }
+ },
+ "forecasts-outages": {
+  "key": "forecasts-outages",
+  "stage": 1,
+  "title": "Forecasts and outages (forecast.py, Forecasts and Outages pages)",
+  "batches_total": 5,
+  "batches_done": [
+   1,
+   2
+  ],
+  "review": null,
+  "findings": {
+   "engine-forecast-01": {
+    "status": "implemented",
+    "summary": "forecast.pv now fits the performance ratio and the clearness fan on the 14 whole local days before the tick's own day (new _local_midnight helper; the partial day is left out of the fit; the last-hour blend still reads up to t0). On the finding's alternating clear/0.45 history, the ticks at 00:00, 09:00, 12:00 and 15:00 now all fit pr 1.0 and the fan 0.45/0.45/0.725/1.0. Before the fix, the 09:00 tick fitted 0.937 and the 12:00 tick 0.742.",
+    "reason": "",
+    "commits": [
+     "7949d90"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_the_pv_fit_reads_whole_local_days_so_every_tick_of_a_day_fits_the_same_ratio_and_fan"
+    ]
+   },
+   "engine-forecast-04": {
+    "status": "implemented",
+    "summary": "New forecast.available_pv(g) returns pv + curtail_w (NaN where the output is unknown). The stage-1 fit, the last-hour smart-persistence blend, score_day's PV actuals and the forecast page's PV actuals now read it instead of the curtailed pv_power_w. A clear plant that curtails 40 % from 11:00 to 14:00 now fits pr 1.0 (before: 0.83), and a clear-sky forecast now scores under 1 % nRMSE.",
+    "reason": "",
+    "commits": [
+     "775d55e"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_the_pv_fit_and_score_read_available_power_not_curtailed_output"
+    ]
+   },
+   "pages-C-22": {
+    "status": "implemented",
+    "summary": "Covers duplicates engine-forecast-07 and role-analyst-18. Backend: the score_day PV and load rows moved into a new _power_scores. The PV day-ahead row now carries a smart-persistence baseline: clear sky times yesterday's clearness index at the same step, with model and baseline scored over the same daytime slots. PV and load also get one row per horizon class (0-2h, 2-6h, 6-24h, 24-48h), scored over every stored issue whose steps fall on the day at that horizon. PV class baselines are the persistence known at the issue time: last hour's clearness for 0-2h (reported only), same step yesterday f",
+    "reason": "",
+    "commits": [
+     "f49fa6a",
+     "056ac24"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_pv_scores_carry_a_smart_persistence_baseline_and_every_horizon_class",
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_the_accuracy_summary_gives_skill_overall_and_by_horizon_class",
+     "frontend/src/features/forecasts/forecasts-r7.test.tsx (counts the 7-day tile's days..., shows each kind's skill..., an older answer...)",
+     "frontend/src/features/outages/outage-model-card.test.tsx"
+    ]
+   },
+   "pages-C-01": {
+    "status": "implemented",
+    "summary": "Backend: forecast.page() now also returns `past`: the 96 steps before belief_time with their 15-minute actuals (available PV, load, or 1 where the grid was down). It also carries the arrays of the issue held a day before over those steps (q05-q95 and cs for PV, quantiles and crit for load, p_down and p_start for outages). Its belief_time is None when no such issue exists. The actual computation moved into the shared helpers _actual15 and _past. Web app: withPast (forecast-words.ts, memoised in the panel) joins the past in front of the latest issue for the PV and load fans and the outage chart.",
+    "reason": "",
+    "commits": [
+     "77bc903",
+     "ce0d6e3"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_the_forecast_page_carries_the_past_24_hours_of_actuals_and_the_issue_held_then",
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_the_past_of_a_site_without_an_older_issue_still_has_its_actuals",
+     "frontend/src/features/forecasts/forecasts-r7.test.tsx (draws the past 24 hours..., withPast x2)"
+    ]
+   },
+   "engine-forecast-03": {
+    "status": "implemented",
+    "summary": "With 3 to 6 fitted days, forecast.pv now keeps the prior's shape but moves its median from the month's climatology towards the site's median clearness, with weight days/7. The step to the empirical quantiles at 7 days stays small. Before the fix, the scaling term median(kn)/median(kn) was 1, so the prior was used unchanged. A mostly overcast 4-day site now forecasts a median below the prior's 0.89, and an all-clear site a median above it.",
+    "reason": "",
+    "commits": [
+     "35f94af"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_with_three_to_six_fitted_days_the_clearness_quantiles_move_with_the_site_s_days"
+    ]
+   },
+   "engine-forecast-14": {
+    "status": "implemented",
+    "summary": "Both halves are fixed. (1) The 'last 7 days' figure now covers the last 7 calendar days in Pakistan time, with n7 days scored, instead of the last 7 scored rows. This is in scores() in the scoring commit, and the tiles show the n7 count. (2) The outage chart's p_start: p_start[i] is the chance an outage starts in step i+1, matching how optimise.py:314 holds the reserve at the end of step i. The new outageSeries (outage-probability-chart.tsx, used by both the Forecasts and Outages pages) now draws that series at t[i] + 15 minutes. The backend answer is unchanged.",
+    "reason": "",
+    "commits": [
+     "f49fa6a",
+     "77d2289",
+     "056ac24"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_the_seven_day_summary_covers_the_last_seven_calendar_days",
+     "frontend/src/features/outages/outage-probability-chart.test.ts"
+    ]
+   },
+   "pages-C-02": {
+    "status": "implemented",
+    "summary": "With no announced schedule the outage issue's adherence is now null, so the pages no longer show the Beta(8, 2) prior's 80 % as a measured share. This covers the issue, kpis.adherence and the plan summary. A new adherence_windows field (in the issue and in kpis) counts the window occurrences seen whole, and 0 means the figure is still the prior. The Outages KPI tile, the model card and the Forecasts outage panel now read 'No announced schedule', '80 % (prior)' with 'prior: no window seen yet', or the share with 'N windows seen'. An older answer without the count shows the share as before. This",
+    "reason": "",
+    "commits": [
+     "backend 9ddc641",
+     "backend ca823d7",
+     "frontend dbd4a34"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_without_an_announced_schedule_the_outage_issue_has_no_adherence_and_a_schedule_not_yet_seen_is_the_prior",
+     "frontend/src/features/outages/outages-r7.test.tsx (3 pages-C-02 cases)",
+     "frontend/src/features/forecasts/forecasts-r7.test.tsx::says the outage panel has no announced schedule instead of a prior shown as measured"
+    ]
+   },
+   "engine-forecast-02": {
+    "status": "implemented",
+    "summary": "Adherence is now counted per window occurrence instead of per 24-hour block from the tick. The new forecast._adherence_trials finds the maximal runs of the window mask, so each window on a local day is one run and a window across midnight belongs to the day it starts. Each run seen whole is one Bernoulli trial on the Beta(8, 2) prior. A run cut by the start of the history, or still running at the tick, is not a trial. Neither is one whose known samples cover less than half its minutes (ADHERENCE_COVERAGE). The posterior no longer depends on the tick's time of day: before the fix a 15:00 tick g",
+    "reason": "",
+    "commits": [
+     "backend 48a69d7"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_schedule_adherence_counts_each_window_on_its_own_local_day_whatever_the_tick_time",
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_a_window_with_too_few_readings_is_not_a_trial"
+    ]
+   },
+   "engine-forecast-08": {
+    "status": "implemented",
+    "summary": "Outage events for the hazard now come from the censoring's own runs (_outage_runs, which bridge unknown minutes up to OUTAGE_GAP_MINUTES and flickers of at most 2 samples), through a new forecast._outage_events. A lost row is therefore no longer a restoration. An event's length runs from its first to its last grid-down sample plus the source's interval, which also keeps 5- and 15-minute sources as one event each. A run that starts at the first known sample is not counted as a start, and one still running at the end is a start whose length is left out. The observed outage's start is now the sta",
+    "reason": "",
+    "commits": [
+     "backend 90e78e3"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_a_gap_in_the_readings_does_not_split_an_outage_in_the_hazard_or_the_observed_outage",
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_an_outage_running_at_the_end_of_the_history_counts_as_a_start_but_not_as_a_length"
+    ]
+   },
+   "engine-forecast-12": {
+    "status": "implemented",
+    "summary": "Rural feeders now start from plan 5.3's cold-start figure, flagged as a prior. COLD_START_DOWN_HOURS gives 10 hours a day without grid to QESCO, PESCO and SEPCO (the plan's examples) and to HESCO and TESCO (the twin's rural set). While no schedule is entered, the part the DISCO trip prior does not cover is spread evenly over the day in 2-hour blocks (SHED_BLOCK_STEPS), adding to p_down, p_start and the length. It carries the hazard prior's 7-day weight, 7/(days+7), so it fades as the site's and its feeder's outages are seen. A QESCO site with no history now forecasts about 9-10 hours a day ins",
+    "reason": "",
+    "commits": [
+     "backend 1efd0b3",
+     "frontend 214165f"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_a_rural_feeder_without_a_schedule_starts_from_about_ten_hours_a_day_without_grid_flagged_as_a_prior",
+     "frontend/src/features/outages/outages-r7.test.tsx::flags the rural cold-start prior while no schedule is entered (engine-forecast-12)",
+     "frontend/src/features/forecasts/forecasts-r7.test.tsx::flags the outage panel's rural cold-start prior (engine-forecast-12)"
+    ]
+   },
+   "brief-vs-build-09": {
+    "status": "partial",
+    "summary": "Feeder pooling is built. forecast.outage now pools the 28-day grid history of the company's other sites with the same DISCO, outage_unit kind and code (code trimmed, any case; at most 20 sites; a unit without a code is not pooled). The pooled history adds to the hazard's counts and days (a rate per site-day), the outage lengths and the adherence trials. A new site on a feeder with history therefore starts from its feeder and reaches stage 1. Pooling stays inside one company's own files, so no data crosses companies. The issue answers days_known (this site's own days) and pooled{sites, days}. T",
+    "reason": "Season and weekday effects need real feeder data (stage 2). The CCMS and K-Electric scrapers (FOR-08) need an owner decision on scraping PITC and K-Electric sources.",
+    "commits": [
+     "backend ecde23c",
+     "frontend a1efdff"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_sites_on_the_same_feeder_pool_their_outage_history",
+     "frontend/src/features/outages/outages-r7.test.tsx::says how many other sites on the feeder the history is pooled with, and the site's own days (pages-C-08, brief-vs-build-09)"
+    ]
+   },
+   "pages-C-08": {
+    "status": "implemented",
+    "summary": "The outage model card no longer promises pooling that does not happen, and now gives the sample size. A new 'History' line reads 'N of the last 28 days at this site, and D days from M other sites on this feeder'. Under the feeder it says 'Pooled with M other sites on this feeder.' or 'No other site on this feeder yet, so the history is this site's own.' With no feeder set it reads 'Not set: this site's own history only'. The request to set the feeder shows only when no feeder code is set, and only to roles with edit_sites; the page passes useCan('edit_sites') to the card. A feeder name without",
+    "reason": "",
+    "commits": [
+     "backend ecde23c",
+     "frontend a1efdff",
+     "frontend ba93db7"
+    ],
+    "tests": [
+     "frontend/src/features/outages/outages-r7.test.tsx::says the history is the site's own when no other site shares the feeder (pages-C-08)",
+     "frontend/src/features/outages/outages-r7.test.tsx::asks for the feeder only when none is set, and only a role that can set it (role-analyst-19)",
+     "frontend/src/features/outages/outages-r7.test.tsx::flags a feeder name without a code, which is not pooled (role-analyst-19)",
+     "frontend/src/features/outages/outages-r7.test.tsx::passes the edit permission from the page to the model card (role-analyst-19)"
+    ]
+   },
+   "pages-C-21": {
+    "status": "implemented",
+    "summary": "POST /forecasts/refresh now saves through the tick's protection: it calls plans._saved_outage and plans._keep_observed_outage, read only, so a blind issue never replaces the same quarter's observed one (the DESIGN_LOG rounds 1-2 rule). The route needs a new permission, refresh_forecasts = {admin, analyst} (plan 9.4, R8 2.8 'retrain is owner and analyst'), which GET /meta now lists. An operator gets 403 'Refreshing forecasts is for an administrator or an analyst'. The web app's stage card keys on refresh_forecasts and says the same. The Permission type, the test helper metaFor and the meta.json",
+    "reason": "",
+    "commits": [
+     "backend 31b1967",
+     "frontend fa7d2bc"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_refreshing_forecasts_is_for_an_administrator_or_an_analyst",
+     "backend/tests/test_fix_r7_forecasts_outages.py::test_a_refresh_keeps_the_quarter_s_observed_outage_when_the_edge_s_rows_lag",
+     "frontend/src/features/forecasts/forecasts-r7.test.tsx::offers the refresh to an administrator or an analyst, not an operator (pages-C-21)"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 3,
+    "theme": "Load model, holidays, critical load and stages",
+    "ids": [
+     "engine-forecast-05",
+     "engine-forecast-06",
+     "engine-forecast-11",
+     "pages-C-06",
+     "engine-forecast-09",
+     "pages-C-12"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Outages page: reserve adequacy, announced windows, calendar heatmap",
+    "ids": [
+     "pages-C-07",
+     "role-analyst-15",
+     "pages-C-10",
+     "pages-C-19"
+    ]
+   },
+   {
+    "batch": 5,
+    "theme": "Forecast bands and Forecasts page wording",
+    "ids": [
+     "engine-forecast-16",
+     "pages-C-09",
+     "pages-C-23",
+     "role-owner-21"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/forecasts-outages",
+   "head": "ca823d7",
+   "commits": [
+    "ca823d7 R7 forecasts-outages: wrap the outage answer's adherence line to the module's width (audit pages-C-02)",
+    "31b1967 R7 forecasts-outages: a manual forecast refresh keeps the quarter's observed outage and is for an administrator or an analyst (audit pages-C-21)",
+    "1efd0b3 R7 forecasts-outages: a rural feeder without a schedule starts from about 10 hours a day without grid, flagged as a prior (audit engine-forecast-12)",
+    "ecde23c R7 forecasts-outages: pool the outage history of the company's sites on the same feeder code, and answer the site's own days and the pooling (audit brief-vs-build-09, pages-C-08)",
+    "90e78e3 R7 forecasts-outages: one outage across lost rows in the hazard and in the observed outage's start, as the censoring's runs bridge them (audit engine-forecast-08)",
+    "9ddc641 R7 forecasts-outages: no adherence without an announced schedule, and the number of windows seen so the prior is called a prior (audit pages-C-02, role-viewer-03, role-operator-13)",
+    "48a69d7 R7 forecasts-outages: count schedule adherence per window occurrence on its local day, not per 24-hour block from the tick (audit engine-forecast-02)",
+    "77bc903 R7 forecasts-outages: the forecast page answers the past 24 hours, with their actuals and the issue held a day before (audit pages-C-01)",
+    "f49fa6a R7 forecasts-outages: score PV against smart persistence per horizon class, and summarise the last 7 calendar days (audit pages-C-22, engine-forecast-07, engine-forecast-14, role-analyst-18)",
+    "35f94af R7 forecasts-outages: with 3 to 6 fitted PV days, move the prior's median towards the site's own clearness (audit engine-forecast-03)",
+    "775d55e R7 forecasts-outages: fit, blend, score and draw available PV (output plus curtail_w), not curtailed output (audit engine-forecast-04)",
+    "7949d90 R7 forecasts-outages: fit the PV ratio and fan on whole local days, not 24-hour blocks from the tick (audit engine-forecast-01)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/forecasts-outages",
+   "head": "ba93db7",
+   "commits": [
+    "ba93db7 R7 forecasts-outages: name a transformer as such in the model card's history and pooling lines (audit pages-C-08)",
+    "fa7d2bc R7 forecasts-outages: offer the forecast refresh to an administrator or an analyst, on the backend's refresh_forecasts permission (audit pages-C-21)",
+    "214165f R7 forecasts-outages: show the rural cold-start prior on the outage model card and the Forecasts outage panel (audit engine-forecast-12)",
+    "a1efdff R7 forecasts-outages: the outage model card shows the history and the feeder pooling, and asks for the feeder only when none is set and only roles that can set it (audit pages-C-08, role-analyst-19, brief-vs-build-09)",
+    "dbd4a34 R7 forecasts-outages: say \"No announced schedule\" or \"80 % (prior)\" instead of showing the prior as a measured adherence (audit pages-C-02, role-viewer-03, role-operator-13)",
+    "ce0d6e3 R7 forecasts-outages: draw the past 24 hours on the forecast charts, with their actuals and the issue held a day before (audit pages-C-01)",
+    "056ac24 R7 forecasts-outages: show the last 7 calendar days' count, the skill against each baseline and the accuracy by hours ahead (audit pages-C-22, engine-forecast-07, engine-forecast-14, role-analyst-18)",
+    "77d2289 R7 forecasts-outages: draw the outage-start chance on the step it is about, one slot after the issue's index (audit engine-forecast-14)"
+   ],
+   "dirty": []
+  }
+ },
+ "telemetry-genset-battery": {
+  "key": "telemetry-genset-battery",
+  "stage": 1,
+  "title": "Telemetry/CSV import, genset and battery pages, Devices and data",
+  "batches_total": 5,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "flow-telemetry-plan-control-01": {
+    "status": "implemented",
+    "summary": "Before the fix, a partial CSV over stored minutes set pv/SoC/battery/grid power to null (reproduced). Now ingest writes with an upsert (telemetry._insert_sql with merge=True): any column the new row leaves missing (absent, blank or unreadable) keeps its stored value, and the file's columns replace the stored ones. This covers CSV and edge batches; the twin's write_rows keeps INSERT OR REPLACE. import_csv counts the minutes that were already stored, says so in its notes, and answers `overlap` and `minutes`.",
+    "reason": "",
+    "commits": [
+     "125b865"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_an_overlapping_upload_keeps_every_column_the_file_does_not_carry"
+    ]
+   },
+   "flow-telemetry-plan-control-10": {
+    "status": "implemented",
+    "summary": "Before the fix, a 15-minute file gave 1/15 of the energy and 95 'gaps' (reproduced). import_csv now finds the logger's interval: the most common step between rows, the shorter one on a tie. Each 2-60 minute row is stored on the minutes it starts, up to the next row: readings are held over those minutes, and interval energy (grid_import_wh, grid_export_wh, genset_fuel_l) is divided by the step (ingest spans/step_min). A day's energy, peak, outage minutes, completeness and outages() are now right. Gaps count only steps longer than max(5 min, step). Rows more than 60 minutes apart are refused wit",
+    "reason": "",
+    "commits": [
+     "826b0d1",
+     "7b24c88"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_a_coarse_file_is_stored_as_the_intervals_its_rows_cover[5]",
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_a_coarse_file_is_stored_as_the_intervals_its_rows_cover[15]",
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_a_missing_row_in_a_coarse_file_is_a_gap_and_its_minutes_stay_missing",
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_rows_more_than_an_hour_apart_are_refused",
+     "frontend/src/features/telemetry/telemetry-page.test.tsx (round 7 audit: warnings in amber, minutes beside rows)"
+    ]
+   },
+   "flow-telemetry-plan-control-13": {
+    "status": "implemented",
+    "summary": "New telemetry._check_values runs on every CSV. PV or load cells below -500 W, and BMS SoC cells outside 0-100 %, are stored as missing and counted. Small negative PV, such as an inverter's standby draw at night, is kept. A load column, or PV between 10:00 and 14:00 Karachi time, that never reaches 1,000 W over at least an hour is named as probably kW. A SoC that never goes above 1 over at least an hour is named as probably a fraction; both are stored as read. These lines go in the answer's new `warnings` (also at the end of `log`, so the quality page's imports row shows them). The import's `st",
+    "reason": "",
+    "commits": [
+     "b4a6a0d",
+     "7b24c88"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_kilowatts_in_watt_columns_are_reported",
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_impossible_values_are_stored_as_missing_and_reported",
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_a_state_of_charge_given_as_a_fraction_is_reported",
+     "frontend/src/features/telemetry/telemetry-page.test.tsx (shows an import with warnings in amber...; keeps a clean import green)"
+    ]
+   },
+   "flow-telemetry-plan-control-14": {
+    "status": "implemented",
+    "summary": "Before the fix, ON/OFF in grid_present imported as 0 outage minutes (reproduced). on/off, true/false and yes/no are now read as 1/0 for grid_present and genset_running. A file in which no row's grid_present (or grid_voltage_v) can be read, whether unreadable or all blank, is refused with one sentence before anything is stored; the route answers 422. Some unreadable grid_present cells give a warning and status 'done_with_warnings'.",
+    "reason": "",
+    "commits": [
+     "4d5a69d",
+     "7b24c88"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_grid_present_written_as_on_and_off_is_read",
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_a_file_whose_grid_present_cannot_be_read_is_refused",
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_some_unreadable_grid_present_cells_are_a_warning",
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_the_upload_route_answers_the_new_fields"
+    ]
+   },
+   "frontend-states-formats-06": {
+    "status": "implemented",
+    "summary": "Also covers its duplicate flow-telemetry-plan-control-11. The web app's 'Times in the file are' choice now starts on Karachi (UTC+5), listed first, and sends tz_offset_h=5; UTC stays a choice, and the hint says Karachi is the default. On the backend, telemetry._zone_warning flags a probable zone slip, either way round: PV above 5 % of the file's peak (and above 1 kW) for 30 minutes or more between 20:00 and 05:00 Karachi time. This gives a warning that the times may be in another zone than the one chosen. The API's own tz_offset_h default stays 0 per plan Part 7.5 ('UTC or a declared timezone'",
+    "reason": "",
+    "commits": [
+     "228bf1f",
+     "7b24c88"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_solar_power_at_night_reports_a_probable_time_zone_slip",
+     "frontend/src/features/telemetry/telemetry-page.test.tsx (reads a file's times as Karachi time unless UTC is chosen)"
+    ]
+   },
+   "flow-telemetry-plan-control-24": {
+    "status": "implemented",
+    "summary": "import_csv keeps the last row of each minute before writing (after a stable sort by time) and counts the dropped rows in the new `duplicates` field. The notes say '60 rows repeat a minute that a later row of the file also gives: the last row of each minute was kept'. `rows`, in the answer and the imports row, is now the number of distinct rows kept (60, not 120).",
+    "reason": "",
+    "commits": [
+     "cd34dc8"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_telemetry_genset_battery.py::test_duplicate_times_are_counted_once_and_reported"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "Genset litres, runs, fuel cost and cards",
+    "ids": [
+     "pages-C-03",
+     "pages-C-04",
+     "pages-C-05",
+     "role-owner-07",
+     "pages-C-15",
+     "pages-C-16",
+     "role-operator-32"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "CSV mapping, refusals, data quality and series",
+    "ids": [
+     "flow-telemetry-plan-control-12",
+     "role-viewer-07",
+     "flow-telemetry-plan-control-25",
+     "pages-B-11",
+     "pages-B-17"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Battery page",
+    "ids": [
+     "role-operator-14",
+     "pages-C-13",
+     "pages-C-14",
+     "role-owner-30",
+     "role-owner-38",
+     "frontend-states-formats-11"
+    ]
+   },
+   {
+    "batch": 5,
+    "theme": "Late: telemetry file cost: read transactions, streamed CSV upload, series cap, forecast-issue retention",
+    "ids": [
+     "performance-live-03",
+     "performance-live-04",
+     "tests-and-perf-05",
+     "performance-live-06"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/telemetry-genset-battery",
+   "head": "228bf1f",
+   "commits": [
+    "228bf1f R7 telemetry-genset-battery: a CSV with solar power at night is reported as a probable time-zone slip (audit frontend-states-formats-06, flow-telemetry-plan-control-11)",
+    "b4a6a0d R7 telemetry-genset-battery: a CSV's implausible readings are reported per file, and impossible ones are stored as missing (audit flow-telemetry-plan-control-13)",
+    "4d5a69d R7 telemetry-genset-battery: a CSV whose grid_present cannot be read is refused, on/off words are read, and unreadable cells are a warning (audit flow-telemetry-plan-control-14)",
+    "826b0d1 R7 telemetry-genset-battery: a 5- or 15-minute CSV is stored as the minutes its rows cover, and rows over an hour apart are refused (audit flow-telemetry-plan-control-10)",
+    "cd34dc8 R7 telemetry-genset-battery: a CSV's duplicate times are counted once and reported (audit flow-telemetry-plan-control-24)",
+    "125b865 R7 telemetry-genset-battery: an upload that overlaps stored minutes merges per column instead of erasing the columns it does not carry (audit flow-telemetry-plan-control-01)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/telemetry-genset-battery",
+   "head": "7b24c88",
+   "commits": [
+    "7b24c88 R7 telemetry-genset-battery: the CSV upload reads times as Karachi time by default and shows an import's warnings in amber (audit frontend-states-formats-06, flow-telemetry-plan-control-11, -13, -14, -10)"
+   ],
+   "dirty": []
+  }
+ },
+ "sites-onboarding": {
+  "key": "sites-onboarding",
+  "stage": 1,
+  "title": "Sites, onboarding wizard, site settings, native capture and who may manage sites",
+  "batches_total": 5,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "flow-onboarding-05": {
+    "status": "implemented",
+    "summary": "Fixed in both repositories. On the server, PUT /api/sites/:id, PUT /api/sites/:id/connection (with id) and PUT /api/sites/:id/assets/:role take an optional if_unchanged: the stored fields the form was based on, or null for a connection or asset when none was stored. If any of those fields has changed since, the save gets 409 site_changed. The sentence names the fields, `changed` lists their keys, and nothing is written. The check and the write share one write transaction, and the audit line is written in it. A save without if_unchanged works as before, so Site settings is unchanged. In the wiz",
+    "reason": "",
+    "commits": [
+     "gridlytics-backend 9b945b4",
+     "gridlytics-frontend 11022fb",
+     "gridlytics-frontend bf28ceb"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_sites_onboarding.py::test_a_site_save_based_on_older_values_is_refused_rather_than_written_over_newer_ones",
+     "backend/tests/test_fix_r7_sites_onboarding.py::test_a_connection_save_based_on_older_values_is_refused",
+     "backend/tests/test_fix_r7_sites_onboarding.py::test_an_asset_save_based_on_older_values_is_refused",
+     "frontend/src/features/sites/onboarding/r7-draft-integrity.test.tsx (describe 'flow-onboarding-05: a resumed draft never reverts newer changes to its site', 4 tests)",
+     "frontend/src/features/sites/onboarding/r7-draft-integrity.test.tsx (describe 'flow-onboarding-05: the wizard's own saves move its base with them', 2 tests)"
+    ]
+   },
+   "flow-onboarding-15": {
+    "status": "implemented",
+    "summary": "The wizard now sends what the autosave has not sent yet when it unmounts, that is when another page of the app opens. It also sends it on beforeunload, where it calls preventDefault so the browser asks before leaving. The 1.5 s autosave timer skips a payload that was already sent this way, so nothing is saved twice. I did not use keepalive fetch, because that would mean editing lib/api/client.ts, which belongs to auth-security; the browser's leave prompt gives the request time to finish instead.",
+    "reason": "",
+    "commits": [
+     "gridlytics-frontend 6cd2c07"
+    ],
+    "tests": [
+     "frontend/src/features/sites/onboarding/r7-draft-integrity.test.tsx (describe 'flow-onboarding-15: the last edits are kept when the person leaves the wizard', 2 tests)"
+    ]
+   },
+   "pages-A-10": {
+    "status": "implemented",
+    "summary": "Review and activate is now locked until tabs A to D are all complete (plan 9.3, R8 2.2). The page names the tabs still open: 'Review and activate opens once tabs A to D are complete: tab D is not complete yet'. Tab D's 'Save and review' saves and then opens Review once it unlocks. LetteredNav's own next button cannot reach a locked tab, so tab D uses its own button. Each Review row that still holds a typical default carries a Preliminary mark: map pin, worked-out peak load, PV tilt, azimuth and losses, battery health, efficiencies and state-of-charge band, wear economics, genset curve and cost",
+    "reason": "",
+    "commits": [
+     "gridlytics-frontend c63f51e"
+    ],
+    "tests": [
+     "frontend/src/features/sites/onboarding/r7-review.test.tsx (describe 'pages-A-10: Review opens once tabs A to D are complete, with the defaults marked and what happens next', 2 tests)"
+    ]
+   },
+   "flow-onboarding-06": {
+    "status": "implemented",
+    "summary": "Review cannot be opened while equipment is typed but not saved, because tab B is then incomplete and Review is locked. Review shows what GET /sites/:id holds (formFromSite of the site), not the typed form. The hook has a new saveAll, used by tab D's 'Save and review' and by Activate. It saves every incomplete tab in order and stops at, and opens, a tab that cannot be saved. Activate sends POST /activate only after that, so typed PV and battery figures are saved before activation and are not lost with the draft. The server's activation rule (data source, tariff) is the batch-2 findings and was ",
+    "reason": "",
+    "commits": [
+     "gridlytics-frontend c63f51e"
+    ],
+    "tests": [
+     "frontend/src/features/sites/onboarding/r7-review.test.tsx (describe 'flow-onboarding-06: nothing typed and unsaved is activated past, or shown as saved')"
+    ]
+   },
+   "pages-A-15": {
+    "status": "implemented",
+    "summary": "The shared DataSourceCard (wizard tab A and Site settings General) now clears the grid-signal tick when another kind of source is chosen. The source schema then refuses the save on the page until the person ticks it again for the new kind. So {kind: 'csv', grid_signal_confirmed: true} is only sent after a real confirmation, and the server's stamp (sites._stamp_source) records the person who gave it.",
+    "reason": "",
+    "commits": [
+     "gridlytics-frontend 1264efd"
+    ],
+    "tests": [
+     "frontend/src/features/sites/settings/r7-data-source.test.tsx (2 tests: Site settings General and wizard tab A)"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "Server validation, who may manage sites, data source tier and activation rules",
+    "ids": [
+     "flow-onboarding-03",
+     "role-operator-07",
+     "flow-onboarding-07",
+     "flow-onboarding-08",
+     "flow-onboarding-14",
+     "flow-onboarding-18",
+     "role-operator-16"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Tariff, connection and location defaults",
+    "ids": [
+     "flow-onboarding-02",
+     "engine-tariffs-05",
+     "flow-onboarding-12",
+     "role-owner-40",
+     "role-operator-30",
+     "flow-onboarding-24"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Equipment fields: inverter checks, genset fuel, rating and start method, feeder prompt",
+    "ids": [
+     "flow-onboarding-09",
+     "flow-onboarding-10",
+     "flow-onboarding-11",
+     "flow-onboarding-16",
+     "flow-onboarding-17"
+    ]
+   },
+   {
+    "batch": 5,
+    "theme": "Wizard content, edge step and wording",
+    "ids": [
+     "flow-onboarding-22",
+     "flow-onboarding-25",
+     "flow-onboarding-19",
+     "flow-onboarding-20"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/sites-onboarding",
+   "head": "9bc879a",
+   "commits": [
+    "9bc879a R7 sites-onboarding: adding, drafting and activating sites and changing their control limits need manage_sites, an administrator's (audit role-operator-07)",
+    "717ae4b R7 sites-onboarding: a CSV or cloud data source lets the site reach advisory writes (a CSV once a file carries the inverter's mode), set when the source is saved (audit flow-onboarding-03)",
+    "559ca4d R7 sites-onboarding: activation asks for the data source with its grid-presence signal confirmed (audit flow-onboarding-08)",
+    "5d5eb31 R7 sites-onboarding: a native capture holds no more slots than the site's inverter brand's table (audit role-operator-16, role-owner-35, role-analyst-27)",
+    "b82ebe4 R7 sites-onboarding: a native capture's slots start at a time from 00:00 to 23:59 and never two at the same time (audit flow-onboarding-14, flow-savings-pilot-bill-15)",
+    "3bbd160 R7 sites-onboarding: the tariff-category test expects the 422 refusal that sites.put_connection raises, not a ValueError (audit flow-onboarding-07)",
+    "4696ac7 R7 sites-onboarding: agreement dates must be days in order, and the genset's money figures and tank have upper bounds (audit flow-onboarding-18)",
+    "03616df R7 sites-onboarding: refuse an empty or unknown tariff category on every connection save, and ask for one before activating (audit flow-onboarding-07)",
+    "9b945b4 R7 sites-onboarding: refuse a site, connection or asset save based on values changed since, with 409 site_changed (audit flow-onboarding-05)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/sites-onboarding",
+   "head": "9cd87ab",
+   "commits": [
+    "9cd87ab WIP (interrupted, unreviewed): sites-onboarding, batch 2 (Server validation, who may manage sites, data source tier and activation rules; audit flow-onboarding-03, role-operator-07, flow-onboarding-07, flow-onboarding-08, flow-onboarding-14, flow-onboarding-18, role-operator-16)",
+    "631fd02 R7 sites-onboarding: say the agreement ends before it starts beside tab C's other problems, and bound the genset's money figures and tank as the server does (audit flow-onboarding-18)",
+    "bf28ceb R7 sites-onboarding: tab B's own Save and Remove buttons check and move the draft's base too, one asset at a time (audit flow-onboarding-05)",
+    "1264efd R7 sites-onboarding: choosing another kind of data source clears the grid-signal confirmation, so it is asked for again (audit pages-A-15)",
+    "c63f51e R7 sites-onboarding: open Review only once tabs A to D are complete, show the site's values with Preliminary marks and what happens next, and save every tab before activating (audit pages-A-10, flow-onboarding-06)",
+    "6cd2c07 R7 sites-onboarding: save the wizard's last edits when it closes or the browser leaves, instead of dropping the pending autosave (audit flow-onboarding-15)",
+    "11022fb R7 sites-onboarding: a resumed draft asks before its older values are used, and its saves never revert newer site changes (audit flow-onboarding-05)"
+   ],
+   "dirty": []
+  }
+ },
+ "fleet-overview": {
+  "key": "fleet-overview",
+  "stage": 1,
+  "title": "Fleet and site Overview pages (fleet/now/overview routes)",
+  "batches_total": 3,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "flow-onboarding-04": {
+    "status": "implemented",
+    "summary": "A site that has been created but not activated is no longer a dead end. The Overview and Plan pages now offer 'Activate the site' (POST /sites/:id/activate, which needs edit_sites; a refusal is shown in the server's own words, and the answer updates the cached site). It is the last step of the first-plan checklist. When everything else is in, or a plan from a manual re-solve is in force, a notice says the site is not activated yet and the optimiser plans only active sites, and offers Activate. The 15-minute promise is gone for such a site. A role without edit_sites is told that an administrato",
+    "reason": "",
+    "commits": [
+     "frontend 143f47b"
+    ],
+    "tests": [
+     "frontend/src/features/plan/plan-empty.test.tsx (A site that is not activated: 3 tests)",
+     "frontend/src/features/overview/overview-page.test.tsx (UI-04 for a site that is not activated: 3 tests, including clicking Activate posts /activate and the notice turns to the active wording)",
+     "frontend/src/features/sites/fleet-page.test.tsx (says a site is not activated yet where its next plan step would be)",
+     "frontend/src/lib/site-rules.test.ts (isActivated)"
+    ]
+   },
+   "pages-A-01": {
+    "status": "implemented",
+    "summary": "Fixed by the same commit as flow-onboarding-04. The Overview and Plan checklists read site.status, and the Overview takes the site's own status first and then /now's site.status. For an observing site they add 'Activate the site' as the last step and drop 'it solves every 15 minutes' and 'the first plan arrives within 15 minutes'. Their hints now say the optimiser plans only active sites. The Plan page's half lives in plan-empty.tsx (this package's), so plan-page.tsx is untouched.",
+    "reason": "",
+    "commits": [
+     "frontend 143f47b"
+    ],
+    "tests": [
+     "frontend/src/features/plan/plan-empty.test.tsx",
+     "frontend/src/features/overview/overview-page.test.tsx"
+    ]
+   },
+   "flow-savings-pilot-bill-02": {
+    "status": "implemented",
+    "summary": "Covers its duplicates role-owner-01, role-operator-01 and role-analyst-02. Before, _mtd_saving summed only the daily claimed_rs, so Fleet and Overview left out the month's MDI lever. It now reads verify.summary from the 1st to today, exactly as GET /savings does for 'This month', and takes the native baseline's claimed_rs, MDI lever included. The figure is null while no day of the month is scored. The fleet summary is the sum of the rows and matches /fleet/savings total_claimed_rs within rounding. The test checks equality with the Savings answer and does not pin a figure. The test's data gives",
+    "reason": "",
+    "commits": [
+     "backend b0cbdb7",
+     "frontend 522bb35"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_fleet_overview.py::test_the_month_to_date_saving_on_fleet_and_overview_is_the_savings_page_s_month_figure_with_its_mdi_lever"
+    ]
+   },
+   "pages-B-12": {
+    "status": "implemented",
+    "summary": "Added lib/site-rules.gridSettled, which mirrors routes_sites._grid_settled: a connection, a farm, or data.off_grid on a site of any type. The Overview Checklist and PlanEmpty use it, so a non-farm off-grid site's grid step reads Done. site-form.ts canRemoveConnection belongs to sites-onboarding and already applies the same rule, so it was not touched.",
+    "reason": "",
+    "commits": [
+     "frontend 1620eec"
+    ],
+    "tests": [
+     "frontend/src/lib/site-rules.test.ts (gridSettled)",
+     "frontend/src/features/plan/plan-empty.test.tsx (UI-09 cold-start checklist, the grid step)",
+     "frontend/src/features/overview/overview-page.test.tsx (UI-04 checklist, the grid step)"
+    ]
+   },
+   "pages-A-03": {
+    "status": "implemented",
+    "summary": "Covers its duplicate role-viewer-09 for this package's half. In the backend, fleet_row now treats off-grid as a fact about the site: a connection of regime off_grid, or no connection at a farm or at a site whose data says off_grid (it reuses _grid_settled). A grid site with no saved connection gets category null, and summary.in_outage now counts it. In the web app, FleetSite.category is string | null and the row shows 'Grid connection not saved'. Not done here: the site header line (site-header.tsx belongs to shell-nav) and the Outages page's 'no grid connection (off grid)' sentence that role-",
+    "reason": "",
+    "commits": [
+     "backend af08a4a",
+     "frontend 097d968"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_fleet_overview.py::test_a_grid_site_without_its_connection_yet_is_not_off_grid_in_the_fleet_and_its_outage_counts",
+     "frontend/src/features/sites/fleet-page.test.tsx (reads 'Grid connection not saved' ...)",
+     "backend/tests/test_fix_r3_api.py (the existing off-grid connection case still passes)"
+    ]
+   },
+   "pages-A-08": {
+    "status": "implemented",
+    "summary": "Covers the money-tile half of its duplicate frontend-states-formats-19. The fleet row, the fleet summary and /now's month now carry the method ('counterfactual') and the computation date of the month's days, as mtd_saving_rs_method/mtd_saving_rs_computed and month.saving_rs_method/saving_rs_computed. Because the names contain '_rs_', money.py strips them for a viewer and an API key, along with the figure. The tiles read, for example, 'Counterfactual replay against the native settings, computed 9 Nov 2026, 05:40' in Karachi time; Fleet says 'last computed' and uses the newest date. Without a sc",
+    "reason": "",
+    "commits": [
+     "backend b0cbdb7",
+     "frontend 522bb35"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_fleet_overview.py (method and computed equal the Savings answer's; the viewer's answers hold none of them)",
+     "frontend/src/features/overview/overview-page.test.tsx (UI-04 the month's saving names its method and computation date)",
+     "frontend/src/features/sites/fleet-page.test.tsx (names the saving's method and when it was last computed; fleetKpis picks the newest real-site date)"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "Overview content",
+    "ids": [
+     "role-owner-11",
+     "parity-boxlytics-ui-15",
+     "pages-A-09",
+     "role-owner-31",
+     "frontend-states-formats-14",
+     "frontend-states-formats-15",
+     "frontend-states-formats-18"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Fleet table",
+    "ids": [
+     "role-analyst-14",
+     "pages-A-11",
+     "pages-A-17",
+     "role-owner-16",
+     "role-viewer-22",
+     "frontend-a11y-06",
+     "frontend-a11y-21"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/fleet-overview",
+   "head": "af08a4a",
+   "commits": [
+    "af08a4a R7 fleet-overview: a grid site whose connection is not saved yet has no category in the fleet, not Off-grid, and its outage counts (audit pages-A-03, role-viewer-09)",
+    "b0cbdb7 R7 fleet-overview: the month-to-date saving on Fleet and Overview is the Savings page's month figure, MDI lever included, with its method and computation date (audit flow-savings-pilot-bill-02, role-owner-01, role-operator-01, role-analyst-02, pages-A-08)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/fleet-overview",
+   "head": "522bb35",
+   "commits": [
+    "522bb35 R7 fleet-overview: the month's saving on Fleet and Overview names its method and computation date, and is the Savings page's month figure (audit flow-savings-pilot-bill-02, role-owner-01, role-operator-01, role-analyst-02, pages-A-08)",
+    "1620eec R7 fleet-overview: the first-plan checklists count the grid step done as POST /activate does, data.off_grid included (audit pages-B-12)",
+    "143f47b R7 fleet-overview: a site that is not activated is told so on Overview, Plan and Fleet, with Activate the site, instead of a plan promised every 15 minutes (audit flow-onboarding-04, pages-A-01)",
+    "097d968 R7 fleet-overview: the Fleet reads \"Grid connection not saved\" for a grid site whose connection is not saved yet, not Off-grid (audit pages-A-03, role-viewer-09)"
+   ],
+   "dirty": []
+  }
+ },
+ "alerts-reports": {
+  "key": "alerts-reports",
+  "stage": 1,
+  "title": "Alerts and reports",
+  "batches_total": 6,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "security-roles-03": {
+    "status": "implemented",
+    "summary": "Alerts are now filtered by role. alerts.reader_categories() lists the categories a reader may receive: Data, Reserve, Battery, Genset and Forecast for everyone; Control, Tariff and Savings need see_costs; Product needs see_fee. A viewer or an API key therefore gets only the energy categories. alerts.listing() and alerts.counts() apply this filter, so the inbox, the counts, a site's Now page and the fleet all follow it. Acting on an alert of a category the reader cannot see returns 404. GET /api/alerts/rules and the per-site rules return only the readable categories. The counts answer now names",
+    "reason": "",
+    "commits": [
+     "66183fc",
+     "aa096b5",
+     "4469277"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_viewer_receives_only_the_energy_categories_of_alerts",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_the_rules_a_reader_reads_are_those_of_the_categories_they_receive",
+     "frontend/src/features/alerts/alerts-page.test.tsx"
+    ]
+   },
+   "pages-D-14": {
+    "status": "implemented",
+    "summary": "Added the alert rules the plan lists. Data: data_gap for a gap of more than an hour, plus the edge's data events. Control: edge events, edge_offline, and plan_expired when the plan ended with nothing replacing it. Genset: genset_unrequested, genset_low_load and genset_request_missed. Forecast: a stage change. Tariff: bill_residual when the rebuilt bill differs from the printed one by more than the threshold. Savings: savings_negative and savings_withheld, run by the nightly job. Product: fee_above_third. The alert details hold dates, epoch times and figures, not ids or codes. In this session I",
+    "reason": "",
+    "commits": [
+     "e5e9526",
+     "5e5cd5b",
+     "db4fab4"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_gap_in_the_data_of_more_than_an_hour_raises_a_data_alert",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_the_edges_events_raise_control_and_data_alerts",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_an_expired_plan_and_a_silent_edge_raise_control_alerts",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_the_genset_rules_unrequested_low_load_and_a_request_nobody_answered",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_bill_the_rebuild_misses_by_more_than_the_threshold_raises_a_tariff_alert",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_forecast_stage_change_is_said",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_the_savings_and_product_rules_after_the_nightly_jobs",
+     "frontend/src/features/alerts/alert-words.test.ts"
+    ]
+   },
+   "pages-D-27": {
+    "status": "implemented",
+    "summary": "A site that has never sent data now raises the Data alert. The age is counted from when the site was activated, and the alert opens once the source's normal staleness limit has passed (OEM and edge sources: the 20-minute limit; a CSV site waits a day). Before, a missing last reading gave age None, so the rule could never fire.",
+    "reason": "",
+    "commits": [
+     "965008c"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_site_that_never_sent_data_raises_a_data_alert_after_its_sources_limit",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_csv_site_that_never_uploaded_waits_a_day"
+    ]
+   },
+   "engine-forecast-10": {
+    "status": "implemented",
+    "summary": "alerts.forecast_bust now uses the plan's definition: a PV error above bust_pct (default 30 %) of the clear-sky ceiling, held over a half hour. The alert fires when the busted time reaches bust_hours, and both thresholds can be set per company or per site. The detail gives the day, the hours, the worst half hour, the worst miss and the day's nRMSE in percent. A fog morning raises the alert; an ordinary day does not. Re-solving the plan on a bust stays with stage 2 (brief-vs-build-15), as the plan's notes say.",
+    "reason": "",
+    "commits": [
+     "1e1d74c",
+     "5e5cd5b",
+     "db4fab4"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_forecast_bust_is_the_plans_and_a_fog_morning_raises_it",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_an_ordinary_day_raises_no_bust",
+     "frontend/src/features/alerts/alert-words.test.ts"
+    ]
+   },
+   "brief-vs-build-18": {
+    "status": "implemented",
+    "summary": "alerts.tariff_staleness raises Tariff alerts from the stored tariff versions, with no scraping of NEPRA or OGRA. tariff_awaiting fires when an awaiting-notification date has passed and the version is not in the library. tariff_lapsed fires when a version in force has ended with nothing after it. adder_missing_fca and adder_missing_qta fire when the billing month's FCA or QTA is missing. fuel_price_old fires when the latest fuel price is older than the set age (diesel 14 days, captive gas about half a year). The alert titles give dates in words; the details give due_on, ended_on, price_from, da",
+    "reason": "",
+    "commits": [
+     "c0ff946",
+     "5e5cd5b",
+     "db4fab4"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_passed_awaiting_notification_date_and_an_old_fuel_price_raise_tariff_alerts",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_version_in_force_that_ended_with_nothing_after_it_raises_a_tariff_alert",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_a_captive_gas_price_is_old_after_half_a_year_not_a_fortnight",
+     "frontend/src/features/alerts/alert-words.test.ts"
+    ]
+   },
+   "pages-D-29": {
+    "status": "implemented",
+    "summary": "alerts.set_rules now checks quiet hours: they must be two different times of day in Karachi time, kept as HH:MM-HH:MM, or the save is refused with a 422; old free-text values read as none. The backend now stores bounded thresholds per category (alerts.THRESHOLDS), for the company and as per-site overrides through GET and PUT /api/alerts/rules/sites/{id}, and the evaluator reads them. The web app's rule editor checks quiet hours before sending, shows each threshold in words, and edits either the company's rules or one site's, including a 'Follow the company's rules' reset. Sending by email, SMS",
+    "reason": "",
+    "commits": [
+     "b3441f9",
+     "aa096b5",
+     "84629dd"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_alerts_reports.py::test_the_rule_editor_refuses_quiet_hours_that_are_not_two_times_and_keeps_canonical_ones",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_an_old_free_text_quiet_hours_reads_as_none",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_thresholds_are_kept_per_company_and_per_site_and_the_evaluator_reads_them",
+     "backend/tests/test_fix_r7_alerts_reports.py::test_the_reserve_and_agreement_thresholds_change_what_is_raised",
+     "frontend/src/features/alerts/alerts-page.test.tsx"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "Monthly report content",
+    "ids": [
+     "pages-D-07",
+     "pages-D-08",
+     "engine-savings-13",
+     "pr-review-06",
+     "role-viewer-17",
+     "role-analyst-25"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Reports page, access and limits",
+    "ids": [
+     "frontend-states-formats-05",
+     "pages-D-24",
+     "pages-D-25",
+     "security-roles-08",
+     "role-operator-20"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Alert actions and wording",
+    "ids": [
+     "pages-C-11",
+     "pages-D-28",
+     "pages-D-16",
+     "role-operator-31",
+     "frontend-states-formats-10"
+    ]
+   },
+   {
+    "batch": 5,
+    "theme": "Late: alert actions and the rule editor: closed-alert state, re-raise after close, rule validation, channels not sending",
+    "ids": [
+     "flow-reports-alerts-members-keys-08",
+     "flow-reports-alerts-members-keys-10",
+     "flow-reports-alerts-members-keys-09",
+     "flow-reports-alerts-members-keys-11"
+    ]
+   },
+   {
+    "batch": 6,
+    "theme": "Late: reports: file paths under the data folder, period validation, header and empty periods, the viewer's list",
+    "ids": [
+     "parity-architecture-11",
+     "flow-reports-alerts-members-keys-13",
+     "flow-reports-alerts-members-keys-16",
+     "flow-reports-alerts-members-keys-29"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/alerts-reports",
+   "head": "5e5cd5b",
+   "commits": [
+    "5e5cd5b R7 alerts-reports: the new alerts' details carry dates, times and figures, not ids or codes (audit pages-D-14, brief-vs-build-18, engine-forecast-10)",
+    "aa096b5 R7 alerts-reports: a reader reads the rules of the categories they receive only (audit security-roles-03, pages-D-29)",
+    "c0ff946 R7 alerts-reports: a Tariff alert when the stored tariff library goes stale (audit brief-vs-build-18)",
+    "e5e9526 R7 alerts-reports: the alert rules the plan lists for Data, Control, Genset, Forecast, Tariff, Savings and Product (audit pages-D-14)",
+    "1e1d74c R7 alerts-reports: the forecast bust is the plan's, a PV error above 30 % of the clear-sky ceiling over 30 minutes (audit engine-forecast-10)",
+    "b3441f9 R7 alerts-reports: alert rules with checked quiet hours, thresholds and site overrides the evaluator reads (audit pages-D-29)",
+    "965008c R7 alerts-reports: a site that never sent data raises the Data alert (audit pages-D-27)",
+    "66183fc R7 alerts-reports: a viewer receives only the energy categories of alerts (audit security-roles-03, pages-D-15)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/alerts-reports",
+   "head": "db4fab4",
+   "commits": [
+    "db4fab4 R7 alerts-reports: the drawer says the new alerts' dates, Karachi times and figures in words (audit pages-D-14, brief-vs-build-18, engine-forecast-10)",
+    "84629dd R7 alerts-reports: the rule editor checks quiet hours, sets thresholds and edits one site's rules (audit pages-D-29)",
+    "4469277 R7 alerts-reports: the alert filter offers only the categories the reader receives (audit security-roles-03, pages-D-15)"
+   ],
+   "dirty": []
+  }
+ },
+ "auth-security": {
+  "key": "auth-security",
+  "stage": 1,
+  "title": "Auth, roles, money filter, API keys, passwords and company settings (preassigned accounts only)",
+  "batches_total": 5,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "security-roles-01": {
+    "status": "implemented",
+    "summary": "Done by the interrupted earlier attempt and checked again here. GET /api/sites/{id}/events now passes through the money filter, so a viewer or an API key no longer gets a fuel log's cost_rs. This also covers the duplicates tracker-and-docs-02 and tests-and-perf-01.",
+    "reason": "",
+    "commits": [
+     "c7e713b"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_auth_security.py::test_the_events_route_gives_no_fuel_cost_to_a_viewer_or_a_key"
+    ]
+   },
+   "security-roles-02": {
+    "status": "implemented",
+    "summary": "Done by the earlier attempt and checked again here. The API's guard now runs money.filter_json on every JSON answer for any reader who may not see all money fields (a viewer, an operator or a site key). It no longer depends on each route calling out(). A bare 'total' now counts as a number of things, not as money.",
+    "reason": "",
+    "commits": [
+     "eca0b74"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_auth_security.py::test_every_answer_is_filtered_for_a_viewer_and_a_count_is_not_money",
+     "backend/tests/test_role_walk.py::test_a_route_that_forgets_the_filter_is_filtered_all_the_same"
+    ]
+   },
+   "tracker-and-docs-03": {
+    "status": "implemented",
+    "summary": "Done by the earlier attempt and checked again here. backend/tests/test_role_walk.py now exists. It reads every GET route the app mounts as administrator, operator, viewer and a site key with sites:read and plans:read. It fails on any money key (money.is_money), a rupee figure inside a sentence, or a money value from the administrator's answer showing up in the viewer's answer. It also checks that an operator gets no fee or money setting and a key gets no money at all. The route list is read from the app, so a new route is walked without editing the test. This covers the duplicate tests-and-per",
+    "reason": "",
+    "commits": [
+     "eca0b74"
+    ],
+    "tests": [
+     "backend/tests/test_role_walk.py"
+    ]
+   },
+   "role-operator-06": {
+    "status": "implemented",
+    "summary": "Done by the earlier attempt and checked again here. A new permission, see_money_settings, goes to administrator and analyst. Without it, the filter removes VoLL, the replacement cost, the wear price c_cyc, the genset's c_start/c_runhr/c_om and c_short. When an asset form is saved with these fields sent back at their defaults, the stored values are kept. In the web app, the battery Economics card and the money-setting fields read 'Hidden for your role' for an operator. This covers the duplicate pages-C-20.",
+    "reason": "",
+    "commits": [
+     "1bcef1e",
+     "38e5272"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_auth_security.py::test_an_operator_sees_costs_but_not_the_money_settings",
+     "backend/tests/test_fix_r7_auth_security.py::test_an_operator_saves_the_equipment_without_the_money_settings_it_cannot_see",
+     "frontend battery-cards.test.tsx",
+     "frontend money-settings-role.test.tsx"
+    ]
+   },
+   "role-viewer-19": {
+    "status": "implemented",
+    "summary": "Done by the earlier attempt and checked again here. For a viewer, the savings route now sends the whole answer through the money filter instead of a cut-down answer. The viewer keeps litres saved, verified days and each day's litres. The Savings page shows them, and the table note now reads 'Costs and savings are hidden for your role.'",
+    "reason": "",
+    "commits": [
+     "2ff1d79",
+     "ae6da89"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_auth_security.py::test_a_viewer_reads_the_litres_saved_and_the_verified_days_but_no_rupee"
+    ]
+   },
+   "security-roles-16": {
+    "status": "implemented",
+    "summary": "An administrator can now let a named viewer see costs, as plan Part 10.5 asks. Each member row has a new grants column (a new store.py migration, schema version 3). auth.GRANTS = {'see_costs': 'viewer'} sets what can be granted and to which role. auth.can() honours a grant only for that role and never for an API key. PUT /api/users/{id} takes 'grants', a list holding 'see_costs' or nothing; anything else is refused with 422. A grant to a role other than viewer is also refused with 422, because the other roles see costs already. A change of role ends the grant (store_members.update_member). GET",
+    "reason": "",
+    "commits": [
+     "3ab651f",
+     "0908c44"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_auth_security.py::test_an_administrator_grants_a_named_viewer_the_costs_and_takes_them_back",
+     "backend/tests/test_fix_r7_auth_security.py::test_a_grant_is_a_viewers_and_ends_when_the_role_changes",
+     "backend/tests/test_fix_r7_auth_security.py::test_a_grant_is_kept_in_the_company_file_and_a_key_never_holds_one",
+     "frontend/src/features/org/company-settings-page.test.tsx (Round 7 security-roles-16: two tests)"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "Passwords, lockout and sessions",
+    "ids": [
+     "pages-A-02",
+     "founder-console-07",
+     "founder-console-08",
+     "security-roles-09",
+     "security-roles-10",
+     "role-analyst-32"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Seats, switched-off companies and API keys",
+    "ids": [
+     "founder-console-06",
+     "security-roles-07",
+     "role-analyst-20",
+     "founder-console-15"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Company settings: a11y and audit trail",
+    "ids": [
+     "frontend-a11y-07",
+     "frontend-a11y-16",
+     "frontend-a11y-19",
+     "role-owner-23"
+    ]
+   },
+   {
+    "batch": 5,
+    "theme": "Late: sessions and sign-in: same-second revocation, removed members, the optional owner-applied Supabase mode (web sign-in, members list), the API's log folder, throttling, how people are added",
+    "ids": [
+     "parity-supabase-auth-01",
+     "flow-reports-alerts-members-keys-07",
+     "parity-supabase-auth-04",
+     "parity-architecture-05",
+     "parity-supabase-auth-05",
+     "parity-supabase-auth-08",
+     "flow-reports-alerts-members-keys-28"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/auth-security",
+   "head": "3ab651f",
+   "commits": [
+    "3ab651f R7 auth-security: an administrator can let a named viewer see costs (members.grants, schema version 3; PUT /api/users takes grants [\"see_costs\"] for a viewer only, auth.can reads it, a change of role ends it, the trail records it, a key never holds one) (audit security-roles-16)",
+    "2ff1d79 R7 auth-security: a viewer's savings answer is the whole answer through the money filter, so it keeps the litres saved, the verified days and each day's litres (audit role-viewer-19)",
+    "1bcef1e R7 auth-security: an operator sees costs but not the money settings (new permission see_money_settings for administrator and analyst; the filter leaves out VoLL, the replacement cost, the wear price and the genset's costs; an asset saved back with the form's defaults keeps them) (audit role-operator-06, pages-C-20)",
+    "eca0b74 R7 auth-security: the API's guard runs the money filter on every JSON answer, \"total\" is a count and not money, and a role walk (test_role_walk.py, the file the docs cite) reads every GET route as admin, operator, viewer and a site key (audit security-roles-02, tracker-and-docs-03)",
+    "c7e713b R7 auth-security: the events route goes through the money filter, so a fuel log's cost reaches no viewer or key (audit security-roles-01, tracker-and-docs-02)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/auth-security",
+   "head": "0908c44",
+   "commits": [
+    "0908c44 R7 auth-security: Members gives a viewer's row a \"Sees costs\" checkbox for the administrator (the member's grants), and the role table says a named viewer can be let see costs (audit security-roles-16)",
+    "ae6da89 R7 auth-security: a viewer's Savings page shows the diesel saved, the verified days and the days table's litres, which are not money, and the table's note says only costs and savings are hidden (audit role-viewer-19)",
+    "38e5272 R7 auth-security: the battery's Economics card and the equipment forms' money settings are for see_money_settings (administrator and analyst); an operator reads \"Hidden for your role\" there and the wear tile names the wear price in words (audit role-operator-06, pages-C-20)"
+   ],
+   "dirty": []
+  }
+ },
+ "founder-console": {
+  "key": "founder-console",
+  "stage": 1,
+  "title": "Founder console, companies and backups",
+  "batches_total": 4,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "founder-console-09": {
+    "status": "implemented",
+    "summary": "Signing out now ends the founder session on the server, not only in the browser. There is a new route, POST /api/founder/logout {everywhere?}. It stores only the sha256 of the token (founder.token_id, store_founder.sign_out), and the server then refuses that token with 401 founder_session_ended. With everywhere=true, every founder session made so far ends (store_founder.end_sessions). The first time the server sees a new founder password hash (or session secret), it ends every earlier session once, before it makes a new one, so the new password's first session still works (store_founder.sessio",
+    "reason": "",
+    "commits": [
+     "860da67 (backend)",
+     "60e8e17 (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_founder_console.py::test_signing_out_ends_the_founder_session_on_the_server_and_only_that_one",
+     "backend/tests/test_fix_r7_founder_console.py::test_signing_out_everywhere_ends_every_founder_session",
+     "backend/tests/test_fix_r7_founder_console.py::test_a_new_founder_password_ends_every_session_made_with_the_old_one",
+     "backend/tests/test_fix_r7_founder_console.py::test_a_new_password_seen_first_by_a_sign_in_ends_the_old_sessions_but_not_the_new_one",
+     "backend/tests/test_founder.py (route list now includes the logout route; the route walk signs out last, with a fresh session for each body)",
+     "frontend/src/features/ops/founder-session.test.tsx (4 tests)"
+    ]
+   },
+   "founder-console-01": {
+    "status": "implemented",
+    "summary": "Added the missing scripts/restore_backup.py to the backend repository. It lists the companies, lists a company's copies (Pakistan time, sizes in MB), and restores one by company id or name. It refuses with exit status 2 and one sentence while the launcher's data-folder lock is held (the lock is the same as start_local.hold's, and the script holds it during the restore), and for an unknown company or copy. backups.restore now puts back the copy as one set, all from the same copy: the workspace file, the telemetry file taken with it (an empty one when the copy had none, so no later telemetry is ",
+    "reason": "",
+    "commits": [
+     "cd1cd47 (backend)",
+     "039e395 (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_founder_console.py::test_a_restore_puts_back_the_workspace_its_telemetry_and_its_keys_together",
+     "backend/tests/test_fix_r7_founder_console.py::test_a_copy_made_with_no_telemetry_restores_an_empty_telemetry_file",
+     "backend/tests/test_fix_r7_founder_console.py::test_the_restore_script_the_backups_page_names_exists_and_restores_a_company",
+     "backend/tests/test_fix_r7_founder_console.py::test_the_restore_script_refuses_while_the_launcher_holds_the_data_folder",
+     "frontend/src/features/ops/founder-backups.test.tsx::names the restore script that exists, with the company's id, and says switched-off companies are not copied each day"
+    ]
+   },
+   "security-roles-12": {
+    "status": "implemented",
+    "summary": "A GRIDLYTICS_FOUNDER_SESSION_SECRET shorter than 32 characters (identity.SECRET_CHARS, the same limit as GRIDLYTICS_LOCAL_JWT_SECRET) is now refused. founder.check_startup raises a RuntimeError when routes_founder loads, so the API does not start. founder.malformed() also lists the secret, so every founder route answers 503 'unavailable' with a sentence that never repeats the value. A new command, python -m gridlytics.founder session-secret, prints a 64-character secret. If no secret is set at all, the console stays off (503) and the API still starts.",
+    "reason": "",
+    "commits": [
+     "cf34c33 (backend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_founder_console.py::test_a_short_founder_session_secret_is_refused_by_the_console",
+     "backend/tests/test_fix_r7_founder_console.py::test_the_founders_command_line_makes_a_session_secret_long_enough",
+     "backend/tests/test_fix_r7_founder_console.py::test_the_api_does_not_start_with_a_short_founder_session_secret"
+    ]
+   },
+   "founder-console-12": {
+    "status": "implemented",
+    "summary": "The backup list now shows each copy as one set. backups.list_backups returns {name, kind, modified, bytes, workspace_bytes, telemetry, telemetry_bytes, keys}: 'telemetry' names the telemetry copy (null when there was none), 'keys' counts the signing keys, and 'bytes' is the whole copy's size, workspace plus telemetry. prune now removes a copy's telemetry file and keys folder along with its workspace copy; before, the telemetry copies were never removed. The Backups page has one row per set in two columns ('Copy' and 'Size'), so a 375 px screen shows the size. Each row shows the time in Karachi",
+    "reason": "",
+    "commits": [
+     "cd1cd47 (backend)",
+     "039e395 (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_founder_console.py::test_a_copy_lists_its_telemetry_its_keys_and_their_whole_size_and_is_pruned_as_one",
+     "backend/tests/test_founder.py::test_backups_are_per_company_and_reachable_only_by_the_founder (new fields)",
+     "frontend/src/features/ops/founder-backups.test.tsx (lists each copy...; two columns; sizes in MB)"
+    ]
+   },
+   "frontend-states-formats-17": {
+    "status": "implemented",
+    "summary": "The founder route already sent UTC with its offset: since the lift (R-408), store_founder._backups_here re-read the file times and ignored list_backups' times. So the console's displayed time could not actually be 5 hours off through that route. The line the finding cites, backups.list_backups writing datetime.fromtimestamp(st_mtime).isoformat() with no zone, was still the root, and the new restore script reads it. That line now writes datetime.fromtimestamp(st_mtime, timezone.utc). _backups_here now just returns list_backups, so there is one source for the time. The page shows the time throug",
+    "reason": "",
+    "commits": [
+     "cd1cd47 (backend)",
+     "039e395 (frontend)"
+    ],
+    "tests": [
+     "backend/tests/test_fix_r7_founder_console.py::test_the_backup_list_says_its_times_in_utc",
+     "frontend/src/features/ops/founder-backups.test.tsx::lists each copy with its telemetry and keys, its whole size in MB and its time in Karachi"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "Company and user management",
+    "ids": [
+     "founder-console-04",
+     "founder-console-10",
+     "founder-console-05",
+     "founder-console-16",
+     "founder-console-13",
+     "founder-console-18"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Console UI and wording",
+    "ids": [
+     "founder-console-02",
+     "founder-console-03",
+     "founder-console-11",
+     "founder-console-14",
+     "founder-console-17",
+     "founder-console-19",
+     "pages-A-07"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Late: owner-applied Supabase mode: project SQL for review, membership-state refusals",
+    "ids": [
+     "parity-supabase-auth-03",
+     "parity-supabase-auth-09"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/founder-console",
+   "head": "cd1cd47",
+   "commits": [
+    "cd1cd47 R7 founder-console: a backup is one set (workspace, telemetry, signing keys), listed with real sizes in UTC, pruned and restored together, with scripts/restore_backup.py (audit founder-console-01, founder-console-12, frontend-states-formats-17)",
+    "860da67 R7 founder-console: founder sign-out ends the session on the server, sign out everywhere, and a new founder password ends every session (audit founder-console-09)",
+    "cf34c33 R7 founder-console: refuse a founder session secret shorter than 32 characters, at start-up and on every founder route (audit security-roles-12)"
+   ],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/founder-console",
+   "head": "039e395",
+   "commits": [
+    "039e395 R7 founder-console: the Backups page lists each copy as one set (workspace, telemetry, keys) in MB and Karachi time, names the restore script that now exists, and says switched-off companies are not copied daily (audit founder-console-01, founder-console-12, frontend-states-formats-17)",
+    "60e8e17 R7 founder-console: Sign out ends the founder session on the server, Sign out everywhere, and the login says why the server ended a session (audit founder-console-09, security-roles-12 in the contract)"
+   ],
+   "dirty": []
+  }
+ },
+ "shell-nav": {
+  "key": "shell-nav",
+  "stage": 1,
+  "title": "Web shell: titles, focus, navigation by role and site, header, switcher, shell states",
+  "batches_total": 4,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "frontend-a11y-01": {
+    "status": "implemented",
+    "summary": "Each route now carries its page name in its `handle` (app/router.tsx). Company pages use their own headings (Fleet, Alerts, Reports, Tariffs, Company settings, My account, Add a site). Site pages use the menu's words through the new sitePageLabel() in nav.ts, which the breadcrumb now uses too. The not-found route is 'Page not found'. The shell sets the tab title with useDocumentTitle (components/layout/route-title.ts): 'Plan \u00b7 Faisalabad textile mill (demo) \u00b7 Gridlytics' on a site page, 'No such site \u00b7 Gridlytics' for a 404 site, and the same strings PageHeader already writes on company pages.",
+    "reason": "",
+    "commits": [
+     "3a56828"
+    ],
+    "tests": [
+     "frontend/src/components/layout/app-shell.test.tsx: 'names the page in the tab, with the site's name on a site's page'",
+     "frontend/src/components/layout/app-shell.test.tsx: 'moves focus to the new page's heading after a navigation, and leaves it alone on the first load'",
+     "frontend/src/app/router.test.tsx: 'names every page of the app in its route, a site's pages with the menu's own words'",
+     "frontend/src/app/router.test.tsx: 'titles a site's page with the page and the site'"
+    ]
+   },
+   "frontend-a11y-02": {
+    "status": "implemented",
+    "summary": "A 'Skip to main content' link is now the first Tab stop on every shell page. It sits off screen until it has focus, and it is placed outside the shell's grid so showing it does not move the layout. Activating it focuses <main id=\"main\" tabIndex={-1}> without adding '#main' to the address (preventDefault, then focus). This also covers duplicates role-viewer-11, role-owner-12, role-operator-25 and role-analyst-22. A browser screenshot of the worktree app confirms the link appears at the top left on the first Tab.",
+    "reason": "",
+    "commits": [
+     "055219f"
+    ],
+    "tests": [
+     "frontend/src/components/layout/app-shell.test.tsx: 'offers 'Skip to main content' as the first Tab stop, and it moves focus into the page'"
+    ]
+   },
+   "role-owner-19": {
+    "status": "implemented",
+    "summary": "Added components/layout/not-found.tsx: an h1, one plain sentence and a 'Go to the fleet' button. The '*' route uses it ('There is no such page', tab title 'Page not found'). SiteLayout uses it for a site that answers 404 ('There is no such site', tab title 'No such site'). The shell's useShellSite now treats a route site that answers 404 as no site, so the Site group links, the phone's short menu, Pilot set-up, the tier chip and the DEMO ribbon offer nothing for it. A site is now remembered as the last one worked on only after it has answered, so a bad id is never stored. This also covers dupl",
+    "reason": "",
+    "commits": [
+     "c94baac"
+    ],
+    "tests": [
+     "frontend/src/components/layout/app-shell.test.tsx: 'says so under a heading, with a way back, and the menu offers no links to the missing site'",
+     "frontend/src/app/router.test.tsx: 'answers an unknown address with a heading, a title and a way back to the fleet'",
+     "frontend/src/app/router.test.tsx: 'answers a site the company does not have with a heading and a way back, and no links to it'"
+    ]
+   },
+   "frontend-states-formats-22": {
+    "status": "implemented",
+    "summary": "RouteErrorBoundary no longer shows a JavaScript error's message as the explanation. It says in a plain sentence what happened and what to do: reload, and tell your administrator if it happens again. The program's own message is kept under a closed 'Technical details' disclosure. A failed lazy chunk, which often follows a new release, gets its own sentence: 'Its code could not be loaded ... Reload the page'. An ApiError shows the server's own sentence, which is already written for people. A router 404 says 'There is no such page'. The heading 'This page could not be drawn' is unchanged, so the ",
+    "reason": "",
+    "commits": [
+     "0879fd2"
+    ],
+    "tests": [
+     "frontend/src/components/ui/route-error-boundary.test.tsx (3 tests: plain sentence with the raw message hidden in details; chunk-load failure; ApiError sentence shown)"
+    ]
+   },
+   "role-owner-41": {
+    "status": "implemented",
+    "summary": "The router's page() helper now gives every lazy route (all 19 pages and /admin/*) a HydrateFallback, the PageLoading spinner. On first load the guards and the shell draw at once, with the spinner where the page will be. React Router no longer logs 'No `HydrateFallback` element provided to render during initial hydration'. Before the fix, the test saw the warning on a first load of /alerts. After it, the worktree app's console was clean on /fleet, /nosuchpage and /sites/doesnotexist. This also covers duplicate role-operator-33.",
+    "reason": "",
+    "commits": [
+     "2e14bd6"
+    ],
+    "tests": [
+     "frontend/src/app/router.test.tsx: 'draws a lazy page on the first load without React Router's 'No HydrateFallback' warning'",
+     "frontend/src/app/router.test.tsx: 'gives every lazy page a loading fallback and an error boundary'"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "Navigation by role and site",
+    "ids": [
+     "pages-A-05",
+     "pages-A-13",
+     "role-owner-34",
+     "pages-C-18",
+     "pages-A-14",
+     "role-owner-33"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Site switcher and shell states",
+    "ids": [
+     "pages-A-12",
+     "frontend-states-formats-13",
+     "frontend-a11y-20",
+     "role-viewer-25",
+     "frontend-a11y-22"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Late: build settings in env.ts",
+    "ids": [
+     "parity-architecture-04",
+     "tests-and-perf-16"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/shell-nav",
+   "head": "ab83058",
+   "commits": [],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/shell-nav",
+   "head": "0cf91f2",
+   "commits": [
+    "0cf91f2 WIP (interrupted, unreviewed): shell-nav, batch 2 (Navigation by role and site; audit pages-A-05, pages-A-13, role-owner-34, pages-C-18, pages-A-14, role-owner-33)",
+    "4970099 R7 shell-nav: Outages is not listed for an off-grid site, read from its connection or its off-grid record (audit pages-C-18)",
+    "96d5120 R7 shell-nav: Pilot set-up is listed with the site's pages, and the control plane is named \"Control\" apart from \"Devices and data\" in the menu, tab title, breadcrumb and the links to it (audit role-owner-34, role-viewer-12)",
+    "3d52be3 R7 shell-nav: the menu marks one current page on the company's settings, Members on ?view=members and Settings on every other tab (audit pages-A-13, role-owner-17, role-analyst-21, role-operator-24, flow-reports-alerts-members-keys-22)",
+    "c94baac R7 shell-nav: not-found pages have a heading and a way back, and an unknown site leaves no live site links in the menu (audit role-owner-19, role-viewer-23)",
+    "055219f R7 shell-nav: a \"Skip to main content\" link is the first Tab stop of every page (audit frontend-a11y-02, role-viewer-11, role-owner-12, role-operator-25, role-analyst-22)",
+    "3a56828 R7 shell-nav: every page names itself and its site in the browser tab, and focus moves to the new page's heading (audit frontend-a11y-01, frontend-states-formats-08, role-viewer-10, role-owner-18)",
+    "2e14bd6 R7 shell-nav: every lazy page has a loading fallback, so React Router no longer warns on each load (audit role-owner-41, role-operator-33)",
+    "0879fd2 R7 shell-nav: the route error boundary says a plain sentence, with the program's message under \"Technical details\" (audit frontend-states-formats-22)"
+   ],
+   "dirty": []
+  }
+ },
+ "ui-charts-a11y": {
+  "key": "ui-charts-a11y",
+  "stage": 1,
+  "title": "Shared UI, charts, wizard and formats: contrast, axes, tables, heatmaps",
+  "batches_total": 4,
+  "batches_done": [
+   1
+  ],
+  "review": null,
+  "findings": {
+   "frontend-a11y-03": {
+    "status": "implemented",
+    "summary": "Changed --color-muted from #64748b to #5b6576 in frontend/src/styles/index.css. Muted text now reaches 4.7:1 or more on every background it sits on: the page (5.49), white (5.89), surface-2 table headers and NotForRole (5.29), brand-soft selected cards (5.22), line and each soft tone. It stays lighter than ink-2. Changing the token fixes every call site the finding cites, including the founder console's .fc .table th, with no edits at those sites. A new shared helper, src/test/contrast.ts, gives the WCAG ratio and reads the @theme tokens from index.css. A follow-up commit makes the helper reac",
+    "reason": "",
+    "commits": [
+     "832ad56",
+     "39a2bdc"
+    ],
+    "tests": [
+     "frontend/src/styles/contrast.test.ts"
+    ]
+   },
+   "frontend-a11y-14": {
+    "status": "implemented",
+    "summary": "Added a new token, --color-line-strong (#7a8597). It measures 3.73:1 on a card, 3.48:1 on the page and 3.36:1 on a disabled field. It is now the border of inputClass, selectClass and textareaClass in components/ui/field.tsx, of the founder console's .fc inputs and selects in index.css, and of the site switcher's trigger. --color-line stays as the colour of dividers and card edges, which do not mark out a control. Tests check the token's contrast, the border class of each shared control class, the founder CSS rule and the rendered site-switcher trigger.",
+    "reason": "",
+    "commits": [
+     "fa58a1e"
+    ],
+    "tests": [
+     "frontend/src/components/ui/field.test.tsx"
+    ]
+   },
+   "frontend-a11y-15": {
+    "status": "implemented",
+    "summary": "Darkened the three chart colours that failed, in lib/colors.ts and the --color-pv token. PV is now #c27c0e: the same amber hue, 3.40:1 on white (was 2.15). Export is #0284c7 (4.10, was 2.54), a sky blue kept apart from grid #2563eb. The muted series grey for 'Native settings SoC' and 'Clear sky' is #7a8597 (3.73, was 2.56). Every solid SOURCE colour now reaches 3:1, and the @theme tokens match SOURCE. In the data-quality strip, a 0 % day is now red like any day below 80 %, which matches the hint 'red below' (it was bg-line, 1.25:1). A day with no data is a dashed outlined cell, border-muted at",
+    "reason": "",
+    "commits": [
+     "af69ac5"
+    ],
+    "tests": [
+     "frontend/src/lib/colors.test.ts",
+     "frontend/src/components/charts/energy-flow.test.tsx",
+     "frontend/src/features/telemetry/data-quality-contrast.test.tsx"
+    ]
+   },
+   "frontend-a11y-11": {
+    "status": "implemented",
+    "summary": "Segmented now behaves as the radio group it announces to screen readers, following the ARIA APG pattern. It has one tab stop, on the checked option, or on the first option when none is checked. ArrowRight or ArrowDown and ArrowLeft or ArrowUp move the focus with wrap-around, Home and End go to the ends, and the focused option is chosen. The change is inside the component only, so none of the 7 call sites needed an edit. Tests cover the single tab stop, arrows with wrap-around, Home and End, and the case where no option is checked.",
+    "reason": "",
+    "commits": [
+     "f889025"
+    ],
+    "tests": [
+     "frontend/src/components/ui/segmented.test.tsx"
+    ]
+   }
+  },
+  "remaining_batches": [
+   {
+    "batch": 2,
+    "theme": "Charts: time axes, units, text alternatives",
+    "ids": [
+     "frontend-states-formats-04",
+     "frontend-a11y-05",
+     "role-viewer-13",
+     "role-owner-22",
+     "frontend-a11y-18",
+     "role-owner-29"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Tables, heatmaps and KPI tiles",
+    "ids": [
+     "role-operator-09",
+     "role-operator-21",
+     "role-owner-28",
+     "role-owner-39",
+     "frontend-states-formats-23"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Lettered wizard",
+    "ids": [
+     "frontend-a11y-09",
+     "frontend-a11y-10",
+     "frontend-states-formats-21",
+     "flow-onboarding-21"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/ui-charts-a11y",
+   "head": "ab83058",
+   "commits": [],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/ui-charts-a11y",
+   "head": "f889025",
+   "commits": [
+    "f889025 R7 ui-charts-a11y: Segmented behaves as a radio group from the keyboard (audit frontend-a11y-11)",
+    "39a2bdc R7 ui-charts-a11y: the contrast test helper reads index.css under the app's typecheck (audit frontend-a11y-03)",
+    "af69ac5 R7 ui-charts-a11y: chart colours, strip cells and EnergyFlow labels reach their contrast (audit frontend-a11y-15)",
+    "fa58a1e R7 ui-charts-a11y: form controls draw their border at 3:1 (audit frontend-a11y-14)",
+    "832ad56 R7 ui-charts-a11y: muted text reads at 4.5:1 on the page, table headers and selected cards (audit frontend-a11y-03)"
+   ],
+   "dirty": []
+  }
+ },
+ "demo-seed": {
+  "key": "demo-seed",
+  "stage": 1,
+  "title": "Demo seed and demo narrative consistency",
+  "batches_total": 1,
+  "batches_done": [],
+  "review": null,
+  "findings": {},
+  "remaining_batches": [
+   {
+    "batch": 1,
+    "theme": "Demo narrative, history and build",
+    "ids": [
+     "role-owner-15",
+     "engine-delivery-18",
+     "engine-plans-live-20",
+     "pages-A-04",
+     "role-operator-29",
+     "security-roles-15",
+     "tracker-and-docs-21"
+    ]
+   }
+  ],
+  "gridlytics-backend": {
+   "branch": "audit/demo-seed",
+   "head": "ab83058",
+   "commits": [],
+   "dirty": []
+  },
+  "gridlytics-frontend": {
+   "branch": "audit/demo-seed",
+   "head": "499cebb",
+   "commits": [],
+   "dirty": []
+  }
+ },
+ "savings-ui-crosscut": {
+  "key": "savings-ui-crosscut",
+  "stage": 2,
+  "title": "Stage 2: cross-module engine work, Savings page, pilot go/no-go, audit, and cross-page consistency sweeps",
+  "batches_total": 8,
+  "batches_done": [],
+  "review": null,
+  "findings": {},
+  "remaining_batches": [
+   {
+    "batch": 1,
+    "theme": "Cross-module engine: connections, metering factor and duty; Mode B and genset charging end to end; event re-solves",
+    "ids": [
+     "tracker-and-docs-01",
+     "engine-savings-09",
+     "engine-delivery-17",
+     "engine-plans-live-18",
+     "brief-vs-build-15",
+     "engine-tariffs-09"
+    ]
+   },
+   {
+    "batch": 2,
+    "theme": "Fee card and headline display",
+    "ids": [
+     "pages-D-01",
+     "role-operator-19",
+     "role-analyst-23",
+     "frontend-states-formats-12",
+     "pages-D-21"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Pilot go/no-go, switchback tiles, KPIs and audit",
+    "ids": [
+     "pages-D-12",
+     "pages-D-05",
+     "security-roles-04",
+     "brief-vs-build-13"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Exports and recompute",
+    "ids": [
+     "pages-D-06",
+     "pr-review-05",
+     "pr-review-07",
+     "pr-review-08"
+    ]
+   },
+   {
+    "batch": 5,
+    "theme": "Savings ledger, days table and daily chart",
+    "ids": [
+     "flow-savings-pilot-bill-17",
+     "flow-savings-pilot-bill-18",
+     "flow-savings-pilot-bill-20",
+     "pages-D-22",
+     "pages-D-20",
+     "flow-savings-pilot-bill-19",
+     "pages-D-23"
+    ]
+   },
+   {
+    "batch": 6,
+    "theme": "Cross-page consistency: fuel units, off-grid site, dates and raw keys, role gating",
+    "ids": [
+     "frontend-states-formats-01",
+     "role-operator-10",
+     "frontend-states-formats-02",
+     "role-analyst-24",
+     "role-owner-37",
+     "role-viewer-20"
+    ]
+   },
+   {
+    "batch": 7,
+    "theme": "Cross-page a11y, written dates and freshness",
+    "ids": [
+     "frontend-a11y-08",
+     "frontend-a11y-13",
+     "frontend-a11y-17",
+     "role-operator-28",
+     "frontend-states-formats-20",
+     "role-analyst-29"
+    ]
+   },
+   {
+    "batch": 8,
+    "theme": "Late: engine version on stored results, deleted sites, lifted wording",
+    "ids": [
+     "parity-architecture-12",
+     "flow-reports-alerts-members-keys-14",
+     "flow-reports-alerts-members-keys-27"
+    ]
+   }
+  ]
+ },
+ "tests-ci": {
+  "key": "tests-ci",
+  "stage": 2,
+  "title": "Tests and browser check: engine acceptance tests, default suite, e2e",
+  "batches_total": 3,
+  "batches_done": [],
+  "review": null,
+  "findings": {},
+  "remaining_batches": [
+   {
+    "batch": 1,
+    "theme": "Acceptance tests, default suite and browser check",
+    "ids": [
+     "tracker-and-docs-08",
+     "pr-review-01",
+     "tracker-and-docs-15",
+     "tracker-and-docs-17",
+     "tracker-and-docs-22",
+     "frontend-a11y-24"
+    ]
+   },
+   {
+    "batch": 2,
+    "theme": "Late: test infrastructure: sibling contract tests, lifted guard tests, company isolation, load-independent optimiser tests",
+    "ids": [
+     "parity-architecture-09",
+     "parity-architecture-10",
+     "tests-and-perf-14",
+     "tests-and-perf-12"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Late: missing suites: Part 7.4 contract suite, outage forecaster outputs, onboarding activation, behaviour not constants",
+    "ids": [
+     "tests-and-perf-15",
+     "tests-and-perf-24",
+     "tests-and-perf-19",
+     "tests-and-perf-20"
+    ]
+   }
+  ]
+ },
+ "parity-ui": {
+  "key": "parity-ui",
+  "stage": 3,
+  "title": "Boxlytics UI/UX parity: fonts, tokens, logo, shell look, landing, sign-in, help",
+  "batches_total": 3,
+  "batches_done": [],
+  "review": null,
+  "findings": {},
+  "remaining_batches": [
+   {
+    "batch": 1,
+    "theme": "Brand foundations: fonts, tokens, logo",
+    "ids": [
+     "parity-boxlytics-ui-02",
+     "parity-boxlytics-ui-04",
+     "parity-boxlytics-ui-03",
+     "parity-boxlytics-ui-07"
+    ]
+   },
+   {
+    "batch": 2,
+    "theme": "Public pages: landing, sign-in, help, head tags",
+    "ids": [
+     "parity-boxlytics-ui-01",
+     "parity-boxlytics-ui-09",
+     "parity-boxlytics-ui-17",
+     "parity-boxlytics-ui-08"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "Shell and component look",
+    "ids": [
+     "parity-boxlytics-ui-05",
+     "parity-boxlytics-ui-06",
+     "parity-boxlytics-ui-10",
+     "parity-boxlytics-ui-11",
+     "parity-boxlytics-ui-12",
+     "parity-boxlytics-ui-13",
+     "parity-boxlytics-ui-14"
+    ]
+   }
+  ]
+ },
+ "docs": {
+  "key": "docs",
+  "stage": 3,
+  "title": "Docs, tracker and handoff corrections",
+  "batches_total": 4,
+  "batches_done": [],
+  "review": null,
+  "findings": {},
+  "remaining_batches": [
+   {
+    "batch": 1,
+    "theme": "HANDOFF and README",
+    "ids": [
+     "tracker-and-docs-11",
+     "brief-vs-build-14",
+     "pr-review-12",
+     "pr-review-13",
+     "tracker-and-docs-23",
+     "tracker-and-docs-16"
+    ]
+   },
+   {
+    "batch": 2,
+    "theme": "Tracker ticks",
+    "ids": [
+     "tracker-and-docs-09",
+     "tracker-and-docs-12",
+     "tracker-and-docs-13",
+     "tracker-and-docs-20"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "API contract and design log",
+    "ids": [
+     "pages-A-18",
+     "tracker-and-docs-18",
+     "tracker-and-docs-19",
+     "pr-review-10"
+    ]
+   },
+   {
+    "batch": 4,
+    "theme": "Late: CLAUDE.md, the family docs set and Boxlytics provenance",
+    "ids": [
+     "parity-architecture-08",
+     "parity-architecture-14",
+     "parity-architecture-15"
+    ]
+   }
+  ]
+ },
+ "storage-perf": {
+  "key": "storage-perf",
+  "stage": 2,
+  "title": "Storage growth, read paths, scheduler capacity and payload cost (plan retention, telemetry and plan reads, tick observability, jobs, compression, bundles)",
+  "batches_total": 3,
+  "batches_done": [],
+  "review": null,
+  "findings": {},
+  "remaining_batches": [
+   {
+    "batch": 1,
+    "theme": "Plan store and scheduler: plan retention, tick failures and a scheduler test, tick timing and capacity",
+    "ids": [
+     "performance-live-01",
+     "parity-architecture-06",
+     "tests-and-perf-13",
+     "performance-live-09",
+     "performance-live-11"
+    ]
+   },
+   {
+    "batch": 2,
+    "theme": "Server read paths and long requests: solves as jobs, /now cost and freshness, plans.active_at, tick history reads, capture photo",
+    "ids": [
+     "performance-live-05",
+     "performance-live-02",
+     "tests-and-perf-10",
+     "tests-and-perf-07",
+     "tests-and-perf-09",
+     "tests-and-perf-08"
+    ]
+   },
+   {
+    "batch": 3,
+    "theme": "What the browser downloads and polls: shell fleet poll, compression, chart bundles",
+    "ids": [
+     "performance-live-08",
+     "performance-live-10",
+     "performance-live-12",
+     "tests-and-perf-17"
+    ]
+   }
+  ]
+ },
+ "deploy-ci": {
+  "key": "deploy-ci",
+  "stage": 3,
+  "title": "Deployment, CI and repository shape: workflows, Docker and deploy settings, Vercel, secret ignore rules, lint gate, dependencies, lifted-code drift",
+  "batches_total": 2,
+  "batches_done": [],
+  "review": null,
+  "findings": {},
+  "remaining_batches": [
+   {
+    "batch": 1,
+    "theme": "CI and deployment: workflows, Docker image and deploy settings, Vercel, release scripts, pins and audit",
+    "ids": [
+     "parity-architecture-01",
+     "parity-architecture-02",
+     "parity-architecture-03",
+     "parity-architecture-16",
+     "parity-architecture-20"
+    ]
+   },
+   {
+    "batch": 2,
+    "theme": "Repository hygiene: secret ignore rules, lifted-code drift, lint and format gate, unused dependencies, caches",
+    "ids": [
+     "parity-architecture-13",
+     "parity-architecture-07",
+     "parity-architecture-18",
+     "parity-architecture-19",
+     "parity-architecture-21"
+    ]
+   }
+  ]
+ }
+}

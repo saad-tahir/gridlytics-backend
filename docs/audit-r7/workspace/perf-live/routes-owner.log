@@ -1,0 +1,190 @@
+  0.005   0.006      2642 200            - meta
+  0.067   0.075      8672 200            - fleet
+  0.007   0.010       155 200            - alerts/counts
+  0.007   0.009      2246 200            - alerts active
+  0.006   0.008      3049 200            - alerts all
+  0.005   0.005       708 200            - alerts/rules
+  0.006   0.006       391 200            - demo
+  0.008   0.008      5550 200            - reports
+  0.013   0.014     11473 200            - tariffs
+  0.006   0.007      2084 200            - tariffs/fuel
+  0.010   0.010      8113 200            - drafts
+  0.007   0.007     18869 200            - sites
+  0.006   0.007      1750 200            - users
+  0.005   0.006       120 200            - platform/org
+  0.005   0.006      2523 200            - platform/keys
+  0.009   0.009     70316 200            - audit
+  0.004   0.006       662 200            - local/context
+  0.009   0.011      2980 200   Faisalabad site
+  0.120   0.142      2663 200   Faisalabad now
+  0.014   0.015     70794 200   Faisalabad overview/chart 24h
+  0.022   0.023    116624 200   Faisalabad plan
+  0.016   0.017     69311 200   Faisalabad plans
+  0.017   0.020    115800 200   Faisalabad plans/:id
+  0.032   0.045      4321 200   Faisalabad plan/compare
+  0.006   0.020         2 200   Faisalabad overrides
+  0.012   0.016      2765 200   Faisalabad control
+  0.014   0.014       370 200   Faisalabad edge
+  0.008   0.009       650 200   Faisalabad telemetry/quality 14
+  0.007   0.007       690 200   Faisalabad telemetry/quality 30
+  0.006   0.008       381 200   Faisalabad native
+  0.040   0.045      4964 200   Faisalabad savings this_month
+  0.029   0.030      3508 200   Faisalabad savings last_month
+  0.042   0.046      6741 200   Faisalabad savings last_30
+  0.014   0.332      1170 200   Faisalabad switchback
+  0.006   0.006      1494 200   Faisalabad bills
+  0.011   0.014       763 200   Faisalabad savings/export.csv
+  0.007   0.007      1351 200   Faisalabad pilot
+  0.006   0.006      1519 200   Faisalabad pilot/calendar.ics
+  0.019   0.020     51694 200   Faisalabad telemetry 24h default names
+  0.014   0.015     31417 200   Faisalabad telemetry 7d default names
+  0.029   0.029     71234 200   Faisalabad telemetry 30d default names
+  0.025   0.030     18476 200   Faisalabad telemetry 90d default names
+  0.021   0.022     51524 200   Faisalabad telemetry 7d all names
+  0.006   0.006       103 422   Faisalabad telemetry 24h res=raw
+  0.011   0.013      2529 200   Faisalabad telemetry grid_present 7d 1h
+  0.010   0.012      1689 200   Faisalabad heatmap load 7
+  0.013   0.015      1717 200   Faisalabad heatmap load 28
+  0.018   0.021      1717 200   Faisalabad heatmap load 90
+  0.216   0.218   2186260 200   Faisalabad telemetry/export.csv 14d
+  0.009   0.011     10809 200   Faisalabad forecasts/pv
+  0.012   0.014     13794 200   Faisalabad forecasts/load
+  0.008   0.008      5835 200   Faisalabad forecasts/outage
+  0.007   0.009      2753 200   Faisalabad forecasts/scores 30
+  0.040   0.040     20654 200   Faisalabad outages 7
+  0.070   0.078     21962 200   Faisalabad outages 30
+  0.071   0.077     21962 200   Faisalabad outages 90
+  0.141   0.144     17672 200   Faisalabad battery
+  0.071   0.110      1835 200   Faisalabad genset 14
+  0.007   0.009        11 200   Faisalabad genset/fuel
+  0.080   0.098      2840 200   Faisalabad prices
+  0.008   0.008      2858 200      Karachi site
+  0.121   0.126      2290 200      Karachi now
+  0.014   0.015     71908 200      Karachi overview/chart 24h
+  0.016   0.017    117763 200      Karachi plan
+  0.014   0.016     69143 200      Karachi plans
+  0.018   0.020    116839 200      Karachi plans/:id
+  0.034   0.039      4325 200      Karachi plan/compare
+  0.007   0.007         2 200      Karachi overrides
+  0.010   0.013      3542 200      Karachi control
+  0.008   0.008       201 200      Karachi edge
+  0.007   0.009       650 200      Karachi telemetry/quality 14
+  0.007   0.008       690 200      Karachi telemetry/quality 30
+  0.008   0.008       393 200      Karachi native
+  0.030   0.031      5102 200      Karachi savings this_month
+  0.025   0.026      3484 200      Karachi savings last_month
+  0.051   0.055      6844 200      Karachi savings last_30
+  0.007   0.011        27 200      Karachi switchback
+  0.007   0.007      4781 200      Karachi bills
+  0.015   0.025       769 200      Karachi savings/export.csv
+  0.006   0.009       528 200      Karachi pilot
+  0.006   0.009        83 200      Karachi pilot/calendar.ics
+  0.020   0.020     57923 200      Karachi telemetry 24h default names
+  0.015   0.025     35489 200      Karachi telemetry 7d default names
+  0.030   0.038     78320 200      Karachi telemetry 30d default names
+  0.018   0.022     20122 200      Karachi telemetry 90d default names
+  0.023   0.023     55491 200      Karachi telemetry 7d all names
+  0.006   0.006       103 422      Karachi telemetry 24h res=raw
+  0.009   0.013      2529 200      Karachi telemetry grid_present 7d 1h
+  0.009   0.011      1753 200      Karachi heatmap load 7
+  0.013   0.014      1760 200      Karachi heatmap load 28
+  0.014   0.014      1760 200      Karachi heatmap load 90
+  0.194   0.212   2324396 200      Karachi telemetry/export.csv 14d
+  0.010   0.011     11085 200      Karachi forecasts/pv
+  0.011   0.014     14246 200      Karachi forecasts/load
+  0.009   0.010      5853 200      Karachi forecasts/outage
+  0.009   0.011      2732 200      Karachi forecasts/scores 30
+  0.038   0.041     19378 200      Karachi outages 7
+  0.061   0.072     19661 200      Karachi outages 30
+  0.066   0.071     19662 200      Karachi outages 90
+  0.140   0.140     18583 200      Karachi battery
+  0.043   0.050      1034 200      Karachi genset 14
+  0.006   0.006        11 200      Karachi genset/fuel
+  0.086   0.087      2841 200      Karachi prices
+  0.007   0.007      2938 200       Lahore site
+  0.131   0.142      2666 200       Lahore now
+  0.015   0.016     70932 200       Lahore overview/chart 24h
+  0.023   0.024    116975 200       Lahore plan
+  0.016   0.027     68739 200       Lahore plans
+  0.017   0.017    116426 200       Lahore plans/:id
+  0.034   0.035      4323 200       Lahore plan/compare
+  0.006   0.006         2 200       Lahore overrides
+  0.012   0.012      3073 200       Lahore control
+  0.013   0.119       201 200       Lahore edge
+  0.007   0.009       650 200       Lahore telemetry/quality 14
+  0.008   0.011       690 200       Lahore telemetry/quality 30
+  0.007   0.010       393 200       Lahore native
+  0.032   0.058      4990 200       Lahore savings this_month
+  0.027   0.027      3424 200       Lahore savings last_month
+  0.049   0.050      6702 200       Lahore savings last_30
+  0.008   0.012        27 200       Lahore switchback
+  0.007   0.008      1441 200       Lahore bills
+  0.013   0.015       830 200       Lahore savings/export.csv
+  0.007   0.008       528 200       Lahore pilot
+  0.007   0.007        83 200       Lahore pilot/calendar.ics
+  0.018   0.024     51553 200       Lahore telemetry 24h default names
+  0.016   0.021     30928 200       Lahore telemetry 7d default names
+  0.031   0.032     70413 200       Lahore telemetry 30d default names
+  0.019   0.027     18043 200       Lahore telemetry 90d default names
+  0.022   0.029     51056 200       Lahore telemetry 7d all names
+  0.006   0.006       103 422       Lahore telemetry 24h res=raw
+  0.011   0.012      2529 200       Lahore telemetry grid_present 7d 1h
+  0.016   0.027      1696 200       Lahore heatmap load 7
+  0.017   0.017      1699 200       Lahore heatmap load 28
+  0.019   0.059      1699 200       Lahore heatmap load 90
+  0.204   0.219   2208795 200       Lahore telemetry/export.csv 14d
+  0.015   0.017     10582 200       Lahore forecasts/pv
+  0.011   0.013     13747 200       Lahore forecasts/load
+  0.014   0.017      5851 200       Lahore forecasts/outage
+  0.010   0.010      2738 200       Lahore forecasts/scores 30
+  0.037   0.048     19535 200       Lahore outages 7
+  0.074   0.076     20385 200       Lahore outages 30
+  0.061   0.067     20385 200       Lahore outages 90
+  0.120   0.132     17502 200       Lahore battery
+  0.062   0.064      1858 200       Lahore genset 14
+  0.007   0.007        11 200       Lahore genset/fuel
+  0.083   0.086      3056 200       Lahore prices
+  0.008   0.009      2216 200     RYK farm site
+  0.127   0.132      2610 200     RYK farm now
+  0.015   0.025     71959 200     RYK farm overview/chart 24h
+  0.017   0.018    118171 200     RYK farm plan
+  0.017   0.018     69354 200     RYK farm plans
+  0.018   0.019    117345 200     RYK farm plans/:id
+  0.043   0.045      4303 200     RYK farm plan/compare
+  0.007   0.008         2 200     RYK farm overrides
+  0.013   0.018      2579 200     RYK farm control
+  0.008   0.012       201 200     RYK farm edge
+  0.007   0.010       650 200     RYK farm telemetry/quality 14
+  0.007   0.008       690 200     RYK farm telemetry/quality 30
+  0.007   0.007       387 200     RYK farm native
+  0.028   0.031      4952 200     RYK farm savings this_month
+  0.025   0.033      3412 200     RYK farm savings last_month
+  0.038   0.040      6653 200     RYK farm savings last_30
+  0.007   0.007        27 200     RYK farm switchback
+  0.008   0.008         2 200     RYK farm bills
+  0.012   0.013       733 200     RYK farm savings/export.csv
+  0.007   0.008       524 200     RYK farm pilot
+  0.006   0.006        83 200     RYK farm pilot/calendar.ics
+  0.019   0.024     49078 200     RYK farm telemetry 24h default names
+  0.016   0.016     29857 200     RYK farm telemetry 7d default names
+  0.027   0.034     67799 200     RYK farm telemetry 30d default names
+  0.019   0.021     17483 200     RYK farm telemetry 90d default names
+  0.023   0.026     52908 200     RYK farm telemetry 7d all names
+  0.007   0.008       103 422     RYK farm telemetry 24h res=raw
+  0.009   0.011      2529 200     RYK farm telemetry grid_present 7d 1h
+  0.010   0.011      1528 200     RYK farm heatmap load 7
+  0.014   0.015      1549 200     RYK farm heatmap load 28
+  0.014   0.014      1549 200     RYK farm heatmap load 90
+  0.211   0.224   2171706 200     RYK farm telemetry/export.csv 14d
+  0.009   0.010     10393 200     RYK farm forecasts/pv
+  0.009   0.014     12020 200     RYK farm forecasts/load
+  0.009   0.013      5088 200     RYK farm forecasts/outage
+  0.007   0.009      2682 200     RYK farm forecasts/scores 30
+  0.114   0.114     18415 200     RYK farm outages 7
+  0.240   0.241     18589 200     RYK farm outages 30
+  0.222   0.223     18589 200     RYK farm outages 90
+  0.109   0.120     18621 200     RYK farm battery
+  0.227   0.264      8774 200     RYK farm genset 14
+  0.007   0.007        11 200     RYK farm genset/fuel
+  0.007   0.007      2565 200     RYK farm prices
+written routes-owner.json

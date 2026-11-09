@@ -1,0 +1,396 @@
+===== engine-money-live-11 medium The 'tuned' baseline can be worse than native: Lahore's tuned table costs Rs 294 a day more than the native settings
+   0.25 flow-savings-pilot-bill-17 [savings-ui-crosscut] Negative days are shown but not explained; the per-day lever split that explains them is not on the page
+   0.19 flow-savings-pilot-bill-18 [savings-ui-crosscut] Native-block days are explained only in a hover tooltip, and their tuned-baseline losses pull down the 'Saving against a tuned table' headli
+   0.19 role-owner-02 [savings-engine] Headline savings rest on carry-over credit: Faisalabad's whole saving is carry-over on a day its actual cost was higher than native
+   0.19 role-owner-03 [dup:pages-D-01] Fee check says 'claimed against the native settings' but shows the lower of the native and tuned figures
+   0.14 engine-plans-live-07 [dup:engine-optimiser-02] MDI target set from a 48-hour view at the start of a billing month: the battery chases a target it cannot hold, and the month ends higher
+===== parity-architecture-23 low An engine rule is re-implemented in the browser and already disagrees with the server: the pilot page demands 6 days on each arm, while verify.switchb
+   0.23 flow-savings-pilot-bill-03 [savings-engine] Switchback claims Rs 71,256/day (adjusted Rs 22,572/day) from a single plan day, with no Preliminary flag and no counterfactual agreement ch
+   0.23 pages-D-19 [savings-engine] Pilot tab A has no data-completeness check or KPI list; tab C has no holiday-closure rule
+   0.22 role-analyst-01 [dup:flow-savings-pilot-bill-03] Switchback gives a per-day saving from 1 plan day and 7 native days (Rs 71,256/day unadjusted, Rs 22,572 adjusted)
+   0.22 flow-savings-pilot-bill-25 [savings-engine] 3-day switchback blocks are offered at tier-2 sites, and 'fortnights' is the wrong word for 3-day pairs
+   0.21 flow-savings-pilot-bill-11 [savings-engine] A pilot can start on a calendar in the past, with no baseline window, at a monitor-tier site with no data; the tab shows a green check while
+===== engine-money-live-15 low A genset day before the first entered diesel price is silently priced at a later price
+   0.33 role-owner-07 [telemetry-genset-battery] Genset 'Fuel cost, 14 days' prices every litre at the newest diesel price, not the price dated to each run
+   0.25 role-operator-17 [dup:role-owner-07] Genset 'Fuel cost, 14 days' prices every litre at today's price, though Tariffs says each day uses its dated price
+   0.15 role-viewer-05 [dup:frontend-states-formats-01] Gas genset site is reported as 'Diesel' in litres on Savings, Plan and Compare
+   0.14 role-owner-25 [tariffs] Tariffs page shows raw internal keys and odd capitals ('Tou', 'Icp', 'net_billing', 'xwdisco', 'Positive fca', 'Hsd')
+   0.13 flow-savings-pilot-bill-22 [dup:role-operator-18] Switchback calendar never labels November: the week containing 1 Nov is labelled 'Oct 2026'
+===== tests-and-perf-25 low Every tariff lookup first re-checks that the shipped library is seeded, costing an extra connection and a full key scan
+   0.12 engine-tariffs-08 [tariffs] Several of the 13 bill steps marked done are missing: PF penalty, Punjab per-unit grid duty, extra tax (atl unused), credit-before-tax and T
+   0.09 tracker-and-docs-01 [savings-ui-crosscut] SIT-01 [x] says a two-connection site rebuilds per connection, but the engine, ledger and bill rebuild read only the first connection while 
+   0.08 flow-onboarding-07 [sites-onboarding] An empty tariff category is accepted, after which the active site never plans, raises no alert, and is shown as 'Done'
+   0.08 pages-D-09 [dup:tracker-and-docs-01] Bills can only be entered and rebuilt for the site's first connection
+   0.08 flow-onboarding-13 [dup:engine-tariffs-05] Tax flags and ICP, which change every price, cannot be entered in the wizard or in settings
+===== performance-live-03 medium Every telemetry read takes the telemetry file's write lock (BEGIN IMMEDIATE), so all reads and writes of a company's telemetry run one at a time
+   0.13 flow-telemetry-plan-control-01 [telemetry-genset-battery] A CSV upload that overlaps stored minutes erases every column the file does not carry (silent data loss)
+   0.11 flow-telemetry-plan-control-14 [telemetry-genset-battery] A file whose grid_present cells are all unreadable (ON/OFF) is accepted as a good import
+   0.10 flow-telemetry-plan-control-11 [dup:frontend-states-formats-06] The upload defaults to UTC: a Pakistani logger's local-time file shifts by 5 h silently (solar at 21:00)
+   0.09 frontend-states-formats-06 [telemetry-genset-battery] CSV upload assumes the file's times are UTC by default; a local-time logger file is silently shifted by 5 hours
+   0.09 frontend-a11y-05 [ui-charts-a11y] Time-series and forecast charts have no text or data alternative; values exist only in mouse-hover tooltips
+===== performance-live-04 medium A 23.5 MB CSV upload takes 14 s, raises the API process's memory by 544 MB (23x the file) and stalls other users' requests to about 1 s
+   0.16 flow-telemetry-plan-control-10 [telemetry-genset-battery] A 15-minute CSV is stored as one minute per row: day energy 1/15th, peak 14.7 kW, outages 4 min, and a green "Done"
+   0.16 flow-telemetry-plan-control-01 [telemetry-genset-battery] A CSV upload that overlaps stored minutes erases every column the file does not carry (silent data loss)
+   0.13 frontend-states-formats-06 [telemetry-genset-battery] CSV upload assumes the file's times are UTC by default; a local-time logger file is silently shifted by 5 hours
+   0.12 flow-telemetry-plan-control-25 [telemetry-genset-battery] Refusals for common logger formats give no format hint; 26-30 MB files get a bare 413 and the importer's own 30 MB sentence is unreachable
+   0.12 engine-delivery-23 [control-edge] Edge messages accept unbounded free-form dicts and strings up to the 25 MB API cap, and the heartbeat body is written into the site's carrie
+===== tests-and-perf-05 medium The telemetry series route lets any role request 400 days at 1-minute resolution, a multi-megabyte JSON answer built in Python
+   0.16 engine-delivery-22 [control-edge] The canonical JSON for signatures is Python's json.dumps, which a non-Python edge cannot reproduce for floats
+   0.15 flow-telemetry-plan-control-25 [telemetry-genset-battery] Refusals for common logger formats give no format hint; 26-30 MB files get a bare 413 and the importer's own 30 MB sentence is unreachable
+   0.12 flow-telemetry-plan-control-11 [dup:frontend-states-formats-06] The upload defaults to UTC: a Pakistani logger's local-time file shifts by 5 h silently (solar at 21:00)
+   0.12 pages-B-17 [telemetry-genset-battery] Telemetry series picker omits stored series the API already serves (grid import/export energy, battery voltage/current, genset running flag,
+   0.12 flow-telemetry-plan-control-20 [dup:pages-B-01] POST /control/hold with non-numeric hours answers 500, even for a viewer, before the permission check
+===== performance-live-06 medium Telemetry file sizing: forecast issues store the full 48-hour quantile JSON each hour forever (about 240 MB per site-year, 4x the 1-minute data), and 
+   0.18 founder-console-12 [founder-console] The backup list hides each copy's telemetry file and real size, names copies by raw UUID, and says 'once a day' though switched-off companie
+   0.12 flow-telemetry-plan-control-01 [telemetry-genset-battery] A CSV upload that overlaps stored minutes erases every column the file does not carry (silent data loss)
+   0.12 flow-telemetry-plan-control-10 [telemetry-genset-battery] A 15-minute CSV is stored as one minute per row: day energy 1/15th, peak 14.7 kW, outages 4 min, and a green "Done"
+   0.11 flow-telemetry-plan-control-14 [telemetry-genset-battery] A file whose grid_present cells are all unreadable (ON/OFF) is accepted as a good import
+   0.10 frontend-states-formats-06 [telemetry-genset-battery] CSV upload assumes the file's times are UTC by default; a local-time logger file is silently shifted by 5 hours
+===== flow-reports-alerts-members-keys-08 medium Acknowledging a closed alert reopens it, creating a duplicate in the inbox
+   0.19 pages-D-28 [alerts-reports] Acknowledging or closing with a note overwrites who did it
+   0.17 pages-D-16 [alerts-reports] regime_expiring alert says 'ends on' for an agreement already past; no 'Regime expired' state on the Tariffs page
+   0.14 role-owner-16 [fleet-overview] Fleet's 'Open alerts 0' disagrees with the sidebar and bell badges (3) once a real site exists
+   0.13 flow-onboarding-01 [tariffs] An expired or not-yet-started net-billing or legacy net-metering agreement still earns export credit in the price vector
+   0.13 engine-delivery-03 [control-edge] Edge sequence numbers are a per-site high-water mark: a reset or out-of-order batch is acknowledged as 'duplicate' and silently dropped
+===== flow-reports-alerts-members-keys-10 medium PUT /api/alerts/rules has no validation: 500 on a bad type, garbage stored
+   0.35 pages-D-29 [alerts-reports] Alert rule editor stores free-text quiet hours and has no thresholds or site overrides; nothing sends (known)
+   0.11 pages-D-14 [alerts-reports] Alert rule set covers a fraction of the plan's categories; no Savings, Product, Genset-condition, edge/plan-expiry, data-gap or bill-residua
+   0.10 frontend-states-formats-18 [fleet-overview] Raw codes and lowercase words leak into copy: overview alert badges, genset 'start is none'
+   0.10 security-roles-03 [alerts-reports] Viewer receives every alert category (Tariff, Control, Savings, Genset requests); the plan limits a viewer to energy-category alerts
+   0.09 flow-onboarding-18 [sites-onboarding] The server does not validate agreement dates or bound money figures
+===== flow-reports-alerts-members-keys-09 medium Closing an alert whose condition still holds is undone at the next tick (new alert, new id)
+   0.24 pages-D-28 [alerts-reports] Acknowledging or closing with a note overwrites who did it
+   0.18 frontend-states-formats-10 [alerts-reports] Alerts empty state says new alerts appear 'within a minute'; alerts are evaluated only on the 15-minute tick
+   0.16 role-analyst-29 [savings-ui-crosscut] Analyst is offered actions they cannot take before the page says so (alerts intro, 'Edit the alert rules', 'Edit in Site settings')
+   0.13 pages-D-27 [alerts-reports] No Data alert is raised for a site that has never received any data
+   0.12 pages-D-14 [alerts-reports] Alert rule set covers a fraction of the plan's categories; no Savings, Product, Genset-condition, edge/plan-expiry, data-gap or bill-residua
+===== flow-reports-alerts-members-keys-11 medium Email, SMS and WhatsApp alert channels look live and save, but nothing sends; only a muted footnote says so
+   0.46 pages-D-29 [alerts-reports] Alert rule editor stores free-text quiet hours and has no thresholds or site overrides; nothing sends (known)
+   0.09 frontend-states-formats-10 [alerts-reports] Alerts empty state says new alerts appear 'within a minute'; alerts are evaluated only on the 15-minute tick
+   0.09 role-owner-16 [fleet-overview] Fleet's 'Open alerts 0' disagrees with the sidebar and bell badges (3) once a real site exists
+   0.08 founder-console-15 [auth-security] A member of a switched-off company is told 'Your account is not set up for Gridlytics. Ask us to add you.'
+   0.08 role-analyst-29 [savings-ui-crosscut] Analyst is offered actions they cannot take before the page says so (alerts intro, 'Edit the alert rules', 'Edit in Site settings')
+===== flow-reports-alerts-members-keys-13 low Report period not validated: '2026-11-05', '2026-1', '1999-01' and future '2027-03' are accepted and listed
+   0.16 engine-savings-13 [alerts-reports] Report wording: the Preliminary sentence omits two of the four conditions, and the baseline at manual-genset sites includes an assumed opera
+   0.15 pages-D-24 [alerts-reports] Daily operations sheet asks for a month but renders 'tomorrow's' slot table from the current plan, not the sheet the plan describes
+   0.12 pages-D-25 [alerts-reports] Reports list has no 'generated by' column, no browser preview and no schedules (known UI-14 gap)
+   0.12 role-viewer-17 [alerts-reports] Backend-written text shows internal ids, a raw enum and ISO dates (alert drawer, alert title, energy report PDF)
+   0.11 founder-console-14 [founder-console] At phone width, every Companies and Users action is behind a sideways scroll inside the table, with rows 200-270 px tall and the selects cut
+===== flow-reports-alerts-members-keys-16 low Report header calls a grid-connected site without a connection 'Off-grid' and prints the raw regime 'none'; an empty period is not stated
+   0.20 pages-D-24 [alerts-reports] Daily operations sheet asks for a month but renders 'tomorrow's' slot table from the current plan, not the sheet the plan describes
+   0.18 frontend-states-formats-05 [alerts-reports] Reports empty state promises 'Your first monthly report on the 3rd', but nothing generates reports on a schedule
+   0.17 pages-A-03 [fleet-overview] A grid site whose connection is not saved yet is labelled "Off-grid" in the site header and the Fleet table
+   0.17 pages-D-25 [alerts-reports] Reports list has no 'generated by' column, no browser preview and no schedules (known UI-14 gap)
+   0.16 role-viewer-09 [dup:pages-A-03] A site with no connection yet is labelled 'Off-grid' even though it has a DISCO
+===== flow-reports-alerts-members-keys-29 low Viewer's Reports page does not say in words that only energy-only reports are listed for the role
+   0.25 pages-D-24 [alerts-reports] Daily operations sheet asks for a month but renders 'tomorrow's' slot table from the current plan, not the sheet the plan describes
+   0.16 role-operator-20 [alerts-reports] Operator can download the Monthly savings report (PDF/CSV) although the pages say exporting savings is for an administrator or an analyst
+   0.15 frontend-states-formats-05 [alerts-reports] Reports empty state promises 'Your first monthly report on the 3rd', but nothing generates reports on a schedule
+   0.15 founder-console-12 [founder-console] The backup list hides each copy's telemetry file and real size, names copies by raw UUID, and says 'once a day' though switched-off companie
+   0.14 engine-plans-live-10 [delivery-twin] 'Compare with native' cannot show what the reserve is worth, so a reserve-holding plan always looks worse than native
+===== parity-supabase-auth-01 medium A session started in the same second as a password reset survives it for up to an hour (and one from the second of a disable comes back on re-enable)
+   0.39 security-roles-09 [auth-security] Sign-out ends only the refresh token: the access token keeps working for up to an hour after logout
+   0.13 founder-console-02 [founder-console] The audit's Detail column shows '…' instead of what changed for every change of seats, company role, status or account
+   0.11 pr-review-01 [tests-ci] Opt-in benchmark removes the only default-suite check of round 5's second-day hour-mark rows and of the real 192-step farm plans
+   0.11 founder-console-10 [founder-console] The founder can disable a company's only owner without warning, and the Companies list still shows that owner and '1 admin'
+   0.11 parity-boxlytics-ui-09 [parity-ui] Sign-in page does not match the Boxlytics auth page: a small grey-page card titled by an h2 ('Sign in to Gridlytics', 14 px), with no 'Welco
+===== flow-reports-alerts-members-keys-07 medium Person removed from the company by the founder stays in Members; the owner can switch them on (taking a seat) and make them administrator
+   0.19 founder-console-17 [founder-console] Wording slips in the console's notices and hints ('is member of', '2 of 1 seats are taken', 'admin' with two meanings)
+   0.17 founder-console-06 [auth-security] A member left without a seat by the founder's seat limit sees the full app with 'This is not available for your role'
+   0.16 founder-console-16 [founder-console] The Users page shows a stale Gridlytics role after a company-role change: a demoted owner reads 'Administrator' until their next request
+   0.14 founder-console-05 [founder-console] The Switch off dialog does not say that the company's sites stop being planned, its edge keys are refused and telemetry is lost
+   0.14 founder-console-04 [founder-console] The company role 'Admin' does nothing in Gridlytics, but the console offers it and says the person 'is admin', next to an 'admins' count tha
+===== parity-supabase-auth-05 low Members list drops Solarlytics' supabase branch: in supabase mode nobody who has not signed in yet is listed, so an admin cannot set a role ahead
+   0.16 founder-console-13 [founder-console] No way to delete or archive a company or an account: test and departed customers stay in the console for good
+   0.14 founder-console-04 [founder-console] The company role 'Admin' does nothing in Gridlytics, but the console offers it and says the person 'is admin', next to an 'admins' count tha
+   0.12 founder-console-10 [founder-console] The founder can disable a company's only owner without warning, and the Companies list still shows that owner and '1 admin'
+   0.12 founder-console-02 [founder-console] The audit's Detail column shows '…' instead of what changed for every change of seats, company role, status or account
+   0.11 founder-console-03 [founder-console] Company role and membership selects on Users save on every change with no confirmation: one arrow key changes a role on the server
+===== flow-reports-alerts-members-keys-28 low An owner cannot add, invite or remove a member, and the Members page does not say how people are added
+   0.22 pages-A-02 [auth-security] Sign-in tells people to ask their company admin for a new password, but only the founder console can set one; there is no forced first-sign-
+   0.20 frontend-a11y-17 [savings-ui-crosscut] Row actions with identical names ('Switch off', 'Revoke', 'Remove', 'Edit') and tables with no row headers
+   0.16 frontend-a11y-07 [auth-security] Selects that write or reload on every change: arrow keys on Windows switch company, change member roles and suspend memberships
+   0.15 pages-A-07 [founder-console] Founder console tells people they can change their password "under Settings"; in Gridlytics it is on My account
+   0.14 founder-console-14 [founder-console] At phone width, every Companies and Users action is behind a sideways scroll inside the table, with rows 200-270 px tall and the selects cut
+===== parity-supabase-auth-04 medium Supabase mode is half-lifted: the backend carries it, but the web app is local-only, so GRIDLYTICS_AUTH_MODE=supabase leaves no way to sign in
+   0.09 pages-A-02 [auth-security] Sign-in tells people to ask their company admin for a new password, but only the founder console can set one; there is no forced first-sign-
+   0.08 founder-console-04 [founder-console] The company role 'Admin' does nothing in Gridlytics, but the console offers it and says the person 'is admin', next to an 'admins' count tha
+   0.08 flow-onboarding-22 [sites-onboarding] The wizard is missing parts of plan 9.3's tab content: no map pin, no live source test, and no write budget, fallback, grid-charge permissio
+   0.08 founder-console-16 [founder-console] The Users page shows a stale Gridlytics role after a company-role change: a demoted owner reads 'Administrator' until their next request
+   0.08 founder-console-18 [founder-console] Founder API answers still carry the lifted field 'solarlytics_role', justified by a console page that no longer reads it
+===== parity-architecture-05 medium Every scratch run writes its log into the owner's data folder: api.py logs beside GRIDLYTICS_DB's default (gridlytics-backend/data/logs), and the laun
+   0.18 tracker-and-docs-11 [docs] The backend README's 'Run it' seed command writes the demo into the owner's data/ folder; the README's test count and module table are stale
+   0.11 founder-console-01 [founder-console] The Backups page tells the founder to run scripts/restore_backup.py, which does not exist, and backups.restore puts back only half of a comp
+   0.10 tracker-and-docs-17 [tests-ci] 'npm run e2e' as documented fails on a HANDOFF-built machine: it defaults to a build-machine accounts path, and the README names the wrong a
+   0.09 engine-delivery-13 [control-edge] The signing key is found by an absolute file path and silently replaced when the file is missing; keys are not in backups
+   0.09 security-roles-13 [dup:pages-B-01] POST /control/{action} parses hours and soc_pct with bare float() before the permission check: any member can trigger a 500
+===== parity-supabase-auth-08 low Sign-in throttling is about 200 times looser than Supabase's defaults: 1,200 tries a minute per address, about 50 ms of PBKDF2 each, no per-account ca
+   0.19 security-roles-10 [auth-security] Password lockout counts per (email, address) only; behind an untrusted proxy every client shares the 'forwarded' bucket
+   0.11 security-roles-08 [alerts-reports] Lowest role can drive unbounded disk and CPU work: unlimited synchronous report generation, and costly GETs throttled only at 6000 a minute
+   0.11 founder-console-08 [auth-security] Passwords the founder issues are not one-time: no forced change at first sign-in, and the hint sends people to the wrong page
+   0.11 security-roles-16 [auth-security] No way to grant a named viewer see_costs, which plan Part 10.5 provides
+   0.11 parity-boxlytics-ui-17 [parity-ui] No Help entry or page: Boxlytics has /help in its account menu, and plan 9.5 puts 'help' in the sidebar footer
+===== parity-supabase-auth-03 medium No supabase/ folder: Solarlytics' SQL (preflight, migration, rollback) and its owner checklist were never ported, though the code and plan reference t
+   0.09 founder-console-10 [founder-console] The founder can disable a company's only owner without warning, and the Companies list still shows that owner and '1 admin'
+   0.09 tracker-and-docs-11 [docs] The backend README's 'Run it' seed command writes the demo into the owner's data/ folder; the README's test count and module table are stale
+   0.09 founder-console-04 [founder-console] The company role 'Admin' does nothing in Gridlytics, but the console offers it and says the person 'is admin', next to an 'admins' count tha
+   0.08 parity-boxlytics-ui-09 [parity-ui] Sign-in page does not match the Boxlytics auth page: a small grey-page card titled by an h2 ('Sign in to Gridlytics', 14 px), with no 'Welco
+   0.07 founder-console-16 [founder-console] The Users page shows a stale Gridlytics role after a company-role change: a demoted owner reads 'Administrator' until their next request
+===== parity-supabase-auth-09 low A suspended or pending membership is told 'You are not a member of that company'
+   0.23 founder-console-15 [auth-security] A member of a switched-off company is told 'Your account is not set up for Gridlytics. Ask us to add you.'
+   0.18 founder-console-03 [founder-console] Company role and membership selects on Users save on every change with no confirmation: one arrow key changes a role on the server
+   0.17 founder-console-04 [founder-console] The company role 'Admin' does nothing in Gridlytics, but the console offers it and says the person 'is admin', next to an 'admins' count tha
+   0.14 frontend-a11y-07 [auth-security] Selects that write or reload on every change: arrow keys on Windows switch company, change member roles and suspend memberships
+   0.14 founder-console-13 [founder-console] No way to delete or archive a company or an account: test and departed customers stay in the console for good
+===== parity-architecture-04 medium env.ts throws away every build setting when one is invalid: VITE_AUTH_MODE=supabase, which the backend accepts, silently resets VITE_API_BASE_URL to '
+   0.08 frontend-states-formats-06 [telemetry-genset-battery] CSV upload assumes the file's times are UTC by default; a local-time logger file is silently shifted by 5 hours
+   0.07 frontend-states-formats-17 [founder-console] Founder backups list shifts backup times by the server's UTC offset (naive local timestamp read as UTC)
+   0.06 tracker-and-docs-17 [tests-ci] 'npm run e2e' as documented fails on a HANDOFF-built machine: it defaults to a build-machine accounts path, and the README names the wrong a
+   0.06 tracker-and-docs-23 [docs] HANDOFF section 8.D still lists 'create the repositories, push v1-build' as an owner task, though section 2 and the remotes show both reposi
+   0.05 tracker-and-docs-12 [docs] PLT-02 [x]: test_deploy_docs.py and .env.production.example do not exist
+===== tests-and-perf-16 low Full zod (69.5 kB gzip) is in the eager bundle only to parse two environment variables
+   0.07 flow-savings-pilot-bill-29 [dup:role-operator-09] At 375 px the bill line table hides the Amount column off-screen and the totals wrap 'Rs' onto its own line
+   0.07 flow-onboarding-18 [sites-onboarding] The server does not validate agreement dates or bound money figures
+   0.06 founder-console-12 [founder-console] The backup list hides each copy's telemetry file and real size, names copies by raw UUID, and says 'once a day' though switched-off companie
+   0.05 pages-C-18 [shell-nav] Outages is listed in the sidebar for off-grid sites, which the plan hides
+   0.05 role-owner-29 [ui-charts-a11y] 'No live data: the site is offline' is drawn over the energy-flow diagram
+===== parity-architecture-12 medium Plans, savings days and reports do not record the engine version that computed them (Solarlytics PS-27), and version.py's lifted docstring describes P
+   0.14 engine-savings-07 [dup:pages-D-06] CSV annexes lack the tariff version and capture version the plan requires, while the PDF says the tariff versions are 'dated in the CSV anne
+   0.12 pages-D-08 [alerts-reports] Monthly PDF prints 'Diesel saved 0 L' when the genset was unmetered, and prints a saving for days whose claim is withheld without any mark
+   0.11 pages-D-06 [savings-ui-crosscut] Savings CSV and the report CSV lack the tariff version, capture version and claim columns; the PDF says the CSV annex dates the tariff versi
+   0.10 engine-savings-13 [alerts-reports] Report wording: the Preliminary sentence omits two of the four conditions, and the baseline at manual-genset sites includes an assumed opera
+   0.10 flow-onboarding-14 [sites-onboarding] The native-settings capture accepts impossible slot times ('99:99') and duplicate starts, and the savings baseline replays them
+===== flow-reports-alerts-members-keys-14 low Deleting a site leaves its reports (shown by raw id) and its API keys active
+   0.16 founder-console-13 [founder-console] No way to delete or archive a company or an account: test and departed customers stay in the console for good
+   0.12 pages-D-24 [alerts-reports] Daily operations sheet asks for a month but renders 'tomorrow's' slot table from the current plan, not the sheet the plan describes
+   0.11 role-viewer-17 [alerts-reports] Backend-written text shows internal ids, a raw enum and ISO dates (alert drawer, alert title, energy report PDF)
+   0.11 pages-A-16 [deferred] API keys table shows a "Role on record" column while the page says a key holds no role
+   0.11 founder-console-11 [founder-console] Unused commercial-plan widgets ('Plans due', a 'Plan' column always 'No plan') sit next to 'Plans issued' dispatch plans, so 'plan' means tw
+===== flow-reports-alerts-members-keys-27 low Solarlytics leftovers in wording: key error suggests a non-existent scope 'quotes:read'; audit says 'generated a energy only report'
+   0.32 security-roles-07 [auth-security] API key scopes: sites:read reaches the current plan and every GET under the site, while plans:read gates only /plans; the edge/partner key k
+   0.17 pages-D-25 [alerts-reports] Reports list has no 'generated by' column, no browser preview and no schedules (known UI-14 gap)
+   0.15 frontend-states-formats-05 [alerts-reports] Reports empty state promises 'Your first monthly report on the 3rd', but nothing generates reports on a schedule
+   0.11 pages-A-16 [deferred] API keys table shows a "Role on record" column while the page says a key holds no role
+   0.10 pages-A-04 [demo-seed] Fleet empty state and Demo tab promise "90 days of simulated history"; the demo seeds 21 days
+===== parity-architecture-09 medium No cross-repository contract tests (Solarlytics S0a sibling.py and sibling.ts): types, permissions, refusal codes and fixtures are copied by hand from
+   0.11 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+   0.09 pages-B-12 [fleet-overview] Plan and Overview checklists key 'off-grid' on site_type 'farm' instead of data.off_grid (the backend's activate rule accepts either); a non
+   0.08 tracker-and-docs-07 [dup:engine-tariffs-07] The tariff and bill goldens claimed by TAR-01 to TAR-06, OPT-06 and VER-04 [x] do not exist: no hand-worked bills to the paisa, no regime go
+   0.08 pages-B-09 [deferred] Tier sign-off is not shown on Devices and control although the docs say it is
+   0.08 tracker-and-docs-08 [tests-ci] Engine acceptance tests claimed by TWN-01, VER-02, DAT-01, DAT-08, OPT-03, OPT-04 and OPT-07 [x] are absent, including OPT-04's reserve-safe
+===== parity-architecture-10 medium The lifted request guard has no tests: Solarlytics' test_hygiene, test_signin_guard, test_deploy_docs, test_seed_demo and test_role_walk were not carr
+   0.09 pr-review-09 [savings-engine] New behaviour without tests: the chained perfect-foresight bound, the grid-presence unread rule, the 62-day walk limit and legacy rows
+   0.08 tracker-and-docs-03 [auth-security] The money-filter guarantee is documented against tests that do not exist (test_role_walk.py, optimise/explain.py, money.strip_for)
+   0.07 founder-console-05 [founder-console] The Switch off dialog does not say that the company's sites stop being planned, its edge keys are refused and telemetry is lost
+   0.06 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+   0.06 tracker-and-docs-08 [tests-ci] Engine acceptance tests claimed by TWN-01, VER-02, DAT-01, DAT-08, OPT-03, OPT-04 and OPT-07 [x] are absent, including OPT-04's reserve-safe
+===== tests-and-perf-14 medium No test checks company isolation on the EMS routes; the only two-company isolation test is one of the 7 skipped lifted tests
+   0.14 pr-review-01 [tests-ci] Opt-in benchmark removes the only default-suite check of round 5's second-day hour-mark rows and of the real 192-step farm plans
+   0.14 tracker-and-docs-03 [auth-security] The money-filter guarantee is documented against tests that do not exist (test_role_walk.py, optimise/explain.py, money.strip_for)
+   0.13 security-roles-15 [demo-seed] The demo build lock is process-wide: one company's demo build blocks another company's and tells it a demo is 'already being built'
+   0.12 pr-review-09 [savings-engine] New behaviour without tests: the chained perfect-foresight bound, the grid-presence unread rule, the 62-day walk limit and legacy rows
+   0.12 security-roles-02 [auth-security] The money filter is opt-in per route (out()) and matches key names; about 20 member-readable GET routes skip it, and the role-walk test cove
+===== tests-and-perf-13 medium The scheduler's tick and nightly jobs are never executed by any test
+   0.13 pr-review-01 [tests-ci] Opt-in benchmark removes the only default-suite check of round 5's second-day hour-mark rows and of the real 192-step farm plans
+   0.11 brief-vs-build-14 [docs] HANDOFF section 1 'every 15 minutes the backend does five things' overstates the tick: signing is on pull, savings are nightly, Mode B is no
+   0.11 pages-B-08 [control-edge] Confirmation of a marked table is computed only by the nightly job (00:40 PKT): there is no 'it took / it did not take' card, and the Mark-a
+   0.10 tracker-and-docs-20 [docs] PLT-09 [x] describes one computed Demo company linked into customers via demo_link rows and regenerated nightly; the code copies the demo in
+   0.07 security-roles-04 [savings-ui-crosscut] Mutating routes without an audit row, and audit rows without before/after values for money settings
+===== tests-and-perf-12 medium Three optimiser tests assert wall-clock times or 'optimal within 10 s' under -n 4 (HANDOFF trap 6); they will flake on CI or a loaded machine
+   0.14 engine-optimiser-08 [optimiser-plans] Wall-clock limits (HANDOFF 8.A.3): any time-limited incumbent, whatever its gap, supersedes the last plan, and the relaxed retry publishes g
+   0.10 pr-review-01 [tests-ci] Opt-in benchmark removes the only default-suite check of round 5's second-day hour-mark rows and of the real 192-step farm plans
+   0.09 flow-savings-pilot-bill-06 [dup:engine-optimiser-14] The 'perfect-foresight bound' is below the claimed saving and often negative, so it is not an upper bound
+   0.09 engine-delivery-10 [control-edge] The heartbeat reports clock-offset actions ('control demoted', 'peak slots widened') that the code never takes
+   0.08 pr-review-09 [savings-engine] New behaviour without tests: the chained perfect-foresight bound, the grid-presence unread rule, the 62-day walk limit and legacy rows
+===== tests-and-perf-15 medium The Part 7.4 contract test suite does not exist, although DAT-03 and DLV-03 are ticked on it; per-brand Mode A grammar is tested only as slot counts
+   0.25 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+   0.22 brief-vs-build-12 [control-edge] Product 2 contract: writable primitives are untyped and ignored by the compiler; no exported schema files despite DAT-02 being ticked
+   0.18 tracker-and-docs-08 [tests-ci] Engine acceptance tests claimed by TWN-01, VER-02, DAT-01, DAT-08, OPT-03, OPT-04 and OPT-07 [x] are absent, including OPT-04's reserve-safe
+   0.15 engine-delivery-17 [savings-ui-crosscut] Mode B is never executed by the twin: Mode B sites (the feed mill) run the 2-slot Mode A table in the demo, the guard and plan_compare
+   0.15 tracker-and-docs-07 [dup:engine-tariffs-07] The tariff and bill goldens claimed by TAR-01 to TAR-06, OPT-06 and VER-04 [x] do not exist: no hand-worked bills to the paisa, no regime go
+===== tests-and-perf-24 low The outage forecaster's announced-window outputs (p_start, dur_steps, g) and its prior shrinkage are untested
+   0.14 engine-forecast-12 [forecasts-outages] Cold start without an entered schedule treats a rural feeder as almost always up: the DISCO prior covers unscheduled trips only (about 2 h/d
+   0.14 engine-forecast-14 [forecasts-outages] The accuracy tiles' 'last 7 days' is the mean of the last 7 scored rows (any span), and the outage chart draws p_start one slot early
+   0.14 role-viewer-03 [dup:pages-C-02] 'Schedule adherence 80 %' shown as measured at sites with no announced schedule
+   0.13 engine-forecast-08 [forecasts-outages] Unscheduled-outage hazard splits one outage into several at any data gap and the observed-outage walk-back stops at a gap
+   0.13 brief-vs-build-09 [forecasts-outages] Outage forecaster is per-site only: no feeder pooling, no season or weekday effect, schedules by hand; the UI promises pooling that does not
+===== tests-and-perf-19 low Onboarding: no test drives tab D, the Review tab or POST /activate
+   0.21 pages-A-10 [sites-onboarding] Review tab opens before A-D are complete and omits the "what happens next" text and the Preliminary marks on defaulted values
+   0.20 pr-review-07 [savings-ui-crosscut] The 'Recompute needed' role branch and its test cover a state the API never sends; the reachable path is untested
+   0.18 frontend-a11y-09 [ui-charts-a11y] Lettered wizards drop keyboard focus to <body> on Next, Previous and Edit, and never move it to the new step
+   0.16 flow-onboarding-20 [sites-onboarding] The Review summary uses raw codes and has small wording errors
+   0.16 flow-onboarding-06 [sites-onboarding] Activate goes through with unsaved equipment edits, Review shows them as if saved, and the draft holding them disappears
+===== tests-and-perf-20 low Some tests check constants or compatibility shims rather than behaviour
+   0.14 pr-review-09 [savings-engine] New behaviour without tests: the chained perfect-foresight bound, the grid-presence unread rule, the 62-day walk limit and legacy rows
+   0.11 tracker-and-docs-07 [dup:engine-tariffs-07] The tariff and bill goldens claimed by TAR-01 to TAR-06, OPT-06 and VER-04 [x] do not exist: no hand-worked bills to the paisa, no regime go
+   0.10 tracker-and-docs-08 [tests-ci] Engine acceptance tests claimed by TWN-01, VER-02, DAT-01, DAT-08, OPT-03, OPT-04 and OPT-07 [x] are absent, including OPT-04's reserve-safe
+   0.10 pr-review-01 [tests-ci] Opt-in benchmark removes the only default-suite check of round 5's second-day hour-mark rows and of the real 192-step farm plans
+   0.09 brief-vs-build-07 [delivery-twin] Safety fallback (expiry, link loss, revert to native) is declared in the message but never simulated or tested
+===== parity-architecture-08 medium Code derived from Boxlytics (another party) is not recorded in THIRD_PARTY_NOTICES or the DESIGN_LOG: the founder session-token format, the founder st
+   0.15 founder-console-09 [founder-console] A founder session cannot be ended: Sign out never reaches the server, and the token stays valid for all 8 hours
+   0.11 security-roles-12 [founder-console] Founder session secret has no minimum length; a short GRIDLYTICS_FOUNDER_SESSION_SECRET makes founder tokens forgeable offline
+   0.10 founder-console-01 [founder-console] The Backups page tells the founder to run scripts/restore_backup.py, which does not exist, and backups.restore puts back only half of a comp
+   0.09 founder-console-17 [founder-console] Wording slips in the console's notices and hints ('is member of', '2 of 1 seats are taken', 'admin' with two meanings)
+   0.09 pages-A-07 [founder-console] Founder console tells people they can change their password "under Settings"; in Gridlytics it is on My account
+===== parity-architecture-14 medium No CLAUDE.md in either Gridlytics repository, although the family is built and maintained by Claude Code sessions and Solarlytics (both repositories) 
+   0.13 tracker-and-docs-23 [docs] HANDOFF section 8.D still lists 'create the repositories, push v1-build' as an owner task, though section 2 and the remotes show both reposi
+   0.12 tracker-and-docs-12 [docs] PLT-02 [x]: test_deploy_docs.py and .env.production.example do not exist
+   0.10 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+   0.09 pr-review-12 [docs] HANDOFF test counts are stale after the opt-in commit (504 passed and 7 skipped should be 503 and 8)
+   0.09 tracker-and-docs-17 [tests-ci] 'npm run e2e' as documented fails on a HANDOFF-built machine: it defaults to a build-machine accounts path, and the README names the wrong a
+===== parity-architecture-15 medium The docs set does not match the family's: no CHANGELOG, ACCOUNTS, TROUBLESHOOTING, DEPLOY, PRODUCT_BRIEF, EQUATIONS, ASSUMPTIONS, TEST_MATRIX or OWNER
+   0.25 pr-review-12 [docs] HANDOFF test counts are stale after the opt-in commit (504 passed and 7 skipped should be 503 and 8)
+   0.22 tracker-and-docs-11 [docs] The backend README's 'Run it' seed command writes the demo into the owner's data/ folder; the README's test count and module table are stale
+   0.21 tracker-and-docs-23 [docs] HANDOFF section 8.D still lists 'create the repositories, push v1-build' as an owner task, though section 2 and the remotes show both reposi
+   0.15 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+   0.14 pr-review-10 [docs] 'Done when' evidence for 8.A.1 is not reproducible, and its Rs 1 match holds by construction on gap-free data
+===== performance-live-01 high Plan rows are never pruned and each stores about 130 KB of JSON: the workspace file grows about 12.5 MB per site per day (4.6 GB per site-year), copie
+   0.17 founder-console-12 [founder-console] The backup list hides each copy's telemetry file and real size, names copies by raw UUID, and says 'once a day' though switched-off companie
+   0.10 tracker-and-docs-20 [docs] PLT-09 [x] describes one computed Demo company linked into customers via demo_link rows and regenerated nightly; the code copies the demo in
+   0.10 founder-console-01 [founder-console] The Backups page tells the founder to run scripts/restore_backup.py, which does not exist, and backups.restore puts back only half of a comp
+   0.09 role-owner-24 [dup:pages-A-04] Demo sites tab claims '90 days of history'; the demo holds about 15 days
+   0.09 engine-delivery-23 [control-edge] Edge messages accept unbounded free-form dicts and strings up to the 25 MB API cap, and the heartbeat body is written into the site's carrie
+===== parity-architecture-06 medium A failing 15-minute tick is invisible: the scheduler logs the exception and skips alerts.evaluate, and there is no plan_failed alert, no error webhook
+   0.23 flow-onboarding-07 [sites-onboarding] An empty tariff category is accepted, after which the active site never plans, raises no alert, and is shown as 'Done'
+   0.21 frontend-states-formats-10 [alerts-reports] Alerts empty state says new alerts appear 'within a minute'; alerts are evaluated only on the 15-minute tick
+   0.17 flow-onboarding-04 [fleet-overview] A created but not activated site is a dead end: no page except its own wizard draft can activate it, and the overview says a plan is coming
+   0.16 pages-A-01 [fleet-overview] Overview and Plan checklists tell a never-activated (observing) site that the optimiser solves every 15 minutes; it never does
+   0.12 frontend-states-formats-13 [shell-nav] Loading or failed queries read as 'empty' in the shell: 'No sites yet', 'Last data: none yet', no alert counts
+===== parity-architecture-11 medium The data folder cannot be moved to another machine or volume: report files and per-site signing keys are stored by absolute path in the company databa
+   0.26 engine-delivery-13 [control-edge] The signing key is found by an absolute file path and silently replaced when the file is missing; keys are not in backups
+   0.15 founder-console-12 [founder-console] The backup list hides each copy's telemetry file and real size, names copies by raw UUID, and says 'once a day' though switched-off companie
+   0.11 founder-console-01 [founder-console] The Backups page tells the founder to run scripts/restore_backup.py, which does not exist, and backups.restore puts back only half of a comp
+   0.10 frontend-states-formats-05 [alerts-reports] Reports empty state promises 'Your first monthly report on the 3rd', but nothing generates reports on a schedule
+   0.10 pages-D-07 [alerts-reports] Monthly savings PDF covers a fraction of plan 8.5 (no switchback/carry-over, bill comparison, KPI grid or tuned ledger); no company roll-up 
+===== performance-live-09 low Tick timing cannot be observed: no tick or per-site duration is logged, and a manual re-solve overwrites the scheduled run's row
+   0.15 flow-savings-pilot-bill-09 [savings-engine] POST /pilot/start on an already-started pilot silently resets the start time and overwrites the sign-off
+   0.12 flow-onboarding-07 [sites-onboarding] An empty tariff category is accepted, after which the active site never plans, raises no alert, and is shown as 'Done'
+   0.09 frontend-a11y-22 [shell-nav] Some errors and outcomes appear only in toasts that auto-dismiss after 4 s
+   0.08 flow-telemetry-plan-control-01 [telemetry-genset-battery] A CSV upload that overlaps stored minutes erases every column the file does not carry (silent data loss)
+   0.08 flow-telemetry-plan-control-15 [control-edge] Hold reaches neither the plan nor the edge until the next 15-minute tick (pause, release and resume act at once)
+===== performance-live-11 low The 15-minute tick runs every site of every company in one thread inside the API process; its per-site cost grows with history and a genset site may t
+   0.16 frontend-states-formats-10 [alerts-reports] Alerts empty state says new alerts appear 'within a minute'; alerts are evaluated only on the 15-minute tick
+   0.12 engine-plans-live-19 [optimiser-plans] plans.time_limited_recent is never called: no route, alert or idle re-solve uses it
+   0.11 engine-optimiser-08 [optimiser-plans] Wall-clock limits (HANDOFF 8.A.3): any time-limited incumbent, whatever its gap, supersedes the last plan, and the relaxed retry publishes g
+   0.11 tracker-and-docs-20 [docs] PLT-09 [x] describes one computed Demo company linked into customers via demo_link rows and regenerated nightly; the code copies the demo in
+   0.10 brief-vs-build-14 [docs] HANDOFF section 1 'every 15 minutes the backend does five things' overstates the tick: signing is on pull, savings are nightly, Mode B is no
+===== performance-live-05 medium Re-solve, resume and savings recompute run the solver inside the HTTP request: 3.6 s measured, up to 30 s for a solve, and up to 62 five-second solves
+   0.25 pr-review-05 [savings-ui-crosscut] Synchronous recompute can now do about twice the work the 62-day cap was set for, and the web app reports only the asked-for days
+   0.13 role-owner-05 [dup:engine-optimiser-14] 'Perfect-foresight bound' is below the achieved saving at Karachi and negative at Lahore
+   0.12 flow-savings-pilot-bill-06 [dup:engine-optimiser-14] The 'perfect-foresight bound' is below the claimed saving and often negative, so it is not an upper bound
+   0.12 pages-A-01 [fleet-overview] Overview and Plan checklists tell a never-activated (observing) site that the optimiser solves every 15 minutes; it never does
+   0.11 pr-review-02 [savings-engine] Re-scoring one day silently rewrites the claims of up to 62 later days, including closed months, with no audit, no report flag and an answer
+===== performance-live-02 medium Every site page polls /now every 30 s only for its header, and /now re-reads 30 days of 1-minute data (battery.state) on each call: the API caps at ab
+   0.09 engine-optimiser-07 [optimiser-plans] The plan starts from a stale SoC and does not widen its uncertainty: battery.state uses the last reading up to 30 days old and freezes sigma
+   0.07 role-owner-38 [telemetry-genset-battery] Battery 'Cycles, 30 days 5.9 — 0.38 a day' divides by days with data (15.5), not by 30
+   0.07 tracker-and-docs-01 [savings-ui-crosscut] SIT-01 [x] says a two-connection site rebuilds per connection, but the engine, ledger and bill rebuild read only the first connection while 
+   0.06 role-owner-22 [ui-charts-a11y] Chart unit label ('kW' or '%') collides with the 'now' marker label
+   0.06 flow-savings-pilot-bill-17 [savings-ui-crosscut] Negative days are shown but not explained; the per-day lever split that explains them is not on the page
+===== tests-and-perf-10 medium The overview's 'today' figures freeze for live (edge) sites: GET /now writes today's day row once and nothing refreshes it until the next night
+   0.18 role-owner-09 [dup:role-operator-10] The off-grid farm is shown in a permanent 'outage' ('the grid is down') on Overview, Fleet, Genset and Savings
+   0.14 pages-A-09 [fleet-overview] Overview lacks the plan's operator quick actions, three KPI tiles (PV self-consumed %, battery cycles today, outages covered), TOU-window sh
+   0.14 frontend-states-formats-14 [fleet-overview] Zero and missing are confused: 'Outage today 0.0 h' with no data, fleet 'Rs 0' saving with no priced day, zero rupee difference shown as '–'
+   0.14 frontend-states-formats-15 [fleet-overview] Times shown without a day: 'Hold until 21:00' for a multi-day hold, and next events as bare HH:MM up to 48 h ahead
+   0.13 role-analyst-07 [dup:role-operator-10] Off-grid farm is described as a grid outage across Fleet, Overview, Plan, Genset and Savings
+===== tests-and-perf-07 medium plans.active_at is called in loops (per genset run, per peak quarter, per outage); each call sorts all of a site's plans and parses a full plan
+   0.16 flow-savings-pilot-bill-15 [dup:flow-onboarding-14] Native capture accepts impossible slot times such as '25:99', and the replay then silently uses that slot as the overnight default
+   0.12 pages-C-04 [telemetry-genset-battery] Genset runs and the outage log count rows, not minutes: a blank sample ends a run or outage, and 5/15-minute sources under-count genset kWh,
+   0.12 engine-optimiser-11 [optimiser-plans] Grid-tied terminal value never uses the genset's marginal cost on outage-heavy feeders
+   0.12 engine-plans-live-19 [optimiser-plans] plans.time_limited_recent is never called: no route, alert or idle re-solve uses it
+   0.11 engine-optimiser-10 [optimiser-plans] Terminal value: c_cal_hold is a one-step calendar slope, not the holding cost until the next peak (unit error)
+===== tests-and-perf-09 medium Each tick re-reads about 4 months of 1-minute rows per site, all 17 columns, converted cell by cell in Python; /now re-reads 30 days on every 30-s hea
+   0.12 flow-telemetry-plan-control-10 [telemetry-genset-battery] A 15-minute CSV is stored as one minute per row: day energy 1/15th, peak 14.7 kW, outages 4 min, and a green "Done"
+   0.10 flow-telemetry-plan-control-01 [telemetry-genset-battery] A CSV upload that overlaps stored minutes erases every column the file does not carry (silent data loss)
+   0.10 flow-telemetry-plan-control-13 [telemetry-genset-battery] Implausible values import silently: kW in W columns, SoC 150 % or 0.6, negative load and PV
+   0.10 engine-forecast-01 [forecasts-outages] PV stage-1 fit slices history into 24 h blocks from the tick time, not local days: performance ratio and fan change with the time of day
+   0.10 pages-B-16 [deferred] Per-step cost column rounds to whole rupees, so most 15-minute steps read 'Rs 0'
+===== tests-and-perf-08 medium native_latest uses SELECT * and so reads the native-capture photo (up to 7 MB) on every sites.full(): every tick and nearly every site page
+   0.11 flow-savings-pilot-bill-12 [savings-engine] The pilot's native baseline is not pinned: an operator can record a new capture after the start, with no amendment
+   0.10 flow-savings-pilot-bill-15 [dup:flow-onboarding-14] Native capture accepts impossible slot times such as '25:99', and the replay then silently uses that slot as the overnight default
+   0.09 engine-delivery-22 [control-edge] The canonical JSON for signatures is Python's json.dumps, which a non-Python edge cannot reproduce for floats
+   0.08 frontend-a11y-08 [savings-ui-crosscut] About 15 validation messages bypass Field: not tied to their control, not announced, and the submit button stays disabled with no reason
+   0.08 flow-onboarding-14 [sites-onboarding] The native-settings capture accepts impossible slot times ('99:99') and duplicate starts, and the savings baseline replays them
+===== performance-live-08 low The app shell polls the full /fleet answer on every page each minute only to fill the site switcher: about 4 ms per site (about 0.4 s at the 100-site 
+   0.08 role-owner-01 [dup:flow-savings-pilot-bill-02] Karachi's 'saving this month' is Rs 1,956 on Fleet and Overview but Rs 43,594 on Savings
+   0.08 tracker-and-docs-01 [savings-ui-crosscut] SIT-01 [x] says a two-connection site rebuilds per connection, but the engine, ledger and bill rebuild read only the first connection while 
+   0.07 flow-savings-pilot-bill-02 [fleet-overview] Month-to-date saving differs between pages: Fleet and Overview show Rs 1,956 for Karachi, while Savings, the fleet-savings API and the month
+   0.07 pages-A-03 [fleet-overview] A grid site whose connection is not saved yet is labelled "Off-grid" in the site header and the Fleet table
+   0.07 role-operator-01 [dup:flow-savings-pilot-bill-02] 'Saving this month' on Fleet and Overview leaves out the MDI lever; the Savings page includes it (Karachi Rs 1,956 vs Rs 43,594)
+===== performance-live-10 low API answers are not compressed: the plan page fetches 173 KB of JSON that gzip makes about 14 KB
+   0.12 flow-telemetry-plan-control-19 [control-edge] Missing from UI-15 and the phone path: no Test fallback, no Share as text, no "it took / it did not take" card
+   0.09 role-viewer-13 [ui-charts-a11y] Chart tooltips on Overview, Telemetry and Outages give numbers without units
+   0.09 role-owner-33 [shell-nav] Phone bottom bar (Overview, Plan, Genset, Control) on company pages leads to an unnamed site
+   0.07 role-owner-11 [fleet-overview] 'The next 12 hours' strip shows only the :15 step of each hour and misses actions that 'Now and next' lists
+   0.06 engine-plans-live-01 [dup:engine-optimiser-01] Optimiser plans to shed factory or mall load with the grid up to hold its MDI target; the step is labelled 'idle'
+===== performance-live-12 low Two chart libraries are shipped: the fleet landing page loads Recharts only for 84 x 24 px spark bars, and the battery page loads Recharts and ECharts
+   0.23 role-analyst-14 [fleet-overview] Fleet 7-day bars rescale each row on its own, so a -Rs 0.09 day draws as a full-height red 'loss' bar
+   0.20 role-owner-13 [dup:role-analyst-14] Fleet 7-day sparkline blows up paise-level noise into a full-height red 'loss' bar
+   0.15 role-viewer-08 [dup:role-operator-14] Battery 'Daily cycles' chart has a bogus '99999' top tick on every site
+   0.14 frontend-a11y-06 [fleet-overview] Recharts 3 makes each chart a focusable role=application inside a role=img wrapper: unnamed tab stops, one per Fleet row
+   0.10 flow-savings-pilot-bill-21 [dup:role-analyst-14] Fleet 7-day sparkline draws Lahore's -Rs 0.09 replay noise as a full-height red loss bar
+===== tests-and-perf-17 low The 680 kB ECharts chunk registers six modules nothing uses, and the size warning is switched off
+   0.16 role-owner-13 [dup:role-analyst-14] Fleet 7-day sparkline blows up paise-level noise into a full-height red 'loss' bar
+   0.15 role-analyst-14 [fleet-overview] Fleet 7-day bars rescale each row on its own, so a -Rs 0.09 day draws as a full-height red 'loss' bar
+   0.12 flow-savings-pilot-bill-21 [dup:role-analyst-14] Fleet 7-day sparkline draws Lahore's -Rs 0.09 replay noise as a full-height red loss bar
+   0.11 frontend-a11y-06 [fleet-overview] Recharts 3 makes each chart a focusable role=application inside a role=img wrapper: unnamed tab stops, one per Fleet row
+   0.09 frontend-states-formats-04 [ui-charts-a11y] Multi-day charts label the time axis with HH:MM only (every day tick reads '00:00'), with ticks placed in the browser's own zone
+===== parity-architecture-01 high No CI in either Gridlytics repository: no .github/workflows on any branch, so pull requests into v1-build are merged with no automated test, type chec
+   0.31 tracker-and-docs-23 [docs] HANDOFF section 8.D still lists 'create the repositories, push v1-build' as an owner task, though section 2 and the remotes show both reposi
+   0.14 pr-review-10 [docs] 'Done when' evidence for 8.A.1 is not reproducible, and its Rs 1 match holds by construction on gap-free data
+   0.12 tracker-and-docs-12 [docs] PLT-02 [x]: test_deploy_docs.py and .env.production.example do not exist
+   0.12 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+   0.11 brief-vs-build-14 [docs] HANDOFF section 1 'every 15 minutes the backend does five things' overstates the tick: signing is on pull, savings are nightly, Mode B is no
+===== parity-architecture-02 high The API cannot be deployed as the family deploys: no Dockerfile, .dockerignore, .env.production.example, DEPLOY.md, compose or proxy notes, and 27 of 
+   0.16 tracker-and-docs-12 [docs] PLT-02 [x]: test_deploy_docs.py and .env.production.example do not exist
+   0.07 founder-console-01 [founder-console] The Backups page tells the founder to run scripts/restore_backup.py, which does not exist, and backups.restore puts back only half of a comp
+   0.07 tracker-and-docs-03 [auth-security] The money-filter guarantee is documented against tests that do not exist (test_role_walk.py, optimise/explain.py, money.strip_for)
+   0.06 security-roles-10 [auth-security] Password lockout counts per (email, address) only; behind an untrusted proxy every client shares the 'forwarded' bucket
+   0.05 pages-A-07 [founder-console] Founder console tells people they can change their password "under Settings"; in Gridlytics it is on My account
+===== parity-architecture-03 medium No Vercel configuration: no frontend/vercel.json (SPA rewrite, CSP and security headers, asset caching) and no build-time deploy check, although the p
+   0.17 tracker-and-docs-12 [docs] PLT-02 [x]: test_deploy_docs.py and .env.production.example do not exist
+   0.10 frontend-a11y-24 [tests-ci] The 375 px check skips ?view= pages, dialogs and the installer's Slots and Mark-as-applied path; the plan's 375x812 Playwright project is mi
+   0.09 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+   0.07 parity-boxlytics-ui-02 [parity-ui] Font system differs from Boxlytics: Inter only at a fixed 16 px root, instead of Poppins everywhere (300-900), JetBrains Mono and a 14/15/16
+   0.07 tracker-and-docs-23 [docs] HANDOFF section 8.D still lists 'create the repositories, push v1-build' as an owner task, though section 2 and the remotes show both reposi
+===== parity-architecture-16 medium No scripts/ folder: the founder console tells the founder to run scripts/restore_backup.py, which does not exist, and GRIDLYTICS_WEB_DIST and the igno
+   0.45 founder-console-01 [founder-console] The Backups page tells the founder to run scripts/restore_backup.py, which does not exist, and backups.restore puts back only half of a comp
+   0.14 brief-vs-build-12 [control-edge] Product 2 contract: writable primitives are untyped and ignored by the compiler; no exported schema files despite DAT-02 being ticked
+   0.13 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+   0.12 engine-delivery-13 [control-edge] The signing key is found by an absolute file path and silently replaced when the file is missing; keys are not in backups
+   0.12 pages-A-07 [founder-console] Founder console tells people they can change their password "under Settings"; in Gridlytics it is on My account
+===== parity-architecture-20 low The sign-in stack's pins differ from Solarlytics', where the identical lifted modules were last tested, and no dependency scan runs
+   0.08 engine-forecast-11 [forecasts-outages] Load day types are Sunday-or-not only: no Pakistan public holidays, Eid, Ramadan or site off days, although FOR-06 is marked done with the h
+   0.07 founder-console-13 [founder-console] No way to delete or archive a company or an account: test and departed customers stay in the console for good
+   0.06 pages-A-07 [founder-console] Founder console tells people they can change their password "under Settings"; in Gridlytics it is on My account
+   0.05 parity-boxlytics-ui-09 [parity-ui] Sign-in page does not match the Boxlytics auth page: a small grey-page card titled by an h2 ('Sign in to Gridlytics', 14 px), with no 'Welco
+   0.05 pr-review-12 [docs] HANDOFF test counts are stale after the opt-in commit (504 passed and 7 skipped should be 503 and 8)
+===== parity-architecture-13 medium The backend .gitignore does not ignore .env, .env.production, .env.founder or platform.secret outside data/, and the launcher reads .env.founder from 
+   0.16 security-roles-12 [founder-console] Founder session secret has no minimum length; a short GRIDLYTICS_FOUNDER_SESSION_SECRET makes founder tokens forgeable offline
+   0.11 tracker-and-docs-12 [docs] PLT-02 [x]: test_deploy_docs.py and .env.production.example do not exist
+   0.07 brief-vs-build-12 [control-edge] Product 2 contract: writable primitives are untyped and ignored by the compiler; no exported schema files despite DAT-02 being ticked
+   0.07 tracker-and-docs-17 [tests-ci] 'npm run e2e' as documented fails on a HANDOFF-built machine: it defaults to a build-machine accounts path, and the README names the wrong a
+   0.05 tracker-and-docs-11 [docs] The backend README's 'Run it' seed command writes the demo into the owner's data/ folder; the README's test count and module table are stale
+===== parity-architecture-07 medium The sign-in, tenancy and founder code is a hand copy of Solarlytics with no drift check: 8 backend modules are byte-identical after a rename and 7 dif
+   0.09 pages-A-07 [founder-console] Founder console tells people they can change their password "under Settings"; in Gridlytics it is on My account
+   0.09 pages-A-02 [auth-security] Sign-in tells people to ask their company admin for a new password, but only the founder console can set one; there is no forced first-sign-
+   0.08 founder-console-05 [founder-console] The Switch off dialog does not say that the company's sites stop being planned, its edge keys are refused and telemetry is lost
+   0.07 founder-console-19 [founder-console] Dropped in the lift: the console's skip link and sidebar-footer aria-controls; tab titles also do not say 'Founder console'
+   0.07 founder-console-18 [founder-console] Founder API answers still carry the lifted field 'solarlytics_role', justified by a console page that no longer reads it
+===== parity-architecture-18 low No lint or format gate: no eslint flat config, no prettier, no lint, format:check or coverage threshold scripts; Boxlytics runs eslint with react-hook
+   0.22 tracker-and-docs-22 [tests-ci] UI-00 [x] 'the lint fails on a banned word' does not hold for 'optimal': the source-rules test leaves it out
+   0.11 frontend-a11y-24 [tests-ci] The 375 px check skips ?view= pages, dialogs and the installer's Slots and Mark-as-applied path; the plan's 375x812 Playwright project is mi
+   0.09 tracker-and-docs-16 [docs] The browser-check results and the 'round 5 followed' claims contradict each other across HANDOFF, GATES, BUILD_NOTES, API_CONTRACT and BACKE
+   0.08 tracker-and-docs-17 [tests-ci] 'npm run e2e' as documented fails on a HANDOFF-built machine: it defaults to a build-machine accounts path, and the README names the wrong a
+   0.08 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+===== parity-architecture-19 low Unused runtime dependencies are pinned and declared as shipped: pandas in the backend, date-fns and @radix-ui/react-popover in the web app
+   0.07 engine-forecast-11 [forecasts-outages] Load day types are Sunday-or-not only: no Pakistan public holidays, Eid, Ramadan or site off days, although FOR-06 is marked done with the h
+   0.06 flow-savings-pilot-bill-12 [savings-engine] The pilot's native baseline is not pinned: an operator can record a new capture after the start, with no amendment
+   0.06 tracker-and-docs-22 [tests-ci] UI-00 [x] 'the lint fails on a banned word' does not hold for 'optimal': the source-rules test leaves it out
+   0.05 parity-boxlytics-ui-08 [parity-ui] index.html head is minimal: title 'Gridlytics' with no 'Product - tagline' pattern, no description, Open Graph or Twitter tags, no apple-tou
+   0.05 role-owner-41 [shell-nav] React Router 'No HydrateFallback element' warning logged on every page load
+===== parity-architecture-21 low The web repository's .gitignore does not ignore Python caches, so running the launcher's tests leaves scripts/__pycache__ and scripts/tests/__pycache_
+   0.15 tracker-and-docs-04 [dup:brief-vs-build-12] DAT-02 [x] is not met: no delivery/contract.py, no generated schema files, no scripts/export_contract.py, no drift test, no numbered contrac
+   0.09 pr-review-01 [tests-ci] Opt-in benchmark removes the only default-suite check of round 5's second-day hour-mark rows and of the real 192-step farm plans
+   0.08 tracker-and-docs-21 [demo-seed] PLT-05 [x] and the seed_demo docstring and --help name template CSVs that are not in the repository; re-run idempotency is untested
+   0.07 founder-console-01 [founder-console] The Backups page tells the founder to run scripts/restore_backup.py, which does not exist, and backups.restore puts back only half of a comp
+   0.07 tracker-and-docs-12 [docs] PLT-02 [x]: test_deploy_docs.py and .env.production.example do not exist

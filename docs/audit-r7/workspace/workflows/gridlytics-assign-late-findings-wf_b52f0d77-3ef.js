@@ -1,0 +1,23 @@
+export const meta = {
+  name: 'gridlytics-assign-late-findings',
+  description: 'Assign the late audit findings to the existing work packages as extra batches (or mark them duplicates/deferred), then a critic checks coverage',
+  phases: [{ title: 'Assign', detail: 'one planner' }, { title: 'Critique', detail: 'one critic' }],
+}
+const A = args.audit
+const PLAN = { type: 'object', properties: {
+  wps: { type: 'array', items: { type: 'object', properties: {
+    key: { type: 'string' }, title: { type: 'string' }, repos: { type: 'array', items: { type: 'string' } }, owns_files: { type: 'array', items: { type: 'string' } },
+    stage: { type: 'integer' }, depends_on: { type: 'array', items: { type: 'string' } },
+    batches: { type: 'array', items: { type: 'object', properties: { ids: { type: 'array', items: { type: 'string' } }, theme: { type: 'string' } }, required: ['ids', 'theme'] } },
+    notes: { type: 'string' } }, required: ['key', 'title', 'repos', 'owns_files', 'stage', 'depends_on', 'batches', 'notes'] } },
+  duplicates: { type: 'array', items: { type: 'object', properties: { canonical: { type: 'string' }, dups: { type: 'array', items: { type: 'string' } }, note: { type: 'string' } }, required: ['canonical', 'dups'] } },
+  deferred: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, reason: { type: 'string' } }, required: ['id', 'reason'] } },
+  summary: { type: 'string' },
+}, required: ['wps', 'duplicates', 'deferred', 'summary'] }
+const BRIEF = `CONTEXT: An audit of Gridlytics (OnyxLeaf's energy dispatch optimiser; backend ${args.backend}, web app ${args.frontend}) has an implementation plan ${A}/impl/plan.json: work packages (wps: key, title, owns_files, stage, notes, batches of finding ids), duplicates and deferred. Stage-1 packages are being implemented now, each in its own worktree and branch; stage 2 (savings-ui-crosscut, tests-ci) builds on the integrated stage-1 branch; stage 3 (parity-ui = Boxlytics look and landing page; docs) last. ${'116'} LATE findings arrived after the plan was made: index ${A}/impl/index-late.tsv (id, severity, repo, label, file, area, title), full records in ${A}/results/findings-late-*.json (dimensions: engine-money-live, flow-reports-alerts-members-keys, parity-architecture, parity-supabase-auth, performance-live, tests-and-perf). The original findings are in ${A}/impl/index.tsv and ${A}/impl/all-findings.json.
+TASK: produce a LATE plan in the same schema: for each existing package key that receives late findings, an entry with the SAME key, title, owns_files, stage, depends_on and notes copied from plan.json (notes may get one added sentence about the late findings), and batches containing ONLY late ids (4-7 related ids per batch, severity-ordered). You may add NEW packages only where no existing one fits; say why (likely candidates: 'storage-perf' for plan-row retention, backups and polling cost if they do not fit optimiser-plans/fleet-overview; 'deploy-ci' for Docker/CI/repository-shape findings at stage 2 or 3; Supabase-mode parity under the owner's rule — preassigned accounts only, no Google, no self-signup, Supabase only as an optional owner-applied mode as in solarlytics-backend — belongs to auth-security or founder-console). A late finding that is the same defect as an ORIGINAL finding goes in duplicates with the original canonical id (look it up in plan.json: if the original is itself a dup, use its canonical). Defer only owner/business decisions, hardware or real-site data, or a finding that merely restates a whole HANDOFF-8 feature with a design (tariff editor, report schedules, alert delivery, 2-slot ranking, solve limits). Every late id exactly once across batches, duplicates.dups and deferred.`
+phase('Assign')
+const draft = await agent(`${BRIEF}\n\nYou are the planner. Read index-late.tsv fully, the late records where needed, plan.json (wps keys, owns_files, notes; duplicates), then produce the late plan.`, { label: 'late:plan', phase: 'Assign', schema: PLAN })
+phase('Critique')
+const fin = await agent(`${BRIEF}\n\nYou are the critic. Check the draft below: every late id exactly once (write a python check against index-late.tsv; you may save the draft to ${A}/impl/plan-late-draft.json), duplicates truly the same root cause as the original, packages chosen by file ownership, batches coherent. Return the corrected full late plan.\n\nDRAFT:\n${JSON.stringify(draft)}`, { label: 'late:critic', phase: 'Critique', schema: PLAN })
+return { plan: fin || draft }

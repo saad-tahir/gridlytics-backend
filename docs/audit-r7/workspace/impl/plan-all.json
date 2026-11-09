@@ -1,0 +1,2485 @@
+{
+ "wps": [
+  {
+   "key": "savings-engine",
+   "title": "Savings engine and pilot set-up (verify.py, the pilot and switchback routes, features/pilot)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/verify.py (all but the bill functions _bill_day, add_bill, rebuild_bill, _bill_row and bills, which are tariffs')",
+    "backend/gridlytics/routes_savings.py (switchback, switchback_paint, pilot_get, pilot_put, pilot_start, pilot_ics only)",
+    "frontend/src/features/pilot/",
+    "backend/tests/test_r7_savings_engine.py (new)",
+    "backend/tests/test_r7_pilot.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Claim integrity: which days claim and what the headline sums",
+     "ids": [
+      "role-owner-02",
+      "engine-savings-02",
+      "engine-savings-06",
+      "pr-review-03",
+      "pr-review-11"
+     ]
+    },
+    {
+     "theme": "MDI lever: selected range, month-to-date, rate per month, month-end re-score",
+     "ids": [
+      "flow-savings-pilot-bill-01",
+      "pages-D-03",
+      "engine-savings-04",
+      "engine-savings-05",
+      "engine-savings-10"
+     ]
+    },
+    {
+     "theme": "Carry-over, re-scoring and the switchback method",
+     "ids": [
+      "flow-savings-pilot-bill-03",
+      "engine-savings-08",
+      "brief-vs-build-11",
+      "pr-review-02",
+      "engine-savings-11"
+     ]
+    },
+    {
+     "theme": "Tuned baseline, the perfect-foresight bound, legacy rows and tests",
+     "ids": [
+      "engine-savings-03",
+      "engine-optimiser-14",
+      "pr-review-04",
+      "pr-review-09"
+     ]
+    },
+    {
+     "theme": "Pilot record integrity: request model, start, sign-off, pinned baseline, amendments",
+     "ids": [
+      "pages-D-04",
+      "flow-savings-pilot-bill-09",
+      "flow-savings-pilot-bill-12",
+      "flow-savings-pilot-bill-30",
+      "pages-D-17",
+      "pages-D-19"
+     ]
+    },
+    {
+     "theme": "Pilot start gates and the switchback calendar: tier, draw, rules, labels, export",
+     "ids": [
+      "flow-savings-pilot-bill-11",
+      "pages-D-11",
+      "security-roles-06",
+      "flow-savings-pilot-bill-25",
+      "flow-savings-pilot-bill-24",
+      "role-operator-18",
+      "security-roles-14"
+     ]
+    },
+    {
+     "theme": "Late: tuned baseline never worse than native; switchback checks from the server",
+     "ids": [
+      "engine-money-live-11",
+      "parity-architecture-23"
+     ]
+    }
+   ],
+   "notes": "The pilot WP is folded in here: the pilot's pinned baseline (flow-savings-pilot-bill-12), the calendar draw (security-roles-06) and the tier rule (pages-D-11) all change verify.py, so one worktree owns verify.py, the pilot routes and the pilot pages. Expose the new fields in the API for stage 2 (per day and in the summary: claimed vs all-days totals, withheld reason, which levers a withheld day keeps, the MDI lever's month, provisional flag and rate version, carry-over share, fee basis) and list them in API_CONTRACT/types. Claims: only days whose control was actually in force claim (paused, released, failed plan, offline edge, native block do not). MDI lever priced per month with that month's tariff version, claimed once per billing month and pro rata for a sub-range, never from withheld days, provisional until the month closes; the month is re-scored at its end or after late data from inside verify.compute_day, which the nightly job already calls (scheduler.py is control-edge's: no edit there). Carry-over: chain only through claiming periods, credit native blocks' hand-over too, address HANDOFF 8.A.1 (done when the per-day ledger tracks the continuous replay within about Rs 1k over 11 days for several seeds); re-scoring that changes closed months is limited/flagged with an audit line; legacy (pre-round-6) rows flagged. Switchback result: Preliminary until the minimum days per arm, counterfactual agreement check (15 %/Rs 300), and no switchback result at a monitor-tier site (its days are recommendation_only). Tuned baseline gets the HOMER cycle-charging rule at genset sites; the perfect-foresight bound includes unserved and MDI terms and refuses time-limited solves. The metering factor (engine-savings-09) and the per-connection ledger are stage 2's. Pilot: PUT /pilot gets a request model (schemas.py) with sign-off and amendments server-owned; a second POST /pilot/start is refused; the native capture version is pinned at start and verify replays the pinned version; a later capture is recorded as an amendment (reason, old and new values, audit row). The 'a typed capture cannot claim read back by the edge device' half of flow-savings-pilot-bill-12 is sites-onboarding's (native capture form and validation). Start gates: control tier at least advisory for switchback, baseline window present with a data-completeness check and KPI list (tab A), calendar not in the past, rule checks incl. holiday closures (tab C) must pass, and the tab shows red when they fail. Calendar: a server-side draw from os entropy (secrets) stored with the calendar, not re-rollable or backdatable once locked, and only blocks painted before they began count toward the 8 weeks; 3-day blocks only where allowed, the right word for pairs, correct month labels (Nov 2026), page refreshes after 409 calendar_locked; .ics escapes text (no CRLF injection), has DTSTAMP and a file name. The Savings-page halves (amendments shown on Savings, the monitor-tier ledger title, the switchback panel) are stage 2's (features/savings); pilot success-criteria scoring (pages-D-12) is stage 2's. Every money change gets a golden test. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder. Late batch: the tuned fit gets a native-like self-use candidate and values end-of-day energy as the ledger does, so the tuned baseline is never worse than native (engine-money-live-11, golden test), and the pilot page takes its switchback checks from the server (a result needs 6 days in total with both arms, as verify.switchback_result) instead of re-implementing them in switchback-rules.ts (parity-architecture-23); the late duplicates of role-owner-02, engine-savings-08, flow-savings-pilot-bill-01, pages-D-03 and engine-optimiser-14 add evidence (the carry-over mechanism: both replays start at the actual's SoC and the next day's native replay inherits the energy credited at the peak price; the off-grid farm's month that is all carry-over; the MDI month's actual peak built from every day of the month, not only scored days; the perfect-foresight bound solved at 15 minutes from the day's month-to-date M0 against a native arm priced per minute, so compare both on the same 1-minute basis and levers)."
+  },
+  {
+   "key": "tariffs",
+   "title": "Tariffs: price vector, bill rebuild and comparison, goldens, Tariffs page and draft dialog",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/tariffs.py",
+    "backend/gridlytics/tariff_data.py",
+    "backend/gridlytics/routes_tariffs.py",
+    "backend/gridlytics/verify.py (bill functions only: _bill_day, add_bill, rebuild_bill, _bill_row, bills)",
+    "backend/gridlytics/routes_savings.py (bills, bill_add only; new correct/delete bill routes appended next to them)",
+    "frontend/src/features/tariffs/",
+    "frontend/src/features/savings/bills-panel.tsx",
+    "frontend/src/features/savings/bill-dialog.tsx",
+    "backend/tests/test_r7_tariffs_golden.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Price vector correctness",
+     "ids": [
+      "flow-onboarding-01",
+      "engine-tariffs-03",
+      "engine-tariffs-04",
+      "engine-tariffs-11",
+      "engine-tariffs-12"
+     ]
+    },
+    {
+     "theme": "Bill rebuild and bill comparison",
+     "ids": [
+      "engine-tariffs-01",
+      "engine-tariffs-02",
+      "engine-tariffs-08",
+      "pages-D-10",
+      "flow-savings-pilot-bill-08",
+      "engine-tariffs-10",
+      "flow-savings-pilot-bill-23"
+     ]
+    },
+    {
+     "theme": "Golden bills, schedule expiry, Tariffs page and the draft dialog",
+     "ids": [
+      "engine-tariffs-07",
+      "engine-tariffs-06",
+      "role-analyst-16",
+      "role-owner-25",
+      "role-operator-22",
+      "role-viewer-21"
+     ]
+    },
+    {
+     "theme": "Late: fuel price before the first entry; seeding check on every lookup",
+     "ids": [
+      "engine-money-live-15",
+      "tests-and-perf-25"
+     ]
+    }
+   ],
+   "notes": "Price vector: export credit only inside an agreement's dates, and the Tariffs page shows each agreement's state (active, not started, ended; this is also the Tariffs-page half of pages-D-16, whose alert text is alerts-reports'); every FCA line (not only key 'fca') with its negative-FCA exemption; legacy net-metering surplus at the NAPPP rate from the source; DSS 43 paisa for D-2; TOU calendar versions must cover each month exactly once. Bill rebuild (tariffs.py and the bill functions of verify.py, which you own): each day priced with the versions in force that day; excess export credit carried forward; missing bill steps (PF penalty, Punjab per-unit grid duty, extra tax, credit-before-tax); ICP at legacy sites caps gross-import increments at net imports pro rata; gaps not counted as zero import (fill from the profile as the page says, or withhold the 2 % verdict below a completeness threshold), in the bill code rather than telemetry.py; printed peak/off-peak units and MDI compared line by line; overlapping bills refused; a bill can be corrected or deleted; the fixed-charge line adds up. Goldens to the paisa with their sources for everything tracker-and-docs-07 lists: the four hand-worked bills (TAR-06, VER-04), a golden per regime (TAR-02), ICP above/below/uncertain (TAR-03, OPT-06), peak membership at every season boundary and the midnight-crossing window (TAR-01), TAR-04/05 line by line. Schedule expiry (engine-tariffs-06): flag a passed 'awaiting notification' schedule after 1 Jan 2027 in the price vector, the plan answer and the Tariffs page; the alert for it is alerts-reports' (brief-vs-build-18, no scraping of NEPRA/OGRA). The Punjab self-generation duty by province (engine-tariffs-09) and bills per connection are stage 2's: no edit to plans.py or the ledger here. Tariffs page: readable labels, duty table fits its card, no developer note or inert date picker for a viewer. Draft dialog (role-analyst-16, a defect inside the existing dialog): a per-kind example body, kind names in words ('Time of use', 'ICP'), the JSON error once and in words; the lettered-tab editor UI-03 (pages-D-13) stays deferred. Every money calculation gets a golden test. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder. Late batch: a genset day before the first entered fuel price is flagged 'no fuel price for this day' instead of borrowing a later price (engine-money-live-15, golden test), and the shipped-library seeding check runs once per company file and process instead of on every lookup (tests-and-perf-25); the late duplicate of flow-onboarding-01 extends the agreement dates to the bill rebuild (tariffs.py 548-553, 607-611) and prices exports after a legacy agreement's end by the regime that follows it, not at the import rate."
+  },
+  {
+   "key": "delivery-twin",
+   "title": "Delivery compile, vendor tables and the twin (delivery.py compile half, twin.py, slot wording)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/delivery.py (the compile half: BRANDS, FALLBACK_HOURS, grid_charging, step_intents, GEN_CHARGE_SUPPORTED, compile_mode_a, _intent_words, vendor_view, _mode_b_floor, mode_b)",
+    "backend/gridlytics/twin.py (all but truth(), whose day boundary demo-seed fixes)",
+    "backend/gridlytics/routes_plans.py (plan_compare only)",
+    "frontend/src/features/devices/vendor-table.tsx",
+    "frontend/src/features/plan/compare-drawer.tsx",
+    "frontend/src/features/plan/slot-words.ts",
+    "backend/tests/test_r7_delivery.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Vendor table content: charge targets, MDI cap, per-brand layouts",
+     "ids": [
+      "role-operator-02",
+      "pages-B-03",
+      "pages-B-04",
+      "pages-B-05",
+      "engine-delivery-07",
+      "flow-telemetry-plan-control-18",
+      "flow-onboarding-23"
+     ]
+    },
+    {
+     "theme": "Mode A compile: slot reduction, genset runs in the slots, safe tail, fallback block",
+     "ids": [
+      "engine-delivery-04",
+      "flow-telemetry-plan-control-04",
+      "engine-delivery-08",
+      "brief-vs-build-07",
+      "pages-B-13"
+     ]
+    },
+    {
+     "theme": "Twin fidelity and the compare with native",
+     "ids": [
+      "engine-delivery-15",
+      "engine-delivery-16",
+      "engine-delivery-19",
+      "engine-delivery-20",
+      "engine-delivery-21",
+      "pages-B-14",
+      "engine-plans-live-10"
+     ]
+    }
+   ],
+   "notes": "Vendor view shows the slot's target SoC (not the floor) and carries grid_cap_w where the brand can take it; where it cannot, set max_discharge_w and the floor per Part 7.1 step 4, report mdi_not_enforceable in the compiled table the plan answer already carries, and make the twin not peak-shave that brand (engine-delivery-15 is the same twin change: no shaving below the slot floor or the reserve). Per-brand layouts and grammar: Huawei (valid periods, no 'hold', SoC targets, global cut-off and floor registers), Deye (6-program ring fully specified, sell flag, self-use not keyed as power 0), Growatt 3+3 windows (fix the contradicting grammar text in BRANDS, which the plan Slots view prints), Sungrow 2 slots, Voltronic, Solis, other. Compile: re-merge adjacent same-mode runs after the slot-count reduction so a planned charge/discharge is not dropped (the twin-priced boundary ranking of HANDOFF 8.A.2 stays out); the compiled slots carry the plan's genset runs and twin.slots_policy follows them, so plans._guard, plan_compare, the demo and verify's fidelity replay all get it without call-site edits (flow-telemetry-plan-control-04); whole-table safety for a table that persists past today (safe tail); fallback block without a revert timer, with native_settings_ref and max_export_w_floor, and slot-words.fallbackSentence (yours) no longer promises a revert (control-cards.tsx only calls it); simulate expiry and link loss in the twin with tests. Twin: honours max_charge_kw in the native replay and charge_end_ts, export without booking battery energy as curtailed PV, brand profiles (TWN-02). Compare with native: say when the baseline is an assumed self-use one, show what the reserve is worth. Mode B execution (engine-delivery-17) and genset charging (engine-plans-live-18, GEN_CHARGE_SUPPORTED) are stage 2's because they also change the guard, the demo and build_problem. Agree the delivered SoC floor with optimiser-plans (engine-delivery-02: the plan floor is the higher of BMS soc_min and the floor the table/fallback holds). twin.truth is demo-seed's; the signing and message-model half of delivery.py is control-edge's. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder."
+  },
+  {
+   "key": "control-edge",
+   "title": "Control and edge: what reaches the device, control state and actions, advisory budget, edge protocol, keys",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/routes_plans.py (all but plan_compare)",
+    "backend/gridlytics/routes_edge.py",
+    "backend/gridlytics/scheduler.py",
+    "backend/gridlytics/routes_sites.py (control_state only)",
+    "backend/gridlytics/delivery.py (from _key_dir on: keys, canonical, sign, verify, message models)",
+    "backend/gridlytics/plans.py (RELEASE_REASONS, _ts, control_release, _guard, current, held_info, get, history, _released_at, active_at, now_and_next, mark_applied, applied_rows, _no_money, _record_send, _release_message, signed_message, and new functions appended after signed_message)",
+    "frontend/src/features/devices/ (control-page, control-actions, control-cards, capabilities-card, edge-card, mark-applied, overrides-list, new control components)",
+    "frontend/src/features/plan/plan-held.tsx",
+    "frontend/src/features/plan/plan-history.tsx",
+    "frontend/src/features/plan/overrides-panel.tsx",
+    "backend/tests/test_r7_control_edge.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "What reaches the device: tier gating, wrong-plan guard, expiry, switchback native days",
+     "ids": [
+      "flow-telemetry-plan-control-03",
+      "engine-delivery-01",
+      "engine-savings-01",
+      "engine-plans-live-05",
+      "engine-delivery-24"
+     ]
+    },
+    {
+     "theme": "Edge protocol: sequence numbers, contract, acks, heartbeat actions",
+     "ids": [
+      "engine-delivery-03",
+      "engine-delivery-11",
+      "engine-delivery-12",
+      "engine-delivery-10",
+      "brief-vs-build-12"
+     ]
+    },
+    {
+     "theme": "Control actions and the control state: validation, immediacy, held-state wording, times with a day",
+     "ids": [
+      "pages-B-01",
+      "flow-telemetry-plan-control-15",
+      "pages-B-15",
+      "flow-telemetry-plan-control-21",
+      "flow-telemetry-plan-control-22",
+      "flow-telemetry-plan-control-23"
+     ]
+    },
+    {
+     "theme": "Advisory tier: stable daily table, write budget, confirmation, honest chip",
+     "ids": [
+      "pages-B-02",
+      "pages-B-08",
+      "role-owner-08",
+      "pages-B-06",
+      "role-owner-36"
+     ]
+    },
+    {
+     "theme": "Control page: overrides UI, closed-loop panel, fallback test, edge card",
+     "ids": [
+      "flow-telemetry-plan-control-17",
+      "role-operator-11",
+      "flow-telemetry-plan-control-19",
+      "frontend-states-formats-16"
+     ]
+    },
+    {
+     "theme": "Edge message hardening and signing keys",
+     "ids": [
+      "engine-delivery-13",
+      "security-roles-11",
+      "engine-delivery-22",
+      "engine-delivery-23"
+     ]
+    }
+   ],
+   "notes": "A monitor-tier site's edge gets no actionable plan; the wrong-plan guard can actually refuse (and checks the MDI cap); plans past valid_until are not current or served; on switchback native-block days the live site goes to native through control_release (it returns a release when verify.arm_on says native), so tick needs no edit: tick and build_problem are optimiser-plans'. Control actions take request models (validation before any float(), so nothing 500s before the permission check); hold/pause/release/resume take effect at once (re-send/re-solve now); wording matches the stored held state; the Versions list does not badge a paused plan Active; the releasing operator may resume. control_state (routes_sites.py, yours): no demo_link forcing (a demo site reports 'Table not confirmed today' or 'Edge offline' like a customer site; demo-seed seeds the applied rows), a force charge shows in the chip, hold/pause/release labels name the day and the end (site-chips.tsx prints the label: no edit there). Advisory tier: one stable daily table compiled at a fixed time (a daily job in scheduler.py and new functions after signed_message) and re-issued only within the 3-4 a day write budget, counted on Karachi dates from real table changes and 'Mark as applied' (not edge pulls); the page records which table was keyed; a same-day 'it took / it did not take' card; monitor tier shows no Pause writes or write counter. Edge: sequence per stream with reset handling; the U3 contract (envelope fields, event names, partial acks, heartbeat states, telemetry shape) plus exported JSON-schema files, an export script and a drift test (brief-vs-build-12); act on rejected/partial acks, control_disabled, firmware_change and heartbeat state; real clock-offset actions; bounded message models. Keys: path relative to the data folder, never silently regenerated, created 0600 (os.open mode); canonical JSON a non-Python edge can reproduce, with test vectors; the backup copy of the keys folder is founder-console's (backups.py). UI: place force charge, genset hold, charge block and reserve overrides; closed-loop control panel (edge, read-back, ack codes, write log, fallback test) with Test fallback and Share as text on the control page (the plan Slots view is optimiser-plans': no edit there); edge card in local time and plain units. Event re-solves for genset starts, forecast busts and tariff changes (brief-vs-build-15) are stage 2's. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder."
+  },
+  {
+   "key": "optimiser-plans",
+   "title": "Optimiser and plan building (optimise.py, battery.py, plans.build_problem and tick) and the plan page",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/optimise.py",
+    "backend/gridlytics/battery.py",
+    "backend/gridlytics/plans.py (SELFGEN_DUTY_RS_PER_KWH, peak_mask, _month_start, billing_period, month_to_date, GAP_MINUTES, _carried_genset, _override_steps, offgrid_c_next, build_problem, _steps_out, _saved_outage, _keep_observed_outage, tick, _iso, _plan_out, _plan_time_limited, _status_label, time_limited_recent)",
+    "frontend/src/lib/reasons.ts",
+    "frontend/src/features/plan/ (plan-page, plan-header, plan-views, slots-view, reasons-legend, resolve-button, use-clock)",
+    "frontend/src/components/charts/slot-table.tsx",
+    "frontend/src/components/charts/plan-gantt.tsx",
+    "frontend/src/components/charts/reason-chip.tsx",
+    "backend/tests/test_r7_optimiser.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Grid-up load shedding, peak-window buying and reason labels",
+     "ids": [
+      "engine-optimiser-01",
+      "flow-telemetry-plan-control-02",
+      "flow-telemetry-plan-control-08",
+      "engine-plans-live-17"
+     ]
+    },
+    {
+     "theme": "SoC floors, inverter limits and the outage reserve",
+     "ids": [
+      "engine-delivery-02",
+      "engine-plans-live-03",
+      "engine-plans-live-06",
+      "engine-plans-live-12",
+      "engine-optimiser-09"
+     ]
+    },
+    {
+     "theme": "Battery state, uncertainty and infeasible starts",
+     "ids": [
+      "engine-plans-live-02",
+      "flow-telemetry-plan-control-09",
+      "engine-optimiser-07",
+      "engine-optimiser-03",
+      "engine-optimiser-04",
+      "brief-vs-build-03",
+      "engine-optimiser-15"
+     ]
+    },
+    {
+     "theme": "MDI month handling and the cost breakdown",
+     "ids": [
+      "engine-optimiser-02",
+      "engine-plans-live-08",
+      "engine-optimiser-12",
+      "engine-optimiser-13",
+      "engine-optimiser-10"
+     ]
+    },
+    {
+     "theme": "Genset and off-grid dispatch",
+     "ids": [
+      "engine-optimiser-05",
+      "engine-optimiser-06",
+      "engine-plans-live-15",
+      "engine-optimiser-11",
+      "engine-plans-live-16"
+     ]
+    },
+    {
+     "theme": "Battery life and solve limits: cycle cap, derating, time-limited plans",
+     "ids": [
+      "brief-vs-build-04",
+      "brief-vs-build-05",
+      "engine-optimiser-08",
+      "engine-plans-live-19"
+     ]
+    },
+    {
+     "theme": "Plan page: table flags, slot table a11y, re-solve feedback, slot wording",
+     "ids": [
+      "pages-B-07",
+      "frontend-a11y-04",
+      "frontend-a11y-12",
+      "frontend-states-formats-07",
+      "frontend-a11y-23",
+      "flow-telemetry-plan-control-26"
+     ]
+    }
+   ],
+   "notes": "No load shedding with the grid up (U = L on grid-up steps) and the guard catches it (the guard is control-edge's: cover it with a test against your problem); no grid buying inside the peak window to refill the reserve unless priced and labelled as such; reasons derived from the numbers (no 'likely outage' at 1-3 %, no 'cheaper' in the peak, no 'Wear > saving' next to a peak discharge); grid charging smoothed under the plan's own MDI cap. Plan SoC floor = the higher of BMS soc_min and the floor the delivered table/fallback holds (agree the value with delivery-twin's compile; the compile call is in tick, yours). Inverter limits: PV to AC plus battery discharge within the inverter's kW AC (the engine half of flow-onboarding-09, whose form and server check are sites-onboarding's) and the reserve limited by battery discharge and inverter AC power; an AMF auto-start covers the reserve instead of a 30-minute full-load battery reserve; the 'reserve floor when an outage is likely' setting is honoured; no double-charged shortfall. Battery: a start below soc_min stays feasible, out-of-band relaxation only for the start, stale SoC widens sigma, sigma re-anchors at a full charge (fixes the 95 % for 48 h plans; prove the Faisalabad/Lahore plans no longer cost more than native), BMS trust score low without an independent estimate, temperature derating with the derate/imbalance/capacity_drop alerts raised by battery.state (alerts.evaluate already reads them: no alerts.py edit), cycle cap applied. MDI: month-start anchoring fixed, 'MDI rise' and the cost breakdown itemise M2 instead of 'Not itemised', c_cal_hold as holding cost to the next peak, month_to_date treats missing minutes as unknown. Genset/off-grid: fuel carried between ticks (tank 0 = unknown, not unlimited), follow cap on every grid-down step whatever gen_charge_allowed, no simultaneous charge/discharge, no curtailing free PV while the battery has room, genset marginal cost in the grid-tied terminal value; genset charging (GEN_CHARGE_SUPPORTED, engine-plans-live-18) and the Punjab duty by province (engine-tariffs-09) are stage 2's. Time limits: tick is yours whole; a time-limited incumbent with a large gap does not supersede the last plan and the relaxed retry is labelled; surface time_limited_recent on the plan answer/page (the deterministic work limit / idle re-solve of HANDOFF 8.A.3 stays out). Plan page: Flags/override column and past-24-hour actuals in the table view, legible past slots, reason chips not one tab stop each and readable on a phone, re-solve feedback with the guard's reason and no raw solver text, an all-day slot written as 'all day' in slots-view.tsx (slot-words.ts is delivery-twin's). Golden tests for every cost term changed. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder."
+  },
+  {
+   "key": "forecasts-outages",
+   "title": "Forecasts and outages (forecast.py, Forecasts and Outages pages)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/forecast.py",
+    "backend/gridlytics/routes_forecasts.py",
+    "backend/gridlytics/solar.py",
+    "backend/gridlytics/routes_telemetry.py (outages, schedule_put, outage_cause only)",
+    "frontend/src/features/forecasts/",
+    "frontend/src/features/outages/",
+    "backend/tests/test_r7_forecast.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "PV fit, scoring and accuracy summary",
+     "ids": [
+      "engine-forecast-01",
+      "engine-forecast-04",
+      "pages-C-22",
+      "pages-C-01",
+      "engine-forecast-03",
+      "engine-forecast-14"
+     ]
+    },
+    {
+     "theme": "Outage model: adherence, gaps, cold start, feeder pooling, refresh",
+     "ids": [
+      "pages-C-02",
+      "engine-forecast-02",
+      "engine-forecast-08",
+      "engine-forecast-12",
+      "brief-vs-build-09",
+      "pages-C-08",
+      "pages-C-21"
+     ]
+    },
+    {
+     "theme": "Load model, holidays, critical load and stages",
+     "ids": [
+      "engine-forecast-05",
+      "engine-forecast-06",
+      "engine-forecast-11",
+      "pages-C-06",
+      "engine-forecast-09",
+      "pages-C-12"
+     ]
+    },
+    {
+     "theme": "Outages page: reserve adequacy, announced windows, calendar heatmap",
+     "ids": [
+      "pages-C-07",
+      "role-analyst-15",
+      "pages-C-10",
+      "pages-C-19"
+     ]
+    },
+    {
+     "theme": "Forecast bands and Forecasts page wording",
+     "ids": [
+      "engine-forecast-16",
+      "pages-C-09",
+      "pages-C-23",
+      "role-owner-21"
+     ]
+    }
+   ],
+   "notes": "The outage functions of routes_telemetry.py are yours; telemetry-genset-battery owns the rest of that file and segments runs and outages by minutes (pages-C-04) inside telemetry.outages, which your route already calls: no edit needed here. PV: fit on local days and on available power (pv + curtail_w), stage-1 quantiles really scaled, actuals overlay from the start of the window, persistence/smart-persistence skill and more than one horizon class, 'last 7 days' by date, the outage chart's p_start on the right slot. Outages: adherence updated on local-day windows only; with no schedule show 'no announced schedule' and the prior as a prior, not '80 %'; one outage across a data gap; a cold-start prior that includes scheduled shedding for rural feeders; feeder pooling across sites sharing a feeder (the model card's hint only when no feeder is set and only to roles that can set it); manual refresh keeps the observed-outage protection (call plans._keep_observed_outage, read only) and is limited to roles that may run it. Load: critical load learnt from adequately backed outages with the template as fallback and a visible warning when zero (the form default in site-form.ts is sites-onboarding's half of engine-forecast-05); accuracy scored on unshed minutes with the same slot set for persistence; no self-reference in the 2-hour ratio; Pakistan public holidays, Eid, Ramadan and site off days (a dated table with its source). Stages: Preliminary until 28 verified days and stage 1; no PV forecast for a site without PV; no outage stage for an off-grid site; stage wording matches the 3-day rule; empirical/conformal bands (FOR-05/07 in a v1 form). The weather feed (FOR-02) is deferred pending the owner's licence: pages-C-09 adds only the 'no weather feed, clear sky x climatology' notice. Outages page: reserve-adequacy KPI and reserve at the start of each outage (in a function the stage-2 pilot gates can call), announced-window match with a tolerance, a calendar (date x hour) heatmap, announced windows on the probability chart and the 'now' line at now. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder."
+  },
+  {
+   "key": "telemetry-genset-battery",
+   "title": "Telemetry/CSV import, genset and battery pages, Devices and data",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/telemetry.py",
+    "backend/gridlytics/routes_telemetry.py (series, days, heatmap, quality, _upload_window, _import, upload, export, battery_page, genset_page, genset_answer, fuel_logs, fuel_log)",
+    "frontend/src/features/telemetry/",
+    "frontend/src/features/genset/",
+    "frontend/src/features/battery/ (all but battery-cards.tsx, which is auth-security's)",
+    "frontend/src/features/devices/data-quality-card.tsx",
+    "frontend/src/features/devices/devices-page.tsx",
+    "backend/tests/test_r7_telemetry.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "CSV import integrity",
+     "ids": [
+      "flow-telemetry-plan-control-01",
+      "flow-telemetry-plan-control-10",
+      "flow-telemetry-plan-control-13",
+      "flow-telemetry-plan-control-14",
+      "frontend-states-formats-06",
+      "flow-telemetry-plan-control-24"
+     ]
+    },
+    {
+     "theme": "Genset litres, runs, fuel cost and cards",
+     "ids": [
+      "pages-C-03",
+      "pages-C-04",
+      "pages-C-05",
+      "role-owner-07",
+      "pages-C-15",
+      "pages-C-16",
+      "role-operator-32"
+     ]
+    },
+    {
+     "theme": "CSV mapping, refusals, data quality and series",
+     "ids": [
+      "flow-telemetry-plan-control-12",
+      "role-viewer-07",
+      "flow-telemetry-plan-control-25",
+      "pages-B-11",
+      "pages-B-17"
+     ]
+    },
+    {
+     "theme": "Battery page",
+     "ids": [
+      "role-operator-14",
+      "pages-C-13",
+      "pages-C-14",
+      "role-owner-30",
+      "role-owner-38",
+      "frontend-states-formats-11"
+     ]
+    },
+    {
+     "theme": "Late: telemetry file cost: read transactions, streamed CSV upload, series cap, forecast-issue retention",
+     "ids": [
+      "performance-live-03",
+      "performance-live-04",
+      "tests-and-perf-05",
+      "performance-live-06"
+     ]
+    }
+   ],
+   "notes": "CSV: an upload that overlaps stored minutes merges per column and never erases columns the file does not carry (high, regression test); detect the logger step and store 5/15-minute rows as intervals (energy, peaks and outage minutes right, no green Done on a wrong import); plausibility checks (W vs kW, SoC 0-100 vs 0-1, negative PV/load) reported per file; a file whose grid_present cells are unreadable is refused or reported; duplicate timestamps reported; Asia/Karachi as the default time zone with an explicit choice; a column/unit/sign mapping step (UI-06, spec 7.5) with format hints for common loggers; the importer's 30 MB sentence reachable (size check before the API cap). Data quality: today's completeness against elapsed minutes (the heatmap's colour-scale legend is ui-charts-a11y's), the same colour thresholds on Telemetry and Devices, every stored series in the picker. Genset: litres metered where metered and estimated from the fuel curve where not (never 0 L and Rs 0 for an unmetered set; labels agree with Savings), runs and outages segmented by minutes inside telemetry.py so a blank sample does not end a run (the outage log and alerts read the same function), 'no run signal' vs 'no runs', fuel priced at the price dated to each run, KPI row per plan (Rs/kWh, hours below minimum load, month view), fuel curve with measured points and a refit from the fuel log/data-sheet points, policy card shows the policy, fuel-curve chart axes fit. Battery: cycles divided by days with data and labelled, Daily cycles axis formatted with a unit (no '99999'), SoH 'as entered', BMS vs estimated SoC marked and drawn consistently, temperature axis and outage hatching, wear-rate unit once in battery-kpis.tsx (the same slip in onboarding tab-review.tsx is sites-onboarding's half). The gas-genset unit sweep across pages (MMBtu) is stage 2's; the events route (money filter) and battery-cards.tsx (Economics and replacement-cost role gates) are auth-security's. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder. Late batch: telemetry reads use deferred (read) transactions and only writers take BEGIN IMMEDIATE (export_csv formats outside any lock), a CSV upload is parsed once in a streamed or chunked pass with bounded memory and written in day-sized transactions, the series route caps or downgrades an explicit resolution to about 2,000 points for every role, and forecast_issues keep only what skill scoring needs after a set age (the 13-month minute-row archive to Parquet, DAT-07, stays planned work)."
+  },
+  {
+   "key": "sites-onboarding",
+   "title": "Sites, onboarding wizard, site settings, native capture and who may manage sites",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/sites.py",
+    "backend/gridlytics/routes_sites.py (meta, site CRUD, activate, connection, assets, tier, native, overrides, drafts, prices: all but control_state and the fleet/now/chart functions)",
+    "backend/gridlytics/auth.py (one appended last PERMISSIONS entry, 'manage_sites', only)",
+    "frontend/src/features/sites/onboarding/",
+    "frontend/src/features/sites/settings/",
+    "frontend/src/features/sites/site-settings-page.tsx",
+    "frontend/src/features/devices/native-capture-form.tsx",
+    "frontend/src/features/devices/native-card.tsx",
+    "frontend/src/features/devices/assets-card.tsx",
+    "backend/tests/test_r7_sites.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Draft resume and save integrity",
+     "ids": [
+      "flow-onboarding-05",
+      "flow-onboarding-06",
+      "flow-onboarding-15",
+      "pages-A-10",
+      "pages-A-15"
+     ]
+    },
+    {
+     "theme": "Server validation, who may manage sites, data source tier and activation rules",
+     "ids": [
+      "flow-onboarding-03",
+      "role-operator-07",
+      "flow-onboarding-07",
+      "flow-onboarding-08",
+      "flow-onboarding-14",
+      "flow-onboarding-18",
+      "role-operator-16"
+     ]
+    },
+    {
+     "theme": "Tariff, connection and location defaults",
+     "ids": [
+      "flow-onboarding-02",
+      "engine-tariffs-05",
+      "flow-onboarding-12",
+      "role-owner-40",
+      "role-operator-30",
+      "flow-onboarding-24"
+     ]
+    },
+    {
+     "theme": "Equipment fields: inverter checks, genset fuel, rating and start method, feeder prompt",
+     "ids": [
+      "flow-onboarding-09",
+      "flow-onboarding-10",
+      "flow-onboarding-11",
+      "flow-onboarding-16",
+      "flow-onboarding-17"
+     ]
+    },
+    {
+     "theme": "Wizard content, edge step and wording",
+     "ids": [
+      "flow-onboarding-22",
+      "flow-onboarding-25",
+      "flow-onboarding-19",
+      "flow-onboarding-20"
+     ]
+    }
+   ],
+   "notes": "Drafts: resuming an older draft must not show stale values as complete or overwrite newer Site-settings changes (version check, 409 with a choice); autosave flushed on navigation; Activate saves pending equipment edits first; Review only after A-D are complete, with 'what happens next' and Preliminary marks; changing the data source kind clears the grid-signal confirmation. Server: tariff category required; data source and confirmed grid signal required to activate (API too); the data source kind sets tier_capable in sites.py when the source is saved (CSV with inverter mode / OEM cloud can reach advisory) so the wizard's promise holds, without editing routes_edge.py; native capture slot times validated (00:00-23:59, unique starts), the slot count per brand from /api/meta, and a typed capture cannot claim 'read back by the edge device' (the form half of flow-savings-pilot-bill-12); agreement dates and money figures bounded. Who may manage sites (role-operator-07, plan 9.4/9.6): append 'manage_sites': {'admin'} as the last entry of auth.PERMISSIONS (auth-security leaves the end of that dict alone) and use it for create, activate, drafts and the control-limit fields of site_update; operators keep native capture and overrides; the wizard's Activate follows it; Fleet's 'Add a site' (fleet-overview) and the nav (shell-nav) switch to useCan('manage_sites') at integration, and the demo-load gate is demo-seed's. Defaults: K-Electric gets its own TOU group and no Punjab duty; defaults follow site kind and DISCO and carry Preliminary marks; tax flags/ICP/Tariff F season editable in wizard and settings; no Lahore pin for another city; kind and DISCO defaults that agree; review prints labels not codes ('CSV'); off-grid for any site kind. Equipment: a server check (sites.py) and a tab B warning when PV AC, battery power or export exceed the inverter's kW AC (flow-onboarding-09; the plan's own inverter cap is optimiser-plans'); gas/RLNG gets a gas fuel curve; rating in kVA with power factor; start method asked after the genset exists; the critical-load field is not a silent 0 (the form half of engine-forecast-05); feeder prompt that matches what forecasts-outages' pooling delivers. Wizard content per plan 9.3 (map pin, live source test, write budget, fallback, grid-charge permission), an edge-device next step that says who can make the site key, validation sentences that match their fields, the wear-rate unit printed once in tab-review.tsx (the onboarding half of frontend-states-formats-11). Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder."
+  },
+  {
+   "key": "fleet-overview",
+   "title": "Fleet and site Overview pages (fleet/now/overview routes)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/routes_sites.py (_snapshot, _mtd_saving, fleet_row, fleet, site_now, overview_chart only)",
+    "frontend/src/features/overview/",
+    "frontend/src/features/sites/fleet-page.tsx",
+    "frontend/src/features/plan/plan-empty.tsx",
+    "frontend/src/components/charts/spark-bars.tsx",
+    "backend/tests/test_r7_fleet.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Activation path, off-grid and connection labels, checklists and the month-to-date saving",
+     "ids": [
+      "flow-onboarding-04",
+      "flow-savings-pilot-bill-02",
+      "pages-A-01",
+      "pages-B-12",
+      "pages-A-03",
+      "pages-A-08"
+     ]
+    },
+    {
+     "theme": "Overview content",
+     "ids": [
+      "role-owner-11",
+      "parity-boxlytics-ui-15",
+      "pages-A-09",
+      "role-owner-31",
+      "frontend-states-formats-14",
+      "frontend-states-formats-15",
+      "frontend-states-formats-18"
+     ]
+    },
+    {
+     "theme": "Fleet table",
+     "ids": [
+      "role-analyst-14",
+      "pages-A-11",
+      "pages-A-17",
+      "role-owner-16",
+      "role-viewer-22",
+      "frontend-a11y-06",
+      "frontend-a11y-21"
+     ]
+    }
+   ],
+   "notes": "Month-to-date saving on Fleet and Overview must equal the Savings page's month figure (MDI lever included): call the same verify summary the Savings route uses, show method and computation date, and test equality (savings-engine changes what is claimed, so do not pin a figure). A created-but-not-activated site: Overview and Plan say it is observing and offer Activate (POST /activate exists) instead of promising a plan every 15 minutes; checklists key off-grid on data.off_grid; fleet_row's category and the in-outage filter read data.off_grid and say 'Grid connection not saved' for a grid site with no saved connection (pages-A-03; the one line in site-header.tsx is shell-nav's). Overview: next-12-hours strip built from every step with chips that fit, the plan's quick actions, KPI tiles (PV self-consumed %, battery cycles today, outages covered) and TOU shading, Battery and Genset series on by default where they matter, zero vs missing ('no data' instead of 0.0 h / Rs 0), next events up to 48 h ahead and the Fleet Next column with a day (frontend-states-formats-15; the hold chip's own label is control_state, control-edge's flow-telemetry-plan-control-23), readable alert badges through alert-words.ts's severityWords (import only: that file is alerts-reports') and a sentence per genset start-control value. Fleet: sparkline scaled across rows with a noise floor (no full-height bar for paise), not a focusable role=application, viewer gets a kWh/litres substitute with a 'hidden for your role' note, summary strip/filters/Now glyph/empty state per UI-01 (the empty state drops the '90 days' promise without naming a day count; demo-seed fixes the demo tab and the seed, pages-A-04), stale readings not shown as 'now', open-alerts count consistent with the badges, filter results announced. control_state is control-edge's; the off-grid-farm-as-outage sweep and fuel units are stage 2's. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder."
+  },
+  {
+   "key": "alerts-reports",
+   "title": "Alerts and reports",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/alerts.py",
+    "backend/gridlytics/routes_alerts.py",
+    "backend/gridlytics/reports.py",
+    "backend/gridlytics/routes_reports.py",
+    "backend/gridlytics/routes_savings.py (fleet_savings: the chain_stale_days flag only)",
+    "frontend/src/features/alerts/",
+    "frontend/src/features/reports/",
+    "backend/tests/test_r7_alerts_reports.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Alert rules and role filtering",
+     "ids": [
+      "security-roles-03",
+      "pages-D-14",
+      "pages-D-27",
+      "engine-forecast-10",
+      "brief-vs-build-18",
+      "pages-D-29"
+     ]
+    },
+    {
+     "theme": "Monthly report content",
+     "ids": [
+      "pages-D-07",
+      "pages-D-08",
+      "engine-savings-13",
+      "pr-review-06",
+      "role-viewer-17",
+      "role-analyst-25"
+     ]
+    },
+    {
+     "theme": "Reports page, access and limits",
+     "ids": [
+      "frontend-states-formats-05",
+      "pages-D-24",
+      "pages-D-25",
+      "security-roles-08",
+      "role-operator-20"
+     ]
+    },
+    {
+     "theme": "Alert actions and wording",
+     "ids": [
+      "pages-C-11",
+      "pages-D-28",
+      "pages-D-16",
+      "role-operator-31",
+      "frontend-states-formats-10"
+     ]
+    },
+    {
+     "theme": "Late: alert actions and the rule editor: closed-alert state, re-raise after close, rule validation, channels not sending",
+     "ids": [
+      "flow-reports-alerts-members-keys-08",
+      "flow-reports-alerts-members-keys-10",
+      "flow-reports-alerts-members-keys-09",
+      "flow-reports-alerts-members-keys-11"
+     ]
+    },
+    {
+     "theme": "Late: reports: file paths under the data folder, period validation, header and empty periods, the viewer's list",
+     "ids": [
+      "parity-architecture-11",
+      "flow-reports-alerts-members-keys-13",
+      "flow-reports-alerts-members-keys-16",
+      "flow-reports-alerts-members-keys-29"
+     ]
+    }
+   ],
+   "notes": "You alone edit alerts.py in stage 1. A viewer gets only energy-category alerts in the inbox and counts (security, regression test). Rules: savings (claim withheld, bill residual), product, genset condition, edge/plan expiry, data gap including a site that never sent data; a forecast_bust threshold a real bust can reach (the bust re-solve itself is stage 2's brief-vs-build-15); a tariff-staleness rule (brief-vs-build-18): a Tariff alert when an in-force schedule or version has passed its end or its 'awaiting notification' date, or a fuel price is older than a set age, read from the stored tariff versions (no scraping of NEPRA/OGRA; tariffs flags the same state in the engine and on the Tariffs page under engine-tariffs-06); quiet hours as validated times, thresholds and per-site overrides stored and used by the evaluator - sending by email/SMS/WhatsApp stays deferred (alert delivery). The battery derate/imbalance/capacity_drop alerts come from battery.state (optimiser-plans'): the evaluator already reads them. Actions: acknowledge/close keep each actor and note (history), genset requests answered once and not after withdrawal, regime_expiring says 'ended' for a past agreement (the Tariffs page's agreement state is tariffs', the other half of pages-D-16), alert titles relative to when they opened, assignee chosen from members, rule names in words. Monthly PDF/CSV: switchback and carry-over, bill comparison, KPI grid, marks on withheld days, 'not metered' instead of 'Diesel saved 0 L', the full Preliminary sentence and the genset-arm fidelity wording, a warning when chain_stale_days > 0 (and the flag on the fleet roll-up in fleet_savings), a company roll-up and pilot write-up, files named per site, rounding as on the page, no internal ids/raw enums/ISO dates in backend-written text; take every number from verify's summary (savings-engine changes it), do not recompute. Reports page: no 'first report on the 3rd' promise (schedules UI-14 stay deferred) but a 'generated by' column and a browser preview; the daily sheet for the chosen day from the plan in force that day; the savings report needs export rights (admin/analyst); generation bounded per user (concurrency/rate limit at the route; ratelimit.py is auth-security's); the alerts empty state says alerts are evaluated every 15 minutes. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder. Late batches: acknowledging a closed alert is refused (409), closing a still-true condition suppresses it until the condition changes or the drawer says it will be raised again, PUT /api/alerts/rules gets a request model (no 500, bounded values, every known category), Email/SMS/WhatsApp are shown as not sending yet and the quiet-hours/escalation fields carry no placeholder that reads as a set value (delivery itself stays deferred), report files are stored relative to the data folder and resolved through platform.data_dir() so a moved or restored folder still serves every stored download (parity-architecture-11; its signing-key half is control-edge's engine-delivery-13 and reports/ in the backup copy is founder-console's), report periods are validated (YYYY-MM, not before the site's data, not in the future), the report header says 'Grid connection not saved' instead of 'Off-grid', prints the regime in words and states an empty period or a site with no plan, and the viewer's Reports page says in words which reports the role lists; the late duplicate of pages-D-24 raises it to high (the daily sheet printed the 48-hour plan's partial last day, undated, as 'Tomorrow's slot table': print dated day tables, today's remainder and tomorrow, and ask for a day, not a month, in the dialog)."
+  },
+  {
+   "key": "auth-security",
+   "title": "Auth, roles, money filter, API keys, passwords and company settings (preassigned accounts only)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/auth.py (all but the last PERMISSIONS entry, which sites-onboarding appends)",
+    "backend/gridlytics/api.py",
+    "backend/gridlytics/apikeys.py",
+    "backend/gridlytics/platform.py",
+    "backend/gridlytics/routes_local.py",
+    "backend/gridlytics/routes_platform.py",
+    "backend/gridlytics/routes_common.py",
+    "backend/gridlytics/money.py",
+    "backend/gridlytics/store_members.py",
+    "backend/gridlytics/identity.py",
+    "backend/gridlytics/mfa.py",
+    "backend/gridlytics/ratelimit.py",
+    "backend/gridlytics/routes_telemetry.py (events only)",
+    "backend/gridlytics/routes_founder.py (the set-password route only)",
+    "backend/gridlytics/store_founder.py (the set-password function only)",
+    "frontend/src/features/auth/",
+    "frontend/src/features/org/ (all but demo-tab.tsx)",
+    "frontend/src/lib/api/client.ts",
+    "frontend/src/features/battery/battery-cards.tsx",
+    "frontend/src/features/savings/savings-kpis.tsx (the viewer's litres and verified days only)",
+    "backend/tests/test_role_walk.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Money on the wire",
+     "ids": [
+      "security-roles-01",
+      "security-roles-02",
+      "tracker-and-docs-03",
+      "role-operator-06",
+      "role-viewer-19",
+      "security-roles-16"
+     ]
+    },
+    {
+     "theme": "Passwords, lockout and sessions",
+     "ids": [
+      "pages-A-02",
+      "founder-console-07",
+      "founder-console-08",
+      "security-roles-09",
+      "security-roles-10",
+      "role-analyst-32"
+     ]
+    },
+    {
+     "theme": "Seats, switched-off companies and API keys",
+     "ids": [
+      "founder-console-06",
+      "security-roles-07",
+      "role-analyst-20",
+      "founder-console-15"
+     ]
+    },
+    {
+     "theme": "Company settings: a11y and audit trail",
+     "ids": [
+      "frontend-a11y-07",
+      "frontend-a11y-16",
+      "frontend-a11y-19",
+      "role-owner-23"
+     ]
+    },
+    {
+     "theme": "Late: sessions and sign-in: same-second revocation, removed members, the optional owner-applied Supabase mode (web sign-in, members list), the API's log folder, throttling, how people are added",
+     "ids": [
+      "parity-supabase-auth-01",
+      "flow-reports-alerts-members-keys-07",
+      "parity-supabase-auth-04",
+      "parity-architecture-05",
+      "parity-supabase-auth-05",
+      "parity-supabase-auth-08",
+      "flow-reports-alerts-members-keys-28"
+     ]
+    }
+   ],
+   "notes": "Accounts stay preassigned: no Google sign-in and no self-signup. Money: every member-readable route goes through the money filter by default (a response hook in api.py/routes_common, not opt-in out()); the events route stops leaking fuel-log cost_rs (high, regression test); a role walk over every GET route (backend/tests/test_role_walk.py, the file the docs cite) for viewer, operator and a sites:read key; the filter keeps non-money figures (litres saved, verified days) for a viewer; operators lose see_costs (plan 10.5), so the money filter and useCan hide money settings, the battery Economics card and the PackCard replacement cost (battery-cards.tsx, yours); check that the settings and onboarding forms (sites-onboarding's) still save without the stripped fields (asset_put keeps the stored values) and tell sites-onboarding if one needs a change; a per-member see_costs grant (plan 10.5). Roles: who may create/activate/onboard sites is sites-onboarding's role-operator-07 (it appends 'manage_sites' at the end of auth.PERMISSIONS: leave the end of that dict alone); API key scopes (/plan under plans:read in api.py's scope map, edge vs partner key kinds enforced); a seatless member and a member of a switched-off company get their own clear pages; org tabs do not call routes the role is refused and say 'API keys are'. Passwords: a one-time password set by the company administrator (Members) or the founder forces a change at next sign-in and clears the lockout; for the founder (founder-console-07/08) edit only the set-password route and its store function, and leave founder-users.tsx/founder-companies.tsx to founder-console, which writes the 'one-time, change it under My account' wording (pages-A-07); the sign-in hint names who can help; sign-out revokes the access token too; lockout per account as well as per address, with trusted-proxy handling. My account: open sessions with sign-out of others and notification preferences (UI-18); the report-schedules half of role-analyst-32 stays deferred (UI-14). Company settings a11y: selects that write save on an explicit action, the one-time key dialog cannot close by Escape/outside click before copying, h1 on the sign-in pages, audit Detail in words and local time; unique row-action names and row headers across the app (frontend-a11y-17) are stage 2's sweep. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder. Late batch: tokens issued in the same second as a password reset or a disable are refused (sub-second or inclusive comparison, regression test), a person the founder removed leaves Members and cannot be switched on, promoted or counted against seats, Members says that OnyxLeaf adds and removes people (no invite flow: accounts stay preassigned), GET /api/users carries Solarlytics' supabase branch so an admin can set a role before first sign-in, the web app gets Solarlytics' optional owner-applied Supabase sign-in (password only: no Google, no sign-up, no invites; the VITE_SUPABASE_* settings in env.ts are shell-nav's), sign-in throttling tightens per address and per account with unknown-email tries counted, and api.py writes its log under the data folder in use so a scratch run never writes into gridlytics-backend/data (the web repository's scripts/start_local.py also sets GRIDLYTICS_DB beside GRIDLYTICS_DATA_DIR, as Solarlytics' launcher does)."
+  },
+  {
+   "key": "founder-console",
+   "title": "Founder console, companies and backups",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/founder.py",
+    "backend/gridlytics/routes_founder.py (all but the set-password route)",
+    "backend/gridlytics/store_founder.py (all but the set-password function)",
+    "backend/gridlytics/companies.py",
+    "backend/gridlytics/backups.py",
+    "scripts/restore_backup.py (new, backend repo)",
+    "frontend/src/features/ops/",
+    "backend/tests/test_r7_founder.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Founder session and backups",
+     "ids": [
+      "founder-console-09",
+      "founder-console-01",
+      "security-roles-12",
+      "founder-console-12",
+      "frontend-states-formats-17"
+     ]
+    },
+    {
+     "theme": "Company and user management",
+     "ids": [
+      "founder-console-04",
+      "founder-console-10",
+      "founder-console-05",
+      "founder-console-16",
+      "founder-console-13",
+      "founder-console-18"
+     ]
+    },
+    {
+     "theme": "Console UI and wording",
+     "ids": [
+      "founder-console-02",
+      "founder-console-03",
+      "founder-console-11",
+      "founder-console-14",
+      "founder-console-17",
+      "founder-console-19",
+      "pages-A-07"
+     ]
+    },
+    {
+     "theme": "Late: owner-applied Supabase mode: project SQL for review, membership-state refusals",
+     "ids": [
+      "parity-supabase-auth-03",
+      "parity-supabase-auth-09"
+     ]
+    }
+   ],
+   "notes": "Founder sign-out ends the session on the server (token id revoked) and a short GRIDLYTICS_FOUNDER_SESSION_SECRET is refused at start-up (security, regression tests). Backups: a real scripts/restore_backup.py that restores a company's database and telemetry together (and the page names it correctly); the copy also takes the company's signing-key folder (data_dir/keys/<company>: the backup half of control-edge's engine-delivery-13); the list shows names, real sizes and telemetry files and an honest frequency for switched-off companies; times in local time (naive timestamp bug). Companies/users: company role 'Admin' mapped to the Gridlytics administrator (or removed from the console) with the choice recorded in docs/BACKEND_ASKS.md; disabling a company's only owner warns and the counts refresh; the Switch-off dialog states that planning stops, edge keys are refused and telemetry is lost; the Users page shows the current Gridlytics role after a company-role change; archive (not delete) for companies and accounts; drop the lifted 'solarlytics_role' field. Console UI: audit Detail shows before -> after; role/membership selects save on an explicit button with confirmation; remove the unused commercial-plan widgets so 'plan' means dispatch plans; phone layout without sideways-scrolled actions; wording slips fixed; skip link, aria-controls and 'Founder console' in tab titles; the password hints name My account and say the founder's password is one-time (the founder-users.tsx side of founder-console-08). auth-security edits only the set-password route and function (forced change, lockout clearing). Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder. Late batch: Solarlytics' supabase/ SQL (preflight, accounts and companies, rollback) and its owner checklist are ported, renamed and marked for review only, for the optional owner-applied mode that companies._project_context and store_founder._Project already expect (preassigned accounts, no Google, no self-signup), and a suspended or pending membership is told its state and who can change it instead of 'You are not a member of that company'; besides, the daily copy takes the company's reports/ folder beside keys/ and restore_backup.py puts both back with the database and telemetry (the backup halves of parity-architecture-11 and -16), and backups.daily_all copies the default database only when it lies in the data folder in use, so a scratch run never writes a backup into gridlytics-backend/data (performance-live-07's half)."
+  },
+  {
+   "key": "shell-nav",
+   "title": "Web shell: titles, focus, navigation by role and site, header, switcher, shell states",
+   "repos": [
+    "frontend"
+   ],
+   "owns_files": [
+    "frontend/src/components/layout/",
+    "frontend/src/components/gates/",
+    "frontend/src/app/",
+    "frontend/src/stores/",
+    "frontend/src/components/ui/route-error-boundary.tsx"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Titles, focus, skip link, not-found and error pages",
+     "ids": [
+      "frontend-a11y-01",
+      "frontend-a11y-02",
+      "role-owner-19",
+      "frontend-states-formats-22",
+      "role-owner-41"
+     ]
+    },
+    {
+     "theme": "Navigation by role and site",
+     "ids": [
+      "pages-A-05",
+      "pages-A-13",
+      "role-owner-34",
+      "pages-C-18",
+      "pages-A-14",
+      "role-owner-33"
+     ]
+    },
+    {
+     "theme": "Site switcher and shell states",
+     "ids": [
+      "pages-A-12",
+      "frontend-states-formats-13",
+      "frontend-a11y-20",
+      "role-viewer-25",
+      "frontend-a11y-22"
+     ]
+    },
+    {
+     "theme": "Late: build settings in env.ts",
+     "ids": [
+      "parity-architecture-04",
+      "tests-and-perf-16"
+     ]
+    }
+   ],
+   "notes": "Titles 'Page - Site - Gridlytics' from route handles and focus moved to the page heading on navigation; skip link; not-found pages with a heading and a way back and no live site links for an unknown site; the route error boundary shows a plain sentence (details behind a toggle); HydrateFallback added. Navigation: a viewer sees only the energy pages; Outages hidden for off-grid sites; Pilot set-up listed under the site; distinct names for 'Devices and data' and 'Devices and control'; one active item on /settings vs ?view=members; no tier chip and no site bottom bar for an unnamed site on company pages (Fleet, Tariffs, Add a site), and none carried into a newly created site. Header: the site header reads off-grid from data.off_grid and says 'Grid connection not saved' for a grid site with no saved connection (the header line of fleet-overview's pages-A-03); the chip prints control_state's label (control-edge's), so a force charge needs no site-chips.tsx edit; site switcher with state dot, last-data age and search; loading/failed shell queries not shown as empty; current page in the phone menu not by colour alone; 44 px tap targets and a cue on cut-off tab strips at 375 px; error toasts persist until dismissed, set once on the Toaster in app/providers.tsx so no call site changes (frontend-a11y-22). Nav entries for site management switch to useCan('manage_sites') at integration (sites-onboarding's role-operator-07). parity-ui (stage 3) restyles these files later: keep changes functional and token-based. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, new test fixture files. Late batch: env.ts keeps each valid build setting when another one is invalid, refuses or warns on an unknown VITE_AUTH_MODE and accepts the modes the backend has (local, and supabase with its VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY for auth-security's optional mode), and parses the variables with plain code so full zod leaves the eager bundle."
+  },
+  {
+   "key": "ui-charts-a11y",
+   "title": "Shared UI, charts, wizard and formats: contrast, axes, tables, heatmaps",
+   "repos": [
+    "frontend"
+   ],
+   "owns_files": [
+    "frontend/src/components/ui/ (all but route-error-boundary.tsx)",
+    "frontend/src/components/workflow/",
+    "frontend/src/components/charts/time-series-chart.tsx",
+    "frontend/src/components/charts/fan-chart.tsx",
+    "frontend/src/components/charts/heatmap-grid.tsx",
+    "frontend/src/components/charts/energy-flow.tsx",
+    "frontend/src/components/charts/use-echarts.ts",
+    "frontend/src/components/charts/echarts-setup.ts",
+    "frontend/src/lib/format.ts (shared additive)",
+    "frontend/src/lib/time.ts (shared additive)",
+    "frontend/src/lib/colors.ts",
+    "frontend/src/styles/index.css"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Contrast and form controls",
+     "ids": [
+      "frontend-a11y-03",
+      "frontend-a11y-14",
+      "frontend-a11y-15",
+      "frontend-a11y-11"
+     ]
+    },
+    {
+     "theme": "Charts: time axes, units, text alternatives",
+     "ids": [
+      "frontend-states-formats-04",
+      "frontend-a11y-05",
+      "role-viewer-13",
+      "role-owner-22",
+      "frontend-a11y-18",
+      "role-owner-29"
+     ]
+    },
+    {
+     "theme": "Tables, heatmaps and KPI tiles",
+     "ids": [
+      "role-operator-09",
+      "role-operator-21",
+      "role-owner-28",
+      "role-owner-39",
+      "frontend-states-formats-23"
+     ]
+    },
+    {
+     "theme": "Lettered wizard",
+     "ids": [
+      "frontend-a11y-09",
+      "frontend-a11y-10",
+      "frontend-states-formats-21",
+      "flow-onboarding-21"
+     ]
+    }
+   ],
+   "notes": "Contrast with the current tokens: muted text >= 4.5:1 on the page, table headers and selected cards; control borders and chart/strip colours >= 3:1; EnergyFlow labels readable; Segmented gets arrow keys and roving tabindex (in the component: no call-site edits). Charts: multi-day axes show the day at day boundaries in Asia/Karachi (not the browser zone); tooltips carry units; the unit label does not collide with the 'now' label; a data-table or summary text alternative per chart; aria only on elements with a role; the demo ribbon toggle has state; the offline notice sits outside the energy-flow diagram. Tables: at 375 px key columns stay visible (priority columns or stacked rows) with a scroll cue; money and units never wrap (numeric cells nowrap) and the Plan Versions table is not clipped at 1440, all through components/ui/table.tsx so plan-history.tsx (control-edge's) needs no edit; a row-header option on the Table primitives for stage 2's frontend-a11y-17; KPI tiles do not break values ('trust 69 %'). Heatmaps: a colour-scale legend and negatives shown (diverging scale); today's partial-day colour is telemetry-genset-battery's (role-viewer-07). Lettered wizard: focus to the new step's heading on Next/Previous/Edit, a visible focus outline on the panel, Save and continue disabled while saving, the active tab scrolled into view on phones. Written dates beside native date inputs (role-operator-28) are stage 2's sweep. lib/format.ts and lib/time.ts are shared additive: append helpers, do not rename existing ones. parity-ui changes tokens and fonts in stage 3. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, new test fixture files."
+  },
+  {
+   "key": "demo-seed",
+   "title": "Demo seed and demo narrative consistency",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/demo.py",
+    "backend/gridlytics/seed_demo.py",
+    "backend/gridlytics/routes_demo.py",
+    "backend/gridlytics/twin.py (truth() only)",
+    "frontend/src/features/org/demo-tab.tsx",
+    "frontend/src/features/sites/demo-loader.tsx",
+    "backend/tests/test_r7_demo.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Demo narrative, history and build",
+     "ids": [
+      "role-owner-15",
+      "engine-delivery-18",
+      "engine-plans-live-20",
+      "pages-A-04",
+      "role-operator-29",
+      "security-roles-15",
+      "tracker-and-docs-21"
+     ]
+    }
+   ],
+   "notes": "control_state is control-edge's (role-owner-08 is there and stops forcing 'Following plan (table applied)' for demo sites): seed applied rows only for the days the seed records 'Mark as applied', within the write budget, and only those days are confirmed (engine-delivery-18), so the chip, the applied log and the alert agree; the closed-loop Karachi demo gets a consistent story (edge record, heartbeat, read-back) or is seeded at a tier its source supports, and every demo site records its data_source consistently with Site settings; the farm stores data.off_grid = true; outages and genset runs continue across midnight (fix in twin.truth or the demo's day loop; twin.simulate is delivery-twin's); the demo build lock is per company; the demo tab names the days actually seeded, or the seed makes 90 (fleet-overview drops the number from the Fleet empty state); seed_demo's docstring/--help name only files in the repo and a re-run is idempotent (test); the demo-load gate in routes_demo.py becomes administrator-only (an existing admin-only permission such as edit_workspace: the demo half of sites-onboarding's role-operator-07). Mode B in the demo is stage 2's (engine-delivery-17). Never write into the owner's data folder. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder."
+  },
+  {
+   "key": "savings-ui-crosscut",
+   "title": "Stage 2: cross-module engine work, Savings page, pilot go/no-go, audit, and cross-page consistency sweeps",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/routes_savings.py (savings, recompute, savings_csv, fee_put, fleet_savings)",
+    "frontend/src/features/savings/",
+    "backend/tests/test_audit_walk.py (new)",
+    "backend/tests/test_r7_crossmodule.py (new)",
+    "cross-module engine: plans.build_problem, verify.py, tariffs.py, delivery.py, twin.py, demo.py, routes_edge.py as batch 1 needs (stage 2)",
+    "cross-page sweeps: any feature file on the integrated branch (stage 2)"
+   ],
+   "stage": 2,
+   "depends_on": [
+    "savings-engine",
+    "tariffs",
+    "delivery-twin",
+    "control-edge",
+    "optimiser-plans",
+    "forecasts-outages",
+    "telemetry-genset-battery",
+    "sites-onboarding",
+    "fleet-overview",
+    "alerts-reports",
+    "auth-security",
+    "shell-nav",
+    "ui-charts-a11y",
+    "demo-seed"
+   ],
+   "batches": [
+    {
+     "theme": "Cross-module engine: connections, metering factor and duty; Mode B and genset charging end to end; event re-solves",
+     "ids": [
+      "tracker-and-docs-01",
+      "engine-savings-09",
+      "engine-delivery-17",
+      "engine-plans-live-18",
+      "brief-vs-build-15",
+      "engine-tariffs-09"
+     ]
+    },
+    {
+     "theme": "Fee card and headline display",
+     "ids": [
+      "pages-D-01",
+      "role-operator-19",
+      "role-analyst-23",
+      "frontend-states-formats-12",
+      "pages-D-21"
+     ]
+    },
+    {
+     "theme": "Pilot go/no-go, switchback tiles, KPIs and audit",
+     "ids": [
+      "pages-D-12",
+      "pages-D-05",
+      "security-roles-04",
+      "brief-vs-build-13"
+     ]
+    },
+    {
+     "theme": "Exports and recompute",
+     "ids": [
+      "pages-D-06",
+      "pr-review-05",
+      "pr-review-07",
+      "pr-review-08"
+     ]
+    },
+    {
+     "theme": "Savings ledger, days table and daily chart",
+     "ids": [
+      "flow-savings-pilot-bill-17",
+      "flow-savings-pilot-bill-18",
+      "flow-savings-pilot-bill-20",
+      "pages-D-22",
+      "pages-D-20",
+      "flow-savings-pilot-bill-19",
+      "pages-D-23"
+     ]
+    },
+    {
+     "theme": "Cross-page consistency: fuel units, off-grid site, dates and raw keys, role gating",
+     "ids": [
+      "frontend-states-formats-01",
+      "role-operator-10",
+      "frontend-states-formats-02",
+      "role-analyst-24",
+      "role-owner-37",
+      "role-viewer-20"
+     ]
+    },
+    {
+     "theme": "Cross-page a11y, written dates and freshness",
+     "ids": [
+      "frontend-a11y-08",
+      "frontend-a11y-13",
+      "frontend-a11y-17",
+      "role-operator-28",
+      "frontend-states-formats-20",
+      "role-analyst-29"
+     ]
+    },
+    {
+     "theme": "Late: engine version on stored results, deleted sites, lifted wording",
+     "ids": [
+      "parity-architecture-12",
+      "flow-reports-alerts-members-keys-14",
+      "flow-reports-alerts-members-keys-27"
+     ]
+    }
+   ],
+   "notes": "Stage 2: starts from the integrated stage-1 branch, so it may touch any file; batches run in order. Batch 1 holds the engine changes that need several stage-1 WPs' code at once: multi-connection sites (high) - build_problem, the ledger, the bill rebuild and bills for every connection (the bills panel picks the connection); the metering factor per connection (VER-13: an energy and an MDI scalar fitted on two bills, tested on a held-out third, applied to both arms before pricing, a factor outside 0.97-1.03 raised as a data finding, the 2 % gate closing only on a held-out bill); the Punjab self-generation duty from the connection's province in tariff data, in build_problem and the ledger's genset cost (replacing the latitude rule); Mode B executed by the twin (per-step battery_power_w within the residual band) and used by the guard, plan_compare, the demo and verify's replay for Mode B sites; genset charging where the brand's grammar has it (Voltronic/Axpert charger source priority, Deye gen_charge): a compiled gen-charge slot, the twin executing it, and build_problem allowing a_gen per brand instead of the global GEN_CHARGE_SUPPORTED, with the farm's run hours and litres compared against today's; event re-solves for genset start/stop events, an intra-day forecast bust and an approved tariff version, as the outage events already do. Fee card: claimed-days basis (no whole-month extrapolation labelled 'verified'), the baseline it really uses, a Preliminary mark, 'no fee set' instead of Rs 0, a 'Hidden for your role' note wherever a role removes a card or column (slot-table money, Gantt price line, fleet sparkline, fee card) and no fee_multiple to an operator; 'claimed' wording matching the engine. Pilot go/no-go: score the stored criteria against measured KPIs, including reserve adequacy (forecasts-outages' function), constraint violations, control health, genset and cycling gates; switchback tiles show the carry-over with a correct subtitle. Audit: every mutating route writes an audit row (pilot_put, recompute, fuel_log, outage_cause, forecast refresh, set_tier_capable...), money settings with before/after values, test_audit_walk.py. Savings page: per-day lever split explaining negative days, native-block days explained inline and left out of the tuned headline, the native baseline shown (work mode, backup %, slots, capture version), daily chart ticks in rupees (no 'Rs 2k' for 1,700) and all-negative ranges, flags for withheld/not-applied/native days and a verified-only toggle, 'Diesel saved' estimated vs metered, billing-period and pilot-window options, and the Savings-page halves of stage-1 findings (pilot amendments shown, pages-D-17; the monitor-tier ledger title and no switchback, pages-D-11). Exports: a CSV that reconciles with the page (claimed, withheld reason, levers, MDI, tariff and capture versions), recompute reports every day it changed, a stale notice that names the causes and a reachable action, tests on the reachable path. Cross-page: one fuel-unit helper (litres vs MMBtu, 'Diesel' only for diesel) on Savings, Overview, Plan, Compare, fuel log and PDF; unmetered '0.0 L estimated' fixed on Overview and on Savings ranges over 62 days; one off-grid helper so the farm is never 'in an outage'/'the grid is down'; ISO dates, raw keys and lower-cased acronyms through lib/format; jargon explained; no calls to routes the role is refused; validation messages through Field (aria-describedby, announced, submit says why it is disabled); explanations not only in title attributes; unique row-action names and row headers (members, keys, founder users, onboarding review, savings days, compare, alert rules) using the Table row-header option; a written date (9 Nov 2026) beside every native date input (fuel log, Tariffs 'In force on', pilot); query invalidation after mutations (fleet chip, overview alerts, seats, outage cause); analysts not offered actions they cannot take. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixture files. store.py migrations: prefer existing JSON columns; a new migration is renumbered at integration. api.py is auth-security's: add routes to the existing route modules. Stages 1-2 leave HANDOFF.md/DESIGN_LOG.md alone; tests never use the owner's data folder. Late batch: every stored plan, savings day, bill rebuild and report records version.stamp() and the monthly PDF and CSV print it (version.py's lifted Solarlytics docstring rewritten), deleting a site revokes its API keys and its reports keep the site's name marked 'site removed', Solarlytics leftovers in wording go ('quotes:read' in the key error and docstring, 'a energy only report' in the audit), recompute runs as a background job one site at a time (tests-and-perf-11, a duplicate of pr-review-05), the report CSV lists plan ids by Karachi day (from the duplicate of pages-D-06) and the off-grid energy report drops its grid rows (the duplicate of role-operator-10)."
+  },
+  {
+   "key": "tests-ci",
+   "title": "Tests and browser check: engine acceptance tests, default suite, e2e",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/tests/ (new acceptance tests, conftest.py, test_fix_r5_genset.py)",
+    "scripts/e2e/ (frontend repo)",
+    "frontend/src/test/source-rules.test.ts"
+   ],
+   "stage": 2,
+   "depends_on": [
+    "optimiser-plans",
+    "delivery-twin",
+    "savings-engine",
+    "telemetry-genset-battery",
+    "demo-seed",
+    "sites-onboarding",
+    "alerts-reports",
+    "forecasts-outages",
+    "control-edge"
+   ],
+   "batches": [
+    {
+     "theme": "Acceptance tests, default suite and browser check",
+     "ids": [
+      "tracker-and-docs-08",
+      "pr-review-01",
+      "tracker-and-docs-15",
+      "tracker-and-docs-17",
+      "tracker-and-docs-22",
+      "frontend-a11y-24"
+     ]
+    },
+    {
+     "theme": "Late: test infrastructure: sibling contract tests, lifted guard tests, company isolation, load-independent optimiser tests",
+     "ids": [
+      "parity-architecture-09",
+      "parity-architecture-10",
+      "tests-and-perf-14",
+      "tests-and-perf-12"
+     ]
+    },
+    {
+     "theme": "Late: missing suites: Part 7.4 contract suite, outage forecaster outputs, onboarding activation, behaviour not constants",
+     "ids": [
+      "tests-and-perf-15",
+      "tests-and-perf-24",
+      "tests-and-perf-19",
+      "tests-and-perf-20"
+     ]
+    }
+   ],
+   "notes": "Stage 2, on the integrated stage-1 branch, in parallel with savings-ui-crosscut: add test files and e2e scripts only (no product code). Backend: the engine acceptance tests the tracker claims (TWN-01, VER-02, DAT-01, DAT-08, OPT-03, OPT-04 reserve-safe, OPT-07), written against the fixed engine; a default-suite check of round 5's second-day hour-mark rows and of a real 192-step farm plan within a time budget (the long benchmark stays opt-in). Frontend: the source-rules test bans 'optimal'; scripts/e2e: the accounts path from an environment variable with the HANDOFF default and a README that names the right file; the 375 px check covers ?view= pages, dialogs and the installer's Slots and Mark-as-applied path (a 375x812 Playwright project); the acceptance steps are actually performed by the browser check (create a site, upload a CSV, download a report). CI/deployment itself (DEP-01..07) is planned work and out of scope. Tests never use the owner's data folder; leave HANDOFF.md/DESIGN_LOG.md to the docs WP. Late batches: cross-repository contract tests through backend/tests/sibling.py and frontend/src/test/sibling.ts (types, permissions, refusal codes, re-captured fixtures, metaFor from fx.meta), the lifted guard tests (hygiene, sign-in guard, seed demo, the 7 skipped lifted tests re-aimed; test_role_walk.py is auth-security's and test_deploy_docs.py deploy-ci's), company isolation on the EMS routes and key folders, the wall-clock optimiser assertions made load-independent (quality checks, a serial marker or a deterministic budget), the Part 7.4 contract suite on control-edge's contract models and schema files (brief-vs-build-12) with per-brand Mode A grammar checks, the outage forecaster's announced-window outputs, the onboarding Review and activate path, and behaviour instead of constants (the fallback parametrisations go; the routes_plans._held shim they keep alive is product code, removed by storage-perf), while the scheduler test (tests-and-perf-13) is storage-perf's because that package changes the tick's failure path in the same stage, and CI itself is deploy-ci's (stage 3)."
+  },
+  {
+   "key": "parity-ui",
+   "title": "Boxlytics UI/UX parity: fonts, tokens, logo, shell look, landing, sign-in, help",
+   "repos": [
+    "frontend"
+   ],
+   "owns_files": [
+    "frontend/src/styles/index.css",
+    "frontend/src/components/layout/",
+    "frontend/src/components/ui/",
+    "frontend/src/components/workflow/lettered-tabs.tsx",
+    "frontend/src/components/charts/use-echarts.ts",
+    "frontend/index.html",
+    "frontend/public/ (favicon, fonts)",
+    "frontend/src/features/auth/login-page.tsx",
+    "frontend/src/app/router.tsx",
+    "frontend/src/features/landing/ (new)",
+    "frontend/src/features/help/ (new)"
+   ],
+   "stage": 3,
+   "depends_on": [
+    "shell-nav",
+    "ui-charts-a11y",
+    "auth-security",
+    "savings-ui-crosscut"
+   ],
+   "batches": [
+    {
+     "theme": "Brand foundations: fonts, tokens, logo",
+     "ids": [
+      "parity-boxlytics-ui-02",
+      "parity-boxlytics-ui-04",
+      "parity-boxlytics-ui-03",
+      "parity-boxlytics-ui-07"
+     ]
+    },
+    {
+     "theme": "Public pages: landing, sign-in, help, head tags",
+     "ids": [
+      "parity-boxlytics-ui-01",
+      "parity-boxlytics-ui-09",
+      "parity-boxlytics-ui-17",
+      "parity-boxlytics-ui-08"
+     ]
+    },
+    {
+     "theme": "Shell and component look",
+     "ids": [
+      "parity-boxlytics-ui-05",
+      "parity-boxlytics-ui-06",
+      "parity-boxlytics-ui-10",
+      "parity-boxlytics-ui-11",
+      "parity-boxlytics-ui-12",
+      "parity-boxlytics-ui-13",
+      "parity-boxlytics-ui-14"
+     ]
+    }
+   ],
+   "notes": "Stage 3, on top of everything. Fonts: Poppins 300-900 and JetBrains Mono actually loaded (self-hosted or a Google Fonts link), ECharts canvases using them, a 14/15/16 root scale. Tokens: brand #1f8a78/#145f53/#2ba98f on a white page and the Boxlytics state colours; re-check the contrast thresholds ui-charts-a11y set. Logo and favicon in the Boxlytics treatment. Public: a marketing landing page at '/' with a public shell, footer, contact and legal pages (sign-in stays for preassigned accounts; no self-signup); the Boxlytics-style sign-in page ('Welcome back', h1); a Help page reachable from the account menu and the sidebar footer; index.html head with a 'Product - tagline' title, description, Open Graph/Twitter tags and apple-touch-icon. Shell and components: sidebar glass logo band and solid #145f53 active pill with side bar; top bar with page title/subtitle, glass hairline and account menu; rounded-2xl glass cards and KPI tiles; page-header type scale; buttons/inputs (outline variant, sizes); dialogs/drawers/toasts/empty states; sticky pill lettered tabs. Keep stage 2's Field, DateField and Table row-header behaviour while restyling. Boxlytics belongs to another party: never change it; reuse its code only where the owner's decisions allow and record each reused file with its path and commit (THIRD_PARTY_NOTICES)."
+  },
+  {
+   "key": "docs",
+   "title": "Docs, tracker and handoff corrections",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "HANDOFF.md (backend)",
+    "README.md (backend)",
+    "docs/DESIGN_LOG.md (backend)",
+    "docs/*.md (frontend: HANDOFF, API_CONTRACT, BACKEND_ASKS, BUILD_NOTES, GATES)",
+    "README.md (frontend)",
+    "tracker EMS_BUILD_PROGRESS.md (plan package)"
+   ],
+   "stage": 3,
+   "depends_on": [
+    "savings-ui-crosscut",
+    "tests-ci"
+   ],
+   "batches": [
+    {
+     "theme": "HANDOFF and README",
+     "ids": [
+      "tracker-and-docs-11",
+      "brief-vs-build-14",
+      "pr-review-12",
+      "pr-review-13",
+      "tracker-and-docs-23",
+      "tracker-and-docs-16"
+     ]
+    },
+    {
+     "theme": "Tracker ticks",
+     "ids": [
+      "tracker-and-docs-09",
+      "tracker-and-docs-12",
+      "tracker-and-docs-13",
+      "tracker-and-docs-20"
+     ]
+    },
+    {
+     "theme": "API contract and design log",
+     "ids": [
+      "pages-A-18",
+      "tracker-and-docs-18",
+      "tracker-and-docs-19",
+      "pr-review-10"
+     ]
+    },
+    {
+     "theme": "Late: CLAUDE.md, the family docs set and Boxlytics provenance",
+     "ids": [
+      "parity-architecture-08",
+      "parity-architecture-14",
+      "parity-architecture-15"
+     ]
+    }
+   ],
+   "notes": "Stage 3, last; write what the code now does, checked against the integrated branch. Backend README: run commands use a scratch data folder (never the owner's data/), test counts and module table refreshed. HANDOFF: section 1's tick description (signing on pull, savings nightly, Mode B execution as stage 2 left it), test counts, open work (the Karachi grid site's negative energy levers if still true, what stages 1-2 closed), drop the done 'create the repositories, push v1-build' owner task, reconcile the browser-check and 'round 5 followed' claims across HANDOFF, GATES, BUILD_NOTES, API_CONTRACT and BACKEND_ASKS. Tracker: untick or annotate items whose acceptance is still not met after stages 1-2 (UI-18/17/08, PLT-02, FOR-06/04/10, VER-12, PLT-09). API_CONTRACT: wear cost = replacement / (cycles x depth) per kWh discharged with a doc test; stale rows (Outages 7-day read, /now held state, vendor_view columns); the seven undocumented routes. DESIGN_LOG: make 8.A.1's done-when evidence reproducible (script and seeds); record the round-7 ownership decisions (control_state, tick, the bill functions of verify.py, manage_sites). Late batch: a CLAUDE.md per repository (the .scratch venv, never write to gridlytics-backend/data, --scratch on 8151/5295, branches, origin, never merge or push unasked; .claude/launch.json without the Windows-only path), the family docs set (CHANGELOG, ACCOUNTS, TROUBLESHOOTING, PRODUCT_BRIEF, EQUATIONS, ASSUMPTIONS, TEST_MATRIX, OWNER_CHECKLIST; DEPLOY.md is deploy-ci's) with the stale README figures refreshed (bringing the plan package onto v1-build is the owner's merge), and the Boxlytics constructions (founder token format, founder store and client, the founder lists' search) recorded with their Boxlytics paths and commit c429bef in both THIRD_PARTY_NOTICES files and the DESIGN_LOG, as the owner's decisions allow; PLT-02 (tracker-and-docs-12, with its late duplicate parity-supabase-auth-06) becomes true when deploy-ci adds .env.production.example, DEPLOY.md and test_deploy_docs.py, so tick it only once those have landed and annotate it otherwise."
+  },
+  {
+   "key": "storage-perf",
+   "title": "Storage growth, read paths, scheduler capacity and payload cost (plan retention, telemetry and plan reads, tick observability, jobs, compression, bundles)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/plans.py (stage 2: a new prune function and the column choice of history/current/active_at; no change to build_problem or the guard)",
+    "backend/gridlytics/scheduler.py (stage 2: failed-site runs rows, tick timing, the nightly prune call, bounded tick)",
+    "backend/gridlytics/jobs.py",
+    "backend/gridlytics/routes_plans.py (stage 2: re-solve and resume as jobs, and _held's getattr/TypeError fallback removed, only)",
+    "backend/gridlytics/routes_sites.py (stage 2: site_now, fleet_row and the site list's light fields only)",
+    "backend/gridlytics/battery.py (stage 2: the estimate cached per tick only)",
+    "backend/gridlytics/forecast.py (stage 2: the history window read once per tick only)",
+    "backend/gridlytics/telemetry.py (stage 2: column-selecting reads only)",
+    "backend/gridlytics/sites.py (stage 2: native_latest columns only)",
+    "backend/gridlytics/alerts.py (stage 2: plan_failed and tick-overrun rules only)",
+    "backend/gridlytics/store.py (connection reuse and indexes; a migration renumbered at integration)",
+    "backend/gridlytics/api.py (stage 2: GZipMiddleware only)",
+    "frontend/src/components/layout/ (stage 2: the site switcher's light poll only)",
+    "frontend/src/components/charts/spark-bars.tsx (stage 2: SVG sparkline)",
+    "frontend/src/components/charts/echarts-setup.ts (stage 2: registered modules)",
+    "frontend/vite.config.ts (chunk-size warning)",
+    "backend/tests/test_storage_perf.py (new)",
+    "backend/tests/test_scheduler.py (new)"
+   ],
+   "stage": 2,
+   "depends_on": [
+    "savings-engine",
+    "tariffs",
+    "delivery-twin",
+    "control-edge",
+    "optimiser-plans",
+    "forecasts-outages",
+    "telemetry-genset-battery",
+    "sites-onboarding",
+    "fleet-overview",
+    "alerts-reports",
+    "auth-security",
+    "founder-console",
+    "shell-nav",
+    "ui-charts-a11y",
+    "demo-seed"
+   ],
+   "batches": [
+    {
+     "theme": "Plan store and scheduler: plan retention, tick failures and a scheduler test, tick timing and capacity",
+     "ids": [
+      "performance-live-01",
+      "parity-architecture-06",
+      "tests-and-perf-13",
+      "performance-live-09",
+      "performance-live-11"
+     ]
+    },
+    {
+     "theme": "Server read paths and long requests: solves as jobs, /now cost and freshness, plans.active_at, tick history reads, capture photo",
+     "ids": [
+      "performance-live-05",
+      "performance-live-02",
+      "tests-and-perf-10",
+      "tests-and-perf-07",
+      "tests-and-perf-09",
+      "tests-and-perf-08"
+     ]
+    },
+    {
+     "theme": "What the browser downloads and polls: shell fleet poll, compression, chart bundles",
+     "ids": [
+      "performance-live-08",
+      "performance-live-10",
+      "performance-live-12",
+      "tests-and-perf-17"
+     ]
+    }
+   ],
+   "notes": "New package for late findings: plan-row retention, telemetry read cost, tick failures, observability and capacity, long requests and payload cost cut across files owned by several stage-1 packages (plans.py and scheduler.py split between control-edge and optimiser-plans, routes_plans.py, routes_sites.py, telemetry.py, battery.py, forecast.py, sites.py, alerts.py, api.py, store.py, the shell and two chart files), so they run once on the integrated stage-1 branch instead of in optimiser-plans or fleet-overview. Stage 2, in parallel with savings-ui-crosscut and tests-ci: change only the functions named in owns_files; routes_savings.py is savings-ui-crosscut's, which moves recompute onto the same jobs.py pattern (tests-and-perf-11 under pr-review-05), and reports.py is savings-ui-crosscut's in this stage. Plan store: retention per spec Part 3.3 (superseded plans' steps and slots kept 90 days, then only the first plan of each hour, the plan active at each step and applied plans), run from the nightly job, never removing a row verify's replays, the reports or the applied log read (test: savings and report figures equal before and after a prune); readers select the columns they use (history, current, fleet_row); plans.active_at fetches the plans covering a range once per request; indexes on plans(site_id, belief_time), plan_messages(site_id, sent_at) and acks(site_id, received_at). Back up before any schema change. The data-folder paths are not here: report files are alerts-reports' (parity-architecture-11, stage 1), the signing keys control-edge's (engine-delivery-13) and the keys/ and reports/ backup copies founder-console's. Scheduler: a failing site tick writes a failed runs row, raises the plan_failed alert and still evaluates alerts, so the page's 'first plan within 15 minutes' gives way to the failure; scheduled ticks record start, end and per-site durations apart from manual re-solves (a re-solve no longer overwrites the tick's row) and log one line per tick; an overrun raises an alert; the tick stays well under the quarter at the documented sites per core (staggering or a small worker pool, DLV-09); the deterministic work limit and idle re-solve of HANDOFF 8.A.3 stay out. Scheduler test (tests-and-perf-13, moved here from tests-ci because this package changes the tick's failure path in the same stage): two companies with a few sites each, one raising, through tick_company and nightly_company: plans, runs and savings_days rows land in each company's own file, the failing site leaves a failed runs row and does not stop the others, a demo site advances before its tick, 'yesterday' is the PKT day and aggregate_day gets the peak mask. Requests: re-solve and resume answer 202 and run as jobs with progress (jobs.py); routes_plans._held drops its getattr/TypeError fallback now that plans.held_info always exists (the product half of tests-and-perf-20, whose test half is tests-ci's); /now reads the header's state from indexed reads and a battery estimate stored per tick (no 30-day battery.state per poll) and re-aggregates today's day row when it is older than the last minute, so edge sites' 'today' tiles move (tests-and-perf-10); the tick reads its history window once with only the columns each forecaster needs and shares it; native_latest selects explicit columns with has_photo; one connection per request (no PRAGMA round trips per connection). Web: the shell's site switcher polls a light list (the site list gains the state dot and last-data age) instead of /fleet; GZipMiddleware(minimum_size=1000); an SVG sparkline instead of Recharts, keeping fleet-overview's cross-row scale and noise floor; ECharts registers only the charts and components used, the chunk-size warning is back on and chunk sizes go in GATES. Each change gets a test that fails without it; timings are measured and reported in the pull request, never asserted as wall-clock limits. Never run against the owner's data folder. Shared additive (append only): types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, schemas.py, new test fixture files; leave HANDOFF.md/DESIGN_LOG.md to the docs WP."
+  },
+  {
+   "key": "deploy-ci",
+   "title": "Deployment, CI and repository shape: workflows, Docker and deploy settings, Vercel, secret ignore rules, lint gate, dependencies, lifted-code drift",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    ".github/workflows/ci.yml (new, both repositories)",
+    "Dockerfile, .dockerignore, .env.production.example (new, backend repository)",
+    "docs/DEPLOY.md (new, backend repository)",
+    "backend/tests/test_deploy_docs.py (new)",
+    "backend/tests/test_lift_drift.py and backend/lift_manifest.json (new)",
+    "scripts/build_release.py, scripts/load_check.py (new, backend repository)",
+    "frontend/vercel.json (new)",
+    "frontend/scripts/deploy_check.mjs (new)",
+    "frontend/eslint.config.js, frontend/.prettierrc (new)",
+    "frontend/package.json and frontend/package-lock.json (scripts, devDependencies, removed dependencies)",
+    "requirements.txt, requirements-dev.txt (backend repository)",
+    ".gitignore (both repositories)",
+    "backend/gridlytics/founder.py (stage 3: founder_file()'s backend-root .env.founder fallback only)",
+    "THIRD_PARTY_NOTICES.md (both repositories: the dependency lists only; the Boxlytics section is docs')"
+   ],
+   "stage": 3,
+   "depends_on": [
+    "tests-ci",
+    "savings-ui-crosscut",
+    "storage-perf",
+    "parity-ui"
+   ],
+   "batches": [
+    {
+     "theme": "CI and deployment: workflows, Docker image and deploy settings, Vercel, release scripts, pins and audit",
+     "ids": [
+      "parity-architecture-01",
+      "parity-architecture-02",
+      "parity-architecture-03",
+      "parity-architecture-16",
+      "parity-architecture-20"
+     ]
+    },
+    {
+     "theme": "Repository hygiene: secret ignore rules, lifted-code drift, lint and format gate, unused dependencies, caches",
+     "ids": [
+      "parity-architecture-13",
+      "parity-architecture-07",
+      "parity-architecture-18",
+      "parity-architecture-19",
+      "parity-architecture-21"
+     ]
+    }
+   ],
+   "notes": "New package for late findings: the original plan left CI and deployment (DEP-01..07) out of tests-ci as planned work, and no package owns the repository shape (workflows, Docker, Vercel, ignore rules, lint, pins), so it runs last, once tests-ci has made the suites deterministic, storage-perf has settled the server settings and parity-ui has restyled the web files the lint and format gate will touch. Stage 3, after parity-ui and in parallel with docs: append only to BACKEND_ASKS.md and BUILD_NOTES.md (docs owns the rest of them) and touch only the dependency lists of THIRD_PARTY_NOTICES.md. CI (.github/workflows/ci.yml in both repositories, the family's shape): the backend on every push and pull request with Python 3.12 and pytest -n auto, the web repository checked out beside it with a read-only FRONTEND_READ_TOKEN (the owner adds the secret: write it in BACKEND_ASKS as an owner task), pip-audit; the frontend with tsc, vitest, build, lint and format:check and npm audit; the browser check as its own job. Deployment (the Solarlytics S0b shape): Dockerfile on python:3.12-slim-bookworm, API only, non-root, a /data volume (platform.db, companies/, keys/, reports/, backup/, logs/), HEALTHCHECK on /api/health, one uvicorn worker so one scheduler runs; .dockerignore; .env.production.example naming every GRIDLYTICS_* setting the code reads (the service-role key server-only, the founder console's 503 until its four secrets are set, Supabase only as the optional owner-applied mode with preassigned accounts, no Google, no self-signup), enforced by test_deploy_docs.py (this meets PLT-02: tracker-and-docs-12 and its late duplicate parity-supabase-auth-06); docs/DEPLOY.md with compose and reverse-proxy notes (TLS, TRUST_PROXY, hosts and CORS); scripts/build_release.py for the GRIDLYTICS_WEB_DIST release and scripts/load_check.py (restore_backup.py, which also puts back keys/ and reports/, is founder-console's and export_contract.py control-edge's; no fetch_tariffs/fetch_schedules scraping of NEPRA/OGRA). Web hosting: frontend/vercel.json (vite, npm ci, a deploy check before and after the build that refuses an unset or unknown VITE_AUTH_MODE or API base, an SPA rewrite of every non-asset path, a CSP whose connect-src names the API host plus the security headers, asset caching). Hygiene: both .gitignore files ignore .env, .env.*, !.env*.example, data/platform.secret, demo/*.local.md, __pycache__/, *.pyc and .pytest_cache/, and the launcher's backend-root .env.founder fallback goes; eslint 9 flat config (typescript-eslint, react-hooks exhaustive-deps, import order), prettier 3 with the Tailwind plugin and a coverage threshold from 60 % of lines, all in npm run gates and CI (fix what they flag, parity-ui's restyled files included; a rule left off is written in BUILD_NOTES); pandas, date-fns and @radix-ui/react-popover removed and the notices' dependency lists matched; the shared sign-in stack pinned as in solarlytics-backend once both suites pass on it. Lifted code: a manifest of every module lifted from Solarlytics (path, commit, rename map) and a drift test against a read-only sibling checkout when one is present (skipped otherwise); shared onyxleaf-platform/@onyxleaf/auth packages are an owner decision, written in BACKEND_ASKS. Never change Solarlytics or Boxlytics; never push or merge: the owner opens the pull requests. Tests never use the owner's data folder."
+  }
+ ],
+ "duplicates": [
+  {
+   "canonical": "flow-savings-pilot-bill-02",
+   "dups": [
+    "role-owner-01",
+    "role-operator-01",
+    "role-analyst-02"
+   ],
+   "note": "Fleet/Overview month-to-date saving leaves out the MDI lever (Karachi Rs 1,956 vs Rs 43,594 on Savings)"
+  },
+  {
+   "canonical": "role-owner-08",
+   "dups": [
+    "role-viewer-01",
+    "role-operator-03",
+    "role-analyst-04",
+    "flow-telemetry-plan-control-27",
+    "flow-savings-pilot-bill-28"
+   ],
+   "note": "Control chip forced to 'Following plan (table applied)' for demo sites, also while offline"
+  },
+  {
+   "canonical": "pages-C-03",
+   "dups": [
+    "role-viewer-04",
+    "role-owner-06",
+    "role-operator-05",
+    "role-analyst-05",
+    "flow-savings-pilot-bill-27",
+    "pages-A-06"
+   ],
+   "note": "Genset litres labelled estimated/metered inconsistently; unmetered sets never estimated"
+  },
+  {
+   "canonical": "frontend-states-formats-01",
+   "dups": [
+    "role-viewer-05",
+    "role-operator-04",
+    "role-analyst-06",
+    "flow-savings-pilot-bill-14",
+    "pages-C-17"
+   ],
+   "note": "Gas genset (MMBtu) shown as diesel litres"
+  },
+  {
+   "canonical": "role-operator-10",
+   "dups": [
+    "frontend-states-formats-03",
+    "role-viewer-02",
+    "role-owner-09",
+    "role-analyst-07"
+   ],
+   "note": "Off-grid farm shown as a permanent grid outage"
+  },
+  {
+   "canonical": "pages-C-02",
+   "dups": [
+    "role-viewer-03",
+    "role-operator-13"
+   ],
+   "note": "Schedule adherence 80 % prior shown as measured"
+  },
+  {
+   "canonical": "role-operator-14",
+   "dups": [
+    "role-viewer-08",
+    "role-owner-14",
+    "role-analyst-08"
+   ],
+   "note": "Battery Daily cycles axis '99999' tick"
+  },
+  {
+   "canonical": "flow-savings-pilot-bill-20",
+   "dups": [
+    "role-owner-04",
+    "role-operator-15",
+    "role-analyst-13"
+   ],
+   "note": "Daily saving chart ticks rounded to thousands"
+  },
+  {
+   "canonical": "role-analyst-14",
+   "dups": [
+    "role-owner-13",
+    "flow-savings-pilot-bill-21"
+   ],
+   "note": "Fleet sparkline per-row scale blows paise noise into a full red bar"
+  },
+  {
+   "canonical": "frontend-a11y-02",
+   "dups": [
+    "role-viewer-11",
+    "role-owner-12",
+    "role-operator-25",
+    "role-analyst-22"
+   ],
+   "note": "No skip link"
+  },
+  {
+   "canonical": "frontend-a11y-01",
+   "dups": [
+    "frontend-states-formats-08",
+    "role-viewer-10",
+    "role-owner-18"
+   ],
+   "note": "Site pages never set document.title"
+  },
+  {
+   "canonical": "role-owner-19",
+   "dups": [
+    "role-viewer-23"
+   ],
+   "note": "Bare not-found pages"
+  },
+  {
+   "canonical": "pages-A-13",
+   "dups": [
+    "role-owner-17",
+    "role-analyst-21",
+    "role-operator-24"
+   ],
+   "note": "Settings and Members both highlighted"
+  },
+  {
+   "canonical": "role-owner-34",
+   "dups": [
+    "role-viewer-12"
+   ],
+   "note": "Pilot set-up under Company; two 'Devices and ...' items"
+  },
+  {
+   "canonical": "pages-A-14",
+   "dups": [
+    "parity-boxlytics-ui-18",
+    "flow-onboarding-26"
+   ],
+   "note": "Another site's tier chip on company pages / Add a site"
+  },
+  {
+   "canonical": "pages-A-05",
+   "dups": [
+    "pages-D-26"
+   ],
+   "note": "Viewer sidebar lists pages they cannot use"
+  },
+  {
+   "canonical": "role-operator-09",
+   "dups": [
+    "role-viewer-06",
+    "role-owner-10",
+    "role-analyst-10",
+    "flow-savings-pilot-bill-29"
+   ],
+   "note": "Tables at 375 px hide key columns"
+  },
+  {
+   "canonical": "role-operator-21",
+   "dups": [
+    "role-owner-27",
+    "parity-boxlytics-ui-16",
+    "role-analyst-26"
+   ],
+   "note": "Plan Versions clipped; money and units wrap in tables"
+  },
+  {
+   "canonical": "role-operator-22",
+   "dups": [
+    "role-owner-26"
+   ],
+   "note": "Electricity-duty table overflows its card"
+  },
+  {
+   "canonical": "parity-boxlytics-ui-15",
+   "dups": [
+    "role-owner-20",
+    "role-viewer-15"
+   ],
+   "note": "Next-12-hours chips truncated"
+  },
+  {
+   "canonical": "role-owner-29",
+   "dups": [
+    "role-operator-27"
+   ],
+   "note": "Offline notice drawn over the energy-flow diagram"
+  },
+  {
+   "canonical": "role-owner-22",
+   "dups": [
+    "role-viewer-14"
+   ],
+   "note": "Chart unit label collides with 'now'"
+  },
+  {
+   "canonical": "role-viewer-07",
+   "dups": [
+    "role-analyst-09"
+   ],
+   "note": "Today's partial day shown red in data quality"
+  },
+  {
+   "canonical": "frontend-states-formats-04",
+   "dups": [
+    "role-owner-32",
+    "role-analyst-30"
+   ],
+   "note": "Multi-day charts show hours only"
+  },
+  {
+   "canonical": "role-owner-21",
+   "dups": [
+    "role-analyst-17",
+    "role-viewer-16"
+   ],
+   "note": "'Built learnt' and other wording slips"
+  },
+  {
+   "canonical": "pages-C-23",
+   "dups": [
+    "engine-forecast-13"
+   ],
+   "note": "Stage wording says a week; stage 1 comes after 3 days"
+  },
+  {
+   "canonical": "pages-C-22",
+   "dups": [
+    "engine-forecast-07",
+    "role-analyst-18"
+   ],
+   "note": "Accuracy 'last 7 days' is last 7 rows; no PV skill; one horizon"
+  },
+  {
+   "canonical": "pages-C-08",
+   "dups": [
+    "role-analyst-19"
+   ],
+   "note": "Outage model card always asks to set the feeder"
+  },
+  {
+   "canonical": "engine-forecast-11",
+   "dups": [
+    "brief-vs-build-17"
+   ],
+   "note": "No Pakistan holiday calendar"
+  },
+  {
+   "canonical": "engine-savings-03",
+   "dups": [
+    "brief-vs-build-10"
+   ],
+   "note": "Tuned baseline lacks HOMER cycle charging"
+  },
+  {
+   "canonical": "engine-savings-11",
+   "dups": [
+    "pages-D-30"
+   ],
+   "note": "Carry-over only at plan-to-native boundaries"
+  },
+  {
+   "canonical": "engine-savings-01",
+   "dups": [
+    "brief-vs-build-01",
+    "flow-savings-pilot-bill-05"
+   ],
+   "note": "Live tick ignores switchback native blocks"
+  },
+  {
+   "canonical": "flow-savings-pilot-bill-03",
+   "dups": [
+    "role-analyst-01",
+    "engine-savings-12"
+   ],
+   "note": "Switchback per-day saving from one plan day; no agreement check"
+  },
+  {
+   "canonical": "pages-D-01",
+   "dups": [
+    "flow-savings-pilot-bill-04",
+    "role-owner-03"
+   ],
+   "note": "Fee card extrapolates and names the wrong baseline"
+  },
+  {
+   "canonical": "engine-savings-06",
+   "dups": [
+    "pages-D-02"
+   ],
+   "note": "Headline sums non-claiming days"
+  },
+  {
+   "canonical": "engine-optimiser-14",
+   "dups": [
+    "role-owner-05",
+    "role-operator-12",
+    "flow-savings-pilot-bill-06"
+   ],
+   "note": "Perfect-foresight bound below the achieved saving"
+  },
+  {
+   "canonical": "pages-D-06",
+   "dups": [
+    "engine-savings-07",
+    "flow-savings-pilot-bill-16"
+   ],
+   "note": "Savings/report CSV lacks claim, tariff and capture columns"
+  },
+  {
+   "canonical": "pages-D-07",
+   "dups": [
+    "tracker-and-docs-14"
+   ],
+   "note": "Monthly report short of plan 8.5; no company roll-up"
+  },
+  {
+   "canonical": "tracker-and-docs-01",
+   "dups": [
+    "pages-D-09"
+   ],
+   "note": "Only the first connection is priced, ledgered and billed"
+  },
+  {
+   "canonical": "pages-D-10",
+   "dups": [
+    "flow-savings-pilot-bill-07"
+   ],
+   "note": "Bill comparison checks only the total"
+  },
+  {
+   "canonical": "pages-D-04",
+   "dups": [
+    "security-roles-05",
+    "flow-savings-pilot-bill-10"
+   ],
+   "note": "PUT /pilot unvalidated; client writes the sign-off"
+  },
+  {
+   "canonical": "flow-savings-pilot-bill-11",
+   "dups": [
+    "pages-D-18"
+   ],
+   "note": "Pilot starts without baseline window or passing rules"
+  },
+  {
+   "canonical": "pages-D-12",
+   "dups": [
+    "brief-vs-build-02",
+    "flow-savings-pilot-bill-13"
+   ],
+   "note": "Pilot criteria never evaluated; gates missing"
+  },
+  {
+   "canonical": "role-operator-18",
+   "dups": [
+    "flow-savings-pilot-bill-22"
+   ],
+   "note": "Switchback calendar month labels wrong"
+  },
+  {
+   "canonical": "security-roles-14",
+   "dups": [
+    "flow-savings-pilot-bill-26"
+   ],
+   "note": ".ics unescaped, no DTSTAMP, no file name"
+  },
+  {
+   "canonical": "flow-onboarding-14",
+   "dups": [
+    "flow-savings-pilot-bill-15"
+   ],
+   "note": "Native capture accepts impossible slot times"
+  },
+  {
+   "canonical": "role-operator-16",
+   "dups": [
+    "role-owner-35",
+    "role-analyst-27"
+   ],
+   "note": "Native capture allows 14 slots for every brand"
+  },
+  {
+   "canonical": "role-operator-02",
+   "dups": [
+    "role-analyst-03",
+    "flow-telemetry-plan-control-05"
+   ],
+   "note": "Vendor table shows the SoC floor instead of the charge target"
+  },
+  {
+   "canonical": "pages-B-04",
+   "dups": [
+    "engine-delivery-05"
+   ],
+   "note": "Huawei vendor view invalid periods and 'hold'"
+  },
+  {
+   "canonical": "pages-B-05",
+   "dups": [
+    "engine-delivery-06",
+    "tracker-and-docs-06"
+   ],
+   "note": "Generic layout for Growatt, Sungrow, Voltronic, Solis"
+  },
+  {
+   "canonical": "pages-B-13",
+   "dups": [
+    "engine-delivery-14",
+    "tracker-and-docs-05"
+   ],
+   "note": "Fallback block carries a 3-hour revert timer"
+  },
+  {
+   "canonical": "engine-delivery-02",
+   "dups": [
+    "flow-telemetry-plan-control-06"
+   ],
+   "note": "Plan uses soc_min 10 % but the table floors at 20 %"
+  },
+  {
+   "canonical": "engine-delivery-04",
+   "dups": [
+    "flow-telemetry-plan-control-07",
+    "role-analyst-11"
+   ],
+   "note": "Slot reduction drops planned discharge; no re-merge"
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-04",
+   "dups": [
+    "engine-plans-live-09"
+   ],
+   "note": "Compare/guard/replay run the farm genset all day"
+  },
+  {
+   "canonical": "pages-B-01",
+   "dups": [
+    "security-roles-13",
+    "flow-telemetry-plan-control-20"
+   ],
+   "note": "Control routes take raw dicts; non-numeric hours 500"
+  },
+  {
+   "canonical": "pages-B-02",
+   "dups": [
+    "engine-delivery-09",
+    "brief-vs-build-06",
+    "flow-telemetry-plan-control-16"
+   ],
+   "note": "No stable daily table; write budget counts pulls, never enforced"
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-17",
+   "dups": [
+    "role-operator-08",
+    "tracker-and-docs-10"
+   ],
+   "note": "No UI for force charge, genset hold, charge block"
+  },
+  {
+   "canonical": "role-operator-11",
+   "dups": [
+    "role-analyst-12"
+   ],
+   "note": "Closed-loop control page is the advisory page"
+  },
+  {
+   "canonical": "role-owner-15",
+   "dups": [
+    "role-viewer-24",
+    "role-analyst-28"
+   ],
+   "note": "Demo closed-loop/data-source records contradict each other"
+  },
+  {
+   "canonical": "engine-delivery-17",
+   "dups": [
+    "brief-vs-build-08"
+   ],
+   "note": "Mode B never executed by the twin"
+  },
+  {
+   "canonical": "brief-vs-build-12",
+   "dups": [
+    "tracker-and-docs-04"
+   ],
+   "note": "No exported contract schema (DAT-02)"
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-03",
+   "dups": [
+    "engine-plans-live-11"
+   ],
+   "note": "Monitor-tier edge gets a signed actionable plan"
+  },
+  {
+   "canonical": "engine-optimiser-01",
+   "dups": [
+    "engine-plans-live-01"
+   ],
+   "note": "Plan sheds load with the grid up"
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-02",
+   "dups": [
+    "engine-plans-live-04",
+    "engine-plans-live-13"
+   ],
+   "note": "Grid buying in the peak window labelled 'cheaper'"
+  },
+  {
+   "canonical": "engine-optimiser-02",
+   "dups": [
+    "engine-plans-live-07"
+   ],
+   "note": "Billing-month start MDI anchoring"
+  },
+  {
+   "canonical": "engine-optimiser-12",
+   "dups": [
+    "role-analyst-31"
+   ],
+   "note": "Cost breakdown omits next-month MDI ('Not itemised')"
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-08",
+   "dups": [
+    "engine-plans-live-14"
+   ],
+   "note": "Reason labels contradict the numbers"
+  },
+  {
+   "canonical": "pages-C-16",
+   "dups": [
+    "brief-vs-build-16"
+   ],
+   "note": "Fuel curve never fitted; policy card empty"
+  },
+  {
+   "canonical": "security-roles-01",
+   "dups": [
+    "tracker-and-docs-02"
+   ],
+   "note": "Events route leaks fuel-log cost_rs"
+  },
+  {
+   "canonical": "security-roles-03",
+   "dups": [
+    "pages-D-15"
+   ],
+   "note": "Viewer receives every alert category"
+  },
+  {
+   "canonical": "role-operator-06",
+   "dups": [
+    "pages-C-20"
+   ],
+   "note": "Operator sees money settings and the Economics card"
+  },
+  {
+   "canonical": "pages-A-08",
+   "dups": [
+    "frontend-states-formats-19"
+   ],
+   "note": "Money KPIs carry no method or computation date"
+  },
+  {
+   "canonical": "pages-A-11",
+   "dups": [
+    "role-viewer-18"
+   ],
+   "note": "Viewer's fleet sparkline silently dropped"
+  },
+  {
+   "canonical": "pages-A-04",
+   "dups": [
+    "frontend-states-formats-09",
+    "role-owner-24",
+    "role-operator-26"
+   ],
+   "note": "'90 days of history' promise vs the seeded demo"
+  },
+  {
+   "canonical": "role-owner-07",
+   "dups": [
+    "role-operator-17"
+   ],
+   "note": "Genset fuel cost at today's price"
+  },
+  {
+   "canonical": "pages-A-03",
+   "dups": [
+    "role-viewer-09"
+   ],
+   "note": "Grid site without a connection labelled Off-grid"
+  },
+  {
+   "canonical": "role-owner-41",
+   "dups": [
+    "role-operator-33"
+   ],
+   "note": "HydrateFallback warning"
+  },
+  {
+   "canonical": "frontend-states-formats-06",
+   "dups": [
+    "flow-telemetry-plan-control-11"
+   ],
+   "note": "CSV times default to UTC"
+  },
+  {
+   "canonical": "engine-tariffs-05",
+   "dups": [
+    "flow-onboarding-13"
+   ],
+   "note": "Tax flags, ICP and Tariff F season cannot be set"
+  },
+  {
+   "canonical": "engine-tariffs-07",
+   "dups": [
+    "tracker-and-docs-07"
+   ],
+   "note": "No hand-worked golden bills (TAR-01..06, OPT-06, VER-04)"
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-26",
+   "dups": [
+    "role-viewer-26"
+   ],
+   "note": "All-day slot shown as 00:00 to 00:00"
+  },
+  {
+   "canonical": "role-analyst-24",
+   "dups": [
+    "role-operator-23"
+   ],
+   "note": "ISO dates and raw keys in customer-facing text"
+  },
+  {
+   "canonical": "role-owner-02",
+   "dups": [
+    "engine-money-live-01"
+   ],
+   "note": "Faisalabad's whole saving is carry-over: both replays start at the actual's SoC, the day's end energy is credited at the peak price while the next day's native replay inherits it (verify.py 641-675, 733); Part 8.2 prices carry-over only at switchback block boundaries."
+  },
+  {
+   "canonical": "engine-savings-08",
+   "dups": [
+    "engine-money-live-02"
+   ],
+   "note": "The off-grid farm claims Rs 12,581 this month, all carry-over, while burning more diesel than native."
+  },
+  {
+   "canonical": "flow-savings-pilot-bill-01",
+   "dups": [
+    "engine-money-live-03"
+   ],
+   "note": "The MDI lever follows the chosen range; the month's actual peak must also come from every day of the month, not only scored days (FSD 26 Oct)."
+  },
+  {
+   "canonical": "flow-onboarding-01",
+   "dups": [
+    "engine-money-live-04"
+   ],
+   "note": "Legacy net-metering end date ignored in the vectors and in the bill rebuild (tariffs.py 548-553, 607-611): after expiry exports are priced by the regime that follows (net billing Rs 8.13), not at the import rate."
+  },
+  {
+   "canonical": "flow-savings-pilot-bill-02",
+   "dups": [
+    "engine-money-live-05"
+   ],
+   "note": "Same Karachi Rs 1,956 (fleet, overview) vs Rs 43,594 (savings, report, fleet-savings API)."
+  },
+  {
+   "canonical": "pages-D-03",
+   "dups": [
+    "engine-money-live-06"
+   ],
+   "note": "Month-to-date books the whole month's MDI reduction while its daily holding cost accrues."
+  },
+  {
+   "canonical": "engine-optimiser-14",
+   "dups": [
+    "engine-money-live-07"
+   ],
+   "note": "Bound below the claim and negative (KHI Nov Rs 615 against Rs 43,594; LHR Nov -Rs 7,314). Besides the missing MDI term and the 5 s limit, the bound is solved at 15 minutes from the day's month-to-date M0 and compared with a native arm priced per minute: compare both on the same 1-minute basis and levers (written in savings-engine's late note)."
+  },
+  {
+   "canonical": "flow-savings-pilot-bill-08",
+   "dups": [
+    "engine-money-live-08"
+   ],
+   "note": "Bill comparison counts missing meter data as zero while the page says the gaps were filled."
+  },
+  {
+   "canonical": "frontend-states-formats-01",
+   "dups": [
+    "engine-money-live-09"
+   ],
+   "note": "Karachi's captive-gas MMBtu shown as diesel litres in savings-kpis.tsx."
+  },
+  {
+   "canonical": "engine-tariffs-05",
+   "dups": [
+    "engine-money-live-10"
+   ],
+   "note": "Tax flags and the ICP baseline cannot be set in the web app."
+  },
+  {
+   "canonical": "pages-D-01",
+   "dups": [
+    "engine-money-live-12"
+   ],
+   "note": "Fee check labels the tuned figure 'against the native settings' and extrapolates 1-4 days to a month."
+  },
+  {
+   "canonical": "pages-D-06",
+   "dups": [
+    "engine-money-live-13",
+    "flow-reports-alerts-members-keys-04"
+   ],
+   "note": "Savings CSV omits MDI, levers, carry-over, baseline peak and version ids; the report CSV has no tariff or capture version and its plan_ids are the first four plans by UTC date (reports.py:152): list plan ids by Karachi day."
+  },
+  {
+   "canonical": "role-analyst-14",
+   "dups": [
+    "engine-money-live-14"
+   ],
+   "note": "Lahore's -Rs 0.09 drawn as a full-height red bar."
+  },
+  {
+   "canonical": "pages-D-24",
+   "dups": [
+    "flow-reports-alerts-members-keys-01",
+    "flow-reports-alerts-members-keys-19"
+   ],
+   "note": "Raises pages-D-24 to high: at 17:11 the sheet printed the 48-hour plan's partial last day (hold 20 % all day) undated as 'Tomorrow's slot table'; print dated day tables (today's remainder and tomorrow, spec line 582), and the dialog asks for a day, not a month, with no Preliminary hint."
+  },
+  {
+   "canonical": "frontend-states-formats-05",
+   "dups": [
+    "flow-reports-alerts-members-keys-02"
+   ],
+   "note": "Empty Reports page promises an automatic report on the 3rd; schedules (UI-14) stay deferred."
+  },
+  {
+   "canonical": "pages-D-07",
+   "dups": [
+    "flow-reports-alerts-members-keys-03",
+    "flow-reports-alerts-members-keys-05"
+   ],
+   "note": "No company roll-up or pilot report (pilot kind answers 422), no browser preview (pages-D-25's half), and the PDF lacks forecast skill, control health, switchback and carry-over, bill comparison and outage coverage, and does not state a partial-data period."
+  },
+  {
+   "canonical": "founder-console-06",
+   "dups": [
+    "flow-reports-alerts-members-keys-06"
+   ],
+   "note": "Both no_seat and member_disabled render as 'not available for your role'."
+  },
+  {
+   "canonical": "security-roles-07",
+   "dups": [
+    "flow-reports-alerts-members-keys-12"
+   ],
+   "note": "sites:read reads plans and telemetry; plans:read cannot read /plan."
+  },
+  {
+   "canonical": "role-analyst-25",
+   "dups": [
+    "flow-reports-alerts-members-keys-15"
+   ],
+   "note": "Report file names omit the site."
+  },
+  {
+   "canonical": "engine-savings-13",
+   "dups": [
+    "flow-reports-alerts-members-keys-17"
+   ],
+   "note": "The PDF's Preliminary sentence must name the condition that applies, including the 8-week switchback one; litres marked Estimated and no '-0 L' (with pages-D-08)."
+  },
+  {
+   "canonical": "role-operator-20",
+   "dups": [
+    "flow-reports-alerts-members-keys-18"
+   ],
+   "note": "Report route checks only see_costs, not export."
+  },
+  {
+   "canonical": "role-operator-09",
+   "dups": [
+    "flow-reports-alerts-members-keys-20"
+   ],
+   "note": "At 375 px the Reports, API keys and Members tables hide PDF/CSV, Revoke and Switch off."
+  },
+  {
+   "canonical": "role-analyst-20",
+   "dups": [
+    "flow-reports-alerts-members-keys-21"
+   ],
+   "note": "'The API keys is not available for your role'."
+  },
+  {
+   "canonical": "pages-A-13",
+   "dups": [
+    "flow-reports-alerts-members-keys-22"
+   ],
+   "note": "Settings and Members both highlighted on every Company settings tab."
+  },
+  {
+   "canonical": "frontend-a11y-07",
+   "dups": [
+    "flow-reports-alerts-members-keys-23"
+   ],
+   "note": "Member role select saves on change, including promotion to Administrator."
+  },
+  {
+   "canonical": "frontend-a11y-16",
+   "dups": [
+    "flow-reports-alerts-members-keys-24"
+   ],
+   "note": "One-time key dialog closes on Escape; the 'Role on record' half was refuted in verification as pages-A-16, so change that column only if the page text contradicts it."
+  },
+  {
+   "canonical": "pages-D-16",
+   "dups": [
+    "flow-reports-alerts-members-keys-25"
+   ],
+   "note": "'ends on 2020-01-01' for long-ended agreements; the drawer's raw rule and connection ids are role-viewer-17's half."
+  },
+  {
+   "canonical": "role-operator-31",
+   "dups": [
+    "flow-reports-alerts-members-keys-26"
+   ],
+   "note": "Free-text assignee; the API also stores any string: validate against members."
+  },
+  {
+   "canonical": "role-operator-10",
+   "dups": [
+    "flow-reports-alerts-members-keys-30"
+   ],
+   "note": "The off-grid farm's energy report prints grid import/export, peak import 0.0 kW and 'Outage time 168 h'."
+  },
+  {
+   "canonical": "pages-A-02",
+   "dups": [
+    "parity-supabase-auth-02"
+   ],
+   "note": "'Forgotten your password? Ask your company's administrator' names someone with no reset path; the late finding adds that another member's name or email can be changed nowhere (PUT /api/users refuses them, the founder's PATCH takes only disabled and name), so the hint names who can help under preassigned accounts (OnyxLeaf), as auth-security's sign-in hint item says."
+  },
+  {
+   "canonical": "tracker-and-docs-12",
+   "dups": [
+    "parity-supabase-auth-06"
+   ],
+   "note": "Same defect as the original: PLT-02 is ticked while .env.production.example and test_deploy_docs.py do not exist and about 30 GRIDLYTICS_* settings are documented nowhere; the late finding adds DEPLOY.md, the service-role key being server-only and the founder console's 503 until its four secrets are set. deploy-ci writes the files under parity-architecture-02, and docs ticks PLT-02 once they land."
+  },
+  {
+   "canonical": "parity-architecture-13",
+   "dups": [
+    "parity-supabase-auth-07"
+   ],
+   "note": "Late-late duplicate: .env files not ignored in the backend."
+  },
+  {
+   "canonical": "parity-architecture-08",
+   "dups": [
+    "parity-supabase-auth-10"
+   ],
+   "note": "Late-late duplicate: Boxlytics reuse not recorded with path and commit."
+  },
+  {
+   "canonical": "parity-architecture-05",
+   "dups": [
+    "performance-live-07"
+   ],
+   "note": "Late-late duplicate of the log half (api.py, auth-security). Its other half, backups.daily_all copying Path(store.DB_PATH), the default database, every day, so a scratch run writes a backup into gridlytics-backend/data, is founder-console's (backups.py) and is written in founder-console's late note."
+  },
+  {
+   "canonical": "tests-and-perf-05",
+   "dups": [
+    "performance-live-13"
+   ],
+   "note": "Late-late duplicate: series exceed the ~2,000-point cap (2,880 at 2 days / 1 min, 2,881 at 30 days / 15 min)."
+  },
+  {
+   "canonical": "security-roles-01",
+   "dups": [
+    "tests-and-perf-01"
+   ],
+   "note": "Events route returns fuel-log cost_rs to viewers and keys."
+  },
+  {
+   "canonical": "tracker-and-docs-03",
+   "dups": [
+    "tests-and-perf-02"
+   ],
+   "note": "The money-filter test is not the every-route role walk; test_role_walk.py does not exist."
+  },
+  {
+   "canonical": "engine-tariffs-07",
+   "dups": [
+    "tests-and-perf-03"
+   ],
+   "note": "No hand-worked golden bill."
+  },
+  {
+   "canonical": "performance-live-03",
+   "dups": [
+    "tests-and-perf-04"
+   ],
+   "note": "Late-late duplicate: BEGIN IMMEDIATE on every telemetry read."
+  },
+  {
+   "canonical": "performance-live-01",
+   "dups": [
+    "tests-and-perf-06"
+   ],
+   "note": "Late-late duplicate; adds plans.history's SELECT * and the plan_messages/acks indexes."
+  },
+  {
+   "canonical": "pr-review-05",
+   "dups": [
+    "tests-and-perf-11"
+   ],
+   "note": "Recompute runs up to 62 days of replays and bound solves inside one request: run it as a background job (jobs.py), one per site, at low priority beside the ticks."
+  },
+  {
+   "canonical": "parity-architecture-09",
+   "dups": [
+    "tests-and-perf-18"
+   ],
+   "note": "Late-late duplicate: fixtures predate rounds 3-5 and the role map is hard-coded; re-capture them and check them through sibling.ts."
+  },
+  {
+   "canonical": "performance-live-11",
+   "dups": [
+    "tests-and-perf-21"
+   ],
+   "note": "Late-late duplicate: sequential tick; an overrun silently skips the next tick."
+  },
+  {
+   "canonical": "performance-live-10",
+   "dups": [
+    "tests-and-perf-22"
+   ],
+   "note": "Late-late duplicate: no gzip on large JSON answers."
+  },
+  {
+   "canonical": "performance-live-04",
+   "dups": [
+    "tests-and-perf-23"
+   ],
+   "note": "Late-late duplicate: upload read whole and parsed twice, one locking write; the unreachable 30 MB sentence is flow-telemetry-plan-control-25's."
+  }
+ ],
+ "deferred": [
+  {
+   "id": "pages-B-09",
+   "reason": "refuted in verification"
+  },
+  {
+   "id": "pages-B-10",
+   "reason": "refuted in verification"
+  },
+  {
+   "id": "pages-B-16",
+   "reason": "refuted in verification"
+  },
+  {
+   "id": "pages-A-16",
+   "reason": "refuted in verification"
+  },
+  {
+   "id": "pages-D-13",
+   "reason": "HANDOFF 8.C planned feature with a design (tariff editor UI-03: lettered tabs, heatmap and price-vector review, diff, simulate on a site, reject/withdraw, 'used by N sites', version timeline); the finding restates that the editor is not built. The defects inside the existing raw-JSON draft dialog are fixed under role-analyst-16 (tariffs)"
+  },
+  {
+   "id": "engine-forecast-15",
+   "reason": "Owner decision: the weather feed (FOR-02, Open-Meteo) needs a commercial licence the owner must buy before it is wired in (HANDOFF 8.C, owner task O5); the Forecasts-page notice that no weather feed is used is implemented under pages-C-09"
+  },
+  {
+   "id": "parity-architecture-17",
+   "reason": "Owner decision: one frontend toolchain and a shared @onyxleaf/ui package across Boxlytics, Solarlytics and Gridlytics would change the other products (Boxlytics belongs to another party and is never changed); Gridlytics' own look is parity-ui's (stage 3) and react-hook-form's absence is recorded in BUILD_NOTES by the docs WP."
+  },
+  {
+   "id": "parity-architecture-22",
+   "reason": "Restates planned HANDOFF 8.C work with its plan 10.1 design: the independent verification harness (VER-05, VER-06, VER-07: python-microgrid replay and the REopt-style case with their own requirements and weekly job) and the MILP benchmark (DEP-02); the default-suite 192-step check is tests-ci's (pr-review-01)."
+  }
+ ],
+ "summary": "557 findings: 407 canonical findings in 75 batches across 19 work packages, 144 duplicates folded into 82 canonical ids, 6 deferred (4 refuted; pages-D-13, the UI-03 tariff editor; engine-forecast-15, the FOR-02 weather feed that waits on the owner's licence). Checked with check_plan.py: every index.tsv id appears exactly once. Critic corrections to the draft: (1) the pilot WP is folded into savings-engine, because its pinned baseline, calendar draw and tier rule all edit verify.py; (2) one owner per file in stage 1 (only function splits remain, each written in owns_files): control_state -> control-edge (with role-owner-08, so demo-seed and fleet-overview no longer edit it), plans.tick -> optimiser-plans whole (control-edge acts through control_release and its own functions), scheduler.py -> control-edge alone (the month-end re-score runs inside verify.compute_day), verify.py's bill functions -> tariffs, slot-words.ts -> delivery-twin, battery-cards.tsx -> auth-security alone, api.py -> auth-security, devices-page.tsx -> telemetry, the key-folder backup -> founder-console, alerts.py -> alerts-reports alone (battery alerts already come from battery.state; the tariff-staleness rule brief-vs-build-18 moved to alerts-reports), flow-onboarding-09 -> sites-onboarding (its engine half named in optimiser-plans), role-operator-07 -> sites-onboarding (owns the routes it gates); (3) findings that need several stage-1 WPs' code moved to the stage-2 batch 1: multi-connection with the metering factor (engine-savings-09) and the Punjab duty by connection (engine-tariffs-09), Mode B in the twin/guard/demo (engine-delivery-17), genset charging (engine-plans-live-18), event re-solves (brief-vs-build-15); app-wide row-action names (frontend-a11y-17) and written dates (role-operator-28) moved to the stage-2 sweep; (4) duplicates: flow-telemetry-plan-control-23 is no longer a duplicate of frontend-states-formats-15 (control_state's chip label vs the Overview/Fleet next-event times, different code and owners); (5) deferrals: role-analyst-16 is no longer deferred, because the existing raw-JSON draft dialog has its own defects (parser message twice, raw kind names, no example body), so it goes to tariffs; (6) batches regrouped to 4-7 findings and ordered by severity, counting each canonical id's duplicates. Stage 1 (15 WPs, in parallel): savings-engine, tariffs, delivery-twin, control-edge, optimiser-plans, forecasts-outages, telemetry-genset-battery, sites-onboarding, fleet-overview, alerts-reports, auth-security, founder-console, shell-nav, ui-charts-a11y, demo-seed. Stage 2 (on the integrated stage-1 branch): savings-ui-crosscut (cross-module engine batch, Savings page, pilot go/no-go, audit walk, cross-page sweeps) and tests-ci (engine acceptance tests, browser check). Stage 3: parity-ui (Boxlytics look) and docs. Remaining function splits: plans.py (optimiser-plans / control-edge), delivery.py (delivery-twin compile half / control-edge keys and messages), routes_sites.py (sites-onboarding / fleet-overview / control-edge control_state), routes_telemetry.py (telemetry / forecasts-outages outage routes / auth-security events), routes_savings.py (savings-engine pilot and switchback / tariffs bills / alerts-reports fleet_savings flag), verify.py (savings-engine / tariffs bill functions), routes_plans.py (control-edge / delivery-twin plan_compare), twin.py (delivery-twin / demo-seed truth), routes_founder.py and store_founder.py (founder-console / auth-security set-password), auth.py (auth-security / sites-onboarding's one appended 'manage_sites' entry). Some findings are split by agreement and named in both WPs' notes: pages-A-03 (header line, shell-nav), pages-D-16 (Tariffs-page state, tariffs), flow-savings-pilot-bill-12, frontend-states-formats-11 and engine-forecast-05 (form halves, sites-onboarding). Shared additive: types/api.ts, lib/api/endpoints.ts, lib/api/keys.ts, API_CONTRACT.md, BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py, new test fixtures; store.py migrations are renumbered at integration. Parts of findings that restate planned work stay out and are named in the notes: report schedules (pages-D-25, role-analyst-32), alert sending (pages-D-29), the twin-priced 2-slot ranking (engine-delivery-04), the deterministic work limit / idle re-solve (engine-optimiser-08, engine-plans-live-19), CI/deployment (tests-ci). Accounts stay preassigned (no Google, no self-signup)."
+}

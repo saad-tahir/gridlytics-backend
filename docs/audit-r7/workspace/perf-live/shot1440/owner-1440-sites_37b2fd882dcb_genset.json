@@ -1,0 +1,64 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/37b2fd882dcb/genset",
+  "url": "http://127.0.0.1:5295/sites/37b2fd882dcb/genset",
+  "signedIn": true,
+  "loadMs": 2412,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Lahore mall (demo)",
+    "H2: Genset",
+    "H2: Advice",
+    "H3: Requests",
+    "H3: The plan's next runs",
+    "H2: Runs",
+    "H2: Fuel curve",
+    "H2: Fuel price",
+    "H2: Policy",
+    "H2: Fuel log",
+    "H2: Fuel logged"
+  ],
+  "buttons": [
+    "Lahore mall (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "Log fuel"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [
+    "Rs 207,371",
+    "Rs 382",
+    "Rs 382",
+    "Rs,"
+  ],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Lahore mall (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Monitor (recommendation only) Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Lahore mall (demo) Genset Lahore mall (demo) DEMO Monitor (recommendation only) Recommendation only Lahore LESCO · A-2(c) Last data: 10 min ago Genset Run hours, 14 days 5.9 h 6 starts Fuel, 14 days 543 L Estimated from the fuel curve Starts 6 over 14 days Average load 40 % of 640 kW rated Fuel cost, 14 days Rs 207,371 litres × Rs 382.25/L, price of 6 Nov 2026 Advice This genset's start is auto on grid loss: the product sends no start requests, and plans around it. Requests No requests. The plan's next runs The plan does not ask for the genset in the next 48 hours. Runs The last 14 days, newest first, in Karachi time. Genset runs Start End Hours Energy Litres (estimated) Load Grid Plan asked 6 Nov 2026, 05:46 06:53 1.1 h 145 kWh 63.1 L 20 % Outage No 3 Nov 2026, 19:56 21:13 1.3 h 508 kWh 166 L 62 % Outage No 1 Nov 2026, 15:03 16:01 1.0 h 358 kWh 118 L 58 % Outage No 31 Oct 2026, 14:36 15:17 0.7 h 242 kWh 80.6 L 56 % Outage No 28 Oct 2026, 22:26 23:47 1.4 h 207 kWh 85.0 L 24 % Outage No 28 Oct 2026, 05:53 06:24 0.5 h 69.8 kWh 30.0 L 21 % Outage No Fuel curve Litres an hour = 0.273 × load kW + 0.033 × 640 kW rated. Fuel without a meter is estimated from it. 25 % 50 % 75 % 100 % 0 L 50 L 100 L 150 L 200 L 25 %: 64.8 L/h 50 %: 108.5 L/h 75 %: 152.2 L/h 100 %: 195.8 L/h Fuel price What a litre costs in the plan and the fuel-cost figures. Rs 382.25/L Hsd · OGRA · read 6 Nov 2026 OGRA daily HSD notifications as reported by APP, Dawn and Business Recorder Secondary source Where it comes from Policy Gridlytics never starts or stops the genset itself: it asks, with a reason, and records whether the advice was followed. Start control at this site: auto on grid loss. Fuel log Fills and dips as they happen; they check the curve's estimates. The tank holds 4,000 L. Litres Cost (Rs, optional) Day Note (optional) Log fuel Fuel logged Newest first, as logged above. No fuel logged yet. 0 L",
+  "a11yTree": null
+}

@@ -1,0 +1,55 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/6d4db49bf87e/forecasts",
+  "url": "http://127.0.0.1:5295/sites/6d4db49bf87e/forecasts",
+  "signedIn": true,
+  "loadMs": 2375,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Faisalabad textile mill (demo)",
+    "H2: Forecasts",
+    "H2: What the optimiser believes",
+    "H2: Solar (PV)",
+    "H2: Load",
+    "H2: Outage",
+    "H2: Daily scores"
+  ],
+  "buttons": [
+    "Faisalabad textile mill (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "Refresh forecasts",
+    "Grid down (chance)",
+    "Outage starts (chance)"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Faisalabad textile mill (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Advisory (slot tables) Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Faisalabad textile mill (demo) Forecasts Faisalabad textile mill (demo) DEMO Advisory (slot tables) Following plan (table applied) Faisalabad FESCO · B-2(b) Last data: 9 min ago Forecasts What the optimiser believes Forecasts are issued every 15 minutes for the next 48 hours; each kind learns the site at its own pace. Refresh forecasts Solar (PV) Stage 1 Built learnt from this site's own output. Load Stage 1 Built learnt from this site's own load. Outage Stage 1 Built learnt from this feeder's own outages. Solar (PV) kW over the next 48 hours: the median, the middle half and the 5 to 95 % range; the dashed grey line is the model's nominal clear sky; a plant fitted above it can be forecast above the line, never above the inverter's AC rating. Stage 1 Middle half (25 to 75 %) 5 to 95 % Median Clear sky Issued 17:15, 8 min ago · model v1.0 · performance ratio 1.00 No actuals yet for this issue: they appear as dots as the 15-minute steps pass. nRMSE, last 7 days 8.7 % 12 days scored · lower is better nRMSE, last 30 days 9.0 % 12 days scored Load kW over the next 48 hours: the median, the middle half and the 5 to 95 % range; the dashed line is the critical load kept in an outage. Stage 1 Middle half (25 to 75 %) 5 to 95 % Median Critical load Issued 17:15, 8 min ago · model v1.0 No actuals yet for this issue: they appear as dots as the 15-minute steps pass. nRMSE, last 7 days 29.0 % 12 days scored · lower is better nRMSE, last 30 days 30.4 % 12 days scored Outage The chance the grid is down in each step and the chance an outage starts in it; shaded where the grid was down. Stage 1 Grid down (chance) Outage starts (chance) Highest chance in 48 hours 87 % Typical length 105 min Schedule adherence 83 % Issued 17:15, 8 min ago · model v1.0 Brier score, last 7 days 0.060 12 days scored · lower is better Brier score, last 30 days 0.054 12 days scored Daily scores Each day's forecast, issued before local midnight, scored against what happened: nRMSE for PV and load, the Brier score for outages. Lower is better. Forecast scores by day Day Load nRMSE Outage Brier score Solar (PV) nRMSE 8 Nov 2026 5.7 % baseline 5.6 % 0.057 baseline 0.052 14.9 % 7 Nov 2026 43.3 % baseline 22.7 % 0.078 baseline 0.076 20.9 % 6 Nov 2026 37.2 % baseline 7.7 % 0.097 baseline 0.024 2.2 % 5 Nov 2026 32.8 % baseline 22.7 % 0.043 baseline 0.045 2.5 % 4 Nov 2026 37.0 % baseline 16.6 % 0.025 baseline 0.025 5.6 % 3 Nov 2026 33.4 % baseline 35.4 % 0.009 baseline 0.005 6.6 % 2 Nov 2026 13.6 % baseline 39.7 % 0.113 baseline 0.128 8.2 % 1 Nov 2026 4.5 % baseline 1.",
+  "a11yTree": null
+}

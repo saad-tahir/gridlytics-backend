@@ -1,0 +1,42 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/47895916bed4/outages",
+  "url": "http://127.0.0.1:5295/sites/47895916bed4/outages",
+  "signedIn": true,
+  "loadMs": 2257,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Rahim Yar Khan farm (demo)",
+    "H2: Outages"
+  ],
+  "buttons": [
+    "Rahim Yar Khan farm (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Rahim Yar Khan farm (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Advisory (slot tables) Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Rahim Yar Khan farm (demo) Outages Rahim Yar Khan farm (demo) DEMO Advisory (slot tables) Following plan (table applied) Rahim Yar Khan No DISCO · Off-grid Last data: 11 min ago Outages This site has no grid connection (off grid), so there are no feeder outages to track. The genset and battery pages carry the site; if it does have a grid connection, add it in Site settings.",
+  "a11yTree": null
+}

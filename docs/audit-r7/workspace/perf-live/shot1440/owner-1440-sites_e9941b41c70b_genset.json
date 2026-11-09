@@ -1,0 +1,64 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/e9941b41c70b/genset",
+  "url": "http://127.0.0.1:5295/sites/e9941b41c70b/genset",
+  "signedIn": true,
+  "loadMs": 2321,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Karachi feed mill (demo)",
+    "H2: Genset",
+    "H2: Advice",
+    "H3: Requests",
+    "H3: The plan's next runs",
+    "H2: Runs",
+    "H2: Fuel curve",
+    "H2: Fuel price",
+    "H2: Policy",
+    "H2: Fuel log",
+    "H2: Fuel logged"
+  ],
+  "buttons": [
+    "Karachi feed mill (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "Log fuel"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [
+    "Rs 0",
+    "Rs 4,200",
+    "Rs 4,200",
+    "Rs,"
+  ],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Karachi feed mill (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Closed loop Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Karachi feed mill (demo) Genset Karachi feed mill (demo) DEMO Closed loop Following plan Karachi K-Electric · B-3 Last data: 10 min ago Genset Run hours, 14 days 0.0 h 0 starts Fuel, 14 days 0.0 MMBtu Estimated from the fuel curve Starts 0 over 14 days Average load – of 1,000 kW rated Fuel cost, 14 days Rs 0 MMBtu × Rs 4,200.00/MMBtu, price of 6 Nov 2026 Advice A request arrives up to two hours before each run the plan wants; answer it so the savings count what really happened. Requests No requests. The next one comes before the plan's next run. The plan's next runs The plan does not ask for the genset in the next 48 hours. Runs The last 14 days, newest first, in Karachi time. No runs in this period. A missing genset signal reads as unknown, not as off. Fuel curve MMBtu an hour = 0.009 × load kW + 0.001 × 1,000 kW rated. Fuel without a meter is estimated from it. 25 % 50 % 75 % 100 % 0MMBtu 3MMBtu 6MMBtu 9MMBtu 12MMBtu 25 %: 3.1 MMBtu/h 50 %: 5.3 MMBtu/h 75 %: 7.4 MMBtu/h 100 %: 9.5 MMBtu/h Fuel price What an MMBtu costs in the plan and the fuel-cost figures. Rs 4,200.00/MMBtu Gas captive · OGRA · read 6 Nov 2026 Captive gas: placeholder Rs per MMBtu, enter the site's contract price Unverified source Where it comes from Policy Gridlytics never starts or stops the genset itself: it asks, with a reason, and records whether the advice was followed. Start control at this site: manual. Fuel log Fills and dips as they happen; they check the curve's estimates. Litres Cost (Rs, optional) Day Note (optional) Log fuel Fuel logged Newest first, as logged above. No fuel logged yet. 0 MMBtu",
+  "a11yTree": null
+}

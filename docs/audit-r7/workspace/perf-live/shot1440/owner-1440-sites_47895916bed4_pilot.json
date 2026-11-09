@@ -1,0 +1,52 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/47895916bed4/pilot",
+  "url": "http://127.0.0.1:5295/sites/47895916bed4/pilot",
+  "signedIn": true,
+  "loadMs": 2260,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Rahim Yar Khan farm (demo)",
+    "H2: Pilot set-up",
+    "H2: A. Baseline window"
+  ],
+  "buttons": [
+    "Rahim Yar Khan farm (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "A Baseline window",
+    "B Native-mode capture",
+    "C Switchback calendar",
+    "D Success criteria",
+    "R Review and start",
+    "Save the baseline window",
+    "Previous",
+    "Next"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Rahim Yar Khan farm (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Advisory (slot tables) Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Rahim Yar Khan farm (demo) Pilot set-up Rahim Yar Khan farm (demo) DEMO Advisory (slot tables) Following plan (table applied) Rahim Yar Khan No DISCO · Off-grid Last data: 11 min ago Pilot set-up Pre-register the pilot: the baseline window, the inverter's own settings, the switchback calendar and the gates it is judged by, signed off before it starts. Not started A Baseline window B Native-mode capture C Switchback calendar D Success criteria R Review and start A. Baseline window Days on the inverter's native settings before the switchback starts: the reference both methods are read against. First day Days 14 is the default; 7 to 90 No baseline window chosen yet. Save the baseline window Previous Next",
+  "a11yTree": null
+}

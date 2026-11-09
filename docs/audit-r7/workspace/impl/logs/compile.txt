@@ -1,0 +1,15 @@
+alerts-reports backend-compile=ok
+auth-security backend-compile=ok
+control-edge backend-compile=ok
+delivery-twin backend-compile=ok
+demo-seed backend-compile=ok
+fleet-overview backend-compile=ok
+forecasts-outages backend-compile=ok
+founder-console backend-compile=ok
+optimiser-plans backend-compile=ok
+savings-engine backend-compile=ok
+shell-nav backend-compile=ok
+sites-onboarding backend-compile=ok
+tariffs backend-compile=ok
+telemetry-genset-battery backend-compile=ok
+ui-charts-a11y backend-compile=ok

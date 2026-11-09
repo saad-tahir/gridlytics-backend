@@ -1,0 +1,66 @@
+{
+  "role": "owner",
+  "width": 1440,
+  "path": "/sites/e9941b41c70b/battery",
+  "url": "http://127.0.0.1:5295/sites/e9941b41c70b/battery",
+  "signedIn": true,
+  "loadMs": 2375,
+  "console": [
+    "warning: No `HydrateFallback` element provided to render during initial hydration"
+  ],
+  "pageErrors": [],
+  "failedRequests": [],
+  "api4xx": [],
+  "api5xx": [],
+  "title": "Gridlytics",
+  "overflowX": false,
+  "scrollWidth": 1440,
+  "headings": [
+    "H1: Karachi feed mill (demo)",
+    "H2: Battery",
+    "H2: State of charge",
+    "H2: Daily cycles",
+    "H2: Trust in the estimate",
+    "H2: Pack",
+    "H2: Limits",
+    "H2: Economics"
+  ],
+  "buttons": [
+    "Karachi feed mill (demo)",
+    "Sign out",
+    "Open the menu",
+    "Your account",
+    "Fold",
+    "SoC (estimated)",
+    "SoC (BMS)",
+    "Plan: SoC",
+    "Reserve",
+    "Battery power"
+  ],
+  "unlabeledInputs": [],
+  "landmarks": [
+    "ASIDE",
+    "NAV[Main]",
+    "HEADER",
+    "MAIN",
+    "NAV[Breadcrumbs]",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "HEADER",
+    "NAV[Short menu]"
+  ],
+  "moneyWords": [
+    "Rs 32,992",
+    "Rs 10",
+    "Rs 52,000",
+    "Rs 10",
+    "Rs 32,992",
+    "Rs 52,000"
+  ],
+  "bannedWords": [],
+  "textSample": "Gridlytics FLEET Fleet Alerts 6 Reports SITE Karachi feed mill (demo) Overview Plan Telemetry Forecasts Outages Battery Genset Savings Devices and data Devices and control Site settings Add a site COMPANY Tariffs Pilot set-up Settings Members Demo Owner Sign out Closed loop Administrator 6 DEMO A simulated twin site: every figure is illustrative and dated, and it is left out of your real KPIs and reports. Fold Fleet Karachi feed mill (demo) Battery Karachi feed mill (demo) DEMO Closed loop Following plan Karachi K-Electric · B-3 Last data: 10 min ago Battery State of charge (estimated) 83.7 % BMS 83.2 % · ± 12.4 points · trust 67 % Usable energy 233 kWh above the 10 % floor, less two sigma State of health 100 % 500 kWh nominal Cycles, 30 days 6.1 0.39 a day · cap 1.5 a day Throughput, 30 days 3,045 kWh energy discharged Hot and full, 24 hours 0.0 h above 90 % charge and 35 °C Wear, 30 days Rs 32,992 throughput × Rs 10.83/kWh per kWh discharged, to 9 Nov 2026 State of charge Solid lines are the last 48 hours (estimate and BMS); dashed lines are the plan's next 48 hours, with the outage reserve in red. SoC (estimated) SoC (BMS) Plan: SoC Reserve Battery power Daily cycles Energy discharged each day as a share of the nameplate, against the site's cycle cap. Sun 25 Oct Wed 28 Oct Sat 31 Oct Tue 3 Nov Thu 5 Nov Mon 9 Nov 0 0.45 0.9 1.35 1.7249999999999999 Cap 1.5/day Trust in the estimate The estimate follows the energy in and out between anchors (a full charge or the floor), with the BMS as a check. Trust 67 % Estimate and BMS 83.7 % / 83.2 % Uncertainty (one sigma) ± 12.4 points Last anchor 41 h ago Last reading 11 min ago Pack As entered for the site; the plan works within these figures. Nameplate 500 kWh State of health 100 % Charge and discharge power 250 kW / 250 kW Efficiency, charge and discharge 95 % / 95 % State-of-charge window 10 % to 95 % Warranty 6,000 cycles at 80 % depth Replacement cost Rs 52,000 per kWh Temperature, last reading 31.6 °C Limits What the plan never crosses. Floor and ceiling 10 % to 95 % Charge and discharge power 250 kW / 250 kW Cycle cap 1.5 cycles a day Outage reserve now 87 % Held back for a likely outage; above 100 % means the battery alone cannot carry it. Change the limits in Site settings. Economics The wear price the optimiser weighs against every saving. Wear price Rs 10.83/kWh Replacement cost ÷ (warranted cycles × depth), per kWh discharged. Wear, last 30 days Rs 32,992 Throughput 3,045 kWh × the wear price; computed 9 Nov 2026. Replacement cost Rs 52,000 per kWh 0",
+  "a11yTree": null
+}

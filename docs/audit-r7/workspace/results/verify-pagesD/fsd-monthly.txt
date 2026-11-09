@@ -1,0 +1,87 @@
+    Monthly savings report: Faisalabad textile mill (demo)
+01 November 2026 to 30 November 2026. FESCO B-2(b), none. Generated 09 Nov 2026 05:33 PKT by
+Gridlytics.
+
+Preliminary. Fewer than 28 verified days, the month is not over, or a fuel adjustment of the period is not yet
+billed.
+
+
+Headline
+ Against                                                        Saving    Claimed (applied days)          Diesel saved     Verified days
+
+ The inverter's own settings (native capture)                  Rs 1,900                   Rs 1,901                    0L              1
+
+ The best static table (tuned baseline)                       -Rs 1,919                     Rs 458                    0L              1
+
+
+
+
+Ledger by lever, against the native capture
+ Lever                                                                                                     Rupees
+
+ Peak-window import avoided                                                                                   Rs 0
+
+ Off-peak energy (charging)                                                                               -Rs 4,149
+
+ Export credit                                                                                                Rs 0
+
+ Genset fuel and running cost                                                                                 Rs 0
+
+ Battery wear                                                                                              Rs 1,666
+
+ Carry-over (stored energy at day end)                                                                     Rs 4,383
+
+ Maximum demand (MDI)                                                                                         Rs 0
+
+ Perfect foresight (not achievable, for reference)                                                        Rs 40,464
+
+Method: Counterfactual replay at 1-minute resolution against the native capture and a tuned table, priced on the
+bearable-cost basis (recoverable GST and adjustable s.235 excluded), with the dated fuel price and the same
+wear charge on both arms.
+
+Energy
+ Quantity                                                                                   Month
+
+ Grid import                                                                         27,546 kWh
+
+ Grid export                                                                                0 kWh
+
+ Solar                                                                                   8,691 kWh
+
+ Load                                                                                36,355 kWh
+
+ Genset                                                                           308 kWh, 4.7 h
+
+ Outage time                                                                                15.1 h
+
+ Unserved critical load                                                                    1.9 kWh
+
+ Peak 30-minute import                                                                    326.3 kW
+
+
+
+
+Daily rows
+ Day             Import kWh       Solar kWh     Outage h   Genset h   Saving vs native         Fidelity
+
+ 2026-11-01               1,229       1,016          0.0        0.0              Rs 0      native_block
+
+ 2026-11-02               4,375       1,102          1.5        1.2              -Rs 0     native_block
+ 2026-11-03       4,197       1,121       1.9        0.0             Rs 0   native_block
+
+ 2026-11-04       3,876       1,344       2.3        0.0            -Rs 0   native_block
+
+ 2026-11-05       4,119       1,208       2.7        0.5            -Rs 0   native_block
+
+ 2026-11-06       3,852       1,206       2.2        0.0             Rs 0   native_block
+
+ 2026-11-07       3,769        814        3.4        3.0             Rs 0   native_block
+
+ 2026-11-08       1,570        879        1.1        0.0         Rs 1,901     confirmed
+
+ 2026-11-09         558          0        0.0        0.0                -              -
+
+
+Native capture version 1; tariff versions as dated in the CSV annex. Figures are measured against a replay of the
+inverter's own settings on the same day's sun, load and outages.
+

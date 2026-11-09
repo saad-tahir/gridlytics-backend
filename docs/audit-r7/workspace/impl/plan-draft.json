@@ -1,0 +1,1852 @@
+{
+ "wps": [
+  {
+   "key": "savings-engine",
+   "title": "Savings engine (verify.py): claims, MDI lever, carry-over, switchback method, baselines",
+   "repos": [
+    "backend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/verify.py",
+    "backend/gridlytics/scheduler.py (nightly: one added month-end re-score call; shared with control-edge)",
+    "backend/tests/test_r7_savings_engine.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Claim integrity: which days claim and what the headline sums",
+     "ids": [
+      "role-owner-02",
+      "engine-savings-02",
+      "engine-savings-06",
+      "pr-review-03",
+      "pr-review-11"
+     ]
+    },
+    {
+     "theme": "MDI lever: selected range, month-to-date, rate per month, month-end re-score",
+     "ids": [
+      "flow-savings-pilot-bill-01",
+      "pages-D-03",
+      "engine-savings-04",
+      "engine-savings-05",
+      "engine-savings-10"
+     ]
+    },
+    {
+     "theme": "Carry-over and switchback method",
+     "ids": [
+      "flow-savings-pilot-bill-03",
+      "engine-savings-08",
+      "brief-vs-build-11",
+      "pr-review-02",
+      "engine-savings-11",
+      "pr-review-04"
+     ]
+    },
+    {
+     "theme": "Baselines, the perfect-foresight bound, metering factor, tests",
+     "ids": [
+      "engine-savings-03",
+      "engine-savings-09",
+      "engine-optimiser-14",
+      "pr-review-09"
+     ]
+    }
+   ],
+   "notes": "Backend only. Stage-2 savings-ui-crosscut shows the new fields, so expose them in the API (per day and in the summary: claimed vs all-days totals, withheld reason, which levers a withheld day keeps, MDI lever's month, provisional flag and rate version, carry-over share, fee basis) and list them in API_CONTRACT/types. Claims: only days whose control was actually in force claim (paused, released, failed plan, offline edge, native block do not); MDI lever priced per month with that month's tariff version, claimed once per billing month and pro rata for a sub-range, never from withheld days, provisional until the month closes, and the month re-scored at its end or after late data (nightly job in scheduler.py, shared with control-edge: add one call). Carry-over: chain only through claiming periods, price native blocks' hand-over too, address HANDOFF 8.A.1 (done when the per-day ledger tracks the continuous replay within about Rs 1k over 11 days for several seeds), re-scoring marks/limits changes to closed months with an audit line, legacy rows flagged. Switchback result: Preliminary until the minimum days per arm, counterfactual agreement check (15 %/Rs 300). Tuned baseline gets the HOMER cycle-charging rule at genset sites; perfect-foresight bound includes unserved and MDI terms and refuses time-limited solves; metering factor (VER-13) fitted from entered bills vs CT energy and applied to both arms with an out-of-band flag. Every money change gets a golden test. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "pilot",
+   "title": "Pilot set-up and switchback calendar (pilot routes + features/pilot)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/routes_savings.py (pilot_get, pilot_put, pilot_start, pilot_ics, switchback, switchback_paint only)",
+    "backend/gridlytics/schemas.py (shared additive)",
+    "frontend/src/features/pilot/",
+    "backend/tests/test_r7_pilot.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Pilot record integrity: request model, start, sign-off, pinned baseline, amendments",
+     "ids": [
+      "pages-D-04",
+      "flow-savings-pilot-bill-09",
+      "flow-savings-pilot-bill-12",
+      "flow-savings-pilot-bill-30",
+      "pages-D-17",
+      "pages-D-19"
+     ]
+    },
+    {
+     "theme": "Pilot start gates and switchback calendar rules and export",
+     "ids": [
+      "flow-savings-pilot-bill-11",
+      "pages-D-11",
+      "security-roles-06",
+      "flow-savings-pilot-bill-25",
+      "flow-savings-pilot-bill-24",
+      "role-operator-18",
+      "security-roles-14"
+     ]
+    }
+   ],
+   "notes": "Edit only the pilot/switchback functions of routes_savings.py (bills are tariffs', savings/export/recompute are stage-2 savings-ui-crosscut's). PUT /pilot gets a request model (schemas.py) with sign-off and amendments server-owned; a second POST /pilot/start is refused; the native capture version is pinned at start and a new capture after start needs an amendment; amendments keep reason, old and new values and write an audit row; amendments shown on Savings is a one-line link the stage-2 WP can finish. Start gates: tier at least advisory for switchback, baseline window present with a data-completeness check, calendar not in the past, rule checks (incl. holiday closures) must pass, and the tab shows red when they fail. Calendar: server-side seed that cannot be re-rolled or backdated once locked, 3-day blocks only where allowed, correct word for pairs, correct month labels, page refreshes after 409 calendar_locked; .ics escapes text (no CRLF injection), has DTSTAMP and a file name. Pilot success-criteria scoring (pages-D-12) is in stage 2 because it needs the engine's KPIs. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "tariffs",
+   "title": "Tariffs: price vector, bill rebuild and comparison, goldens, Tariffs page",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/tariffs.py",
+    "backend/gridlytics/tariff_data.py",
+    "backend/gridlytics/routes_tariffs.py",
+    "backend/gridlytics/routes_savings.py (bills, bill_add only)",
+    "backend/gridlytics/plans.py (Punjab-duty line in build_problem only; shared with optimiser-plans)",
+    "frontend/src/features/tariffs/",
+    "frontend/src/features/savings/bills-panel.tsx",
+    "frontend/src/features/savings/bill-dialog.tsx",
+    "backend/tests/test_r7_tariffs_golden.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Price vector correctness",
+     "ids": [
+      "flow-onboarding-01",
+      "engine-tariffs-03",
+      "engine-tariffs-04",
+      "engine-tariffs-11",
+      "engine-tariffs-12",
+      "engine-tariffs-09"
+     ]
+    },
+    {
+     "theme": "Bill rebuild and bill comparison",
+     "ids": [
+      "engine-tariffs-01",
+      "engine-tariffs-02",
+      "engine-tariffs-08",
+      "pages-D-10",
+      "flow-savings-pilot-bill-08",
+      "engine-tariffs-10",
+      "flow-savings-pilot-bill-23"
+     ]
+    },
+    {
+     "theme": "Golden bills, schedule expiry, Tariffs page",
+     "ids": [
+      "engine-tariffs-07",
+      "engine-tariffs-06",
+      "brief-vs-build-18",
+      "role-owner-25",
+      "role-operator-22",
+      "role-viewer-21"
+     ]
+    }
+   ],
+   "notes": "Price vector: export credit only inside an agreement's dates, every FCA line (not only key 'fca') with its negative-FCA exemption, legacy net-metering surplus at the NAPPP rate from the source, DSS 43 paisa for D-2, TOU calendar versions must cover each month exactly once, Punjab self-generation duty from the connection's province in the tariff data instead of the latitude rule in plans.build_problem (one line in plans.py, shared with optimiser-plans; expose a helper so the ledger can use it \u2014 the verify.py call is a one-line addition, keep it minimal because savings-engine edits verify.py). Bill rebuild: each day priced with the versions in force that day, excess export credit carried forward, missing bill steps (PF penalty, Punjab per-unit grid duty, extra tax, credit-before-tax), ICP pro rata at legacy sites, gaps not counted as zero import (fill from profile as the page says, or withhold the 2 % verdict below a completeness threshold), printed peak/off-peak units and MDI compared line by line, overlapping bills refused, a bill can be corrected or deleted, fixed-charge line adds up. Hand-worked golden bills to the paisa with their sources (tracker TAR-01..06). Flag a passed 'awaiting notification' schedule after 1 Jan 2027 and add a tariff-staleness/regime-expiry check (brief-vs-build-18: no scraping of NEPRA/OGRA; if an alert rule is needed add it as a separate function in alerts.py, shared with alerts-reports). Tariffs page: readable labels, duty table fits, no developer note or inert date picker for a viewer. The UI-03 editor stays deferred. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "delivery-twin",
+   "title": "Delivery compile, vendor tables and the twin (delivery.py compile half, twin.py)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/delivery.py (BRANDS, grid_charging, step_intents, compile_mode_a, _intent_words, vendor_view, _mode_b_floor, mode_b)",
+    "backend/gridlytics/twin.py (all but the per-day truth boundary, which demo-seed fixes)",
+    "backend/gridlytics/routes_plans.py (plan_compare only)",
+    "frontend/src/features/devices/vendor-table.tsx",
+    "frontend/src/features/plan/compare-drawer.tsx",
+    "backend/tests/test_r7_delivery.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Vendor table content: charge targets, MDI cap, per-brand layouts",
+     "ids": [
+      "role-operator-02",
+      "pages-B-03",
+      "pages-B-04",
+      "pages-B-05",
+      "engine-delivery-07",
+      "flow-telemetry-plan-control-18",
+      "flow-onboarding-23"
+     ]
+    },
+    {
+     "theme": "Mode A compile: slot reduction, safe tail, fallback block",
+     "ids": [
+      "engine-delivery-04",
+      "engine-delivery-08",
+      "pages-B-13",
+      "brief-vs-build-07"
+     ]
+    },
+    {
+     "theme": "Twin fidelity",
+     "ids": [
+      "engine-delivery-15",
+      "engine-delivery-16",
+      "engine-delivery-19",
+      "engine-delivery-20",
+      "engine-delivery-21"
+     ]
+    },
+    {
+     "theme": "Mode B execution and compare with native",
+     "ids": [
+      "engine-delivery-17",
+      "flow-telemetry-plan-control-04",
+      "pages-B-14",
+      "engine-plans-live-10"
+     ]
+    }
+   ],
+   "notes": "Vendor view shows the slot's target SoC (not the floor) and carries grid_cap_w where the brand can take it; where it cannot, flag mdi_not_enforceable and make the twin not peak-shave that brand. Per-brand layouts and grammar: Huawei (valid periods, no 'hold', SoC targets, global cut-off and floor registers), Deye (6-program ring fully specified, sell flag, self-use not keyed as power 0), Growatt 3+3 windows (fix the contradicting grammar text), Sungrow 2 slots, Voltronic, Solis, other. Compile: re-merge adjacent same-mode runs after the slot-count reduction so a planned charge/discharge is not dropped (the twin-priced boundary ranking of HANDOFF 8.A.2 is a separate design and stays out); whole-table safety for a table that persists past today (safe tail); fallback block without a revert timer, with native_settings_ref and max_export_w_floor; simulate expiry and link loss in the twin with tests. Twin: honours max_charge_kw in the native replay, charge_end_ts, export without booking battery energy as curtailed PV, brand profiles (TWN-02), and executes Mode B setpoints for Mode B sites. Compare with native: include the plan's genset runs (the off-grid farm), say when the baseline is an assumed self-use one, and show what the reserve is worth. GEN_CHARGE_SUPPORTED in delivery.py is optimiser-plans' to change; the signing and message-model half of delivery.py is control-edge's. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "control-edge",
+   "title": "Control and edge: what reaches the device, control actions, advisory budget, edge protocol, keys",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/routes_plans.py (all but plan_compare)",
+    "backend/gridlytics/routes_edge.py",
+    "backend/gridlytics/scheduler.py (shared with savings-engine)",
+    "backend/gridlytics/delivery.py (from _key_dir on: keys, canonical, sign, verify, message models)",
+    "backend/gridlytics/plans.py (_guard, current, held_info, control_release, _released_at, active_at, now_and_next, mark_applied, applied_rows, _no_money, _record_send, _release_message, signed_message, publish step of tick)",
+    "frontend/src/features/devices/ (control-page, control-actions, control-cards, capabilities-card, edge-card, mark-applied, overrides-list)",
+    "frontend/src/features/plan/plan-held.tsx",
+    "frontend/src/features/plan/plan-history.tsx",
+    "frontend/src/features/plan/overrides-panel.tsx",
+    "backend/tests/test_r7_control_edge.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "What reaches the device: tier gating, wrong-plan guard, expiry, switchback native days",
+     "ids": [
+      "flow-telemetry-plan-control-03",
+      "engine-delivery-01",
+      "engine-savings-01",
+      "engine-plans-live-05",
+      "engine-delivery-24"
+     ]
+    },
+    {
+     "theme": "Edge protocol: sequence numbers, contract, acks, heartbeat actions",
+     "ids": [
+      "engine-delivery-03",
+      "engine-delivery-11",
+      "engine-delivery-12",
+      "engine-delivery-10",
+      "brief-vs-build-12"
+     ]
+    },
+    {
+     "theme": "Control actions: validation, immediacy, held state wording",
+     "ids": [
+      "pages-B-01",
+      "flow-telemetry-plan-control-15",
+      "pages-B-15",
+      "flow-telemetry-plan-control-21",
+      "flow-telemetry-plan-control-22",
+      "role-owner-36"
+     ]
+    },
+    {
+     "theme": "Advisory tier: stable daily table, write budget, confirmation",
+     "ids": [
+      "pages-B-02",
+      "pages-B-08",
+      "pages-B-06",
+      "flow-telemetry-plan-control-19"
+     ]
+    },
+    {
+     "theme": "Control page: overrides UI, closed-loop panel, event re-solves",
+     "ids": [
+      "flow-telemetry-plan-control-17",
+      "role-operator-11",
+      "brief-vs-build-15",
+      "frontend-states-formats-16"
+     ]
+    },
+    {
+     "theme": "Edge message hardening and signing keys",
+     "ids": [
+      "engine-delivery-13",
+      "security-roles-11",
+      "engine-delivery-22",
+      "engine-delivery-23"
+     ]
+    }
+   ],
+   "notes": "A monitor-tier site's edge gets no actionable plan; the wrong-plan guard can actually refuse (and checks the MDI cap); plans past valid_until are not current or served; on switchback native-block days the live tick sends release-to-native (the demo twin already does). Control actions take request models (validation before any float(), before the permission check cannot 500), hold/pause/release/resume take effect at once (re-send/re-solve now), wording matches the stored held state, the Versions list does not badge a paused plan Active, the releasing operator may resume, monitor tier shows no Pause writes or write counter. Advisory tier: one stable daily table compiled at a fixed time and re-issued only within the 3-4 a day write budget, counted on Karachi dates from real table changes and 'Mark as applied' (not edge pulls), the page records which table was keyed, and a same-day 'it took / it did not take' card plus Test fallback and Share as text. Edge: sequence per stream with reset handling, the U3 contract (envelope fields, event names, partial acks, heartbeat states, telemetry shape) plus an exported JSON-schema set, export script and drift test (brief-vs-build-12), act on rejected/partial acks, control_disabled, firmware_change and heartbeat state, real clock-offset actions, bounded message models, event re-solves for genset start/stop, forecast busts and tariff changes. Keys: path under the data folder, never silently regenerated, created 0600 (os.open mode), included in backups (one added path in backups.py, founder-console's file); canonical JSON a non-Python edge can reproduce, with test vectors. UI: place force charge, genset hold, charge block and reserve overrides, show a force charge in the header chip (site-chips.tsx is shell-nav's: one-line change), closed-loop control panel (edge, read-back, ack codes, write log, fallback test), edge card in local time and plain units. Read the plans.py split in owns_files: optimiser-plans owns build_problem and the solve. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "optimiser-plans",
+   "title": "Optimiser and plan building (optimise.py, battery.py, plans.build_problem) and the plan page",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/optimise.py",
+    "backend/gridlytics/battery.py",
+    "backend/gridlytics/plans.py (peak_mask, billing_period, month_to_date, _carried_genset, offgrid_c_next, build_problem, _steps_out, solve step of tick, _plan_time_limited, _status_label, time_limited_recent, _plan_out)",
+    "backend/gridlytics/delivery.py (GEN_CHARGE_SUPPORTED constant only)",
+    "frontend/src/lib/reasons.ts",
+    "frontend/src/features/plan/ (plan-page, plan-header, plan-views, slots-view, reasons-legend, resolve-button, slot-words, use-clock)",
+    "frontend/src/components/charts/slot-table.tsx",
+    "frontend/src/components/charts/plan-gantt.tsx",
+    "frontend/src/components/charts/reason-chip.tsx",
+    "frontend/src/features/sites/onboarding/equipment-checks.ts (new, flow-onboarding-09)",
+    "backend/tests/test_r7_optimiser.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Grid-up load shedding, peak-window buying and reason labels",
+     "ids": [
+      "engine-optimiser-01",
+      "flow-telemetry-plan-control-02",
+      "flow-telemetry-plan-control-08",
+      "engine-plans-live-17"
+     ]
+    },
+    {
+     "theme": "SoC floors, inverter limits and the outage reserve",
+     "ids": [
+      "engine-delivery-02",
+      "engine-plans-live-03",
+      "engine-plans-live-06",
+      "engine-plans-live-12",
+      "flow-onboarding-09",
+      "engine-optimiser-09"
+     ]
+    },
+    {
+     "theme": "Battery state, uncertainty and infeasible starts",
+     "ids": [
+      "engine-plans-live-02",
+      "flow-telemetry-plan-control-09",
+      "engine-optimiser-07",
+      "engine-optimiser-03",
+      "engine-optimiser-04",
+      "brief-vs-build-03",
+      "engine-optimiser-15"
+     ]
+    },
+    {
+     "theme": "MDI month handling and the cost breakdown",
+     "ids": [
+      "engine-optimiser-02",
+      "engine-plans-live-08",
+      "engine-optimiser-12",
+      "engine-optimiser-13",
+      "engine-optimiser-10"
+     ]
+    },
+    {
+     "theme": "Genset and off-grid dispatch",
+     "ids": [
+      "engine-optimiser-05",
+      "engine-optimiser-06",
+      "engine-plans-live-18",
+      "engine-plans-live-15",
+      "engine-optimiser-11",
+      "engine-plans-live-16"
+     ]
+    },
+    {
+     "theme": "Battery life and solve limits: cycle cap, derating, time-limited plans",
+     "ids": [
+      "brief-vs-build-04",
+      "brief-vs-build-05",
+      "engine-optimiser-08",
+      "engine-plans-live-19"
+     ]
+    },
+    {
+     "theme": "Plan page: table flags, slot table a11y, re-solve feedback, slot wording",
+     "ids": [
+      "pages-B-07",
+      "frontend-a11y-04",
+      "frontend-a11y-12",
+      "frontend-states-formats-07",
+      "frontend-a11y-23",
+      "flow-telemetry-plan-control-26"
+     ]
+    }
+   ],
+   "notes": "No load shedding with the grid up (U = L on grid-up steps) and the guard catches it; no grid buying inside the peak window to refill the reserve unless priced and labelled as such; reasons derived from the numbers (no 'likely outage' at 1-3 %, no 'cheaper' in the peak, no 'Wear > saving' next to a peak discharge); grid charge smoothed under the plan's own MDI cap. Plan SoC floor is the higher of BMS soc_min and the floor the delivered table/fallback holds (coordinate the value with delivery-twin's compile); reserve limited by battery discharge and inverter AC power (inverter.kw_ac read by the engine; flow-onboarding-09's form warning goes in the new equipment-checks.ts called with one line from the onboarding tab, because sites-onboarding owns site-form.ts), AMF auto-start covers the reserve instead of a 30-minute full-load battery reserve, 'reserve floor when an outage is likely' setting honoured, no double-charged shortfall. Battery: start below soc_min feasible, out-of-band relaxation only for the start, stale SoC widens sigma, sigma re-anchors at a full charge (fixes the 95 % for 48 h plans; prove Faisalabad/Lahore plans no longer cost more than native), BMS trust score low without an independent estimate, temperature derating (derate/imbalance/capacity_drop rules: add separate functions in alerts.py, shared with alerts-reports), cycle cap applied. MDI: month-start anchoring fixed, 'MDI rise' and cost breakdown itemise M2 instead of 'Not itemised', c_cal_hold as holding cost to the next peak, month_to_date treats missing minutes as unknown. Genset/off-grid: fuel carried between ticks (tank 0 = no tank info, not unlimited), follow cap with gen_charge_allowed False, GEN_CHARGE_SUPPORTED genset charging for the off-grid farm, no simultaneous charge/discharge, no curtailing free PV while the battery has room, genset marginal cost in the grid-tied terminal value. Time limits: a time-limited incumbent with a large gap does not supersede the last plan and the relaxed retry is labelled; surface time_limited_recent on the plan answer/page (the deterministic work limit/idle re-solve of HANDOFF 8.A.3 stays out). Plan page: Flags/override column and past-24-hour actuals in the table view, past slots legible, reason chips not one tab stop each and readable on a phone, re-solve feedback with the guard's reason, all-day slot written as 'all day'. Golden tests for every cost term changed. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "forecasts-outages",
+   "title": "Forecasts and outages (forecast.py, Forecasts and Outages pages)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/forecast.py",
+    "backend/gridlytics/routes_forecasts.py",
+    "backend/gridlytics/solar.py",
+    "backend/gridlytics/routes_telemetry.py (outages, schedule_put, outage_cause only)",
+    "frontend/src/features/forecasts/",
+    "frontend/src/features/outages/",
+    "backend/tests/test_r7_forecast.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "PV fit, scoring and accuracy summary",
+     "ids": [
+      "engine-forecast-01",
+      "engine-forecast-04",
+      "pages-C-22",
+      "pages-C-01",
+      "engine-forecast-03",
+      "engine-forecast-14"
+     ]
+    },
+    {
+     "theme": "Outage model: adherence, gaps, cold start, feeder pooling, refresh",
+     "ids": [
+      "pages-C-02",
+      "engine-forecast-02",
+      "engine-forecast-08",
+      "engine-forecast-12",
+      "brief-vs-build-09",
+      "pages-C-08",
+      "pages-C-21"
+     ]
+    },
+    {
+     "theme": "Load model, holidays, critical load and stages",
+     "ids": [
+      "engine-forecast-05",
+      "engine-forecast-06",
+      "engine-forecast-11",
+      "pages-C-06",
+      "engine-forecast-09",
+      "pages-C-12"
+     ]
+    },
+    {
+     "theme": "Outages page: reserve adequacy, announced windows, calendar heatmap",
+     "ids": [
+      "pages-C-07",
+      "role-analyst-15",
+      "pages-C-10",
+      "pages-C-19"
+     ]
+    },
+    {
+     "theme": "Forecast bands and Forecasts page wording",
+     "ids": [
+      "engine-forecast-16",
+      "pages-C-09",
+      "pages-C-23",
+      "role-owner-21"
+     ]
+    }
+   ],
+   "notes": "The outage functions of routes_telemetry.py are yours; telemetry-genset-battery owns the rest of that file and fixes run/outage segmentation by minutes (pages-C-04) in a shared helper: use it, do not rewrite it. PV: fit on local days and on available power (pv + curtail_w), stage-1 quantiles really scaled, actuals overlay from the start of the window, persistence/smart-persistence skill and more than one horizon class, 'last 7 days' by date, outage chart p_start on the right slot. Outages: adherence updated on local-day windows only; with no schedule show 'no announced schedule' and the prior as a prior, not '80 %'; one outage across a data gap; cold-start prior including scheduled shedding for rural feeders; feeder pooling across sites sharing a feeder (and the model card's hint only when no feeder is set and only to roles that can set it); manual refresh keeps the observed-outage protection and is limited to roles that may run it. Load: critical-load default with a visible warning when zero, accuracy scored on unshed minutes with the same slot set for persistence, no self-reference in the 2-hour ratio, Pakistan public holidays/Eid/Ramadan and site off days (a dated table with its source). Stages: Preliminary until 28 verified days and stage 1; no PV forecast for a site without PV; no outage stage for an off-grid site; stage wording matches the 3-day rule; empirical/conformal bands (FOR-05/07 in a v1 form). The weather feed (FOR-02) is deferred pending the owner's licence: pages-C-09 adds only the 'no weather feed, clear sky x climatology' notice. Outages page: reserve-adequacy KPI and reserve at the start of each outage (computed in a function the stage-2 pilot gates can call), announced-window match with a tolerance, calendar (date x hour) heatmap, announced windows on the probability chart and the 'now' line at now. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "telemetry-genset-battery",
+   "title": "Telemetry/CSV import, genset and battery pages",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/telemetry.py",
+    "backend/gridlytics/routes_telemetry.py (series, days, heatmap, quality, upload, export, battery_page, genset_page, genset_answer, fuel_logs, fuel_log)",
+    "frontend/src/features/telemetry/",
+    "frontend/src/features/genset/",
+    "frontend/src/features/battery/",
+    "frontend/src/features/devices/data-quality-card.tsx",
+    "backend/tests/test_r7_telemetry.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "CSV import integrity",
+     "ids": [
+      "flow-telemetry-plan-control-01",
+      "flow-telemetry-plan-control-10",
+      "flow-telemetry-plan-control-13",
+      "flow-telemetry-plan-control-14",
+      "frontend-states-formats-06",
+      "flow-telemetry-plan-control-24"
+     ]
+    },
+    {
+     "theme": "Genset litres, runs, fuel cost and cards",
+     "ids": [
+      "pages-C-03",
+      "pages-C-04",
+      "pages-C-05",
+      "role-owner-07",
+      "pages-C-15",
+      "pages-C-16",
+      "role-operator-32"
+     ]
+    },
+    {
+     "theme": "CSV mapping, refusals, data quality and series",
+     "ids": [
+      "flow-telemetry-plan-control-12",
+      "role-viewer-07",
+      "flow-telemetry-plan-control-25",
+      "pages-B-11",
+      "pages-B-17"
+     ]
+    },
+    {
+     "theme": "Battery page",
+     "ids": [
+      "role-operator-14",
+      "pages-C-13",
+      "pages-C-14",
+      "role-owner-30",
+      "role-owner-38",
+      "frontend-states-formats-11"
+     ]
+    }
+   ],
+   "notes": "CSV: an upload that overlaps stored minutes merges per column and never erases columns the file does not carry (high, regression test); detect the logger step and store 5/15-minute rows as intervals (energy, peaks and outage minutes right); plausibility checks (W vs kW, SoC 0-100 vs 0-1, negative PV/load) reported per file; a file whose grid_present cells are unreadable is refused or reported; duplicate timestamps reported; Asia/Karachi as the default time zone with an explicit choice; a column/unit/sign mapping step (UI-06, spec 7.5) with format hints for common loggers; the 30 MB sentence reachable (limit check before the API cap). Data quality: today's completeness against elapsed minutes, the same colour thresholds on Telemetry and Devices, every stored series in the picker. Genset: litres metered where metered and estimated from the fuel curve where not (never 0 L and Rs 0 for an unmetered set), runs and outages segmented by minutes so a blank sample does not end a run (shared helper also used by the outage log), 'no run signal' vs 'no runs', fuel priced at the price dated to each run, KPI row per plan (Rs/kWh, hours below minimum load, month), fuel curve with measured points and a refit from the fuel log/data-sheet points, policy card shows the policy, chart axis labels fit. Battery: cycles divided by days with data and labelled, Daily cycles axis formatted with a unit (no '99999'), SoH 'as entered', BMS vs estimated SoC marked, temperature axis and outage hatching, wear rate unit once. The gas-genset unit sweep (MMBtu everywhere) is stage-2's; here make the genset page and fuel log correct. The events route (money filter) is auth-security's; the Economics card role gate in battery-cards.tsx is auth-security's one-line change. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "sites-onboarding",
+   "title": "Sites, onboarding wizard, site settings and native capture",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/sites.py",
+    "backend/gridlytics/routes_sites.py (meta, site CRUD, activate, connection, assets, tier, native, overrides, drafts, prices)",
+    "frontend/src/features/sites/onboarding/ (except the new equipment-checks.ts)",
+    "frontend/src/features/sites/settings/",
+    "frontend/src/features/sites/site-settings-page.tsx",
+    "frontend/src/features/devices/native-capture-form.tsx",
+    "frontend/src/features/devices/native-card.tsx",
+    "frontend/src/features/devices/assets-card.tsx",
+    "backend/tests/test_r7_sites.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Draft resume and save integrity",
+     "ids": [
+      "flow-onboarding-05",
+      "flow-onboarding-06",
+      "flow-onboarding-15",
+      "pages-A-10",
+      "pages-A-15"
+     ]
+    },
+    {
+     "theme": "Server validation, data source tier and activation rules",
+     "ids": [
+      "flow-onboarding-03",
+      "flow-onboarding-07",
+      "flow-onboarding-08",
+      "flow-onboarding-14",
+      "flow-onboarding-18",
+      "role-operator-16"
+     ]
+    },
+    {
+     "theme": "Tariff, connection and location defaults",
+     "ids": [
+      "flow-onboarding-02",
+      "engine-tariffs-05",
+      "flow-onboarding-12",
+      "role-owner-40",
+      "role-operator-30",
+      "flow-onboarding-24"
+     ]
+    },
+    {
+     "theme": "Genset fields, feeder prompt",
+     "ids": [
+      "flow-onboarding-10",
+      "flow-onboarding-11",
+      "flow-onboarding-16",
+      "flow-onboarding-17"
+     ]
+    },
+    {
+     "theme": "Wizard content, edge step and wording",
+     "ids": [
+      "flow-onboarding-22",
+      "flow-onboarding-25",
+      "flow-onboarding-19",
+      "flow-onboarding-20"
+     ]
+    }
+   ],
+   "notes": "Drafts: resuming an older draft must not show stale values as complete or overwrite newer Site-settings changes (version check, 409 with a choice); autosave flushed on navigation; Activate saves pending edits first; Review only after A-D are complete, with 'what happens next' and Preliminary marks; changing the data source kind clears the grid-signal confirmation. Server: tariff category required, data source and confirmed grid signal required to activate (API too), the data source kind sets tier_capable (CSV with inverter mode / OEM cloud can reach advisory) so the wizard's promise holds, native capture slot times validated (00:00-23:59, unique starts) and the slot count per brand from /api/meta, agreement dates and money figures bounded. Defaults: K-Electric gets its own TOU group and no Punjab duty, defaults depend on site kind and DISCO and carry Preliminary marks, tax flags/ICP/Tariff F season editable in wizard and settings, no Lahore pin for another city, kind and DISCO defaults that agree, review prints labels not codes ('CSV'), off-grid for any site kind. Genset: gas/RLNG gets a gas fuel curve, rating in kVA with pf, start method asked after the genset exists, feeder prompt without promising pooled history unless forecasts-outages pools it. Wizard content per plan 9.3 (map pin, live source test, write budget, fallback, grid-charge permission), an edge-device next step and who can make the site key, validation sentences that match their fields. flow-onboarding-09's inverter check is optimiser-plans' (new equipment-checks.ts). Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "fleet-overview",
+   "title": "Fleet and site Overview pages (fleet/now/overview routes)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/routes_sites.py (_snapshot, _mtd_saving, fleet_row, fleet, site_now, overview_chart only)",
+    "frontend/src/features/overview/",
+    "frontend/src/features/sites/fleet-page.tsx",
+    "frontend/src/features/plan/plan-empty.tsx",
+    "frontend/src/components/charts/spark-bars.tsx",
+    "backend/tests/test_r7_fleet.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Activation path, checklists and the month-to-date saving",
+     "ids": [
+      "flow-onboarding-04",
+      "flow-savings-pilot-bill-02",
+      "pages-A-01",
+      "pages-B-12",
+      "pages-A-08"
+     ]
+    },
+    {
+     "theme": "Overview content",
+     "ids": [
+      "role-owner-11",
+      "parity-boxlytics-ui-15",
+      "pages-A-09",
+      "role-owner-31",
+      "frontend-states-formats-14",
+      "frontend-states-formats-15",
+      "frontend-states-formats-18"
+     ]
+    },
+    {
+     "theme": "Fleet table",
+     "ids": [
+      "role-analyst-14",
+      "pages-A-11",
+      "pages-A-17",
+      "role-owner-16",
+      "role-viewer-22",
+      "frontend-a11y-06",
+      "frontend-a11y-21"
+     ]
+    }
+   ],
+   "notes": "Month-to-date saving on Fleet and Overview must equal the Savings page's month figure (MDI lever included): call the same verify summary the Savings route uses, show method and computation date, and test equality (savings-engine changes what is claimed, so do not pin a figure). A created-but-not-activated site: Overview and Plan say it is observing and offer Activate (POST /activate exists) instead of promising a plan every 15 minutes; checklists key off-grid on data.off_grid. Overview: next-12-hours strip built from every step and chips that fit, quick actions and the plan's KPI tiles (PV self-consumed %, battery cycles today, outages covered) and TOU shading, Battery and Genset series on by default where they matter, zero vs missing ('no data' instead of 0.0 h / Rs 0), times with a day for multi-day holds and events up to 48 h ahead (the hold chip text comes from the now/fleet payload you own), readable alert badges. Fleet: sparkline scaled across rows with a noise floor (no full-height bar for paise), not a focusable role=application, viewer gets a kWh/litres substitute with a 'hidden for your role' note, summary strip/filters/Now glyph/empty state per UI-01, stale readings not shown as 'now', open-alerts count consistent with the badges, filter results announced. The off-grid-farm-as-outage sweep and fuel units are stage-2's; the 90-days demo text is demo-seed's. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "alerts-reports",
+   "title": "Alerts and reports",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/alerts.py",
+    "backend/gridlytics/routes_alerts.py",
+    "backend/gridlytics/reports.py",
+    "backend/gridlytics/routes_reports.py",
+    "frontend/src/features/alerts/",
+    "frontend/src/features/reports/",
+    "backend/tests/test_r7_alerts_reports.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Alert rules and role filtering",
+     "ids": [
+      "security-roles-03",
+      "pages-D-14",
+      "pages-D-27",
+      "engine-forecast-10",
+      "pages-D-29"
+     ]
+    },
+    {
+     "theme": "Monthly report content",
+     "ids": [
+      "pages-D-07",
+      "pages-D-08",
+      "engine-savings-13",
+      "pr-review-06",
+      "role-viewer-17",
+      "role-analyst-25"
+     ]
+    },
+    {
+     "theme": "Reports page, access and limits",
+     "ids": [
+      "frontend-states-formats-05",
+      "pages-D-24",
+      "pages-D-25",
+      "security-roles-08",
+      "role-operator-20"
+     ]
+    },
+    {
+     "theme": "Alert actions and wording",
+     "ids": [
+      "pages-C-11",
+      "pages-D-28",
+      "pages-D-16",
+      "role-operator-31",
+      "frontend-states-formats-10"
+     ]
+    }
+   ],
+   "notes": "Viewer gets only energy-category alerts in the inbox and counts (security, regression test). Rules: savings (claim withheld, bill residual), product, genset condition, edge/plan expiry, data gap including a site that never sent data; forecast_bust threshold a real bust can reach (the bust re-solve itself is control-edge's brief-vs-build-15); quiet hours as validated times, thresholds and per-site overrides stored and used by the evaluator \u2014 sending by email/SMS/WhatsApp stays deferred (alert delivery). Actions: acknowledge/close keep each actor and note (history), genset requests answered once and not after withdrawal, regime_expiring says 'ended' for a past agreement, alert titles relative to when they opened, assignee chosen from members. Monthly PDF/CSV: switchback and carry-over, bill comparison, KPI grid, marks on withheld days, 'not metered' instead of 'Diesel saved 0 L', the full Preliminary sentence, warning when chain_stale_days > 0, a company roll-up, files named per site, rounding as on the page, no internal ids/raw enums/ISO dates in backend-written text; take every number from verify's summary (savings-engine changes it), do not recompute. Reports page: no 'first report on the 3rd' promise (schedules UI-14 stay deferred), 'generated by' column and a browser preview, daily sheet for the chosen day from the plan in force that day, the savings report needs export rights (admin/analyst), generation bounded per user (concurrency/rate; add the limiter at the route, ratelimit.py is auth-security's); alerts empty state says alerts are evaluated every 15 minutes. Battery derate/imbalance/capacity_drop rules may be added by optimiser-plans and a tariff-staleness rule by tariffs as separate functions in alerts.py: keep your edits out of those functions. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "auth-security",
+   "title": "Auth, roles, money filter, API keys, passwords and company settings (preassigned accounts only)",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/auth.py",
+    "backend/gridlytics/apikeys.py",
+    "backend/gridlytics/platform.py",
+    "backend/gridlytics/routes_local.py",
+    "backend/gridlytics/routes_platform.py",
+    "backend/gridlytics/routes_common.py",
+    "backend/gridlytics/money.py",
+    "backend/gridlytics/store_members.py",
+    "backend/gridlytics/identity.py",
+    "backend/gridlytics/mfa.py",
+    "backend/gridlytics/ratelimit.py",
+    "backend/gridlytics/routes_telemetry.py (events only)",
+    "frontend/src/features/auth/",
+    "frontend/src/features/org/ (except demo-tab.tsx)",
+    "frontend/src/lib/api/client.ts",
+    "frontend/src/features/battery/battery-cards.tsx (Economics-card role gate only)",
+    "backend/tests/test_role_walk.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Money on the wire",
+     "ids": [
+      "security-roles-01",
+      "security-roles-02",
+      "tracker-and-docs-03",
+      "role-operator-06",
+      "role-viewer-19",
+      "security-roles-16"
+     ]
+    },
+    {
+     "theme": "Passwords, lockout and sessions",
+     "ids": [
+      "pages-A-02",
+      "founder-console-07",
+      "founder-console-08",
+      "security-roles-09",
+      "security-roles-10",
+      "role-analyst-32"
+     ]
+    },
+    {
+     "theme": "Roles, seats and API keys",
+     "ids": [
+      "role-operator-07",
+      "founder-console-06",
+      "security-roles-07",
+      "role-analyst-20",
+      "founder-console-15"
+     ]
+    },
+    {
+     "theme": "Company settings: a11y and audit trail",
+     "ids": [
+      "frontend-a11y-07",
+      "frontend-a11y-16",
+      "frontend-a11y-17",
+      "frontend-a11y-19",
+      "role-owner-23"
+     ]
+    }
+   ],
+   "notes": "Accounts stay preassigned: no Google sign-in and no self-signup. Money: every member-readable route goes through the money filter by default (response hook/decorator in routes_common, not opt-in out()); the events route stops leaking fuel-log cost_rs (high, regression test); a role walk over every GET route (backend/tests/test_role_walk.py, the file the docs cite) for viewer, operator and a sites:read key; the filter keeps non-money figures (litres saved, verified days) for a viewer; operators get no money settings and no battery Economics card (one gate in battery-cards.tsx); a per-member see_costs grant (plan 10.5). Roles: operator cannot create/activate/onboard sites, change control limits or load the demo (plan 9.4/9.6); API key scopes (/plan under plans:read, edge vs partner key kinds enforced); seatless member and member of a switched-off company get their own clear pages; org tabs do not call routes the role is refused and say 'API keys are'. Passwords: a one-time password set by the company administrator (Members) or the founder forces a change at next sign-in and clears the lockout (founder-console-07/08: minimal additions in routes_founder/store_founder, the rest of those files is founder-console's); sign-in hint names who can help; sign-out revokes the access token too; lockout per account as well as per address, with trusted-proxy handling. My account: open sessions with sign-out of others and notification preferences (UI-18); the report-schedules half of role-analyst-32 stays deferred (UI-14). Company settings a11y: selects that write save on an explicit action, the one-time key dialog cannot close by Escape/outside click before copying, unique row-action names and row headers, h1 on sign-in pages, audit Detail in words and local time. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "founder-console",
+   "title": "Founder console, companies and backups",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/founder.py",
+    "backend/gridlytics/routes_founder.py",
+    "backend/gridlytics/store_founder.py",
+    "backend/gridlytics/companies.py",
+    "backend/gridlytics/backups.py",
+    "scripts/restore_backup.py (new, backend repo)",
+    "frontend/src/features/ops/",
+    "backend/tests/test_r7_founder.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Founder session and backups",
+     "ids": [
+      "founder-console-09",
+      "founder-console-01",
+      "security-roles-12",
+      "founder-console-12",
+      "frontend-states-formats-17"
+     ]
+    },
+    {
+     "theme": "Company and user management",
+     "ids": [
+      "founder-console-04",
+      "founder-console-10",
+      "founder-console-05",
+      "founder-console-16",
+      "founder-console-13",
+      "founder-console-18"
+     ]
+    },
+    {
+     "theme": "Console UI and wording",
+     "ids": [
+      "founder-console-02",
+      "founder-console-03",
+      "founder-console-11",
+      "founder-console-14",
+      "founder-console-17",
+      "founder-console-19",
+      "pages-A-07"
+     ]
+    }
+   ],
+   "notes": "Founder sign-out ends the session on the server (token id revoked) and a short GRIDLYTICS_FOUNDER_SESSION_SECRET is refused at start-up (security, regression tests). Backups: a real scripts/restore_backup.py that restores a company's database and telemetry together (and the page names it correctly), list shows names, real sizes and telemetry files, honest frequency for switched-off companies, times shown in local time (naive timestamp bug). Companies/users: company role 'Admin' mapped to the Gridlytics administrator (or removed from the console) with the choice recorded in docs/BACKEND_ASKS.md; disabling a company's only owner warns and counts refresh; Switch-off dialog states that planning stops, edge keys are refused and telemetry is lost; users page shows the current Gridlytics role after a company-role change; archive (not delete) for companies and accounts; drop the lifted 'solarlytics_role' field. Console UI: audit Detail shows before -> after, role/membership selects save on an explicit button with confirmation, remove the unused commercial-plan widgets so 'plan' means dispatch plans, phone layout without sideways-scrolled actions, wording slips fixed, skip link, aria-controls and 'Founder console' in tab titles, the password hint names My account. auth-security adds must_change/lockout-clear to the founder's set-password path and control-edge adds the signing-key folder to the backup copy list: keep those small edits when merging. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "shell-nav",
+   "title": "Web shell: titles, focus, navigation by role/site, header, switcher, shell states",
+   "repos": [
+    "frontend"
+   ],
+   "owns_files": [
+    "frontend/src/components/layout/",
+    "frontend/src/components/gates/",
+    "frontend/src/app/",
+    "frontend/src/stores/",
+    "frontend/src/components/ui/route-error-boundary.tsx"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Titles, focus, skip link, not-found and error pages",
+     "ids": [
+      "frontend-a11y-01",
+      "frontend-a11y-02",
+      "role-owner-19",
+      "frontend-states-formats-22",
+      "role-owner-41"
+     ]
+    },
+    {
+     "theme": "Navigation by role and site",
+     "ids": [
+      "pages-A-05",
+      "pages-A-13",
+      "role-owner-34",
+      "pages-C-18",
+      "pages-A-14",
+      "role-owner-33"
+     ]
+    },
+    {
+     "theme": "Site header, switcher and shell states",
+     "ids": [
+      "pages-A-03",
+      "pages-A-12",
+      "frontend-states-formats-13",
+      "frontend-a11y-20",
+      "role-viewer-25",
+      "frontend-a11y-22"
+     ]
+    }
+   ],
+   "notes": "Titles 'Page - Site - Gridlytics' from route handles and focus moved to the page heading on navigation; skip link; not-found pages with a heading and a way back and no live site links for an unknown site; route error boundary shows a plain sentence (details behind a toggle); HydrateFallback added. Navigation: a viewer sees only the energy pages, Outages hidden for off-grid sites, Pilot set-up listed under the site, distinct names for 'Devices and data' and 'Devices and control', one active item on /settings vs ?view=members, no tier chip and no site bottom bar on company pages (Fleet, Tariffs, Add a site), and none carried into a newly created site. Header: a grid site without a saved connection reads 'Grid connection not saved', not 'Off-grid' (put the helper where fleet-page can call it; one-line change there); the hold/force-charge chip text comes from the API (control-edge may add one line in site-chips.tsx); site switcher with state dot, last-data age and search; loading/failed shell queries not shown as empty; current page in the phone menu not by colour alone; 44 px tap targets and a cue on cut-off tab strips at 375 px; error toasts persist until dismissed (providers). parity-ui (stage 3) restyles these files later: keep changes functional and token-based. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "ui-charts-a11y",
+   "title": "Shared UI, charts, wizard and formats: contrast, axes, tables, heatmaps",
+   "repos": [
+    "frontend"
+   ],
+   "owns_files": [
+    "frontend/src/components/ui/ (except route-error-boundary.tsx)",
+    "frontend/src/components/workflow/",
+    "frontend/src/components/charts/time-series-chart.tsx",
+    "frontend/src/components/charts/fan-chart.tsx",
+    "frontend/src/components/charts/heatmap-grid.tsx",
+    "frontend/src/components/charts/energy-flow.tsx",
+    "frontend/src/components/charts/use-echarts.ts",
+    "frontend/src/components/charts/echarts-setup.ts",
+    "frontend/src/lib/format.ts (shared additive)",
+    "frontend/src/lib/time.ts (shared additive)",
+    "frontend/src/lib/colors.ts",
+    "frontend/src/styles/index.css"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Contrast and form controls",
+     "ids": [
+      "frontend-a11y-03",
+      "frontend-a11y-14",
+      "frontend-a11y-15",
+      "frontend-a11y-11",
+      "role-operator-28"
+     ]
+    },
+    {
+     "theme": "Charts: time axes, units, text alternatives",
+     "ids": [
+      "frontend-states-formats-04",
+      "frontend-a11y-05",
+      "role-viewer-13",
+      "role-owner-22",
+      "frontend-a11y-18",
+      "role-owner-29"
+     ]
+    },
+    {
+     "theme": "Tables, heatmaps and KPI tiles",
+     "ids": [
+      "role-operator-09",
+      "role-operator-21",
+      "role-owner-28",
+      "role-owner-39",
+      "frontend-states-formats-23"
+     ]
+    },
+    {
+     "theme": "Lettered wizard",
+     "ids": [
+      "frontend-a11y-09",
+      "frontend-a11y-10",
+      "frontend-states-formats-21",
+      "flow-onboarding-21"
+     ]
+    }
+   ],
+   "notes": "Contrast with the current tokens: muted text >= 4.5:1 on page, table headers and selected cards; control borders and chart/strip colours >= 3:1; EnergyFlow labels readable; Segmented gets arrow keys and roving tabindex; native date inputs replaced or paired with a written date (9 Nov 2026). Charts: multi-day axes show the day at day boundaries in Asia/Karachi (not the browser zone), tooltips carry units, the unit label does not collide with the 'now' label, a data-table or summary text alternative per chart, aria only on elements with a role, demo ribbon toggle with state, the offline notice outside the energy-flow diagram. Tables: at 375 px key columns stay visible (priority columns or stacked rows) with a scroll cue, money and units never wrap (numeric cells nowrap, Plan Versions not clipped at 1440), KPI tiles do not break values; heatmaps get a colour-scale legend and show negatives (diverging scale). Lettered wizard: focus to the new step's heading on Next/Previous/Edit, visible focus outline on the panel, Save and continue disabled while saving, active tab scrolled into view on phones. lib/format.ts and lib/time.ts are shared additive: append helpers, do not rename existing ones. parity-ui changes tokens and fonts in stage 3. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "demo-seed",
+   "title": "Demo seed and demo narrative consistency",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/demo.py",
+    "backend/gridlytics/seed_demo.py",
+    "backend/gridlytics/routes_demo.py",
+    "backend/gridlytics/routes_sites.py (control_state only)",
+    "backend/gridlytics/twin.py (truth day boundary only)",
+    "frontend/src/features/org/demo-tab.tsx",
+    "frontend/src/features/sites/demo-loader.tsx",
+    "backend/tests/test_r7_demo.py (new)"
+   ],
+   "stage": 1,
+   "depends_on": [],
+   "batches": [
+    {
+     "theme": "Demo control narrative",
+     "ids": [
+      "role-owner-08",
+      "role-owner-15",
+      "engine-delivery-18",
+      "engine-plans-live-20"
+     ]
+    },
+    {
+     "theme": "Demo history and build",
+     "ids": [
+      "pages-A-04",
+      "role-operator-29",
+      "security-roles-15",
+      "tracker-and-docs-21"
+     ]
+    }
+   ],
+   "notes": "The control chip comes from the site's real state (applied log, tier, offline, edge), never forced for demo_link (fixes 'Following plan (table applied)' on sites whose log says nothing applied, and while offline); demo advisory sites apply a table only when the seed records 'Mark as applied' within the write budget and only those days are confirmed; the closed-loop Karachi demo gets a consistent story (edge record, heartbeat, read-back) or is seeded at a tier its source supports, and every demo site records its data_source consistently with Site settings; the farm stores data.off_grid = true; outages and genset runs continue across midnight (fix in twin.truth or the demo's day loop; twin.simulate is delivery-twin's); the demo build lock is per company; the '90 days of history' text (fleet empty state, demo tab) matches what is seeded (or seed 90 days); seed_demo's docstring/--help name only files in the repo and a re-run is idempotent (test). Never write into the owner's data folder. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "savings-ui-crosscut",
+   "title": "Savings page UI, pilot gates, multi-connection, audit, and cross-page consistency sweeps",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/gridlytics/routes_savings.py (savings, recompute, savings_csv, fee_put, fleet_savings)",
+    "frontend/src/features/savings/",
+    "backend/tests/test_audit_walk.py (new)",
+    "cross-page sweeps: any feature file on the integrated branch (stage 2)"
+   ],
+   "stage": 2,
+   "depends_on": [
+    "savings-engine",
+    "pilot",
+    "tariffs",
+    "telemetry-genset-battery",
+    "demo-seed",
+    "optimiser-plans",
+    "fleet-overview"
+   ],
+   "batches": [
+    {
+     "theme": "Fee card and headline display",
+     "ids": [
+      "pages-D-01",
+      "role-operator-19",
+      "role-analyst-23",
+      "frontend-states-formats-12",
+      "pages-D-21"
+     ]
+    },
+    {
+     "theme": "Cross-module: multi-connection sites, pilot gates and audit",
+     "ids": [
+      "tracker-and-docs-01",
+      "pages-D-12",
+      "security-roles-04",
+      "brief-vs-build-13"
+     ]
+    },
+    {
+     "theme": "Savings ledger, days table and daily chart",
+     "ids": [
+      "flow-savings-pilot-bill-17",
+      "flow-savings-pilot-bill-18",
+      "flow-savings-pilot-bill-20",
+      "pages-D-22",
+      "pages-D-20",
+      "flow-savings-pilot-bill-19",
+      "pages-D-23"
+     ]
+    },
+    {
+     "theme": "Exports, recompute and switchback panel",
+     "ids": [
+      "pages-D-06",
+      "pages-D-05",
+      "pr-review-05",
+      "pr-review-07",
+      "pr-review-08"
+     ]
+    },
+    {
+     "theme": "Cross-page consistency: fuel units, off-grid site, dates and raw keys, role gating",
+     "ids": [
+      "frontend-states-formats-01",
+      "role-operator-10",
+      "frontend-states-formats-02",
+      "role-analyst-24",
+      "role-owner-37",
+      "role-viewer-20"
+     ]
+    },
+    {
+     "theme": "Cross-page a11y and freshness",
+     "ids": [
+      "frontend-a11y-08",
+      "frontend-a11y-13",
+      "frontend-states-formats-20",
+      "role-analyst-29"
+     ]
+    }
+   ],
+   "notes": "Stage 2: starts from the integrated stage-1 branch, so it may touch any file; it builds on savings-engine's new fields, pilot's record and gates, telemetry's metered/estimated litres, demo-seed's off_grid flag, optimiser-plans' build_problem and tariffs' rebuild. Fee card: claimed-days basis (no whole-month extrapolation labelled 'verified'), the baseline it really uses, Preliminary mark, 'no fee set' instead of Rs 0, a 'Hidden for your role' note wherever a role removes a card or column (slot-table money, Gantt price line, fleet sparkline, fee card) and no fee_multiple to an operator; 'claimed' wording matching the engine. Multi-connection sites (tracker-and-docs-01, high): the engine, the ledger and the bill rebuild per connection, bills for any connection. Pilot go/no-go: score the stored criteria against measured KPIs, including reserve adequacy (forecasts-outages' function), constraint violations, control health, genset and cycling gates. Audit: every mutating route writes an audit row, money settings with before/after values, test_audit_walk.py. Savings page: per-day lever split explaining negative days, native-block days explained inline and kept out of the tuned headline, the native baseline shown (work mode, backup %, slots, capture version), daily chart ticks in rupees (no 'Rs 2k' for 1,700) and all-negative ranges, flags for withheld/not-applied/native days and a verified-only toggle, 'Diesel saved' estimated vs metered, billing-period and pilot-window options, switchback tiles that show carry-over and a correct subtitle, CSV that reconciles with the page (claimed, withheld reason, levers, MDI, tariff and capture versions), recompute reports every day it changed, stale notice that names the causes and a reachable action, tests on the reachable path. Cross-page: one fuel-unit helper (litres vs MMBtu, 'Diesel' only for diesel) on Savings, Overview, Plan, Compare, fuel log and PDF; unmetered 0.0 L 'estimated' fixed on Overview and Savings >62 days; one off-grid helper so the farm is never 'in an outage'/'the grid is down'; ISO dates, raw keys and lower-cased acronyms through lib/format; jargon explained; no calls to routes the role is refused; validation messages through Field (aria-describedby, announced, submit says why it is disabled); explanations not only in title attributes; query invalidation after mutations (fleet chip, overview alerts, seats, outage cause); analysts not offered actions they cannot take. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "tests-ci",
+   "title": "Tests and browser check: engine acceptance tests, default suite, e2e",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "backend/tests/ (new acceptance tests, conftest.py, test_fix_r5_genset.py)",
+    "scripts/e2e/ (frontend repo)",
+    "frontend/src/test/source-rules.test.ts"
+   ],
+   "stage": 2,
+   "depends_on": [
+    "optimiser-plans",
+    "delivery-twin",
+    "savings-engine",
+    "telemetry-genset-battery",
+    "demo-seed"
+   ],
+   "batches": [
+    {
+     "theme": "Acceptance tests, default suite and browser check",
+     "ids": [
+      "tracker-and-docs-08",
+      "pr-review-01",
+      "tracker-and-docs-15",
+      "tracker-and-docs-17",
+      "tracker-and-docs-22",
+      "frontend-a11y-24"
+     ]
+    }
+   ],
+   "notes": "Stage 2, on the integrated branch. Backend: the engine acceptance tests the tracker claims (TWN-01, VER-02, DAT-01, DAT-08, OPT-03, OPT-04 reserve-safe, OPT-07) written against the fixed engine; a default-suite check of round 5's second-day hour-mark rows and of a real 192-step farm plan within a time budget (the long benchmark stays opt-in). Frontend: the source-rules test bans 'optimal'; scripts/e2e: the accounts path from an env variable with the HANDOFF default and a README that names the right file, the 375 px check covering ?view= pages, dialogs and the installer's Slots and Mark-as-applied path (a 375x812 Playwright project), and the acceptance steps actually performed by the browser check (create a site, upload a CSV, download a report). CI/deployment itself (DEP-01..07) is planned work and out of scope. Shared additive files any WP may append to: frontend/src/types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts and lib/time.ts helpers (append, do not reorder), backend schemas.py. store.py migrations are a conflict hotspot: prefer the existing JSON data columns or settings; if a new table/column is unavoidable add one migration and say so in the commit (integration renumbers versions). Do not edit HANDOFF.md or DESIGN_LOG.md in stages 1-2 (integration and the docs WP write them); never touch the owner's data folder (use a scratch data path in tests)."
+  },
+  {
+   "key": "parity-ui",
+   "title": "Boxlytics UI/UX parity: fonts, tokens, logo, shell look, landing, sign-in, help",
+   "repos": [
+    "frontend"
+   ],
+   "owns_files": [
+    "frontend/src/styles/index.css",
+    "frontend/src/components/layout/",
+    "frontend/src/components/ui/",
+    "frontend/src/components/workflow/lettered-tabs.tsx",
+    "frontend/src/components/charts/use-echarts.ts",
+    "frontend/index.html",
+    "frontend/public/ (favicon, fonts)",
+    "frontend/src/features/auth/login-page.tsx",
+    "frontend/src/app/router.tsx",
+    "frontend/src/features/landing/ (new)",
+    "frontend/src/features/help/ (new)"
+   ],
+   "stage": 3,
+   "depends_on": [
+    "shell-nav",
+    "ui-charts-a11y",
+    "auth-security"
+   ],
+   "batches": [
+    {
+     "theme": "Brand foundations: fonts, tokens, logo",
+     "ids": [
+      "parity-boxlytics-ui-02",
+      "parity-boxlytics-ui-04",
+      "parity-boxlytics-ui-03",
+      "parity-boxlytics-ui-07"
+     ]
+    },
+    {
+     "theme": "Public pages: landing, sign-in, help, head tags",
+     "ids": [
+      "parity-boxlytics-ui-01",
+      "parity-boxlytics-ui-09",
+      "parity-boxlytics-ui-17",
+      "parity-boxlytics-ui-08"
+     ]
+    },
+    {
+     "theme": "Shell and component look",
+     "ids": [
+      "parity-boxlytics-ui-05",
+      "parity-boxlytics-ui-06",
+      "parity-boxlytics-ui-10",
+      "parity-boxlytics-ui-11",
+      "parity-boxlytics-ui-12",
+      "parity-boxlytics-ui-13",
+      "parity-boxlytics-ui-14"
+     ]
+    }
+   ],
+   "notes": "Stage 3, on top of everything. Fonts: Poppins 300-900 and JetBrains Mono actually loaded (self-hosted or a Google Fonts link), ECharts using them, a 14/15/16 root scale. Tokens: brand #1f8a78/#145f53/#2ba98f on a white page and the Boxlytics state colours; re-check the contrast thresholds ui-charts-a11y set. Logo and favicon in the Boxlytics treatment. Public: a marketing landing page at '/' with public shell, footer, contact and legal pages; the Boxlytics-style sign-in page ('Welcome back', h1); a Help page reachable from the account menu and sidebar footer; index.html head with 'Product - tagline' title, description, Open Graph/Twitter tags and apple-touch-icon. Shell and components: sidebar glass logo band and solid #145f53 active pill with side bar, top bar with page title/subtitle, glass hairline and account menu, rounded-2xl glass cards and KPI tiles, page header type scale, buttons/inputs (outline variant, sizes), dialogs/drawers/toasts/empty states, sticky pill lettered tabs. Boxlytics belongs to another party: never change it; reuse its code only where the owner's decisions allow and record each reused file with its path and commit (THIRD_PARTY_NOTICES)."
+  },
+  {
+   "key": "docs",
+   "title": "Docs, tracker and handoff corrections",
+   "repos": [
+    "backend",
+    "frontend"
+   ],
+   "owns_files": [
+    "HANDOFF.md (backend)",
+    "README.md (backend)",
+    "docs/DESIGN_LOG.md (backend)",
+    "docs/*.md (frontend: HANDOFF, API_CONTRACT, BACKEND_ASKS, BUILD_NOTES, GATES)",
+    "README.md (frontend)",
+    "tracker EMS_BUILD_PROGRESS.md (plan package)"
+   ],
+   "stage": 3,
+   "depends_on": [
+    "savings-ui-crosscut",
+    "tests-ci"
+   ],
+   "batches": [
+    {
+     "theme": "HANDOFF and README",
+     "ids": [
+      "tracker-and-docs-11",
+      "brief-vs-build-14",
+      "pr-review-12",
+      "pr-review-13",
+      "tracker-and-docs-23",
+      "tracker-and-docs-16"
+     ]
+    },
+    {
+     "theme": "Tracker ticks",
+     "ids": [
+      "tracker-and-docs-09",
+      "tracker-and-docs-12",
+      "tracker-and-docs-13",
+      "tracker-and-docs-20"
+     ]
+    },
+    {
+     "theme": "API contract and design log",
+     "ids": [
+      "pages-A-18",
+      "tracker-and-docs-18",
+      "tracker-and-docs-19",
+      "pr-review-10"
+     ]
+    }
+   ],
+   "notes": "Stage 3, last. Backend README: run commands use a scratch data folder (never the owner's data/), test counts and module table refreshed; HANDOFF: section 1's tick description (signing on pull, savings nightly, Mode B not executed unless stage 1 changed it), test counts, open work (the Karachi energy levers, what stages 1-2 closed), drop the done 'create the repositories' owner task, reconcile browser-check/round-5 claims across HANDOFF, GATES, BUILD_NOTES, API_CONTRACT and BACKEND_ASKS. Tracker: untick or annotate items whose acceptance is not met after stages 1-2 (UI-18/17/08, PLT-02, FOR-06/04/10, VER-12, PLT-09). API_CONTRACT: wear cost = replacement / (cycles x depth) per kWh discharged with a doc test, stale rows (Outages 7-day read, /now held state, vendor_view columns), the seven undocumented routes. DESIGN_LOG: make 8.A.1's done-when evidence reproducible (script and seeds). Write what the code now does, checked against the integrated branch."
+  }
+ ],
+ "duplicates": [
+  {
+   "canonical": "flow-savings-pilot-bill-02",
+   "dups": [
+    "role-owner-01",
+    "role-operator-01",
+    "role-analyst-02"
+   ]
+  },
+  {
+   "canonical": "role-owner-08",
+   "dups": [
+    "role-viewer-01",
+    "role-operator-03",
+    "role-analyst-04",
+    "flow-telemetry-plan-control-27",
+    "flow-savings-pilot-bill-28"
+   ]
+  },
+  {
+   "canonical": "pages-C-03",
+   "dups": [
+    "role-viewer-04",
+    "role-owner-06",
+    "role-operator-05",
+    "role-analyst-05",
+    "flow-savings-pilot-bill-27",
+    "pages-A-06"
+   ]
+  },
+  {
+   "canonical": "frontend-states-formats-01",
+   "dups": [
+    "role-viewer-05",
+    "role-operator-04",
+    "role-analyst-06",
+    "flow-savings-pilot-bill-14",
+    "pages-C-17"
+   ]
+  },
+  {
+   "canonical": "role-operator-10",
+   "dups": [
+    "frontend-states-formats-03",
+    "role-viewer-02",
+    "role-owner-09",
+    "role-analyst-07"
+   ]
+  },
+  {
+   "canonical": "pages-C-02",
+   "dups": [
+    "role-viewer-03",
+    "role-operator-13"
+   ]
+  },
+  {
+   "canonical": "role-operator-14",
+   "dups": [
+    "role-viewer-08",
+    "role-owner-14",
+    "role-analyst-08"
+   ]
+  },
+  {
+   "canonical": "flow-savings-pilot-bill-20",
+   "dups": [
+    "role-owner-04",
+    "role-operator-15",
+    "role-analyst-13"
+   ]
+  },
+  {
+   "canonical": "role-analyst-14",
+   "dups": [
+    "role-owner-13",
+    "flow-savings-pilot-bill-21"
+   ]
+  },
+  {
+   "canonical": "frontend-a11y-02",
+   "dups": [
+    "role-viewer-11",
+    "role-owner-12",
+    "role-operator-25",
+    "role-analyst-22"
+   ]
+  },
+  {
+   "canonical": "frontend-a11y-01",
+   "dups": [
+    "frontend-states-formats-08",
+    "role-viewer-10",
+    "role-owner-18"
+   ]
+  },
+  {
+   "canonical": "role-owner-19",
+   "dups": [
+    "role-viewer-23"
+   ]
+  },
+  {
+   "canonical": "pages-A-13",
+   "dups": [
+    "role-owner-17",
+    "role-analyst-21",
+    "role-operator-24"
+   ]
+  },
+  {
+   "canonical": "role-owner-34",
+   "dups": [
+    "role-viewer-12"
+   ]
+  },
+  {
+   "canonical": "pages-A-14",
+   "dups": [
+    "parity-boxlytics-ui-18",
+    "flow-onboarding-26"
+   ]
+  },
+  {
+   "canonical": "pages-A-05",
+   "dups": [
+    "pages-D-26"
+   ]
+  },
+  {
+   "canonical": "role-operator-09",
+   "dups": [
+    "role-viewer-06",
+    "role-owner-10",
+    "role-analyst-10",
+    "flow-savings-pilot-bill-29"
+   ]
+  },
+  {
+   "canonical": "role-operator-21",
+   "dups": [
+    "role-owner-27",
+    "parity-boxlytics-ui-16",
+    "role-analyst-26"
+   ]
+  },
+  {
+   "canonical": "role-operator-22",
+   "dups": [
+    "role-owner-26"
+   ]
+  },
+  {
+   "canonical": "parity-boxlytics-ui-15",
+   "dups": [
+    "role-owner-20",
+    "role-viewer-15"
+   ]
+  },
+  {
+   "canonical": "role-owner-29",
+   "dups": [
+    "role-operator-27"
+   ]
+  },
+  {
+   "canonical": "role-owner-22",
+   "dups": [
+    "role-viewer-14"
+   ]
+  },
+  {
+   "canonical": "role-viewer-07",
+   "dups": [
+    "role-analyst-09"
+   ]
+  },
+  {
+   "canonical": "frontend-states-formats-04",
+   "dups": [
+    "role-owner-32",
+    "role-analyst-30"
+   ]
+  },
+  {
+   "canonical": "role-owner-21",
+   "dups": [
+    "role-analyst-17",
+    "role-viewer-16"
+   ]
+  },
+  {
+   "canonical": "pages-C-23",
+   "dups": [
+    "engine-forecast-13"
+   ]
+  },
+  {
+   "canonical": "pages-C-22",
+   "dups": [
+    "engine-forecast-07",
+    "role-analyst-18"
+   ]
+  },
+  {
+   "canonical": "pages-C-08",
+   "dups": [
+    "role-analyst-19"
+   ]
+  },
+  {
+   "canonical": "engine-forecast-11",
+   "dups": [
+    "brief-vs-build-17"
+   ]
+  },
+  {
+   "canonical": "engine-savings-03",
+   "dups": [
+    "brief-vs-build-10"
+   ]
+  },
+  {
+   "canonical": "engine-savings-11",
+   "dups": [
+    "pages-D-30"
+   ]
+  },
+  {
+   "canonical": "engine-savings-01",
+   "dups": [
+    "brief-vs-build-01",
+    "flow-savings-pilot-bill-05"
+   ]
+  },
+  {
+   "canonical": "flow-savings-pilot-bill-03",
+   "dups": [
+    "role-analyst-01",
+    "engine-savings-12"
+   ]
+  },
+  {
+   "canonical": "pages-D-01",
+   "dups": [
+    "flow-savings-pilot-bill-04",
+    "role-owner-03"
+   ]
+  },
+  {
+   "canonical": "engine-savings-06",
+   "dups": [
+    "pages-D-02"
+   ]
+  },
+  {
+   "canonical": "engine-optimiser-14",
+   "dups": [
+    "role-owner-05",
+    "role-operator-12",
+    "flow-savings-pilot-bill-06"
+   ]
+  },
+  {
+   "canonical": "pages-D-06",
+   "dups": [
+    "engine-savings-07",
+    "flow-savings-pilot-bill-16"
+   ]
+  },
+  {
+   "canonical": "pages-D-07",
+   "dups": [
+    "tracker-and-docs-14"
+   ]
+  },
+  {
+   "canonical": "tracker-and-docs-01",
+   "dups": [
+    "pages-D-09"
+   ]
+  },
+  {
+   "canonical": "pages-D-10",
+   "dups": [
+    "flow-savings-pilot-bill-07"
+   ]
+  },
+  {
+   "canonical": "pages-D-04",
+   "dups": [
+    "security-roles-05",
+    "flow-savings-pilot-bill-10"
+   ]
+  },
+  {
+   "canonical": "flow-savings-pilot-bill-11",
+   "dups": [
+    "pages-D-18"
+   ]
+  },
+  {
+   "canonical": "pages-D-12",
+   "dups": [
+    "brief-vs-build-02",
+    "flow-savings-pilot-bill-13"
+   ]
+  },
+  {
+   "canonical": "role-operator-18",
+   "dups": [
+    "flow-savings-pilot-bill-22"
+   ]
+  },
+  {
+   "canonical": "security-roles-14",
+   "dups": [
+    "flow-savings-pilot-bill-26"
+   ]
+  },
+  {
+   "canonical": "flow-onboarding-14",
+   "dups": [
+    "flow-savings-pilot-bill-15"
+   ]
+  },
+  {
+   "canonical": "role-operator-16",
+   "dups": [
+    "role-owner-35",
+    "role-analyst-27"
+   ]
+  },
+  {
+   "canonical": "role-operator-02",
+   "dups": [
+    "role-analyst-03",
+    "flow-telemetry-plan-control-05"
+   ]
+  },
+  {
+   "canonical": "pages-B-04",
+   "dups": [
+    "engine-delivery-05"
+   ]
+  },
+  {
+   "canonical": "pages-B-05",
+   "dups": [
+    "engine-delivery-06",
+    "tracker-and-docs-06"
+   ]
+  },
+  {
+   "canonical": "pages-B-13",
+   "dups": [
+    "engine-delivery-14",
+    "tracker-and-docs-05"
+   ]
+  },
+  {
+   "canonical": "engine-delivery-02",
+   "dups": [
+    "flow-telemetry-plan-control-06"
+   ]
+  },
+  {
+   "canonical": "engine-delivery-04",
+   "dups": [
+    "flow-telemetry-plan-control-07",
+    "role-analyst-11"
+   ]
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-04",
+   "dups": [
+    "engine-plans-live-09"
+   ]
+  },
+  {
+   "canonical": "pages-B-01",
+   "dups": [
+    "security-roles-13",
+    "flow-telemetry-plan-control-20"
+   ]
+  },
+  {
+   "canonical": "pages-B-02",
+   "dups": [
+    "engine-delivery-09",
+    "brief-vs-build-06",
+    "flow-telemetry-plan-control-16"
+   ]
+  },
+  {
+   "canonical": "frontend-states-formats-15",
+   "dups": [
+    "flow-telemetry-plan-control-23"
+   ]
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-17",
+   "dups": [
+    "role-operator-08",
+    "tracker-and-docs-10"
+   ]
+  },
+  {
+   "canonical": "role-operator-11",
+   "dups": [
+    "role-analyst-12"
+   ]
+  },
+  {
+   "canonical": "role-owner-15",
+   "dups": [
+    "role-viewer-24",
+    "role-analyst-28"
+   ]
+  },
+  {
+   "canonical": "engine-delivery-17",
+   "dups": [
+    "brief-vs-build-08"
+   ]
+  },
+  {
+   "canonical": "brief-vs-build-12",
+   "dups": [
+    "tracker-and-docs-04"
+   ]
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-03",
+   "dups": [
+    "engine-plans-live-11"
+   ]
+  },
+  {
+   "canonical": "engine-optimiser-01",
+   "dups": [
+    "engine-plans-live-01"
+   ]
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-02",
+   "dups": [
+    "engine-plans-live-04",
+    "engine-plans-live-13"
+   ]
+  },
+  {
+   "canonical": "engine-optimiser-02",
+   "dups": [
+    "engine-plans-live-07"
+   ]
+  },
+  {
+   "canonical": "engine-optimiser-12",
+   "dups": [
+    "role-analyst-31"
+   ]
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-08",
+   "dups": [
+    "engine-plans-live-14"
+   ]
+  },
+  {
+   "canonical": "pages-C-16",
+   "dups": [
+    "brief-vs-build-16"
+   ]
+  },
+  {
+   "canonical": "security-roles-01",
+   "dups": [
+    "tracker-and-docs-02"
+   ]
+  },
+  {
+   "canonical": "security-roles-03",
+   "dups": [
+    "pages-D-15"
+   ]
+  },
+  {
+   "canonical": "role-operator-06",
+   "dups": [
+    "pages-C-20"
+   ]
+  },
+  {
+   "canonical": "pages-A-08",
+   "dups": [
+    "frontend-states-formats-19"
+   ]
+  },
+  {
+   "canonical": "pages-A-11",
+   "dups": [
+    "role-viewer-18"
+   ]
+  },
+  {
+   "canonical": "pages-A-04",
+   "dups": [
+    "frontend-states-formats-09",
+    "role-owner-24",
+    "role-operator-26"
+   ]
+  },
+  {
+   "canonical": "role-owner-07",
+   "dups": [
+    "role-operator-17"
+   ]
+  },
+  {
+   "canonical": "pages-A-03",
+   "dups": [
+    "role-viewer-09"
+   ]
+  },
+  {
+   "canonical": "role-owner-41",
+   "dups": [
+    "role-operator-33"
+   ]
+  },
+  {
+   "canonical": "frontend-states-formats-06",
+   "dups": [
+    "flow-telemetry-plan-control-11"
+   ]
+  },
+  {
+   "canonical": "engine-tariffs-05",
+   "dups": [
+    "flow-onboarding-13"
+   ]
+  },
+  {
+   "canonical": "engine-tariffs-07",
+   "dups": [
+    "tracker-and-docs-07"
+   ]
+  },
+  {
+   "canonical": "flow-telemetry-plan-control-26",
+   "dups": [
+    "role-viewer-26"
+   ]
+  },
+  {
+   "canonical": "role-analyst-24",
+   "dups": [
+    "role-operator-23"
+   ]
+  }
+ ],
+ "deferred": [
+  {
+   "id": "pages-B-09",
+   "reason": "refuted in verification"
+  },
+  {
+   "id": "pages-B-10",
+   "reason": "refuted in verification"
+  },
+  {
+   "id": "pages-B-16",
+   "reason": "refuted in verification"
+  },
+  {
+   "id": "pages-A-16",
+   "reason": "refuted in verification"
+  },
+  {
+   "id": "pages-D-13",
+   "reason": "HANDOFF 8.C planned feature with a design (tariff editor UI-03: lettered tabs, price-vector review, diff, simulate on a site, reject/withdraw); the finding restates that the editor is not built"
+  },
+  {
+   "id": "role-analyst-16",
+   "reason": "HANDOFF 8.C planned feature (tariff editor UI-03, per-kind templates/schemas); restates the known UI-03 gap, same as pages-D-13"
+  },
+  {
+   "id": "engine-forecast-15",
+   "reason": "Owner decision: the weather feed (FOR-02, Open-Meteo) needs a commercial licence the owner must buy before it can be wired in (HANDOFF 8.C); the Forecasts-page notice that no weather feed is used is implemented under pages-C-09"
+  }
+ ],
+ "summary": "557 findings: 405 canonical findings in 76 batches across 20 work packages, 145 duplicates folded into 83 canonical ids, 7 deferred (4 refuted; the UI-03 tariff editor pair pages-D-13 and role-analyst-16; the FOR-02 weather feed, which waits on the owner's licence). Stage 1 (16 WPs, in parallel): savings-engine, pilot, tariffs, delivery-twin, control-edge, optimiser-plans, forecasts-outages, telemetry-genset-battery, sites-onboarding, fleet-overview, alerts-reports, auth-security, founder-console, shell-nav, ui-charts-a11y, demo-seed. Stage 2 (on the integrated stage-1 branch): savings-ui-crosscut (Savings page on the engine's new fields, pilot gates, multi-connection sites, audit walk, and the cross-page sweeps: fuel units, off-grid farm, dates/raw keys, role gating, Field validation) and tests-ci (engine acceptance tests and the browser check). Stage 3: parity-ui (Boxlytics look) and docs. Files shared by function, with the split written in owns_files: plans.py (optimiser-plans builds and solves; control-edge guards, serves and releases; tariffs one duty line), delivery.py (delivery-twin compile half; control-edge keys and message models), routes_sites.py (sites-onboarding CRUD; fleet-overview fleet/now/chart; demo-seed control_state), routes_telemetry.py (telemetry; forecasts-outages outage routes; auth-security events), routes_savings.py (pilot; tariffs bills; stage-2 savings routes), routes_plans.py (control-edge; delivery-twin plan_compare), scheduler.py (control-edge; savings-engine one nightly call), alerts.py (alerts-reports; separate rule functions added by optimiser-plans and tariffs). Shared additive: types/api.ts, docs/API_CONTRACT.md, docs/BACKEND_ASKS.md, lib/format.ts, lib/time.ts, schemas.py; store.py migrations get renumbered at integration. Parts of findings that restate planned work stay out and are named in the notes: report schedules (pages-D-25, role-analyst-32), alert sending (pages-D-29), 2-slot twin-priced ranking (engine-delivery-04), the deterministic work limit/idle re-solve (engine-plans-live-19, engine-optimiser-08), CI/deployment (tests-ci)."
+}
