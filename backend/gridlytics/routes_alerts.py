@@ -22,9 +22,15 @@ def counts():
     return c
 
 
+def _readable(rules: dict) -> dict:
+    """The rules of the categories the reader receives (a viewer: the energy ones; no bill tolerance or fee rule)."""
+    cats = alerts.reader_categories()
+    return {c: r for c, r in rules.items() if c in cats}
+
+
 @router.get("/api/alerts/rules")
 def rules_get():
-    return alerts.rules()
+    return _readable(alerts.rules())
 
 
 @router.put("/api/alerts/rules")
@@ -40,7 +46,7 @@ def rules_put(inp: dict = Body(...)):
 def site_rules_get(site_id: str):
     """The rules the evaluator applies at a site (the company's with the site's overrides on top) and the overrides themselves."""
     site_or_404(site_id)
-    return {"site_id": site_id, "rules": alerts.site_rules(site_id), "overrides": alerts.site_overrides(site_id)}
+    return {"site_id": site_id, "rules": _readable(alerts.site_rules(site_id)), "overrides": _readable(alerts.site_overrides(site_id))}
 
 
 @router.put("/api/alerts/rules/sites/{site_id}")

@@ -498,3 +498,12 @@ def test_a_captive_gas_price_is_old_after_half_a_year_not_a_fortnight(world):
         assert "fuel_price_old" not in _tariff_alerts(sid)
         alerts.tariff_staleness(sites.full(sid), _at(2027, 1, 20), alerts.site_rules(sid))
         assert "captive gas" in _tariff_alerts(sid)["fuel_price_old"]["title"]
+
+
+def test_the_rules_a_reader_reads_are_those_of_the_categories_they_receive(world):
+    sid = world.site
+    viewer = world.c["viewer"].get("/api/alerts/rules").json()
+    assert set(viewer) == {"Data", "Reserve", "Battery", "Genset", "Forecast"}, viewer.keys()   # no bill tolerance or fee rule for a viewer
+    assert set(world.c["viewer"].get(f"/api/alerts/rules/sites/{sid}").json()["rules"]) == set(viewer)
+    assert "Product" not in world.c["operator"].get("/api/alerts/rules").json()
+    assert len(world.c["admin"].get("/api/alerts/rules").json()) == 9
