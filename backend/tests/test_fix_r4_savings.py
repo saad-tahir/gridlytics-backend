@@ -104,7 +104,10 @@ def test_an_off_grid_days_carry_over_is_valued_at_the_gensets_cost_at_its_night_
     at_night = b["eta_d"] * optimise._gen_marginal(gm, ratio) - optimise.wear_cost(b)
     at_75 = b["eta_d"] * optimise._gen_marginal(gm) - optimise.wear_cost(b)
     assert r["actual"]["v_end"] == pytest.approx(at_night, abs=0.01) and at_night > at_75 + 15.0
-    assert r["levers"]["carry_over"] == pytest.approx((r["actual"]["e_end_kwh"] - r["baseline"]["e_end_kwh"]) * r["actual"]["v_end"], abs=1.0)
+    # the stored end energies are rounded to 0.01 kWh each, so their difference is good to 0.01 kWh at v_end (Rs 1.6 here; demo.create_sites draws
+    # a fresh site id, and the twin seeds its days by it, so a fixed Rs 1 failed on some draws)
+    assert r["levers"]["carry_over"] == pytest.approx((r["actual"]["e_end_kwh"] - r["baseline"]["e_end_kwh"]) * r["actual"]["v_end"],
+                                                      abs=0.011 * r["actual"]["v_end"])
 
 
 # ------------------------------------------------------------------------------------------------ round 4b: a blank genset that ran (savings-1)
