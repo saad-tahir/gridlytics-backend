@@ -115,6 +115,11 @@ def test_the_closed_loop_demo_sites_edge_is_the_twin_and_reports_as_it_runs(worl
     assert world.c["operator"].get(f"/api/sites/{mill}/edge").json()["online"] is False
     # a site with a cloud source has no edge, and the twin reports none for it
     assert world.c["operator"].get(f"/api/sites/{farm}/edge").json()["last_seen"] is None
+    # removing the demo removes its edge's records with it
+    with world.use():
+        demo.remove("t")
+        with store.connect() as con:
+            assert [con.execute(f"SELECT count(*) FROM {t} WHERE site_id = ?", (mill,)).fetchone()[0] for t in ("acks", "capabilities")] == [0, 0]
 
 
 # ------------------------------------------------------------------------------------------------ one keyed table a day (engine-delivery-18)

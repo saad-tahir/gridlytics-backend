@@ -474,7 +474,8 @@ def remove(by: str) -> int:
         sites.delete(sid, by)
         telemetry.delete_site(sid)
         with store.connect() as con:
-            for table in ("plans", "savings_days", "alerts", "notifications", "switchback", "runs", "bills", "applied", "forecast_scores", "telemetry_days"):
+            for table in ("plans", "savings_days", "alerts", "notifications", "switchback", "runs", "bills", "applied", "forecast_scores", "telemetry_days",
+                          "acks", "capabilities"):
                 con.execute(f"DELETE FROM {table} WHERE site_id = ?", (sid,))
             con.execute("DELETE FROM settings WHERE key = ?", (f"demo_twin:{sid}",))
     store.set_setting("demo_status", {"state": "none"})
