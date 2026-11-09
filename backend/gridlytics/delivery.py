@@ -29,7 +29,7 @@ CONTRACT = "ems-edge/1.0"
 #: `max_slots` is what compile_mode_a fits a day into: Growatt's 3 plus 3 windows (Part 7.1 step 2) with Load First between them, which takes none
 BRANDS = {
     "deye": {"label": "Deye / Sunsynk", "max_slots": 6, "layout": "six programs (Time of Use)", "ring": True, "min_slot_minutes": 30,
-             "fields": ["program", "time", "power_w", "soc_pct", "grid_charge", "gen_charge"], "table_writes_per_day": 3, "mdi_primitive": False},
+             "fields": ["program", "time", "power_w", "soc_pct", "grid_charge", "gen_charge", "sell"], "table_writes_per_day": 3, "mdi_primitive": False},
     "huawei": {"label": "Huawei SUN2000", "max_slots": 14, "layout": "fourteen TOU periods (charge or discharge), with a global cut-off and floors",
                "ring": False, "min_slot_minutes": 15, "fields": ["period", "start", "end", "charge_or_discharge", "days"], "table_writes_per_day": 3,
                "mdi_primitive": True},
@@ -320,6 +320,11 @@ def _min_floor(compiled: dict) -> float:
     return float((compiled.get("fallback") or {}).get("min_soc_floor_pct") or 20.0)
 
 
+def _limit(compiled: dict, key: str) -> int | float | None:
+    """One of the battery's limits the compiled table carries (`limits`: max_charge_w, max_discharge_w, battery_v); None on a table from before."""
+    return (compiled.get("limits") or {}).get(key)
+
+
 def _kw(x: float) -> str:
     return f"{x:,.0f} kW" if abs(x) >= 100 else f"{x:.1f} kW"
 
@@ -338,10 +343,50 @@ def _soc_keyed(s: dict) -> int:
     return round(s["soc_target_pct"] if s["mode"].startswith("charge") else s["soc_floor_pct"])
 
 
+def _minutes(hhmm: str) -> int:
+    return int(hhmm[:2]) * 60 + int(hhmm[3:])
+
+
+def _ring(slots: list[dict], n: int) -> list[tuple[int, int]]:
+    """(slot index, start minute) for exactly `n` programs where the day has fewer slots: the longest stretch is split in two, on a quarter-hour
+    mark where it is at least 30 minutes long, until there are `n` (a split program repeats its slot's settings, so the device does the same)."""
+    pieces = [[k, _minutes(s["start"]), _minutes(s["end"]) or 1440] for k, s in enumerate(slots)]
+    while len(pieces) < n:
+        i = max(range(len(pieces)), key=lambda j: pieces[j][2] - pieces[j][1])
+        k, a, b = pieces[i]
+        if b - a < 2:
+            break
+        mid = (a + (b - a) // 2) // 15 * 15 if b - a >= 30 else a + (b - a) // 2
+        mid = mid if mid > a else a + 15
+        pieces[i:i + 1] = [[k, a, mid], [k, mid, b]]
+    return [(k, a) for k, a, _ in pieces]
+
+
 def _deye(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
-    rows = [{"program": k + 1, "time": s["start"], "power_w": s["max_discharge_w"] or s["max_charge_w"] or 0, "soc_pct": _soc_keyed(s),
-             "grid_charge": s["grid_charge"], "gen_charge": s["gen_charge"], "_slots": [k]} for k, s in enumerate(slots)]
-    return rows, [], []
+    """Deye / Sunsynk (R6 3.1): six programs in a ring, each a start time, a power (the most the battery discharges in it), a capacity (the SoC a
+    discharge stops at, or a charge from grid or genset goes up to), the grid and genset charge flags and the sell flag (export allowed). All six are
+    always keyed: where the plan needs fewer, a slot's settings are repeated, so no program keeps an old value. A self-use slot discharges at the
+    battery's power (keyed as 0 it would be a hold); a hold is power 0 at its level; an export slot sells."""
+    rows, notes = [], []
+    rated = _limit(compiled, "max_discharge_w")
+    for i, (k, start) in enumerate(_ring(slots, 6)):
+        s = slots[k]
+        if s["mode"] in ("discharge", "export"):
+            power = s["max_discharge_w"]
+        elif s["mode"] == "self_use":
+            power = s["max_discharge_w"] or rated
+        elif s["mode"].startswith("charge"):
+            power = s["max_charge_w"]
+        else:
+            power = 0
+        rows.append({"program": i + 1, "time": f"{start // 60:02d}:{start % 60:02d}", "power_w": power, "soc_pct": _soc_keyed(s),
+                     "grid_charge": s["grid_charge"], "gen_charge": s["gen_charge"], "sell": bool(s.get("export_allowed")), "_slots": [k]})
+    if len(rows) > len(slots):
+        notes.append("Deye runs its six programs in a ring: all six are set, and where the plan needs fewer a program repeats the settings of the "
+                     "one before it, so none keeps an old value.")
+    if any(r["power_w"] is None for r in rows):
+        notes.append("Key the battery's rated discharge power where the power is blank: those programs run self-use.")
+    return rows, [], notes
 
 
 def _windows(slots: list[dict], kind_of) -> list[dict]:
@@ -404,10 +449,6 @@ def _huawei(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
             notes.append(f"Huawei keeps one grid-charge cut-off for the day ({cutoff:.0f} %): the charge from {_span(s)} is planned to stop at "
                          f"{s['soc_target_pct']:.0f} % but will run on to {cutoff:.0f} %.")
     return rows, settings, notes
-
-
-def _limit(compiled: dict, key: str) -> int | None:
-    return (compiled.get("limits") or {}).get(key)
 
 
 def _floor_notes(brand: str, what: str, floor: float, slots: list[dict]) -> list[str]:

@@ -272,3 +272,37 @@ def test_the_compiled_table_carries_the_batterys_limits_for_the_brands_that_key_
     assert comp["limits"] == {"max_charge_w": 250000, "max_discharge_w": 300000, "battery_v": None}
     assert delivery.compile_mode_a(_steps_for([("idle", 0.0, 0.0)] * 96), "sungrow", None, 20.0)["limits"] == {
         "max_charge_w": None, "max_discharge_w": None, "battery_v": None}
+
+
+# ------------------------------------------------------------------------------------------------ Deye's ring of six programs (engine-delivery-07,
+# flow-telemetry-plan-control-18)
+
+LIMITS = {"max_charge_w": 300000, "max_discharge_w": 300000, "battery_v": None}
+
+
+def test_deye_keys_all_six_programs_of_its_ring_repeating_a_slots_settings_where_the_plan_needs_fewer():
+    """A day of one slot gave one program ('1 of 6'): whatever programs 2 to 6 already held kept running in the ring."""
+    t = _table("deye", [_slot("00:00", "00:00", "hold", 60, 60)], limits=LIMITS)
+    times = [r["time"] for r in t["rows"]]
+    assert [r["program"] for r in t["rows"]] == [1, 2, 3, 4, 5, 6] and times == sorted(set(times)) and times[0] == "00:00"
+    assert {(r["power_w"], r["soc_pct"], r["grid_charge"], r["sell"]) for r in t["rows"]} == {(0, 60, False, False)} and t["slots"] == [[0]] * 6
+    assert any("six programs" in n and "ring" in n for n in t["notes"]), t["notes"]
+    three = _table("deye", [_slot("12:15", "18:00", "charge_grid", 30, 80, ch=50000), _slot("18:00", "22:00", "discharge", 30, 80, dis=100000),
+                            _slot("22:00", "00:00", "hold", 30, 30)], limits=LIMITS)
+    # the longest stretch is split in two on a quarter-hour mark until there are six
+    assert [(r["time"], r["power_w"], r["soc_pct"]) for r in three["rows"]] == [("12:15", 50000, 80), ("15:00", 50000, 80), ("16:30", 50000, 80),
+                                                                                ("18:00", 100000, 30), ("20:00", 100000, 30), ("22:00", 0, 30)]
+    assert three["slots"] == [[0], [0], [0], [1], [1], [2]]
+    six = _table("deye", limits=LIMITS)
+    assert len(six["rows"]) == 6 and six["slots"] == [[k] for k in range(6)] and not any("ring" in n for n in six["notes"])
+
+
+def test_deye_keys_self_use_at_the_batterys_power_a_hold_at_none_and_an_export_with_its_sell_flag():
+    """Self-use was keyed as power 0, which on Deye is no discharge at all (a hold), while the twin replays it at the battery's power; an export slot
+    had no sell flag, so a keyed Deye never exported."""
+    slots = BUSY[:4] + [_slot("18:30", "22:30", "export", 25, 95, dis=150000), BUSY[5]]
+    rows = _table("deye", slots, limits=LIMITS)["rows"]
+    assert [(r["power_w"], r["soc_pct"], r["sell"]) for r in rows] == [(50000, 80, False), (0, 80, False), (40000, 95, False), (300000, 55, False),
+                                                                       (150000, 25, True), (30000, 60, False)]
+    old = _table("deye", BUSY)                                                               # a table compiled before its limits were carried
+    assert old["rows"][3]["power_w"] is None and any("rated discharge power" in n for n in old["notes"])
