@@ -765,7 +765,8 @@ def test_a_recompute_answers_audits_and_marks_every_day_it_rescores_in_a_closed_
     with store.connect() as con:
         for b, data in _rows(sid, DAYS[2]).items():
             data["chain"]["start"]["state"]["soc"] += 0.01
-            con.execute("UPDATE savings_days SET data = ? WHERE site_id = ? AND day_local = ? AND baseline = ?", (json.dumps(data), sid, DAYS[2].isoformat(), b))
+            con.execute("UPDATE savings_days SET data = ? WHERE site_id = ? AND day_local = ? AND baseline = ?",
+                        (json.dumps(data), sid, DAYS[2].isoformat(), b))
     verify.compute_day(sid, DAYS[1], with_bound=False)
     walks = _audits(sid, WALKED)
     assert len(walks) == 1 and walks[0]["actor"] == "system" and walks[0]["after_day"] == DAYS[1].isoformat()
