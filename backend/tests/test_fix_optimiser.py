@@ -78,6 +78,8 @@ def _now_t0() -> int:
 
 def test_a_pause_holds_the_plan_and_the_edge_gets_a_release_not_the_slots(company):
     sid = _site()
+    sites.set_tier_capable(sid, "closed_loop")                  # only a closed-loop site's edge is sent a message (round 7)
+    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
     first = plans.tick(sid)
     assert first["status"] == "active"
     sites.add_override(sid, {"kind": "pause_control", "until": _until(24), "reason": "test"}, "t")
@@ -95,6 +97,8 @@ def test_a_pause_holds_the_plan_and_the_edge_gets_a_release_not_the_slots(compan
 
 def test_release_to_native_holds_the_plan_without_relabelling_its_steps(company):
     sid = _site()
+    sites.set_tier_capable(sid, "closed_loop")                  # only a closed-loop site's edge is sent a message (round 7)
+    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
     sites.add_override(sid, {"kind": "force_native", "until": _until(4), "reason": "test"}, "t")
     r = plans.tick(sid)
     assert r["status"] == "held" and r["summary"]["control_release"]["reason"] == "released_to_native"

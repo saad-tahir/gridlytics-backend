@@ -302,6 +302,11 @@ def test_an_off_grid_threshold_site_with_a_part_full_tank_solves_to_optimal_insi
 
 # ------------------------------------------------------------------------------------------------ data-override-pause-native-noop
 
+def _closed_loop(sid: str) -> None:
+    sites.set_tier_capable(sid, "closed_loop")
+    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
+
+
 def _fail_every_solve(monkeypatch):
     def fail(p, time_limit=10.0, gap=1e-3, relaxed=False):
         return {"status": "not_solved", "solver_status": 2, "message": "forced by the test", "relaxed": relaxed, "notes": [], "config_hash": "x"}
@@ -310,6 +315,7 @@ def _fail_every_solve(monkeypatch):
 
 def test_a_failed_solve_during_a_pause_still_ends_the_pre_pause_plan(company, monkeypatch):
     sid = _site(genset=False)
+    _closed_loop(sid)                                           # only a closed-loop site's edge is sent a message (round 7)
     first = plans.tick(sid)
     assert first["status"] == "active" and plans.current(sid)["id"] == first["plan_id"]
     sites.add_override(sid, {"kind": "pause_control", "until": _until(24), "reason": "test"}, "t")
@@ -478,6 +484,7 @@ def test_legacy_net_metering_passes_the_months_exports(company, monkeypatch):
 
 def test_the_signed_message_carries_no_money_and_records_only_when_asked(company):
     sid = _site(genset=False)
+    _closed_loop(sid)                                           # only a closed-loop site's edge is sent a message (round 7)
     assert plans.tick(sid)["status"] == "active"
     quiet = plans.signed_message(sid, record=False)
     assert "objective_rs" not in json.dumps(quiet) and quiet["notes"]["reason"]

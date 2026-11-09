@@ -694,7 +694,12 @@ def _release_message(site_id: str, rel: dict, record: bool = True) -> dict:
 def signed_message(site_id: str, record: bool = True) -> dict | None:
     """The current plan as the ems-edge/1.0 plan message, signed with the site's key; a signed release instead while control is paused or
     released to native. The body carries no money field (the plan's rupees stay on the plan page). `record` writes the plan_messages row that
-    the edge page lists as a send: the edge's own pull (the key-only route) records it; any other caller passes record=False."""
+    the edge page lists as a send: the edge's own pull (the key-only route) records it; any other caller passes record=False.
+    Only a closed-loop site's edge applies plans (plan Part 2.3): below it (the effective tier, monitor or advisory_writes) nothing is signed or
+    sent and NotClosedLoop is raised, so a plans:read key at a monitor site gets no actionable table and no send is counted."""
+    tier = (sites.get(site_id) or {}).get("tier", "monitor")
+    if tier != "closed_loop":
+        raise NotClosedLoop(tier)
     rel = control_release(site_id)
     if rel:
         return _release_message(site_id, rel, record=record)
@@ -712,3 +717,16 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
     if record:
         _record_send(site_id, plan["id"], msg)
     return msg
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): what reaches the device
+
+class NotClosedLoop(Exception):
+    """A signed plan message asked for at a site whose effective control tier is below closed loop: nothing is sent to its edge (plan Part 2.3,
+    monitor: recommendations only; advisory_writes: a person keys the table in)."""
+
+    def __init__(self, tier: str):
+        self.tier = tier
+        words = {"monitor": "monitor", "advisory_writes": "advisory writes"}.get(tier, str(tier).replace("_", " "))
+        how = ("the plan is a recommendation" if tier == "monitor" else "a person keys the table in")
+        super().__init__(f"The site's control tier is {words}, so no plan is sent to its edge: {how}")
