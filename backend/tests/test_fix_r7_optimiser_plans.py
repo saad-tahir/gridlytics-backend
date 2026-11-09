@@ -153,3 +153,60 @@ def test_a_peak_discharge_held_to_the_cap_under_the_upper_load_does_not_alternat
     extra = np.maximum(0.0, np.asarray(p["Lhi"]) - np.asarray(p["L"]))
     assert float(np.max(G + extra - M)) <= 1e-6
     assert not _sawtooth(r["sol"]["D"])
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-02, engine-plans-live-04, -13
+
+def _peak_start(p_peak: float, T=96, E0=20.0):
+    """A plan made at the start of the peak window (Rs 60 for four hours, then Rs 28) with an empty battery: the only way to refill the outage
+    reserve before the off-peak hours is the grid at the peak price."""
+    p = _problem(T=T, peak=(0, 16))
+    p["battery"]["E0"] = E0
+    p["p_start"] = np.where(np.asarray(p["peak"]), p_peak, 0.0)
+    p["c_short"] = 130.0                                  # a genset site's marginal cost of a kWh short
+    return p
+
+
+def test_grid_charging_in_the_peak_for_the_reserve_is_named_for_the_reserve_and_never_cheaper():
+    """Faisalabad charged 92 kWh at Rs 40.02 in the peak with the reason "Charging from the grid while energy is cheaper". The reserve rule's
+    expected shortfall pays for it, so the plan may do it, but the step names the reserve, its chance of an outage and the price paid."""
+    p = _peak_start(0.05)
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    s, pk = r["sol"], np.asarray(p["peak"])
+    grid_charge = [t for t in range(p["T"]) if pk[t] and s["C"][t] > 0.1 and s["G"][t] > 0.1]
+    assert grid_charge, "the reserve at p = 0.05 a step is worth buying at the peak price: the case needs a peak grid charge"
+    for t in grid_charge:
+        x = r["reasons"][t]
+        assert x["reason"] == "charge_for_reserve", (t, x)
+        assert x["detail"]["rs_per_kwh"] == pytest.approx(60.0)
+        # the chance of an outage starting while the charge is held for it: every step of the window, not one step's 5 %
+        n = round(x["detail"]["within_h"] / H)
+        assert x["detail"]["p"] == pytest.approx(1 - (1 - 0.05) ** n, abs=0.006)
+        assert x["detail"]["p"] > 0.05
+        assert 0 < x["detail"]["kwh"] <= (0.95 - 0.1) * 200.0
+    assert not any(x["reason"] == "charge_from_grid" for t, x in enumerate(r["reasons"]) if pk[t])
+
+
+def test_no_grid_charging_in_the_peak_without_a_reserve_row():
+    """Below p = 0.01 a step has no reserve row, and nothing else makes peak energy worth buying: the refill waits for the off-peak price."""
+    p = _peak_start(0.005)
+    r = optimise.solve(p)
+    pk = np.asarray(p["peak"])
+    assert float(np.max(r["sol"]["C"][pk])) < 0.1
+
+
+def test_off_peak_grid_charging_names_the_price_and_the_time_the_energy_is_used_at():
+    p = _problem()
+    p["battery"]["E0"] = 20.0
+    r = optimise.solve(p)
+    s = r["sol"]
+    charges = [t for t in range(72) if s["C"][t] > 0.1 and s["G"][t] > 0.1]
+    assert charges
+    first_use = next(t for t in range(p["T"]) if s["D"][t] > 0.1)
+    assert first_use == 72
+    for t in charges:
+        x = r["reasons"][t]
+        assert x["reason"] == "charge_from_grid"
+        assert x["detail"]["rs_per_kwh"] == pytest.approx(28.0)
+        assert x["detail"]["use_t"] == int(p["ts"][72]) and x["detail"]["use_rs_per_kwh"] == pytest.approx(60.0)

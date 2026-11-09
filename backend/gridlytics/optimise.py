@@ -24,7 +24,7 @@ EPS_CHARGE = 0.001     # Rs/kWh: a tie-break against charging and discharging at
 SURPLUS_ROWS = True    # solve's grid-down rows on the set's surplus and the battery; a switch only for the tests that check they cut no plan off
 REASONS = ("hold_for_outage", "charge_from_pv", "charge_from_grid", "discharge_peak_window", "mdi_cap", "genset_on", "genset_off", "icp_flat_price",
            "terminal_value", "export_capped", "wear_margin_too_small", "forecast_guard", "operator_hold", "carry_outage", "self_consumption", "idle",
-           "unserved")
+           "unserved", "charge_for_reserve")
 
 
 class Model:
@@ -308,11 +308,13 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         # reserve (soft, expected value): rows only where the grid is up and an outage may start next
         sig = bat.get("sigma0", 0.0)
         R = np.zeros(T)
+        R_steps = np.zeros(T, dtype=int)  # the steps of outage each reserve covers (two at most behind an AMF panel), for explain's detail
         r_idx = {}
         c_short = p["c_short"]
         deficit = np.maximum(0.0, Lc - PVlo) * H / bat["eta_d"]
         for t in range(T):
             d_ = int(dur[t]) if not (gen and gen["control"] == "auto_on_grid_loss") else min(int(dur[t]), 2)
+            R_steps[t] = d_
             R[t] = min((bat["soc_max"] - bat["soc_min"]) * En, float(deficit[t + 1:t + 1 + d_].sum())) + 2 * sig * En
         for t in range(T):
             if g[t] > 0.5 and p_start[t] >= 0.01 and R[t] > 0:
@@ -544,6 +546,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     out["sol"] = sol
     out["T"] = T
     out["R"] = R if bat else np.zeros(T)
+    out["R_steps"] = R_steps if bat else np.zeros(T, dtype=int)
     out["r"] = {t: float(x[i]) for t, i in r_idx.items()} if bat else {}
     out["manual_floor"] = dict(rm_floor)
     out["M"] = [float(x[i]) for i in M_idx]
@@ -771,8 +774,42 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
     En = bat["E_nom"] if bat else 1.0
     Emin = bat["soc_min"] * En if bat else 0.0
     R = out.get("R", np.zeros(T))
+    R_steps = np.asarray(out.get("R_steps", np.asarray(p["dur_steps"])[:T]), dtype=int)
     icp = p.get("icp") or {}
     thr = p.get("reserve_threshold", 0.2)
+    c_imp, p_start, ts = np.asarray(p["c_imp"], dtype=float), np.asarray(p["p_start"], dtype=float), np.asarray(p["ts"], dtype=np.int64)
+    Cs, Ds, Es = np.asarray(s["C"], dtype=float), np.asarray(s["D"], dtype=float), np.asarray(s["E"], dtype=float)
+    rows = out.get("r") or {}                       # the steps that carry a reserve row (p_start >= 0.01 with the grid up)
+    tol = 0.02 * En
+
+    def binds(k: int) -> bool:
+        """The reserve row of step k holds the battery: its energy after the step is at or under the reserve it asks for."""
+        return k in rows and float(Es[k + 1]) <= Emin + float(R[k]) + tol
+
+    def reserve_window(t: int, stop_at_charge: bool) -> int | None:
+        """The last step whose reserve row binds the energy the battery holds after step t: from t on, while the grid is up and until the
+        battery next discharges (or, for a step that holds, next charges, which refills what a discharge now would take). None where no row in
+        that stretch binds: the reserve is not what keeps the energy."""
+        last = None
+        for k in range(t, T):
+            if g[k] < 0.5 or (k > t and Ds[k] > 0.1) or (stop_at_charge and k > t and Cs[k] > 0.1):
+                break
+            if binds(k):
+                last = k
+        return last
+
+    def reserve_detail(t: int, last: int) -> dict:
+        """The figures a reserve reason can be checked against: the chance that an outage starts while the energy is held for it (every step of
+        the window, not one step's), how long that is, how long an outage the reserve covers (two steps behind an AMF panel), and the reserve
+        the rows ask for, never above the battery's usable band."""
+        k0 = next(k for k in range(t, last + 1) if binds(k))
+        chance = 1.0 - float(np.prod(1.0 - np.clip(p_start[t:last + 1], 0.0, 1.0)))
+        kwh = min(float(R[k0]), (bat["soc_max"] - bat["soc_min"]) * En)
+        return {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "hours": round(int(R_steps[k0]) * H, 2), "kwh": round(kwh, 1)}
+
+    def next_discharge(t: int) -> int | None:
+        return next((k for k in range(t + 1, T) if Ds[k] > 0.1), None)
+
     reasons = []
     for t in range(T):
         G, X, K, U, C, D, P = (float(s[k][t]) for k in ("G", "X", "K", "U", "C", "D", "P"))
@@ -814,8 +851,23 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
             # what PV and the genset leave over after the load, as delivery.grid_charging reads it; a site without grid charging never names it
             surplus = max(0.0, PV[t] - K + (P if gen else 0.0) - L[t])
             if C - surplus > 0.1 and G > 0.1 and (not bat or bat.get("a_grid", True)):
-                r = "charge_from_grid"
-                d = {"rs_per_kwh": round(float(p["c_imp"][t]), 2)}
+                # grid charging is "cheaper" only against a dearer step the energy is used at; where it is not (the peak window, or a later use
+                # at the same price) and the reserve rows bind the energy, the step is named for the reserve it refills (round 7,
+                # flow-telemetry-plan-control-02): never "while energy is cheaper" at the day's highest price
+                use = next_discharge(t)
+                use_price = float(c_imp[use]) if use is not None and g[use] > 0.5 else None
+                cheaper = use_price is not None and use_price > float(c_imp[t]) + 1e-6
+                last = reserve_window(t, stop_at_charge=False) if bat else None
+                d = {"rs_per_kwh": round(float(c_imp[t]), 2)}
+                if last is not None and not cheaper:
+                    r = "charge_for_reserve"
+                    d.update(reserve_detail(t, last))
+                else:
+                    r = "charge_from_grid"
+                    if use is not None:
+                        d["use_t"] = int(ts[use])
+                        if use_price is not None:
+                            d["use_rs_per_kwh"] = round(use_price, 2)
             elif gen and P > 0.1:
                 r = "genset_on"
             else:
