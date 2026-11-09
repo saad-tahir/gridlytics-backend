@@ -124,3 +124,84 @@ def test_a_viewer_reads_the_litres_saved_and_the_verified_days_but_no_rupee(worl
     assert [(d["day"], d["litres_actual"], d["litres_native"]) for d in seen["days"]] == [("2026-11-02", 40.0, 52.5), ("2026-11-03", 40.0, 47.5)]
     assert {k for k in _keys(seen) if money.is_money(k)} == set()
     assert not {4321.0, 2345.0, 6666.0, 30000.0} & {v for d in seen["days"] for v in d.values()} and "6666" not in json.dumps(seen)
+
+
+# ------------------------------------------------------------------------------------------------ security-roles-16
+
+def _member(world, email: str) -> dict:
+    return next(u for u in world.c["admin"].get("/api/users").json() if u["email"] == email)
+
+
+def test_an_administrator_grants_a_named_viewer_the_costs_and_takes_them_back(world):
+    """Plan Part 10.5: "A named viewer may be granted see_costs by an admin." The grant is the costs alone: the fee, the money settings, exports and every
+    change stay the roles'; a grant is a viewer's, and a viewer made another role loses it."""
+    from gridlytics import store
+    sid, a, op, v = world.site, world.c["admin"], world.c["operator"], world.c["viewer"]
+    assert a.put(f"/api/sites/{sid}", json={"voll_rs_per_kwh": 650}).status_code == 200
+    assert op.post(f"/api/sites/{sid}/genset/fuel", json={"litres": 50, "day": "2026-11-05", "cost_rs": 14000, "note": "tanker"}).status_code == 200
+    viewer = _member(world, "viewer@fix.test")
+    assert viewer["grants"] == []
+
+    def costs() -> bool:
+        return v.get("/api/auth/state").json()["can"]["see_costs"]
+
+    assert not costs() and v.get("/api/tariffs").status_code == 403
+    # only an administrator grants, only the costs, and only as a list of grants
+    assert op.put(f"/api/users/{viewer['id']}", json={"grants": ["see_costs"]}).status_code == 403
+    for wrong in (["see_fee"], ["export"], "see_costs", [1]):
+        r = a.put(f"/api/users/{viewer['id']}", json={"grants": wrong})
+        assert r.status_code == 422 and "see costs" in r.json()["detail"], (wrong, r.text)
+    r = a.put(f"/api/users/{viewer['id']}", json={"grants": ["see_costs"]})
+    assert r.status_code == 200 and r.json()["grants"] == ["see_costs"] and r.json()["role"] == "viewer", r.text
+    assert _member(world, "viewer@fix.test")["grants"] == ["see_costs"]
+    # the viewer now reads the costs (a fuel log's rupees, the tariff library), and nothing else of the roles: no fee, no money setting, no export, no change
+    can = v.get("/api/auth/state").json()["can"]
+    assert can["see_costs"] and not any(can[p] for p in ("see_fee", "see_money_settings", "export", "edit_sites", "manage_users", "apply_plan"))
+    assert v.get("/api/meta").json()["permissions"]["see_costs"] is True
+    assert [e["detail"]["cost_rs"] for e in v.get(f"/api/sites/{sid}/events").json() if e["type"] == "fuel_log"] == [14000]
+    assert v.get("/api/tariffs").status_code == 200
+    site = v.get(f"/api/sites/{sid}").json()
+    assert "voll_rs_per_kwh" not in _keys(site) and "fee" not in _keys(site)
+    assert v.put(f"/api/sites/{sid}", json={"name": "Mill Renamed"}).status_code == 403
+    # the trail says who granted what
+    with world.use():
+        trail = [x for x in store.list_audit() if x["action"] == "changed a user" and x["target"] == "viewer@fix.test"]
+    assert trail and trail[0]["detail"]["grants"] == ["see_costs"] and trail[0]["detail"]["grants_before"] == []
+    # taken back
+    r = a.put(f"/api/users/{viewer['id']}", json={"grants": []})
+    assert r.status_code == 200 and r.json()["grants"] == []
+    assert not costs() and v.get("/api/tariffs").status_code == 403
+    assert "cost_rs" not in _keys(v.get(f"/api/sites/{sid}/events").json())
+
+
+def test_a_grant_is_a_viewers_and_ends_when_the_role_changes(world):
+    a = world.c["admin"]
+    operator = _member(world, "operator@fix.test")
+    # the other roles see the costs already
+    r = a.put(f"/api/users/{operator['id']}", json={"grants": ["see_costs"]})
+    assert r.status_code == 422 and "viewer" in r.json()["detail"], r.text
+    r = a.put(f"/api/users/{operator['id']}", json={"role": "viewer", "grants": ["see_costs"]})
+    assert r.status_code == 200 and (r.json()["role"], r.json()["grants"]) == ("viewer", ["see_costs"]), r.text
+    # made an analyst, the grant ends; made a viewer again, it does not come back by itself
+    assert a.put(f"/api/users/{operator['id']}", json={"role": "analyst"}).json()["grants"] == []
+    again = a.put(f"/api/users/{operator['id']}", json={"role": "viewer"}).json()
+    assert (again["role"], again["grants"]) == ("viewer", [])
+    assert world.c["operator"].get("/api/auth/state").json()["can"]["see_costs"] is False
+    # a refusal names the viewers who were granted the costs
+    r = world.c["operator"].get("/api/tariffs")
+    assert r.status_code == 403 and "a viewer allowed to see costs" in r.json()["detail"], r.text
+
+
+def test_a_grant_is_kept_in_the_company_file_and_a_key_never_holds_one(world, tmp_path):
+    """The grant is a column of the member's row (schema version 3); a machine key carries scopes, never a role's permission or a grant."""
+    from gridlytics import auth, store, store_members
+    with world.use(), store.connect() as con:
+        assert "grants" in {r[1] for r in con.execute("PRAGMA table_info(members)").fetchall()}
+    with world.use():
+        with __import__("pytest").raises(ValueError):
+            store_members.update_member(_member(world, "viewer@fix.test")["id"], grants=["export"])
+    token = auth.current.set({"id": "key:x", "role": "viewer", "api_key": True, "grants": ["see_costs"]})
+    try:
+        assert auth.can("see_costs") is False
+    finally:
+        auth.current.reset(token)

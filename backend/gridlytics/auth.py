@@ -47,6 +47,13 @@ PERMISSIONS = {
     #: the energy-only report carries no money (plan Part 8.5: the viewer-safe report), so every member may generate it, a viewer included
     "energy_report": {"admin", "operator", "analyst", "viewer"},
 }
+#: What an administrator may grant a named member beyond the role (plan Part 10.5: "A named viewer may be granted see_costs by an admin"; audit
+#: security-roles-16), and the role a grant is for: every other role holds it already. A grant is kept on the member's row (`members.grants`) and ends when
+#: the person's role changes (store_members.update_member); a machine key never holds one.
+GRANTS = {"see_costs": "viewer"}
+#: A grant in words, for the Members page and the refusals
+GRANT_WORDS = {"see_costs": "see costs"}
+
 #: A session of local sign-in (its refresh tokens, platform.py) ends this many hours unused, and however active, this many days after sign-in (review of batch
 #: 1, for the cookie sessions of before)
 SESSION_HOURS = 12
@@ -152,13 +159,19 @@ def can(permission: str) -> bool:
         # a machine key carries scopes, not a role (plan Part 10.5): the guard limits it to its scopes and its site, and it holds no role permission, so
         # no key sees costs or the fee, exports or changes a setting, whatever role it was made with
         return False
-    return user["role"] in PERMISSIONS[permission]
+    if user["role"] in PERMISSIONS[permission]:
+        return True
+    # a grant an administrator gave this person (plan Part 10.5), good only for the role it is for
+    return GRANTS.get(permission) == user["role"] and permission in (user.get("grants") or ())
 
 
 def roles_words(permission: str) -> str:
-    """The roles that hold a permission, in a phrase: "an administrator or an engineer"."""
+    """The roles that hold a permission, in a phrase: "an administrator or an engineer"; a permission that can be granted names who it is granted to ("an
+    administrator, an operator, an analyst or a viewer allowed to see costs")."""
     names = [ROLES[r].lower() for r in ROLES if r in PERMISSIONS[permission]]
     named = [f"{'an' if n[0] in 'aeiou' else 'a'} {n}" for n in names]
+    if permission in GRANTS:
+        named.append(f"a {ROLES[GRANTS[permission]].lower()} allowed to {GRANT_WORDS[permission]}")
     return named[0] if len(named) == 1 else f"{', '.join(named[:-1])} or {named[-1]}"
 
 
