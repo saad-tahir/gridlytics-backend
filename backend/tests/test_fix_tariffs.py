@@ -162,9 +162,10 @@ def test_legacy_surplus_period_moves_only_the_bare_credit(company, tax):
     vec = tariffs.vectors(conn, _t0(ts), 96, mtd_imp, None, 1e9, mtd_exp, None)
     s = OFF // 15
     tie = tariffs.LEGACY_EXPORT_TIE_BREAK  # the optimiser's export price sits a hair below the import (tariffs-legacy-degenerate-lp)
-    assert vec["c_imp"][s] == pytest.approx(35.15) and vec["c_exp"][s] == pytest.approx(35.15 - tie)
-    assert -_bump(conn, ts, imp, exp, d0, d0, OFF, "exp") == pytest.approx(35.15, abs=0.02)
-    assert _bump(conn, ts, imp, exp, d0, d0, OFF, "imp") == pytest.approx(35.15, abs=0.02)
+    s_rate = 25.32  # the notified NAPPP since round 7 (audit engine-tariffs-04); the off-peak 35.15 before
+    assert vec["c_imp"][s] == pytest.approx(s_rate) and vec["c_exp"][s] == pytest.approx(s_rate - tie)
+    assert -_bump(conn, ts, imp, exp, d0, d0, OFF, "exp") == pytest.approx(s_rate, abs=0.02)
+    assert _bump(conn, ts, imp, exp, d0, d0, OFF, "imp") == pytest.approx(s_rate, abs=0.02)
     p = PEAK_NOV // 15  # the peak period still nets to an import
     assert -_bump(conn, ts, imp, exp, d0, d0, PEAK_NOV, "exp") == pytest.approx(vec["c_exp"][p] + tie, rel=1e-3, abs=0.02)
 

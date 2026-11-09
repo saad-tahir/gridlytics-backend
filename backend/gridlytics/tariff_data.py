@@ -124,6 +124,14 @@ SHIPPED = [
     {"kind": "prosumer", "key": "net_metering_legacy", "effective_from": "2015-09-01", "known_from": "2026-09-07", "status": "active",
      "body": {"netting": "by_period", "surplus_rate": "off_peak", "accounting_rate": 25.32, "netting_verified": "unverified"},
      "source": {**SRO_251, "ref": "SRO 547(I)/2026 keeps 2015 agreements to expiry; netting by period is DISCO practice (secondary, unverified)"}},
+    # From the CY2026 PPP reference (notified w.e.f. 1 January 2026), the legacy surplus at the notified NAPPP, the only primary figure (R9 8.2): NEPRA
+    # accounts net-metering exports at Rs 25.32/kWh for Apr-Jun 2026. The off-peak rule of R9 8.3 rests on press reports of DISCO practice; a legacy
+    # bill that shows the off-peak rate is entered as a version with surplus_rate "off_peak". A newer quarter's NAPPP is a new version
+    {"kind": "prosumer", "key": "net_metering_legacy", "effective_from": "2026-01-01", "known_from": "2026-09-07", "status": "active",
+     "body": {"name": "Legacy net metering: surplus credited at the notified NAPPP", "netting": "by_period", "surplus_rate": "nappp", "nappp": 25.32,
+              "quarter": "2026-04..2026-06", "netting_verified": "unverified"},
+     "source": {**SRO_1501, "ref": "SRO 1501(I)/2026 para 23: net-metering exports accounted at the notified NAPPP, Rs 25.32/kWh for Apr-Jun 2026 "
+                                   "(PPP reference w.e.f. 01-01-2026); SRO 547(I)/2026 keeps 2015 agreements to expiry"}},
 ]
 
 #: Daily HSD pump prices (R9 section 9.1), Rs per litre

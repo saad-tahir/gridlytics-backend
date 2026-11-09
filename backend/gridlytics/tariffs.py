@@ -253,9 +253,14 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
         if key == "net_billing" and (not _num(body.get("naepp")) or body["naepp"] < 0):
             raise ValueError("Net billing needs the export price naepp in Rs/kWh")
         if key == "net_metering_legacy":
-            sr = body.get("surplus_rate", "off_peak")
-            if not (sr in ("off_peak", "peak") or (_num(sr) and sr >= 0)):
-                raise ValueError('Legacy net metering\'s surplus_rate is "off_peak", "peak" or a rate in Rs/kWh')
+            if "nappp" in body and (not _num(body["nappp"]) or body["nappp"] < 0):
+                raise ValueError("Legacy net metering's nappp is the notified national average power purchase price in Rs/kWh")
+            sr = body.get("surplus_rate", "nappp" if "nappp" in body else "off_peak")
+            if not (sr in ("nappp", "off_peak", "peak") or (_num(sr) and sr >= 0)):
+                raise ValueError('Legacy net metering\'s surplus_rate is "nappp" (the notified national average power purchase price), "off_peak", '
+                                 '"peak" or a rate in Rs/kWh')
+            if sr == "nappp" and "nappp" not in body:
+                raise ValueError('Legacy net metering\'s surplus_rate "nappp" needs the notified rate: nappp in Rs/kWh')
             if body.get("netting", "by_period") != "by_period":
                 raise ValueError("Legacy net metering is modelled with by-period netting only (netting: by_period)")
     elif kind == "tax":
@@ -592,10 +597,15 @@ def _seasonal_factor(data: dict, month: int) -> float:
 
 
 def _legacy_surplus_rate(card: dict, pro: dict | None) -> float:
-    """The rate a legacy net-metering surplus is credited at, from the prosumer version (the off-peak rate by default; no duty or tax on it)."""
-    sr = (pro or {}).get("surplus_rate", "off_peak")
+    """The rate a legacy net-metering surplus is credited at, from the prosumer version (no duty or tax on it): the notified NAPPP ("nappp", the
+    shipped default from 2026: NEPRA accounts net-metering exports at it, SRO 1501(I)/2026 para 23), a fixed rate, or the off-peak (or peak) rate of
+    the connection's tariff where a legacy bill shows that (the 2015 practice R9 8.3 reports, unverified)."""
+    pro = pro or {}
+    sr = pro.get("surplus_rate", "nappp" if _num(pro.get("nappp")) else "off_peak")
     if _num(sr):
         return float(sr)
+    if sr == "nappp" and _num(pro.get("nappp")):
+        return float(pro["nappp"])
     return _energy_rate(card, sr == "peak")
 
 

@@ -100,6 +100,36 @@ def test_the_savings_report_counts_a_bundled_fca_as_billed(company):
     assert verify.summary(sid, "2026-11-01", "2026-11-30")["final_conditions"]["fca_billed"] is True  # before: only key "fca" counted
 
 
+# ------------------------------------------------------------------------------------------------ engine-tariffs-04: the legacy surplus at the NAPPP
+
+@pytest.mark.parametrize("category", ["A-2(c)", "B-2(b)"])
+def test_a_legacy_surplus_is_credited_at_the_notified_nappp(company, category):
+    conn = _conn(category, "net_metering_legacy")
+    ts, imp, exp = _flat_day(NOV)
+    exp[9 * 60:15 * 60] = 400.0  # the off-peak period ends in surplus
+    cal = tariffs.calendar_for(conn, NOV)
+    peak = np.array([tariffs.is_peak_local(cal, datetime.fromtimestamp(int(t), PKT)) for t in ts])
+    mtd_imp = {"peak": float(imp[peak].sum() / 60), "off_peak": float(imp[~peak].sum() / 60)}
+    mtd_exp = {"peak": float(exp[peak].sum() / 60), "off_peak": float(exp[~peak].sum() / 60)}
+    vec = tariffs.vectors(conn, _t0(ts), 96, mtd_imp, None, 1e9, mtd_exp, None)
+    assert tariffs.prosumer("net_metering_legacy", NOV)["nappp"] == 25.32
+    assert vec["c_imp"][OFF // 15] == pytest.approx(25.32)                        # before: 35.15 (A-2(c)) or 22.83 (B-2(b)), the off-peak rate
+    assert -_bump(conn, ts, imp, exp, NOV, NOV, OFF, "exp") == pytest.approx(25.32, abs=0.02)
+    credit = next(line for line in tariffs.rebuild(ts, imp, exp, conn, NOV, NOV)["lines"] if line["line"] == "Export credit")
+    assert credit["amount_rs"] == pytest.approx(-25.32 * credit["units_kwh"], abs=0.01)
+
+
+def test_a_legacy_bill_that_shows_the_off_peak_rate_overrides_the_nappp(company):
+    _approve("prosumer", "net_metering_legacy", "2026-11-01", {"name": "Legacy surplus at the off-peak rate (confirmed on the site's bill)",
+                                                             "netting": "by_period", "surplus_rate": "off_peak"})
+    conn = _conn("A-2(c)", "net_metering_legacy")
+    ts, imp, exp = _flat_day(NOV)
+    exp[9 * 60:15 * 60] = 400.0
+    assert -_bump(conn, ts, imp, exp, NOV, NOV, OFF, "exp") == pytest.approx(35.15, abs=0.02)
+    with pytest.raises(ValueError, match="nappp"):
+        tariffs.propose("prosumer", "net_metering_legacy", "2027-01-01", {"netting": "by_period", "surplus_rate": "nappp"}, SRC, "t")
+
+
 # ------------------------------------------------------------------------------------------------ engine-tariffs-11: DSS by category
 
 def _line(bill, prefix):

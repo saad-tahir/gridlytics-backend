@@ -331,8 +331,9 @@ def test_the_ledger_prices_a_legacy_surplus_period_at_the_surplus_rate(company):
     _flat_rows(sid, date(2026, 11, 1), 3, 100.0, export_kw=lambda m: 400.0 if 9 * 60 <= m < 15 * 60 else 0.0)  # off-peak exports beat imports
     day = date(2026, 11, 2)
     pr = verify._minute_prices(conn, day, sid)
-    assert pr["c_imp"][OFF] == pytest.approx(35.15)  # before: priced as a net import (about 39.5), the exports never passed
-    assert pr["c_exp"][OFF] == pytest.approx(35.15)  # the bill's own price: the optimiser's tie-break is not booked in the ledger
+    s_rate = 25.32  # the notified NAPPP since round 7 (audit engine-tariffs-04); the off-peak 35.15 before
+    assert pr["c_imp"][OFF] == pytest.approx(s_rate)  # before: priced as a net import (about 39.5), the exports never passed
+    assert pr["c_exp"][OFF] == pytest.approx(s_rate)  # the bill's own price: the optimiser's tie-break is not booked in the ledger
     tot = verify.month_totals(sid, conn, day)
     assert tot["export"]["off_peak"] > tot["import"]["off_peak"] and tot["export"]["peak"] == 0.0
     assert verify.month_imports(sid, conn, day) == tot["import"]
@@ -401,7 +402,8 @@ def test_a_legacy_site_never_plans_import_and_export_in_the_same_step(company):
     vec = tariffs.vectors(conn, datetime(2026, 11, 2, 0, 0, tzinfo=PKT).astimezone(timezone.utc), 96, {"peak": 400.0, "off_peak": 2000.0}, None, 1e9,
                           {"peak": 0.0, "off_peak": 2400.0}, None)
     s = OFF // 15
-    assert vec["c_imp"][s] == pytest.approx(35.15) and vec["c_exp"][s] == pytest.approx(35.15 - tariffs.LEGACY_EXPORT_TIE_BREAK)
+    s_rate = 25.32  # the notified NAPPP since round 7 (audit engine-tariffs-04); the off-peak 35.15 before
+    assert vec["c_imp"][s] == pytest.approx(s_rate) and vec["c_exp"][s] == pytest.approx(s_rate - tariffs.LEGACY_EXPORT_TIE_BREAK)
 
 
 # ------------------------------------------------------------------------------------------------ tariffs-adder-early-start-drops-previous
