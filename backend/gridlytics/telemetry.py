@@ -115,12 +115,22 @@ def connect():
 
 # ------------------------------------------------------------------------------------------------ writing
 
-def write_rows(rows: list[tuple], columns: tuple = COLUMNS) -> int:
+def _insert_sql(columns: tuple, merge: bool) -> str:
+    """The minute rows' write. Without `merge` a row replaces the stored minute whole (the twin's own rows); with it, a stored minute keeps every column
+    the new row leaves missing (None), so an upload or a batch that carries fewer columns never erases the others (audit R7, overlap)."""
+    base = f"INSERT INTO minute ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})"
+    if not merge:
+        return base.replace("INSERT INTO", "INSERT OR REPLACE INTO", 1)
+    sets = ", ".join(f"{c} = excluded.{c}" if c == "source_id" else f"{c} = COALESCE(excluded.{c}, minute.{c})"
+                     for c in columns if c not in ("site_id", "ts"))
+    return f"{base} ON CONFLICT(site_id, ts) DO UPDATE SET {sets}"
+
+
+def write_rows(rows: list[tuple], columns: tuple = COLUMNS, merge: bool = False) -> int:
     if not rows:
         return 0
-    sql = f"INSERT OR REPLACE INTO minute ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})"
     with connect() as con:
-        con.executemany(sql, rows)
+        con.executemany(_insert_sql(columns, merge), rows)
     return len(rows)
 
 
@@ -169,8 +179,12 @@ def _epoch(v) -> int | None:
     return int(v)
 
 
-def ingest(site_id: str, records: list[dict], source: str, now: int | None = None) -> dict:
+def ingest(site_id: str, records: list[dict], source: str, now: int | None = None, count_overlap: bool = False) -> dict:
     """Normalised dict rows (edge batches and CSV) into the minute table; idempotent by (site, minute), the last value wins.
+
+    A stored minute is merged, never replaced whole: a column the row leaves missing (absent, blank or unreadable) keeps its stored value, so a CSV that
+    carries only the load never erases the PV, the battery or an edge batch's own columns for the minutes it overlaps (audit R7). With `count_overlap`
+    the answer also gives `overlap`, the minutes that were already stored.
 
     A row whose ts is not a time, or lies before 2015 or more than a day after `now`, is skipped and counted (`skipped`, and `out_of_range` for the
     dated ones), never raised: one bad row must not fail the batch on every retry."""
@@ -198,8 +212,18 @@ def ingest(site_id: str, records: list[dict], source: str, now: int | None = Non
         if row[3] is None and row[_VOLT] is not None:
             row[3] = 1.0 if row[_VOLT] >= 180 else 0.0  # grid present from voltage (plan Part 7.5; 180 V to confirm); an unreadable voltage stays unknown
         rows.append(tuple(row))
-    write_rows(rows, ALL)
-    return {"accepted": len(rows), "skipped": skipped, "unreadable_cells": unreadable, "out_of_range": out_of_range}
+    res = {"accepted": len(rows), "skipped": skipped, "unreadable_cells": unreadable, "out_of_range": out_of_range}
+    if count_overlap:
+        res["overlap"] = 0
+    if not rows:
+        return res
+    with connect() as con:
+        if count_overlap:
+            stamps = {r[1] for r in rows}
+            res["overlap"] = sum(1 for (t,) in con.execute("SELECT ts FROM minute WHERE site_id = ? AND ts >= ? AND ts <= ?",
+                                                           (site_id, min(stamps), max(stamps))) if t in stamps)
+        con.executemany(_insert_sql(ALL, merge=True), rows)
+    return res
 
 
 def _check_window(stamps: list[int], now: int | None = None) -> None:
@@ -319,8 +343,11 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         log.append(f"{bad_ts} rows without a readable ts were skipped")
     records.sort(key=lambda r: r["ts"])
     gaps = sum(1 for a, b in zip(records, records[1:]) if b["ts"] - a["ts"] > 300)
-    res = ingest(site_id, records, "csv", now=now)
+    res = ingest(site_id, records, "csv", now=now, count_overlap=True)
     res["skipped"] += bad_ts
+    if res["overlap"]:
+        log.append(f"{res['overlap']:,} minutes were already stored: the file's values replaced theirs, and the columns the file does not carry (or "
+                   f"leaves blank) were kept")
     if res.get("unreadable_cells"):
         log.append(f"{res['unreadable_cells']} cells were not finite numbers (text such as N/A, NaN or inf) or were beyond any meter's range "
                    f"(over a billion), and were stored as missing")
@@ -335,7 +362,7 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
                     (iid, site_id, "csv", digest, res["accepted"], gaps, "done", json.dumps(log), store._now(), first, last, name))
     for day in _local_days(r["ts"] for r in records):  # only the days that received rows, not every day between the first and the last
         aggregate_day(site_id, day)
-    return {"id": iid, "rows": res["accepted"], "skipped": res["skipped"], "gaps": gaps, "log": log,
+    return {"id": iid, "rows": res["accepted"], "skipped": res["skipped"], "gaps": gaps, "log": log, "minutes": res["accepted"], "overlap": res["overlap"],
             "from": datetime.fromtimestamp(first, timezone.utc).isoformat(), "to": datetime.fromtimestamp(last, timezone.utc).isoformat(),
             "from_ts": first, "to_ts": last, "file_name": name}
 
