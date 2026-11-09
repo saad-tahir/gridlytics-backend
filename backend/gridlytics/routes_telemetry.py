@@ -219,8 +219,7 @@ def outages(site_id: str, days: int = 30):
     sch = forecast.schedule(site_id)
     if sch:
         for o in log:
-            m = forecast._window_mask(sch["windows"], np.array([o["start"] + 300]))
-            o["scheduled"] = bool(m[0])
+            o["scheduled"] = forecast.in_announced_window(sch["windows"], o["start"], o["end"])
     with store.connect() as con:
         rows = con.execute("SELECT ts, detail FROM events WHERE site_id = ? AND type = 'outage_cause'", (site_id,)).fetchall()
     cause = {}

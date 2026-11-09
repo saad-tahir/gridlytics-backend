@@ -443,6 +443,20 @@ def _window_mask(windows: list, ts: np.ndarray) -> np.ndarray:
     return m
 
 
+#: an outage that starts up to this many minutes before an announced window opens, and is still down when it does, is that window's shedding: a DISCO's
+#: feeder is switched by hand and seldom on the minute (round 7, role-analyst-15: 13:51 and 13:53 starts read as unannounced against 14:00)
+ANNOUNCED_EARLY_MIN = 15
+
+
+def in_announced_window(windows: list, start: int, end: int) -> bool:
+    """Whether the outage [start, end) is an announced window's: it starts inside a window, or up to ANNOUNCED_EARLY_MIN minutes before one opens and
+    is still down when it does. One over before the window opens, or starting earlier (a trip running into the window), is not."""
+    if not windows:
+        return False
+    xs = np.arange(int(start), min(int(end), int(start) + ANNOUNCED_EARLY_MIN * 60 + 1), 60)
+    return bool(len(xs) and _window_mask(windows, xs).any())
+
+
 #: the schedule adherence's prior, Beta(8, 2) (plan Part 5.3): 8 kept windows in 10
 ADHERENCE_PRIOR = (8.0, 10.0)
 #: a window occurrence is a trial only when its known grid samples cover at least this share of its minutes (a logger that was off says nothing)

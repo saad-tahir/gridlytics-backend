@@ -814,3 +814,66 @@ def test_the_plan_s_forecast_stage_leaves_out_a_kind_that_does_not_apply(api_wor
     with w.use():
         out = plans.tick(w.site, save=False)
     assert out["summary"]["stage"] == 0 and "pv" not in out["summary"]["stages"] and out["summary"]["stages"]["load"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ outages page: helpers
+
+#: the outages page's "now" in the route tests: Monday 9 November 2026, 18:00 in Karachi
+PAGE_NOW = int(datetime(2026, 11, 9, 18, 0, tzinfo=PKT).timestamp())
+
+
+def _pkt(month: int, day: int, hh: int, mm: int) -> int:
+    return int(datetime(2026, month, day, hh, mm, tzinfo=PKT).timestamp())
+
+
+def _page(w, monkeypatch, days: int, role: str = "analyst") -> dict:
+    """GET /outages?days= at PAGE_NOW as `role`."""
+    from gridlytics import routes_telemetry
+    monkeypatch.setattr(routes_telemetry, "now_ts", lambda: PAGE_NOW)
+    r = w.c[role].get(f"/api/sites/{w.site}/outages?days={days}")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _grid_with_downs(sid: str, t0: int, t1: int, downs, soc=None) -> None:
+    """1-minute grid-present rows from t0 to t1, down in each [start, end) of `downs`; with `soc` (0-1, a number or a function of ts), the estimated state
+    of charge."""
+    ts = np.arange(t0, t1, 60, dtype=np.int64)
+    g = np.ones(len(ts))
+    for a, b in downs:
+        g[(ts >= a) & (ts < b)] = 0.0
+    if soc is None:
+        _write_grid(sid, ts, g)
+    else:
+        s = soc(ts) if callable(soc) else np.full(len(ts), float(soc))
+        telemetry.write_rows([(sid, int(t), "edge", float(x), float(y) * 100) for t, x, y in zip(ts, g, s)],
+                             ("site_id", "ts", "source_id", "grid_present", "battery_soc_est_pct"))
+
+
+# ------------------------------------------------------------------------------------------------ role-analyst-15
+
+def test_an_outage_starting_a_few_minutes_before_an_announced_window_is_that_window_s(api_world, monkeypatch):
+    """The feeder's schedule is 14:00 to 16:00, Monday to Saturday. A DISCO's feeder is switched by hand and seldom on the minute: an outage that starts up
+    to 15 minutes before a window opens and is still down when it does is the window's shedding, as is one starting inside it. One starting 30 minutes
+    early, one over before the window opens, one on a Sunday and one at 10:00 are not. v1 tested only the start plus 5 minutes, so 13:51 and 13:53 read
+    'Announced: No' with no cause, while 13:59 read 'In a window', 'Scheduled shedding'."""
+    w = api_world
+    outs = {
+        (10, 31, 13, 51): ((10, 31, 16, 6), True),     # Saturday, 9 minutes early (v1: not announced)
+        (11, 2, 13, 30): ((11, 2, 14, 30), False),     # Monday, 30 minutes early: a trip that ran into the window
+        (11, 3, 10, 0): ((11, 3, 10, 40), False),      # Tuesday morning, no window
+        (11, 4, 13, 59): ((11, 4, 16, 15), True),      # Wednesday, a minute early
+        (11, 5, 14, 4): ((11, 5, 16, 0), True),        # Thursday, inside the window
+        (11, 6, 13, 53): ((11, 6, 16, 8), True),       # Friday, 7 minutes early (v1: not announced)
+        (11, 7, 13, 40): ((11, 7, 13, 50), False),     # Saturday, over before the window opens
+        (11, 8, 14, 0): ((11, 8, 16, 0), False),       # Sunday: the windows are Monday to Saturday
+    }
+    with w.use():
+        forecast.set_schedule(w.site, [["14:00", "16:00", "weekdays"]], "entered", "test")
+        _grid_with_downs(w.site, PAGE_NOW - 10 * 86400, PAGE_NOW, [(_pkt(*a), _pkt(*b)) for a, (b, _) in outs.items()])
+    log = {o["start"]: o for o in _page(w, monkeypatch, 10)["log"]}
+    assert len(log) == len(outs)
+    for a, (_b, announced) in outs.items():
+        o = log[_pkt(*a)]
+        assert o["scheduled"] is announced, a
+        assert o["cause"] == ("scheduled" if announced else ""), a
