@@ -37,6 +37,10 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
         return {"key": "paused", "label": "Control paused", "until": kinds["pause_control"]["until_ts"]}
     if "force_native" in kinds:
         return {"key": "native", "label": "Released to native", "until": kinds["force_native"]["until_ts"]}
+    block = plans.switchback_release(site["id"], now)
+    if block:
+        # a native block of the switchback calendar: the inverter runs its own settings all day, so no table is keyed in or followed
+        return {"key": "native_block", "label": "Switchback: native settings today", "until": block["until"]}
     if "reserve" in kinds:
         until = datetime.fromisoformat(kinds["reserve"]["until_ts"]).astimezone(PKT).strftime("%H:%M")
         return {"key": "hold", "label": f"Hold until {until}", "until": kinds["reserve"]["until_ts"]}

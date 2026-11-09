@@ -5,7 +5,9 @@ Batch 1, what reaches the device:
 - the wrong-plan guard can refuse a plan: the fallback floor, unserved critical load in a forecast outage, the plan's own MDI cap, load shed with the
   grid up, a genset slot with the grid present, an export slot where nothing may be exported, a slot floor under the fallback (audit
   engine-delivery-01, engine-plans-live-05);
-- a plan past its valid_until is not in force, not served and not keyed in (audit engine-delivery-24).
+- a plan past its valid_until is not in force, not served and not keyed in (audit engine-delivery-24);
+- on a day in a native block of the switchback calendar the live site runs its native settings: the tick holds the plan, the edge gets a release,
+  the pages say so (audit engine-savings-01, brief-vs-build-01, flow-savings-pilot-bill-05).
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -275,3 +277,61 @@ def test_the_plan_and_control_pages_and_the_edge_see_an_expired_plan_as_no_plan(
     kh = world.key(["plans:read"], role="viewer")
     r = world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=kh)
     assert r.status_code == 404 and r.json()["code"] == "plan_expired", r.text
+
+
+# ------------------------------------------------------------------------------------------------ engine-savings-01, brief-vs-build-01, flow-savings-pilot-bill-05
+
+def _block(sid: str, start: date, end: date, arm: str, locked: int = 1) -> None:
+    with store.connect() as con:
+        con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,?)",
+                    (sid, start.isoformat(), end.isoformat(), arm, locked))
+
+
+def _today() -> date:
+    return datetime.now(PKT).date()
+
+
+def test_a_native_block_day_releases_the_live_site_to_its_native_settings(company):
+    sid = _site(genset=False)
+    _closed_loop(sid)
+    assert plans.tick(sid)["status"] == "active"
+    today = _today()
+    _block(sid, today - timedelta(days=2), today + timedelta(days=1), "native")
+    rel = plans.control_release(sid)
+    assert rel["reason"] == "switchback_native" and rel["kind"] == "switchback" and rel["override_id"] is None
+    end = datetime(*(today + timedelta(days=2)).timetuple()[:3], tzinfo=PKT)          # the block's last day ends at midnight Pakistan time
+    assert plans._ts(rel["until"]) == int(end.timestamp())
+    r = plans.tick(sid)
+    assert r["status"] == "held"
+    with store.connect() as con:
+        assert con.execute("SELECT reason FROM plans WHERE id = ?", (r["plan_id"],)).fetchone()["reason"] == "switchback_native"
+    assert plans.current(sid) is None                                                  # the plan block's plan stops being in force
+    assert plans.active_at(sid, _now()) is None
+    h = plans.held_info(sid)
+    assert h["reason"] == "switchback_native" and h["plan_id"] == r["plan_id"] and plans._ts(h["until"]) == int(end.timestamp())
+    msg = plans.signed_message(sid)
+    assert msg["type"] == "release" and msg["release"]["reason"] == "switchback_native" and msg["mode_a"]["days"] == []
+    assert delivery.verify(msg, delivery.public_key(sid)["public_key"])
+
+
+def test_a_plan_block_day_runs_the_plan_and_a_persons_pause_comes_before_the_calendar(company):
+    sid = _site(genset=False)
+    today = _today()
+    _block(sid, today, today + timedelta(days=6), "plan")
+    assert plans.control_release(sid) is None and plans.tick(sid)["status"] == "active"
+    other = _site(genset=False)
+    _block(other, today, today + timedelta(days=6), "native")
+    sites.add_override(other, {"kind": "pause_control", "until": _until(2), "reason": "test"}, "t")
+    assert plans.control_release(other)["reason"] == "control_paused"
+
+
+def test_the_plan_and_control_pages_say_a_native_block_day(world):
+    sid = world.site
+    with world.use():
+        _block(sid, _today(), _today() + timedelta(days=3), "native")
+    a = world.c["admin"]
+    body = a.get(f"/api/sites/{sid}/plan").json()
+    assert body["plan"] is None and body["held"]["reason"] == "switchback_native"
+    ctl = a.get(f"/api/sites/{sid}/control").json()["control"]
+    assert ctl["key"] == "native_block" and plans._ts(ctl["until"]) is not None
+    assert "native" in ctl["label"].lower()

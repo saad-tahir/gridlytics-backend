@@ -118,6 +118,11 @@ def _carried_genset(site_id: str, t0: int) -> dict:
 
 
 RELEASE_REASONS = {"pause_control": "control_paused", "force_native": "released_to_native"}
+#: the held reason of a day in a native block of the switchback calendar (plan 8.2, VER-08: a baseline block plans "native"); it holds the plan as a
+#: pause does, but comes from the calendar, not from an override, so no person resumes it: the block's end does
+SWITCHBACK_REASON = "switchback_native"
+#: every held reason under which no plan is in force because the inverter runs its own settings
+RELEASED_REASONS = (*RELEASE_REASONS.values(), SWITCHBACK_REASON)
 
 
 def _ts(iso: str | None) -> int | None:
@@ -138,15 +143,17 @@ def _override_steps(o: dict, ts: np.ndarray) -> np.ndarray:
 
 
 def control_release(site_id: str, at: int | None = None) -> dict | None:
-    """The pause (pause_control) or release to native (force_native) in force at `at` (now by default), else None. While one is in force no
-    plan is in force: the tick stores its plan as held and the edge is sent a release instead of the slots (Part 7.3)."""
+    """The pause (pause_control) or release to native (force_native) in force at `at` (now by default), else, on a day in a native block of the
+    switchback calendar, that block (`switchback_release`), else None. While one is in force no plan is in force: the tick stores its plan as held
+    and the edge is sent a release instead of the slots (Part 7.3). A person's pause or release comes first: it names who placed it and can be
+    resumed, which a calendar block cannot."""
     at = int(at if at is not None else datetime.now(timezone.utc).timestamp())
     ovs = sites.overrides(site_id)
     for kind in ("pause_control", "force_native"):
         for o in ovs:
             if o["kind"] == kind and bool(_override_steps(o, np.array([forecast.align(at)]))[0]):
                 return {"reason": RELEASE_REASONS[kind], "kind": kind, "until": o["until_ts"], "author": o["author"], "override_id": o["id"]}
-    return None
+    return switchback_release(site_id, forecast.align(at))
 
 
 def offgrid_c_next(g_asset: dict, fuel_price: float, load: np.ndarray, pv: np.ndarray) -> float:
@@ -570,7 +577,9 @@ def held_info(site_id: str, now: int | None = None) -> dict | None:
       and before the next tick, this is the pause's held plan under the pause's reason.
     - Otherwise, when the active plan has passed its valid_until (the ticks stopped or every solve since failed): `plan_expired`, `until` None,
       the expired plan's id and `since`, its valid_until. The edge then runs its fallback (the inverter's native settings).
-    - Otherwise None: a plan is in force, none was made yet, or the latest solve failed."""
+    - Otherwise None: a plan is in force, none was made yet, or the latest solve failed.
+    A day in a native block of the switchback calendar is a release (control_release): reason switchback_native, `until` the block's end, kind
+    `switchback`, no override."""
     now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
     rel = control_release(site_id, now)
     with store.connect() as con:
@@ -653,7 +662,9 @@ def history(site_id: str, limit: int = 50) -> list[dict]:
 def _released_at(site_id: str, ts: int) -> bool:
     """Whether a pause or a release to native was in force at the instant `ts`, from the override history: from its creation (from_ts) to its end,
     or to when it was cleared if that came first. The instant, not its quarter: a plan published after a pause was cleared mid-quarter is in force
-    from then on."""
+    from then on. A day in a native block of the switchback calendar is released all day (switchback_release)."""
+    if switchback_release(site_id, ts) is not None:
+        return True
     for o in sites.overrides(site_id, active_only=False):
         if o.get("kind") not in RELEASE_REASONS:
             continue
@@ -680,7 +691,7 @@ def active_at(site_id: str, ts: int) -> dict | None:
                 if _past_valid_until(r["valid_until"], ts):
                     return None
                 return _plan_out(con.execute("SELECT * FROM plans WHERE id = ?", (r["id"],)).fetchone())
-            if r["status"] == "held" and r["reason"] in RELEASE_REASONS.values():
+            if r["status"] == "held" and r["reason"] in RELEASED_REASONS:
                 return None
             if r["status"] == "failed" and (json.loads(r["summary"] or "{}") or {}).get("control_release"):
                 return None
@@ -741,8 +752,9 @@ def _record_send(site_id: str, plan_id: str, msg: dict) -> None:
 
 
 def _release_message(site_id: str, rel: dict, record: bool = True) -> dict:
-    """A signed release while control is paused or released to native: the same keys as a plan message, no slots and no steps, and a
-    `release` block; the edge runs the inverter's native settings until the override ends and a fresh plan is issued (Part 7.3)."""
+    """A signed release while control is paused or released to native, or on a native-block day of the switchback calendar: the same keys as a
+    plan message, no slots and no steps, and a `release` block; the edge runs the inverter's native settings until the override or the block
+    ends and a fresh plan is issued (Part 7.3)."""
     site = sites.get(site_id) or {"data": {}}
     floor = float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
     now = store._now()
@@ -750,7 +762,8 @@ def _release_message(site_id: str, rel: dict, record: bool = True) -> dict:
             "valid_until": rel["until"], "timezone": "Asia/Karachi", "mode": "b" if site["data"].get("control_mode") == "mode_b" else "a",
             "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": floor, "revert_after_hours": delivery.FALLBACK_HOURS},
             "mode_a": {"days": []}, "mode_b": None,
-            "notes": {"reason": {"control_paused": "Control paused", "released_to_native": "Released to native"}[rel["reason"]]},
+            "notes": {"reason": {"control_paused": "Control paused", "released_to_native": "Released to native",
+                                 SWITCHBACK_REASON: "Switchback native block"}[rel["reason"]]},
             "release": {"reason": rel["reason"], "until": rel["until"], "by": rel["author"]}}
     msg = delivery.sign(site_id, _no_money(body))
     if record:
@@ -760,9 +773,9 @@ def _release_message(site_id: str, rel: dict, record: bool = True) -> dict:
 
 def signed_message(site_id: str, record: bool = True) -> dict | None:
     """The current plan as the ems-edge/1.0 plan message, signed with the site's key; a signed release instead while control is paused or
-    released to native. The body carries no money field (the plan's rupees stay on the plan page). `record` writes the plan_messages row that
-    the edge page lists as a send: the edge's own pull (the key-only route) records it; any other caller passes record=False.
-    None when no plan is in force (none yet, or the last one is past its valid_until).
+    released to native, or on a native-block day of the switchback calendar. The body carries no money field (the plan's rupees stay on the plan
+    page). `record` writes the plan_messages row that the edge page lists as a send: the edge's own pull (the key-only route) records it; any other
+    caller passes record=False. None when no plan is in force (none yet, or the last one is past its valid_until).
     Only a closed-loop site's edge applies plans (plan Part 2.3): below it (the effective tier, monitor or advisory_writes) nothing is signed or
     sent and NotClosedLoop is raised, so a plans:read key at a monitor site gets no actionable table and no send is counted."""
     tier = (sites.get(site_id) or {}).get("tier", "monitor")
@@ -808,3 +821,23 @@ def _past_valid_until(valid_until: str | None, ts: int) -> bool:
     """Whether the instant `ts` is at or after a plan's valid_until (a plan with none never expires)."""
     end = _ts(valid_until)
     return end is not None and int(ts) >= end
+
+
+def switchback_release(site_id: str, at: int | None = None) -> dict | None:
+    """The native block of the switchback calendar that holds the Pakistan-time day of `at` (now by default), as a release, else None: on such a
+    day the inverter runs its own settings (plan 8.2, VER-08: a baseline block plans "native"), so the tick holds its plan, the edge is sent a
+    release and an advisory site is not asked to key a table. `until` is the block's end (midnight after its last day, Pakistan time); `author` the
+    calendar. The arm is verify.arm_on's (a locked block first), so the live site and the savings ledger read the same calendar."""
+    from . import verify  # verify imports plans at module load
+
+    at = int(at if at is not None else datetime.now(timezone.utc).timestamp())
+    day = _local(at).date()
+    if verify.arm_on(site_id, day) != "native":
+        return None
+    with store.connect() as con:
+        r = con.execute("SELECT block_start, block_end FROM switchback WHERE site_id = ? AND block_start <= ? AND block_end >= ? "
+                        "ORDER BY locked DESC, block_start DESC LIMIT 1", (site_id, day.isoformat(), day.isoformat())).fetchone()
+    end_day = date.fromisoformat(r["block_end"]) + timedelta(days=1)
+    until = datetime(end_day.year, end_day.month, end_day.day, tzinfo=PKT).astimezone(timezone.utc).isoformat(timespec="seconds")
+    return {"reason": SWITCHBACK_REASON, "kind": "switchback", "until": until, "author": "switchback calendar", "override_id": None,
+            "block_start": r["block_start"], "block_end": r["block_end"]}
