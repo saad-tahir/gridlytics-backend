@@ -107,6 +107,8 @@ _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 #: Rs/kWh a legacy net-metering export is priced below the import it nets: the bill is indifferent, but equal prices let the optimiser plan
 #: circulating import and export in the same step at no cost (a degenerate plan with impossible flows and an inflated grid cap)
 LEGACY_EXPORT_TIE_BREAK = 0.01
+#: An adder whose key starts with fca or fpa is a fuel charges adjustment: the month's own "fca", or a late or bundled month's under its own key
+_FCA_KEY = re.compile(r"^(fca|fpa)", re.IGNORECASE)
 
 
 def _canonical_day(value, what: str = "The version's start") -> str:
@@ -413,6 +415,26 @@ def adders_for(billing_month: str) -> list[dict]:
     return [{"key": v["key"], "id": v["id"], "name": v["key"], "exempt": [], **v["body"]} for v in best.values()]
 
 
+def is_fca(adder: dict) -> bool:
+    """A fuel charges adjustment (FCA, also printed FPA): an adder whose key starts with fca or fpa. Besides the month's own "fca", NEPRA bundles two
+    months' FCAs on one bill or moves a late one to the next (R9 6.2), and each is stored under its own key ("fca_sep"); every one of them is an FCA."""
+    return bool(_FCA_KEY.match(str(adder.get("key") or "")))
+
+
+def fca_billed(billing_month: str) -> bool:
+    """An FCA (under any key) is on the bill of the billing month: the condition plan 8.5 waits for before a saving is final."""
+    return any(is_fca(a) for a in adders_for(billing_month))
+
+
+def _charged_on_icp_units(adder: dict, rate: float) -> bool:
+    """An adder is charged on ICP incremental units unless it exempts them (QTA, DSS) or is a negative FCA (SRO 2409(I)/2025: positive FCAs apply to
+    incremental consumption, negative FCAs do not; `negative_exempt_icp: false` keeps one on them where a bill shows it). The bill and the
+    optimiser's ICP price both read this, so they agree."""
+    if "icp_units" in (adder.get("exempt") or []):
+        return False
+    return not (is_fca(adder) and rate < 0 and adder.get("negative_exempt_icp", True))
+
+
 def _reading_day(conn: dict | None) -> int | None:
     rd = ((conn or {}).get("data") or {}).get("reading_day")
     try:
@@ -608,9 +630,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     total_units = e_imp["peak"] + e_imp["off_peak"]
     adders = 0.0
     for a in adders_for(billing_month):
-        units = total_units
-        if "icp_units" in a.get("exempt", []) or (a["key"] == "fca" and a["rate"] < 0 and a.get("negative_exempt_icp")):
-            units = total_units - inc_total
+        units = total_units if _charged_on_icp_units(a, a["rate"]) else total_units - inc_total
         amt = a["rate"] * units
         adders += amt
         lines.append({"line": a.get("name", a["key"]), "units_kwh": round(units, 3), "rate": a["rate"], "amount_rs": round(amt, 2)})
@@ -710,7 +730,8 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     out["billing_month_end_step"] = next((i for i, x in enumerate(in_bm0) if not x), steps)
     adders = {bm: adders_for(bm) for bm in dict.fromkeys(bms or [bm0])}
     add_all = {bm: sum(a["rate"] for a in ads) for bm, ads in adders.items()}
-    add_icp = {bm: sum(a["rate"] for a in ads if a["key"] == "fca" and a["rate"] > 0) for bm, ads in adders.items()}
+    # on ICP units only the adders the bill charges there (every positive FCA, whatever its key)
+    add_icp = {bm: sum(a["rate"] for a in ads if _charged_on_icp_units(a, a["rate"])) for bm, ads in adders.items()}
     bm0_day = date(int(bm0[:4]), int(bm0[5:7]), 1)
     icp = icp_rule(bm0_day)
     regime = data.get("regime", "none")
