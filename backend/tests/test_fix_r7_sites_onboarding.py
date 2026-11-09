@@ -12,6 +12,9 @@ YYYY-MM-DD, the end not before the start, and Rs 1,000,000 a start or a running 
 
 flow-onboarding-14 (and flow-savings-pilot-bill-15): a native capture stored slot starts such as '99:99' and two slots starting at the same time, and the
 savings replay then used the impossible slot as the overnight default. A slot now starts at a time from 00:00 to 23:59, and no two slots start together.
+
+role-operator-16 (and role-owner-35, role-analyst-27): a native capture held up to fourteen slots whatever the inverter, so a six-program Deye could be given
+a table it cannot hold. A capture now holds at most the slots of the site's inverter brand (delivery.BRANDS, GET /api/meta brand_grammars).
 """
 from __future__ import annotations
 
@@ -205,3 +208,27 @@ def test_a_native_capture_holds_real_and_distinct_slot_times(world):
     assert r.status_code == 200 and [s["start"] for s in r.json()["body"]["slots"]] == ["00:00", "17:00", "23:59"], r.text
     with world.use():
         assert [v["version"] for v in sites.native_versions(sid)] == [1]
+
+
+# ------------------------------------------------------------------------------------------------ role-operator-16 (and role-owner-35, role-analyst-27)
+
+def test_a_native_capture_holds_no_more_slots_than_the_sites_inverter_table(world):
+    op, sid = world.c["operator"], world.site
+    hours = [f"{h:02d}:00" for h in range(15)]
+    # no inverter recorded yet: the most any brand's table holds (Huawei's fourteen)
+    assert _native(op, sid, hours[:14]).status_code == 200
+    # a Deye's table holds six programs (delivery.BRANDS, GET /api/meta brand_grammars): a seventh was accepted
+    with world.use():
+        sites.put_asset(sid, "inverter", {"brand": "deye", "kw_ac": 100}, "test")
+    r = _native(op, sid, hours[:7])
+    assert r.status_code == 422 and r.json()["code"] == "invalid", r.text
+    assert r.json()["detail"] == "A Deye / Sunsynk inverter's table holds at most 6 slots"
+    assert _native(op, sid, hours[:6]).status_code == 200
+    with world.use():
+        sites.put_asset(sid, "inverter", {"brand": "voltronic", "kw_ac": 100}, "test")
+    assert _native(op, sid, hours[:4]).json()["detail"] == "A Voltronic / Axpert inverter's table holds at most 3 slots"
+    with world.use():
+        sites.put_asset(sid, "inverter", {"brand": "other", "kw_ac": 100}, "test")
+    assert _native(op, sid, hours[:7]).json()["detail"] == "An inverter's table holds at most 6 slots"
+    with world.use():
+        assert [v["version"] for v in sites.native_versions(sid)] == [2, 1]        # newest first: only the two that fit were kept

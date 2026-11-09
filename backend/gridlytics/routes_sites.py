@@ -390,10 +390,22 @@ def native_get(site_id: str):
     return {"latest": sites.native_latest(site_id), "versions": sites.native_versions(site_id)}
 
 
+def _native_slots_fit(site_id: str, inp: dict) -> None:
+    """A capture holds no more slots than the site's inverter table: its brand's `max_slots` (delivery.BRANDS, GET /api/meta brand_grammars; audit
+    role-operator-16: fourteen were accepted for a six-program Deye). Without a recorded inverter the most any brand holds applies (sites.NativeCapture)."""
+    slots = inp.get("slots") if isinstance(inp, dict) else None
+    brand = ((sites.assets(site_id).get("inverter")) or {}).get("brand")
+    gram = delivery.BRANDS.get(brand) if brand else None
+    if gram and isinstance(slots, list) and len(slots) > gram["max_slots"]:
+        whose = "An inverter's" if brand == "other" else f"A {gram['label']} inverter's"
+        raise Refusal(422, f"{whose} table holds at most {gram['max_slots']} slots", "invalid")
+
+
 @router.post("/api/sites/{site_id}/native")
 def native_post(site_id: str, inp: dict = Body(...)):
     auth.need("edit_sites", "Capturing the native settings")
     site_or_404(site_id)
+    _native_slots_fit(site_id, inp)
     try:
         return sites.capture_native(site_id, inp, auth.actor())
     except ValueError as exc:
