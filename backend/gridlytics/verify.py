@@ -7,7 +7,9 @@ claims nothing and whose replay ran over unread load or PV, on the first plan da
 switchback block that changes arm (_chain_starts). Every arm is priced at 1-minute resolution with the same tariff version, on the connection's
 bearable-cost basis, with the dated fuel price and the same wear charge; the gap in stored energy between the actual arm and the baseline is valued at
 the terminal value, and a day's carry-over is the change of that valued gap over the day, so the days of a chain add up to one continuous replay with
-its end-of-period energy term (carry-over priced, not removed). The perfect-foresight bound is a hindsight re-solve, labelled not achievable.
+its end-of-period energy term (carry-over priced, not removed). Energy a claiming day hands to days the plan did not run (a switchback native
+block, control paused) is claimed at what those days realised with it once they are over, provisional until then (_handover). The
+perfect-foresight bound is a hindsight re-solve, labelled not achievable.
 """
 from __future__ import annotations
 
@@ -916,7 +918,8 @@ def _chain_starts(site_id: str, day: date) -> dict[str, dict]:
       pr-review-03). Days the plan did not run chain among themselves (native against native);
     - on the first day of a switchback block whose arm differs from the day before's ("switchback", plan 8.2): each block's baseline is native from
       the block's measured start, so a plan block's last day carries the hand-over credit at v_end, and a native block, where the inverter ran
-      native, scores about zero. A switchback site is held to that segmented replay (DESIGN_LOG, round 6)."""
+      native, scores about zero. A switchback site is held to that segmented replay (DESIGN_LOG, round 6). Each native block day also says where
+      its hand-over replay starts (`handover`, _expected_handover): the claim values the credit at what the block realised (round 7)."""
     prev = day - timedelta(days=1)
     arm = arm_on(site_id, day)
     switch = (arm == "native") != (arm_on(site_id, prev) == "native")
@@ -926,7 +929,31 @@ def _chain_starts(site_id: str, day: date) -> dict[str, dict]:
                 con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, prev.isoformat()))}
         earlier = bool(rows) or con.execute("SELECT 1 FROM savings_days WHERE site_id = ? AND day_local < ? LIMIT 1",
                                             (site_id, prev.isoformat())).fetchone() is not None
-    return {base: _expected_start(rows.get(base), switch, earlier, plan_arm) for base in ("native", "tuned")}
+    return {base: {**_expected_start(rows.get(base), switch, earlier, plan_arm), "handover": _expected_handover(rows.get(base), switch, arm == "native")}
+            for base in ("native", "tuned")}
+
+
+def _expected_handover(prev: dict | None, switch: bool, native_block: bool) -> dict | None:
+    """Where a switchback native block day's hand-over replay starts (round 7, audit brief-vs-build-11): on the block's first day (`switch`), from
+    that baseline's own end state of the plan day before it, with the credit that day booked for the energy it handed over (its end gap at v_end);
+    on the block's later days, from the hand-over replay's end state of the day before. None on other days, or without that row's end state."""
+    if not native_block or not prev:
+        return None
+    src = ((prev.get("chain") or {}) if switch else (prev.get("handover") or {})).get("end") or {}
+    if not src.get("state"):
+        return None
+    return {"state": src["state"], "carry_rs": float(src.get("carry_rs") or 0.0)}
+
+
+def _handover_matches(row: dict | None, expect: dict | None) -> bool:
+    """Whether a stored row's hand-over replay started where the rows before it now say it starts (none expected, none stored, matches too)."""
+    have = (row or {}).get("handover")
+    if not expect:
+        return not have
+    if not have:
+        return False
+    st = have.get("start") or {}
+    return _same_state(st.get("state"), expect["state"]) and abs(float(st.get("carry_rs") or 0.0) - expect["carry_rs"]) <= 1e-6
 
 
 def _same_state(a: dict | None, b: dict | None) -> bool:
@@ -963,7 +990,7 @@ def _recompute_forward(site_id: str, day: date) -> list[str]:
         if not rows:
             break
         expect = _chain_starts(site_id, d)
-        if all(_start_matches(rows[b].get("chain"), expect[b]) for b in rows if b in expect):
+        if all(_start_matches(rows[b].get("chain"), expect[b]) and _handover_matches(rows[b], expect[b].get("handover")) for b in rows if b in expect):
             continue
         if compute_day(site_id, d, with_bound="perfect_foresight_rs" in (rows.get("native") or {}), forward=False) is None:
             break
@@ -1076,7 +1103,7 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
     sun = _sun_up(site, act["g"]["ts"])
     unread = _unread_minutes(act["g"], on_grid, sun, act.get("filled"))
     blank_inputs = _unread_minutes(act["g"], False, sun, act.get("filled"))
-    sims, chains, befores = {}, {}, {}
+    sims, chains, befores, handovers = {}, {}, {}, {}
     for k, pol in policies.items():
         st = starts[k]
         if st["from"] == "previous_day":
@@ -1101,6 +1128,23 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
                                "v_rs_per_kwh": v_start, "carry_rs": v_start * gap_start},
                      "end": {"state": _end_state(sim), "baseline_e_kwh": e_end_base, "actual_e_kwh": e_end_actual, "gap_kwh": gap_end,
                              "v_rs_per_kwh": v_end, "carry_rs": v_end * gap_end, "unread_min": unread}}
+        ho = st.get("handover")
+        if ho:
+            # a switchback native block's day (round 7, audit brief-vs-build-11): the baseline replayed on from where it stood at the plan block's
+            # end, beside its replay from the block's measured start, prices what the energy the plan block handed over did here. The day's
+            # `rs` is the cost that energy saved plus the change of the still-unspent gap at v_end; the plan day's credit plus the native block's
+            # days' `rs` is the hand-over's realised value (_handover), which the claim takes in place of the credit at v_end
+            hs = ho["state"]
+            sim_h = twin.simulate(series, pol, plant, float(hs["soc"]), bool(hs["gen_on"]), gen_elapsed0=int(hs["gen_elapsed"]),
+                                  outage_min0=int(hs["outage_min"]), gen_rescue0=bool(hs["gen_rescue"]))
+            e_h = float(sim_h["soc"][-1]) * plant.e_nom
+            cost_h = price_arm(site, _grid_masked(sim_h, unresolved, series["pv"], known=charge_known, load=load_read), pr, day, e_h, v_end,
+                               gen_before=bool(hs["gen_on"]))["cost_rs"]
+            gap_h = e_end_base - e_h
+            handovers[k] = {"start": {"state": dict(hs), "carry_rs": ho["carry_rs"]},
+                            "end": {"state": _end_state(sim_h), "baseline_e_kwh": e_h, "gap_kwh": gap_h, "v_rs_per_kwh": v_end, "carry_rs": v_end * gap_h},
+                            "cost_rs": cost_h, "segmented_cost_rs": arms[k]["cost_rs"],
+                            "rs": round(cost_h - arms[k]["cost_rs"] + v_end * gap_h - ho["carry_rs"], 2)}
     # fidelity gates the claim (plan 8.4): a monitor site only recommends, even in the demo; the twin and closed loop follow the plan, but only while
     # one is in force (_control: no pause or release to native, a plan made and not expired, and at a closed-loop site's own edge no fallback to
     # native and telemetry heard), so the day's class is its share of minutes under the plan; in tier advisory a day counts only once telemetry
@@ -1173,6 +1217,8 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
                       # whether the month's totals were projected (the month not over: its ICP case can still flip), its prices' digest and how
                       # complete its telemetry was
                       "month_totals_projected": projected, "price_basis": basis, "inputs_completeness": round(float(act["g"]["completeness"]), 4)}
+        if base in handovers:
+            rows[base]["handover"] = handovers[base]
     if with_bound and b:
         # the hindsight solve prices every minute: it is held against the native arm priced the same way
         native_cost = (price_arm(site, sims["native"], pr, day, 0.0, 0.0, gen_before=befores["native"])["cost_rs"] if unresolved.any()
@@ -1251,7 +1297,7 @@ def _settle_month(site_id: str, conn: dict | None, p0: date, p1: date) -> list[d
         late = any(td.get(k) is not None and row.get(rk) is not None and float(td[k]) > float(row[rk]) + 1e-4
                    for k, rk in (("completeness", "inputs_completeness"), ("import_completeness", "import_completeness")))
         expect = _chain_starts(site_id, d) if done else {}
-        moved = any(not _start_matches(by[b].get("chain"), expect[b]) for b in by if b in expect)
+        moved = any(not (_start_matches(by[b].get("chain"), expect[b]) and _handover_matches(by[b], expect[b].get("handover"))) for b in by if b in expect)
         why = ("prices" if priced else "native_capture" if cap is not None and cap.get("version") != row.get("native_capture_version")
                else "late_data" if late else "chain" if moved else None)
         if why is None:
@@ -1536,7 +1582,8 @@ def _chain_stale(site_id: str, days: dict[str, dict]) -> list[str]:
     """The days whose stored chain no longer starts where the rows before them now say it starts (_chain_starts' rules on the stored rows): a day
     before them was re-scored without re-scoring them, its row is gone or has come, or its claim or its unread minutes changed (a day after one
     that claims nothing over unread inputs restarts from the actual arm's state). Their figures do not add up with the days before them until they
-    are recomputed. A restart at a switchback block is never stale."""
+    are recomputed. A restart at a switchback block is never stale; a native block's day whose hand-over replay (round 7) is missing or starts
+    elsewhere than the day before now ends is."""
     if not days:
         return []
     first = min(days)
@@ -1558,11 +1605,71 @@ def _chain_stale(site_id: str, days: dict[str, dict]) -> list[str]:
         switch = (_arm_in(blocks, day[:10]) == "native") != (_arm_in(blocks, prev_day) == "native")
         # `earlier` only names a restart's reason, and every restart from the actual arm's state gives the same figures; whether the day's arm could be
         # the plan is read from its own row (a recommendation or a native block could not)
+        native_block = _arm_in(blocks, day[:10]) == "native"
         if any(not _start_matches(row.get("chain"), _expected_start(prev.get(base), switch, earlier=True,
                                                                      plan_arm=row.get("fidelity") not in ("recommendation_only", "native_block")))
+               or not _handover_matches(row, _expected_handover(prev.get(base), switch, native_block))
                for base, row in days[day].items()):
             stale.append(day)
     return stale
+
+
+def _rows_after(site_id: str, base: str, day: str, n: int = FORWARD_MAX_DAYS) -> dict[str, dict]:
+    """A baseline's stored rows of the n days after `day`, by day."""
+    d = date.fromisoformat(day[:10])
+    with store.connect() as con:
+        return {r["day_local"]: json.loads(r["data"]) for r in
+                con.execute("SELECT day_local, data FROM savings_days WHERE site_id = ? AND baseline = ? AND day_local > ? AND day_local <= ?",
+                            (site_id, base, d.isoformat(), (d + timedelta(days=n)).isoformat()))}
+
+
+def _handover(day: str, row: dict, after: dict[str, dict], blocks: list[dict]) -> dict | None:
+    """What a claiming day's stored energy was worth on the days after it that the plan did not run (round 7, audit brief-vs-build-11, engine-
+    savings-08; HANDOFF 8.A.1): None unless the next day is such a day (NOT_PLAN_ARM: a switchback native block, control paused, a table not
+    applied). The day booked its end gap at v_end (its carry-over); those days realised that energy as native ran on it, which can differ (the
+    farm's genset hours, Faisalabad's off-peak use: 3,263 credited against 1,771 realised in round 6). The realised value is the credit plus each
+    following day's part: a native block's day its hand-over replay's `rs` (the block's replay restarts from the measured state, so the hand-over
+    is replayed beside it), a day chained from the one before its own saving (native against native from each arm's own state). The run ends at a
+    day the plan ran, at a native block's last day before a plan block, at a day whose chain restarted from the measured state, or after
+    FORWARD_MAX_DAYS days; the last day's part values the gap still unspent at its v_end. `settled` once every day of the run is known and it has
+    ended: until then the credit is provisional. `after`: the baseline's rows of the following days, by day."""
+    d = date.fromisoformat(day[:10])
+    nxt = after.get((d + timedelta(days=1)).isoformat())
+    if not nxt or nxt.get("fidelity") not in NOT_PLAN_ARM:
+        return None
+    end = (row.get("chain") or {}).get("end") or {}
+    credit = float(end["carry_rs"]) if "carry_rs" in end else float((row.get("levers") or {}).get("carry_over") or 0.0)
+    total, n, known, ended = 0.0, 0, True, False
+    for i in range(1, FORWARD_MAX_DAYS + 1):
+        dd = (d + timedelta(days=i)).isoformat()
+        r = after.get(dd)
+        if r is None:  # not scored yet: the run is not known to have ended
+            break
+        if r.get("fidelity") not in NOT_PLAN_ARM:
+            ended = True
+            break
+        if r.get("fidelity") == "native_block":
+            ho = r.get("handover")
+            if not ho:  # stored before the hand-over replay: recompute it (the summary lists it in chain_stale_days)
+                known = False
+                break
+            total += float(ho["rs"])
+        elif (r.get("chain") or {}).get("from") == "previous_day":
+            if _day_withheld(r):
+                known = False
+                break
+            total += float(r.get("saving_rs") or 0.0)
+        else:  # the chain restarted from the measured state: the hand-over ended with the day before
+            ended = True
+            break
+        n += 1
+        if r.get("fidelity") == "native_block" and _arm_in(blocks, (d + timedelta(days=i + 1)).isoformat()) != "native":
+            ended = True
+            break
+    else:
+        ended = True
+    settled = known and ended
+    return {"days": n, "v_end_rs": round(credit, 2), "realised_rs": round(credit + total, 2) if settled else None, "settled": settled}
 
 
 def _day_withheld(d: dict) -> bool:
@@ -1636,7 +1743,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
     """The period's ledger per baseline and its days (plan 8.5). Per baseline: `claimed_rs`, the headline (the claiming days' savings, less the
     carry-over still provisional, plus their shares of the MDI lever), with `levers_claimed_rs` its split by lever; `saving_rs` and `levers`, the
     replay over every scored day whose saving is known (a day withheld for missing data adds to neither); `carry_over_provisional_rs`, the claiming
-    days' carry-over no later scored day has used yet; and the days that claim, are withheld or claim nothing on read data. The MDI lever is each
+    days' carry-over no later scored day has used yet; `carry_over_handover_adjustment_rs`, the change the claim took where days the plan did not run
+    (a switchback native block, control paused) realised a claiming day's handed energy at another value than its credit at v_end (_handover);
+    and the days that claim, are withheld or claim nothing on read data. The MDI lever is each
     billing month's, from every day of the month (_mdi_month); a day adds 1/days of its month's lever where it adds its saving, so sub-ranges add up
     to the whole, and `mdi_provisional_rs` is the claimed part from months not over yet (round 7)."""
     site = sites.get(site_id)
@@ -1664,22 +1773,32 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
 
     # a claiming day's carry-over is its end gap valued at v_end: what the stored energy it leaves will be worth. Until a later day is scored, nothing
     # has used that energy, so the credit is provisional (round 7, audit role-owner-02): left out of the claim and shown apart. A later day's row
-    # settles it (its replay starts where this day's ended, or restarts at a switchback block, plan 8.2's hand-over at v_end)
+    # settles it: a day the plan ran, whose replay starts where this day's ended, at v_end; days the plan did not run (a switchback native block,
+    # control paused, a table not applied) at what they realised with it, once they are over (_handover; audit brief-vs-build-11)
     after = (date.fromisoformat(max(days)[:10]) + timedelta(days=1)).isoformat() if days else None
     with store.connect() as con:
-        next_stored = {r["baseline"] for r in con.execute("SELECT baseline FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, after))} \
-            if after else set()
+        next_rows = {r["baseline"]: json.loads(r["data"]) for r in
+                     con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, after))} if after else {}
+    blocks = switchback_blocks(site_id)
 
-    def provisional(day: str, base: str, d: dict) -> float:
-        """The day's carry-over credit no later scored day has used yet (0 when one has, or when the day does not claim)."""
+    def carry(day: str, base: str, d: dict) -> tuple[float, float, dict | None]:
+        """The day's carry-over credit no later scored day has used yet (0 when one has, or when the day does not claim), the change the claim takes
+        where days the plan did not run realised the handed energy at another value than the credit, and that hand-over (_handover)."""
         if not _day_claims(d):
-            return 0.0
+            return 0.0, 0.0, None
         nxt = (date.fromisoformat(day[:10]) + timedelta(days=1)).isoformat()
-        if base in days.get(nxt, {}) or (nxt == after and base in next_stored):
-            return 0.0
+        nrow = days.get(nxt, {}).get(base) or (next_rows.get(base) if nxt == after else None)
         end = (d.get("chain") or {}).get("end") or {}
         # a row stored before chaining valued its whole end gap as its carry-over lever
-        return float(end["carry_rs"]) if "carry_rs" in end else float((d.get("levers") or {}).get("carry_over") or 0.0)
+        credit = float(end["carry_rs"]) if "carry_rs" in end else float((d.get("levers") or {}).get("carry_over") or 0.0)
+        if nrow is None:
+            return credit, 0.0, None
+        if nrow.get("fidelity") in NOT_PLAN_ARM:
+            ho = _handover(day, d, _rows_after(site_id, base, day), blocks)
+            if ho and ho["settled"]:
+                return 0.0, ho["realised_rs"] - ho["v_end_rs"], ho
+            return credit, 0.0, ho
+        return 0.0, 0.0, None
 
     today = _today()
     #: per billing month the days touch: its MDI lever per baseline, from every day of the month
@@ -1692,12 +1811,13 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
 
     #: per baseline and month: (claimed rupees of the days, their MDI shares included; days whose saving is known), for the fee check
     per_month: dict[str, dict[str, tuple[float, int]]] = {}
-    #: per baseline and day: the provisional carry-over left out of the claim
+    #: per baseline and day: the provisional carry-over left out of the claim, and the hand-over to days the plan did not run
     prov_by_day: dict[str, dict[str, float]] = {}
+    ho_by_day: dict[str, dict[str, dict | None]] = {}
     for base in ("native", "tuned"):
         levers: dict[str, float] = {}
         levers_claimed: dict[str, float] = {}
-        total = claimed = litres = prov_total = 0.0
+        total = claimed = litres = prov_total = ho_adj_total = 0.0
         claiming_days = withheld_days = unclaimed_days = 0
         verified = 0
         gen_unknown_days = imp_unknown_days = 0
@@ -1716,8 +1836,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             # native block) adds to every scored day's total, not to the claim (round 7, audit engine-savings-06)
             withheld = _day_withheld(d)
             claims = _day_claims(d)
-            prov = provisional(day, base, d)
+            prov, ho_adj, ho = carry(day, base, d)
             prov_by_day.setdefault(base, {})[day] = prov
+            ho_by_day.setdefault(base, {})[day] = ho
             if not withheld:
                 for k, v in d["levers"].items():
                     if v is not None:  # a lever withheld (an unmetered genset) adds nothing
@@ -1727,9 +1848,10 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                 for k, v in d["levers"].items():
                     if v is not None:
                         levers_claimed[k] = levers_claimed.get(k, 0.0) + v
-                levers_claimed["carry_over"] = levers_claimed.get("carry_over", 0.0) - prov
-                claimed += d["claimed_rs"] - prov
+                levers_claimed["carry_over"] = levers_claimed.get("carry_over", 0.0) - prov + ho_adj
+                claimed += d["claimed_rs"] - prov + ho_adj
                 prov_total += prov
+                ho_adj_total += ho_adj
             claiming_days += int(claims)
             withheld_days += int(withheld)
             unclaimed_days += int(not claims and not withheld)
@@ -1744,7 +1866,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             share = mdi_share(day, base)
             closed = mdi_info[bill_month(day)]["closed"]
             m = months.setdefault(bill_month(day), [0.0, 0, 0, 0.0, 0.0])
-            m[0] += d["claimed_rs"] - prov + (share if claims else 0.0)
+            m[0] += d["claimed_rs"] - prov + ho_adj + (share if claims else 0.0)
             m[1] += int(not withheld)  # an unknown saving is not a zero saving: the fee's rate is over the days that could claim
             m[2] += int(claims)
             m[3] += 0.0 if withheld else share
@@ -1762,6 +1884,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                                   "levers": {k: round(v, 2) for k, v in levers.items()},
                                   "levers_claimed_rs": {k: round(v, 2) for k, v in levers_claimed.items()},
                                   "carry_over_provisional_rs": round(prov_total, 2), "mdi_provisional_rs": round(mdi_prov, 2),
+                                  "carry_over_handover_adjustment_rs": round(ho_adj_total, 2),
                                   "claiming_days": claiming_days, "withheld_days": withheld_days,
                                   "unclaimed_days": unclaimed_days, "litres_saved": round(litres, 1), "verified_days": verified,
                                   "perfect_foresight_rs": round(bound, 2) if base == "native" else None,
@@ -1788,6 +1911,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "not_claimed_reason": reason,
                             "levers_kept": [k for k, v in (n.get("levers") or {}).items() if v is not None] if withheld else None,
                             "carry_over_provisional": bool(prov), "carry_over_provisional_native_rs": round(prov, 2) if prov else None,
+                            # round 7 (audit brief-vs-build-11): the energy the day handed to days the plan did not run, its credit at v_end and
+                            # what those days realised with it (the claim's figure once settled)
+                            "carry_over_handover": (ho_by_day.get("native") or {}).get(day),
                             "control_share": (n.get("control") or {}).get("in_force_share"), "inputs_unread_min": n.get("inputs_unread_min"),
                             "fidelity": n.get("fidelity"), "actual_cost_rs": (n.get("actual") or {}).get("cost_rs"),
                             "native_cost_rs": (n.get("baseline") or {}).get("cost_rs"), "litres_actual": (n.get("actual") or {}).get("litres"),
@@ -1803,7 +1929,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "month_totals_projected": bool(n.get("month_totals_projected"))})
     verified = out["baselines"].get("native", {}).get("verified_days", 0)
     # plan 8.5: "Preliminary" until 8 weeks of switchback have run and the FCA of every month in the period has been billed
-    sb_weeks = _switchback_weeks(switchback_blocks(site_id), today)
+    sb_weeks = _switchback_weeks(blocks, today)
     fca_billed = (not on_grid) or all(any(a["key"] == "fca" for a in tariffs.adders_for(mk))
                                       for mk in _months_between(bill_month(d0) + "-01", bill_month(d1) + "-01"))
     out["preliminary"] = (verified < VERIFIED_DAYS_FOR_FINAL or not native_capture or sb_weeks < SWITCHBACK_WEEKS_FOR_FINAL or not fca_billed)
@@ -1871,7 +1997,9 @@ def _carry_over_credits(blocks: list[dict], by_day: dict[str, dict]) -> list[dic
     """Plan 8.2: "at every block boundary the bill engine credits the arm that ends with more stored energy by (E_end_A - E_end_B) x v_end".
     `credit_rs` is the credit to the plan's saving at each boundary (negative where the native block handed over more):
     - plan to native: the plan block hands its stored energy to the native block; E_end_native is the native replay's end energy on the plan
-      block's last day;
+      block's last day. Round 7 (audit brief-vs-build-11): once the native block is over and scored with its hand-over replay, the credit is what
+      the native block realised with that energy (_handover: `realised`, the v_end figure kept as `credit_v_end_rs`); until then it is the v_end
+      figure, `provisional`. The brief's common state of charge, without the reset (a control action the native mode never performs, plan 8.2);
     - native to plan (round 7, audit engine-savings-11): the native block hands its stored energy to the plan block, which starts on it (a backup
       mode that holds its battery full flatters the plan block's first day; a self-use native that ends empty handicaps it). The plan arm is not
       replayed on a native day, so its end energy there is the plan days' mean end energy (`e_end_plan_basis: "plan_days_mean"`: the days of the
@@ -1889,16 +2017,21 @@ def _carry_over_credits(blocks: list[dict], by_day: dict[str, dict]) -> list[dic
         if not r:
             continue
         v = float(r["actual"].get("v_end") or 0.0)
+        ho = None
         if a["arm"] == "plan":
             e_p, e_n = float(r["actual"].get("e_end_kwh") or 0.0), float(r["baseline"].get("e_end_kwh") or 0.0)
             basis = "plan_block_last_day"
+            ho = _handover(a["block_end"], r, by_day, blocks)
         else:
             if e_plan_ref is None:
                 continue
             e_p, e_n = e_plan_ref, float(r["actual"].get("e_end_kwh") or 0.0)
             basis = "plan_days_mean"
+        at_v_end = round((e_p - e_n) * v, 2)
+        settled = bool(ho and ho["settled"])
         out.append({"boundary": b["block_start"], "from_arm": a["arm"], "to_arm": b["arm"], "e_end_plan_kwh": round(e_p, 2), "e_end_native_kwh": round(e_n, 2),
-                    "e_end_plan_basis": basis, "v_end": round(v, 2), "credit_rs": round((e_p - e_n) * v, 2)})
+                    "e_end_plan_basis": basis, "v_end": round(v, 2), "credit_rs": ho["realised_rs"] if settled else at_v_end, "credit_v_end_rs": at_v_end,
+                    "realised": settled, "provisional": a["arm"] == "plan" and not settled})
     return out
 
 
@@ -1973,6 +2106,8 @@ def switchback_result(site_id: str) -> dict:
                            (site_id, d0, d1)).fetchall()
     by_day = {r["day_local"]: json.loads(r["data"]) for r in rows}
     credits = _carry_over_credits(blocks, by_day)
+    # the counterfactual of a plan block's last day values its hand-over as the switchback's credit does: realised once the native block is over
+    realised = {(date.fromisoformat(c["boundary"]) - timedelta(days=1)).isoformat(): c["credit_rs"] - c["credit_v_end_rs"] for c in credits if c["realised"]}
     X, y, arms, cf = [], [], [], []
     excluded = {"plan_not_in_control": 0, "withheld": 0}
     for day in sorted(by_day):
@@ -1993,7 +2128,7 @@ def switchback_result(site_id: str) -> dict:
         y.append(r["actual"]["cost_rs"])
         arms.append(arm)
         if arm == "plan":
-            cf.append(float(r.get("saving_rs") or 0.0))
+            cf.append(float(r.get("saving_rs") or 0.0) + realised.get(day, 0.0))
     a = np.array(arms)
     arm_days = {"plan": int(np.sum(a == "plan")), "native": int(np.sum(a == "native"))}
     today = _today()
@@ -2020,7 +2155,7 @@ def switchback_result(site_id: str) -> dict:
     cf_day = float(np.mean(cf)) if cf else 0.0
     tol = max(AGREEMENT_SHARE * abs(sb_adj), AGREEMENT_FLOOR_RS_PER_DAY)
     lo_adj, lo_un = _lower_80(sb_adj, se_adj, df), _lower_80(sb_un, se_un if se_un > 0 else None, df_un)
-    reasons = (["under_8_weeks"] if weeks < SWITCHBACK_WEEKS_FOR_FINAL else [])
+    reasons = (["under_8_weeks"] if weeks < SWITCHBACK_WEEKS_FOR_FINAL else []) + (["carry_over_provisional"] if any(c["provisional"] for c in credits) else [])
     return {**out, "result_withheld": None,
             "result": {"saving_rs_per_day_unadjusted": round(sb_un, 2), "saving_rs_per_day_adjusted": round(sb_adj, 2),
                        "plan_days": plan_days, "native_days": arm_days["native"], "carry_over_credit_rs": round(credit, 2),

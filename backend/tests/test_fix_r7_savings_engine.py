@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from test_fix_r2_savings import NIGHT_CHARGER, D, P
-from test_fix_r6_savings import DAYS, LEAD, _blank_evening, _farm, _night_runs, _run
+from test_fix_r6_savings import DAYS, LEAD, _blank_evening, _continuous, _farm, _night_runs, _run
 from test_fix_savings import _put_rows, company, make_site, twin_day  # noqa: F401 (company is a fixture)
 
 from gridlytics import sites, store, tariffs, telemetry, twin, verify
@@ -576,3 +576,116 @@ def test_a_native_block_that_hands_the_plan_a_fuller_battery_is_credited_at_its_
     assert credits[0]["credit_rs"] == pytest.approx((120.0 - 150.0) * 30.0) and credits[2]["credit_rs"] == pytest.approx((80.0 - 150.0) * 30.0)
     r = verify.switchback_result(sid)["result"]
     assert r["carry_over_credit_rs"] == pytest.approx(-900.0 - 3_000.0 - 2_100.0)
+
+
+# ------------------------------------------------------------------------------------------------ brief-vs-build-11, engine-savings-08: the hand-over
+# ------------------------------------------------------------------------------------------------ is valued at what the native block realised
+
+DAYS5 = [LEAD + timedelta(days=i) for i in range(1, 6)]
+
+
+def _switch_farm(name: str) -> str:
+    """The demo farm on a switchback calendar: the plan's night runs on two days, the native settings on the next two, the plan again."""
+    sid = _farm(name)
+    native = lambda s, ts: twin.native_policy(s, ts)  # noqa: E731
+    _run(sid, [LEAD] + DAYS5, [_night_runs, _night_runs, _night_runs, native, native, _night_runs])
+    _calendar(sid, [(DAYS5[0].isoformat(), DAYS5[1].isoformat(), "plan"), (DAYS5[2].isoformat(), DAYS5[3].isoformat(), "native"),
+                    (DAYS5[4].isoformat(), DAYS5[4].isoformat(), "plan")])
+    return sid
+
+
+def _claimed(sid: str, d0: date, d1: date) -> dict:
+    return verify.summary(sid, d0.isoformat(), d1.isoformat())["baselines"]["native"]
+
+
+def test_a_plan_blocks_hand_over_is_provisional_until_the_native_block_ends_then_claimed_at_what_it_realised(company):
+    # Plan 8.2 credits the plan block's last day with the energy it hands the native block at v_end, and round 6 claimed it once the native block's
+    # first day was scored. v_end can differ from what native makes of that energy (round 6: Faisalabad 3,263 credited against 1,771 realised),
+    # so the switchback site's claims missed the continuous replay by +1.5k to +2k. The native block's days now replay native on from the plan
+    # block's end state beside the block's own replay, and the claim takes the realised value once the block is over
+    sid = _switch_farm("Farm hand-over r7")
+    rows = [verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS5[:3]]
+    credit = rows[1]["chain"]["end"]["carry_rs"]
+    assert abs(credit) > 50.0 and rows[2]["fidelity"] == "native_block" and rows[2]["chain"]["reset"] == "switchback"
+    ho = rows[2]["handover"]
+    assert ho["start"]["state"] == rows[1]["chain"]["end"]["state"] and ho["start"]["carry_rs"] == pytest.approx(credit)
+    # the native block is not over: the hand-over is provisional, left out of the claim (before: claimed at v_end once its first day was scored)
+    n = _claimed(sid, DAYS5[0], DAYS5[2])
+    assert n["carry_over_provisional_rs"] == pytest.approx(credit, abs=0.01)
+    assert n["claimed_rs"] == pytest.approx(rows[0]["claimed_rs"] + rows[1]["claimed_rs"] - credit, abs=0.02)
+    day1 = next(d for d in verify.summary(sid, DAYS5[0].isoformat(), DAYS5[2].isoformat())["days"] if d["day"] == DAYS5[1].isoformat())
+    assert day1["carry_over_handover"]["settled"] is False and day1["carry_over_handover"]["realised_rs"] is None
+    # its last day scored: the hand-over is what the block realised, and the plan block's claim is the replay of native straight through both
+    # blocks, less the native block's own (unclaimed) score
+    rows.append(verify.compute_day(sid, DAYS5[3], with_bound=False)["native"])
+    realised = credit + rows[2]["handover"]["rs"] + rows[3]["handover"]["rs"]
+    assert rows[3]["handover"]["start"]["state"] == rows[2]["handover"]["end"]["state"]
+    pure = _continuous(sid, DAYS5[:4], rows[3]["actual"]["v_end"])
+    n = _claimed(sid, DAYS5[0], DAYS5[3])
+    assert n["carry_over_provisional_rs"] == 0.0 and n["carry_over_handover_adjustment_rs"] == pytest.approx(realised - credit, abs=0.02)
+    assert n["claimed_rs"] == pytest.approx(pure - rows[2]["saving_rs"] - rows[3]["saving_rs"], abs=3.0), (n["claimed_rs"], pure)
+    assert sum(n["levers_claimed_rs"].values()) == pytest.approx(n["claimed_rs"], abs=0.02)
+    day1 = next(d for d in verify.summary(sid, DAYS5[0].isoformat(), DAYS5[3].isoformat())["days"] if d["day"] == DAYS5[1].isoformat())
+    assert day1["carry_over_handover"] == {"days": 2, "v_end_rs": pytest.approx(credit, abs=0.01), "realised_rs": pytest.approx(realised, abs=0.02),
+                                           "settled": True}
+    # the switchback's credit at that boundary is the realised value too, the v_end figure beside it
+    c = next(c for c in verify.switchback_result(sid)["carry_over_credits"] if c["from_arm"] == "plan")
+    assert c["realised"] is True and c["provisional"] is False and c["credit_rs"] == pytest.approx(realised, abs=0.02)
+    assert c["credit_v_end_rs"] == pytest.approx(credit, abs=1.0)
+    # the next plan block restarts from the measured state
+    verify.compute_day(sid, DAYS5[4], with_bound=False)
+    assert verify._rows_after(sid, "native", DAYS5[3].isoformat())[DAYS5[4].isoformat()]["chain"]["reset"] == "switchback"
+    assert verify.summary(sid, DAYS5[0].isoformat(), DAYS5[4].isoformat())["chain_stale_days"] == []
+
+
+def test_a_native_block_day_without_its_hand_over_replay_is_out_of_step_and_a_recompute_restores_it(company):
+    sid = _switch_farm("Farm hand-over stale r7")
+    rows = [verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS5[:4]]
+    span = (DAYS5[0].isoformat(), DAYS5[3].isoformat())
+    settled = _claimed(sid, DAYS5[0], DAYS5[3])["claimed_rs"]
+    # rows stored before the hand-over replay: the hand-over cannot be valued, so it stays provisional and the days are listed for a recompute
+    with store.connect() as con:
+        for d in DAYS5[2:4]:
+            for r in con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ? AND day_local = ?", (sid, d.isoformat())).fetchall():
+                data = json.loads(r["data"])
+                data.pop("handover", None)
+                con.execute("UPDATE savings_days SET data = ? WHERE site_id = ? AND day_local = ? AND baseline = ?",
+                            (json.dumps(data), sid, d.isoformat(), r["baseline"]))
+    s = verify.summary(sid, *span)
+    assert s["chain_stale_days"] == [DAYS5[2].isoformat()]
+    assert s["baselines"]["native"]["carry_over_provisional_rs"] == pytest.approx(rows[1]["chain"]["end"]["carry_rs"], abs=0.01)
+    # a recompute of the native block's first day re-scores the next, whose hand-over starts where the first's now ends
+    verify.compute_range(sid, DAYS5[2], DAYS5[2])
+    assert verify.summary(sid, *span)["chain_stale_days"] == []
+    assert _claimed(sid, DAYS5[0], DAYS5[3])["claimed_rs"] == pytest.approx(settled, abs=0.01)
+    # the plan block's last day re-scored on its own (say, its data corrected): the native block's hand-over replays follow it
+    verify.compute_day(sid, DAYS5[1], with_bound=False, forward=False)
+    assert verify.summary(sid, *span)["chain_stale_days"] == []  # the same end state: nothing moved
+    with store.connect() as con:
+        r = json.loads(con.execute("SELECT data FROM savings_days WHERE site_id = ? AND day_local = ? AND baseline = 'native'",
+                                   (sid, DAYS5[1].isoformat())).fetchone()["data"])
+        r["chain"]["end"]["carry_rs"] += 100.0
+        con.execute("UPDATE savings_days SET data = ? WHERE site_id = ? AND day_local = ? AND baseline = 'native'", (json.dumps(r), sid, DAYS5[1].isoformat()))
+    assert verify.summary(sid, *span)["chain_stale_days"] == [DAYS5[2].isoformat()]
+
+
+def test_energy_handed_to_a_day_the_plan_did_not_run_is_claimed_at_what_that_day_realised(company):
+    # 1 Oct (the plan in control) credits 500 at v_end for the energy it leaves. Control is paused on 2 Oct: the inverter runs its own settings on
+    # that energy, 150 cheaper than native from native's own state, and 200 of the gap is still unspent at the day's end. So the energy realised
+    # 150 + 200 = 350: the credit plus the paused day's own saving (150 - 300). Before: the 500 was claimed once 2 Oct was scored
+    sid = make_site(name="Golden r7 hand-over")
+    rows = {"2026-10-01": _day(_lv(peak_window=1000.0, carry_over=500.0), end_carry=500.0),
+            "2026-10-02": _day(_lv(peak_window=150.0, carry_over=-300.0), fidelity="not_applied", start_carry=500.0, end_carry=200.0),
+            "2026-10-03": _day(_lv(peak_window=700.0, carry_over=50.0), end_carry=50.0)}  # the plan again: restarted from the measured state
+    _put_rows(sid, {d: {"native": r, "tuned": r} for d, r in rows.items()})
+    s = verify.summary(sid, "2026-10-01", "2026-10-03")
+    n = s["baselines"]["native"]
+    assert n["claimed_rs"] == pytest.approx(1500.0 - 150.0 + 700.0) and n["carry_over_handover_adjustment_rs"] == -150.0
+    assert n["carry_over_provisional_rs"] == 50.0 and n["levers_claimed_rs"]["carry_over"] == pytest.approx(350.0)
+    assert sum(n["levers_claimed_rs"].values()) == pytest.approx(n["claimed_rs"])
+    assert s["days"][0]["carry_over_handover"] == {"days": 1, "v_end_rs": 500.0, "realised_rs": 350.0, "settled": True}
+    # while the paused day's own saving is unknown (withheld for its data), so is what the energy realised: the credit stays provisional
+    _put_rows(sid, {"2026-10-02": {b: _day(_lv(peak_window=150.0, wear=None, carry_over=-300.0), fidelity="not_applied", withheld="battery_flow_unknown",
+                                           start_carry=500.0, end_carry=200.0) for b in ("native", "tuned")}})
+    n = verify.summary(sid, "2026-10-01", "2026-10-03")["baselines"]["native"]
+    assert n["carry_over_provisional_rs"] == 550.0 and n["claimed_rs"] == pytest.approx(1000.0 + 700.0)
