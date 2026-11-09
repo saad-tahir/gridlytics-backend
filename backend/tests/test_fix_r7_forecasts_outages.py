@@ -118,3 +118,78 @@ def test_the_pv_fit_and_score_read_available_power_not_curtailed_output(company)
     assert r["value"] < 0.01, r
 
 
+# ------------------------------------------------------------------------------------------------ pages-C-22, engine-forecast-07
+
+def test_pv_scores_carry_a_smart_persistence_baseline_and_every_horizon_class(company):
+    """Plan Part 5.5: PV skill against smart persistence per horizon class. The scored day runs at 0.8 of clear sky, the day before at 0.5 and the one
+    before that at 0.6; hourly issues forecast 0.8 of clear sky. The day-ahead row (the midnight issue) carries the smart-persistence nRMSE of the same
+    slots as its baseline, and the 0-2, 2-6, 6-24 and 24-48 hour classes each get a row whose baseline is the persistence known at the issue time (the
+    last hour's clearness, the same hours yesterday, the same hours two days before). v1 wrote one day-ahead row with no PV baseline at all."""
+    sid = "pv-skill"
+    site = _pv_site(sid)
+    day = date(2026, 11, 9)
+    t0 = _midnight(day)
+    ts = np.arange(t0 - 3 * 86400, t0 + 86400, 60, dtype=np.int64)
+    scale = np.array([0.6, 0.6, 0.5, 0.8])[(ts - (t0 - 3 * 86400)) // 86400]
+    _write_pv(sid, ts, _clear(ts) * scale)
+    for b in range(t0 - 2 * 86400 + 3600, t0 + 86400, 3600):
+        q50 = 0.8 * forecast._mean15(_clear, forecast.step_times(b))
+        telemetry.save_forecast(sid, "pv", b, 1, "v1.0", {"q50": [round(float(x), 3) for x in q50]})
+    rows = [r for r in forecast.score_day(site, day) if r["kind"] == "pv"]
+    assert rows[0]["horizon_class"] == "day_ahead"  # alerts.nightly reads the first PV row as the day's headline
+    by = {r["horizon_class"]: r for r in rows}
+    assert set(by) == {"day_ahead", "0-2h", "2-6h", "6-24h", "24-48h"}, sorted(by)
+    head = by["day_ahead"]
+    assert head["value"] < 0.01 and head["baseline_value"] > 0.05, head
+    for cls in ("2-6h", "6-24h", "24-48h"):
+        assert by[cls]["value"] < 0.01 and by[cls]["baseline_value"] > 0.03, by[cls]
+    # yesterday was 0.3 of clear sky away from the day, the day before 0.2: each class's baseline is the persistence its issues could know
+    assert by["24-48h"]["baseline_value"] == pytest.approx(by["6-24h"]["baseline_value"] * 2 / 3, rel=0.05)
+    assert by["0-2h"]["baseline_value"] is not None
+    with store.connect() as con:
+        stored = {r["horizon_class"]: r["baseline_value"] for r in con.execute("SELECT * FROM forecast_scores WHERE site_id = ? AND kind = 'pv'", (sid,))}
+    assert set(stored) == set(by) and stored["day_ahead"] == pytest.approx(head["baseline_value"])
+
+
+def test_the_accuracy_summary_gives_skill_overall_and_by_horizon_class(company):
+    """GET /forecasts/scores: the day rows stay the day-ahead headline (one per day and metric, as the page's table reads them), each with its skill;
+    the summary gives the skill against the kind's baseline and one entry per horizon class."""
+    sid = "sum-skill"
+    today = datetime.now(PKT).date()
+    with store.connect() as con:
+        for back, v, b in ((3, 0.10, 0.20), (2, 0.12, 0.20)):
+            d = (today - timedelta(days=back)).isoformat()
+            con.execute("INSERT INTO forecast_scores (site_id, kind, day_local, horizon_class, metric, value, baseline_value) VALUES (?,?,?,?,?,?,?)",
+                        (sid, "pv", d, "day_ahead", "nrmse", v, b))
+            con.execute("INSERT INTO forecast_scores (site_id, kind, day_local, horizon_class, metric, value, baseline_value) VALUES (?,?,?,?,?,?,?)",
+                        (sid, "pv", d, "6-24h", "nrmse", v / 2, b))
+    s = forecast.scores(sid, 30)
+    assert [r["horizon_class"] for r in s["days"]["pv"]] == ["day_ahead", "day_ahead"]
+    assert s["days"]["pv"][0]["skill"] == pytest.approx(0.5)
+    pv = s["summary"]["pv"]
+    assert pv["baseline_kind"] == "smart_persistence"
+    assert pv["last7"] == pytest.approx(0.11) and pv["baseline_last7"] == pytest.approx(0.2)
+    assert pv["skill_last7"] == pytest.approx(0.45, abs=1e-3) and pv["skill_last30"] == pytest.approx(0.45, abs=1e-3)
+    cls = {h["horizon_class"]: h for h in pv["horizons"]}
+    assert set(cls) == {"6-24h"} and cls["6-24h"]["skill_last30"] == pytest.approx(0.725, abs=1e-3) and cls["6-24h"]["n"] == 2
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-14, role-analyst-18
+
+def test_the_seven_day_summary_covers_the_last_seven_calendar_days(company):
+    """'last 7 days' is the days scored within the last seven calendar days (Pakistan time), with their count; v1 took the last seven scored rows,
+    whatever span they covered, and the page printed the 30-day count under it."""
+    sid = "sum-days"
+    today = datetime.now(PKT).date()
+    rows = [(20 - i, 0.5) for i in range(9)] + [(3, 0.1), (1, 0.1)]  # nine old days, then a gap, then two recent days
+    with store.connect() as con:
+        for back, v in rows:
+            con.execute("INSERT INTO forecast_scores (site_id, kind, day_local, horizon_class, metric, value, baseline_value) VALUES (?,?,?,?,?,?,?)",
+                        (sid, "pv", (today - timedelta(days=back)).isoformat(), "day_ahead", "nrmse", v, None))
+    pv = forecast.scores(sid, 30)["summary"]["pv"]
+    assert pv["last7"] == pytest.approx(0.1), pv
+    assert pv["n7"] == 2 and pv["n"] == 11
+    assert pv["last30"] == pytest.approx((9 * 0.5 + 2 * 0.1) / 11, abs=1e-4)
+    assert pv["skill_last7"] is None  # no baseline in the window: no skill
+
+

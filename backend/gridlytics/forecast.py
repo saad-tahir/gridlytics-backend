@@ -504,10 +504,136 @@ def _outage_baselines(site: dict, t0: int) -> dict:
     return {"schedule": p_sched, "climatology": p_clim}
 
 
+#: the horizon classes of plan Part 5.5 (hours ahead of the belief time, from inclusive, to exclusive). The day-ahead row (the issue at local midnight
+#: over the whole day) stays the headline that the page's tiles and the forecast-bust alert read; each class is scored over every stored issue whose
+#: steps fall on the day at that horizon
+HORIZON_CLASSES = (("0-2h", 0, 2), ("2-6h", 2, 6), ("6-24h", 6, 24), ("24-48h", 24, 48))
+#: the baseline each kind's skill is measured against (plan Part 5.5): PV smart persistence, load equivalent-day persistence, outage schedule-only
+BASELINES = {"pv": "smart_persistence", "load": "equivalent_day", "outage": "schedule_only"}
+#: the fewest scored 15-minute slots (or issue-step pairs) a score row needs
+MIN_SLOTS = 8
+
+
+def _q15(a) -> np.ndarray:
+    """15-minute means of a minute series from its first minute (NaN where a step has no known minute)."""
+    a = np.asarray(a, dtype=float)
+    n = len(a) // 15
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # a step with no known minute is NaN, as meant
+        return np.nanmean(a[: n * 15].reshape(-1, 15), axis=1)
+
+
+def _nrmse(pred: np.ndarray, act: np.ndarray, denom: float) -> float:
+    return float(np.sqrt(np.mean((pred - act) ** 2)) / denom)
+
+
+def _issues(site_id: str, kind: str, b0: int, b1: int, key: str) -> list[tuple[int, np.ndarray]]:
+    """The stored issues of a kind with a belief time in (b0, b1), oldest first, as (belief time, the issue's array `key`). Quarter issues older than
+    3 days are pruned (telemetry.save_forecast) and hourly ones kept, so the nightly job sees every issue of the day before."""
+    with telemetry.connect() as con:
+        rows = con.execute("SELECT belief_time, body FROM forecast_issues WHERE site_id = ? AND kind = ? AND belief_time > ? AND belief_time < ? "
+                           "ORDER BY belief_time", (site_id, kind, int(b0), int(b1))).fetchall()
+    out = []
+    for r in rows:
+        v = json.loads(r["body"]).get(key)
+        if isinstance(v, list):
+            out.append((int(r["belief_time"]), np.array([np.nan if x is None else float(x) for x in v], dtype=float)))
+    return out
+
+
+def _power_scores(site: dict, kind: str, t0: int, g: dict) -> list[dict]:
+    """The nRMSE rows of a PV or load day (plan Part 5.5): the day-ahead headline and one row per horizon class, each with its baseline.
+
+    PV: daytime slots (solar elevation above 5 degrees) of available PV, by AC nameplate. The baseline is smart persistence, the clear sky at the step
+    times a clearness index known at the issue time: the last hour's before the belief time for 0-2 hours (reported only: the stage-1 blend is that
+    model), the same step yesterday for the headline, 2-6 and 6-24 hours, and the same step two days before for 24-48 hours (yesterday's is not yet
+    known that far ahead). The model and its baseline are scored over the same slots, so the skill compares like with like.
+    Load: by the day's mean load, against equivalent-day persistence (the same slot a week before)."""
+    sid = site["id"]
+    if kind == "pv":
+        pv_asset = site["assets"]["pv"]
+        lat, lon = site["data"].get("lat", 31.5), site["data"].get("lon", 74.3)
+        kw_ac = max(1e-6, float(pv_asset["kw_ac"]))
+        h = telemetry.minute_grid(sid, t0 - 2 * 86400, t0 + 86400)  # the two days before, for persistence, and the day
+        av = _q15(available_pv(h))
+        cs = _q15(solar.pv_power(h["ts"], lat, lon, pv_asset, 1.0, solar.local_month(h["ts"])))
+        act = av[192:]
+        zen, _ = solar.sun_position(step_times(t0, 96) + STEP_S // 2, lat, lon)
+        ok = ~np.isnan(act) & (zen < 85.0)
+        denom = kw_ac
+
+        def same_step(days_before: int) -> np.ndarray:
+            ap, cp = av[192 - 96 * days_before:288 - 96 * days_before], cs[192 - 96 * days_before:288 - 96 * days_before]
+            return np.where(cp > 0.02 * kw_ac, cs[192:] * ap / np.maximum(cp, 1e-9), ap)  # near sunrise and sunset: plain persistence
+
+        sp1, sp2 = same_step(1), same_step(2)
+
+        def baseline(cls: str | None, b: int) -> np.ndarray | None:
+            if cls == "0-2h":
+                i = (b - (t0 - 2 * 86400)) // STEP_S
+                a, c = av[max(0, i - 4):i], cs[max(0, i - 4):i]
+                m = ~np.isnan(a) & (c > 0.1 * kw_ac)
+                if m.sum() < 2:
+                    return None  # no daylight in the hour before the issue: no clearness to persist
+                return np.minimum(cs[192:] * float(np.sum(a[m]) / np.sum(c[m])), kw_ac)
+            return sp2 if cls == "24-48h" else sp1
+    else:
+        act = _q15(g["load"])
+        ok = ~np.isnan(act)
+        if not ok.any():
+            return []
+        denom = max(1e-6, float(np.mean(act[ok])))
+        pers = _q15(telemetry.minute_grid(sid, t0 - 7 * 86400, t0 - 6 * 86400)["load"])
+
+        def baseline(cls: str | None, b: int) -> np.ndarray | None:
+            return pers
+    if ok.sum() < MIN_SLOTS:
+        return []
+    rows = []
+    f = telemetry.latest_forecast(sid, kind, t0)
+    if f is not None and t0 - f["belief_time"] <= 6 * 3600:
+        off = (t0 - f["belief_time"]) // STEP_S
+        pred = np.array(f["q50"][off:off + 96], dtype=float)
+        row = {"kind": kind, "metric": "nrmse", "value": round(_nrmse(pred[ok], act[ok], denom), 4), "horizon_class": "day_ahead"}
+        base = baseline(None, f["belief_time"])
+        okp = ok & ~np.isnan(base)
+        if okp.sum() >= MIN_SLOTS:
+            if kind == "pv":
+                row["value"] = round(_nrmse(pred[okp], act[okp], denom), 4)
+            row["baseline_value"] = round(_nrmse(base[okp], act[okp], denom), 4)
+        rows.append(row)
+    issues = _issues(sid, kind, t0 - 48 * 3600, t0 + 86400, "q50")
+    for cls, a, b in HORIZON_CLASSES:
+        P, A, B = [], [], []
+        for bt, q in issues:
+            k = np.arange(len(q))
+            tgt = bt + STEP_S * k
+            sel = (tgt >= t0) & (tgt < t0 + 86400) & (k >= 4 * a) & (k < 4 * b)
+            if not sel.any():
+                continue
+            base = baseline(cls, bt)
+            if base is None:
+                continue
+            ks = k[sel]
+            js = (tgt[sel] - t0) // STEP_S
+            m = ok[js] & ~np.isnan(base[js]) & ~np.isnan(q[ks])
+            P.append(q[ks][m])
+            A.append(act[js][m])
+            B.append(base[js][m])
+        n = sum(len(x) for x in P)
+        if n < MIN_SLOTS:
+            continue
+        P, A, B = np.concatenate(P), np.concatenate(A), np.concatenate(B)
+        rows.append({"kind": kind, "metric": "nrmse", "value": round(_nrmse(P, A, denom), 4), "horizon_class": cls,
+                     "baseline_value": round(_nrmse(B, A, denom), 4), "pairs": int(n)})
+    return rows
+
+
 def score_day(site: dict, day) -> list[dict]:
-    """Yesterday's scores at the day-ahead issue (the first issue at or before local midnight): PV daytime nRMSE by AC nameplate (solar elevation
-    above 5 degrees), load nRMSE by mean load with skill against same-day persistence, and the outage Brier over the slots with a known grid state
-    against the schedule-only baseline (the pre-registered gate; the climatology Brier is returned beside it) (plan Part 5.5)."""
+    """Yesterday's scores (plan Part 5.5): for PV and load the day-ahead issue's (the first issue at or before local midnight) nRMSE and one row per
+    horizon class, each against its baseline (_power_scores); the outage Brier over the slots with a known grid state against the schedule-only
+    baseline (the pre-registered gate; the climatology Brier is returned beside it). A kind's day-ahead row comes first: alerts.nightly reads the
+    first PV row as the day's headline."""
     t0 = twin.day_start_utc(day)
     g = telemetry.minute_grid(site["id"], t0, t0 + 86400)
     if g["completeness"] < 0.5:
@@ -517,46 +643,27 @@ def score_day(site: dict, day) -> list[dict]:
     for kind in ("pv", "load", "outage"):
         if kind == "pv" and not pv_asset:
             continue
+        if kind in ("pv", "load"):
+            out += _power_scores(site, kind, t0, g)
+            continue
         f = telemetry.latest_forecast(site["id"], kind, t0)
         if f is None or t0 - f["belief_time"] > 6 * 3600:
             continue
         off = (t0 - f["belief_time"]) // STEP_S
         sl = slice(off, off + 96)
-        if kind in ("pv", "load"):
-            col = available_pv(g) if kind == "pv" else g["load"]
-            act = np.nanmean(col.reshape(96, 15), axis=1)
-            pred = np.array(f["q50"][sl])
-            ok = ~np.isnan(act)
-            if kind == "pv":
-                lat, lon = site["data"].get("lat", 31.5), site["data"].get("lon", 74.3)
-                zen, _ = solar.sun_position(step_times(t0, 96) + STEP_S // 2, lat, lon)
-                ok &= zen < 85.0
-            if ok.sum() < 8:
-                continue
-            denom = max(1e-6, float(pv_asset["kw_ac"])) if kind == "pv" else max(1e-6, float(np.mean(act[ok])))
-            nrmse = float(np.sqrt(np.mean((pred[ok] - act[ok]) ** 2)) / denom)
-            row = {"kind": kind, "metric": "nrmse", "value": round(nrmse, 4), "horizon_class": "day_ahead"}
-            if kind == "load":
-                prev = telemetry.minute_grid(site["id"], t0 - 7 * 86400, t0 - 6 * 86400)["load"]
-                pers = np.nanmean(prev.reshape(96, 15), axis=1)
-                okp = ok & ~np.isnan(pers)
-                if okp.sum() >= 8:
-                    row["baseline_value"] = round(float(np.sqrt(np.mean((pers[okp] - act[okp]) ** 2)) / denom), 4)
-            out.append(row)
-        else:
-            G = g["grid"].reshape(96, 15)
-            known = ~np.all(np.isnan(G), axis=1)  # a slot without data is not scored (a dark logger is often the outage itself)
-            if known.sum() < 8:
-                continue
-            act = (np.nanmin(G[known], axis=1) == 0).astype(float)
-            pred = np.array(f["p_down"][sl])[known]
-            base = _outage_baselines(site, t0)
-            row = {"kind": kind, "metric": "brier", "value": round(float(np.mean((pred - act) ** 2)), 4), "horizon_class": "day_ahead",
-                   "baseline_value": round(float(np.mean((base["schedule"][known] - act) ** 2)), 4), "baseline": "schedule_only",
-                   "slots_scored": int(known.sum())}
-            if base["climatology"] is not None:
-                row["climatology_value"] = round(float(np.mean((base["climatology"][known] - act) ** 2)), 4)
-            out.append(row)
+        G = g["grid"].reshape(96, 15)
+        known = ~np.all(np.isnan(G), axis=1)  # a slot without data is not scored (a dark logger is often the outage itself)
+        if known.sum() < MIN_SLOTS:
+            continue
+        act = (np.nanmin(G[known], axis=1) == 0).astype(float)
+        pred = np.array(f["p_down"][sl])[known]
+        base = _outage_baselines(site, t0)
+        row = {"kind": kind, "metric": "brier", "value": round(float(np.mean((pred - act) ** 2)), 4), "horizon_class": "day_ahead",
+               "baseline_value": round(float(np.mean((base["schedule"][known] - act) ** 2)), 4), "baseline": "schedule_only",
+               "slots_scored": int(known.sum())}
+        if base["climatology"] is not None:
+            row["climatology_value"] = round(float(np.mean((base["climatology"][known] - act) ** 2)), 4)
+        out.append(row)
     with store.connect() as con:
         for r in out:
             con.execute("INSERT OR REPLACE INTO forecast_scores (site_id, kind, day_local, horizon_class, metric, value, baseline_value) VALUES (?,?,?,?,?,?,?)",
@@ -564,17 +671,52 @@ def score_day(site: dict, day) -> list[dict]:
     return out
 
 
+def _skill(value: float | None, baseline: float | None) -> float | None:
+    """1 - score / baseline score (lower is better for both): positive when the forecast beats its baseline; None without a baseline above zero."""
+    if value is None or baseline is None or baseline <= 0:
+        return None
+    return round(1.0 - float(value) / float(baseline), 3)
+
+
+def _window(rows: list[dict]) -> dict:
+    """A window's mean score, its days, and the skill over the days with a baseline: 1 - the mean score over the mean baseline of those days (the
+    Brier skill score for outages; for nRMSE the same ratio of the days' means)."""
+    paired = [r for r in rows if r["baseline"] is not None]
+    mean_b = float(np.mean([r["baseline"] for r in paired])) if paired else None
+    return {"value": round(float(np.mean([r["value"] for r in rows])), 4) if rows else None, "n": len(rows),
+            "baseline": round(mean_b, 4) if mean_b is not None else None,
+            "skill": _skill(float(np.mean([r["value"] for r in paired])), mean_b) if paired else None}
+
+
 def scores(site_id: str, days: int = 30) -> dict:
-    since = (datetime.now(PKT).date() - timedelta(days=days)).isoformat()
+    """The scored days of the last `days` calendar days (Pakistan time) and their summary. `days` holds each kind's day-ahead rows (one per day and
+    metric) with their skill; `summary` gives per kind the mean over the last 7 and the last `days` calendar days (`last7`, `last30`; `n7` and `n` days
+    scored in each), the baseline's means and the skill against it, and the same per horizon class (`horizons`, plan Part 5.5's classes in order)."""
+    today = datetime.now(PKT).date()
+    since = (today - timedelta(days=days)).isoformat()
+    since7 = (today - timedelta(days=7)).isoformat()
     with store.connect() as con:
         rows = con.execute("SELECT * FROM forecast_scores WHERE site_id = ? AND day_local >= ? ORDER BY day_local", (site_id, since)).fetchall()
-    out: dict = {}
+    head: dict = {}
+    by_class: dict = {}
     for r in rows:
-        out.setdefault(r["kind"], []).append({"day": r["day_local"], "metric": r["metric"], "value": r["value"], "baseline": r["baseline_value"]})
+        x = {"day": r["day_local"], "metric": r["metric"], "value": r["value"], "baseline": r["baseline_value"], "horizon_class": r["horizon_class"],
+             "skill": _skill(r["value"], r["baseline_value"])}
+        if r["horizon_class"] == "day_ahead":
+            head.setdefault(r["kind"], []).append(x)
+        else:
+            by_class.setdefault(r["kind"], {}).setdefault(r["horizon_class"], []).append(x)
+
+    def window(v: list[dict]) -> dict:
+        w30, w7 = _window(v), _window([x for x in v if x["day"] >= since7])
+        return {"last7": w7["value"], "last30": w30["value"], "n": w30["n"], "n7": w7["n"], "baseline_last7": w7["baseline"],
+                "baseline_last30": w30["baseline"], "skill_last7": w7["skill"], "skill_last30": w30["skill"]}
+
     summary = {}
-    for k, v in out.items():
-        vals7 = [x["value"] for x in v[-7:]]
-        vals30 = [x["value"] for x in v]
-        summary[k] = {"metric": v[0]["metric"], "last7": round(float(np.mean(vals7)), 4) if vals7 else None,
-                      "last30": round(float(np.mean(vals30)), 4) if vals30 else None, "n": len(v)}
-    return {"days": out, "summary": summary}
+    for k in [*head, *(x for x in by_class if x not in head)]:
+        v = head.get(k, [])
+        classes = by_class.get(k, {})
+        horizons = [{"horizon_class": c, "from_h": a, "to_h": b, **window(classes[c])} for c, a, b in HORIZON_CLASSES if classes.get(c)]
+        metric = v[0]["metric"] if v else next(iter(classes.values()))[0]["metric"]
+        summary[k] = {"metric": metric, **window(v), "baseline_kind": BASELINES.get(k), "horizons": horizons}
+    return {"days": head, "summary": summary, "from": since, "from7": since7}
