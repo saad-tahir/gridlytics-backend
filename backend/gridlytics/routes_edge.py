@@ -22,7 +22,7 @@ import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException
 from pydantic import ValidationError
 
-from . import auth, delivery, forecast, money, plans, sites, store, telemetry
+from . import auth, contract, delivery, forecast, money, plans, sites, store, telemetry
 from .routes_common import full_or_404, now_ts, out, put_state, site_or_404, state_change
 from .schemas import Refusal
 
@@ -30,14 +30,14 @@ router = APIRouter()
 log = logging.getLogger("gridlytics.edge")
 
 #: The largest sequence number taken: the seq table keeps a 64-bit integer, and a JSON number above 2**53 is no longer exact everywhere
-SEQ_MAX = 2 ** 53 - 1
+SEQ_MAX = contract.SEQ_MAX
 
 #: A telemetry row's ts must lie between this instant and a day from now (as the CSV upload's window): a ts that is not finite, or one past SQLite's
 #: 64-bit integer (1e20), would otherwise fail the write on every retry of its batch, and a millisecond or unset clock would store rows decades away
 TS_EARLIEST = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
 TS_AHEAD_S = 86400
 
-#: Events that put the site in an unknown state: control pauses until a person resumes it
+#: Events that put the site in an unknown state: control pauses until a person resumes it (U3's names for them act alike: contract.event_meaning)
 PAUSE_EVENTS = ("readback_mismatch", "local_override", "template_change")
 PAUSE_REASON = "Edge reported an unknown device state"
 
@@ -64,14 +64,20 @@ _last_event_solve: dict[str, float] = {}
 _solve_lock = threading.Lock()
 
 
-def _check(model, body):
+def _check(model, body, site_id: str | None = None):
+    """The message validated by its contract model (422 SCHEMA with the first error otherwise); an envelope site_id that is not the path's site (the
+    key's own: the guard checked it) is refused with 403 wrong_site (DAT-03)."""
     try:
         msg = model.model_validate(body)
     except ValidationError as exc:
         e = exc.errors()[0]
-        raise Refusal(422, f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}", "SCHEMA") from None
+        where = ".".join(str(x) for x in e["loc"])
+        text = str(e["msg"]).removeprefix("Value error, ")
+        raise Refusal(422, f"{where}: {text}" if where and not text.startswith(f"{where}:") else text, "SCHEMA") from None
     if getattr(msg, "seq", 0) > SEQ_MAX:
         raise Refusal(422, f"seq: at most {SEQ_MAX}", "SCHEMA")
+    if site_id is not None and getattr(msg, "site_id", None) not in (None, site_id):
+        raise Refusal(403, "The message names another site than the one its key is for", "wrong_site")
     return msg
 
 
@@ -158,18 +164,18 @@ def _row_time(v) -> float | None:
     return None
 
 
-def _check_times(msg) -> None:
+def _check_times(columns: list[str], rows: list[list]) -> None:
     """Refuses (422) a batch with a row whose ts is not finite or lies outside 2015 to a day from now, before anything is written: such a batch is answered
     the same way every time it is sent, so the edge drops it instead of retrying it for ever."""
-    col = msg.columns.index("ts")
+    col = columns.index("ts")
     latest = now_ts() + TS_AHEAD_S
     bad = []
-    for n, row in enumerate(msg.rows):
+    for n, row in enumerate(rows):
         t = _row_time(row[col] if col < len(row) else None)
         if t is not None and (not math.isfinite(t) or t < TS_EARLIEST or t > latest):
             bad.append(n)
     if bad:
-        first = msg.rows[bad[0]][col]
+        first = rows[bad[0]][col]
         raise Refusal(422, f"{len(bad)} row{'s have' if len(bad) != 1 else ' has'} a ts that is not a time from 2015 to a day from now (the first is row "
                            f"{bad[0] + 1}: {first!r}); ts is epoch seconds or ISO 8601, UTC", "SCHEMA")
 
@@ -279,29 +285,31 @@ def _resolve_pending(site_id: str, state: dict | None, background: BackgroundTas
 def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(...)):
     _key_only()
     site = site_or_404(site_id)
-    msg = _check(delivery.TelemetryBatch, inp)
+    msg = _check(delivery.TelemetryBatch, inp, site_id)
     _seen(site_id)
     # the batch is checked before its sequence is looked at, and the sequence is recorded only after the rows are written: a refused or failed batch is
     # answered as such every time it is sent, never acknowledged later as a duplicate (the minute table is idempotent by site and minute, so a batch
-    # written twice by two concurrent sends stores the same rows)
-    unknown = [c for c in msg.columns if c != "ts" and c not in telemetry.ALL]
-    if "ts" not in msg.columns or unknown:
-        raise Refusal(422, f"Unknown columns: {', '.join(unknown)}" if unknown else "The batch needs a ts column", "SCHEMA")
-    twice = sorted({c for c in msg.columns if msg.columns.count(c) > 1})
+    # written twice by two concurrent sends stores the same rows). U3's form (data stamped from ts_start every interval_s) is read as rows with a ts
+    columns, rows = msg.table()
+    ignored = [c for c in columns if c in contract.POINTS_NOT_STORED and c not in telemetry.ALL]
+    unknown = [c for c in columns if c != "ts" and c not in telemetry.ALL and c not in ignored]
+    if unknown:
+        raise Refusal(422, f"Unknown columns: {', '.join(unknown)}", "SCHEMA")
+    twice = sorted({c for c in columns if columns.count(c) > 1})
     if twice:
         raise Refusal(422, f"Columns named more than once: {', '.join(twice)}", "SCHEMA")
-    if "grid_present" not in msg.columns and "grid_voltage_v" not in msg.columns:
+    if "grid_present" not in columns and "grid_voltage_v" not in columns:
         raise Refusal(422, "Every batch carries grid_present (or grid_voltage_v)", "SCHEMA")
-    _check_times(msg)
+    _check_times(columns, rows)
     digest = _digest(msg)
     with store.connect() as con:
         if _was_stored(con, site_id, "telemetry", msg.seq, digest):
             return {"ack": msg.seq, "duplicate": True}
-    records = [dict(zip(msg.columns, row)) for row in msg.rows]
+    records = [{c: v for c, v in zip(columns, row) if c not in ignored} for row in rows]
     res = telemetry.ingest(site_id, records, "edge")
     with store.connect() as con:
         _mark_stored(con, site_id, "telemetry", msg.seq, digest)
-    answer = {"ack": msg.seq, **res}
+    answer = {"ack": msg.seq, **res, **({"ignored_columns": ignored} if ignored else {})}
     # an outage event waiting for this batch (the minute that shows the grid lost or back) re-solves now; the batch is stored either way. The pending
     # re-solve is read now, after the batch is stored, not from the state at the request's start: an event stored meanwhile is the one that decides
     try:
@@ -318,7 +326,7 @@ def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(.
 def edge_heartbeat(site_id: str, inp: dict = Body(...)):
     _key_only()
     site_or_404(site_id)
-    msg = _check(delivery.Heartbeat, inp)
+    msg = _check(delivery.Heartbeat, inp, site_id)
     _put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump())
     warn = None
     if abs(msg.clock_offset_s) >= 900:
@@ -344,17 +352,19 @@ def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Body(...)
     twice; a batch that fails stores nothing and is stored when sent again. An outage starting or ending re-solves the plan (OPT-15)."""
     _key_only()
     site = site_or_404(site_id)
-    msg = _check(delivery.EventBatch, inp)
+    msg = _check(delivery.EventBatch, inp, site_id)
     _seen(site_id)
     digest = _digest(msg)
     with store.write_transaction() as con:
         if _was_stored(con, site_id, "events", msg.seq, digest):
             return {"ack": msg.seq, "duplicate": True}
         for e in msg.events:
-            con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)", (site_id, e.ts, e.type, "edge", json.dumps(e.detail)))
+            # stored as sent (U3's name or this contract's), with the device the edge names as its source
+            con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
+                        (site_id, e.ts, e.type, f"edge:{e.source}" if e.source else "edge", json.dumps(e.detail)))
         _mark_stored(con, site_id, "events", msg.seq, digest)
         # read-back mismatch, a local override or a template change put the site in unknown state: pause control until a person resumes it
-        if any(e.type in PAUSE_EVENTS for e in msg.events):
+        if any(contract.event_meaning(e.type) in PAUSE_EVENTS for e in msg.events):
             _pause_in(con, site_id)
     resolve = None
     outs = [e for e in msg.events if e.type in RESOLVE_EVENTS]
@@ -368,7 +378,11 @@ def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Body(...)
         except Exception:
             log.exception("could not start the event re-solve for site %s", site_id)
             resolve = "failed"
-    return {"ack": msg.seq, "stored": len(msg.events), "resolve": resolve}
+    answer = {"ack": msg.seq, "stored": len(msg.events), "resolve": resolve}
+    unknown = msg.unknown_types()
+    if unknown:
+        answer["unknown_types"] = unknown       # stored; a newer edge's event types never void its batch (1.x adds optional things only)
+    return answer
 
 
 def _merge_pending(held, cands: list[tuple[int, int, str]], now: int) -> dict:
@@ -391,7 +405,7 @@ def _merge_pending(held, cands: list[tuple[int, int, str]], now: int) -> dict:
 def edge_ack(site_id: str, inp: dict = Body(...)):
     _key_only()
     site_or_404(site_id)
-    msg = _check(delivery.Ack, inp)
+    msg = _check(delivery.Ack, inp, site_id)
     _seen(site_id)
     digest = _digest(msg)
     with store.write_transaction() as con:
@@ -407,7 +421,7 @@ def edge_ack(site_id: str, inp: dict = Body(...)):
 def edge_caps(site_id: str, inp: dict = Body(...)):
     _key_only()
     site_or_404(site_id)
-    msg = _check(delivery.Capabilities, inp)
+    msg = _check(delivery.Capabilities, inp, site_id)
     _seen(site_id)
     digest = _digest(msg)
     sent = _row_time(msg.sent_at)
@@ -423,8 +437,8 @@ def edge_caps(site_id: str, inp: dict = Body(...)):
         # older message is kept for the record and sets nothing
         newer = con.execute("SELECT 1 FROM capabilities WHERE site_id = ? AND sent_ts > ? LIMIT 1", (site_id, sent)).fetchone()
     if newer is None:
-        sites.set_tier_capable(site_id, msg.tier)
-    return {"ack": msg.seq, "tier_capable": (sites.get(site_id) or {}).get("tier_capable", msg.tier)}
+        sites.set_tier_capable(site_id, msg.control_tier)
+    return {"ack": msg.seq, "tier_capable": (sites.get(site_id) or {}).get("tier_capable", msg.control_tier)}
 
 
 def _without_money(site_id: str, msg: dict) -> dict:
@@ -447,6 +461,8 @@ def plan_message(site_id: str):
     except plans.NotClosedLoop as exc:
         # only a closed-loop site's edge applies plans: below it the edge gets no table to write (and no send is counted)
         raise Refusal(409, str(exc), "not_closed_loop") from None
+    except plans.CapsMismatch as exc:
+        raise Refusal(409, f"{exc}, so the plan is not sent", "caps_mismatch") from None
     if msg is None:
         held = plans.held_info(site_id) or {}
         if held.get("reason") == plans.EXPIRED_REASON:

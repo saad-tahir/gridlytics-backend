@@ -1,0 +1,385 @@
+{
+  "$defs": {
+    "AckApplied": {
+      "additionalProperties": false,
+      "properties": {
+        "primitive": {
+          "maxLength": 60,
+          "title": "Primitive",
+          "type": "string"
+        },
+        "readback": {
+          "default": null,
+          "title": "Readback"
+        },
+        "readback_ok": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Readback Ok"
+        },
+        "requested": {
+          "default": null,
+          "title": "Requested"
+        },
+        "requested_hash": {
+          "anyOf": [
+            {
+              "maxLength": 100,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Requested Hash"
+        },
+        "written": {
+          "default": null,
+          "title": "Written"
+        }
+      },
+      "required": [
+        "primitive"
+      ],
+      "title": "AckApplied",
+      "type": "object"
+    },
+    "AckDevice": {
+      "additionalProperties": false,
+      "properties": {
+        "applied": {
+          "items": {
+            "$ref": "#/$defs/AckApplied"
+          },
+          "maxItems": 50,
+          "title": "Applied",
+          "type": "array"
+        },
+        "device_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Device Id",
+          "type": "string"
+        },
+        "rejected": {
+          "items": {
+            "$ref": "#/$defs/AckRejected"
+          },
+          "maxItems": 50,
+          "title": "Rejected",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "applied",
+            "partial",
+            "rejected",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "writes_used_today": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "maxProperties": 20,
+          "propertyNames": {
+            "maxLength": 60
+          },
+          "title": "Writes Used Today",
+          "type": "object"
+        }
+      },
+      "required": [
+        "device_id",
+        "status"
+      ],
+      "title": "AckDevice",
+      "type": "object"
+    },
+    "AckItem": {
+      "additionalProperties": false,
+      "properties": {
+        "codes": {
+          "items": {
+            "maxLength": 40,
+            "type": "string"
+          },
+          "maxItems": 10,
+          "title": "Codes",
+          "type": "array"
+        },
+        "device": {
+          "maxLength": 60,
+          "title": "Device",
+          "type": "string"
+        },
+        "primitive": {
+          "maxLength": 60,
+          "title": "Primitive",
+          "type": "string"
+        },
+        "read_back": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Read Back"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "clamped",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "written": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Written"
+        }
+      },
+      "required": [
+        "device",
+        "primitive",
+        "status"
+      ],
+      "title": "AckItem",
+      "type": "object"
+    },
+    "AckRejected": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "anyOf": [
+            {
+              "maxLength": 300,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "primitive": {
+          "maxLength": 60,
+          "title": "Primitive",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 40,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "primitive",
+        "reason"
+      ],
+      "title": "AckRejected",
+      "type": "object"
+    }
+  },
+  "$id": "ems-edge/1.0/ack.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "After each plan or command (U3 5.6): `items` (this contract's) or `per_device` (U3's), and a reason code for a rejected plan.",
+  "properties": {
+    "applied_at": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Applied At"
+    },
+    "contract": {
+      "const": "ems-edge/1.0",
+      "default": "ems-edge/1.0",
+      "title": "Contract",
+      "type": "string"
+    },
+    "detail": {
+      "anyOf": [
+        {
+          "maxLength": 300,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Detail"
+    },
+    "edge_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Edge Id"
+    },
+    "items": {
+      "items": {
+        "$ref": "#/$defs/AckItem"
+      },
+      "maxItems": 200,
+      "title": "Items",
+      "type": "array"
+    },
+    "msg_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Id"
+    },
+    "msg_type": {
+      "anyOf": [
+        {
+          "const": "ack",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Type"
+    },
+    "per_device": {
+      "items": {
+        "$ref": "#/$defs/AckDevice"
+      },
+      "maxItems": 20,
+      "title": "Per Device",
+      "type": "array"
+    },
+    "plan_id": {
+      "maxLength": 120,
+      "title": "Plan Id",
+      "type": "string"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason"
+    },
+    "received_at": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Received At"
+    },
+    "sent_at": {
+      "maxLength": 40,
+      "title": "Sent At",
+      "type": "string"
+    },
+    "seq": {
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "site_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Site Id"
+    },
+    "status": {
+      "enum": [
+        "received",
+        "applied",
+        "partial",
+        "rejected",
+        "expired"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "seq",
+    "sent_at",
+    "plan_id",
+    "status"
+  ],
+  "title": "Ack",
+  "type": "object"
+}

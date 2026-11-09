@@ -444,3 +444,200 @@ def test_a_schema_2_file_keeps_its_capabilities_history_when_migrated(tmp_path, 
         rows = [dict(r) for r in con.execute("SELECT site_id, seq, digest, sent_ts, body FROM capabilities")]
         assert rows == [{"site_id": "s", "seq": 4, "digest": "", "sent_ts": None, "body": '{"seq": 4}'}]
         assert con.execute("SELECT count(*) FROM edge_seen").fetchone()[0] == 0
+
+
+# ------------------------------------------------------------------------------------------------ engine-delivery-11 (batch 2)
+
+from pathlib import Path  # noqa: E402
+
+CONTRACTS = Path(__file__).resolve().parents[2] / "contracts" / "ems-edge" / "1.0"
+
+
+def _example(name: str) -> dict:
+    return json.loads((CONTRACTS / "examples" / f"{name}.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("name,model", [("telemetry", "TelemetryBatch"), ("capabilities", "Capabilities"), ("events", "EventBatch"),
+                                        ("ack", "Ack"), ("heartbeat", "Heartbeat")])
+def test_every_u3_section_5_example_validates(name, model):
+    getattr(delivery, model).model_validate(_example(name))
+
+
+def test_the_u3_telemetry_shape_is_stored(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    msg = _example("telemetry")
+    t0 = _now() // 60 * 60 - 600
+    msg.update(site_id=sid, ts_start=_iso(t0))
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=msg)
+    assert r.status_code == 200 and r.json()["accepted"] == 2, r.text
+    # the U3 1.2 points the cloud does not keep are named, not refused
+    assert set(r.json()["ignored_columns"]) == {"grid_present_min", "battery_trust_score"}, r.text
+    with world.use():
+        g = telemetry.minute_grid(sid, t0, t0 + 120)
+    assert list(g["pv"]) == pytest.approx([12.4, 12.1]) and list(g["grid"]) == pytest.approx([1.0, 1.0])
+    # U3's row count must agree with its data
+    bad = {**msg, "seq": msg["seq"] + 1, "rows": 3}
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=bad)
+    assert r.status_code == 422 and "rows" in r.json()["detail"], r.text
+
+
+def test_an_envelope_naming_another_site_is_refused(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    for path, body in (("telemetry", _tel(1, _now() // 60 * 60 - 60)), ("heartbeat", _env(1, uptime_s=5)),
+                       ("events", _env(1, events=[{"ts": _iso(_now()), "type": "data_gap"}])), ("ack", _env(1, plan_id="p", status="received")),
+                       ("capabilities", _env(1, edge_version="1", tier="closed_loop"))):
+        r = world.anon.post(f"/api/edge/{sid}/{path}", headers=kh, json={**body, "site_id": world.other})
+        assert r.status_code == 403 and r.json()["code"] == "wrong_site", (path, r.text)
+        r = world.anon.post(f"/api/edge/{sid}/{path}", headers=kh, json={**body, "site_id": sid, "msg_type": "telemetry" if path != "telemetry" else "events"})
+        assert r.status_code == 422, (path, r.text)                    # a message sent to the wrong path
+    with world.use():
+        assert sites.get(sid)["tier_capable"] == "monitor" and sites.overrides(sid) == []
+
+
+def test_u3_event_names_act_and_an_unknown_type_does_not_void_the_batch(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    msg = _example("events")
+    msg["site_id"] = sid
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=msg)
+    assert r.status_code == 200 and r.json()["stored"] == 5, r.text
+    with world.use():
+        assert [o["kind"] for o in sites.overrides(sid)] == ["pause_control"]       # override_local is U3's local_override
+        with store.connect() as con:
+            assert con.execute("SELECT source FROM events WHERE site_id = ? AND type = 'genset_start'", (sid,)).fetchone()["source"] == "edge:gen1"
+    later = _env(9, events=[{"ts": _iso(_now()), "type": "battery_contactor_open", "source": "bat1"}, {"ts": _iso(_now()), "type": "data_gap"}])
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=later)
+    assert r.status_code == 200 and r.json()["stored"] == 2 and r.json()["unknown_types"] == ["battery_contactor_open"], r.text
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_env(10, events=[{"ts": _iso(_now()), "type": "Not a type!"}]))
+    assert r.status_code == 422, r.text
+
+
+def test_a_partial_ack_and_u3_heartbeat_states_are_taken(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    ack = {**_example("ack"), "site_id": sid}
+    assert world.anon.post(f"/api/edge/{sid}/ack", headers=kh, json=ack).status_code == 200
+    for n, state in enumerate(("executing", "fallback", "released", "disabled", "following_plan", "native")):
+        r = world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json={**_example("heartbeat"), "site_id": sid, "seq": n, "control_state": state})
+        assert r.status_code == 200, (state, r.text)
+    with world.use(), store.connect() as con:
+        assert con.execute("SELECT status FROM acks WHERE site_id = ?", (sid,)).fetchone()["status"] == "partial"
+
+
+def test_the_signed_plan_carries_the_u3_envelope_and_names_what_it_supersedes(company):
+    sid = _site(genset=False)
+    _closed_loop(sid)
+    with store.connect() as con:
+        con.execute("INSERT INTO capabilities (site_id, seq, digest, received_at, sent_ts, body) VALUES (?,?,?,?,?,?)",
+                    (sid, 17, "d", store._now(), _now(), json.dumps({**_example("capabilities"), "site_id": sid})))
+    assert plans.tick(sid)["status"] == "active"
+    first = plans.signed_message(sid)
+    assert first["msg_type"] == "plan" and first["type"] == "plan" and first["site_id"] == sid and first["edge_id"] == "edge-00a1b2"
+    assert len(first["msg_id"]) >= 16 and first["seq"] == 1 and first["sent_at"]
+    assert first["capabilities_seq"] == 17 and first["targets"] == [{"device_id": "inv1"}] and first["supersedes"] is None
+    delivery.PlanMessage.model_validate(first)
+    with store.connect() as con:                     # a newer plan replaces it
+        con.execute("UPDATE plans SET generated_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (first["plan_id"],))
+    assert plans.tick(sid)["status"] == "active"
+    second = plans.signed_message(sid)
+    assert second["plan_id"] != first["plan_id"] and second["supersedes"] == first["plan_id"] and second["seq"] == 2
+    assert second["msg_id"] != first["msg_id"]
+
+
+# ------------------------------------------------------------------------------------------------ brief-vs-build-12, tracker-and-docs-04 (batch 2)
+
+def test_the_published_schema_files_are_the_contract_models():
+    from gridlytics import contract
+    files = contract.schema_files()
+    assert set(files) == {f"{n}.schema.json" for n in ("telemetry", "heartbeat", "events", "ack", "capabilities", "plan")}
+    for name, text in files.items():
+        assert (CONTRACTS / name).read_text(encoding="utf-8") == text, f"{name} drifted: run python scripts/export_contract.py"
+        schema = json.loads(text)
+        assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    # the capabilities schema names each device's writable primitives, with their range, step, persistence and budget
+    caps = json.loads(files["capabilities.schema.json"])
+    assert set(caps["$defs"]["Primitive"]["properties"]) == {"values", "min", "max", "step", "persistence", "writes_per_day_max"}
+    assert "primitives" in caps["$defs"]["Device"]["properties"]
+
+
+def test_the_export_script_writes_the_files_and_its_check_finds_a_drift(tmp_path):
+    import subprocess
+    import sys
+    script = CONTRACTS.parents[2] / "scripts" / "export_contract.py"
+    run = lambda *a: subprocess.run([sys.executable, str(script), "--out", str(tmp_path), *a], capture_output=True, text=True)
+    assert run().returncode == 0
+    assert run("--check").returncode == 0
+    (tmp_path / "ack.schema.json").write_text("{}\n", encoding="utf-8")
+    r = run("--check")
+    assert r.returncode == 1 and "ack.schema.json" in r.stderr
+    assert (tmp_path / "ack.schema.json").read_text(encoding="utf-8") == "{}\n"     # --check writes nothing
+
+
+def _caps(sid: str, primitives: dict | None, max_slots: int | None = None, seq: int = 17) -> None:
+    body = _example("capabilities")
+    inv = body["devices"][0]
+    if primitives is None:
+        inv.pop("primitives")
+    else:
+        inv["primitives"] = primitives
+    if max_slots is not None:
+        inv["slot_model"]["max_slots"] = max_slots
+    with store.connect() as con:
+        con.execute("INSERT INTO capabilities (site_id, seq, digest, received_at, sent_ts, body) VALUES (?,?,?,?,?,?)",
+                    (sid, seq, f"d{seq}", store._now(), _now() + seq, json.dumps(body)))
+
+
+def _plan_slots(sid: str, slots: list[dict]) -> str:
+    t0 = _now() // 900 * 900
+    day = datetime.fromtimestamp(t0, PKT).date()
+    mid = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    out = []
+    for s in slots:
+        a, b = mid + s.pop("from_h") * 3600, mid + s.pop("to_h") * 3600
+        out.append({"start": datetime.fromtimestamp(a, PKT).strftime("%H:%M"), "end": datetime.fromtimestamp(b, PKT).strftime("%H:%M"),
+                    "start_ts": a, "end_ts": b, "soc_floor_pct": 20.0, "soc_target_pct": 100.0, "max_discharge_w": None, "max_charge_w": None,
+                    "grid_charge": False, "charge_end_ts": None, "charge_end": None, "grid_cap_w": None, "gen_charge": False, "export_allowed": False,
+                    "genset": None, "intent": "", **s})
+    pid = "plan-" + store.new_id(6)
+    with store.connect() as con:
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, objective_rs, summary, steps, slots) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (pid, sid, _iso(t0), _iso(t0), _iso(t0), _iso(t0 + 86400), "a", "active", 1.0,
+                                                         json.dumps({"status_label": "Following"}), "[]",
+                                                         json.dumps({"brand": "deye", "grammar": {"min_slot_minutes": 30},
+                                                                     "days": [{"date": day.isoformat(), "slots": out}],
+                                                                     "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": 20}})))
+    return pid
+
+
+THREE = [{"from_h": 0, "to_h": 5, "mode": "charge_grid", "grid_charge": True, "max_charge_w": 9000, "soc_target_pct": 95.0},
+         {"from_h": 5, "to_h": 17, "mode": "self_use"},
+         {"from_h": 17, "to_h": 24, "mode": "discharge", "max_discharge_w": 20000, "soc_floor_pct": 5.0}]
+
+
+def test_the_signed_plan_carries_only_what_the_device_can_write(company):
+    sid = _site(genset=False)
+    _closed_loop(sid)
+    _plan_slots(sid, [dict(s) for s in THREE])
+    prims = {"battery_mode": {"values": ["self_use", "hold", "charge", "native"]}, "battery_power_w": {"min": -6000, "max": 6000, "step": 10},
+             "soc_floor_pct": {"min": 10, "max": 100, "step": 1}, "soc_target_pct": {"min": 10, "max": 100, "step": 1}}
+    _caps(sid, prims)
+    msg = plans.signed_message(sid)
+    a, _, c = msg["mode_a"]["days"][0]["slots"]
+    assert a["grid_charge"] is False and a["max_charge_w"] == 6000                 # no grid-charge primitive; the charge power in range
+    assert c["max_discharge_w"] == 6000 and c["soc_floor_pct"] == 10               # the floor raised to the device's lowest
+    assert msg["capabilities_fit"] == {"device_id": "inv1", "capabilities_seq": 17, "not_writable": ["grid_charge_allowed"],
+                                       "clamped": ["battery_power_w", "soc_floor_pct"]}
+    # the plan page keeps the optimiser's table; only the message is fitted
+    assert plans.current(sid)["slots"]["days"][0]["slots"][0]["grid_charge"] is True
+
+
+def test_a_device_that_reports_no_primitives_gets_the_table_unchanged_and_too_many_slots_are_not_signed(company):
+    sid = _site(genset=False)
+    _closed_loop(sid)
+    _plan_slots(sid, [dict(s) for s in THREE])
+    _caps(sid, None)
+    msg = plans.signed_message(sid)
+    assert msg["mode_a"]["days"][0]["slots"][0]["grid_charge"] is True and msg.get("capabilities_fit") is None
+    _caps(sid, {"grid_charge_allowed": {}, "battery_power_w": {"min": -20000, "max": 20000}}, max_slots=2, seq=18)
+    with pytest.raises(plans.CapsMismatch) as no:
+        plans.signed_message(sid)
+    assert "3 slots" in str(no.value) and "2" in str(no.value)
+

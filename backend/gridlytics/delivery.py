@@ -12,12 +12,10 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from pydantic import BaseModel, ConfigDict, Field
 
 from . import platform as platformdb
 from . import store
@@ -298,60 +296,78 @@ def verify(message: dict, public_b64: str) -> bool:
 
 # ------------------------------------------------------------------------------------------------ ems-edge/1.0 messages (strict; the one validator)
 
-class _Msg(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    contract: Literal["ems-edge/1.0"] = CONTRACT
-    seq: int = Field(ge=0)
-    sent_at: str
+# The message models live in contract.py (plan DAT-02), with the JSON Schema files generated from them; they are named here as before
+from .contract import (Ack, AckItem, Capabilities, Device, Event, EventBatch, Heartbeat, PlanMessage, TelemetryBatch,  # noqa: E402,F401
+                       INVERTER_ROLES)
 
 
-class TelemetryBatch(_Msg):
-    columns: list[str] = Field(min_length=2, max_length=40)
-    rows: list[list[float | int | str | None]] = Field(max_length=1440)
-    quality: dict = Field(default_factory=dict)
+def latest_capabilities(site_id: str) -> dict | None:
+    """The site's current capabilities message (the newest by its sent_at, whatever its sequence: routes_edge.edge_caps), with `seq`; None when the
+    edge has sent none."""
+    with store.connect() as con:
+        r = con.execute("SELECT seq, body FROM capabilities WHERE site_id = ? ORDER BY sent_ts IS NULL, sent_ts DESC, received_at DESC LIMIT 1",
+                        (site_id,)).fetchone()
+    if r is None:
+        return None
+    body = json.loads(r["body"])
+    return {**body, "seq": int(r["seq"])}
 
 
-class Heartbeat(_Msg):
-    uptime_s: int = Field(ge=0)
-    active_plan: str | None = None
-    valid_until: str | None = None
-    control_state: Literal["following_plan", "native", "hold", "released", "disabled"] = "native"
-    queue_depth: int = Field(0, ge=0)
-    clock_offset_s: float = 0.0
+def targets(caps: dict | None) -> list[dict]:
+    """The devices a plan targets (U3 5.4 `targets`): the inverters the capabilities name."""
+    return [{"device_id": d["device_id"]} for d in (caps or {}).get("devices") or [] if d.get("role") in INVERTER_ROLES and d.get("device_id")]
 
 
-class Event(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    ts: str
-    type: Literal["outage_start", "outage_end", "genset_start", "genset_stop", "plan_received", "plan_rejected", "plan_applied", "plan_expired",
-                  "fallback_engaged", "fallback_cleared", "readback_mismatch", "write_failed", "budget_exhausted", "local_override",
-                  "template_change", "firmware_change", "control_disabled", "control_enabled", "reboot", "link_lost", "clock_unsynced",
-                  "battery_trust_low", "physics_check_failed", "data_gap", "installer_session"]
-    detail: dict = Field(default_factory=dict)
+class NotWritable(ValueError):
+    """A table the device's capabilities cannot take as it stands (more slots than its slot model holds): it is not signed (R6 C1)."""
 
 
-class EventBatch(_Msg):
-    events: list[Event] = Field(max_length=500)
+def fit_to_capabilities(days: list[dict], caps: dict | None) -> tuple[list[dict], dict | None]:
+    """The Mode A days as the target inverter can write them (R6 C1, brief: Product 1 compiles only what the device reports writable; audit
+    brief-vs-build-12). From the first inverter in the current capabilities that names its primitives: a grid-charge, generator-charge or export flag
+    the device cannot write is dropped (the slot runs without it), a power limit is held to battery_power_w's range, and a floor or target to its
+    primitive's range. A day with more slots than the device's slot model holds raises NotWritable. A device that names no primitives (an edge that
+    reports none) gets the table unchanged, as before. Returns the days and what was fitted ({device_id, capabilities_seq, not_writable, clamped}),
+    or None when nothing changed."""
+    dev = next((d for d in (caps or {}).get("devices") or [] if d.get("role") in INVERTER_ROLES and d.get("primitives")), None)
+    if dev is None:
+        return days, None
+    prims, model = dev["primitives"], dev.get("slot_model") or {}
+    dropped, clamped = set(), set()
 
+    def held(s: dict, key: str, lo, hi, name: str) -> None:
+        v = s.get(key)
+        if v is None:
+            return
+        x = min(max(float(v), lo if lo is not None else float(v)), hi if hi is not None else float(v))
+        if x != float(v):
+            s[key] = round(x) if isinstance(v, int) else x
+            clamped.add(name)
 
-class AckItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    device: str = Field(max_length=60)
-    primitive: str = Field(max_length=60)
-    written: float | str | None = None
-    read_back: float | str | None = None
-    status: Literal["ok", "clamped", "failed"]
-    codes: list[str] = Field(default_factory=list, max_length=10)
+    out = []
+    for day in days:
+        cap = model.get("max_slots")
+        if cap and len(day.get("slots") or []) > int(cap):
+            raise NotWritable(f"The table of {day.get('date')} has {len(day['slots'])} slots and the device {dev['device_id']} takes {int(cap)}")
+        slots = []
+        for s in day.get("slots") or []:
+            s = dict(s)
+            for flag, prim in (("grid_charge", "grid_charge_allowed"), ("gen_charge", "gen_charge_allowed"), ("export_allowed", "export_limit_w")):
+                if s.get(flag) and prim not in prims:
+                    s[flag] = False
+                    dropped.add(prim)
+            power = prims.get("battery_power_w")
+            if power is not None:
+                hi, lo = power.get("max"), power.get("min")
+                held(s, "max_discharge_w", None, hi, "battery_power_w")
+                held(s, "max_charge_w", None, abs(lo) if lo is not None else None, "battery_power_w")
+            for key in ("soc_floor_pct", "soc_target_pct"):
+                r = prims.get(key)
+                if r is not None:
+                    held(s, key, r.get("min"), r.get("max"), key)
+            slots.append(s)
+        out.append({**day, "slots": slots})
+    if not dropped and not clamped:
+        return days, None
+    return out, {"device_id": dev["device_id"], "capabilities_seq": (caps or {}).get("seq"), "not_writable": sorted(dropped), "clamped": sorted(clamped)}
 
-
-class Ack(_Msg):
-    plan_id: str
-    status: Literal["received", "applied", "rejected", "expired"]
-    items: list[AckItem] = Field(default_factory=list, max_length=200)
-
-
-class Capabilities(_Msg):
-    edge_version: str = Field(max_length=40)
-    clock_synced: bool = True
-    tier: Literal["monitor", "advisory_writes", "closed_loop"] = "monitor"
-    devices: list[dict] = Field(default_factory=list, max_length=20)

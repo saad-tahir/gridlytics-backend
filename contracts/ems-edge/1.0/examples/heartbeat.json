@@ -1,0 +1,15 @@
+{
+  "contract": "ems-edge/1.0",
+  "msg_type": "heartbeat",
+  "msg_id": "3c1f0a52-8d4e-4b0f-9a57-2f6d1e0b7c90",
+  "site_id": "pk-lhr-0007",
+  "edge_id": "edge-00a1b2",
+  "sent_at": "2026-11-06T13:06:00Z",
+  "seq": 77120,
+  "uptime_s": 86400,
+  "active_plan_id": "pk-lhr-0007:2026-11-06T13:00Z:v1",
+  "plan_valid_until": "2026-11-08T13:00:00Z",
+  "control_state": "executing",
+  "queue_depth": 0,
+  "clock_offset_s": 0.4
+}

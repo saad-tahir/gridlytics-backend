@@ -1,0 +1,157 @@
+{
+  "contract": "ems-edge/1.0",
+  "msg_type": "capabilities",
+  "msg_id": "...",
+  "site_id": "pk-lhr-0007",
+  "edge_id": "edge-00a1b2",
+  "sent_at": "2026-11-06T00:00:10Z",
+  "seq": 17,
+  "edge": {
+    "sw_version": "p2-0.4.2",
+    "hw": "cm5-carrier-a",
+    "contracts_accepted": [
+      "ems-edge/1.0"
+    ],
+    "clock_synced": true,
+    "control_tier": "closed_loop",
+    "control_enabled_by": "installer:ali.raza",
+    "control_enabled_at": "2026-10-20T09:12:00Z"
+  },
+  "devices": [
+    {
+      "device_id": "inv1",
+      "role": "hybrid_inverter",
+      "family": "deye_lv_3ph",
+      "template_id": "deye_sg04lp3@fw1098+",
+      "firmware": "1098-2021",
+      "rated_power_w": 12000,
+      "points": [
+        "grid_present",
+        "grid_power_w",
+        "pv_power_w",
+        "load_power_w",
+        "battery_power_w",
+        "battery_voltage_v",
+        "battery_current_a",
+        "battery_soc_bms_pct",
+        "inverter_mode_active",
+        "genset_power_w"
+      ],
+      "primitives": {
+        "battery_mode": {
+          "values": [
+            "self_use",
+            "hold",
+            "charge",
+            "native"
+          ],
+          "persistence": "eeprom",
+          "writes_per_day_max": 4
+        },
+        "battery_power_w": {
+          "min": -12000,
+          "max": 12000,
+          "step": 10,
+          "persistence": "eeprom",
+          "writes_per_day_max": 4
+        },
+        "soc_floor_pct": {
+          "min": 10,
+          "max": 100,
+          "step": 1,
+          "persistence": "eeprom",
+          "writes_per_day_max": 4
+        },
+        "soc_target_pct": {
+          "min": 10,
+          "max": 100,
+          "step": 1,
+          "persistence": "eeprom",
+          "writes_per_day_max": 4
+        },
+        "grid_charge_allowed": {
+          "persistence": "eeprom",
+          "writes_per_day_max": 4
+        },
+        "gen_charge_allowed": {
+          "persistence": "eeprom",
+          "writes_per_day_max": 4
+        },
+        "export_limit_w": {
+          "min": 0,
+          "max": 12000,
+          "step": 10,
+          "persistence": "eeprom",
+          "writes_per_day_max": 4
+        },
+        "release": {}
+      },
+      "slot_model": {
+        "mode_a_supported": true,
+        "max_slots": 6,
+        "ring": true,
+        "fields": [
+          "start_local",
+          "battery_power_w",
+          "soc_target_pct",
+          "charge_source"
+        ],
+        "time_resolution_min": 1,
+        "min_slot_minutes": 30,
+        "weekday_mask": false,
+        "table_writes_per_day_max": 4
+      },
+      "mode_b": {
+        "supported": false,
+        "reason": "no volatile setpoint register in template"
+      },
+      "native_settings_ref": "capture-2026-10-20T09:00:00Z"
+    },
+    {
+      "device_id": "bat1",
+      "role": "battery",
+      "family": "pylontech_can",
+      "template_id": "pylon_can_v1.3",
+      "capacity_wh_nameplate": 30720,
+      "points": [
+        "battery_soc_bms_pct",
+        "battery_soh_pct",
+        "battery_charge_limit_a",
+        "battery_discharge_limit_a",
+        "battery_cell_v_min",
+        "battery_cell_v_max"
+      ],
+      "shunt_fitted": true,
+      "estimator": {
+        "type": "ekf_2rc",
+        "version": "0.3",
+        "anchors_last_30d": 11
+      }
+    },
+    {
+      "device_id": "gen1",
+      "role": "genset",
+      "family": "deepsea_modbus",
+      "template_id": "UNVERIFIED",
+      "points": [
+        "genset_running",
+        "genset_power_w",
+        "genset_fuel_l"
+      ],
+      "primitives": {},
+      "control": "read_only"
+    },
+    {
+      "device_id": "met1",
+      "role": "grid_meter",
+      "family": "eastron_sdm630",
+      "points": [
+        "grid_power_w",
+        "grid_import_wh",
+        "grid_export_wh",
+        "grid_voltage_v",
+        "grid_frequency_hz"
+      ]
+    }
+  ]
+}

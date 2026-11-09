@@ -764,8 +764,8 @@ def _release_message(site_id: str, rel: dict, record: bool = True) -> dict:
             "mode_a": {"days": []}, "mode_b": None,
             "notes": {"reason": {"control_paused": "Control paused", "released_to_native": "Released to native",
                                  SWITCHBACK_REASON: "Switchback native block"}[rel["reason"]]},
-            "release": {"reason": rel["reason"], "until": rel["until"], "by": rel["author"]}}
-    msg = delivery.sign(site_id, _no_money(body))
+            "release": {"reason": rel["reason"], "until": rel["until"], "by": rel["author"]}, **_edge_envelope(site_id, None)}
+    msg = delivery.sign(site_id, _checked(_no_money(body)))
     if record:
         _record_send(site_id, "release", msg)
     return msg
@@ -787,14 +787,22 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
     plan = current(site_id)
     if plan is None:
         return None
+    caps = delivery.latest_capabilities(site_id)
+    days = [{"date": d["date"], "slots": [{k: v for k, v in s.items() if k not in ("intent",)} for s in d["slots"]]}
+            for d in (plan.get("slots") or {}).get("days", [])]
+    try:
+        # only what the target inverter can write (R6 C1): the plan page keeps the optimiser's table, the message carries what was fitted
+        days, fit = delivery.fit_to_capabilities(days, caps)
+    except delivery.NotWritable as exc:
+        raise CapsMismatch(str(exc)) from None
     body = {"contract": delivery.CONTRACT, "type": "plan", "plan_id": plan["id"], "site_id": site_id, "issued_at": plan["generated_at"],
             "valid_from": plan["valid_from"], "valid_until": plan["valid_until"], "timezone": "Asia/Karachi", "mode": plan["mode"],
-            "fallback": (plan.get("slots") or {}).get("fallback"),
-            "mode_a": {"days": [{"date": d["date"], "slots": [{k: v for k, v in s.items() if k not in ("intent",)} for s in d["slots"]]}
-                                for d in (plan.get("slots") or {}).get("days", [])]},
+            "fallback": (plan.get("slots") or {}).get("fallback"), "mode_a": {"days": days},
             "mode_b": delivery.mode_b(plan["steps"]) if plan["mode"] == "b" else None,
-            "notes": {"reason": plan["summary"].get("status_label")}}
-    msg = delivery.sign(site_id, _no_money(body))
+            "notes": {"reason": plan["summary"].get("status_label")}, **_edge_envelope(site_id, plan["id"], caps)}
+    if fit:
+        body["capabilities_fit"] = fit
+    msg = delivery.sign(site_id, _checked(_no_money(body)))
     if record:
         _record_send(site_id, plan["id"], msg)
     return msg
@@ -815,6 +823,11 @@ class NotClosedLoop(Exception):
         words = {"monitor": "monitor", "advisory_writes": "advisory writes"}.get(tier, str(tier).replace("_", " "))
         how = ("the plan is a recommendation" if tier == "monitor" else "a person keys the table in")
         super().__init__(f"The site's control tier is {words}, so no plan is sent to its edge: {how}")
+
+
+class CapsMismatch(Exception):
+    """The plan in force does not fit the device the edge's current capabilities describe (more slots than its slot model holds): it is not signed
+    (R6 C1: a table the edge would refuse is a cloud bug), and the edge keeps what it runs."""
 
 
 def _past_valid_until(valid_until: str | None, ts: int) -> bool:
@@ -841,3 +854,29 @@ def switchback_release(site_id: str, at: int | None = None) -> dict | None:
     until = datetime(end_day.year, end_day.month, end_day.day, tzinfo=PKT).astimezone(timezone.utc).isoformat(timespec="seconds")
     return {"reason": SWITCHBACK_REASON, "kind": "switchback", "until": until, "author": "switchback calendar", "override_id": None,
             "block_start": r["block_start"], "block_end": r["block_end"]}
+
+
+def _edge_envelope(site_id: str, plan_id: str | None, caps: dict | None = None) -> dict:
+    """U3 5.1 and 5.4's envelope of a plan message (audit engine-delivery-11): msg_type, a fresh msg_id, the edge it is for (the edge_id of its
+    current capabilities or last heartbeat), the message's sequence (one more than the messages sent to the site so far), sent_at, the plan this one
+    supersedes (the last other plan sent to the edge, so it can drop older queued plans after link loss), the capabilities sequence the plan was
+    checked against (CAPS_STALE) and the devices it targets."""
+    import uuid
+
+    caps = caps if caps is not None else delivery.latest_capabilities(site_id)
+    beat = sites.state(site_id).get("edge_heartbeat") or {}
+    with store.connect() as con:
+        sent = con.execute("SELECT count(*) FROM plan_messages WHERE site_id = ?", (site_id,)).fetchone()[0]
+        prev = con.execute("SELECT plan_id FROM plan_messages WHERE site_id = ? AND plan_id NOT IN ('release', ?) ORDER BY sent_at DESC, rowid DESC "
+                           "LIMIT 1", (site_id, plan_id or "")).fetchone()
+    return {"msg_type": "plan", "msg_id": str(uuid.uuid4()), "edge_id": (caps or {}).get("edge_id") or beat.get("edge_id"), "seq": int(sent) + 1,
+            "sent_at": store._now(), "supersedes": prev["plan_id"] if prev and plan_id else None,
+            "capabilities_seq": caps["seq"] if caps else None, "targets": delivery.targets(caps)}
+
+
+def _checked(body: dict) -> dict:
+    """The plan message body checked against the contract's model before it is signed (R6 C1: a message the edge would refuse for its shape is a
+    cloud bug, never signed)."""
+    delivery.PlanMessage.model_validate(body)
+    return body
+

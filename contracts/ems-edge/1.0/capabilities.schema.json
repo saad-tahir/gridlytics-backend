@@ -1,0 +1,625 @@
+{
+  "$defs": {
+    "Device": {
+      "additionalProperties": false,
+      "description": "A device behind the edge (U3 5.3). `primitives` names what the cloud may write on it; a device that names none is read only.",
+      "properties": {
+        "capacity_wh_nameplate": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Capacity Wh Nameplate"
+        },
+        "control": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Control"
+        },
+        "device_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Device Id",
+          "type": "string"
+        },
+        "estimator": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Estimator"
+        },
+        "family": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Family"
+        },
+        "firmware": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Firmware"
+        },
+        "mode_b": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModeB"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "native_settings_ref": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Native Settings Ref"
+        },
+        "points": {
+          "items": {
+            "maxLength": 60,
+            "type": "string"
+          },
+          "maxItems": 80,
+          "title": "Points",
+          "type": "array"
+        },
+        "primitives": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Primitive"
+          },
+          "maxProperties": 40,
+          "propertyNames": {
+            "maxLength": 60
+          },
+          "title": "Primitives",
+          "type": "object"
+        },
+        "rated_power_w": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rated Power W"
+        },
+        "role": {
+          "maxLength": 40,
+          "title": "Role",
+          "type": "string"
+        },
+        "shunt_fitted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Shunt Fitted"
+        },
+        "slot_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlotModel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "template_id": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Template Id"
+        }
+      },
+      "required": [
+        "device_id",
+        "role"
+      ],
+      "title": "Device",
+      "type": "object"
+    },
+    "EdgeInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "clock_synced": {
+          "default": true,
+          "title": "Clock Synced",
+          "type": "boolean"
+        },
+        "contracts_accepted": {
+          "items": {
+            "maxLength": 20,
+            "type": "string"
+          },
+          "maxItems": 10,
+          "title": "Contracts Accepted",
+          "type": "array"
+        },
+        "control_enabled_at": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Control Enabled At"
+        },
+        "control_enabled_by": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Control Enabled By"
+        },
+        "control_tier": {
+          "anyOf": [
+            {
+              "enum": [
+                "monitor",
+                "advisory_writes",
+                "closed_loop"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Control Tier"
+        },
+        "hw": {
+          "anyOf": [
+            {
+              "maxLength": 60,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hw"
+        },
+        "sw_version": {
+          "maxLength": 40,
+          "title": "Sw Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sw_version"
+      ],
+      "title": "EdgeInfo",
+      "type": "object"
+    },
+    "ModeB": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 300,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "supported": {
+          "title": "Supported",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supported"
+      ],
+      "title": "ModeB",
+      "type": "object"
+    },
+    "Primitive": {
+      "additionalProperties": false,
+      "description": "A writable primitive of a device (U3 5.3): its values or range and step, its persistence class and its daily write budget.",
+      "properties": {
+        "max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        },
+        "min": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min"
+        },
+        "persistence": {
+          "anyOf": [
+            {
+              "maxLength": 20,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Persistence"
+        },
+        "step": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Step"
+        },
+        "values": {
+          "anyOf": [
+            {
+              "items": {
+                "maxLength": 40,
+                "type": "string"
+              },
+              "maxItems": 20,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Values"
+        },
+        "writes_per_day_max": {
+          "anyOf": [
+            {
+              "maximum": 10000,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Writes Per Day Max"
+        }
+      },
+      "title": "Primitive",
+      "type": "object"
+    },
+    "SlotModel": {
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "items": {
+            "maxLength": 40,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "title": "Fields",
+          "type": "array"
+        },
+        "max_slots": {
+          "anyOf": [
+            {
+              "maximum": 48,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Slots"
+        },
+        "min_slot_minutes": {
+          "anyOf": [
+            {
+              "maximum": 1440,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min Slot Minutes"
+        },
+        "mode_a_supported": {
+          "default": true,
+          "title": "Mode A Supported",
+          "type": "boolean"
+        },
+        "ring": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ring"
+        },
+        "table_writes_per_day_max": {
+          "anyOf": [
+            {
+              "maximum": 1000,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Table Writes Per Day Max"
+        },
+        "time_resolution_min": {
+          "anyOf": [
+            {
+              "maximum": 60,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Time Resolution Min"
+        },
+        "weekday_mask": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Weekday Mask"
+        }
+      },
+      "title": "SlotModel",
+      "type": "object"
+    }
+  },
+  "$id": "ems-edge/1.0/capabilities.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "On boot, on a template change and at least daily (U3 5.3). The tier is edge-asserted: `tier`, or U3's edge.control_tier.",
+  "properties": {
+    "clock_synced": {
+      "default": true,
+      "title": "Clock Synced",
+      "type": "boolean"
+    },
+    "contract": {
+      "const": "ems-edge/1.0",
+      "default": "ems-edge/1.0",
+      "title": "Contract",
+      "type": "string"
+    },
+    "devices": {
+      "items": {
+        "$ref": "#/$defs/Device"
+      },
+      "maxItems": 20,
+      "title": "Devices",
+      "type": "array"
+    },
+    "edge": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EdgeInfo"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "edge_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Edge Id"
+    },
+    "edge_version": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Edge Version"
+    },
+    "msg_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Id"
+    },
+    "msg_type": {
+      "anyOf": [
+        {
+          "const": "capabilities",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Type"
+    },
+    "sent_at": {
+      "maxLength": 40,
+      "title": "Sent At",
+      "type": "string"
+    },
+    "seq": {
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "site_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Site Id"
+    },
+    "tier": {
+      "anyOf": [
+        {
+          "enum": [
+            "monitor",
+            "advisory_writes",
+            "closed_loop"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tier"
+    }
+  },
+  "required": [
+    "seq",
+    "sent_at"
+  ],
+  "title": "Capabilities",
+  "type": "object"
+}
