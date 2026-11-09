@@ -25,6 +25,8 @@ Batch 3, the control actions and the control state:
 - hold, release, pause, resume and "mark as applied" read their bodies through strict models: the action, then the permission, then the body are
   checked, a bad field is a 422 in one sentence (never a 500, even for a viewer), nothing is written, and an applied day is a date of the plan's
   table (audit pages-B-01, security-roles-13, flow-telemetry-plan-control-20);
+- every action takes effect at once: the plan is re-solved now, so a hold is in the plan and the edge's message straight away and under a pause or a
+  release the plan of before is no longer active (audit flow-telemetry-plan-control-15, flow-telemetry-plan-control-21);
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -929,3 +931,63 @@ def test_marking_a_plan_applied_takes_only_a_date_of_its_table(world):
     assert r.status_code == 422, r.status_code
     with world.use():
         assert len(plans.applied_rows(sid)) == 2
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-15, flow-telemetry-plan-control-21
+
+def test_a_hold_re_solves_at_once_so_the_plan_and_the_edge_take_it(world):
+    sid, op = world.site, world.c["operator"]
+    with world.use():
+        _closed_loop(sid)
+        before = plans.tick(sid)
+    assert before["status"] == "active"
+    r = op.post(f"/api/sites/{sid}/control/hold", json={"hours": 2, "soc_pct": 80})
+    assert r.status_code == 200, r.text
+    resolve = r.json()["resolve"]                                          # no re-solve before: the hold waited for the next quarter
+    assert resolve["status"] == "active" and resolve["plan_id"] != before["plan_id"], resolve
+    with world.use():
+        (o,) = sites.overrides(sid)
+        plan = plans.current(sid)
+        message = plans.signed_message(sid, record=False)
+    assert plan["id"] == resolve["plan_id"] == message["plan_id"]
+    until = plans._ts(o["until_ts"])
+    held = [s for s in plan["steps"] if s["t"] < until]
+    assert held and all(s["reserve_pct"] >= 80 for s in held), [(s["local"], s["reserve_pct"]) for s in held]
+    assert any(s["reserve_pct"] < 80 for s in plan["steps"] if s["t"] >= until)
+
+
+def test_a_pause_or_release_re_solves_at_once_so_the_versions_list_holds_the_plan(world):
+    sid, admin, op = world.site, world.c["admin"], world.c["operator"]
+    for client, action, reason in ((admin, "pause", "control_paused"), (op, "release", "released_to_native")):
+        with world.use():
+            first = plans.tick(sid)
+        assert first["status"] == "active"
+        r = client.post(f"/api/sites/{sid}/control/{action}", json={"hours": 1})
+        assert r.status_code == 200 and r.json()["resolve"]["status"] == "held", r.text
+        rows = world.c["viewer"].get(f"/api/sites/{sid}/plans").json()
+        # the plan of before is no longer badged active under "No plan in force": it is superseded, and the newest is held for the pause
+        assert [x["status"] for x in rows[:2]] == ["held", "superseded"] and rows[0]["reason"] == reason, rows[:2]
+        assert not any(x["status"] == "active" for x in rows)
+        held = world.c["viewer"].get(f"/api/sites/{sid}/plan").json()["held"]
+        assert held["reason"] == reason and held["plan_id"] == rows[0]["id"], held
+        assert admin.post(f"/api/sites/{sid}/control/resume", json={}).json()["resolve"]["status"] == "active"
+
+
+def test_every_action_re_solves_and_a_failed_re_solve_leaves_the_action_standing(world, monkeypatch):
+    sid, admin = world.site, world.c["admin"]
+    ticks = _no_ticks(monkeypatch)
+    for n, action in enumerate(("hold", "release", "pause", "resume"), start=1):
+        r = admin.post(f"/api/sites/{sid}/control/{action}", json={} if action == "resume" else {"hours": 2})
+        assert r.status_code == 200 and r.json()["resolve"] == {"status": "active", "plan_id": f"p-{n}", "reason": None}, (action, r.text)
+    assert ticks == [sid] * 4
+    assert "resolve" not in admin.post(f"/api/sites/{sid}/control/resume", json={}).json() and len(ticks) == 4   # nothing to resume
+
+    def broken(site_id, *a, **k):
+        raise RuntimeError("solver crashed")
+
+    monkeypatch.setattr(plans, "tick", broken)
+    r = admin.post(f"/api/sites/{sid}/control/hold", json={"hours": 2, "soc_pct": 70})
+    assert r.status_code == 200 and r.json()["control"]["key"] == "hold", r.text
+    assert r.json()["resolve"]["status"] == "failed" and r.json()["resolve"]["reason"].startswith("The re-solve after the hold failed"), r.json()
+    with world.use():
+        assert [o["kind"] for o in sites.overrides(sid)] == ["reserve"]

@@ -218,7 +218,9 @@ def control(site_id: str, day: int = 0):
 @router.post("/api/sites/{site_id}/control/{action}")
 def control_action(site_id: str, action: str, inp: dict = Body(default={})):
     """Hold, release, pause and resume. The action, then the permission, then the body are checked (a 404, a 403, then a 422 in one sentence)
-    before anything is written."""
+    before anything is written. Each takes effect at once: the plan is re-solved now (a resume only when it cleared something), so a hold is in the
+    plan and in the edge's signed message straight away, and under a pause or a release the tick holds its plan and the plan of before stops being
+    active. The answer is the control answer with `resolve`, how that re-solve went; a failed one is said, the action stands."""
     site_or_404(site_id)
     if action not in CONTROL_ACTIONS:
         raise Refusal(404, "The control actions are hold, release, pause and resume", "not_found")
@@ -232,31 +234,35 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
             if o["kind"] in RESUMED_KINDS:
                 sites.clear_override(site_id, o["id"], who)
                 cleared += 1
-        if cleared:
-            # while paused or released no plan is in force, so the plan and the edge's signed message come back at once, not at the next quarter
-            resolve = _resolve_after_resume(site_id)
-            res = control(site_id)
-            res["resolve"] = resolve
-            return res
-        return control(site_id)
-    until = (datetime.now(timezone.utc) + timedelta(hours=f.hours)).isoformat()
-    if action == "hold":
-        from . import battery
-        st = battery.state(sites.full(site_id)) or {}
-        fields = {"kind": "reserve", "value": float(f.soc_pct or st.get("soc_pct") or 50), "until": until, "reason": f.reason or "Operator hold"}
-    elif action == "release":
-        fields = {"kind": "force_native", "until": until, "reason": f.reason or "Released to native"}
+        if not cleared:
+            return control(site_id)
     else:
-        fields = {"kind": "pause_control", "until": until, "reason": f.reason or "Paused"}
-    try:
-        sites.add_override(site_id, fields, who)
-    except ValueError as exc:
-        raise bad(exc) from None
-    return control(site_id)
+        until = (datetime.now(timezone.utc) + timedelta(hours=f.hours)).isoformat()
+        if action == "hold":
+            from . import battery
+            st = battery.state(sites.full(site_id)) or {}
+            fields = {"kind": "reserve", "value": float(f.soc_pct or st.get("soc_pct") or 50), "until": until, "reason": f.reason or "Operator hold"}
+        elif action == "release":
+            fields = {"kind": "force_native", "until": until, "reason": f.reason or "Released to native"}
+        else:
+            fields = {"kind": "pause_control", "until": until, "reason": f.reason or "Paused"}
+        try:
+            sites.add_override(site_id, fields, who)
+        except ValueError as exc:
+            raise bad(exc) from None
+    resolve = _resolve_now(site_id, action)
+    res = control(site_id)
+    res["resolve"] = resolve
+    return res
 
 
-def _resolve_after_resume(site_id: str) -> dict:
-    """The tick after a resume. A failed tick is reported, not raised: the resume itself stands (the next scheduled tick tries again)."""
+#: what a failed re-solve names as its cause
+_AFTER = {"hold": "the hold", "release": "the release", "pause": "the pause", "resume": "resuming"}
+
+
+def _resolve_now(site_id: str, action: str) -> dict:
+    """The tick after a control action, so it takes effect at once rather than at the next quarter. A failed tick is reported, not raised: the
+    action itself stands (the next scheduled tick tries again)."""
     _last_solve[site_id] = time.monotonic()
     try:
         if (sites.get(site_id) or {}).get("demo_link"):    # as the manual re-solve: a demo site's twin first catches up to now
@@ -264,9 +270,10 @@ def _resolve_after_resume(site_id: str) -> dict:
             demo.advance(site_id)
         r = plans.tick(site_id)
     except Exception as exc:
-        log.exception("the re-solve after resuming failed for site %s", site_id)
-        return {"status": "failed", "plan_id": None, "reason": f"The re-solve after resuming failed ({type(exc).__name__}); the next scheduled tick tries again"}
-    store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"], "after": "resume"})
+        log.exception("the re-solve after %s failed for site %s", action, site_id)
+        return {"status": "failed", "plan_id": None,
+                "reason": f"The re-solve after {_AFTER[action]} failed ({type(exc).__name__}); the next scheduled tick tries again"}
+    store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"], "after": action})
     return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": r.get("reason")}
 
 
