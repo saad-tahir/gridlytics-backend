@@ -100,6 +100,42 @@ def _litres_saved(b: dict, scored: int, has_genset: bool) -> str:
     return smart(b.get("litres_saved"), " L")
 
 
+def _weeks(x) -> str:
+    v = _finite(x) or 0.0
+    return f"{v:g}" if v == int(v) else f"{v:.1f}"
+
+
+def preliminary_sentence(summ: dict, month_over: bool) -> str:
+    """Why the figures are preliminary: only the conditions that still apply, as the Savings page lists them (verify.summary's final_conditions,
+    plan 8.5): 28 verified days, a native capture, 8 weeks of switchback, the FCA of every month billed; and the month being over."""
+    c = summ.get("final_conditions") or {}
+    left = []
+    if c:
+        if (c.get("verified_days") or 0) < (c.get("verified_days_needed") or 0):
+            left.append(f"{c['verified_days_needed']} verified days ({c.get('verified_days') or 0} so far)")
+        if not c.get("native_capture", True):
+            left.append("a capture of the inverter's native settings")
+        if (_finite(c.get("switchback_weeks")) or 0.0) < (c.get("switchback_weeks_needed") or 0):
+            left.append(f"{c['switchback_weeks_needed']} weeks of switchback ({_weeks(c.get('switchback_weeks'))} so far)")
+        if not c.get("fca_billed", True):
+            left.append("the fuel charges adjustment of every month in the period is billed")
+    if not month_over:
+        left.append("the month is over")
+    if not left:  # an answer without the conditions: the plan's rule in full
+        left = ["28 verified days, a native capture, 8 weeks of switchback, the fuel charges adjustment of every month billed, and the month over"]
+    return "Preliminary. These figures stay preliminary until " + "; ".join(left) + "."
+
+
+def _genset_assumption(site: dict) -> str:
+    """At a site whose genset is started by hand, the native replay's genset is an operator rule the product assumes (twin.simulate), not part of the
+    capture (plan 8.2: the genset stream is reported with its fidelity, not claimed as blinded)."""
+    if not (site.get("assets") or {}).get("genset") or (site.get("data") or {}).get("genset_start_control", "manual") != "manual":
+        return ""
+    return (" At this site the genset is started by hand, so the replay of the native settings also assumes an operator rule: someone starts the genset "
+            "about ten minutes after the battery reaches its floor in an outage and stops it once the battery is charged. That rule is the product's "
+            "assumption, not part of the capture, so the genset's part of the saving is reported with its fidelity, not as a blinded measurement.")
+
+
 def num(x, fmt: str = ",.0f", unit: str = "", scale: float = 1.0) -> str:
     """A quantity as text, or a dash when it is missing (a day row may hold None: a value that was not finite, or never measured)."""
     if x is None or isinstance(x, bool):
@@ -176,8 +212,7 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
         inputs["computed"] = summ.get("computed")
         prelim = bool(summ["preliminary"] or (p1 >= today))
         if prelim:
-            story.append(Paragraph("<b>Preliminary.</b> Fewer than 28 verified days, the month is not over, or a fuel adjustment of the period is not yet billed.",
-                                   styles["Normal"]))
+            story.append(Paragraph(_text(preliminary_sentence(summ, p1 < today)).replace("Preliminary.", "<b>Preliminary.</b>", 1), styles["Normal"]))
             story.append(Spacer(1, 3 * mm))
         if kind == "monthly_savings":
             nat, tun = summ["baselines"].get("native", {}), summ["baselines"].get("tuned", {})
@@ -198,6 +233,8 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
             if nat.get("perfect_foresight_rs") is not None:
                 rows.append(["Perfect foresight (not achievable, for reference)", rs(nat["perfect_foresight_rs"])])
             story.append(_table(rows, [110 * mm, 40 * mm]))
+            story.append(Paragraph("The ledger sums every scored day of the month, the days that claim nothing included (a table not applied, a native "
+                                   "block, a withheld claim); the claimed figure above counts the verified days only.", styles["Normal"]))
             story.append(Spacer(1, 2 * mm))
             story.append(Paragraph("Method: " + _text(summ["method"]) + ".", styles["Normal"]))
         story.append(Paragraph("Energy", styles["Heading2"]))
@@ -236,7 +273,8 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
         cap = sites.native_latest(site_id)
         story.append(Spacer(1, 3 * mm))
         story.append(Paragraph(f"Native capture version {_text(cap['version']) if cap else 'none'}; tariff versions as dated in the CSV annex. "
-                               "Figures are measured against a replay of the inverter's own settings on the same day's sun, load and outages.", styles["Normal"]))
+                               "Figures are measured against a replay of the inverter's own settings on the same day's sun, load and outages."
+                               + _text(_genset_assumption(site)), styles["Normal"]))
     else:
         plan = plans.current(site_id)
         story.append(Paragraph("Tomorrow's slot table, in the vendor's layout", styles["Heading2"]))

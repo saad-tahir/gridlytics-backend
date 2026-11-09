@@ -655,3 +655,35 @@ def test_the_monthly_reports_litres_are_marked_estimated_and_never_minus_zero(wo
     text = built[-1]
     assert not re.search(r"-0(\.0)? L", text), text
     assert "0.0 L" in text and "72.4 L" in text and "Estimated" in text, text
+
+
+def test_the_preliminary_sentence_names_the_conditions_that_apply_and_the_method_names_the_genset_assumption(world, monkeypatch):
+    """engine-savings-13 (and flow-reports-alerts-members-keys-17): the PDF printed one fixed sentence that left out the native capture and the 8 weeks
+    of switchback verify.summary also requires, and said the baseline is purely the inverter's settings although at a manual-start genset site the
+    native replay assumes an operator rule the capture does not record; the ledger summed every day without saying so."""
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    day = f"{month}-05"
+    conds = {"verified_days": 4, "verified_days_needed": 28, "native_capture": True, "switchback_weeks": 1.0, "switchback_weeks_needed": 8,
+             "fca_billed": True}
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(day)], preliminary=True, final_conditions=conds), [_tday(day)])
+    built = _story(monkeypatch)
+    with world.use():
+        rep = reports.generate("monthly_savings", sid, month, "test")
+    assert rep["preliminary"] is True
+    text = built[-1]
+    prelim = next(ln for ln in text.splitlines() if ln.startswith("Preliminary"))
+    assert "28 verified days (4 so far)" in prelim and "8 weeks of switchback (1 so far)" in prelim, prelim
+    assert "fuel" not in prelim and "month is not over" not in prelim and "native settings" not in prelim, prelim
+    assert "started by hand" in text and "assumption" in text and "with its fidelity" in text, text
+    assert "every scored day" in text, text                   # the ledger says it sums the days that claim nothing as well
+    # every condition that applies, and only those: no capture, the FCA not billed
+    conds = {**conds, "verified_days": 30, "switchback_weeks": 9.0, "native_capture": False, "fca_billed": False}
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(day)], preliminary=True, final_conditions=conds))
+    with world.use():
+        sites.update(sid, {"genset_start_control": "auto_on_grid_loss"}, "test")
+        reports.generate("monthly_savings", sid, month, "test")
+    text = built[-1]
+    prelim = next(ln for ln in text.splitlines() if ln.startswith("Preliminary"))
+    assert "native settings" in prelim and "fuel charges adjustment" in prelim and "verified days" not in prelim and "switchback" not in prelim, prelim
+    assert "started by hand" not in text                      # an automatic start is the inverter's own, in the capture
