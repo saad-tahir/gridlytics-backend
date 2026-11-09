@@ -140,9 +140,12 @@ def control(site_id: str, day: int = 0):
     from . import telemetry
     with store.connect() as con:
         writes_today = con.execute("SELECT COUNT(*) FROM plan_messages WHERE site_id = ? AND substr(sent_at,1,10) = ?", (site_id, today().isoformat())).fetchone()[0]
+    # per day, the table in the vendor's layout: its rows, the compiled slots each row keys, the values keyed once, and what the brand cannot hold
+    tables = [delivery.vendor_table(comp, i) for i in range(len((comp or {}).get("days", [])))]
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "tier_capable", "tier_allowed")}, "control": control_state(s, telemetry.latest(site_id), now_ts()),
                 "brand": brand, "grammar": delivery.BRANDS.get(brand, delivery.BRANDS["other"]), "compiled": comp,
-                "vendor_view": [delivery.vendor_view(comp, i) for i in range(len((comp or {}).get("days", [])))] if comp else [],
+                "vendor_view": [t["rows"] for t in tables], "vendor_slots": [t["slots"] for t in tables],
+                "vendor_settings": [t["settings"] for t in tables], "vendor_notes": [t["notes"] for t in tables],
                 "plan_id": (p or {}).get("id"), "applied": plans.applied_rows(site_id), "overrides": sites.overrides(site_id),
                 "budget": {"table_writes_per_day": delivery.BRANDS.get(brand, delivery.BRANDS["other"])["table_writes_per_day"], "used_today": writes_today},
                 "native": sites.native_latest(site_id), "fallback": (comp or {}).get("fallback")})

@@ -209,23 +209,69 @@ def _intent_words(mode: str, floor: float, target: float) -> str:
             "self_use": f"Self-use, not below {floor:.0f} %"}.get(mode, mode)
 
 
-def vendor_view(compiled: dict, day_index: int = 0) -> list[dict]:
-    """The table as the installer keys it into the vendor's own screen (Deye's six programs, Huawei's periods, Growatt's windows)."""
-    if not compiled.get("days"):
-        return []
+# ------------------------------------------------------------------------------------------------ the vendor's layout (Part 7.1 step 4, DLV-02)
+#
+# Each brand's translation answers (rows, settings, notes) for one day: the rows in the vendor's own layout, each with the compiled slots it keys
+# (`_slots`, moved out of the row by vendor_table, so the page can put the plan's intent beside it); the values keyed once for the table (the global
+# settings a brand keeps instead of per-slot values); and a sentence for each thing in the plan the brand cannot hold as planned. Register facts are
+# from R6 3.1 to 3.4 and R8 2.15 (for Huawei read for facts only, nothing copied); none is bench-confirmed yet (DLV-00).
+
+def _end(s: dict) -> str:
+    """A slot's end as the vendor screens take it: a slot that ends at midnight ends at 23:59 (Huawei refuses 00:00 as an end, R6 3.2)."""
+    return "23:59" if s["end"] == "00:00" else s["end"]
+
+
+def _span(s: dict) -> str:
+    return f"{s['start']} to {_end(s)}"
+
+
+def _pct(x: float | None) -> int | None:
+    return None if x is None else round(x)
+
+
+def _setting(key: str, label: str, value, unit: str = "") -> dict:
+    return {"key": key, "label": label, "value": value, "unit": unit}
+
+
+def _min_floor(compiled: dict) -> float:
+    return float((compiled.get("fallback") or {}).get("min_soc_floor_pct") or 20.0)
+
+
+def _soc_keyed(s: dict) -> int:
+    """The state of charge a per-slot SoC field keys: a charging slot's target (it charges up to it), any other slot's floor (it stops there)."""
+    return round(s["soc_target_pct"] if s["mode"].startswith("charge") else s["soc_floor_pct"])
+
+
+def _deye(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
+    rows = [{"program": k + 1, "time": s["start"], "power_w": s["max_discharge_w"] or s["max_charge_w"] or 0, "soc_pct": _soc_keyed(s),
+             "grid_charge": s["grid_charge"], "gen_charge": s["gen_charge"], "_slots": [k]} for k, s in enumerate(slots)]
+    return rows, [], []
+
+
+def _generic(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
+    rows = [{"slot": k + 1, "start": s["start"], "end": s["end"], "mode": s["mode"], "soc_pct": _soc_keyed(s), "_slots": [k]}
+            for k, s in enumerate(slots)]
+    return rows, [], []
+
+
+VENDOR = {"deye": _deye, "other": _generic}
+
+
+def vendor_table(compiled: dict | None, day_index: int = 0) -> dict:
+    """One day's table as the installer keys it into the vendor's own screen: `rows` (in the vendor's layout), `slots` (per row, the compiled
+    slots it keys, for the intent beside it), `settings` (keyed once for the table: {key, label, value, unit}) and `notes` (what the brand cannot
+    hold as planned, one sentence each)."""
+    if not compiled or not compiled.get("days"):
+        return {"rows": [], "slots": [], "settings": [], "notes": []}
     day = compiled["days"][min(day_index, len(compiled["days"]) - 1)]
-    brand = compiled["brand"]
-    rows = []
-    for k, s in enumerate(day["slots"]):
-        if brand == "deye":
-            rows.append({"program": k + 1, "time": s["start"], "power_w": s["max_discharge_w"] or s["max_charge_w"] or 0, "soc_pct": round(
-                s["soc_target_pct"] if s["mode"].startswith("charge") else s["soc_floor_pct"]), "grid_charge": s["grid_charge"], "gen_charge": s["gen_charge"]})
-        elif brand == "huawei":
-            rows.append({"period": k + 1, "start": s["start"], "end": s["end"], "charge_or_discharge": "charge" if s["mode"].startswith("charge") else
-                         "discharge" if s["mode"] in ("discharge", "export") else "hold"})
-        else:
-            rows.append({"slot": k + 1, "start": s["start"], "end": s["end"], "mode": s["mode"], "soc_pct": round(s["soc_floor_pct"])})
-    return rows
+    rows, settings, notes = VENDOR.get(compiled.get("brand"), _generic)(day["slots"], compiled)
+    return {"rows": [{k: v for k, v in r.items() if k != "_slots"} for r in rows], "slots": [r["_slots"] for r in rows], "settings": settings,
+            "notes": notes}
+
+
+def vendor_view(compiled: dict, day_index: int = 0) -> list[dict]:
+    """The rows of vendor_table: the table as the installer keys it into the vendor's own screen."""
+    return vendor_table(compiled, day_index)["rows"]
 
 
 def _mode_b_floor(s: dict) -> float | None:
