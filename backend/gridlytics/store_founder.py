@@ -130,6 +130,56 @@ def code_refusals(seconds: int) -> int:
                            (WHO, CODE_REFUSED, good, now - seconds)).fetchone()[0]
 
 
+# ================================================================================================================ the founder's sessions (founder.py)
+
+#: The record's words for the founder's sessions (audit founder-console-09): the second from which sessions hold, with the mark of the password hash it
+#: was set under ({from, password, why}), and a session signed out ({session: the hash of its token, until})
+SESSIONS_FROM = "founder sessions from"
+SIGNED_OUT = "founder signed out"
+
+
+def _held(con) -> dict | None:
+    row = con.execute("SELECT detail FROM account_events WHERE email = ? AND event = ? ORDER BY id DESC LIMIT 1", (WHO, SESSIONS_FROM)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def sessions_from(mark: str, now: int) -> dict:
+    """The second from which the founder's sessions hold, and why the earlier ones ended ({from, why}: why "password" or "asked", "" before any ended).
+    The mark of the password hash is kept with it: the first time another one is seen (the founder's password, or the session secret, changed), every
+    session made before `now` ends, once, and the founder's audit says so. The first mark ever seen ends nothing."""
+    with platformdb._read() as con:
+        held = _held(con)
+    if held is not None and held.get("password") == mark:
+        return held
+    with platformdb._write() as con:
+        held = _held(con)                               # another request may have seen the change meanwhile
+        if held is not None and held.get("password") == mark:
+            return held
+        now_held = {"from": int(now) if held is not None else 0, "password": mark, "why": "password" if held is not None else ""}
+        _event(con, SESSIONS_FROM, "", now_held)
+    if held is not None:
+        platformdb.founder_audit("ended every founder session", "", {"why": "the founder's password or session secret changed"})
+    return now_held
+
+
+def end_sessions(mark: str, start: int) -> None:
+    """Every founder session made before the second `start` ends (signing out everywhere)."""
+    with platformdb._write() as con:
+        _event(con, SESSIONS_FROM, "", {"from": int(start), "password": mark, "why": "asked"})
+
+
+def sign_out(digest: str, until: int, address: str) -> None:
+    """The session whose token has this hash ends; `until` is when it would have ended by itself."""
+    with platformdb._write() as con:
+        _event(con, SIGNED_OUT, address, {"session": digest, "until": int(until)})
+
+
+def signed_out(digest: str) -> bool:
+    with platformdb._read() as con:
+        return con.execute("SELECT 1 FROM account_events WHERE email = ? AND event = ? AND json_extract(detail, '$.session') = ? LIMIT 1",
+                           (WHO, SIGNED_OUT, digest)).fetchone() is not None
+
+
 # ================================================================================================================ the companies' files
 
 def _plan(cfg_plan=None, invoices=None) -> dict:

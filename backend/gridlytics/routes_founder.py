@@ -4,6 +4,7 @@
     POST  /api/founder/login                         {username, password}  -> {challenge, expires_in, tries}
     POST  /api/founder/login/code                    {challenge, code}     -> {token, expires_at}
     GET   /api/founder/session                                             -> {authenticated, expires_at}
+    POST  /api/founder/logout                        {everywhere?}         -> {ended: true, everywhere}
     GET   /api/founder/overview                                            -> the registry's and the files' figures
     GET   /api/founder/companies                                           -> {companies}
     POST  /api/founder/companies                     {name, seats, enabled, owner}  -> 201 {company, owner, membership}
@@ -175,6 +176,19 @@ def founder_login_code(request: Request, inp: dict = Body(...)):
 @router.get("/api/founder/session")
 def founder_session(ends: int = Depends(_session)):
     return {"authenticated": True, "expires_at": ends}
+
+
+@router.post("/api/founder/logout", dependencies=[Depends(_session)])
+def founder_logout(request: Request, inp: dict | None = Body(None)):
+    """Sign out: the session of this token ends on the server, and is refused from now on (401 founder_session_ended); with everywhere, every founder
+    session made so far ends, this one too (audit founder-console-09)."""
+    _object(inp or {}, {"everywhere"}, "Signing out")
+    everywhere = _yes_no((inp or {}).get("everywhere", False), "Say whether every founder session ends: everywhere, true or false")
+    try:
+        founder.sign_out(request.headers.get("x-founder-session"), everywhere, platformdb.client_address(request))
+    except founder.Refused as refused:
+        raise _refusal(refused) from None
+    return {"ended": True, "everywhere": everywhere}
 
 
 # ------------------------------------------------------------------------------------------------ the overview and the companies

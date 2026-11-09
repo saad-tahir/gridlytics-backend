@@ -191,7 +191,8 @@ def test_every_founder_route_but_the_login_needs_the_session_whatever_else_the_r
     sign_in_required, and a member's token or a company header does not stand in for the founder's session."""
     member = identities.token("member@acme.test", "admin", company_role="owner")
     routes = _founder_routes()
-    assert {("POST", "/api/founder/login"), ("POST", "/api/founder/login/code"), ("GET", "/api/founder/session"), ("GET", "/api/founder/overview"),
+    assert {("POST", "/api/founder/login"), ("POST", "/api/founder/login/code"), ("GET", "/api/founder/session"), ("POST", "/api/founder/logout"),
+            ("GET", "/api/founder/overview"),
             ("GET", "/api/founder/companies"), ("POST", "/api/founder/companies"), ("PATCH", "/api/founder/companies/{company_id}"),
             ("POST", "/api/founder/companies/{company_id}/access"), ("GET", "/api/founder/companies/{company_id}/members"),
             ("GET", "/api/founder/companies/{company_id}/backups"), ("POST", "/api/founder/companies/{company_id}/backups"),
@@ -752,7 +753,7 @@ def test_the_audit_lists_every_action_newest_first_a_page_at_a_time(fdb):
     assert c.get("/api/founder/audit?offset=-1").status_code == 422
 
 
-def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_wrong_shape_in_a_sentence(fdb):
+def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_wrong_shape_in_a_sentence(fdb, clock):
     """The role walk does not reach the founder's routes (walk_cases/founder.py): this is their walk. Each answers its good request with the founder's
     session, and each field of a good body sent as a list, null, a number or a long text, and each body sent empty or not an object, is refused in a
     sentence or answered, never a server error."""
@@ -771,9 +772,12 @@ def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_
              ("POST", "/api/founder/users/{user_id}/password"): {"password": "a walk password 1"},
              ("PATCH", "/api/founder/users/{user_id}"): {"disabled": False, "name": "Walk"},
              ("POST", "/api/founder/users/{user_id}/memberships"): {"company_id": cid, "company_role": "member"},
-             ("PATCH", "/api/founder/users/{user_id}/memberships/{company_id}"): {"status": "active"}}
+             ("PATCH", "/api/founder/users/{user_id}/memberships/{company_id}"): {"status": "active"},
+             ("POST", "/api/founder/logout"): {"everywhere": False}}
     problems = []
-    for method, path in _founder_routes():
+    logout = ("POST", "/api/founder/logout")
+    # signing out ends the walk's session (round 7, audit founder-console-09): it is walked last, each body with a session of its own
+    for method, path in sorted(_founder_routes(), key=lambda route: route == logout):
         url = path.replace("{company_id}", cid).replace("{user_id}", other)
         good = goods.get((method, path))
         if method == "GET" or good is None:
@@ -783,6 +787,9 @@ def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_
             continue
         bodies = [[], "text", 5, {}] + [{**good, k: v} for k in good for v in ([], None, 5, "x" * 500)] + [{**good, "unknown": 1}]
         for body in bodies:
+            if (method, path) == logout:
+                clock.step()
+                c.headers.update(_session())
             r = c.request(method, url, json=body)
             if r.status_code >= 500 or (r.status_code >= 400 and not (_sentence(r) or r.json().get("code") == "invalid_body")):
                 problems.append(f"{method} {path} with {json.dumps(body)[:80]}: answered {r.status_code}: {r.text[:160]}")
