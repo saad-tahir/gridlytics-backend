@@ -96,8 +96,10 @@ SHIPPED = [
               "negative_exempt_icp": True},
      "source": {**SRO_1501, "ref": "FCA September 2026 requested (Tribune, 30-10-2026)", "verified": "unverified"}},
     {"kind": "adder", "key": "dss", "effective_from": "2023-04-01", "known_from": "2023-04-01", "status": "active",
-     "body": {"name": "Debt service surcharge (printed as FC or PHL surcharge)", "rate": 3.23, "billing_months": "all", "exempt": ["icp_units", "lifeline"]},
-     "source": {**POWER_DIV, "ref": "Rs 3.23/kWh (Profit 15-01-2026; ICP decision names it DSS)"}},
+     "body": {"name": "Debt service surcharge (printed as FC or PHL surcharge)", "rate": 3.23, "billing_months": "all", "exempt": ["icp_units", "lifeline"],
+              "category_rates": {"agricultural": 0.43}},
+     "source": {**POWER_DIV, "ref": "Rs 3.23/kWh (Profit 15-01-2026; ICP decision names it DSS); 43 paisa for agricultural tube wells, 2023 structure "
+                                    "(R9 section 7, secondary: confirm on a D-2 bill)"}},
     {"kind": "tax", "key": "national", "effective_from": "2025-07-01", "known_from": "2025-07-01", "status": "active",
      "body": {"gst": 0.18, "further_tax_no_strn": 0.03,
               "electricity_duty": {"sindh": {"industrial": 0.015, "commercial": 0.02, "bulk": 0.02, "agricultural": 0.01, "domestic": 0.015},

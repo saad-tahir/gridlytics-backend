@@ -100,6 +100,67 @@ def test_the_savings_report_counts_a_bundled_fca_as_billed(company):
     assert verify.summary(sid, "2026-11-01", "2026-11-30")["final_conditions"]["fca_billed"] is True  # before: only key "fca" counted
 
 
+# ------------------------------------------------------------------------------------------------ engine-tariffs-11: DSS by category
+
+def _line(bill, prefix):
+    return next((x for x in bill["lines"] if x["line"].startswith(prefix)), None)
+
+
+def test_agricultural_tube_wells_pay_43_paisa_of_debt_service_surcharge(company):
+    ts, imp, exp = _flat_day(NOV)
+    d2 = tariffs.rebuild(ts, imp, exp, _conn("D-2(b)"), NOV, NOV)
+    b2 = tariffs.rebuild(ts, imp, exp, _conn("B-2(b)"), NOV, NOV)
+    assert _line(d2, "Debt service")["rate"] == 0.43 and _line(b2, "Debt service")["rate"] == 3.23
+    units = sum(d2["import_kwh"].values())
+    assert _line(d2, "Debt service")["amount_rs"] == pytest.approx(0.43 * units, abs=0.01)
+    vec = _vec(_conn("D-2(b)"))
+    assert vec["c_imp"][OFF // 15] == pytest.approx((28.69 + 0.43 + 0.5194) * 1.015)     # before: 3.23 on every D-2 unit
+    assert _bump(_conn("D-2(b)"), ts, imp, exp, NOV, NOV, OFF) == pytest.approx(vec["c_imp"][OFF // 15], abs=0.02)
+
+
+def test_an_adder_exemption_names_categories_or_classes(company):
+    _approve("adder", "nj", "2026-11-01", {"name": "Neelum-Jhelum surcharge", "rate": 0.10, "billing_months": "all", "exempt": ["agricultural", "A-2(c)"]})
+    ts, imp, exp = _flat_day(NOV)
+    for category, charged in (("B-2(b)", True), ("D-2(b)", False), ("A-2(c)", False), ("A-2(b)", True)):
+        bill = tariffs.rebuild(ts, imp, exp, _conn(category), NOV, NOV)
+        assert (_line(bill, "Neelum") is not None) == charged, category
+        assert (_bump(_conn(category), ts, imp, exp, NOV, NOV, OFF) - _vec(_conn(category))["c_imp"][OFF // 15]) == pytest.approx(0.0, abs=0.02)
+    with pytest.raises(ValueError, match="category_rates"):
+        tariffs.propose("adder", "dss", "2027-01-01", {"rate": 3.23, "billing_months": "all", "category_rates": {"agricultural": "0.43"}}, SRC, "t")
+
+
+def test_the_tariff_library_shows_an_adders_category_rates_and_exemptions(world):
+    adders = {a["key"]: a for a in world.c["admin"].get("/api/tariffs", params={"on": "2026-11-09"}).json()["adders"]}
+    assert adders["dss"]["category_rates"] == {"agricultural": 0.43} and adders["dss"]["exempt"] == ["icp_units", "lifeline"]
+    assert adders["qta"]["category_rates"] == {} and "prepaid" in adders["qta"]["exempt"]
+
+
+def test_a_company_file_seeded_before_the_dss_correction_gets_it_once(company):
+    tariffs.ensure_shipped()
+    shipped = next(v for v in tariff_data.SHIPPED if v["kind"] == "adder" and v["key"] == "dss")
+    old = {k: v for k, v in shipped["body"].items() if k != "category_rates"}  # the body an earlier build shipped
+    with store.connect() as con:
+        con.execute("UPDATE tariff_versions SET body = ?, hash = ? WHERE kind = 'adder' AND key = 'dss'", (json.dumps(old), tariffs._hash(old)))
+    tariffs.ensure_shipped()
+    tariffs.ensure_shipped()
+    rows = [v for v in tariffs.versions("adder") if v["key"] == "dss"]
+    assert sorted(v["status"] for v in rows) == ["active", "superseded"]
+    assert next(a for a in tariffs.adders_for("2026-11") if a["key"] == "dss")["category_rates"] == {"agricultural": 0.43}
+    with store.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM tariff_versions").fetchone()[0] == len(tariff_data.SHIPPED) + 1
+
+
+def test_a_shipped_correction_leaves_the_companys_own_correction_in_force(company):
+    tariffs.ensure_shipped()
+    _approve("adder", "dss", "2023-04-01", {"name": "DSS as printed on our bills", "rate": 3.30, "billing_months": "all", "exempt": ["icp_units"]})
+    shipped = next(v for v in tariff_data.SHIPPED if v["kind"] == "adder" and v["key"] == "dss")
+    old = {k: v for k, v in shipped["body"].items() if k != "category_rates"}
+    with store.connect() as con:
+        con.execute("UPDATE tariff_versions SET body = ?, hash = ? WHERE kind = 'adder' AND key = 'dss' AND by = 'shipped'", (json.dumps(old), tariffs._hash(old)))
+    tariffs.ensure_shipped()
+    assert [a["rate"] for a in tariffs.adders_for("2026-11") if a["key"] == "dss"] == [3.30]
+
+
 # ------------------------------------------------------------------------------------------------ engine-tariffs-12: TOU calendars cover each month once
 
 def test_a_tou_calendar_must_cover_each_month_once_with_a_peak_window(company):

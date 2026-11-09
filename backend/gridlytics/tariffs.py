@@ -41,29 +41,68 @@ def _num(x) -> bool:
 
 # ------------------------------------------------------------------------------------------------ versions
 
+_SHIPPED_HASH: dict[int, tuple[dict, str]] = {}
+
+
+def _shipped_hash(v: dict) -> str:
+    """The hash of a shipped version's body, computed once per process (the shipped bodies never change while it runs)."""
+    hit = _SHIPPED_HASH.get(id(v))
+    if hit is None or hit[0] is not v:
+        hit = _SHIPPED_HASH[id(v)] = (v, _hash(v["body"]))
+    return hit[1]
+
+
+def _shipped_todo(con) -> list[tuple[dict, object]]:
+    """The shipped versions a company file lacks, each with the shipped row it corrects (None for one the file has no row for at its start).
+
+    A shipped body that changed since the file was seeded (a correction of shipped data for the same start, such as the debt-service surcharge's
+    category rates) replaces the shipped row of the same start and status. The company's own decisions stand: a start the company versioned itself
+    and the build never shipped, and a shipped row the company has since superseded, approved or closed out of that status, are left alone."""
+    rows = con.execute("SELECT id, kind, key, effective_from, effective_to, status, hash, by FROM tariff_versions ORDER BY created, rowid").fetchall()
+    at: dict[tuple, list] = {}
+    for r in rows:
+        at.setdefault((r["kind"], r["key"], r["effective_from"]), []).append(r)
+    todo: list[tuple[dict, object]] = []
+    for v in tariff_data.SHIPPED:
+        same = at.get((v["kind"], v["key"], v["effective_from"]))
+        if not same:
+            todo.append((v, None))
+            continue
+        shipped = [r for r in same if r["by"] == "shipped"]
+        if not shipped or any(r["hash"] == _shipped_hash(v) for r in shipped):
+            continue
+        old = next((r for r in reversed(shipped) if r["status"] == v["status"]), None)
+        if old is not None:
+            todo.append((v, old))
+    return todo
+
+
 def ensure_shipped() -> None:
-    """Seed the shipped versions and fuel prices into the company's file the first time it is used, and add a shipped version that a newer build ships
-    and the file lacks (matched on kind, key and start; a start the company already holds a version for is never doubled).
+    """Seed the shipped versions and fuel prices into the company's file the first time it is used, add a shipped version that a newer build ships
+    and the file lacks (matched on kind, key and start; a start the company already holds a version for is never doubled), and apply a newer build's
+    correction of a shipped body (`_shipped_todo`): the old shipped row is superseded, as an approved correction for the same start supersedes it.
 
     The cheap check runs unlocked; the seeding runs inside an immediate write transaction that checks again, so callers racing on a fresh file (two
     requests, a request and the scheduler tick) seed it once: the first seeds, the rest find the rows."""
-    wanted = {(v["kind"], v["key"], v["effective_from"]) for v in tariff_data.SHIPPED}
     with store.connect() as con:
-        have = {(r[0], r[1], r[2]) for r in con.execute("SELECT kind, key, effective_from FROM tariff_versions")}
+        todo = _shipped_todo(con)
         fuel = con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is not None
-    if wanted <= have and fuel:
+    if not todo and fuel:
         return
     with store.write_transaction() as con:
-        have = {(r[0], r[1], r[2]) for r in con.execute("SELECT kind, key, effective_from FROM tariff_versions")}
-        for v in tariff_data.SHIPPED:
-            k = (v["kind"], v["key"], v["effective_from"])
-            if k in have:
-                continue
-            have.add(k)
+        for v, old in _shipped_todo(con):
+            vid, effective_to = store.new_id(), None
+            if old is not None:
+                effective_to = old["effective_to"]
+                day_before = (date.fromisoformat(v["effective_from"]) - timedelta(days=1)).isoformat()
+                con.execute("UPDATE tariff_versions SET status = 'superseded', effective_to = ? WHERE id = ?", (day_before, old["id"]))
             con.execute("INSERT INTO tariff_versions (id, kind, key, effective_from, effective_to, known_from, status, supersedes, body, source, hash, "
                         "created, by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (store.new_id(), v["kind"], v["key"], v["effective_from"], None, v["known_from"], v["status"], None, json.dumps(v["body"]),
-                         json.dumps(v["source"]), _hash(v["body"]), store._now(), "shipped"))
+                        (vid, v["kind"], v["key"], v["effective_from"], effective_to, v["known_from"], v["status"], old["id"] if old is not None else None,
+                         json.dumps(v["body"]), json.dumps(v["source"]), _shipped_hash(v), store._now(), "shipped"))
+            if old is not None:
+                store.audit("shipped", "corrected a shipped tariff version", f"{v['kind']}/{v['key']}",
+                            {"version_id": vid, "corrects": old["id"], "effective_from": v["effective_from"]}, con=con)
         if con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is None:
             for kind, day, price in tariff_data.FUEL_PRICES:
                 con.execute("INSERT OR IGNORE INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?)",
@@ -175,7 +214,10 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
                                  "it is resolved by billing month, so a later start would leave that bill without it")
         exempt = body.get("exempt", [])
         if not isinstance(exempt, list) or not all(isinstance(x, str) for x in exempt):
-            raise ValueError("An adder's exempt is a list of exemptions (for example icp_units, lifeline, prepaid)")
+            raise ValueError("An adder's exempt is a list of exemptions (for example icp_units, lifeline, prepaid, or a tariff category or class)")
+        rates = body.get("category_rates", {})
+        if not isinstance(rates, dict) or not all(isinstance(k, str) and _num(r) and abs(r) <= 100 for k, r in rates.items()):
+            raise ValueError("An adder's category_rates is a map of tariff category or class (for example agricultural) to a rate in Rs/kWh")
     elif kind == "tou":
         seasons = body.get("seasons")
         if not isinstance(seasons, list) or not seasons:
@@ -426,6 +468,22 @@ def fca_billed(billing_month: str) -> bool:
     return any(is_fca(a) for a in adders_for(billing_month))
 
 
+def adder_rate(adder: dict, conn: dict | None) -> float | None:
+    """An adder's Rs/kWh for a connection: None when its exemptions name the connection's tariff category or class (for example "agricultural");
+    else its rate for that category, or for that class, from `category_rates` (the debt-service surcharge is 43 paisa for agricultural tube wells,
+    R9 section 7); else its rate. Exemptions that name a consumer kind (lifeline, prepaid, protected, evcs) match no category or class."""
+    cat = str((((conn or {}).get("data") or {}).get("tariff_category")) or "")
+    cls = tariff_data.category_class(cat) if cat else ""
+    exempt = adder.get("exempt") or []
+    if cat and (cat in exempt or cls in exempt):
+        return None
+    rates = adder.get("category_rates") or {}
+    for k in (cat, cls):
+        if k and _num(rates.get(k)):
+            return float(rates[k])
+    return float(adder["rate"])
+
+
 def _charged_on_icp_units(adder: dict, rate: float) -> bool:
     """An adder is charged on ICP incremental units unless it exempts them (QTA, DSS) or is a negative FCA (SRO 2409(I)/2025: positive FCAs apply to
     incremental consumption, negative FCAs do not; `negative_exempt_icp: false` keeps one on them where a bill shows it). The bill and the
@@ -630,10 +688,13 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     total_units = e_imp["peak"] + e_imp["off_peak"]
     adders = 0.0
     for a in adders_for(billing_month):
-        units = total_units if _charged_on_icp_units(a, a["rate"]) else total_units - inc_total
-        amt = a["rate"] * units
+        rate = adder_rate(a, conn)
+        if rate is None:  # the adder exempts the connection's category or class
+            continue
+        units = total_units if _charged_on_icp_units(a, rate) else total_units - inc_total
+        amt = rate * units
         adders += amt
-        lines.append({"line": a.get("name", a["key"]), "units_kwh": round(units, 3), "rate": a["rate"], "amount_rs": round(amt, 2)})
+        lines.append({"line": a.get("name", a["key"]), "units_kwh": round(units, 3), "rate": rate, "amount_rs": round(amt, 2)})
     # 8. electricity duty on the variable subtotal
     duty = tf["ed"] * (energy + adders)
     lines.append({"line": "Electricity duty", "rate": tf["ed"], "amount_rs": round(duty, 2)})
@@ -728,10 +789,10 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     bm0 = bms[0] if bms else billing_month_for(conn, on)
     in_bm0 = [b == bm0 for b in bms]
     out["billing_month_end_step"] = next((i for i, x in enumerate(in_bm0) if not x), steps)
-    adders = {bm: adders_for(bm) for bm in dict.fromkeys(bms or [bm0])}
-    add_all = {bm: sum(a["rate"] for a in ads) for bm, ads in adders.items()}
-    # on ICP units only the adders the bill charges there (every positive FCA, whatever its key)
-    add_icp = {bm: sum(a["rate"] for a in ads if _charged_on_icp_units(a, a["rate"])) for bm, ads in adders.items()}
+    # each adder at the connection's own rate (its category's, or none where it is exempt); on ICP units only those the bill charges there
+    rated = {bm: [(a, r) for a in adders_for(bm) for r in (adder_rate(a, conn),) if r is not None] for bm in dict.fromkeys(bms or [bm0])}
+    add_all = {bm: sum(r for _, r in ads) for bm, ads in rated.items()}
+    add_icp = {bm: sum(r for a, r in ads if _charged_on_icp_units(a, r)) for bm, ads in rated.items()}
     bm0_day = date(int(bm0[:4]), int(bm0[5:7]), 1)
     icp = icp_rule(bm0_day)
     regime = data.get("regime", "none")
