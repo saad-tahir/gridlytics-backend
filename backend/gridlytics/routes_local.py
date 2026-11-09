@@ -47,12 +47,15 @@ def _session(account: dict, refresh_token: str) -> dict:
 
 
 def _locked(email: str, address: str) -> None:
-    """Five wrong passwords for one account from one address stop that address for 15 minutes from the fifth (auth.MAX_TRIES, auth.LOCK_MINUTES)."""
-    wait = platformdb.lock_wait(email, address)
+    """Five wrong passwords for one account from one address stop that address for 15 minutes from the fifth (auth.MAX_TRIES, auth.LOCK_MINUTES); twenty
+    from every address together stop the account for as long, but for an address it signed in from lately (auth.ACCOUNT_TRIES, audit security-roles-10)."""
+    wait, why = platformdb.sign_in_wait(email, address)
     if wait:
         minutes = math.ceil(wait / 60)
-        raise HTTPException(status_code=429, detail=f"Too many attempts from here; wait {minutes} minute{'s' if minutes != 1 else ''}",
-                            headers={"Retry-After": str(wait)})
+        wait_words = f"wait {minutes} minute{'s' if minutes != 1 else ''}"
+        detail = (f"Too many attempts from here; {wait_words}" if why == "address" else
+                  f"Too many wrong passwords for this account from several places; {wait_words}, or ask your company's administrator to clear the lockout")
+        raise HTTPException(status_code=429, detail=detail, headers={"Retry-After": str(wait)})
 
 
 def _person(request: Request) -> dict:

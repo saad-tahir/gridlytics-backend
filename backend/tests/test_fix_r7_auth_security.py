@@ -395,3 +395,48 @@ def test_a_refresh_token_used_again_ends_the_access_tokens_of_its_session(world,
     monkeypatch.setattr(platformdb, "_clock", lambda: later)
     assert anon.post("/api/local/refresh", json={"refresh_token": first["refresh_token"]}).status_code == 401
     assert anon.get("/api/sites", headers=h).status_code == 401
+
+
+# ------------------------------------------------------------------------------------------------ security-roles-10
+
+def test_wrong_passwords_from_many_addresses_stop_the_account_but_not_where_it_signs_in(world):
+    """The lockout counted per (account, address) only: N addresses bought 5N guesses. Now ACCOUNT_TRIES wrong passwords from every address together stop
+    the account for LOCK_MINUTES (NIST SP 800-63B 5.2.2), except from an address it signed in from lately, so a stranger cannot lock the person out where
+    they work; a good sign-in, or an administrator clearing the lockout, ends the count."""
+    import identities
+    from gridlytics import auth
+    assert auth.MAX_TRIES < auth.ACCOUNT_TRIES <= 100
+    assert _sign_in("viewer@fix.test", identities.PASSWORD, "10.0.0.1").status_code == 200        # the office, where the person signs in
+
+    def guess_from_many(net: str):
+        for n in range(auth.ACCOUNT_TRIES):
+            assert _sign_in("viewer@fix.test", "a wrong password 1", f"{net}.{n // (auth.MAX_TRIES - 1)}").status_code == 401
+
+    guess_from_many("203.0.113")
+    r = _sign_in("viewer@fix.test", identities.PASSWORD, "198.51.100.9")
+    assert r.status_code == 429 and int(r.headers["retry-after"]) == auth.LOCK_MINUTES * 60, r.text
+    assert "this account" in r.json()["detail"] and "administrator" in r.json()["detail"]
+    assert _sign_in("viewer@fix.test", identities.PASSWORD, "10.0.0.1").status_code == 200         # the office still signs in, which ends the count
+    assert _sign_in("viewer@fix.test", identities.PASSWORD, "198.51.100.9").status_code == 200
+    guess_from_many("192.0.2")
+    assert _sign_in("viewer@fix.test", identities.PASSWORD, "198.51.100.10").status_code == 429
+    viewer = _member(world, "viewer@fix.test")["id"]
+    assert world.c["admin"].post(f"/api/users/{viewer}/unlock").status_code == 200
+    assert _sign_in("viewer@fix.test", identities.PASSWORD, "198.51.100.10").status_code == 200
+
+
+def test_a_forwarded_header_the_server_does_not_trust_is_said_once_in_the_log(world, caplog, monkeypatch):
+    """Behind a proxy without GRIDLYTICS_TRUST_PROXY=1 every client counts as one address ("forwarded") for the lockout: the server says so in its log,
+    once, naming the setting."""
+    import logging
+    from fastapi.testclient import TestClient
+    from gridlytics import api
+    from gridlytics import platform as platformdb
+    monkeypatch.delenv("GRIDLYTICS_TRUST_PROXY", raising=False)
+    monkeypatch.setattr(platformdb, "_proxy_said", False)
+    c = TestClient(api.app, raise_server_exceptions=False)
+    with caplog.at_level(logging.WARNING, logger="gridlytics"):
+        for n in range(2):
+            c.post("/api/local/session", json={"email": "viewer@fix.test", "password": "a wrong password 1"}, headers={"X-Forwarded-For": f"198.51.100.{n}"})
+    said = [r.getMessage() for r in caplog.records if "GRIDLYTICS_TRUST_PROXY" in r.getMessage()]
+    assert len(said) == 1 and "forwarded-allow-ips" in said[0], said

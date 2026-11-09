@@ -66,6 +66,11 @@ ITERATIONS = 200_000
 #: the codes since package P20)
 MAX_TRIES = 5
 LOCK_MINUTES = 15
+#: Wrong passwords for one account from every address together, in LOCK_MINUTES, before the account's sign-in is stopped for as long (audit
+#: security-roles-10): the per-address count alone let N addresses buy 5N guesses. Well under the 100 consecutive failures NIST SP 800-63B (section 5.2.2)
+#: caps an account at [recalled; verify]. An address the account signed in from in the last SESSION_DAYS is not stopped by it (its own count still holds),
+#: so a stranger guessing cannot lock the person out where they work; a good sign-in, or an administrator or the founder clearing the lockout, ends it
+ACCOUNT_TRIES = 20
 #: Wrong codes from every address together, in LOCK_MINUTES, before the code step is stopped for as long (P20's repairs; the founder's code step since stage
 #: B6): without it, N addresses would buy 5N guesses. The program's choice, well under the 100 consecutive failures NIST SP 800-63B (section 5.2.2) caps an
 #: account at [recalled; verify]

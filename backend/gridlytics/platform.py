@@ -21,6 +21,7 @@ own, and they clear a sign-in lockout (`clear_lock`).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -61,6 +62,8 @@ ONE_TIME = "You signed in with a one-time password: choose your own password fir
 _EMAIL = re.compile(r"[^@\s]{1,64}@[^@\s.][^@\s]{0,189}")
 _lock = threading.Lock()
 _clock = time.time
+#: Whether the log has said that a proxy's header arrived untrusted (said once a process: client_address)
+_proxy_said = False
 
 
 # ------------------------------------------------------------------------------------------------ where the files are (addendum item 1)
@@ -599,8 +602,17 @@ def client_address(request) -> str:
     """The address a request counts under for the lockout. A proxy's X-Forwarded-For or Forwarded header is believed only where the server says it runs
     behind a proxy it trusts (GRIDLYTICS_TRUST_PROXY=1, with uvicorn's --forwarded-allow-ips naming it): otherwise uvicorn's default takes the header from
     any client on this machine, and a new address per try bought five more (R-235). A request that carries such a header untrusted counts as "forwarded"."""
+    global _proxy_said
     host = request.client.host if request.client else ""
     if os.environ.get("GRIDLYTICS_TRUST_PROXY") != "1" and (request.headers.get("x-forwarded-for") or request.headers.get("forwarded")):
+        if not _proxy_said:
+            # behind a proxy that was not declared, every client shares the "forwarded" count, and five wrong passwords lock an account for all of them
+            # (audit security-roles-10): said once, loudly, with what to set
+            _proxy_said = True
+            logging.getLogger("gridlytics").warning(
+                "a sign-in carried X-Forwarded-For or Forwarded, but GRIDLYTICS_TRUST_PROXY is not 1: every client behind that proxy counts as one address "
+                "for the sign-in lockout. Behind a proxy you trust, set GRIDLYTICS_TRUST_PROXY=1 and run uvicorn with --forwarded-allow-ips set to the "
+                "proxy's address")
         return "forwarded"
     return host
 
@@ -639,6 +651,23 @@ def lock_wait(email: str, address: str | None, refused: str = REFUSED, cleared: 
                                            (*args, refused, last_good, tries))]
     left = times[0] + window - _clock() if len(times) == tries and times[0] - times[-1] < window else 0
     return max(1, round(left)) if left > 0 else 0
+
+
+def sign_in_wait(email: str, address: str) -> tuple[int, str]:
+    """Seconds before a password may be tried for an account from an address, and why: "address" (MAX_TRIES refused from this address) or "account"
+    (ACCOUNT_TRIES refused from every address together, audit security-roles-10); (0, "") when it may now. The account-wide count does not stop an
+    address the account signed in from in the last SESSION_DAYS."""
+    wait = lock_wait(email, address)
+    if wait:
+        return wait, "address"
+    wait = lock_wait(email, None, tries=auth.ACCOUNT_TRIES)
+    if wait and address and address != "forwarded":
+        with _read() as con:
+            known = con.execute("SELECT 1 FROM account_events WHERE email = ? AND address = ? AND event = ? AND at > ? LIMIT 1",
+                                (email.strip().lower(), address, SIGNED_IN, _clock() - SESSION_DAYS * 86400)).fetchone()
+        if known:
+            return 0, ""
+    return (wait, "account") if wait else (0, "")
 
 
 def clear_lock(email: str, account_id: str, by: str) -> None:
