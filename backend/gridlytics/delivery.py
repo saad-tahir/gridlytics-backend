@@ -772,7 +772,7 @@ def _part_day_notes(slots: list[dict], compiled: dict) -> list[str]:
     ring = BRANDS.get(compiled.get("brand"), BRANDS["other"])["ring"]
     if first["start"] != "00:00":
         out.append(f"This table starts at {first['start']}: key tomorrow's table before midnight."
-                   + (f" Until then its last program (from {last['start']}) also runs from midnight to {first['start']}." if ring else ""))
+                   + (f" Until then the settings of its last slot (from {last['start']}) also run from midnight to {first['start']}." if ring else ""))
     if last["end"] != "00:00":
         out.append(f"This table ends at {last['end']}, where the plan ends: " + ("its last program runs on to midnight." if ring else
                    "after it the inverter runs its own default mode until the next table."))
