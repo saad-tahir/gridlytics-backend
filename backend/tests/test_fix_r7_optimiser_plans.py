@@ -210,3 +210,151 @@ def test_off_peak_grid_charging_names_the_price_and_the_time_the_energy_is_used_
         assert x["reason"] == "charge_from_grid"
         assert x["detail"]["rs_per_kwh"] == pytest.approx(28.0)
         assert x["detail"]["use_t"] == int(p["ts"][72]) and x["detail"]["use_rs_per_kwh"] == pytest.approx(60.0)
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-08, engine-plans-live-14
+
+def _held_for_the_reserve(p_steps):
+    """Faisalabad and Lahore: a full battery at the start of the peak, a reserve (sigma at its cap and a heavy critical load) above the usable band,
+    and reserve rows only where p_start reaches 0.01."""
+    p = _problem(peak=(0, 16))
+    p["battery"]["E0"] = 190.0
+    p["battery"]["sigma0"] = 0.15
+    p["Lc"] = np.full(p["T"], 60.0)
+    p["p_start"] = np.zeros(p["T"])
+    p["p_start"][:16] = p_steps
+    p["c_short"] = 130.0
+    return p
+
+
+def test_a_battery_held_through_the_peak_for_the_reserve_says_so_on_every_step_without_flipping():
+    """Lahore flipped between "Wear > saving" and "Hold for outage" four times in one peak with the state of charge fixed at 95 %, and Faisalabad
+    named 18:00 to 18:30 "Wear > saving" while the battery was held for the reserve rows from 18:45: a step whose own p_start is under 0.01 has no
+    row, but discharging there empties the battery the later rows hold."""
+    p = _held_for_the_reserve([0.005, 0.005, 0.005] + [0.05, 0.005] * 6 + [0.05])
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    s = r["sol"]
+    held = [t for t in range(16) if s["D"][t] <= 0.1 and s["C"][t] <= 0.1]
+    assert held[:3] == [0, 1, 2]
+    first_dis = next((t for t in range(16) if s["D"][t] > 0.1), 16)
+    for t in range(first_dis):
+        x = r["reasons"][t]
+        assert x["reason"] == "hold_for_outage", (t, x)
+        En, Emin = 200.0, 20.0
+        assert x["detail"]["kwh"] <= float(s["E"][t + 1]) - Emin + 1e-6      # never more than the battery holds (184.8 against 182.75)
+        assert x["detail"]["kwh"] <= (0.95 - 0.1) * En + 1e-6
+        n = round(x["detail"]["within_h"] / H)
+        assert x["detail"]["p"] == pytest.approx(1 - float(np.prod(1 - p["p_start"][t:t + n])), abs=0.006)
+    assert not any(x["reason"] == "wear_margin_too_small" for x in r["reasons"][:first_dis])
+
+
+def test_a_peak_step_whose_energy_is_spent_later_says_when_not_wear():
+    """Karachi said "Wear > saving" at 13.4 % right after discharging 250 kW at the same price: the 17 kWh left was spent on MDI-cap discharges the
+    next morning. Here the battery cannot recharge (no grid charging, no PV) and keeps its energy for a dearer peak."""
+    p = _problem()
+    p["c_imp"] = p["c_imp"].copy()
+    p["c_imp"][8:24] = 50.0
+    p["peak"] = p["peak"].copy()
+    p["peak"][8:24] = True
+    p["battery"]["a_grid"] = False
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    s = r["sol"]
+    use = next(t for t in range(p["T"]) if s["D"][t] > 0.1)
+    assert float(np.max(s["D"][8:24])) < 0.1 and 72 <= use < 88
+    for t in range(8, 24):
+        x = r["reasons"][t]
+        assert x["reason"] == "save_for_later", (t, x)
+        assert x["detail"]["use_t"] == int(p["ts"][use]) and x["detail"]["use_rs_per_kwh"] == pytest.approx(60.0)
+        assert x["detail"]["use_reason"] == "discharge_peak_window"
+
+
+def _solution(T, E, C=None, D=None, G=None):
+    z = np.zeros(T)
+    return {"G": z.copy() if G is None else np.asarray(G, float), "X": z.copy(), "K": z.copy(), "U": z.copy(), "P": z.copy(), "F": z.copy(),
+            "C": z.copy() if C is None else np.asarray(C, float), "D": z.copy() if D is None else np.asarray(D, float), "u": z.copy(), "v": z.copy(),
+            "E": np.asarray(E, float), "W": z.copy()}
+
+
+def test_wear_is_named_only_where_a_positive_price_gap_is_smaller_than_the_wear_cost():
+    """Rs 48 now against a refill at Rs 40 a few hours later: Rs 48 - 40 / (0.95 x 0.95) = Rs 3.68 a kWh, under the Rs 5 wear. At the refill's
+    own price there is no gap at all: nothing to gain, not "the gap is smaller than the wear cost"."""
+    T = 8
+    p = _problem(T=T, peak=(0, 4))
+    p["c_imp"] = np.where(np.asarray(p["peak"]), 48.0, 40.0)
+    p["L"] = np.full(T, 80.0)
+    E = [150.0] * 6 + [159.5] * 3                    # held, then a grid charge at step 5
+    s = _solution(T, E, C=[0, 0, 0, 0, 0, 40.0, 0, 0], G=[80, 80, 80, 80, 80, 120, 80, 80])
+    out = {"R": np.zeros(T), "R_steps": np.full(T, 8), "r": {}, "M": [], "v_end": optimise.solve(p)["v_end"]}
+    reasons = optimise.explain(p, s, out)
+    for t in range(4):
+        assert reasons[t]["reason"] == "wear_margin_too_small", (t, reasons[t])
+        assert reasons[t]["detail"]["gap_rs_per_kwh"] == pytest.approx(48.0 - 40.0 / (0.95 * 0.95), abs=0.01)
+        assert reasons[t]["detail"]["wear_rs_per_kwh"] == pytest.approx(5.0)
+    assert reasons[4]["reason"] == "idle"                # Rs 40 now, Rs 40 at the refill
+    assert reasons[5]["reason"] == "charge_from_grid"
+
+
+def test_an_off_grid_battery_carries_the_load_not_an_outage():
+    """Rahim Yar Khan, off-grid: "The grid is down: the battery carries the load" on 45 slots of a site with no grid at all."""
+    p = _problem()
+    p["off_grid"] = True
+    p["g"] = np.zeros(p["T"])
+    p["G_max"] = 0.0
+    p["PV"] = np.where((np.arange(p["T"]) % 96 >= 28) & (np.arange(p["T"]) % 96 < 64), 250.0, 0.0)
+    p["PVlo"] = p["PV"].copy()
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    named = {x["reason"] for x in r["reasons"]}
+    assert "carry_outage" not in named
+    carried = [t for t in range(p["T"]) if r["sol"]["D"][t] > 0.1 and r["sol"]["U"][t] <= 0.1]  # a step that also sheds says "unserved"
+    assert carried and all(r["reasons"][t]["reason"] == "carry_load" for t in carried)
+    assert r["reasons"][carried[0]]["detail"]["kw"] == pytest.approx(float(r["sol"]["D"][carried[0]]), abs=0.05)
+
+
+def _amf(p):
+    """An auto-start (AMF) genset: the reserve covers two steps, the start delay and a failed start."""
+    p["genset"] = {"S": 100.0, "f_min": 0.3, "a": 0.273, "b": 0.033, "c_fuel": 380.0, "c_start": 1500.0, "c_runhr": 400.0, "c_om": 8.0, "UT": 4,
+                   "DT": 2, "u_prev": 0, "elapsed": 99, "cap_hours": 24.0, "hours_today": 0.0, "day_index": np.zeros(p["T"], dtype=int),
+                   "fuel_available": 1e9, "parallel": False, "control": "auto_on_grid_loss", "hold": np.zeros(p["T"], dtype=bool)}
+    p["battery"]["sigma0"] = 0.0
+    return p
+
+
+def test_the_reserve_behind_an_amf_panel_says_it_covers_two_steps():
+    """Lahore's hold said "hours 1.0" although behind its AMF panel the reserve covers the start delay and a failed start: two steps."""
+    p = _amf(_held_for_the_reserve([0.05] * 16))
+    p["battery"]["E0"] = 60.0                         # near the 51.6 kWh the two steps' reserve asks for
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    reserve = [x for x in r["reasons"] if x["reason"] in ("hold_for_outage", "charge_for_reserve")]
+    assert reserve
+    assert all(x["detail"]["hours"] == pytest.approx(0.5) for x in reserve)
+
+
+def test_a_discharge_at_one_price_is_one_run_not_peak_discharge_and_wear_by_turns():
+    """The AUDIT site: 18:00 Peak discharge, 18:15 Wear > saving, 18:30 Peak discharge, all at Rs 40.02. Steps at one price are ties the solver
+    split at random; a tie-break of a fraction of a paisa discharges the earlier and charges the later of two equal steps."""
+    p = _amf(_held_for_the_reserve([0.05] * 16))      # a full battery, 128 kWh above a 51.6 kWh reserve: the peak's 16 steps tie
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    D = r["sol"]["D"][:16]
+    assert float(np.max(D)) > 0.1
+    # one run down to the reserve, a hold, and the reserve's release where its last rows are worth less than the price: before, a third run
+    # (80 x 5, 6, 0, 0, 0, 80, 0, 0, 0, 0, 80, 80) kept energy between two discharges at the same price for no reason the numbers give
+    act = D > 0.1
+    assert int(np.sum(act[1:] & ~act[:-1])) + int(act[0]) <= 2
+    named = [x["reason"] for t, x in enumerate(r["reasons"][:16]) if not act[t]]
+    assert set(named) <= {"hold_for_outage"}
+
+
+def test_a_step_saved_for_later_compiles_as_a_hold_like_the_no_flow_reasons_it_replaces():
+    """A grid-up step that keeps its energy for a later discharge was "Wear > saving" or "idle", both compiled as a hold; the new reason must not
+    fall through to self-use, where the device would discharge the energy the plan keeps."""
+    from gridlytics import delivery
+    step = {"grid_present": 1.0, "discharge_kw": 0.0, "charge_kw": 0.0, "grid_export_kw": 0.0, "load_kw": 80.0, "pv_kw": 0.0, "soc_pct": 60.0,
+            "grid_import_kw": 80.0, "reason": "save_for_later"}
+    battery = {"a_grid": True}
+    assert delivery.step_intents([step], battery)[0]["mode"] == "hold"
+    assert delivery.step_intents([{**step, "reason": "wear_margin_too_small"}], battery)[0]["mode"] == "hold"

@@ -79,7 +79,7 @@ def step_intents(steps: list[dict], battery: dict | None) -> list[dict]:
             mode = "charge_grid"
         elif s["charge_kw"] > 0.1:
             mode = "charge_pv_only"
-        elif s["reason"] in ("hold_for_outage", "wear_margin_too_small", "terminal_value", "idle", "operator_hold", "genset_off"):
+        elif s["reason"] in ("hold_for_outage", "wear_margin_too_small", "terminal_value", "idle", "operator_hold", "genset_off", "save_for_later"):
             mode = "hold"
         else:
             mode = "self_use"

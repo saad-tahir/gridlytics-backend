@@ -21,10 +21,12 @@ from scipy.sparse import coo_matrix
 H = 0.25
 EPS_CURTAIL = 0.05     # Rs/kWh: keep PV unless export is capped and the battery is full
 EPS_CHARGE = 0.001     # Rs/kWh: a tie-break against charging and discharging at once
+EPS_ORDER = 0.002      # Rs/kWh across the horizon: of two steps alike, discharge the earlier and charge the later (round 7: ties split by turns
+                       # read as 0 / full / 0 / full runs, "Peak discharge" and "Wear > saving" alternating at one price)
 SURPLUS_ROWS = True    # solve's grid-down rows on the set's surplus and the battery; a switch only for the tests that check they cut no plan off
 REASONS = ("hold_for_outage", "charge_from_pv", "charge_from_grid", "discharge_peak_window", "mdi_cap", "genset_on", "genset_off", "icp_flat_price",
            "terminal_value", "export_capped", "wear_margin_too_small", "forecast_guard", "operator_hold", "carry_outage", "self_consumption", "idle",
-           "unserved", "charge_for_reserve")
+           "unserved", "charge_for_reserve", "save_for_later", "carry_load")
 
 
 class Model:
@@ -278,8 +280,11 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         c_cyc = bat["c_cyc"]
         ch_ub = np.full(T, bat["P_ch"])
         ch_ub[np.asarray(bat.get("charge_block", np.zeros(T, dtype=bool)), dtype=bool)] = 0
-        C = m.var("C", T, 0, ch_ub, H * EPS_CHARGE)
-        D = m.var("D", T, 0, bat["P_dis"], H * c_cyc)
+        # the order tie-break only where the grid is up: grid-down and off-grid steps keep their costs (the battery-inverter follows the load
+        # there, and the off-grid threshold solves are timed to the second)
+        ramp = np.where(g > 0.5, np.arange(T) / max(T, 1), 0.0)
+        C = m.var("C", T, 0, ch_ub, H * (EPS_CHARGE + EPS_ORDER * np.where(g > 0.5, 1.0 - ramp, 0.0)))
+        D = m.var("D", T, 0, bat["P_dis"], H * (c_cyc + EPS_ORDER * ramp))
         e_lb = np.full(T + 1, min(Emin, E0))
         e_ub = np.full(T + 1, max(Emax, E0))
         e_lb[0] = e_ub[0] = E0
@@ -776,7 +781,6 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
     R = out.get("R", np.zeros(T))
     R_steps = np.asarray(out.get("R_steps", np.asarray(p["dur_steps"])[:T]), dtype=int)
     icp = p.get("icp") or {}
-    thr = p.get("reserve_threshold", 0.2)
     c_imp, p_start, ts = np.asarray(p["c_imp"], dtype=float), np.asarray(p["p_start"], dtype=float), np.asarray(p["ts"], dtype=np.int64)
     Cs, Ds, Es = np.asarray(s["C"], dtype=float), np.asarray(s["D"], dtype=float), np.asarray(s["E"], dtype=float)
     rows = out.get("r") or {}                       # the steps that carry a reserve row (p_start >= 0.01 with the grid up)
@@ -810,6 +814,45 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
     def next_discharge(t: int) -> int | None:
         return next((k for k in range(t + 1, T) if Ds[k] > 0.1), None)
 
+    uses: dict[int, int] = {}                       # a step saved for later and the step its energy is used at (its reason is filled in after)
+
+    def held(t: int, E1: float) -> tuple[str, dict] | None:
+        """Why a grid-up step with energy above the floor neither charges nor discharges, from the numbers (round 7, flow-telemetry-plan-control-08):
+        - the reserve: a reserve row binds from this step on, before the battery next charges or discharges, so a kWh discharged now is a kWh
+          short for the outage those rows hold it for (also on a step whose own p_start has no row);
+        - later use: the battery discharges later before it next charges, so the energy is kept for that step;
+        - wear: discharging now and putting the kWh back at the next charge (its grid price, or the export its PV forgoes, over the round trip)
+          gains a positive gap smaller than the wear cost;
+        - the terminal value: nothing refills or uses the energy in the horizon, and it is worth more kept for the day after.
+        None where none holds (nothing to gain)."""
+        last = reserve_window(t, stop_at_charge=True)
+        if last is not None:
+            det = reserve_detail(t, last)
+            det["kwh"] = round(min(float(det["kwh"]), E1 - Emin), 1)  # the reserve the battery holds, never above what it holds
+            return "hold_for_outage", det
+        nc = next((k for k in range(t + 1, T) if Cs[k] > 0.1), None)
+        use = next_discharge(t)
+        if use is not None and (nc is None or use < nc):
+            uses[t] = use
+            det = {"use_t": int(ts[use])}
+            if g[use] > 0.5:
+                det["use_rs_per_kwh"] = round(float(c_imp[use]), 2)
+            return "save_for_later", det
+        rt = bat["eta_c"] * bat["eta_d"]
+        if nc is None:
+            refill = float(out.get("v_end", 0.0)) / bat["eta_d"]
+        else:
+            Gn, Kn, Pn = float(s["G"][nc]), float(s["K"][nc]), float(s["P"][nc]) if gen else 0.0
+            from_grid = Cs[nc] - max(0.0, PV[nc] - Kn + Pn - L[nc]) > 0.1 and Gn > 0.1
+            refill = float(c_imp[nc] if from_grid else np.asarray(p["c_exp"], dtype=float)[nc]) / rt
+        gap = float(c_imp[t]) - refill
+        c_cyc = float(bat["c_cyc"])
+        if nc is None and gap < c_cyc + 1e-6:
+            return "terminal_value", {}
+        if nc is not None and 0.01 < gap < c_cyc + 1e-6:
+            return "wear_margin_too_small", {"gap_rs_per_kwh": round(gap, 2), "wear_rs_per_kwh": round(c_cyc, 2)}
+        return None
+
     reasons = []
     for t in range(T):
         G, X, K, U, C, D, P = (float(s[k][t]) for k in ("G", "X", "K", "U", "C", "D", "P"))
@@ -826,7 +869,8 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
                 r = "genset_on"
                 d = {"kw": round(P, 1), "rs_per_kwh": round(_gen_marginal(gen), 1) if gen else None}
             elif D > 0.1:
-                r = "carry_outage"
+                # a site without a grid has no outage: its battery simply carries the load (round 7, engine-plans-live-14)
+                r = "carry_load" if p.get("off_grid") else "carry_outage"
                 d = {"kw": round(D, 1)}
             elif C > 0.1:
                 r = "charge_from_pv"
@@ -876,18 +920,15 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
             # a set running with the grid up (parallel) is named for what it does, never "genset_off" (Part 4.7)
             r = "genset_on"
             d = {"kw": round(P, 1), "rs_per_kwh": round(_gen_marginal(gen), 1)}
-        elif bat and R[t] > 0 and float(p["p_start"][t]) >= 0.01 and E1 <= Emin + R[t] + 0.02 * En and (peak[t] or float(p["p_start"][t]) >= thr):
-            r = "hold_for_outage"
-            d = {"p": round(float(p["p_start"][t]), 2), "hours": round(int(p["dur_steps"][t]) * H, 2), "kwh": round(float(R[t]), 1)}
-        elif bat and peak[t] and E1 > Emin + 0.02 * En:
-            r = "wear_margin_too_small"
-        elif bat and t >= T - 24 and E1 > Emin + 0.05 * En:
-            r = "terminal_value"
+        elif bat and E1 > Emin + tol and (why := held(t, E1)) is not None:
+            r, d = why
         elif gen and g[t] > 0.5 and float(p["p_start"][t]) > 0.2:
             r = "genset_off"
         else:
             r = "idle"
         reasons.append({"reason": r, "detail": d})
+    for t, k in uses.items():
+        reasons[t]["detail"]["use_reason"] = reasons[k]["reason"]
     return reasons
 
 
