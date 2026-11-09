@@ -1868,22 +1868,37 @@ def arm_on(site_id: str, day: date) -> str | None:
 
 
 def _carry_over_credits(blocks: list[dict], by_day: dict[str, dict]) -> list[dict]:
-    """Plan 8.2: at each plan-to-native boundary the plan block hands its stored energy to the native block; the plan arm is credited with
-    (E_end_plan - E_end_native) x v_end, where E_end_native is the native replay's end energy on the plan block's last day. A native block's last day has
-    no plan replay to compare with, so native-to-plan boundaries carry no credit."""
+    """Plan 8.2: "at every block boundary the bill engine credits the arm that ends with more stored energy by (E_end_A - E_end_B) x v_end".
+    `credit_rs` is the credit to the plan's saving at each boundary (negative where the native block handed over more):
+    - plan to native: the plan block hands its stored energy to the native block; E_end_native is the native replay's end energy on the plan
+      block's last day;
+    - native to plan (round 7, audit engine-savings-11): the native block hands its stored energy to the plan block, which starts on it (a backup
+      mode that holds its battery full flatters the plan block's first day; a self-use native that ends empty handicaps it). The plan arm is not
+      replayed on a native day, so its end energy there is the plan days' mean end energy (`e_end_plan_basis: "plan_days_mean"`: the days of the
+      calendar the plan was in control, none withheld); with no such day yet there is no credit."""
+    plan_ends = [float(r["actual"].get("e_end_kwh") or 0.0) for d, r in by_day.items()
+                 if _arm_in(blocks, d) == "plan" and r.get("fidelity") in CLAIMING and not _day_withheld(r)]
+    e_plan_ref = float(np.mean(plan_ends)) if plan_ends else None
     out = []
     for a, b in zip(blocks, blocks[1:]):
-        if a["arm"] != "plan" or b["arm"] != "native":
+        if {a["arm"], b["arm"]} != {"plan", "native"}:
             continue
         if date.fromisoformat(a["block_end"]) + timedelta(days=1) != date.fromisoformat(b["block_start"]):
             continue
         r = by_day.get(a["block_end"])
         if not r:
             continue
-        e_a, e_b = float(r["actual"].get("e_end_kwh") or 0.0), float(r["baseline"].get("e_end_kwh") or 0.0)
         v = float(r["actual"].get("v_end") or 0.0)
-        out.append({"boundary": b["block_start"], "from_arm": "plan", "to_arm": "native", "e_end_plan_kwh": round(e_a, 2), "e_end_native_kwh": round(e_b, 2),
-                    "v_end": round(v, 2), "credit_rs": round((e_a - e_b) * v, 2)})
+        if a["arm"] == "plan":
+            e_p, e_n = float(r["actual"].get("e_end_kwh") or 0.0), float(r["baseline"].get("e_end_kwh") or 0.0)
+            basis = "plan_block_last_day"
+        else:
+            if e_plan_ref is None:
+                continue
+            e_p, e_n = e_plan_ref, float(r["actual"].get("e_end_kwh") or 0.0)
+            basis = "plan_days_mean"
+        out.append({"boundary": b["block_start"], "from_arm": a["arm"], "to_arm": b["arm"], "e_end_plan_kwh": round(e_p, 2), "e_end_native_kwh": round(e_n, 2),
+                    "e_end_plan_basis": basis, "v_end": round(v, 2), "credit_rs": round((e_p - e_n) * v, 2)})
     return out
 
 

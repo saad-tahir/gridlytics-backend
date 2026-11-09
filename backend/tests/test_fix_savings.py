@@ -497,11 +497,14 @@ def test_the_switchback_credits_the_plan_block_for_the_energy_it_hands_over(comp
                                               v_end=30.0)}
     _put_rows(sid, rows)
     res = verify.switchback_result(sid)
-    credits = res["carry_over_credits"]
+    credits = [c for c in res["carry_over_credits"] if c["from_arm"] == "plan"]
     assert [c["boundary"] for c in credits] == ["2026-09-08", "2026-09-22"] and all(c["credit_rs"] == pytest.approx(4500.0) for c in credits)
+    # round 7 (audit engine-savings-11): the native block's hand-over to the plan block on 15 Sep is credited too, against the plan days' mean end
+    # energy ((12 x 100 + 2 x 200) / 14 kWh): the native block ended 14 kWh below it, so the plan block started short
+    back = (1600.0 / 14 - 100.0) * 30.0
     r = res["result"]
-    assert r["carry_over_credit_rs"] == pytest.approx(9000.0)
-    assert r["saving_rs_per_day_unadjusted"] == pytest.approx(1000.0 + 9000.0 / 14, abs=0.01)
+    assert r["carry_over_credit_rs"] == pytest.approx(9000.0 + back, abs=0.01)
+    assert r["saving_rs_per_day_unadjusted"] == pytest.approx(1000.0 + (9000.0 + back) / 14, abs=0.01)
     assert r["saving_rs_per_day_unadjusted_before_carry_over"] == pytest.approx(1000.0, abs=0.01)
 
 

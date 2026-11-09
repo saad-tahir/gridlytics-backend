@@ -544,3 +544,35 @@ def test_a_plan_day_the_plan_did_not_control_or_a_withheld_day_is_no_switchback_
                     for i, (d, r) in enumerate(sorted(rows.items()))})
     sb = verify.switchback_result(mon)
     assert sb["result"] is None and sb["result_withheld"] == "monitor_tier" and sb["arm_days"]["plan"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ engine-savings-11, pages-D-30: every block boundary
+
+def test_a_native_block_that_hands_the_plan_a_fuller_battery_is_credited_at_its_boundary(company):
+    # plan 8.2: "at every block boundary the bill engine credits the arm that ends with more stored energy". A backup-mode native holds its battery
+    # full; the plan block after it starts on that energy. Before: only plan-to-native boundaries were credited, so the plan's block was flattered
+    sid = make_site(name="Switchback r7 native hand-over")
+    _calendar(sid, [("2026-09-01", "2026-09-07", "plan"), ("2026-09-08", "2026-09-14", "native"), ("2026-09-15", "2026-09-21", "plan"),
+                    ("2026-09-22", "2026-09-28", "native")])
+    rows = {}
+    for i in range(28):
+        d = (date(2026, 9, 1) + timedelta(days=i)).isoformat()
+        plan = (i // 7) % 2 == 0
+        r = _sb_day(sid, d, 9_000.0 + 13 * (i % 3) if plan else 10_000.0 + 17 * (i % 4), 1_000.0 if plan else 0.0, i,
+                    fidelity="confirmed" if plan else "native_block")
+        # the plan ends its days at 100 kWh (120 on its first block's last day, 80 on its second's); native's backup mode at 200, its replay at 150
+        r["actual"]["e_end_kwh"] = (120.0 if i == 6 else 80.0 if i == 20 else 100.0) if plan else 200.0
+        r["baseline"]["e_end_kwh"] = 150.0 if plan else 200.0
+        rows[d] = r
+    _put_rows(sid, {d: {"native": r} for d, r in rows.items()})
+    credits = verify.switchback_result(sid)["carry_over_credits"]
+    assert [(c["boundary"], c["from_arm"], c["to_arm"]) for c in credits] == [("2026-09-08", "plan", "native"), ("2026-09-15", "native", "plan"),
+                                                                               ("2026-09-22", "plan", "native")]
+    # the plan arm's end energy on a native block's last day is not replayed: it is the plan days' mean end energy (100 kWh here), so the native
+    # block that handed over 200 kWh takes 100 kWh at v_end off the plan's saving
+    back = credits[1]
+    assert back["e_end_plan_kwh"] == pytest.approx(100.0) and back["e_end_native_kwh"] == 200.0 and back["e_end_plan_basis"] == "plan_days_mean"
+    assert back["credit_rs"] == pytest.approx((100.0 - 200.0) * 30.0)
+    assert credits[0]["credit_rs"] == pytest.approx((120.0 - 150.0) * 30.0) and credits[2]["credit_rs"] == pytest.approx((80.0 - 150.0) * 30.0)
+    r = verify.switchback_result(sid)["result"]
+    assert r["carry_over_credit_rs"] == pytest.approx(-900.0 - 3_000.0 - 2_100.0)
