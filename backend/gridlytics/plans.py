@@ -784,6 +784,9 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
     rel = control_release(site_id)
     if rel:
         return _release_message(site_id, rel, record=record)
+    clock = clock_info(site_id)
+    if clock and clock["level"] == "demoted":
+        raise ClockDemoted(clock["offset_s"])
     plan = current(site_id)
     if plan is None:
         return None
@@ -802,6 +805,11 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
             "notes": {"reason": plan["summary"].get("status_label")}, **_edge_envelope(site_id, plan["id"], caps)}
     if fit:
         body["capabilities_fit"] = fit
+    if clock and clock["level"] == "widen":
+        # the inverter clock is more than 300 s off: every discharge slot starts 15 minutes early and ends 15 minutes late (R6 C10)
+        grammar = (plan.get("slots") or {}).get("grammar") or {}
+        body["mode_a"] = {"days": delivery.widen_peak_slots(days, CLOCK_WIDEN_MIN, int(grammar.get("min_slot_minutes") or 15))}
+        body["clock"] = {"offset_s": clock["offset_s"], "widened_min": CLOCK_WIDEN_MIN}
     msg = delivery.sign(site_id, _checked(_no_money(body)))
     if record:
         _record_send(site_id, plan["id"], msg)
@@ -979,4 +987,44 @@ def edge_fidelity(site_id: str, day: date) -> str:
 
 def _iso_utc(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), timezone.utc).isoformat(timespec="seconds")
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the clock-offset ladder
+
+#: R6 C10 (plan Part 7.3): over CLOCK_WARN_S the cloud raises clock_unsynced; over CLOCK_WIDEN_S the plan message widens every discharge slot by
+#: CLOCK_WIDEN_MIN each side and the control state asks for the inverter clock to be set; over CLOCK_DEMOTE_S control is demoted (no table is sent)
+#: until the offset is back under CLOCK_WARN_S
+CLOCK_WARN_S, CLOCK_WIDEN_S, CLOCK_DEMOTE_S, CLOCK_WIDEN_MIN = 120, 300, 900, 15
+
+
+def clock_level(offset_s: float, demoted: bool = False) -> str:
+    """The ladder's step for the worst clock offset (seconds, either sign): 'ok', 'unsynced', 'widen' or 'demoted'; a demoted site stays demoted
+    until the offset is under CLOCK_WARN_S."""
+    off = abs(float(offset_s))
+    if off >= CLOCK_DEMOTE_S or (demoted and off >= CLOCK_WARN_S):
+        return "demoted"
+    return "widen" if off >= CLOCK_WIDEN_S else "unsynced" if off >= CLOCK_WARN_S else "ok"
+
+
+def clock_info(site_id: str) -> dict | None:
+    """The site's clock offset when the ladder acts on it ({offset_s, level, source}: the worst of the edge's heartbeat and the inverter's own clock
+    reported in telemetry, routes_edge), else None."""
+    c = sites.state(site_id).get("edge_clock") or {}
+    if c.get("level", "ok") == "ok":
+        return None
+    return {"offset_s": float(c["offset_s"]), "level": c["level"], "source": c.get("source")}
+
+
+def clock_words(offset_s: float) -> str:
+    off = abs(float(offset_s))
+    return f"{off / 60:.0f} min" if off >= 90 else f"{off:.0f} s"
+
+
+class ClockDemoted(Exception):
+    """The site's clock is off by CLOCK_DEMOTE_S or more (or has not come back under CLOCK_WARN_S since): control is demoted and no table is signed."""
+
+    def __init__(self, offset_s: float):
+        self.offset_s = offset_s
+        super().__init__(f"The inverter clock is {clock_words(offset_s)} off, so control is demoted and no plan is sent until the clock is within "
+                         f"{CLOCK_WARN_S} seconds")
 

@@ -315,6 +315,12 @@ def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(.
     res = telemetry.ingest(site_id, records, "edge")
     with store.connect() as con:
         _mark_stored(con, site_id, "telemetry", msg.seq, digest)
+    if "inverter_clock_offset_s" in columns:
+        # the inverter's own clock (R6 C10 b): its newest reading in the batch moves the clock ladder as the heartbeat's does
+        k = columns.index("inverter_clock_offset_s")
+        seen = [float(r[k]) for r in rows if k < len(r) and isinstance(r[k], (int, float)) and not isinstance(r[k], bool) and math.isfinite(r[k])]
+        if seen:
+            _clock_update(site_id, seen[-1], "inverter")
     answer = {"ack": msg.seq, **res, **({"ignored_columns": ignored} if ignored else {})}
     # an outage event waiting for this batch (the minute that shows the grid lost or back) re-solves now; the batch is stored either way. The pending
     # re-solve is read now, after the batch is stored, not from the state at the request's start: an event stored meanwhile is the one that decides
@@ -334,12 +340,40 @@ def edge_heartbeat(site_id: str, inp: dict = Body(...)):
     site_or_404(site_id)
     msg = _check(delivery.Heartbeat, inp, site_id)
     _put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump(), edge_heartbeat_at=now_ts())
-    warn = None
-    if abs(msg.clock_offset_s) >= 900:
-        warn = "clock_offset_900s: control demoted until the clock is set"
-    elif abs(msg.clock_offset_s) >= 300:
-        warn = "clock_offset_300s: peak slots are widened by 15 minutes"
-    return {"ack": msg.seq, "warning": warn}
+    level = _clock_update(site_id, msg.clock_offset_s, "edge")
+    return {"ack": msg.seq, "warning": _clock_warning(level, msg.clock_offset_s)}
+
+
+def _clock_warning(level: str, offset_s: float) -> str | None:
+    off = f"the clock is {abs(offset_s):.0f} s off"
+    return {"unsynced": f"clock_offset_120s: {off}; the cloud raised clock_unsynced. Set the clock",
+            "widen": f"clock_offset_300s: {off}; the next plan message starts every discharge slot 15 minutes early and ends it 15 minutes late. "
+                     "Set the inverter clock",
+            "demoted": f"clock_offset_900s: {off}; control is demoted and no plan is sent until the offset is under {plans.CLOCK_WARN_S} s. "
+                       "Set the inverter clock"}.get(level)
+
+
+def _clock_update(site_id: str, offset_s: float, source: str) -> str:
+    """Records a clock offset (the edge's from its heartbeat, the inverter's from telemetry's inverter_clock_offset_s) and moves the site along R6
+    C10's ladder on the worst of them (plans.clock_level; audit engine-delivery-10): clock_unsynced is raised as an event when the offset first goes
+    over 120 s, and an audit line says when control is demoted (900 s) and restored (back under 120 s). The level now."""
+    def change(cur):
+        c = dict(cur.get("edge_clock") or {})
+        offsets = {**(c.get("offsets") or {}), source: round(float(offset_s), 1)}
+        src, worst = max(offsets.items(), key=lambda kv: abs(kv[1]))
+        before = c.get("level", "ok")
+        level = plans.clock_level(worst, before == "demoted")
+        return {"edge_clock": {"offsets": offsets, "offset_s": worst, "source": src, "level": level, "at": now_ts()}}, (before, level, worst)
+    _, (before, level, worst) = _state_change(site_id, change)
+    if before == "ok" and level != "ok":
+        with store.connect() as con:
+            con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
+                        (site_id, store._now(), "clock_unsynced", "cloud", json.dumps({"offset_s": worst, "from": source})))
+    if level == "demoted" and before != "demoted":
+        store.audit("edge", "demoted control: the clock is off", site_id, {"offset_s": worst, "from": source})
+    elif before == "demoted" and level != "demoted":
+        store.audit("edge", "restored control: the clock is set", site_id, {"offset_s": worst, "from": source})
+    return level
 
 
 def _pause_in(con, site_id: str) -> None:
@@ -491,6 +525,8 @@ def plan_message(site_id: str):
         raise Refusal(409, str(exc), "not_closed_loop") from None
     except plans.CapsMismatch as exc:
         raise Refusal(409, f"{exc}, so the plan is not sent", "caps_mismatch") from None
+    except plans.ClockDemoted as exc:
+        raise Refusal(409, str(exc), "clock_unsynced") from None
     if msg is None:
         held = plans.held_info(site_id) or {}
         if held.get("reason") == plans.EXPIRED_REASON:
@@ -512,5 +548,5 @@ def edge_status(site_id: str):
     return out({"last_seen": last, "online": bool(last and now_ts() - last < 300), "heartbeat": st.get("edge_heartbeat"),
                 "capabilities": json.loads(cap["body"]) if cap else None, "acks": [{**dict(a), "body": json.loads(a["body"])} for a in acks],
                 "sent": [dict(r) for r in sent], "public_key": delivery.public_key(site_id) if auth.can("edit_sites") else None,
-                # what the edge reports when it is not running the plan in force (audit engine-delivery-12)
-                "reports": plans.edge_view(site_id)})
+                # what the edge reports when it is not running the plan in force, and the clock-offset ladder's step (audit engine-delivery-10, 12)
+                "reports": plans.edge_view(site_id), "clock": plans.clock_info(site_id)})

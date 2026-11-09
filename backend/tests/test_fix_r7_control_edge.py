@@ -735,3 +735,82 @@ def test_a_closed_loop_day_the_edge_did_not_follow_claims_nothing(company):
                     ("a2", sid, "p", "rejected", json.dumps({"status": "rejected"}), _iso(noon + 2 * 86400 + 60)))
     assert plans.edge_fidelity(sid, day + timedelta(days=2)) == "not_applied"
 
+
+# ------------------------------------------------------------------------------------------------ engine-delivery-10 (batch 2)
+
+def _day_slots(*spec, day=date(2026, 11, 6)) -> list[dict]:
+    mid = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    hm = lambda t: datetime.fromtimestamp(t, PKT).strftime("%H:%M")
+    out = []
+    for a, b, mode in spec:
+        s0, s1 = mid + int(a * 3600), mid + int(b * 3600)
+        out.append({"start": hm(s0), "end": hm(s1), "start_ts": s0, "end_ts": s1, "mode": mode, "soc_floor_pct": 20.0, "soc_target_pct": 100.0,
+                    "charge_end_ts": s1 if mode.startswith("charge") else None})
+    return [{"date": day.isoformat(), "slots": out}]
+
+
+def test_a_widened_table_starts_each_discharge_slot_15_minutes_early_and_ends_it_15_minutes_late():
+    w = delivery.widen_peak_slots(_day_slots((0, 17, "hold"), (17, 21, "discharge"), (21, 24, "charge_grid")), 15, 30)
+    assert [(s["start"], s["end"], s["mode"]) for s in w[0]["slots"]] == [("00:00", "16:45", "hold"), ("16:45", "21:15", "discharge"),
+                                                                           ("21:15", "00:00", "charge_grid")]
+    assert w[0]["slots"][2]["charge_end_ts"] == w[0]["slots"][2]["end_ts"]
+    # a slot squeezed under the device's shortest slot gives its time to the discharge beside it
+    w = delivery.widen_peak_slots(_day_slots((0, 16.5, "self_use"), (16.5, 17, "hold"), (17, 21, "discharge"), (21, 24, "self_use")), 15, 30)
+    assert [(s["start"], s["end"]) for s in w[0]["slots"]] == [("00:00", "16:30"), ("16:30", "21:15"), ("21:15", "00:00")]
+    # a table with no discharge slot is unchanged
+    flat = _day_slots((0, 24, "self_use"))
+    assert delivery.widen_peak_slots(flat, 15, 30) == flat
+
+
+def test_the_clock_offset_ladder_warns_widens_and_demotes_until_the_clock_is_set(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    pk = world.key(["plans:read"], role="viewer")
+    with world.use():
+        _closed_loop(sid)
+        _plan_slots(sid, [{"from_h": 0, "to_h": 17, "mode": "hold"}, {"from_h": 17, "to_h": 21, "mode": "discharge", "max_discharge_w": 5000},
+                          {"from_h": 21, "to_h": 24, "mode": "self_use"}])
+    beat = lambda n, off: world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json=_env(n, uptime_s=60, clock_offset_s=off, control_state="executing")).json()
+    message = lambda: world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=pk)
+
+    def unsynced() -> int:
+        with world.use(), store.connect() as con:
+            return con.execute("SELECT count(*) FROM events WHERE site_id = ? AND type = 'clock_unsynced' AND source = 'cloud'", (sid,)).fetchone()[0]
+
+    assert beat(1, 30)["warning"] is None and unsynced() == 0
+    assert beat(2, 150)["warning"].startswith("clock_offset_120s") and unsynced() == 1
+    assert beat(3, -160)["warning"].startswith("clock_offset_120s") and unsynced() == 1      # raised once while it lasts
+    m = message().json()
+    assert m["mode_a"]["days"][0]["slots"][1]["start"] == "17:00" and m.get("clock") is None
+    # over 300 s the next plan message widens the discharge slot, and the control state asks for the clock to be set
+    w = beat(4, 400)["warning"]
+    assert w.startswith("clock_offset_300s") and "15 minutes" in w
+    m = message().json()
+    hold, dis, rest = m["mode_a"]["days"][0]["slots"]
+    assert (hold["end"], dis["start"], dis["end"], rest["start"]) == ("16:45", "16:45", "21:15", "21:15")
+    assert m["clock"] == {"offset_s": 400.0, "widened_min": 15}
+    assert "set the inverter clock" in _control(world, sid)["label"]
+    assert world.c["viewer"].get(f"/api/sites/{sid}/edge").json()["clock"] == {"offset_s": 400.0, "level": "widen", "source": "edge"}
+    # over 900 s control is demoted: no table is sent until the offset is under 120 s
+    assert beat(5, 1000)["warning"].startswith("clock_offset_900s")
+    r = message()
+    assert r.status_code == 409 and r.json()["code"] == "clock_unsynced", r.text
+    assert _control(world, sid)["key"] == "clock_demoted"
+    assert beat(6, 200)["warning"].startswith("clock_offset_900s")
+    assert message().status_code == 409
+    assert beat(7, 20)["warning"] is None
+    r = message()
+    assert r.status_code == 200 and r.json().get("clock") is None and r.json()["mode_a"]["days"][0]["slots"][1]["start"] == "17:00"
+    assert _control(world, sid)["key"] == "following"
+    with world.use():
+        acts = [a["action"] for a in store.list_audit()]
+    assert "demoted control: the clock is off" in acts and "restored control: the clock is set" in acts
+
+
+def test_the_inverters_own_clock_offset_counts_too(world):
+    sid, kh = world.site, world.key(["telemetry:write"])
+    m = _now() // 60 * 60 - 120
+    batch = _env(1, columns=["ts", "grid_present", "inverter_clock_offset_s"], rows=[[m, 1, 30], [m + 60, 1, 1200]])
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=batch)
+    assert r.status_code == 200 and r.json()["accepted"] == 2, r.text
+    with world.use():
+        assert plans.clock_info(sid) == {"offset_s": 1200.0, "level": "demoted", "source": "inverter"}

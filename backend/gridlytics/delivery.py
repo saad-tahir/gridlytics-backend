@@ -371,3 +371,54 @@ def fit_to_capabilities(days: list[dict], caps: dict | None) -> tuple[list[dict]
         return days, None
     return out, {"device_id": dev["device_id"], "capabilities_seq": (caps or {}).get("seq"), "not_writable": sorted(dropped), "clamped": sorted(clamped)}
 
+
+#: The slot modes that avoid the peak by discharging: those R6 C10 widens when the inverter clock is off
+PEAK_MODES = ("discharge", "export")
+
+
+def widen_peak_slots(days: list[dict], minutes: int = 15, min_slot_minutes: int = 15) -> list[dict]:
+    """The Mode A days with every discharge or export slot started `minutes` early and ended `minutes` late (R6 C10: an inverter clock more than 300 s
+    off shifts every boundary; being early costs a little stored energy, being late costs the peak tariff; audit engine-delivery-10). The slots beside
+    it give up that time (never more than they hold), and one left shorter than the device's shortest slot (`min_slot_minutes`) gives the rest of its
+    time to the discharge beside it. A charge slot's charge_end is kept within the slot. The local HH:MM times follow the new boundaries."""
+    step = int(minutes) * 60
+    hhmm = lambda t: datetime.fromtimestamp(int(t), PKT).strftime("%H:%M")
+    out = []
+    for day in days:
+        slots = sorted((dict(s) for s in day.get("slots") or []), key=lambda s: s["start_ts"])
+        peak = [s.get("mode") in PEAK_MODES for s in slots]
+        if not any(peak):
+            out.append(day)
+            continue
+        for i, s in enumerate(slots):
+            if not peak[i]:
+                continue
+            if i > 0 and not peak[i - 1]:
+                s["start_ts"] = max(slots[i - 1]["start_ts"], s["start_ts"] - step)
+                slots[i - 1]["end_ts"] = s["start_ts"]
+            if i + 1 < len(slots) and not peak[i + 1]:
+                s["end_ts"] = min(slots[i + 1]["end_ts"], s["end_ts"] + step)
+                slots[i + 1]["start_ts"] = s["end_ts"]
+        kept: list[tuple[dict, bool]] = []
+        for i, s in enumerate(slots):
+            if not peak[i] and s["end_ts"] - s["start_ts"] < int(min_slot_minutes) * 60:
+                if i + 1 < len(slots) and peak[i + 1]:
+                    slots[i + 1]["start_ts"] = s["start_ts"]
+                elif kept:
+                    kept[-1][0]["end_ts"] = s["end_ts"]
+                elif i + 1 < len(slots):
+                    slots[i + 1]["start_ts"] = s["start_ts"]
+                else:
+                    kept.append((s, peak[i]))
+                continue
+            kept.append((s, peak[i]))
+        new = []
+        for s, _ in kept:
+            s["start"], s["end"] = hhmm(s["start_ts"]), hhmm(s["end_ts"])
+            if s.get("charge_end_ts") is not None and s["charge_end_ts"] > s["end_ts"]:
+                s["charge_end_ts"] = s["end_ts"]
+                if "charge_end" in s:
+                    s["charge_end"] = hhmm(s["end_ts"])
+            new.append(s)
+        out.append({**day, "slots": new})
+    return out

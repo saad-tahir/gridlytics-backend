@@ -47,10 +47,15 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
     if tier == "closed_loop" and age is not None and age > 5 and not site.get("demo_link"):
         return {"key": "edge_offline", "label": "Edge offline"}
     if tier == "closed_loop":
+        clock = plans.clock_info(site["id"])
+        if clock and clock["level"] == "demoted":
+            return {"key": "clock_demoted", "label": f"Control demoted: the inverter clock is {plans.clock_words(clock['offset_s'])} off"}
         # what the edge itself reports (a fallback, control it disabled, the plan refused or applied in part) comes before "Following plan"
         edge = plans.edge_view(site["id"], now)
         if edge:
             return edge
+        if clock and clock["level"] == "widen":
+            return {"key": "following", "label": f"Following plan (set the inverter clock: it is {plans.clock_words(clock['offset_s'])} off)"}
     if tier == "monitor":
         return {"key": "recommendation", "label": "Recommendation only"}
     if tier == "advisory_writes":
