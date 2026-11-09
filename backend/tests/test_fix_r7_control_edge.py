@@ -814,3 +814,6 @@ def test_the_inverters_own_clock_offset_counts_too(world):
     assert r.status_code == 200 and r.json()["accepted"] == 2, r.text
     with world.use():
         assert plans.clock_info(sid) == {"offset_s": 1200.0, "level": "demoted", "source": "inverter"}
+    # the edge's own clock is right: its heartbeat is told what the inverter's offset does
+    w = world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json=_env(1, uptime_s=60, clock_offset_s=2)).json()["warning"]
+    assert w.startswith("clock_offset_900s: the clock is 1200 s off"), w

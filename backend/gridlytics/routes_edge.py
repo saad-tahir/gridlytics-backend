@@ -340,8 +340,8 @@ def edge_heartbeat(site_id: str, inp: dict = Body(...)):
     site_or_404(site_id)
     msg = _check(delivery.Heartbeat, inp, site_id)
     _put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump(), edge_heartbeat_at=now_ts())
-    level = _clock_update(site_id, msg.clock_offset_s, "edge")
-    return {"ack": msg.seq, "warning": _clock_warning(level, msg.clock_offset_s)}
+    level, worst = _clock_update(site_id, msg.clock_offset_s, "edge")
+    return {"ack": msg.seq, "warning": _clock_warning(level, worst)}
 
 
 def _clock_warning(level: str, offset_s: float) -> str | None:
@@ -353,10 +353,10 @@ def _clock_warning(level: str, offset_s: float) -> str | None:
                        "Set the inverter clock"}.get(level)
 
 
-def _clock_update(site_id: str, offset_s: float, source: str) -> str:
+def _clock_update(site_id: str, offset_s: float, source: str) -> tuple[str, float]:
     """Records a clock offset (the edge's from its heartbeat, the inverter's from telemetry's inverter_clock_offset_s) and moves the site along R6
     C10's ladder on the worst of them (plans.clock_level; audit engine-delivery-10): clock_unsynced is raised as an event when the offset first goes
-    over 120 s, and an audit line says when control is demoted (900 s) and restored (back under 120 s). The level now."""
+    over 120 s, and an audit line says when control is demoted (900 s) and restored (back under 120 s). The level now, and the worst offset."""
     def change(cur):
         c = dict(cur.get("edge_clock") or {})
         offsets = {**(c.get("offsets") or {}), source: round(float(offset_s), 1)}
@@ -373,7 +373,7 @@ def _clock_update(site_id: str, offset_s: float, source: str) -> str:
         store.audit("edge", "demoted control: the clock is off", site_id, {"offset_s": worst, "from": source})
     elif before == "demoted" and level != "demoted":
         store.audit("edge", "restored control: the clock is set", site_id, {"offset_s": worst, "from": source})
-    return level
+    return level, worst
 
 
 def _pause_in(con, site_id: str) -> None:
