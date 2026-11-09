@@ -570,7 +570,8 @@ def test_a_pause_or_release_answers_no_plan_while_the_plan_of_before_is_still_ac
 
 def _ali(w, n: int):
     import identities
-    return identities.client(f"ali.{n}@fix.test", "operator", w.company, "member", name="Ali Khan", raise_server_exceptions=False)
+    # administrators: saving a draft is the administrator's (audit role-operator-07); the name, not the role, is what these tests are about
+    return identities.client(f"ali.{n}@fix.test", "admin", w.company, "member", name="Ali Khan", raise_server_exceptions=False)
 
 
 def test_two_members_with_one_name_keep_their_own_drafts(world):

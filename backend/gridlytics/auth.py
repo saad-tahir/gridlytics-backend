@@ -41,6 +41,9 @@ PERMISSIONS = {
     "run_jobs": {"admin", "operator", "analyst"},
     #: the energy-only report carries no money (plan Part 8.5: the viewer-safe report), so every member may generate it, a viewer included
     "energy_report": {"admin", "operator", "analyst", "viewer"},
+    #: adding, activating and drafting sites and changing their control limits (plan Part 9.4: the administrator "creates sites ... edits limits"; the
+    #: operator places holds and overrides within them; audit role-operator-07). Editing a site's other fields stays edit_sites
+    "manage_sites": {"admin"},
 }
 #: A session of local sign-in (its refresh tokens, platform.py) ends this many hours unused, and however active, this many days after sign-in (review of batch
 #: 1, for the cookie sessions of before)

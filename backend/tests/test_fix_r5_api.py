@@ -7,10 +7,13 @@ from test_fix_api import world  # noqa: F401  (world is a fixture)
 
 
 def test_a_person_discards_their_own_draft_and_nobody_else_s(world):
-    a, op = world.c["admin"], world.c["operator"]
+    import identities
+    a = world.c["admin"]
+    other = identities.client("admin.two@fix.test", "admin", world.company, "member", raise_server_exceptions=False)
     assert a.put("/api/drafts/d-r5", json={"name": "Half a site"}).status_code == 200
-    assert op.delete("/api/drafts/d-r5").status_code == 404                 # another member's draft is private, so it is not found
+    assert other.delete("/api/drafts/d-r5").status_code == 404              # another member's draft is private, so it is not found
     assert world.c["viewer"].delete("/api/drafts/d-r5").status_code == 403  # a viewer edits no sites
+    assert world.c["operator"].delete("/api/drafts/d-r5").status_code == 403  # nor does an operator add them (audit role-operator-07)
     r = a.delete("/api/drafts/d-r5")
     assert r.status_code == 200 and r.json() == {"deleted": "d-r5"}
     assert all(d["draft_id"] != "d-r5" for d in a.get("/api/drafts").json())

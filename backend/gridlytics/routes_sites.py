@@ -114,6 +114,11 @@ ASSET_MONEY_FIELDS = {"battery": ("replacement_cost_per_kwh", "warranted_cycles"
                       "genset": ("c_start_rs", "c_runhr_rs", "c_om_rs_per_kwh")}
 
 
+#: The site's control limits (plan Part 9.4: the administrator "edits limits", the operator works within them; audit role-operator-07): the reserve floor
+#: and its outage threshold, which the plan never crosses, the cycle cap, the control mode, the critical load and the battery's charge sources
+SITE_LIMIT_FIELDS = ("control_mode", "reserve_policy", "cycle_cap_per_day", "critical_load_kw", "grid_charge_allowed", "gen_charge_allowed")
+
+
 def _defaults(model, names) -> dict:
     return {k: model.model_fields[k].default for k in names if k in model.model_fields}
 
@@ -131,7 +136,7 @@ def sites_list():
 
 @router.post("/api/sites")
 def site_create(inp: dict = Body(...)):
-    auth.need("edit_sites", "Adding a site")
+    auth.need("manage_sites", "Adding a site")
     _need_money_settings(inp, _defaults(sites.SiteFields, SITE_MONEY_FIELDS), SITE_MONEY_FIELDS, "Setting the site's value of lost load or wear costing")
     try:
         s = sites.create(inp, auth.actor())
@@ -170,6 +175,9 @@ def site_update(site_id: str, inp: dict = Body(...)):
     auth.need("edit_sites", "Editing a site")
     s = site_or_404(site_id)
     expect = _if_unchanged(inp, held_may_be_none=False)
+    # a control limit sent unchanged (the form sent back whole) is not a change of it
+    if any(k in inp and inp[k] != (s.get("data") or {}).get(k) for k in SITE_LIMIT_FIELDS):
+        auth.need("manage_sites", "Changing the site's control limits")
     _need_money_settings(inp, {**_defaults(sites.SiteFields, SITE_MONEY_FIELDS), **(s.get("data") or {})}, SITE_MONEY_FIELDS,
                          "Changing the site's value of lost load or wear costing")
     try:
@@ -198,7 +206,7 @@ def _grid_settled(site: dict, connections: list[dict]) -> bool:
 
 @router.post("/api/sites/{site_id}/activate")
 def site_activate(site_id: str):
-    auth.need("edit_sites", "Activating a site")
+    auth.need("manage_sites", "Activating a site")
     s = sites.full(site_id) or {}
     if not s:
         raise HTTPException(status_code=404, detail="No such site")
@@ -556,7 +564,7 @@ def draft_put(draft_id: str, inp: dict = Body(...), site_id: str | None = None):
     site the draft made, once it exists; a draft saved without one keeps the site it has. A query `site_id` that names no site is refused (422); the
     body's is the form's own field, which the wizard sends in every autosave, so one that names no site (deleted meanwhile) is not recorded and the
     save stands. A draft id another member's draft holds is refused (409), never written over; the check and the write are one write transaction."""
-    auth.need("edit_sites", "Saving a draft")
+    auth.need("manage_sites", "Saving a draft")
     if len(json.dumps(inp)) > 200_000:
         raise Refusal(422, "The draft is too large", "invalid")
     if site_id:
@@ -581,7 +589,7 @@ def draft_put(draft_id: str, inp: dict = Body(...), site_id: str | None = None):
 def draft_delete(draft_id: str):
     """Discards the caller's own draft ("Add a site" offers it next to Resume). Another member's draft, or none, answers 404: a draft is private to
     the person who started it."""
-    auth.need("edit_sites", "Discarding a draft")
+    auth.need("manage_sites", "Discarding a draft")
     owner = _draft_owner()
     with store.write_transaction() as con:
         n = con.execute("DELETE FROM site_drafts WHERE draft_id = ? AND person = ?", (draft_id, owner)).rowcount

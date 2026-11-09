@@ -22,6 +22,9 @@ outages could not be seen. Activation now asks for the data source with its grid
 flow-onboarding-03: tier_capable was set only by an edge's capabilities message, so a CSV or cloud site stayed at monitor for good although the wizard
 promises slot tables to key in. Saving a CSV or cloud source makes the site capable of advisory writes (a CSV once a file carries the inverter's mode);
 a change back to an edge device takes what the edge last asserted.
+
+role-operator-07: an operator could add, draft and activate sites and change the control limits, which plan 9.4 gives the administrator. They now need
+manage_sites (an administrator's); the operator keeps the site's other fields, the native capture and overrides.
 """
 from __future__ import annotations
 
@@ -61,8 +64,8 @@ def test_a_site_save_based_on_older_values_is_refused_rather_than_written_over_n
     r = op.put(f"/api/sites/{sid}", json={"city": "Faisalabad", "if_unchanged": fresh})
     assert r.status_code == 200, r.text
     assert r.json()["data"]["city"] == "Faisalabad" and r.json()["data"]["name"] == "Mill One (renamed by the owner)"
-    # a stored number read back as a whole number (20.0 sent as 20 by the web app) is the same value
-    r = op.put(f"/api/sites/{sid}", json={"cycle_cap_per_day": 2, "if_unchanged": {"cycle_cap_per_day": 1.5, "critical_load_kw": [20] * 24}})
+    # a stored number read back as a whole number (20.0 sent as 20 by the web app) is the same value (the cycle cap is the administrator's, role-operator-07)
+    r = a.put(f"/api/sites/{sid}", json={"cycle_cap_per_day": 2, "if_unchanged": {"cycle_cap_per_day": 1.5, "critical_load_kw": [20] * 24}})
     assert r.status_code == 200, r.text
     # if_unchanged is an object of stored values; anything else is refused in a sentence
     for wrong in ("yes", [1], None):
@@ -302,3 +305,42 @@ def test_a_csv_or_cloud_source_lets_the_site_reach_advisory_writes(world):
     r = a.post("/api/sites", json={"name": "Cloud site", "data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}})
     assert r.status_code == 200 and (r.json()["tier_capable"], r.json()["tier"]) == ("advisory_writes", "monitor"), r.text
     assert a.post("/api/sites", json={"name": "No source"}).json()["tier_capable"] == "monitor"
+
+
+# ------------------------------------------------------------------------------------------------ role-operator-07
+
+def test_creating_activating_and_the_control_limits_are_for_an_administrator(world):
+    a, op, sid = world.c["admin"], world.c["operator"], world.site
+    meta = op.get("/api/meta").json()["permissions"]
+    assert meta["manage_sites"] is False and meta["edit_sites"] is True
+    assert a.get("/api/meta").json()["permissions"]["manage_sites"] is True
+    r = op.post("/api/sites", json={"name": "AUDIT operator onboarding"})
+    assert r.status_code == 403 and r.json()["detail"] == "Adding a site is for an administrator", r.text
+    r = op.put("/api/drafts/d-op", json={"general": {"name": "Half a site"}})
+    assert r.status_code == 403 and r.json()["detail"] == "Saving a draft is for an administrator", r.text
+    with world.use():
+        sites.put_asset(sid, "inverter", {"kw_ac": 100}, "test")
+    a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "csv", "grid_signal_confirmed": True}})
+    r = op.post(f"/api/sites/{sid}/activate")
+    assert r.status_code == 403 and r.json()["detail"] == "Activating a site is for an administrator", r.text
+    # the control limits: the reserve floor the plan never crosses, the cycle cap, the control mode, the critical load and the charge sources
+    for change in ({"reserve_policy": {"p_threshold": 0.2, "min_soc_pct": 5}}, {"cycle_cap_per_day": 3}, {"control_mode": "mode_b"},
+                   {"critical_load_kw": [0.0] * 24}, {"grid_charge_allowed": False}):
+        r = op.put(f"/api/sites/{sid}", json=change)
+        assert r.status_code == 403, (change, r.text)
+        assert r.json()["detail"] == "Changing the site's control limits is for an administrator"
+    held = _site(a, sid)["data"]
+    assert (held["reserve_policy"]["min_soc_pct"], held["cycle_cap_per_day"], held["control_mode"]) == (20, 1.5, "advisory")
+    # the form sent back whole with the limits unchanged is not a change of them; the operator keeps the site's other fields, native capture and overrides
+    r = op.put(f"/api/sites/{sid}", json={**held, "notes": "Gate 2 is locked after 18:00"})
+    assert r.status_code == 200 and r.json()["data"]["notes"] == "Gate 2 is locked after 18:00", r.text
+    assert _native(op, sid, ["00:00", "17:00"]).status_code == 200
+    from datetime import datetime, timedelta, timezone
+    until = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    r = op.post(f"/api/sites/{sid}/overrides", json={"kind": "reserve", "value": 40, "until": until})
+    assert r.status_code == 200, r.text
+    # the administrator does all of it
+    assert a.put(f"/api/sites/{sid}", json={"cycle_cap_per_day": 3}).status_code == 200
+    assert a.post(f"/api/sites/{sid}/activate").status_code == 200
+    assert a.post("/api/sites", json={"name": "Admin's site"}).status_code == 200
+    assert a.put("/api/drafts/d-admin", json={"general": {"name": "Half a site"}}).status_code == 200
