@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 from test_fix_r2_savings import NIGHT_CHARGER, D, P
-from test_fix_r6_savings import DAYS, LEAD, _farm, _night_runs, _rows, _run
+from test_fix_r6_savings import DAYS, LEAD, _blank_evening, _farm, _night_runs, _run
 from test_fix_savings import company, make_site, twin_day  # noqa: F401 (company is a fixture)
 
 from gridlytics import sites, store, telemetry, twin, verify
@@ -163,3 +163,54 @@ def test_the_first_plan_day_after_days_the_plan_did_not_run_restarts_from_the_me
     sites.set_tier_allowed(sid, "monitor", "t", "test")
     a, b = (verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS[:2])
     assert b["fidelity"] == "recommendation_only" and b["chain"]["from"] == "previous_day"
+
+
+# ------------------------------------------------------------------------------------------------ pr-review-11: no claim rests on a long dropout
+
+def test_a_blank_pv_or_load_is_closed_from_the_balance_and_a_day_the_balance_cannot_close_is_withheld(company):
+    sid = _farm("Farm PV blank r7")
+    _run(sid, [LEAD] + DAYS, _night_runs)
+    full = [verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS]
+    assert all(r["claim_withheld"] is None and r["inputs_unread_min"] == 0 for r in full)
+    # PV blank 10:00-13:00, the load, the battery and the genset read. Before: the replay counted the PV as zero, so native's replay saw no sun, ran
+    # its set and drained, and the day claimed that (the verifier's case: no other withhold rule applies), and the next day chained from that state.
+    # The balance closes the PV exactly (load, battery and genset read), so the replay runs on what the site had
+    assert _blank_evening(sid, DAYS[1], 10.0, 13.0, cols=("pv_power_w",)) == 180
+    rows = [verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS]
+    for r, f in zip(rows, full):
+        assert r["claimed_rs"] == pytest.approx(f["claimed_rs"], abs=1.0) and r["inputs_unread_min"] == 0
+    assert rows[2]["chain"]["from"] == "previous_day"
+    # the load blank too: the balance still gives load less PV exactly, which native's battery and genset answer
+    assert _blank_evening(sid, DAYS[1], 10.0, 13.0, cols=("pv_power_w", "load_power_w")) == 180
+    r = verify.compute_day(sid, DAYS[1], with_bound=False)["native"]
+    assert r["claimed_rs"] == pytest.approx(full[1]["claimed_rs"], abs=1.0) and r["inputs_unread_min"] == 0
+    # the battery's power blank as well (its state of charge read): nothing closes the PV or the load, and three hours of them are over 5 % of the
+    # day, so the day claims nothing and the next day restarts from the measured state
+    assert _blank_evening(sid, DAYS[1], 10.0, 13.0, cols=("pv_power_w", "load_power_w", "battery_power_w")) == 180
+    rows = [verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS]
+    assert rows[1]["claim_withheld"] == "inputs_unread" and rows[1]["claimed_rs"] == 0.0 and rows[1]["inputs_unread_min"] == 180
+    assert rows[1]["fidelity"] == "confirmed" and rows[1]["chain"]["end"]["unread_min"] == 180
+    assert rows[2]["chain"]["from"] == "actual" and rows[2]["chain"]["reset"] == "unread_inputs"
+    assert rows[0]["claimed_rs"] == pytest.approx(full[0]["claimed_rs"], abs=0.01)
+    assert verify.summary(sid, DAYS[0].isoformat(), DAYS[2].isoformat())["baselines"]["native"]["verified_days"] == 2
+    # a short gap the balance cannot close (20 minutes) is carried as the replay counts it: the day claims and the next day chains on
+    _run(sid, [LEAD] + DAYS, _night_runs)
+    assert _blank_evening(sid, DAYS[1], 12.0, 12.0 + 20 / 60, cols=("pv_power_w", "load_power_w", "battery_power_w")) == 20
+    rows = [verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS]
+    assert rows[1]["claim_withheld"] is None and rows[1]["inputs_unread_min"] == 20 and rows[2]["chain"]["from"] == "previous_day"
+    # PV blank at night hides nothing (the sun is down, so the replay's zero is right): no unread minute even with nothing to close it
+    _run(sid, [LEAD] + DAYS, _night_runs)
+    assert _blank_evening(sid, DAYS[1], 0.0, 4.0, cols=("pv_power_w", "battery_power_w")) == 240
+    r = verify.compute_day(sid, DAYS[1], with_bound=False)["native"]
+    assert r["inputs_unread_min"] == 0 and r["chain"]["end"]["unread_min"] == 0 and r["claim_withheld"] is None
+
+
+def test_a_closed_loop_edge_not_heard_for_two_hours_is_partial_and_its_claim_withheld(company):
+    sid = _closed_loop_day("Closed r7 unheard")
+    t0 = twin.day_start_utc(D)
+    with telemetry.connect() as con:
+        assert con.execute("DELETE FROM minute WHERE site_id = ? AND ts >= ? AND ts < ?", (sid, t0 + 10 * 3600, t0 + 12 * 3600)).rowcount == 120
+    r = verify.compute_day(sid, D, with_bound=False)["native"]
+    assert r["control"]["edge_unheard_min"] == 120 and r["fidelity"] == "partial"
+    # two hours with neither load nor PV read: the grid's own rule does not count such minutes, so before nothing capped them and the day claimed
+    assert r["import_unknown"] is False and r["claim_withheld"] == "inputs_unread" and r["claimed_rs"] == 0.0 and r["inputs_unread_min"] == 120

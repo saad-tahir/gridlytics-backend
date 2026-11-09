@@ -3,7 +3,8 @@
 The actual arm is the measured day; the baseline arms are the native capture and the tuned table replayed by the twin on the measured PV, load and
 outages. Each baseline's replays are chained: a day starts from that baseline's own end state of the day before (its state of charge and its genset's
 run, as the twin carries them), and from the actual arm's state only on the first scored day, after a day that was not scored, after a day that
-claims nothing and whose replay ran over unread load or PV, and on the first day of a switchback block that changes arm (_chain_starts). Every arm is priced at 1-minute resolution with the same tariff version, on the connection's
+claims nothing and whose replay ran over unread load or PV, on the first plan day after days the plan did not run, and on the first day of a
+switchback block that changes arm (_chain_starts). Every arm is priced at 1-minute resolution with the same tariff version, on the connection's
 bearable-cost basis, with the dated fuel price and the same wear charge; the gap in stored energy between the actual arm and the baseline is valued at
 the terminal value, and a day's carry-over is the change of that valued gap over the day, so the days of a chain add up to one continuous replay with
 its end-of-period energy term (carry-over priced, not removed). The perfect-foresight bound is a hindsight re-solve, labelled not achievable.
@@ -15,7 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 
-from . import forecast, optimise, plans, sites, store, tariffs, telemetry, twin
+from . import forecast, optimise, plans, sites, solar, store, tariffs, telemetry, twin
 from .schemas import Refusal
 
 PKT = timezone(timedelta(hours=5))
@@ -132,16 +133,59 @@ def price_arm(site: dict, sim: dict, pr: dict, day: date, e_end_kwh: float, v_en
             "genset_hours": round(float(np.sum(sim["gen_on"]) / 60), 2), "e_end_kwh": round(e_end_kwh, 2), "v_end": round(v_end, 2)}
 
 
+def _balance_fill(g: dict, on_grid: bool, has_bat: bool, has_gen: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """A blank PV or load reading closed from the minute's energy balance (PV + import + battery discharge + genset = served load + export) where
+    every other flow of the minute was read (the genset's power, or its running flag reading off; no grid flow off grid): the replays run on what the
+    site had, not on a zero. Where both are blank the balance still gives their difference exactly, and the PV is drawn across the gap. Counted as zero, a PV blank at noon made native's replay buy or burn for the whole array (+Rs 660 on a farm day for 5
+    minutes, +Rs 1,370 at a grid site for 15) and a load blank made it serve nothing (round 7, audit pr-review-11). Returns the PV and the load in
+    kW (NaN where still unread) and which minutes were filled."""
+    n = len(g["ts"])
+    zero = np.zeros(n)
+    pv, load = np.asarray(g["pv"], dtype=float), np.asarray(g["load"], dtype=float)
+    bat = np.asarray(g["bat"], dtype=float) if has_bat else zero
+    if has_gen:
+        p_gen = np.asarray(g["gen"], dtype=float)
+        gen = np.where(np.isnan(p_gen) & (np.nan_to_num(np.asarray(g["gen_on"], dtype=float), nan=1.0) < 0.5), 0.0, p_gen)
+    else:
+        gen = zero
+    imp, exp = (np.asarray(g["imp"], dtype=float), np.asarray(g["exp"], dtype=float)) if on_grid else (zero, zero)
+    rest = imp + bat + gen - exp                      # NaN wherever one of them is unread
+    known = ~np.isnan(rest)
+    pv_fill = np.isnan(pv) & ~np.isnan(load) & known
+    load_fill = np.isnan(load) & ~np.isnan(pv) & known
+    pv_out = np.where(pv_fill, np.maximum(load - rest, 0.0), pv)
+    load_out = np.where(load_fill, np.maximum(pv + rest, 0.0), load)
+    # both blank: the balance gives the net (load less PV) exactly, which the battery and the genset answer; the PV is drawn across the gap from the
+    # readings either side (at least what the net exports or charges), and the load is the PV plus the net
+    both = np.isnan(pv) & np.isnan(load) & known
+    if both.any():
+        have = np.where(~np.isnan(pv_out))[0]
+        guess = np.interp(np.arange(n), have, pv_out[have]) if have.size else zero
+        pv_both = np.maximum(np.maximum(guess, -rest), 0.0)
+        pv_out = np.where(both, pv_both, pv_out)
+        load_out = np.where(both, np.maximum(pv_both + rest, 0.0), load_out)
+        pv_fill, load_fill = pv_fill | both, load_fill | both
+    return pv_out, load_out, pv_fill, load_fill
+
+
 def _replay_inputs(site: dict, day: date) -> tuple[dict, dict] | tuple[None, None]:
+    """The replays' inputs for a day (PV available, load demanded, critical load, grid presence, temperature) and the measured day (`g`, the minute
+    grid; `f`, its gaps filled as telemetry.filled does). A blank PV or load closed from the balance is the replays' input there (_balance_fill;
+    `filled` names those minutes); what stays blank counts as zero."""
     t0 = twin.day_start_utc(day)
     g = telemetry.minute_grid(site["id"], t0, t0 + 86400)
     if g["completeness"] < 0.5:
         return None, None
     f = telemetry.filled(g)
+    conn = (site.get("connections") or [None])[0]
+    assets = site.get("assets") or {}
+    pv, load, pv_fill, load_fill = _balance_fill(g, conn is not None and conn["data"].get("regime") != "off_grid", bool(assets.get("battery")),
+                                                 bool(assets.get("genset")))
+    pv, load = np.nan_to_num(pv, nan=0.0), np.nan_to_num(load, nan=0.0)
     hours = ((g["ts"] + 5 * 3600) % 86400) // 3600
-    series = {"ts": g["ts"], "pv": f["pv"] + f["curtail"], "load": f["load"] + f["unserved"], "grid": f["grid"],
-              "crit": np.minimum(twin.critical_share(site)[hours], f["load"] + f["unserved"]), "temp": np.nan_to_num(g["temp"], nan=30.0)}
-    return series, {"g": g, "f": f}
+    series = {"ts": g["ts"], "pv": pv + f["curtail"], "load": load + f["unserved"], "grid": f["grid"],
+              "crit": np.minimum(twin.critical_share(site)[hours], load + f["unserved"]), "temp": np.nan_to_num(g["temp"], nan=30.0)}
+    return series, {"g": g, "f": f, "filled": {"pv": pv_fill, "load": load_fill}}
 
 
 def _soc(g: dict) -> np.ndarray:
@@ -785,13 +829,40 @@ def _claims(row: dict | None) -> bool:
     return bool(row) and row.get("fidelity") in CLAIMING and not row.get("claim_withheld")
 
 
-def _unread_minutes(g: dict, on_grid: bool) -> int:
-    """The minutes of a day whose replay inputs were not read: the load or the PV blank (the replay counts them as zero), or, on a grid
-    connection, the grid's presence blank (carried forward, so an outage there is unseen). Native's end state after them is not its own."""
-    out = np.isnan(np.asarray(g["load"], dtype=float)) | np.isnan(np.asarray(g["pv"], dtype=float))
+#: A day whose replays ran over unread load or PV (by daylight) for more than this share of its minutes claims nothing (`claim_withheld:
+#: inputs_unread`): the replay counts a blank load or PV as zero, so native's costs and end state there are not its own. The same 5 % the grid's
+#: own rule allows unresolved (GRID_UNRESOLVED_MAX), which does not count a minute with neither load nor PV read, so a logger offline for hours
+#: was capped by nothing. Shorter gaps are carried as counted (a 70-minute logger gap claims within 2 % of its metered claim, round 3; a 20-minute
+#: load gap at the farm moves the day by a few tens of rupees); the day after a withheld one restarts (_expected_start)
+REPLAY_UNREAD_MAX = GRID_UNRESOLVED_MAX
+
+
+def _unread_mask(g: dict, on_grid: bool, sun_up: np.ndarray | None = None, filled: dict | None = None) -> np.ndarray:
+    """The minutes of a day whose replay inputs were not read: the load blank, or the PV blank while the sun is up (`sun_up`; None counts every
+    PV blank; a site without PV passes all False), both counted as zero by the replay unless the balance closed them (`filled`, _balance_fill), or,
+    on a grid connection, the grid's presence blank (carried forward, so an outage there is unseen). Native's end state after them is not its own.
+    A PV blank at night hides nothing: the replay's zero is right there."""
+    filled = filled or {}
+    pv_blank = np.isnan(np.asarray(g["pv"], dtype=float)) & ~np.asarray(filled.get("pv", False), dtype=bool)
+    if sun_up is not None:
+        pv_blank = pv_blank & np.asarray(sun_up, dtype=bool)
+    out = (np.isnan(np.asarray(g["load"], dtype=float)) & ~np.asarray(filled.get("load", False), dtype=bool)) | pv_blank
     if on_grid:
         out = out | np.isnan(np.asarray(g["grid"], dtype=float))
-    return int(np.sum(out))
+    return out
+
+
+def _unread_minutes(g: dict, on_grid: bool, sun_up: np.ndarray | None = None, filled: dict | None = None) -> int:
+    """How many minutes _unread_mask counts."""
+    return int(np.sum(_unread_mask(g, on_grid, sun_up, filled)))
+
+
+def _sun_up(site: dict, ts: np.ndarray) -> np.ndarray:
+    """The minutes the sun is above the horizon at the site, where a PV reading can be other than zero; all False at a site without PV."""
+    if not (site.get("assets") or {}).get("pv"):
+        return np.zeros(len(ts), dtype=bool)
+    zen, _ = solar.sun_position(np.asarray(ts) + 30, float(site["data"].get("lat") or 31.5), float(site["data"].get("lon") or 74.3))
+    return zen < 90.0
 
 
 #: Fidelities of a day whose actual arm was not the plan: a recommendation (monitor), a switchback native block, a table not applied (or control
@@ -899,8 +970,11 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
     """Score a day against the native and the tuned baseline and store its rows (one per baseline).
 
     Each baseline's replay is chained (_chain_starts): it starts from that baseline's own end state of the day before, so the days of a chain add up
-    to one continuous replay; a day after one that claims nothing and ran over unread inputs restarts from the actual arm's state, so a claim never
-    rests on what a dropout hid. Its carry-over lever is the change of the valued gap in stored energy over the day: v_end x (actual - baseline end
+    to one continuous replay. A day whose replays ran over unread load or PV (by daylight) for more than REPLAY_UNREAD_MAX of its minutes claims
+    nothing, and
+    the day after a day that claims nothing over unread inputs restarts from the actual arm's state, so no claim rests on a dropout longer than
+    that; a shorter gap is carried, counted as zero load or PV, into the day's claim and the next day's start (a known limit: filling it from the
+    load forecast is a later item). Its carry-over lever is the change of the valued gap in stored energy over the day: v_end x (actual - baseline end
     energy) less the day before's v_end x (actual - baseline start energy), which is zero where the chain restarts from the actual arm's state. A
     run of the genset across midnight is one start on each arm. The row stores the chain's start and end (`chain`), and with `forward` the stored
     later days whose chain started from this day's old end are re-scored (_recompute_forward)."""
@@ -980,8 +1054,11 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
     starts = _chain_starts(site_id, day)
     policies = {"native": twin.native_policy(site, series["ts"]), "tuned": twin.table_policy(fit_tuned(site, day), series["ts"])}
     e_start_actual = soc0 * plant.e_nom
-    # minutes the replays ran over unread inputs: a day after one that claims nothing restarts when there were any (_chain_starts)
-    unread = _unread_minutes(act["g"], on_grid)
+    # minutes the replays ran over unread inputs: a day after one that claims nothing restarts when there were any (_chain_starts), and a day with
+    # unread load or PV over more than REPLAY_UNREAD_MAX of its minutes claims nothing
+    sun = _sun_up(site, act["g"]["ts"])
+    unread = _unread_minutes(act["g"], on_grid, sun, act.get("filled"))
+    blank_inputs = _unread_minutes(act["g"], False, sun, act.get("filled"))
     sims, chains, befores = {}, {}, {}
     for k, pol in policies.items():
         st = starts[k]
@@ -1057,12 +1134,14 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
         saving = round(sum(v for v in levers.values() if v is not None), 2)
         # a day whose import or whose actual battery flow is unknown claims nothing: withholding only its wear lever would credit the baseline's whole
         # wear when the actual cycled more (the "never over-claim" rule of plan 8.4); likewise a day whose genset may have run unseen, whose energy
-        # the grid levers or the carry-over would credit without its fuel
-        withheld = ("import_unknown" if imp_unknown else "battery_flow_unknown" if wear_unknown else "genset_unknown" if gen_unseen else None)
+        # the grid levers or the carry-over would credit without its fuel, and a day whose replays ran over unread load or PV for more than
+        # REPLAY_UNREAD_MAX of it (counted as zero, so native's costs and end state there are not its own)
+        withheld = ("import_unknown" if imp_unknown else "battery_flow_unknown" if wear_unknown else "genset_unknown" if gen_unseen
+                    else "inputs_unread" if blank_inputs > REPLAY_UNREAD_MAX * len(act["g"]["ts"]) else None)
         claim = saving if fidelity in CLAIMING and not withheld else 0.0
         rows[base] = {"saving_rs": saving, "claimed_rs": claim, "levers": levers, "actual": a, "baseline": n, "fidelity": fidelity,
                       "fidelity_score": fidelity_score, "litres_saved": None if g_unknown else round(n["litres"] - a["litres"], 2),
-                      "genset_unknown": g_unknown, "import_unknown": imp_unknown, "claim_withheld": withheld,
+                      "genset_unknown": g_unknown, "import_unknown": imp_unknown, "claim_withheld": withheld, "inputs_unread_min": blank_inputs,
                       "import_completeness": round(float(act["g"].get("imp_completeness", 1.0)), 4),
                       "import_rebuilt_share": round(float(np.mean(rebuilt)), 4) if len(rebuilt) else 0.0,
                       "import_unresolved_share": round(unresolved_share, 4),
