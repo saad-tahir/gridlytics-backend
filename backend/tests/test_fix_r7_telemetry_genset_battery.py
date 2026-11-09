@@ -502,7 +502,8 @@ def test_the_month_view_compares_with_the_month_before_and_counts_hours_below_th
     assert page["period"]["kind"] == "month" and page["period"]["month"] == m
     assert (page["kpis"]["hours"], page["kpis"]["starts"], page["kpis"]["litres"]) == (1.0, 1, 30.0)
     assert page["previous"] == {"month": pm, "hours": 2.0, "starts": 1, "litres": 24.0, "kwh": 100.0}
-    assert page["daily"][0]["day"] == d.replace(day=1).isoformat() and page["daily"][-1]["day"] == datetime.now(PKT).date().isoformat()
+    last_day = datetime.fromtimestamp(page["period"]["end"] - 1, PKT).date().isoformat()  # today, or the month's last day on the 1st of a month
+    assert page["daily"][0]["day"] == d.replace(day=1).isoformat() and page["daily"][-1]["day"] == last_day
     assert next(x for x in page["daily"] if x["day"] == d.isoformat()) == {"day": d.isoformat(), "hours": 1.0, "litres": 30.0}
     last = c.get(f"/api/sites/{sid}/genset", params={"month": pm}).json()
     assert last["kpis"]["hours_below_min"] == 2.0 and last["runs"][0]["hours_below_min"] == 2.0
