@@ -711,3 +711,19 @@ def test_the_site_s_off_days_and_half_days_are_settings():
     with pytest.raises(schemas.Refusal) as e:
         schemas.check(sites.SiteFields, {"name": "Mill", "off_days": ["friday"]})
     assert "off days" in e.value.detail and "must be one of" in e.value.detail
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-09
+
+def test_the_last_two_hours_ratio_compares_with_earlier_days_only(company):
+    """Monday 16 November 2026, 12:00: three days of 100 kW behind it (Friday afternoon, Saturday, Sunday off) and the last two hours at 130 kW. The
+    ratio compares those two hours with the same slots on the earlier working day (Saturday: 100 kW), so it is 1.3 and the first step is 130 kW. v1's
+    reference took the median with today's own values of those slots (median(100, 130) = 115), halving the lift."""
+    sid = "ratio"
+    site = _load_site(sid, battery=False, site_type="tower")
+    t0 = int(datetime(2026, 11, 16, 12, tzinfo=PKT).timestamp())
+    ts = np.arange(t0 - 3 * 86400, t0, 60, dtype=np.int64)
+    _write_load(sid, ts, np.where(ts >= t0 - 7200, 130.0, 100.0), grid=np.ones(len(ts)))
+    f = forecast.load(site, t0)
+    assert f["stage"] == 1
+    assert f["q"]["q50"][0] == pytest.approx(130.0, abs=0.5), f["q"]["q50"][:4]

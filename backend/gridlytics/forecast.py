@@ -346,10 +346,12 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     slot_of = ((hist_t + 5 * 3600) % 86400) // STEP_S
     known15 = ~np.isnan(lo15)
 
-    def same_slot(s: int, dt_: int, need: int) -> np.ndarray:
-        """The last 7 values of slot s on days of type dt_ (or of its fallback types, the first with at least `need`); empty when none has."""
+    def same_slot(s: int, dt_: int, need: int, before: int | None = None) -> np.ndarray:
+        """The last 7 values of slot s on days of type dt_ (or of its fallback types, the first with at least `need`), from history steps starting
+        before `before` when given; empty when none has."""
+        m0 = known15 if before is None else known15 & (hist_t < before)
         for k in (dt_, *DAY_FALLBACK.get(dt_, ())):
-            v = lo15[(slot_of == s) & (hist_type == k) & known15][-7:]
+            v = lo15[(slot_of == s) & (hist_type == k) & m0][-7:]
             if len(v) >= need:
                 return v
         return lo15[:0]
@@ -363,14 +365,15 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
         spread = max(float(np.std(vals)), 0.06 * med)
         qarr[:, i] = med + spread * np.array([-1.645, -1.2816, -0.6745, 0, 0.6745, 1.2816, 1.645])
     qarr = np.maximum(qarr, 0)
-    # scale by the last two hours' ratio with a decaying weight
+    # scale by the last two hours' ratio with a decaying weight: those two hours against the same slots on earlier days only (the history before them),
+    # so today's own values are not in their reference
     recent = lo[-120:]
     if np.sum(~np.isnan(recent)) * iv > 60:
         rt = t0 - 7200 + 60 * np.arange(120)
         rt_type = _day_type(rt, site)
         ref = []
         for x, k in zip(rt, rt_type):
-            v = same_slot(((x + 5 * 3600) % 86400) // STEP_S, int(k), 1)
+            v = same_slot(((x + 5 * 3600) % 86400) // STEP_S, int(k), 1, before=t0 - 7200)
             ref.append(np.median(v) if len(v) else np.nan)
         ref = np.array(ref)
         ok = ~np.isnan(recent) & ~np.isnan(ref) & (ref > 0)
