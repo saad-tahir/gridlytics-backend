@@ -344,3 +344,27 @@ def test_creating_activating_and_the_control_limits_are_for_an_administrator(wor
     assert a.post(f"/api/sites/{sid}/activate").status_code == 200
     assert a.post("/api/sites", json={"name": "Admin's site"}).status_code == 200
     assert a.put("/api/drafts/d-admin", json={"general": {"name": "Half a site"}}).status_code == 200
+
+
+def test_a_limit_sent_as_stored_is_no_change_and_one_a_partial_policy_resets_is(world):
+    """Review of role-operator-07: the limits are compared as the save would store them, not as sent. A key a site saved before it existed lacks, sent at
+    its default, or a number sent as 20 for a stored 20.0, changes nothing; a reserve policy sent in part does change the part it leaves out (sites.update
+    fills it with its default), so that is a change of a limit."""
+    a, op, sid = world.c["admin"], world.c["operator"], world.site
+    with world.use():
+        from gridlytics import store
+        with store.connect() as con:      # a site saved before the charge sources were fields
+            con.execute("UPDATE sites SET data = json_remove(data, '$.gen_charge_allowed', '$.grid_charge_allowed') WHERE id = ?", (sid,))
+    r = op.put(f"/api/sites/{sid}", json={"gen_charge_allowed": True, "grid_charge_allowed": True, "cycle_cap_per_day": 1.5,
+                                          "reserve_policy": {"p_threshold": 0.2, "min_soc_pct": 20}, "notes": "Kept as stored"})
+    assert r.status_code == 200 and r.json()["data"]["notes"] == "Kept as stored", r.text
+    # the administrator sets the outage threshold; the operator's reserve policy without it would put it back to 0.2
+    assert a.put(f"/api/sites/{sid}", json={"reserve_policy": {"p_threshold": 0.5, "min_soc_pct": 20}}).status_code == 200
+    r = op.put(f"/api/sites/{sid}", json={"reserve_policy": {"min_soc_pct": 20}})
+    assert r.status_code == 403 and r.json()["detail"] == "Changing the site's control limits is for an administrator", r.text
+    assert _site(a, sid)["data"]["reserve_policy"] == {"p_threshold": 0.5, "min_soc_pct": 20.0}
+    # a limit the model refuses is refused for the role first; for the administrator it is the 422 of the field
+    assert op.put(f"/api/sites/{sid}", json={"cycle_cap_per_day": 99}).status_code == 403
+    r = a.put(f"/api/sites/{sid}", json={"cycle_cap_per_day": 99})
+    assert r.status_code == 422 and r.json()["code"] == "invalid", r.text
+

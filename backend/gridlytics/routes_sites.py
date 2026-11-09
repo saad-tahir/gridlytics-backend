@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 from fastapi import APIRouter, Body, Header, HTTPException
+from pydantic import ValidationError
 
 from . import alerts, auth, battery, delivery, plans, sites, store, store_members, tariff_data, tariffs, telemetry
 from .routes_common import PKT, bad, full_or_404, now_ts, out, put_state, site_or_404, today
@@ -123,6 +124,22 @@ def _defaults(model, names) -> dict:
     return {k: model.model_fields[k].default for k in names if k in model.model_fields}
 
 
+def _limits_changed(inp: dict, data: dict) -> bool:
+    """Whether the save changes a control limit (SITE_LIMIT_FIELDS): the limits as sites.update would store them, against the stored ones, so a limit sent
+    as stored (the form sent back whole, 20 for a stored 20.0, a key a site saved before it existed lacks sent at its default) is no change, while a
+    reserve policy sent in part changes the part it leaves out (filled with its default). A limit the model refuses counts as a change: the role is
+    checked first, and an administrator's save then gets the field's 422."""
+    sent = {k: inp[k] for k in SITE_LIMIT_FIELDS if isinstance(inp, dict) and k in inp}
+    if not sent:
+        return False
+    held = {k: data[k] for k in SITE_LIMIT_FIELDS if k in data}
+    as_stored = lambda fields: sites.SiteFields.model_validate({"name": "-", **fields}).model_dump(include=set(sent))  # noqa: E731
+    try:
+        return as_stored({**held, **sent}) != as_stored(held)
+    except ValidationError:
+        return True
+
+
 def _need_money_settings(inp: dict, before: dict, names, doing: str) -> None:
     """Refuse a change of any money setting without edit_money_settings; sending a money setting unchanged (a form sent back whole) is not a change."""
     if isinstance(inp, dict) and any(k in inp and inp[k] != before.get(k) for k in names):
@@ -175,8 +192,7 @@ def site_update(site_id: str, inp: dict = Body(...)):
     auth.need("edit_sites", "Editing a site")
     s = site_or_404(site_id)
     expect = _if_unchanged(inp, held_may_be_none=False)
-    # a control limit sent unchanged (the form sent back whole) is not a change of it
-    if any(k in inp and inp[k] != (s.get("data") or {}).get(k) for k in SITE_LIMIT_FIELDS):
+    if _limits_changed(inp, s.get("data") or {}):
         auth.need("manage_sites", "Changing the site's control limits")
     _need_money_settings(inp, {**_defaults(sites.SiteFields, SITE_MONEY_FIELDS), **(s.get("data") or {})}, SITE_MONEY_FIELDS,
                          "Changing the site's value of lost load or wear costing")
