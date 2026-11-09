@@ -5,15 +5,14 @@ when it is made, and kept as the SHA-256 of the key (as share links and invitati
 as `Authorization: Bearer <key>`; the API's guard then works in the company that holds the key (platform.db's index, written here when the key is made in a
 company's database: stage B4a of the sign-in) and the key's organisation, as a user of the key's role named after the key, so every permission
 and every rule that hides a cost from a role holds through a key exactly as through a session (a key never has more rights than its role). On top of the role,
-a key reaches only what its scopes name:
+a key reaches only what its scopes name, on its own site only (plan Part 10.5; the words of each are SCOPES', the paths RESOURCES'):
 
-* a scope is a resource and an access: `quotes:read`, `quotes:write`, `customers:read`, `customers:write`, `projects:read`, `projects:write`;
+* a scope is a resource and an access: `telemetry:write` (the edge paths), `plans:read` (the plan in force, its versions, its comparison and the control
+  state) and `sites:read` (the site's settings); the site's data is in no scope (audit security-roles-07);
 * a read is GET (or HEAD); anything else is a write; `x:write` does not include `x:read`, so a key that writes and reads is given both;
-* two more scopes are rights of the role that a key holds only when they are named (review, 23 October 2026): `quotes:approve` (to approve a quote: the matrix names who
-  approves, and that is a person's decision unless the key is given it) and `quotes:price` (to override a line's price). They are not a path: the quote's own route asks
-  for them (`need`), on top of the role and of `quotes:write`;
-* the resources are the paths under /api (or /api/v1) of `quotes`, `customers` and `projects` (`/api/projects`, the saved designs, and `/api/crm/projects`,
-  the opportunities); every other path is outside every scope, so a key never reaches the settings, the users or the platform's own routes.
+* a key is an edge device's or a partner tool's (`kind`): only an edge device's key sends the capabilities, events, acks and heartbeats and pulls the
+  signed plan (EDGE_ONLY), whatever its scopes;
+* every other path is outside every scope, so a key never reaches the settings of the company, the users or the platform's own routes.
 
 A key that is not known, or was revoked, is answered 401; a known key outside its scopes 403. Each use records the key's last-used time.
 """
@@ -33,14 +32,24 @@ from . import platform as platformdb
 
 #: The scopes a key may hold, with their words
 SCOPES = {
-    "telemetry:write": "Send telemetry, capabilities, events, acks and heartbeats for its site",
-    "plans:read": "Read its site's current plan (no money fields)",
-    "sites:read": "Read its site's settings (no money fields)",
+    "telemetry:write": "Send telemetry for its site; an edge device's key also sends its capabilities, events, acks and heartbeats",
+    "plans:read": "Read its site's current plan, its versions and the control state (no money fields); an edge device's key also pulls the signed plan",
+    "sites:read": "Read its site's settings: the site with its equipment and connections, its native settings and its overrides (no money fields)",
 }
 #: The paths of each resource, under /api (the guard sees /api/v1/x as /api/x). Every one names a site: a key is bound to one site (plan Part 10.5), so the
-#: bare collection /api/sites, which lists every site of the company, is outside every scope
-RESOURCES = (("telemetry", re.compile(r"^/api/edge/[^/]+/")), ("plans", re.compile(r"^/api/sites/[^/]+/plans(/|$)")),
-             ("sites", re.compile(r"^/api/sites/[^/]+(/|$)")))
+#: bare collection /api/sites, which lists every site of the company, is outside every scope. A scope reaches what its words say and no more (audit
+#: security-roles-07): plans:read the plan in force, its versions, its comparison with the native settings and the control state; sites:read the site's
+#: settings. The site's data (telemetry, the battery, outages, forecasts, savings, events, the pilot) is in no scope: a key sends its site's telemetry, it
+#: never reads the site's history back (`reports:read` is a later scope, plan Part 2.6)
+RESOURCES = (("telemetry", re.compile(r"^/api/edge/[^/]+/")),
+             ("plans", re.compile(r"^/api/sites/[^/]+/(?:plan|plans|control)(?:/|$)")),
+             ("sites", re.compile(r"^/api/sites/[^/]+(?:/(?:native|overrides))?$")))
+#: The two kinds of key (plan Part 10.5): an edge device's, which runs the site, and a partner's tool's, which may send telemetry batches (plan Part 7.5:
+#: partners' gateways, Enerlytics push) and read, but never acts as the site's controller (audit security-roles-07)
+KINDS = {"edge": "Edge device", "partner": "Partner tool"}
+#: What only an edge device's key does, whatever its scopes: the capabilities (the control tier the source asserts, plan Part 2.3), the events (an unknown
+#: state pauses control), the acks of the plan it runs and its heartbeats, and the signed plan message (each pull is recorded as a send to the edge)
+EDGE_ONLY = re.compile(r"^/api/edge/[^/]+/(?:capabilities|events|ack|heartbeat)$|^/api/sites/[^/]+/plans/current/message$")
 #: The words a key starts with, then 43 URL-safe characters (32 random bytes)
 PREFIX = "glk_"
 TOKEN = re.compile(r"glk_[A-Za-z0-9_-]{43}")
@@ -84,6 +93,14 @@ def scope_needed(method: str, path: str) -> str | None:
     return f"{resource}:{'read' if method in ('GET', 'HEAD') else 'write'}"
 
 
+def kind_refusal(kind: str, path: str) -> str | None:
+    """Why a key of this kind may not make a request on `path` (its scopes allowing it), in words; None when it may."""
+    if kind != "edge" and EDGE_ONLY.match(path):
+        return ("Only an edge device's key sends a site's capabilities, events, acks and heartbeats and pulls its signed plan: this is a partner tool's key, "
+                "which may send telemetry and read the plan and the site")
+    return None
+
+
 def fields(inp) -> dict:
     """A new key's fields, checked: a name, a role of auth.ROLES (optional: DEFAULT_ROLE) and one or more scopes. Raises ValueError, in words."""
     if not isinstance(inp, dict):
@@ -95,7 +112,7 @@ def fields(inp) -> dict:
     if not isinstance(site_id, str) or not site_id.strip():
         raise ValueError("A key is bound to one site: give its site_id (plan Part 10.5)")
     kind = inp.get("kind", "edge")
-    if kind not in ("edge", "partner"):
+    if kind not in KINDS:
         raise ValueError("A key's kind is edge or partner")
     name = inp.get("name")
     if not isinstance(name, str) or not 1 <= len(name.strip()) <= NAME_MAX:
@@ -108,7 +125,7 @@ def fields(inp) -> dict:
         raise ValueError("The key acts with the rights of a role: " + ", ".join(auth.ROLES))
     scopes = inp.get("scopes")
     if not isinstance(scopes, list) or not scopes or not all(isinstance(s, str) for s in scopes):
-        raise ValueError("Give the key one or more scopes, such as quotes:read")
+        raise ValueError("Give the key one or more scopes, such as plans:read")
     unknown = [s for s in scopes if s not in SCOPES]
     if unknown:
         raise ValueError(f"Unknown scope '{unknown[0][:40]}': the scopes are " + ", ".join(SCOPES))

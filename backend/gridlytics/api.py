@@ -268,6 +268,8 @@ async def _guarded(request, call_next, rid: str):
         needed = apikeys.scope_needed(request.method, path)
         if needed is None or needed not in key["scopes"]:
             return _refusal(rid, 403, f"This API key may not make this request: it holds {', '.join(key['scopes'])}", "out_of_scope")
+        if (why := apikeys.kind_refusal(key.get("kind", "edge"), path)) is not None:
+            return _refusal(rid, 403, why, "out_of_scope")
         named = _SITE_IN_PATH.match(path)
         if named is None:
             # a key is bound to one site (plan Part 10.5): it reaches only paths that name a site, never a collection of the company's sites

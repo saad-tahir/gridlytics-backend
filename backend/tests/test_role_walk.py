@@ -1,10 +1,11 @@
 """The role walk (plan Part 10.5; audit security-roles-02 and tracker-and-docs-03): every GET route the API mounts is read by the administrator, an operator,
-a viewer and a site key (sites:read and plans:read), on the demo company with a few days of history, and the answers are compared.
+a viewer and an edge device's site key (sites:read and plans:read), on the demo company with a few days of history, and the answers are compared.
 
 - The viewer's answer holds no money key at any depth (`money.is_money`), no rupee figure inside a sentence, and no money value of the administrator's
   answer: a figure the administrator reads under a money key, and under no other key, appears nowhere in the viewer's answer.
 - The operator's answer holds no fee and no money setting (plan 9.4: "costs but not money settings or the fee"; audit role-operator-06).
-- A key's answer holds no money key at all, whatever its scopes (plan Part 10.5).
+- A key's answer holds no money key at all, whatever its scopes (plan Part 10.5), and the key reaches exactly the routes its scopes name (KEY_READS; audit
+  security-roles-07): the site's settings and its plan, never its data.
 - The walk covers every GET route: the routes are read from the app, so a new route is walked without being listed here; a path parameter the walk cannot
   fill fails the walk until it is taught one.
 
@@ -31,6 +32,10 @@ FILES = ("/export.csv", "/calendar.ics", "/api/reports/{rid}/{which}")
 #: A rupee figure inside a sentence ("Rs 1,500", "Rs. 12", "PKR 300")
 #: The query a route needs to answer at all
 QUERY = {"/api/tariffs/card": "?category=B-2(b)"}
+#: The GET routes a key with sites:read and plans:read reaches (apikeys.RESOURCES; the signed plan message is an edge device's key's only, apikeys.EDGE_ONLY)
+KEY_READS = {"/api/sites/{site_id}", "/api/sites/{site_id}/native", "/api/sites/{site_id}/overrides", "/api/sites/{site_id}/plan",
+             "/api/sites/{site_id}/plan/compare", "/api/sites/{site_id}/plans", "/api/sites/{site_id}/plans/{plan_id}", "/api/sites/{site_id}/plans/current/message",
+             "/api/sites/{site_id}/control"}
 RUPEES = re.compile(r"\bRs\.?\s*-?\d|\bPKR\s*-?\d|\brupees?\b", re.IGNORECASE)
 
 
@@ -74,7 +79,7 @@ def walk(tmp_path_factory):
         assert client.post("/api/reports", headers=h["admin"], json={"kind": kind, "site_id": sids[0]}).status_code == 200
     assert client.put("/api/drafts/walk-draft", headers=h["admin"], json={"name": "Half a site"}).status_code == 200
     k = client.post("/api/platform/keys", headers=h["admin"], json={"name": "walk", "scopes": ["sites:read", "plans:read"], "site_id": sids[0],
-                                                                    "kind": "partner"})
+                                                                    "kind": "edge"})
     assert k.status_code == 200, k.text
     h["key"] = {"Authorization": "Bearer " + k.json()["token"]}
 
@@ -211,16 +216,22 @@ def test_the_operator_holds_no_fee_and_no_money_setting_on_any_route(walk):
 
 def test_a_site_key_holds_no_money_on_any_route_it_reaches(walk):
     from gridlytics import money
-    problems, reached = [], 0
-    for _, url, got in _read(walk, "key"):
+    problems, reached, refused = [], set(), set()
+    for template, url, got in _read(walk, "key"):
         status, body = got["key"]
-        reached += status == 200
+        if status == 200:
+            reached.add(template)
+        elif status == 403 and (body or {}).get("code") == "out_of_scope":
+            refused.add(template)
         keys = sorted({k for _, k, _, _ in _items(body) if isinstance(k, str) and money.is_money(k)})
         if keys:
             problems.append(f"{url}: {keys[:6]}")
         if any(RUPEES.search(s) for s in _strings(body)):
             problems.append(f"{url}: rupees in words")
-    assert reached >= 20, reached                                # the site's pages are within sites:read and plans:read
+    # the key reaches its site's settings and plan, and nothing else of the site: every other route of the site is out of its scopes
+    assert reached == KEY_READS, (sorted(reached - KEY_READS), sorted(KEY_READS - reached))
+    others = {t for t, urls in walk["answers"].items() if any("key" in g for g in urls.values())} - KEY_READS
+    assert others and others <= refused, sorted(others - refused)
     assert problems == [], "\n".join(problems)
 
 
@@ -232,11 +243,12 @@ def test_a_route_that_forgets_the_filter_is_filtered_all_the_same(walk):
     def forgetful():
         return {"litres": 12.5, "cost_rs": 9876.5, "detail": {"price": 41.0, "fee_ratio": 0.3, "kwh": 3.0}, "rows": [{"saving_rs": 5.0, "day": "2026-11-01"}]}
 
-    api.app.add_api_route("/api/sites/{site_id}/walk-forgetful", lambda site_id: forgetful(), methods=["GET"])
+    # under the plan's path, so a plans:read key reaches it
+    api.app.add_api_route("/api/sites/{site_id}/plan/walk-forgetful", lambda site_id: forgetful(), methods=["GET"])
     added = api.app.router.routes[-1]
     try:
         sid = walk["sites"][0]
-        url = f"/api/sites/{sid}/walk-forgetful"
+        url = f"/api/sites/{sid}/plan/walk-forgetful"
         assert client.get(url, headers=h["admin"]).json() == forgetful()
         for reader in ("viewer", "key"):
             r = client.get(url, headers=h[reader])

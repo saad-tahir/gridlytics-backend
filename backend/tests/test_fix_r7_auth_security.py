@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 
+from gridlytics import sites
+
 from test_fix_api import world  # noqa: F401  (world is a fixture)
 
 
@@ -25,14 +27,15 @@ def test_the_events_route_gives_no_fuel_cost_to_a_viewer_or_a_key(world):
     # the administrator still sees what the fuel cost
     mine = world.c["admin"].get(f"/api/sites/{sid}/events").json()
     assert [e["detail"]["cost_rs"] for e in mine if e["type"] == "fuel_log"] == [14000]
-    # a viewer and a site key holding sites:read see the litres, never the rupees
-    seen = world.c["viewer"].get(f"/api/sites/{sid}/events")
-    keyed = world.anon.get(f"/api/sites/{sid}/events", headers=world.key(["sites:read"]))
-    for r in (seen, keyed):
-        assert r.status_code == 200, r.text
-        logs = [e for e in r.json() if e["type"] == "fuel_log"]
-        assert [e["detail"]["litres"] for e in logs] == [50]
-        assert "cost_rs" not in _keys(r.json()) and "14000" not in json.dumps(r.json())
+    # a viewer sees the litres, never the rupees
+    r = world.c["viewer"].get(f"/api/sites/{sid}/events")
+    assert r.status_code == 200, r.text
+    logs = [e for e in r.json() if e["type"] == "fuel_log"]
+    assert [e["detail"]["litres"] for e in logs] == [50]
+    assert "cost_rs" not in _keys(r.json()) and "14000" not in json.dumps(r.json())
+    # a site key reads no events at all since security-roles-07 (the site's data is in no scope), so no cost reaches it either
+    keyed = world.anon.get(f"/api/sites/{sid}/events", headers=world.key(["sites:read", "plans:read"]))
+    assert (keyed.status_code, keyed.json()["code"]) == (403, "out_of_scope") and "14000" not in keyed.text
 
 
 # ------------------------------------------------------------------------------------------------ security-roles-02 (the filter is the API's)
@@ -524,3 +527,69 @@ def test_the_members_refusal_of_a_name_email_or_password_says_who_changes_them(w
         r = a.put(f"/api/users/{op}", json={field: value})
         assert r.status_code == 422 and "OnyxLeaf" in r.json()["detail"] and "Sign-in help" in r.json()["detail"], (field, r.text)
         assert "My account" not in r.json()["detail"]
+
+
+# ------------------------------------------------------------------------------------------------ security-roles-07 (flow-reports-alerts-members-keys-12)
+
+def _kind_key(world, scopes: list[str], kind: str) -> dict:
+    r = world.c["admin"].post("/api/platform/keys", json={"name": f"{kind} key", "scopes": scopes, "site_id": world.site, "kind": kind})
+    assert r.status_code == 200, r.text
+    return {"Authorization": "Bearer " + r.json()["token"]}
+
+
+def test_a_keys_scopes_reach_what_their_words_say(world):
+    """plans:read is 'Read its site's current plan': the plan in force, its versions, its comparison and the control state; sites:read is 'Read its site's
+    settings': the site with its equipment and connections, its native settings and its overrides. The site's data (telemetry, the battery, outages,
+    savings, forecasts, events) is in no scope."""
+    sid = world.site
+    plan_paths = [f"/api/sites/{sid}/plan", f"/api/sites/{sid}/plan/compare", f"/api/sites/{sid}/plans", f"/api/sites/{sid}/control"]
+    site_paths = [f"/api/sites/{sid}", f"/api/sites/{sid}/native", f"/api/sites/{sid}/overrides"]
+    data_paths = [f"/api/sites/{sid}/{p}" for p in ("telemetry", "telemetry/days", "telemetry/heatmap", "telemetry/quality", "battery", "outages", "events",
+                                                    "savings", "pilot", "switchback", "now", "overview/chart", "genset", "genset/fuel", "forecasts/pv",
+                                                    "forecasts/scores", "edge", "prices", "bills")]
+    plans_key, sites_key, both = world.key(["plans:read"]), world.key(["sites:read"]), world.key(["plans:read", "sites:read"])
+    for path in plan_paths:
+        assert world.anon.get(path, headers=plans_key).status_code == 200, path
+        r = world.anon.get(path, headers=sites_key)
+        assert (r.status_code, r.json()["code"]) == (403, "out_of_scope"), (path, r.text)
+    for path in site_paths:
+        assert world.anon.get(path, headers=sites_key).status_code == 200, path
+        r = world.anon.get(path, headers=plans_key)
+        assert (r.status_code, r.json()["code"]) == (403, "out_of_scope"), (path, r.text)
+    for path in data_paths:
+        r = world.anon.get(path, headers=both)
+        assert (r.status_code, r.json()["code"]) == (403, "out_of_scope"), (path, r.text)
+    # the words a key's scopes are shown with say the same
+    from gridlytics import apikeys
+    assert "settings" in apikeys.SCOPES["sites:read"] and "plan" in apikeys.SCOPES["plans:read"]
+
+
+def test_a_partner_key_never_acts_as_the_sites_controller(world):
+    """Two key kinds (plan Part 10.5): an edge device's key runs the site, so only it sends the capabilities (the control tier the source asserts), the events
+    (which can pause control), the acks and the heartbeats, and pulls the signed plan (each pull is recorded as a send to the edge). A partner's tool may send
+    telemetry batches (plan Part 7.5: partners' gateways, Enerlytics push) and read the plan and the site."""
+    from test_fix_api import _batch
+    sid = world.site
+    stamp = {"contract": "ems-edge/1.0", "seq": 1, "sent_at": "2026-11-06T10:00:00Z"}
+    edge_only = {"capabilities": {**stamp, "edge_version": "1.0", "tier": "closed_loop"},
+                 "events": {**stamp, "events": [{"ts": "2026-11-06T10:00:00Z", "type": "readback_mismatch"}]},
+                 "heartbeat": {**stamp, "uptime_s": 5}, "ack": {**stamp, "plan_id": "p", "status": "received"}}
+    partner = _kind_key(world, ["telemetry:write", "plans:read", "sites:read"], "partner")
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=partner, json=_batch(1))
+    assert r.status_code == 200 and r.json().get("accepted") == 1, r.text
+    assert world.anon.get(f"/api/sites/{sid}/plan", headers=partner).status_code == 200
+    assert world.anon.get(f"/api/sites/{sid}", headers=partner).status_code == 200
+    for what, body in edge_only.items():
+        r = world.anon.post(f"/api/edge/{sid}/{what}", headers=partner, json=body)
+        assert (r.status_code, r.json()["code"]) == (403, "out_of_scope") and "edge device" in r.json()["detail"], (what, r.text)
+    r = world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=partner)
+    assert (r.status_code, r.json()["code"]) == (403, "out_of_scope") and "edge device" in r.json()["detail"], r.text
+    with world.use():
+        assert sites.get(sid)["tier_capable"] == "monitor" and sites.overrides(sid) == []
+    # the edge device's key does all of it
+    edge = _kind_key(world, ["telemetry:write"], "edge")
+    for what, body in edge_only.items():
+        r = world.anon.post(f"/api/edge/{sid}/{what}", headers=edge, json=body)
+        assert r.status_code == 200, (what, r.text)
+    with world.use():
+        assert sites.get(sid)["tier_capable"] == "closed_loop"
