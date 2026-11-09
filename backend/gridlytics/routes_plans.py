@@ -2,20 +2,81 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
 from fastapi import APIRouter, Body
+from pydantic import Field, field_validator
 
 from . import auth, delivery, plans, sites, store, twin, verify
 from .routes_common import full_or_404, now_ts, out, site_or_404, today
-from .schemas import Refusal
+from .schemas import Refusal, Strict, check
 from .routes_common import bad
 
 router = APIRouter()
 log = logging.getLogger("gridlytics.plans")
 _last_solve: dict[str, float] = {}
+
+
+# ------------------------------------------------------------------------------------------------ request models (plan Part 2.8: untrusted input)
+
+def _number(v, lo: float, hi: float, sentence: str) -> float:
+    """A JSON number (or a numeric string, as a lax model takes it) from lo to hi, else the field's one sentence: never a bare float() that turns
+    "four" or a list into a 500."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        raise ValueError(sentence)
+    try:
+        x = float(v)
+    except ValueError:
+        raise ValueError(sentence) from None
+    if not math.isfinite(x) or not lo <= x <= hi:
+        raise ValueError(sentence)
+    return x
+
+
+class TimedFields(Strict):
+    """POST /control/release and /control/pause: for how many hours (0.25 to 72, the page's own bounds; 4 when left out) and an optional reason
+    (a blank one gets the action's default sentence). A value out of bounds is refused, not clamped or cut short."""
+    hours: float = 4.0
+    reason: str | None = Field(None, max_length=300)
+
+    @field_validator("hours", mode="before")
+    @classmethod
+    def _hours(cls, v):
+        return 4.0 if v is None else _number(v, 0.25, 72, "The hours must be a number from 0.25 to 72")
+
+
+class HoldFields(TimedFields):
+    """POST /control/hold: also the state of charge to hold, a percent from 1 to 100; left out, the present level (a 0 was silently that)."""
+    soc_pct: float | None = None
+
+    @field_validator("soc_pct", mode="before")
+    @classmethod
+    def _soc(cls, v):
+        return None if v is None else _number(v, 1, 100, "The state of charge to hold must be a percent from 1 to 100 (leave it out to hold the "
+                                                          "present level)")
+
+
+class ResumeFields(Strict):
+    """POST /control/resume reads no field."""
+
+
+class ApplyFields(Strict):
+    """POST /plan/apply: the plan, the day (Karachi's today when left out; plans.mark_applied checks it is a date of the plan's table), the method
+    and an optional photograph."""
+    plan_id: str = Field(min_length=1, max_length=40)
+    day: str | None = Field(None, max_length=10)
+    method: str = Field("installer_keyed", max_length=40)
+    photo: str = ""
+
+
+#: Each control action: the permission it needs, what a refusal says is being done, and its body
+CONTROL_ACTIONS = {"hold": ("hold_release", "Holding the battery", HoldFields), "release": ("hold_release", "Releasing to native", TimedFields),
+                   "pause": ("resume_control", "Pausing control", TimedFields), "resume": ("resume_control", "Resuming control", ResumeFields)}
+#: the overrides a resume clears
+RESUMED_KINDS = ("pause_control", "force_native", "reserve")
 
 
 @router.get("/api/sites/{site_id}/plan")
@@ -100,9 +161,9 @@ def plan_solve(site_id: str):
 def plan_apply(site_id: str, inp: dict = Body(...)):
     auth.need("apply_plan", "Marking a plan as applied")
     site_or_404(site_id)
+    f = check(ApplyFields, inp)
     try:
-        return plans.mark_applied(site_id, str(inp.get("plan_id", "")), str(inp.get("day") or today().isoformat())[:10], auth.actor(),
-                                  str(inp.get("method", "installer_keyed")), str(inp.get("photo", "")))
+        return plans.mark_applied(site_id, f.plan_id, f.day or today().isoformat(), auth.actor(), f.method, f.photo)
     except KeyError:
         raise bad(ValueError("No such plan")) from None
     except ValueError as exc:
@@ -156,27 +217,19 @@ def control(site_id: str, day: int = 0):
 
 @router.post("/api/sites/{site_id}/control/{action}")
 def control_action(site_id: str, action: str, inp: dict = Body(default={})):
+    """Hold, release, pause and resume. The action, then the permission, then the body are checked (a 404, a 403, then a 422 in one sentence)
+    before anything is written."""
     site_or_404(site_id)
-    hours = float(inp.get("hours", 4) or 4)
-    until = (datetime.now(timezone.utc) + timedelta(hours=max(0.25, min(hours, 72)))).isoformat()
+    if action not in CONTROL_ACTIONS:
+        raise Refusal(404, "The control actions are hold, release, pause and resume", "not_found")
+    perm, doing, model = CONTROL_ACTIONS[action]
+    auth.need(perm, doing)
+    f = check(model, inp)
     who = auth.actor()
-    if action == "hold":
-        auth.need("hold_release", "Holding the battery")
-        from . import battery
-        st = battery.state(sites.full(site_id)) or {}
-        sites.add_override(site_id, {"kind": "reserve", "value": float(inp.get("soc_pct") or st.get("soc_pct") or 50), "until": until,
-                                     "reason": str(inp.get("reason", "Operator hold"))[:300]}, who)
-    elif action == "release":
-        auth.need("hold_release", "Releasing to native")
-        sites.add_override(site_id, {"kind": "force_native", "until": until, "reason": str(inp.get("reason", "Released to native"))[:300]}, who)
-    elif action == "pause":
-        auth.need("resume_control", "Pausing control")
-        sites.add_override(site_id, {"kind": "pause_control", "until": until, "reason": str(inp.get("reason", "Paused"))[:300]}, who)
-    elif action == "resume":
-        auth.need("resume_control", "Resuming control")
+    if action == "resume":
         cleared = 0
         for o in sites.overrides(site_id):
-            if o["kind"] in ("pause_control", "force_native", "reserve"):
+            if o["kind"] in RESUMED_KINDS:
                 sites.clear_override(site_id, o["id"], who)
                 cleared += 1
         if cleared:
@@ -185,8 +238,20 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
             res = control(site_id)
             res["resolve"] = resolve
             return res
+        return control(site_id)
+    until = (datetime.now(timezone.utc) + timedelta(hours=f.hours)).isoformat()
+    if action == "hold":
+        from . import battery
+        st = battery.state(sites.full(site_id)) or {}
+        fields = {"kind": "reserve", "value": float(f.soc_pct or st.get("soc_pct") or 50), "until": until, "reason": f.reason or "Operator hold"}
+    elif action == "release":
+        fields = {"kind": "force_native", "until": until, "reason": f.reason or "Released to native"}
     else:
-        raise Refusal(404, "The control actions are hold, release, pause and resume", "not_found")
+        fields = {"kind": "pause_control", "until": until, "reason": f.reason or "Paused"}
+    try:
+        sites.add_override(site_id, fields, who)
+    except ValueError as exc:
+        raise bad(exc) from None
     return control(site_id)
 
 

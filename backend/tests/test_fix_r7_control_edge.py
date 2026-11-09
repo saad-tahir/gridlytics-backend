@@ -21,6 +21,11 @@ Batch 2, the edge protocol:
 - the clock-offset ladder is real: clock_unsynced at 120 s, the peak slots widened by 15 minutes at 300 s, control demoted until the offset is under
   120 s at 900 s (audit engine-delivery-10).
 
+Batch 3, the control actions and the control state:
+- hold, release, pause, resume and "mark as applied" read their bodies through strict models: the action, then the permission, then the body are
+  checked, a bad field is a 422 in one sentence (never a 500, even for a viewer), nothing is written, and an applied day is a date of the plan's
+  table (audit pages-B-01, security-roles-13, flow-telemetry-plan-control-20);
+
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
@@ -817,3 +822,110 @@ def test_the_inverters_own_clock_offset_counts_too(world):
     # the edge's own clock is right: its heartbeat is told what the inverter's offset does
     w = world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json=_env(1, uptime_s=60, clock_offset_s=2)).json()["warning"]
     assert w.startswith("clock_offset_900s: the clock is 1200 s off"), w
+
+
+# ================================================================================================ batch 3: control actions and the control state
+
+def _no_ticks(monkeypatch) -> list[str]:
+    """plans.tick replaced by a recorder (an action's re-solve is then counted, not run)."""
+    ticks: list[str] = []
+
+    def fake_tick(site_id, *a, **k):
+        ticks.append(site_id)
+        return {"status": "active", "plan_id": f"p-{len(ticks)}"}
+
+    monkeypatch.setattr(plans, "tick", fake_tick)
+    return ticks
+
+
+# ------------------------------------------------------------------------------------------------ pages-B-01, security-roles-13, flow-telemetry-plan-control-20
+
+HOURS = "The hours must be a number from 0.25 to 72"
+SOC = "The state of charge to hold must be a percent from 1 to 100"
+
+
+@pytest.mark.parametrize("action,role,body,said", [
+    ("hold", "operator", {"hours": "four"}, HOURS),
+    ("hold", "operator", {"hours": True}, HOURS),
+    ("hold", "operator", {"soc_pct": "abc"}, SOC),
+    ("hold", "operator", {"hours": 2, "soc_pct": 0}, SOC),                 # was silently the present state of charge
+    ("hold", "operator", {"soc_pct": 140}, SOC),
+    ("hold", "operator", {"hours": 500}, HOURS),                            # was clamped to 72 without a word
+    ("hold", "operator", {"hours": 0.1}, HOURS),
+    ("release", "operator", {"hours": [1]}, HOURS),
+    ("hold", "operator", {"hours": 2, "colour": "red"}, "Unknown field 'colour'"),
+    ("release", "operator", {"hours": 2, "soc_pct": 50}, "Unknown field 'soc_pct'"),
+    ("hold", "operator", {"reason": "x" * 301}, "The reason must be at most 300 characters"),
+    ("hold", "operator", {"reason": 7}, "The reason must be text"),
+    ("pause", "admin", {"hours": {"n": 1}}, HOURS),
+    ("resume", "admin", {"hours": 2}, "Unknown field 'hours'"),
+])
+def test_a_control_action_with_a_bad_field_is_one_sentence_and_does_nothing(world, monkeypatch, action, role, body, said):
+    ticks = _no_ticks(monkeypatch)
+    r = world.c[role].post(f"/api/sites/{world.site}/control/{action}", json=body)
+    assert r.status_code == 422, (r.status_code, r.text)                    # a 500 "server_error" before
+    assert r.json()["detail"].startswith(said) and r.json()["code"] == "invalid", r.json()
+    with world.use():
+        assert sites.overrides(world.site) == []
+    assert ticks == []
+
+
+def test_a_control_action_checks_the_action_then_the_permission_then_the_body(world, monkeypatch):
+    _no_ticks(monkeypatch)
+    sid, op, viewer = world.site, world.c["operator"], world.c["viewer"]
+    assert op.post(f"/api/sites/{sid}/control/explode", json={"hours": "x"}).status_code == 404
+    # a viewer's bad body is refused for the role, never a 500 (security-roles-13, flow-telemetry-plan-control-20)
+    for action, body in (("hold", {"hours": "abc"}), ("hold", {"hours": {}}), ("release", {"hours": [1]}), ("resume", {"hours": "x"})):
+        r = viewer.post(f"/api/sites/{sid}/control/{action}", json=body)
+        assert r.status_code == 403, (action, r.status_code, r.text)
+    assert op.post(f"/api/sites/{sid}/control/pause", json={"hours": [1]}).status_code == 403      # an operator does not pause
+    r = op.post(f"/api/sites/{sid}/control/hold", json={"hours": 2, "soc_pct": 60})
+    assert r.status_code == 200 and r.json()["control"]["key"] == "hold", r.text
+    with world.use():
+        (o,) = sites.overrides(sid)
+    assert o["kind"] == "reserve" and o["value"] == 60.0 and o["reason"] == "Operator hold"
+    # the old meanings stay: no state of charge holds the present level, no hours is 4 hours, a blank reason the default sentence
+    r = op.post(f"/api/sites/{sid}/control/release", json={"reason": "  "})
+    assert r.status_code == 200, r.text
+    with world.use():
+        rel = next(o for o in sites.overrides(sid) if o["kind"] == "force_native")
+    assert rel["reason"] == "Released to native"
+    assert 4 * 3600 - 60 <= plans._ts(rel["until_ts"]) - _now() <= 4 * 3600
+
+
+def _plan_with_days(w, days: list[str]) -> str:
+    t0 = _now() // 900 * 900
+    with w.use(), store.connect() as con:
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, summary, steps, slots) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("p-r7", w.site, _iso(t0), _iso(t0), _iso(t0), _iso(t0 + 86400), "a", "active", "{}", "[]",
+                                                       json.dumps({"brand": "deye", "days": [{"date": d, "slots": []} for d in days], "fallback": None})))
+    return "p-r7"
+
+
+def test_marking_a_plan_applied_takes_only_a_date_of_its_table(world):
+    sid, op = world.site, world.c["operator"]
+    today = datetime.now(PKT).date()
+    days = [today.isoformat(), (today + timedelta(days=1)).isoformat()]
+    pid = _plan_with_days(world, days)
+    for body, said in (({"plan_id": pid, "day": "yesterday"}, "The day is a date written YYYY-MM-DD"),          # stored as "yesterday" before
+                       ({"plan_id": pid, "day": "2026-13-45"}, "The day is a date written YYYY-MM-DD"),
+                       ({"plan_id": pid, "day": "2020-01-01"}, "This plan has no table for 2020-01-01"),
+                       ({"plan_id": pid, "day": days[0], "by": "someone else"}, "Unknown field 'by'"),
+                       ({"day": days[0]}, "The plan id is missing"),
+                       ({"plan_id": pid, "day": 20261109}, "The day must be text"),
+                       ({"plan_id": pid, "day": days[0], "method": "carrier_pigeon"}, "The method is one of")):
+        r = op.post(f"/api/sites/{sid}/plan/apply", json=body)
+        assert r.status_code == 422 and r.json()["detail"].startswith(said), (body, r.status_code, r.text)
+    with world.use(), store.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM applied").fetchone()[0] == 0
+    assert world.c["viewer"].post(f"/api/sites/{sid}/plan/apply", json={"plan_id": pid, "day": "junk"}).status_code == 403
+    r = op.post(f"/api/sites/{sid}/plan/apply", json={"plan_id": pid, "day": days[1], "method": "vendor_app"})
+    assert r.status_code == 200 and r.json()["day_local"] == days[1], r.text
+    r = op.post(f"/api/sites/{sid}/plan/apply", json={"plan_id": pid})                              # the day defaults to Karachi's today
+    assert r.status_code == 200 and r.json()["day_local"] == days[0], r.text
+    # a photograph over the limit is refused, not cut short (which spoilt the image)
+    big = "data:image/png;base64," + "A" * 7_000_000
+    r = op.post(f"/api/sites/{sid}/plan/apply", json={"plan_id": pid, "day": days[0], "photo": big})
+    assert r.status_code == 422, r.status_code
+    with world.use():
+        assert len(plans.applied_rows(sid)) == 2

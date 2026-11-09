@@ -721,12 +721,23 @@ def mark_applied(site_id: str, plan_id: str, day_local: str, by: str, method: st
         raise ValueError("The method is one of installer_keyed, vendor_app, edge_ack or owner_keyed")
     if photo and not photo.startswith(("data:image/png;base64,", "data:image/jpeg;base64,")):
         raise ValueError("The photograph must be a PNG or JPEG image")
-    if get(site_id, plan_id) is None:
+    if len(photo) > 7_000_000:
+        raise ValueError("The photograph is larger than 5 MB")     # refused, not cut short (a cut image does not open)
+    try:
+        day_local = date.fromisoformat(str(day_local)).isoformat()
+    except ValueError:
+        raise ValueError("The day is a date written YYYY-MM-DD") from None
+    plan = get(site_id, plan_id)
+    if plan is None:
         raise KeyError(plan_id)
+    # a day the plan has no table for is never confirmed: control_state and the alerts read today's row, verify scores the day's slots
+    days = [d.get("date") for d in ((plan.get("slots") or {}).get("days") or [])]
+    if day_local not in days:
+        raise ValueError(f"This plan has no table for {day_local}" + (f"; its days are {', '.join(days)}" if days else ""))
     aid = store.new_id()
     with store.connect() as con:
         con.execute("INSERT INTO applied (id, site_id, plan_id, day_local, by, method, photo, created) VALUES (?,?,?,?,?,?,?,?)",
-                    (aid, site_id, plan_id, day_local, by, method, photo[:7_000_000], store._now()))
+                    (aid, site_id, plan_id, day_local, by, method, photo, store._now()))
         con.execute("UPDATE plans SET applied = 1 WHERE id = ?", (plan_id,))
     store.audit(by, "marked a plan as applied", site_id, {"plan_id": plan_id, "day": day_local, "method": method})
     return {"id": aid, "plan_id": plan_id, "day_local": day_local, "method": method, "confirmation": "pending"}
