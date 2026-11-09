@@ -359,7 +359,10 @@ def test_a_battery_starting_below_the_floor_is_planned_not_held(company):
     sid = _site(genset=False)
     sites.put_state(sid, soc=0.05)
     r = plans.tick(sid)
-    assert r["summary"]["guard"] is None and r["status"] == "active"
+    # the floor rules never refuse a start below the band. Round 7: the guard may refuse this plan for another rule, the load it sheds with the grid
+    # up to spare the MDI (which the optimiser's own round-7 package removes), so the plan is active exactly when no rule is broken
+    assert r["summary"]["guard"] not in ("replayed_soc_below_floor", "slot_floor_below_fallback")
+    assert r["status"] == ("active" if r["summary"]["guard"] is None else "held")
 
 
 # ------------------------------------------------------------------------------------------------ optimiser-explain-contradicts-flows

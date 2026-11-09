@@ -324,26 +324,82 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
     return out
 
 
-def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict]) -> str | None:
-    """The wrong-plan guard (Part 7.1 step 8): replay the compiled table through the twin on the forecast and refuse a plan that crosses the floor,
-    imports in a forecast outage or exceeds its own MDI cap."""
+#: the wrong-plan guard's tolerances: state of charge (a fraction of the battery: the twin's minutes against the plan's quarters; at the Lahore demo
+#: a 3 kW peak shave past a 20 % floor dipped 2.1 points, which is not a wrong plan), energy over the horizon (kWh, and a share of the critical
+#: energy of the forecast outages) and an MDI block's mean (kW)
+GUARD_SOC_TOL = 0.05
+GUARD_KWH_TOL, GUARD_OUTAGE_SHARE = 2.0, 0.05
+GUARD_MDI_TOL_KW = 1.0
+
+
+def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict], res: dict | None = None) -> str | None:
+    """The wrong-plan guard (Part 7.1 step 8, R6 rule C2): check the plan and its compiled table, replayed through the twin on the plan's own
+    forecast, and refuse the plan (the previous one stays in force) when either would do what the plan may not. The first rule broken is the
+    reason:
+    - `slot_floor_below_fallback`: a slot's floor is under the fallback's minimum state of charge (the whole-table safety of step 6);
+    - `replayed_soc_below_floor`: with the grid up, the table discharges the battery under that fallback floor (an outage may use the reserve
+      down to the battery's own floor; a grid-up hour may not);
+    - `unserved_in_outage`: in the forecast outages the table leaves more critical load unserved than the plan did (the reserve was spent before);
+    - `mdi_cap_exceeded`: the plan's own grid draw over an MDI block, with any load it sheds while the grid is up added back (the site's meter
+      reads that load), exceeds the plan's MDI cap (`res["M"]`; the first block carries its minutes already elapsed, as the plan's row does);
+    - `sheds_load_with_grid_up`: the plan sheds load with the grid up that the site would in fact serve from the grid (the replay serves it);
+    - `genset_slot_with_grid`: a genset slot lies wholly where the grid is expected present, at a site whose genset may not run beside the grid;
+    - `export_not_allowed`: an export slot at a connection that may export nothing.
+    None when every rule holds, or the site has no battery (no table to replay)."""
     bat = p.get("battery")
     if not bat:
         return None
     T = p["T"]
+    slots = [s for d in compiled["days"] for s in d["slots"]]
+    fallback = float(((compiled.get("fallback") or {}).get("min_soc_floor_pct") or 0.0)) / 100.0
+    if any(float(s["soc_floor_pct"]) / 100.0 < fallback - 1e-6 for s in slots):
+        return "slot_floor_below_fallback"
     ts = np.repeat(p["ts"], 15) + np.tile(np.arange(15) * 60, T)
     series = {"pv": np.repeat(p["PV"], 15), "load": np.repeat(p["L"], 15), "crit": np.repeat(p["Lc"], 15), "grid": np.repeat(p["g"], 15),
               "ts": ts, "temp": np.full(len(ts), 30.0)}
-    slots = [s for d in compiled["days"] for s in d["slots"]]
     pol = twin.slots_policy(slots, ts)
     plant = twin.plant_of(site)
     soc0 = bat["E0"] / bat["E_nom"]
     sim = twin.simulate(series, pol, plant, soc0)
-    # a battery that starts below the band is planned towards it, never refused (Part 4.3): the floor is the lower of the band and the start
-    if float(np.min(sim["soc"])) < min(bat["soc_min"], soc0) - 0.02:
+    up = series["grid"] > 0.5
+    # the fallback floor with the grid up: a battery already under it (a start below the band, or the end of an outage) may stay there, but the
+    # table must not discharge it further
+    if np.any(up & (sim["bat"] > 1e-3) & (sim["soc"] < fallback - GUARD_SOC_TOL)):
         return "replayed_soc_below_floor"
-    if float(np.max(np.where(series["grid"] < 0.5, sim["imp"], 0.0))) > 1e-6:
-        return "import_in_outage"
+    planned = {k: np.array([float(s.get(k) or 0.0) for s in steps_out[:T]]) for k in ("unserved_kw", "grid_present", "grid_import_kw")}
+    down_q = planned["grid_present"] < 0.5
+    unserved_out = float(sim["unserved"][~up].sum() / 60)
+    planned_out = float(planned["unserved_kw"][down_q].sum() * H)
+    crit_out = float(series["crit"][~up].sum() / 60)
+    if unserved_out > planned_out + max(GUARD_KWH_TOL, GUARD_OUTAGE_SHARE * crit_out):
+        return "unserved_in_outage"
+    shed_q = np.where(down_q, 0.0, planned["unserved_kw"])
+    caps = (res or {}).get("M") or []
+    mdi = p.get("mdi")
+    if mdi and caps:
+        n = max(1, int(mdi["n_mdi"]))
+        draw = planned["grid_import_kw"] + shed_q
+        blocks = (np.asarray(p["ts"]) // (n * 900)).astype(np.int64)
+        month_end = int(mdi.get("month_end_step", T))
+        for bid in np.unique(blocks):
+            st = np.flatnonzero(blocks == bid)
+            cap = caps[0] if st[0] < month_end else (caps[1] if len(caps) > 1 else None)
+            if cap is None:
+                continue
+            elapsed = float(mdi.get("G_elapsed") or 0.0) * float(mdi.get("n_elapsed") or 0) if st[0] == 0 else 0.0
+            if (float(draw[st].sum()) + elapsed) / n > cap + GUARD_MDI_TOL_KW:
+                return "mdi_cap_exceeded"
+    if float(shed_q.sum() * H) > float(sim["unserved"][up].sum() / 60) + GUARD_KWH_TOL:
+        return "sheds_load_with_grid_up"
+    if not plant.parallel and not p.get("off_grid"):
+        g_q = np.asarray(p["g"], dtype=float)
+        for s in slots:
+            if s.get("genset"):
+                sel = (np.asarray(p["ts"]) >= s["start_ts"]) & (np.asarray(p["ts"]) < s["end_ts"])
+                if sel.any() and bool(np.all(g_q[sel] > 0.5)):
+                    return "genset_slot_with_grid"
+    if float(p.get("X_max") or 0.0) <= 0.0 and any(s.get("mode") == "export" for s in slots):
+        return "export_not_allowed"
     return None
 
 
@@ -446,7 +502,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     fallback_floor = float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
     bms_low = ((site.get("assets") or {}).get("battery") or {}).get("soc_min", 0.1) * 100
     compiled = delivery.compile_mode_a(steps_out, brand, p.get("battery"), fallback_floor, bms_low, res["M"][0] if res.get("M") else None)
-    guard = _guard(site, p, compiled, steps_out)
+    guard = _guard(site, p, compiled, steps_out, res)
     summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(res["M"][0], 1) if res.get("M") else None,
                     "v_end": round(res.get("v_end", 0.0), 2), "guard": guard})
     # a pause or a release to native means no plan is in force: the plan is kept for reading, held, and the previous one stops being active
