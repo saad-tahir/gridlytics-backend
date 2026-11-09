@@ -647,10 +647,9 @@ def company_members(company_id: str) -> list[dict]:
     for m in d.memberships(company_id=company_id):
         who = accounts.get(m["user_id"], {"email": "", "name": "", "disabled": False})
         held = (read or {"members": {}})["members"].get(m["user_id"])
-        role = held["role"] if held else None
-        # gridlytics_role is the field's name; solarlytics_role (the lifted name) is kept one release for the console page that still reads it
+        # the Gridlytics role only: the lifted name solarlytics_role is gone, no console page reads it (audit founder-console-18)
         out.append({"user_id": m["user_id"], "email": who["email"], "name": who["name"], "company_role": m["role"], "status": m["status"],
-                    "disabled": who["disabled"], "gridlytics_role": role, "solarlytics_role": role, "seated": (not held["disabled"]) if held else None,
+                    "disabled": who["disabled"], "gridlytics_role": held["role"] if held else None, "seated": (not held["disabled"]) if held else None,
                     "last_seen": held["last_seen"] if held else None})
     return sorted(out, key=lambda x: (x["name"].lower(), x["email"]))
 
@@ -663,8 +662,7 @@ def account_view(account: dict, mine: list[dict], names: dict, reads: dict | Non
         view = _membership_view(m, names)
         if reads is not None:
             held = (reads.get(m["company_id"]) or {"members": {}})["members"].get(account["id"])
-            role = held["role"] if held else None
-            view.update(gridlytics_role=role, solarlytics_role=role, last_seen=held["last_seen"] if held else None)
+            view.update(gridlytics_role=held["role"] if held else None, last_seen=held["last_seen"] if held else None)
         out.append(view)
     return {**{k: account[k] for k in ("id", "email", "name", "disabled", "created")},
             "memberships": sorted(out, key=lambda v: v["company_name"].lower())}

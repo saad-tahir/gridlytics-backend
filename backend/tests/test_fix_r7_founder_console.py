@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import sqlite3
 import subprocess
@@ -15,8 +16,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
-from gridlytics import backups, delivery, founder, sites, store, telemetry
+import identities
+from gridlytics import backups, delivery, founder, identity, sites, store, telemetry
 from gridlytics import platform as platformdb
 from test_founder import (PASSWORD, SESSION_SECRET, _audit, _client, _code, _company, _console, _ok, _sentence, clock, fdb)  # noqa: F401  (fixtures)
 
@@ -317,3 +320,39 @@ def test_the_restore_script_refuses_while_the_launcher_holds_the_data_folder(fdb
     finally:
         lock.close()
     assert refused.returncode == 2 and "stop" in refused.stderr.lower(), refused.stderr
+
+
+# ================================================================== company and user management (batch 2)
+
+def _token(who: dict) -> str:
+    return identity.issue_local(who["id"], who["email"], who["name"], 60)
+
+
+def _as(who: dict) -> TestClient:
+    """A client signed in as the person, as their page sends its requests."""
+    c = _client()
+    c.headers.update(identities.headers(_token(who)))
+    return c
+
+
+def _person(c, email: str, name: str, cid: str, company_role: str = "member") -> dict:
+    return _ok(c.post("/api/founder/users", json={"email": email, "name": name, "password": f"{name.split()[0].lower()} first password",
+                                                   "company_id": cid, "company_role": company_role}), 201)["user"]
+
+
+def _role_on_users(c, user_id: str, cid: str) -> str | None:
+    """The Gridlytics role the founder's Users page shows for the person in the company."""
+    user = next(u for u in _ok(c.get("/api/founder/users"))["users"] if u["id"] == user_id)
+    return next(m for m in user["memberships"] if m["company_id"] == cid)["gridlytics_role"]
+
+
+def test_the_founders_answers_carry_the_gridlytics_role_and_not_the_lifted_name(fdb):
+    """founder-console-18: every membership and member carried 'solarlytics_role' beside 'gridlytics_role', kept for a console page that no longer read it."""
+    c = _console()
+    made = _company(c)
+    cid, owner = made["company"]["id"], made["owner"]
+    _ok(_as(owner).get("/api/sites"))
+    members = _ok(c.get(f"/api/founder/companies/{cid}/members"))["members"]
+    users = _ok(c.get("/api/founder/users"))["users"]
+    assert members[0]["gridlytics_role"] == "admin" and users[0]["memberships"][0]["gridlytics_role"] == "admin"
+    assert "solarlytics" not in json.dumps(members) + json.dumps(users)

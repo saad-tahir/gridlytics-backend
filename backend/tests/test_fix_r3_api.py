@@ -407,12 +407,12 @@ def test_the_org_answer_carries_its_seats(world):
     assert body["seats"] == platformdb.company(world.company["id"])["seats"] and body["seats_used"] == 4, body
 
 
-def test_the_founder_console_answers_the_gridlytics_role_and_keeps_the_old_name(world):
+def test_the_founder_console_answers_the_gridlytics_role_and_not_the_old_name(world):
     for c in world.c.values():
         c.get("/api/meta")
     members = store_founder.company_members(world.company["id"])
     assert {m["gridlytics_role"] for m in members} == {"admin", "operator", "analyst", "viewer"}
-    assert all(m["solarlytics_role"] == m["gridlytics_role"] for m in members)
+    assert not any("solarlytics_role" in m for m in members)             # the lifted name is gone (round 7, audit founder-console-18)
 
 
 # ------------------------------------------------------------------------------------------------ telemetry, outages, genset
