@@ -513,6 +513,42 @@ def test_the_month_view_compares_with_the_month_before_and_counts_hours_below_th
         assert r.status_code == 422 and r.json()["detail"].endswith("."), (bad_month, r.text)
 
 
+# ------------------------------------------------------------------------------------------------ pages-C-16: measured points and the refit
+
+def test_the_fuel_curve_shows_the_metered_runs_and_refits_from_them_or_from_data_sheet_points(world):
+    c = world.owner
+    sid = _route_site(c, "Refit")
+    a, b, s = 0.22, 0.05, GEN["rated_kw"]
+    loads = (0.4, 0.6, 0.8, 1.0)
+    with world.use():
+        for n, lr in enumerate(loads):
+            _one_run(sid, _pk_ts(_pk_day(4 - n), 10), power=lr * s * 1000, fuel=(a * lr * s + b * s) / 60)
+    page = c.get(f"/api/sites/{sid}/genset").json()
+    pts = sorted((p["load_ratio"], p["litres_per_hour"]) for p in page["curve"]["measured"])
+    assert pts == [pytest.approx((lr, a * lr * s + b * s), abs=0.02) for lr in loads]
+    fit = c.post(f"/api/sites/{sid}/genset/curve/refit", json={}).json()
+    assert fit["from"] == "meter" and fit["points_used"] == 4 and fit["applied"] is False
+    assert fit["a"] == pytest.approx(a, abs=0.002) and fit["b"] == pytest.approx(b, abs=0.002)
+    assert c.get(f"/api/sites/{sid}").json()["assets"]["genset"]["a"] == GEN["a"]  # a preview changes nothing
+    # data-sheet points, applied by an operator
+    sheet = [{"load_ratio": lr, "litres_per_hour": round(0.3 * lr * s + 0.02 * s, 2)} for lr in (0.25, 0.5, 0.75, 1.0)]
+    for role in ("viewer", "analyst"):
+        assert world.role(role).post(f"/api/sites/{sid}/genset/curve/refit", json={"points": sheet, "apply": True}).status_code == 403
+    op = world.role("operator").post(f"/api/sites/{sid}/genset/curve/refit", json={"points": sheet, "apply": True})
+    assert op.status_code == 200, op.text
+    body = op.json()
+    assert body["from"] == "data_sheet" and body["applied"] is True and body["a"] == pytest.approx(0.3, abs=1e-3)
+    g = c.get(f"/api/sites/{sid}").json()["assets"]["genset"]
+    assert (g["a"], g["b"]) == (body["a"], body["b"]) and g["rated_kw"] == s
+    # refusals: one point, a point at no load, an unknown field, a site without metered runs
+    for bad_body in ({"points": sheet[:1]}, {"points": [{"load_ratio": 0, "litres_per_hour": 5}] + sheet[1:]}, {"pts": sheet}):
+        r = c.post(f"/api/sites/{sid}/genset/curve/refit", json=bad_body)
+        assert r.status_code == 422, bad_body
+    other = _route_site(c, "No meter")
+    r = c.post(f"/api/sites/{other}/genset/curve/refit", json={})
+    assert r.status_code == 422 and "metered runs" in r.json()["detail"]
+
+
 # ------------------------------------------------------------------------------------------------ pages-A-06 (a duplicate of pages-C-03): the Overview
 
 def test_the_overview_month_names_where_its_litres_came_from(world):

@@ -10,11 +10,12 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import PlainTextResponse
+from pydantic import Field
 from starlette.concurrency import run_in_threadpool
 
 from . import alerts, auth, battery, forecast, plans, sites, store, telemetry
 from .routes_common import PKT, bad, full_or_404, now_ts, out, parse_day, parse_ts, site_or_404, today
-from .schemas import Refusal
+from .schemas import Refusal, Strict, check
 
 router = APIRouter()
 
@@ -295,6 +296,13 @@ def battery_page(site_id: str):
 #: the genset page's periods: the last `days` days (1 to GENSET_MAX_DAYS, 14 by default), or a calendar month in Karachi time (`month` YYYY-MM; the current
 #: month runs to now), which also answers the month before it (R8 2.11: run hours and starts this month against last)
 GENSET_MAX_DAYS = 60
+#: the refit reads the metered runs of the last REFIT_DAYS days (R8 2.11: "refit from 30 days of meter data")
+REFIT_DAYS = 30
+#: a run is a measured point of the fuel curve when its litres are all metered, its output all read, and it ran at least POINT_MIN_H hours
+POINT_MIN_H = 0.25
+#: a refit needs at least REFIT_MIN_POINTS points whose loads span at least REFIT_MIN_SPREAD of the rating (else the slope is a guess)
+REFIT_MIN_POINTS = 3
+REFIT_MIN_SPREAD = 0.1
 
 
 def _month_window(month: str, now: int) -> tuple[int, int]:
@@ -330,9 +338,31 @@ def _run_kpis(res: dict) -> dict:
             "hours_below_min": round(sum(r["hours_below_min"] for r in runs), 1)}
 
 
+def _measured_points(runs: list[dict]) -> list[dict]:
+    """The runs that measure the fuel curve: litres all metered, output all read, at least POINT_MIN_H long."""
+    return [{"start": r["start"], "load_ratio": r["load_ratio"], "litres_per_hour": round(r["litres"] / r["hours"], 2), "hours": r["hours"]}
+            for r in runs if r["litres_source"] == "meter" and not r["kwh_estimated"] and r["hours"] >= POINT_MIN_H and r["litres"] > 0
+            and r["load_ratio"] is not None]
+
+
+def _fuel_logged(site_id: str, d0: str, d1: str) -> dict:
+    """The fuel logged for the Karachi days d0..d1: {litres, entries}."""
+    with store.connect() as con:
+        rows = con.execute("SELECT detail FROM events WHERE site_id = ? AND type = 'fuel_log'", (site_id,)).fetchall()
+    litres, n = 0.0, 0
+    for r in rows:
+        try:
+            d = json.loads(r["detail"] or "{}")
+        except ValueError:
+            continue
+        if isinstance(d.get("litres"), (int, float)) and d0 <= str(d.get("day") or "") <= d1:
+            litres, n = litres + float(d["litres"]), n + 1
+    return {"litres": round(litres, 1), "entries": n}
+
+
 @router.get("/api/sites/{site_id}/genset")
 def genset_page(site_id: str, days: int = 14, month: str | None = None):
-    """UI-11: the period's KPIs, runs, daily hours and litres, the fuel curve, the price, the plan's requests and steps, the
+    """UI-11: the period's KPIs, runs, daily hours and litres, the fuel curve with its measured points, the price, the plan's requests and steps, the
     policy. Litres are metered where a fuel meter reads and from the fuel curve where not (`litres_source` as on the Savings page); each run's fuel is
     priced at the fuel price of its own Karachi day (`price_per_l`, `fuel_cost_rs`); without a genset reading in the period (`signal.present` false) the
     hours, starts and litres are unknown (null), not zero."""
@@ -377,7 +407,9 @@ def genset_page(site_id: str, days: int = 14, month: str | None = None):
               "runs": list(reversed(runs)), "daily": res["daily"],
               "curve": {"a": g["a"], "b": g["b"], "rated_kw": g["rated_kw"],
                         "points": [{"load_ratio": lr, "litres_per_hour": round(g["a"] * lr * g["rated_kw"] + g["b"] * g["rated_kw"], 2)}
-                                   for lr in (0.25, 0.5, 0.75, 1.0)]},
+                                   for lr in (0.25, 0.5, 0.75, 1.0)],
+                        "measured": _measured_points(runs)},
+              "fuel_logged": _fuel_logged(site_id, res["daily"][0]["day"], res["daily"][-1]["day"]) if res["daily"] else {"litres": 0.0, "entries": 0},
               "requests": alerts.requests_for(site_id), "plan": [{"t": x["t"], "genset_kw": x["genset_kw"], "reason": x["reason"]}
                                                                   for x in (plans.current(site_id) or {}).get("steps", []) if x["genset_on"]][:96],
               "policy": "Gridlytics never starts or stops the genset itself: it asks, with a reason, and records whether the advice was followed."}
@@ -387,6 +419,80 @@ def genset_page(site_id: str, days: int = 14, month: str | None = None):
         prev = _run_kpis(telemetry.genset_runs(site_id, p0, p1, g))
         answer["previous"] = {"month": pm, **{k: prev[k] for k in ("hours", "starts", "litres", "kwh")}}
     return out(answer)
+
+
+class CurvePoint(Strict):
+    """A point of the genset's data sheet: litres (or the gas unit) an hour at a load ratio (output over rating)."""
+    load_ratio: float = Field(gt=0, le=1.1)
+    litres_per_hour: float = Field(gt=0, le=100000)
+
+
+class RefitIn(Strict):
+    #: data-sheet points; none: the metered runs of the last REFIT_DAYS days
+    points: list[CurvePoint] | None = Field(None, max_length=12)
+    #: save the fitted a and b to the genset (edit_sites); otherwise the fit is only shown
+    apply: bool = False
+
+
+def fit_curve(points: list[tuple[float, float, float]], rated_kw: float) -> dict:
+    """a and b of litres an hour = a x output kW + b x rated kW (HOMER's convention, sites.GensetFields) by weighted least squares over (load ratio,
+    litres an hour, weight) points, b at least 0. Raises ValueError when the points cannot fix a slope or give one GensetFields refuses."""
+    x = np.array([p[0] for p in points], dtype=float)
+    y = np.array([p[1] for p in points], dtype=float) / rated_kw
+    w = np.array([max(1e-6, p[2]) for p in points], dtype=float)
+    if len(x) < 2 or float(x.max() - x.min()) < REFIT_MIN_SPREAD:
+        raise ValueError(f"A fuel curve needs points at loads at least {int(REFIT_MIN_SPREAD * 100)} % of the rating apart.")
+    xm, ym = np.average(x, weights=w), np.average(y, weights=w)
+    a = float(np.sum(w * (x - xm) * (y - ym)) / np.sum(w * (x - xm) ** 2))
+    b = ym - a * xm
+    if b < 0:
+        a, b = float(np.sum(w * x * y) / np.sum(w * x * x)), 0.0
+    if not (0 < a <= 5) or not (0 <= b <= 1):
+        raise ValueError("Those points do not give a fuel curve that rises with the load: check the litres an hour against the load.")
+    rmse = float(np.sqrt(np.average((a * x + b - y) ** 2, weights=w))) * rated_kw
+    return {"a": round(a, 4), "b": round(b, 4), "rmse_lph": round(rmse, 2)}
+
+
+@router.post("/api/sites/{site_id}/genset/curve/refit")
+def curve_refit(site_id: str, inp: dict | None = Body(None)):
+    """Fits the genset's fuel curve (a, b) from data-sheet points, or, without points, from the metered runs of the last REFIT_DAYS days (their measured
+    points as on the genset page; at least REFIT_MIN_POINTS); with `apply` the fit is saved to the genset (edit_sites), otherwise only shown. Answers
+    {a, b, rmse_lph, rated_kw, from (data_sheet or meter), points_used, points (the fitted curve at 25 to 100 %), before {a, b}, applied}."""
+    body = check(RefitIn, inp or {})
+    if body.apply:
+        auth.need("edit_sites", "Saving the genset's fuel curve")
+    s = full_or_404(site_id)
+    g = (s.get("assets") or {}).get("genset")
+    if not g:
+        raise bad(ValueError("This site has no genset."))
+    s_kw = float(g["rated_kw"])
+    if body.points:
+        pts = [(p.load_ratio, p.litres_per_hour, 1.0) for p in body.points]
+        source = "data_sheet"
+    else:
+        now = now_ts()
+        measured = _measured_points(telemetry.genset_runs(site_id, now - REFIT_DAYS * 86400, now, g)["runs"])
+        pts = [(p["load_ratio"], p["litres_per_hour"], p["hours"]) for p in measured]
+        loads = [p[0] for p in pts]
+        if len(pts) < REFIT_MIN_POINTS or max(loads) - min(loads) < REFIT_MIN_SPREAD:
+            raise bad(ValueError(f"Too few metered runs to refit the curve: {len(pts)} in the last {REFIT_DAYS} days with a fuel meter and the output read "
+                                 f"({REFIT_MIN_POINTS} needed, at loads at least {int(REFIT_MIN_SPREAD * 100)} % of the rating apart). Enter the data "
+                                 "sheet's points instead."))
+        source = "meter"
+    try:
+        fit = fit_curve(pts, s_kw)
+    except ValueError as exc:
+        raise bad(exc) from None
+    applied = False
+    if body.apply:
+        fields = {k: v for k, v in g.items() if k != "id"}
+        try:
+            sites.put_asset(site_id, "genset", {**fields, "a": fit["a"], "b": fit["b"]}, auth.actor())
+        except ValueError as exc:
+            raise bad(exc) from None
+        applied = True
+    return {**fit, "rated_kw": s_kw, "from": source, "points_used": len(pts), "applied": applied, "before": {"a": g["a"], "b": g["b"]},
+            "points": [{"load_ratio": lr, "litres_per_hour": round(fit["a"] * lr * s_kw + fit["b"] * s_kw, 2)} for lr in (0.25, 0.5, 0.75, 1.0)]}
 
 
 @router.post("/api/sites/{site_id}/genset/requests/{nid}")
