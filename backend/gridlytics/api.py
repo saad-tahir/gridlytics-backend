@@ -22,12 +22,12 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, apikeys, auth, backups, companies, identity, store, store_members, version
+from . import __version__, apikeys, auth, backups, companies, identity, money, store, store_members, version
 from . import platform as platformdb
 from .schemas import Refusal
 
@@ -314,6 +314,8 @@ async def _guarded(request, call_next, rid: str):
         return _refusal(rid, 403, "Choose a company first", "no_company")
     try:
         response = await call_next(request)
+        if user is not None and money.filtered_reader():
+            response = await _without_money(response)
     except Exception as exc:
         record = {"event": "unanswered_request", "request_id": rid, "method": request.method, "path": path, "user": request.state.user_id,
                   "error": type(exc).__name__, "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
@@ -324,6 +326,20 @@ async def _guarded(request, call_next, rid: str):
     if user is not None and not user.get("api_key") and path.startswith("/api/"):
         response.headers["X-Gridlytics-Role"] = user["role"]
     return response
+
+
+async def _without_money(response):
+    """The money filter, for every route (plan Part 10.5; audit security-roles-02): a JSON answer to a reader who may not see every money field (a viewer,
+    an operator for the fee, a machine key) is sent as `money.filter_json` leaves it, so a route that forgets `out()` sends no rupee either. Other answers
+    (a CSV, a PDF, a calendar file) pass as the route made them."""
+    if not (response.headers.get("content-type") or "").startswith("application/json"):
+        return response
+    raw = b"".join([part async for part in response.body_iterator])
+    clean = money.filter_json(raw)
+    body = raw if clean is None else clean
+    sent = Response(content=body, status_code=response.status_code)
+    sent.raw_headers = [(k, v) for k, v in response.raw_headers if k.lower() != b"content-length"] + [(b"content-length", str(len(body)).encode("latin-1"))]
+    return sent
 
 
 class _VersionedPath:

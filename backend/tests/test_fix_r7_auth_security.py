@@ -33,3 +33,18 @@ def test_the_events_route_gives_no_fuel_cost_to_a_viewer_or_a_key(world):
         logs = [e for e in r.json() if e["type"] == "fuel_log"]
         assert [e["detail"]["litres"] for e in logs] == [50]
         assert "cost_rs" not in _keys(r.json()) and "14000" not in json.dumps(r.json())
+
+
+# ------------------------------------------------------------------------------------------------ security-roles-02 (the filter is the API's)
+
+def test_every_answer_is_filtered_for_a_viewer_and_a_count_is_not_money(world):
+    """The guard filters every JSON answer (test_role_walk walks every route); a bare "total" is a count, so the viewer's alert badge keeps it."""
+    from gridlytics import money
+    assert not money.is_money("total") and money.is_money("total_rs")
+    for role in ("admin", "viewer"):
+        counts = world.c[role].get("/api/alerts/counts")
+        assert counts.status_code == 200 and isinstance(counts.json()["total"], int), (role, counts.text)
+    # the routes that never called out() are filtered all the same: the native capture's answer of a viewer, through a key as well
+    sid = world.site
+    assert world.c["viewer"].get(f"/api/sites/{sid}/native").status_code == 200
+    assert world.anon.get(f"/api/sites/{sid}/overrides", headers=world.key(["sites:read"])).status_code == 200

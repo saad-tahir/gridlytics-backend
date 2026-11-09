@@ -18,7 +18,8 @@ from fastapi import HTTPException
 
 ROLES = {"admin": "Administrator", "operator": "Operator", "analyst": "Analyst", "viewer": "Viewer"}
 
-#: Who may do what (plan Part 10.5). A viewer reads energy figures only: every money field is stripped from its answers by type (`money.strip_for`).
+#: Who may do what (plan Part 10.5). A viewer reads energy figures only: every money field is stripped from its answers by name (`money.for_reader`, which
+#: the API's guard runs on every JSON answer: api._without_money).
 PERMISSIONS = {
     "manage_members": {"admin"},
     "manage_users": {"admin"},
