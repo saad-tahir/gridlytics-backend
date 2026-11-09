@@ -1048,3 +1048,45 @@ def test_the_hold_release_and_pause_chips_name_their_end_with_its_day(world, mon
     assert c["key"] == "paused" and c["label"] == f"Control paused until {said(c['until'])}", c
     with world.use():
         assert routes_sites.control_state(sites.get(sid), None, _now())["label"] == c["label"]
+
+
+# ------------------------------------------------------------------------------------------------ batch 4: role-owner-08 (and its duplicates)
+
+def _tier(sid: str, tier: str) -> None:
+    sites.set_tier_capable(sid, tier)
+    sites.set_tier_allowed(sid, tier, "t", "test")
+
+
+def _today_plan(sid: str, day: date, status: str = "active") -> str:
+    """A plan row with a table for `day` (a hold, a discharge from 18:00 to 22:00, a hold), valid for a day from now."""
+    pid = store.new_id()
+    t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    slots = [{"start": f"{a:02d}:00", "end": f"{b % 24:02d}:00", "start_ts": t0 + a * 3600, "end_ts": t0 + b * 3600, "mode": m, "soc_floor_pct": 20.0,
+              "soc_target_pct": 20.0, "grid_charge": False, "export_allowed": False} for a, b, m in ((0, 18, "hold"), (18, 22, "discharge"), (22, 24, "hold"))]
+    with store.connect() as con:
+        if status == "active":
+            con.execute("UPDATE plans SET status = 'superseded' WHERE site_id = ? AND status = 'active'", (sid,))
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, summary, steps, slots) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (pid, sid, store._now(), _iso(_now()), _iso(_now()), _iso(_now() + 86400), "a", status, "{}", "[]",
+                                                       json.dumps({"brand": "deye", "days": [{"date": day.isoformat(), "slots": slots}], "fallback": None})))
+    return pid
+
+
+def test_a_demo_site_says_its_control_state_as_a_customer_site_does(company):
+    """A demo site's chip is no longer forced to "Following plan (table applied)": with no table marked for today it reads "Table not confirmed
+    today", as its alert and applied log say, and a closed-loop demo site with no data for hours reads "Edge offline" (audit role-owner-08,
+    role-viewer-01, role-operator-03, role-analyst-04, flow-telemetry-plan-control-27, flow-savings-pilot-bill-28)."""
+    from gridlytics import routes_sites
+    now = _now()
+    adv = sites.create({"name": "Faisalabad textile mill (demo)", "disco": "FESCO"}, "t", demo_link="demo")["id"]
+    loop = sites.create({"name": "Karachi feed mill (demo)", "disco": "FESCO"}, "t", demo_link="demo")["id"]
+    _tier(adv, "advisory_writes")
+    _tier(loop, "closed_loop")
+    state = lambda sid, last: routes_sites.control_state(sites.get(sid), last, now)  # noqa: E731
+    # before: "Following plan (table applied)" with nothing marked, and "Following plan" beside "No live data: the site is offline"
+    assert state(adv, {"ts": now}) == {"key": "unconfirmed", "label": "Table not confirmed today"}
+    assert state(loop, {"ts": now - 4 * 3600}) == {"key": "edge_offline", "label": "Edge offline"}
+    assert state(loop, {"ts": now - 60})["key"] == "following"
+    today = datetime.now(PKT).date()
+    plans.mark_applied(adv, _today_plan(adv, today), today.isoformat(), "Installer", "installer_keyed")
+    assert state(adv, {"ts": now}) == {"key": "following", "label": "Following plan (table applied)"}

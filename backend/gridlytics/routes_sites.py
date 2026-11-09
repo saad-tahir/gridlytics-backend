@@ -61,7 +61,8 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
     if "reserve" in kinds:
         until = kinds["reserve"]["until_ts"]
         return {"key": "hold", "label": f"Hold until {until_words(until, now)}", "until": until}
-    if tier == "closed_loop" and age is not None and age > 5 and not site.get("demo_link"):
+    # a demo site says its state as a customer site does (round 7, audit role-owner-08): its chip, its alerts and its applied log agree
+    if tier == "closed_loop" and age is not None and age > 5:
         return {"key": "edge_offline", "label": "Edge offline"}
     if tier == "closed_loop":
         clock = plans.clock_info(site["id"])
@@ -78,8 +79,7 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
     if tier == "advisory_writes":
         with store.connect() as con:
             ok = con.execute("SELECT 1 FROM applied WHERE site_id = ? AND day_local = ?", (site["id"], today().isoformat())).fetchone()
-        return {"key": "following" if ok or site.get("demo_link") else "unconfirmed",
-                "label": "Following plan (table applied)" if ok or site.get("demo_link") else "Table not confirmed today"}
+        return {"key": "following" if ok else "unconfirmed", "label": "Following plan (table applied)" if ok else "Table not confirmed today"}
     return {"key": "following", "label": "Following plan"}
 
 
