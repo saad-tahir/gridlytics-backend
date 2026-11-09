@@ -296,9 +296,17 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         c_next = float(np.max(vec["c_imp"][-96:])) if not off_grid else p["c_short"]
         if off_grid and gen:
             c_next = offgrid_c_next(g_asset, gen["c_fuel"], L[-96:], PV[-96:])
-        lam = p_out.get("lam_day") or 0.0
-        r_next = float(np.mean(Lc)) * 2.0 / b_asset["eta_d"] if (lam > 0.5 or off_grid) else 0.0
-        p["terminal"] = {"c_next": c_next, "H_peak": 4.0, "R_next": r_next, "c_cal_hold": float(np.mean(bat["b_cal"][:32])) if steps else 0.0}
+        # the reserve for the first outage beyond the horizon, held where the site's reserve policy asks for it: the chance that an outage starts
+        # on the horizon's last day (the forecast for the day after) at or above its threshold (round 7, engine-plans-live-12: a hard-coded
+        # 0.5 outages a day decided it, and the site's setting did nothing). Two hours of the critical load, never above what the battery and the
+        # inverter can deliver (engine-plans-live-06)
+        p_next = 1.0 - float(np.prod(1.0 - np.clip(p_start[-96:], 0.0, 1.0))) if len(p_start) else 0.0
+        kw_next = np.minimum(Lc[-96:], float(b_asset["p_dis_kw"]))
+        if p.get("inverter_kw_ac"):
+            kw_next = np.minimum(kw_next, float(p["inverter_kw_ac"]))
+        r_next = float(np.mean(kw_next)) * 2.0 / b_asset["eta_d"] if (off_grid or p_next >= p["reserve_threshold"]) and len(kw_next) else 0.0
+        p["terminal"] = {"c_next": c_next, "H_peak": 4.0, "R_next": r_next, "c_cal_hold": float(np.mean(bat["b_cal"][:32])) if steps else 0.0,
+                         "p_next": p_next}
     return p
 
 

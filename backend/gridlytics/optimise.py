@@ -1047,8 +1047,10 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
             d = {"kw": round(P, 1), "rs_per_kwh": round(_gen_marginal(gen), 1)}
         elif bat and E1 > (Efl if g[t] > 0.5 else Emin) + tol and (why := held(t, E1)) is not None:
             r, d = why
-        elif gen and g[t] > 0.5 and float(p["p_start"][t]) > 0.2:
+        elif gen and g[t] > 0.5 and float(p["p_start"][t]) >= float(p.get("reserve_threshold", 0.2)) > 0.0:
+            # an outage at least as likely as the site's reserve threshold (round 7, engine-plans-live-12), with its chance
             r = "genset_off"
+            d = {"p": round(float(p["p_start"][t]), 2)}
         else:
             r = "idle"
         reasons.append({"reason": r, "detail": d})

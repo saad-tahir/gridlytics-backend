@@ -711,3 +711,62 @@ def test_the_reserve_floor_shipped_is_the_reserve_the_plan_holds():
         assert s["reserve_pct"] <= s["soc_pct"] + 0.1
     assert min(s["reserve_pct"] for s in steps) < 20.0                # no 95 % floor through the peak
 
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-12
+
+def test_the_reserve_policys_threshold_decides_the_reserve_beyond_the_horizon(company):
+    """The site's "reserve when an outage is this likely" did nothing: R_next switched on a hard-coded 0.5 outages a day. It now follows the
+    site's threshold against the chance that an outage starts on the horizon's last day (the forecast for the day after): a Lahore feeder's
+    0.35 trips a day is a 30 % chance, over the default 20 %, and under a 50 % threshold."""
+    sid = _site(disco="LESCO")
+    full = sites.full(sid)
+    t0 = twin.day_start_utc(date(2026, 11, 3))
+    bundle = forecast.issue(full, t0, save=False)
+    p = plans.build_problem(full, t0, bundle, 192)
+    chance = 1.0 - float(np.prod(1.0 - np.asarray(bundle["outage"]["p_start"][96:192])))
+    assert 0.2 < chance < 0.5
+    assert p["terminal"]["p_next"] == pytest.approx(chance, abs=1e-6)
+    assert p["terminal"]["R_next"] > 0
+    # the reserve beyond the horizon is what the battery can deliver: 2 hours of the critical load, never above its discharge power
+    assert p["terminal"]["R_next"] == pytest.approx(float(np.mean(np.minimum(p["Lc"][-96:], 100.0))) * 2.0 / 0.95, abs=1e-6)
+    sites.put_asset(sid, "battery", {"nameplate_kwh": 200, "p_ch_kw": 100, "p_dis_kw": 20}, "t")
+    q = plans.build_problem(sites.full(sid), t0, bundle, 192)
+    assert q["terminal"]["R_next"] == pytest.approx(20.0 * 2.0 / 0.95, abs=1e-6)
+    sites.update(sid, {"reserve_policy": {"p_threshold": 0.5, "min_soc_pct": 20.0}}, "t")
+    full = sites.full(sid)
+    q = plans.build_problem(full, t0, bundle, 192)
+    assert q["terminal"]["R_next"] == 0.0
+
+
+def test_no_step_enters_a_likely_outage_under_the_reserve_floor():
+    """Faisalabad entered its 81 %-likely scheduled load shedding at 13.0-13.7 % against the site's "20 % floor when an outage is 20 % likely".
+    The delivered floor (min_soc_pct, which the fallback holds on every grid-up step) keeps it at 20 % or more, peak or not."""
+    p = _floored(_problem(peak=(24, 40)))
+    p["c_imp"] = np.where(np.asarray(p["peak"]), 40.02, 28.0)
+    p["battery"]["E0"] = 150.0
+    p["p_start"] = np.zeros(p["T"])
+    p["p_start"][39] = 0.81                                            # a window adherence 0.8 keeps g = 1: the chance sits on the step before
+    p["Lc"] = np.zeros(p["T"])                                         # no reserve row: the floor alone holds the battery
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    assert float(np.sum(r["sol"]["D"][24:40])) > 1.0
+    assert float(r["sol"]["E"][40]) >= 40.0 - 1e-6
+    p["battery"].pop("soc_floor_grid")
+    assert float(optimise.solve(p)["sol"]["E"][40]) < 40.0 - 1.0     # without the floor the peak took it to the cut-off
+
+
+def test_genset_off_is_named_at_the_sites_threshold_with_its_chance():
+    """"Genset off ... although an outage is likely soon" was named above a fixed 20 %: it follows the site's threshold and gives the chance."""
+    p = _problem()
+    p["genset"] = {"S": 100.0, "f_min": 0.3, "a": 0.273, "b": 0.033, "c_fuel": 380.0, "c_start": 1500.0, "c_runhr": 400.0, "c_om": 8.0, "UT": 4,
+                   "DT": 2, "u_prev": 0, "elapsed": 99, "cap_hours": 24.0, "hours_today": 0.0, "day_index": np.zeros(p["T"], dtype=int),
+                   "fuel_available": 1e9, "parallel": False, "control": "manual", "hold": np.zeros(p["T"], dtype=bool)}
+    del p["battery"]
+    p["p_start"] = np.full(p["T"], 0.12)
+    p["reserve_threshold"] = 0.1
+    r = optimise.solve(p)
+    assert r["reasons"][10]["reason"] == "genset_off"
+    assert r["reasons"][10]["detail"]["p"] == pytest.approx(0.12)
+    p["reserve_threshold"] = 0.2
+    r = optimise.solve(p)
+    assert r["reasons"][10]["reason"] == "idle"
