@@ -314,8 +314,9 @@ def _run_kpis(res: dict) -> dict:
 @router.get("/api/sites/{site_id}/genset")
 def genset_page(site_id: str, days: int = 14):
     """UI-11: the period's KPIs, runs, the fuel curve, the price, the plan's requests and steps, the
-    policy. Litres are metered where a fuel meter reads and from the fuel curve where not (`litres_source` as on the Savings page); without a genset
-    reading in the period (`signal.present` false) the hours, starts and litres are unknown (null), not zero."""
+    policy. Litres are metered where a fuel meter reads and from the fuel curve where not (`litres_source` as on the Savings page); each run's fuel is
+    priced at the fuel price of its own Karachi day (`price_per_l`, `fuel_cost_rs`); without a genset reading in the period (`signal.present` false) the
+    hours, starts and litres are unknown (null), not zero."""
     s = full_or_404(site_id)
     g = (s.get("assets") or {}).get("genset")
     if not g:
@@ -326,15 +327,27 @@ def genset_page(site_id: str, days: int = 14):
     runs = res["runs"]
     from . import tariffs
     kind = g.get("fuel_kind", "hsd")
+    prices: dict[str, float] = {}
+
+    def price_on(ts: int) -> float:
+        day = datetime.fromtimestamp(ts, PKT).date().isoformat()
+        if day not in prices:
+            prices[day] = tariffs.fuel_price(kind, day)[0]
+        return prices[day]
+
     for r in runs:
         p = plans.active_at(site_id, r["start"])
         stp = next((x for x in (p or {}).get("steps", []) if x["t"] <= r["start"] < x["t"] + 900), None)
         r["plan_requested"] = bool(stp and stp["genset_on"])
+        r["price_per_l"] = price_on(r["start"])
+        r["fuel_cost_rs"] = round(r["litres"] * r["price_per_l"], 0)
     kpis = _run_kpis(res)
+    known = kpis["litres"] is not None
+    kpis["fuel_cost_rs"] = round(sum(r["fuel_cost_rs"] for r in runs), 0) if known else None
     price, src = tariffs.fuel_price(kind, today())
-    kpis["fuel_cost_rs"] = round(kpis["litres"] * price, 0) if kpis["litres"] is not None else None
+    used = [r["price_per_l"] for r in runs]
     answer = {"genset": g, "control": s["data"].get("genset_start_control"), "signal": res["signal"], "kpis": kpis,
-              "fuel_price": {"price_per_l": price, "source": src, "kind": kind},
+              "fuel_price": {"price_per_l": price, "source": src, "kind": kind, "range_per_l": [min(used), max(used)] if used else None},
               "runs": list(reversed(runs)),
               "curve": {"a": g["a"], "b": g["b"], "rated_kw": g["rated_kw"],
                         "points": [{"load_ratio": lr, "litres_per_hour": round(g["a"] * lr * g["rated_kw"] + g["b"] * g["rated_kw"], 2)}

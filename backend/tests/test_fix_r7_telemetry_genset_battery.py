@@ -438,6 +438,33 @@ def _route_site(c, name: str, **g) -> str:
     return sid
 
 
+def test_the_genset_page_names_its_litres_and_prices_each_run_at_its_own_day_s_price(world):
+    """pages-C-03 and role-owner-07: a metered run (30 L) on a day whose diesel is Rs 300/L and an unmetered one (31 L from the curve) on a day whose
+    diesel is Rs 400/L cost Rs 21,400, not 61 L at the newest price; the litres are named partly estimated; a viewer gets the litres, no rupees."""
+    from gridlytics import tariffs
+    c = world.owner
+    sid = _route_site(c, "Priced")
+    d1, d2 = _pk_day(2), _pk_day(1)
+    with world.use():
+        tariffs.ensure_shipped()
+        tariffs.add_fuel_price("hsd", d1.isoformat(), 300.0, "t")
+        tariffs.add_fuel_price("hsd", d2.isoformat(), 400.0, "t")
+        _one_run(sid, _pk_ts(d1, 10), fuel=0.5)
+        _one_run(sid, _pk_ts(d2, 10))
+    page = c.get(f"/api/sites/{sid}/genset").json()
+    k = page["kpis"]
+    assert (k["litres"], k["litres_metered"], k["litres_curve"], k["litres_source"], k["estimated"]) == (61.0, 30.0, 31.0, "curve", True)
+    runs = sorted(page["runs"], key=lambda r: r["start"])
+    assert [(r["litres"], r["litres_source"], r["price_per_l"], r["fuel_cost_rs"]) for r in runs] == [(30.0, "meter", 300.0, 9000.0),
+                                                                                                       (31.0, "curve", 400.0, 12400.0)]
+    assert k["fuel_cost_rs"] == 21400.0 and k["kwh"] == pytest.approx(200.0)
+    assert page["fuel_price"]["range_per_l"] == [300.0, 400.0]
+    v = world.role("viewer").get(f"/api/sites/{sid}/genset").json()
+    assert v["kpis"]["litres"] == 61.0 and v["kpis"]["litres_source"] == "curve"
+    assert "fuel_cost_rs" not in v["kpis"] and "fuel_price" not in v
+    assert all(not {"price_per_l", "fuel_cost_rs"} & set(r) for r in v["runs"])
+
+
 def test_no_run_signal_is_unknown_and_a_live_signal_with_no_runs_is_zero(world):
     """pages-C-05: a source that sends no genset reading gives hours, starts and litres as unknown (null), not 0 h / 0 starts / 0 L; once the signal is
     read and says off, the zeros are facts."""
