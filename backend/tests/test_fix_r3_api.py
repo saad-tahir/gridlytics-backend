@@ -174,9 +174,10 @@ def test_an_events_batch_whose_re_solve_cannot_be_held_is_answered_failed_with_i
 
     monkeypatch.setattr(routes_edge, "_merge_pending", broken)
     _, post_e = _posts(world, sid, kh)
-    r = post_e(1, [{"ts": _iso(_now()), "type": "outage_start"}])
+    events = [{"ts": _iso(_now()), "type": "outage_start"}]
+    r = post_e(1, events)
     assert r.status_code == 200 and r.json()["stored"] == 1 and r.json()["resolve"] == "failed", r.text
-    assert post_e(1, [{"ts": _iso(_now()), "type": "outage_start"}]).json()["duplicate"] is True
+    assert post_e(1, events).json()["duplicate"] is True                # the same message sent again
 
 
 # ------------------------------------------------------------------------------------------------ plan held
