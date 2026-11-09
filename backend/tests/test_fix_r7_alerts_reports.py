@@ -247,7 +247,7 @@ def test_a_forecast_bust_is_the_plans_and_a_fog_morning_raises_it(world):
         sites.put_asset(sid, "pv", {"kwp_dc": 120, "kw_ac": 100}, "test")
         _pv_day(sid, day, [x * 0.95 for x in cs], fog, cs)
         rows = alerts.forecast_bust(sites.full(sid), day)
-        assert rows and rows["hours"] >= 3.5 and rows["nrmse"] < 0.6, rows    # the old rule (daily nRMSE by nameplate > 0.6) never saw it
+        assert rows and rows["hours"] >= 3.5 and rows["nrmse_pct"] < 60, rows    # the old rule (daily nRMSE by nameplate > 0.6) never saw it
         alerts.nightly(sid, day)
         bust = [a for a in alerts.listing("active", sid) if a["rule"] == "forecast_bust"]
         assert len(bust) == 1 and bust[0]["category"] == "Forecast", bust
@@ -384,6 +384,7 @@ def test_a_bill_the_rebuild_misses_by_more_than_the_threshold_raises_a_tariff_al
         alerts.evaluate(sid, now)
         got = [a for a in alerts.listing("active", sid) if a["rule"] == "bill_residual"]
         assert len(got) == 1 and got[0]["category"] == "Tariff" and "3.4 %" in got[0]["title"], got
+        assert got[0]["detail"] == {"period_start": "2026-09-01", "period_end": "2026-09-30", "difference_pct": -3.4}   # no bill id
         with store.connect() as con:
             con.execute("INSERT INTO bills (id, site_id, connection_id, period_start, period_end, real, rebuilt, difference_pct, created) "
                         "VALUES (?,?,?,?,?,?,?,?,?)", ("b2", sid, cid, "2026-10-01", "2026-10-31", "{}", "{}", 1.1, store._now()))
@@ -430,6 +431,7 @@ def test_the_savings_and_product_rules_after_the_nightly_jobs(world, monkeypatch
         got = {a["rule"]: a for a in alerts.listing("active", sid)}
         assert "savings_negative" not in got and "fee_above_third" not in got, got.keys()
         assert got["savings_withheld"]["category"] == "Savings" and "not metered" in got["savings_withheld"]["title"], got["savings_withheld"]
+        assert got["savings_withheld"]["detail"] == {"day": day.isoformat()}                 # the reason is said in the title, not as its code
     # the viewer sees none of them; the analyst sees the Product one (the fee is theirs to read)
     assert not [a for a in world.c["viewer"].get("/api/alerts").json() if a["category"] in ("Savings", "Product")]
 

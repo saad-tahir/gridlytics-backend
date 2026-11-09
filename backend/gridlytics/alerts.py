@@ -220,7 +220,7 @@ def _plan_expired(site_id: str, plan: dict | None, now: int, ready: bool) -> Non
     """Control: the plan in force ran past its end and nothing replaced it (R8 2.16, "plan expired without replacement")."""
     until = _event_ts((plan or {}).get("valid_until"))
     _set(ready and until is not None and until <= now, site_id, "plan_expired", "Control", "critical",
-         f"The plan in force ended at {_when(until)} and no new plan replaced it" if until else "", {"plan_id": (plan or {}).get("id")})
+         f"The plan in force ended at {_when(until)} and no new plan replaced it" if until else "", {"ended_at": until})
 
 
 def _edge_offline(site: dict, now: int, ready: bool, minutes: float) -> None:
@@ -245,7 +245,7 @@ def _bill_residual(site_id: str, pct: float) -> None:
         a, b = date.fromisoformat(r["period_start"][:10]), date.fromisoformat(r["period_end"][:10])
         title = f"The bill for {a.day} {a:%b} to {b.day} {b:%b %Y}, rebuilt from the data, differs from the printed bill by {abs(diff):.1f} %"
     _set(on, site_id, "bill_residual", "Tariff", "warning", title,
-         {"bill": r["id"], "period_start": r["period_start"], "period_end": r["period_end"], "difference_pct": diff} if on else {})
+         {"period_start": r["period_start"], "period_end": r["period_end"], "difference_pct": diff} if on else {})
 
 
 def _forecast_stages(site_id: str, now: int) -> None:
@@ -304,7 +304,7 @@ def tariff_staleness(site: dict, now: int, rules_: dict) -> None:
         name = name[:1].lower() + name[1:]
         title = (f"NEPRA's notification for the {name} was due on {_long(date.fromisoformat(first['effective_from']))} and is not in the library: "
                  "bills and plans still use the rates before it" + (f" ({len(due) - 1} more waiting)" if len(due) > 1 else ""))
-    _set(on, sid, "tariff_awaiting", "Tariff", "warning", title, {"due": [(v["kind"], v["key"], v["effective_from"]) for v in due]} if on else {})
+    _set(on, sid, "tariff_awaiting", "Tariff", "warning", title, {"due_on": due[0]["effective_from"], "waiting": len(due)} if on else {})
     # a version in force that ended with nothing after it
     keys = set()
     for c in grid:
@@ -323,7 +323,7 @@ def tariff_staleness(site: dict, now: int, rules_: dict) -> None:
         kind, _key, end = lapsed[0]
         title = (f"The {KIND_WORDS.get(kind, kind)} in force ended on {_long(date.fromisoformat(end[:10]))} and no version follows it"
                  + (f" ({len(lapsed) - 1} more)" if len(lapsed) > 1 else ""))
-    _set(bool(lapsed), sid, "tariff_lapsed", "Tariff", "warning", title, {"lapsed": lapsed} if lapsed else {})
+    _set(bool(lapsed), sid, "tariff_lapsed", "Tariff", "warning", title, {"ended_on": lapsed[0][2][:10], "waiting": len(lapsed)} if lapsed else {})
     # the month's FCA and QTA
     month = tariffs.billing_month_for(grid[0], today) if grid else None
     for key, words in (("fca", "FCA"), ("qta", "QTA")):
@@ -346,7 +346,7 @@ def tariff_staleness(site: dict, now: int, rules_: dict) -> None:
     old = age is not None and age > _th(rules_, "Tariff", "diesel_price_days" if kind == "hsd" else "gas_price_days")
     _set(old, sid, "fuel_price_old", "Tariff", "info",
          f"The latest {FUEL_WORDS.get(kind, kind)} price in the library is from {_long(date.fromisoformat(last[:10]))}, {age} days ago" if old else "",
-         {"fuel": kind, "valid_from": last, "days": age} if old else {})
+         {"price_from": last[:10], "days": age} if old else {})
 
 
 GENSET_RULES = ("genset_unrequested", "genset_low_load", "genset_request_missed")
@@ -880,9 +880,9 @@ def forecast_bust(site: dict, day: date, bust_pct: float = 30.0) -> dict | None:
     ok = ~np.isnan(act) & (cs > 0.1 * max(float(np.max(cs)), 1e-6))
     kw = float(pv.get("kw_ac") or 1.0)
     worst = int(np.argmax(err))
-    return {"day": day.isoformat(), "hours": round(float(busted.sum()) * 0.5, 1), "windows_scored": int(day_ok.sum()),
+    return {"day": day.isoformat(), "hours": round(float(busted.sum()) * 0.5, 1),
             "worst_at": t0 + worst * 1800 if busted.any() else None, "worst_pct": round(float(err[worst]) * 100) if busted.any() else None,
-            "nrmse": round(float(np.sqrt(np.mean((pred[ok] - act[ok]) ** 2)) / kw), 4) if ok.any() else None}
+            "nrmse_pct": round(float(np.sqrt(np.mean((pred[ok] - act[ok]) ** 2)) / kw) * 100, 1) if ok.any() else None}
 
 
 def nightly(site_id: str, day: date) -> None:
@@ -924,7 +924,7 @@ def _savings_day(site_id: str, day: date, ready: bool) -> None:
     withheld = ready and bool(why)
     _set(withheld, site_id, "savings_withheld", "Savings", "info",
          f"No saving is claimed for {when}: {WITHHELD_WORDS.get(why, str(why).replace('_', ' '))}" if withheld else "",
-         {"day": day.isoformat(), "reason": why} if withheld else {})
+         {"day": day.isoformat()} if withheld else {})
 
 
 def _fee_check(site_id: str, day: date, ready: bool) -> None:
