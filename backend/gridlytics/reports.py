@@ -7,6 +7,8 @@ import csv
 import hashlib
 import io
 import json
+import math
+import re
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -32,10 +34,34 @@ def _text(value) -> str:
     return escape(str(value))
 
 
+def _round(x: float, digits: int = 0) -> float:
+    """x rounded as the web app's Math.round does: half toward +infinity (1900.5 to 1901, -1900.5 to -1900), so a report reads what the page
+    reads; Python's format rounds half to even, which printed a saving of Rs 1,900.5 as "Rs 1,900" beside a claim of "Rs 1,901"."""
+    scale = 10 ** digits
+    v = x * scale
+    r = math.floor(v)
+    if v - r >= 0.5:
+        r += 1
+    return r / scale
+
+
+def _finite(x) -> float | None:
+    if x is None or isinstance(x, bool):
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
 def rs(x) -> str:
-    if x is None:
+    """Whole rupees as the page writes them (lib/format.ts rs): "Rs 1,234", "-Rs 1,234", never "Rs -0"; a dash when missing."""
+    v = _finite(x)
+    if v is None:
         return "-"
-    return ("-" if x < 0 else "") + "Rs " + f"{abs(x):,.0f}"
+    r = int(_round(v)) or 0
+    return ("-" if r < 0 else "") + "Rs " + f"{abs(r):,}"
 
 
 def num(x, fmt: str = ",.0f", unit: str = "", scale: float = 1.0) -> str:
@@ -49,6 +75,14 @@ def num(x, fmt: str = ",.0f", unit: str = "", scale: float = 1.0) -> str:
     if v != v or v in (float("inf"), float("-inf")):
         return "-"
     return f"{v:{fmt}}{unit}"
+
+
+def file_name(r: dict, which: str) -> str:
+    """The name a download is saved under: the site, the kind and the month ("gridlytics-faisalabad-textile-mill-monthly-savings-2026-11.pdf"), so
+    two sites' reports of a month never share a name; a site name with no Latin letters or digits gives the site's id instead."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(r.get("site_name") or "").lower()).strip("-")[:60].strip("-") or str(r.get("site_id") or "")
+    kind = str(r.get("kind") or "report").replace("_", "-")
+    return "-".join(x for x in ("gridlytics", slug, kind, str(r.get("period") or "")) if x) + f".{which}"
 
 
 def _dir() -> Path:
@@ -213,9 +247,13 @@ def listing(site_id: str | None = None) -> list[dict]:
 
 
 def get(rid: str) -> dict | None:
+    """One report as the list shows it, its site's name included."""
     with store.connect() as con:
         r = con.execute("SELECT * FROM reports WHERE id = ?", (rid,)).fetchone()
-    return _row_out(r) if r else None
+    if r is None:
+        return None
+    site = sites.get(r["site_id"]) if r["site_id"] else None
+    return {**_row_out(r), "site_name": (site or {}).get("name", "")}
 
 
 def file_path(rid: str, which: str) -> Path | None:

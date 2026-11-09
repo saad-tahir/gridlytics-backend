@@ -509,3 +509,40 @@ def test_the_rules_a_reader_reads_are_those_of_the_categories_they_receive(world
     assert set(world.c["viewer"].get(f"/api/alerts/rules/sites/{sid}").json()["rules"]) == set(viewer)
     assert "Product" not in world.c["operator"].get("/api/alerts/rules").json()
     assert len(world.c["admin"].get("/api/alerts/rules").json()) == 9
+
+
+# ------------------------------------------------------------------------------------------------ reports: role-analyst-25
+
+def _past_month(back: int = 1) -> str:
+    """A whole month before this one ("YYYY-MM"), `back` months back."""
+    d = datetime.now(PKT).date().replace(day=1)
+    for _ in range(back):
+        d = (d - timedelta(days=1)).replace(day=1)
+    return d.strftime("%Y-%m")
+
+
+def test_report_rupees_round_as_the_page_does_and_claimed_never_reads_above_saving():
+    from gridlytics import reports
+    # the page's rs() is Math.round: half toward +infinity, and never "Rs -0"; Python's format rounds half to even (1900.5 read "Rs 1,900")
+    assert reports.rs(1900.5) == "Rs 1,901" and reports.rs(1901.13) == "Rs 1,901"
+    assert reports.rs(2.5) == "Rs 3" and reports.rs(-1900.5) == "-Rs 1,900" and reports.rs(-0.4) == "Rs 0" and reports.rs(None) == "-"
+    assert reports.rs(1234567.49) == "Rs 1,234,567" and reports.rs(float("nan")) == "-"
+
+
+def test_report_downloads_are_named_after_the_site_kind_and_month(world):
+    sid, month = world.site, _past_month()
+    with world.use():
+        sites.update(sid, {"name": "Faisalabad Textile Mill (demo)"}, "test")
+    a = world.c["admin"]
+    rep = a.post("/api/reports", json={"kind": "energy_only", "site_id": sid, "period": month})
+    assert rep.status_code == 200, rep.text
+    for which in ("pdf", "csv"):
+        r = a.get(f"/api/reports/{rep.json()['id']}/{which}")
+        assert r.status_code == 200
+        assert f'filename="gridlytics-faisalabad-textile-mill-demo-energy-only-{month}.{which}"' in r.headers["content-disposition"], r.headers
+    # a name with no Latin letters or digits falls back to the site's id, so two sites never share a file name
+    with world.use():
+        sites.update(sid, {"name": "مل"}, "test")
+    rep = a.post("/api/reports", json={"kind": "energy_only", "site_id": sid, "period": month}).json()
+    r = a.get(f"/api/reports/{rep['id']}/pdf")
+    assert f'filename="gridlytics-{sid}-energy-only-{month}.pdf"' in r.headers["content-disposition"], r.headers

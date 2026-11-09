@@ -53,4 +53,5 @@ def download(rid: str, which: str):
         raise Refusal(404, "The report's file is missing; generate it again", "not_found")
     # every export is audited (plan Part 2.8 and 10.5)
     store.audit(auth.actor(), f"downloaded a report ({which})", r["site_id"], {"report": rid, "kind": r["kind"], "period": r["period"]})
-    return FileResponse(p, media_type="application/pdf" if which == "pdf" else "text/csv", filename=f"gridlytics-{r['kind']}-{r['period']}.{which}")
+    # named after the site, the kind and the month (audit role-analyst-25): two sites' reports of a month are two files
+    return FileResponse(p, media_type="application/pdf" if which == "pdf" else "text/csv", filename=reports.file_name(r, which))
