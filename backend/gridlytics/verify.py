@@ -85,7 +85,7 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
     c_exp = np.asarray(vec["c_exp"], dtype=float)
     if _legacy(conn):
         # the optimiser's tie-break (an export priced a hair below the import it nets) is not on the bill: the ledger prices exports as the bill does
-        c_exp = c_exp + tariffs.LEGACY_EXPORT_TIE_BREAK
+        c_exp = c_exp + np.asarray(vec["export_tie_break"], dtype=float)  # only where it was taken off: an export outside the agreement earns nothing
     mdi = vec["mdi"] or {}
     iv = int(conn["data"].get("mdi_interval_min", 30) or 30)
     if iv <= 0 or 1440 % iv:
@@ -898,6 +898,11 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
             fidelity_score = conf["fidelity"] if conf else None
     else:
         fidelity = "recommendation_only"
+    # a genset day before the first entered fuel price has no fuel price (tariffs.fuel_price: the first one stands in, flagged): where an arm burned
+    # fuel, or the carry-over off the grid is valued at the set's fuel, the saving rests on a price the day did not have, so the day says so and
+    # claims nothing until a price is entered for it (audit engine-money-live-15)
+    no_fuel_price = (bool(gen_asset) and bool(tariffs.fuel_price(gen_asset.get("fuel_kind", "hsd"), day)[1].get("stands_in"))
+                     and (any(arm["litres"] > 0 for arm in arms.values()) or (bool(b) and not on_grid)))
     rows = {}
     for base in ("native", "tuned"):
         a, n = arms["actual"], arms[base]
@@ -916,7 +921,8 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
         # a day whose import or whose actual battery flow is unknown claims nothing: withholding only its wear lever would credit the baseline's whole
         # wear when the actual cycled more (the "never over-claim" rule of plan 8.4); likewise a day whose genset may have run unseen, whose energy
         # the grid levers or the carry-over would credit without its fuel
-        withheld = ("import_unknown" if imp_unknown else "battery_flow_unknown" if wear_unknown else "genset_unknown" if gen_unseen else None)
+        withheld = ("import_unknown" if imp_unknown else "battery_flow_unknown" if wear_unknown else "genset_unknown" if gen_unseen
+                    else "no_fuel_price" if no_fuel_price else None)
         claim = saving if fidelity in CLAIMING and not withheld else 0.0
         rows[base] = {"saving_rs": saving, "claimed_rs": claim, "levers": levers, "actual": a, "baseline": n, "fidelity": fidelity,
                       "fidelity_score": fidelity_score, "litres_saved": None if g_unknown else round(n["litres"] - a["litres"], 2),
@@ -1314,8 +1320,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
     today_l = datetime.now(PKT).date()
     sb_days = sum((date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in switchback_blocks(site_id)
                   if date.fromisoformat(b["block_end"]) < today_l)
-    fca_billed = (not on_grid) or all(any(a["key"] == "fca" for a in tariffs.adders_for(mk))
-                                      for mk in _months_between(bill_month(d0) + "-01", bill_month(d1) + "-01"))
+    fca_billed = (not on_grid) or all(tariffs.fca_billed(mk) for mk in _months_between(bill_month(d0) + "-01", bill_month(d1) + "-01"))
     out["preliminary"] = (verified < VERIFIED_DAYS_FOR_FINAL or not native_capture or sb_days < 7 * SWITCHBACK_WEEKS_FOR_FINAL or not fca_billed)
     out["final_conditions"] = {"verified_days": verified, "verified_days_needed": VERIFIED_DAYS_FOR_FINAL, "native_capture": native_capture,
                                "switchback_weeks": round(sb_days / 7, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL, "fca_billed": fca_billed}
@@ -1452,6 +1457,12 @@ def switchback_result(site_id: str) -> dict:
 
 # ------------------------------------------------------------------------------------------------ bill truth (Part 8.2 layer 3)
 
+#: The bill comparison's check (plan 8.2 layer 3, 6.3 step 13): the rebuilt total, and each printed unit and MDI figure, within 2 percent of the bill
+BILL_CHECK_PCT = 2.0
+#: Below this share of the period's minutes with meter data the comparison gives no verdict: the gaps are filled from the profile, an estimate
+BILL_COMPLETENESS_MIN = 0.9
+
+
 def _bill_day(value, what: str) -> date:
     if not isinstance(value, str):
         raise ValueError(f"A bill's {what} is a date written YYYY-MM-DD")
@@ -1461,13 +1472,10 @@ def _bill_day(value, what: str) -> date:
         raise ValueError(f"A bill's {what} is a date written YYYY-MM-DD") from None
 
 
-def add_bill(site_id: str, fields: dict, by: str) -> dict:
-    """Enter a DISCO bill and rebuild it from telemetry. The period is either the first day billed and the reading date (period_start, period_end,
-    both billed), or the two reading dates as printed on the bill: previous_reading_date (not billed: it closed the bill before) and period_end, or
-    period_start with period_start_is_reading true. Both forms are stored as the first and last day billed."""
-    conns = sites.connections(site_id)
-    if not conns:
-        raise ValueError("Add the site's grid connection first")
+def _bill_fields(fields: dict) -> tuple[date, date, date, bool, float, dict]:
+    """A bill's period, total and printed figures as entered: (p0, p1, first day billed, p0 is the previous reading, total, the stored `real`).
+    The period is either the first day billed and the reading date (period_start, period_end, both billed), or the two reading dates as printed on
+    the bill: previous_reading_date (not billed: it closed the bill before) and period_end, or period_start with period_start_is_reading true."""
     prev_reading = fields.get("previous_reading_date")
     exclusive = prev_reading not in (None, "") or fields.get("period_start_is_reading") is True
     try:
@@ -1479,37 +1487,226 @@ def add_bill(site_id: str, fields: dict, by: str) -> dict:
     first = p0 + timedelta(days=1) if exclusive else p0
     if p1 < first or (p1 - first).days > 40:
         raise ValueError("A billing period runs forwards and is at most 40 days")
-    real = {k: fields.get(k) for k in ("total_rs", "units_peak", "units_off_peak", "mdi_kw", "reference") if fields.get(k) not in (None, "")}
+    real = {k: fields.get(k) for k in ("total_rs", "units_peak", "units_off_peak", "mdi_kw", "power_factor_pct", "reference")
+            if fields.get(k) not in (None, "")}
+    for k in ("units_peak", "units_off_peak", "mdi_kw", "power_factor_pct"):
+        if k in real and (not tariffs._num(real[k]) or real[k] < 0 or (k == "power_factor_pct" and not 0 < real[k] <= 100)):
+            raise ValueError("A bill's units and MDI are numbers of zero or more, and its power factor a percent above 0 and at most 100")
     if exclusive:
         real["previous_reading_date"] = p0.isoformat()
-    bid = store.new_id()
-    rebuilt = rebuild_bill(site_id, conns[0], p0, p1, period_start_exclusive=exclusive)
-    diff = round((rebuilt["total_rs"] - total) / total * 100, 2) if total else None
+    return p0, p1, first, exclusive, total, real
+
+
+def _bill_overlap(con, connection_id: str, first: date, last: date, skip_id: str = "") -> None:
+    """Refuse a period that overlaps a bill of the connection already entered (one meter reading bills each day once)."""
+    r = con.execute("SELECT period_start, period_end FROM bills WHERE connection_id = ? AND period_start <= ? AND period_end >= ? AND id != ? "
+                    "ORDER BY period_start LIMIT 1", (connection_id, last.isoformat(), first.isoformat(), skip_id)).fetchone()
+    if r is not None:
+        span = tariffs._day_span(date.fromisoformat(r["period_start"]), date.fromisoformat(r["period_end"]))
+        raise ValueError(f"This bill's period overlaps the bill for {span} already entered: correct or delete that bill instead")
+
+
+def _carried_into(connection_id: str, first: date, skip_id: str = "") -> float:
+    """The export credit the connection's bill ending the day before `first` carried forward (0 without one)."""
     with store.connect() as con:
+        r = con.execute("SELECT rebuilt FROM bills WHERE connection_id = ? AND period_end = ? AND id != ?",
+                        (connection_id, (first - timedelta(days=1)).isoformat(), skip_id)).fetchone()
+    return float(json.loads(r["rebuilt"]).get("credit_carried_rs") or 0.0) if r else 0.0
+
+
+def _difference(rebuilt: dict, total: float) -> float | None:
+    return round((rebuilt["total_rs"] - total) / total * 100, 2) if total else None
+
+
+def _rechain(connection_id: str, after: date, carried: float) -> None:
+    """Carry a credit along the bills that follow: the bill starting the day after `after` takes `carried` as its credit brought forward (step 9), and
+    its own carried credit moves on to the next, until one is unchanged. Only the settlement changes; nothing is re-read from the meter."""
+    while True:
+        with store.connect() as con:
+            r = con.execute("SELECT * FROM bills WHERE connection_id = ? AND period_start = ?",
+                            (connection_id, (after + timedelta(days=1)).isoformat())).fetchone()
+        if r is None:
+            return
+        rebuilt = json.loads(r["rebuilt"])
+        if "charges_rs" not in rebuilt or abs(float(rebuilt.get("credit_brought_forward_rs") or 0.0) - carried) < 0.005:
+            return  # unchanged, or a bill rebuilt before credits were carried (kept as entered)
+        lines, total, nxt = tariffs.settle(rebuilt["lines"], rebuilt["charges_rs"], rebuilt["credits_rs"] - rebuilt.get("credit_before_tax_rs", 0.0),
+                                           carried)
+        rebuilt.update(lines=lines, total_rs=round(total, 2), credit_brought_forward_rs=round(carried, 2), credit_carried_rs=round(nxt, 2))
+        diff = _difference(rebuilt, float(json.loads(r["real"]).get("total_rs") or 0.0))
+        with store.connect() as con:
+            con.execute("UPDATE bills SET rebuilt = ?, difference_pct = ? WHERE id = ?", (json.dumps(rebuilt), diff, r["id"]))
+        after, carried = date.fromisoformat(r["period_end"]), nxt
+
+
+def _reconcile(real: dict, rebuilt: dict) -> list[dict]:
+    """The printed figures besides the total, line by line against the rebuilt ones (plan 6.3 step 13, VER-04): peak and off-peak units against the
+    rebuilt imports by period (the import register, before any netting), the MDI against the rebuilt MDI; each with its residual and the 2 % check."""
+    gross = rebuilt.get("import_gross_kwh") or rebuilt.get("import_kwh") or {}
+    rows = []
+    for key, value in (("units_peak", gross.get("peak")), ("units_off_peak", gross.get("off_peak")), ("mdi_kw", rebuilt.get("mdi_kw"))):
+        printed = real.get(key)
+        if not tariffs._num(printed) or not tariffs._num(value):
+            continue
+        diff = float(value) - float(printed)
+        pct = diff / printed * 100 if printed else None
+        rows.append({"line": key, "printed": float(printed), "rebuilt": round(float(value), 2), "difference": round(diff, 2),
+                     "difference_pct": None if pct is None else round(pct, 2),
+                     "within": abs(diff) < 0.5 if pct is None else abs(pct) <= BILL_CHECK_PCT})
+    return rows
+
+
+def _check(rebuilt: dict, difference_pct: float | None, rows: list[dict]) -> dict:
+    """The bill's verdict: "not_comparable" when less than BILL_COMPLETENESS_MIN of the period has meter data (no pass or fail on an estimate),
+    "outside" when the total or a printed line is off by more than BILL_CHECK_PCT (`outside` names them), "within", or "no_total"."""
+    out = {"limit_pct": BILL_CHECK_PCT, "completeness_min": BILL_COMPLETENESS_MIN, "outside": []}
+    comp = rebuilt.get("completeness")
+    if tariffs._num(comp) and comp < BILL_COMPLETENESS_MIN:
+        return {**out, "verdict": "not_comparable"}
+    outside = ([] if difference_pct is None or abs(difference_pct) <= BILL_CHECK_PCT else ["total"]) + [r["line"] for r in rows if not r["within"]]
+    return {**out, "outside": outside, "verdict": "outside" if outside else "no_total" if difference_pct is None else "within"}
+
+
+def _residuals(rows: list[dict]) -> list[dict]:
+    return [{k: r[k] for k in ("line", "printed", "rebuilt", "difference_pct")} for r in rows]
+
+
+def add_bill(site_id: str, fields: dict, by: str) -> dict:
+    """Enter a DISCO bill and rebuild it from telemetry (`_bill_fields` gives the two forms of the period; both are stored as the first and last day
+    billed). A period that overlaps a bill of the connection already entered is refused: that one is corrected (`correct_bill`) or deleted. The
+    rebuild takes the credit the bill before carried forward, and hands its own on to a bill entered after it."""
+    conns = sites.connections(site_id)
+    if not conns:
+        raise ValueError("Add the site's grid connection first")
+    conn = conns[0]
+    p0, p1, first, exclusive, total, real = _bill_fields(fields)
+    with store.connect() as con:
+        _bill_overlap(con, conn["id"], first, p1)
+    rebuilt = rebuild_bill(site_id, conn, p0, p1, period_start_exclusive=exclusive, power_factor_pct=real.get("power_factor_pct"),
+                           credit_brought_forward_rs=_carried_into(conn["id"], first))
+    diff = _difference(rebuilt, total)
+    bid = store.new_id()
+    with store.write_transaction() as con:
+        _bill_overlap(con, conn["id"], first, p1)  # again, inside the write: two entries racing for one period store one
         con.execute("INSERT INTO bills (id, site_id, connection_id, period_start, period_end, real, rebuilt, difference_pct, created) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (bid, site_id, conns[0]["id"], first.isoformat(), p1.isoformat(), json.dumps(real), json.dumps(rebuilt), diff, store._now()))
-    store.audit(by, "entered a DISCO bill", site_id, {"period": f"{first}..{p1}", "difference_pct": diff})
+                    (bid, site_id, conn["id"], first.isoformat(), p1.isoformat(), json.dumps(real), json.dumps(rebuilt), diff, store._now()))
+    rows = _reconcile(real, rebuilt)
+    store.audit(by, "entered a DISCO bill", site_id, {"period": f"{first}..{p1}", "difference_pct": diff, "residuals": _residuals(rows)})
+    _rechain(conn["id"], p1, rebuilt.get("credit_carried_rs", 0.0))
+    return _bill_answer(bid)
+
+
+def _bill_answer(bid: str) -> dict:
     with store.connect() as con:
         row = con.execute("SELECT * FROM bills WHERE id = ?", (bid,)).fetchone()
-    # the stored row as bills() lists it, with the fields this call answered before
-    return {**(_bill_row(row) if row else {}), "id": bid, "real": real, "rebuilt": rebuilt, "difference_pct": diff}
+    return _bill_row(row)
 
 
-def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_exclusive: bool = False) -> dict:
+def _bill_of(site_id: str, bill_id: str):
+    with store.connect() as con:
+        r = con.execute("SELECT * FROM bills WHERE id = ? AND site_id = ?", (bill_id, site_id)).fetchone()
+    if r is None:
+        raise LookupError("No such bill")
+    return r
+
+
+def correct_bill(site_id: str, bill_id: str, fields: dict, by: str) -> dict:
+    """Correct a bill entered with a mistake: the same fields as entering one, rebuilt again and compared; the audit line keeps what it was."""
+    r = _bill_of(site_id, bill_id)
+    conn = next((c for c in sites.connections(site_id) if c["id"] == r["connection_id"]), None)
+    if conn is None:
+        raise ValueError("This bill's grid connection no longer exists: delete the bill instead")
+    p0, p1, first, exclusive, total, real = _bill_fields(fields)
+    with store.connect() as con:
+        _bill_overlap(con, conn["id"], first, p1, skip_id=bill_id)
+    rebuilt = rebuild_bill(site_id, conn, p0, p1, period_start_exclusive=exclusive, power_factor_pct=real.get("power_factor_pct"),
+                           credit_brought_forward_rs=_carried_into(conn["id"], first, skip_id=bill_id))
+    diff = _difference(rebuilt, total)
+    with store.write_transaction() as con:
+        _bill_overlap(con, conn["id"], first, p1, skip_id=bill_id)
+        con.execute("UPDATE bills SET period_start = ?, period_end = ?, real = ?, rebuilt = ?, difference_pct = ? WHERE id = ?",
+                    (first.isoformat(), p1.isoformat(), json.dumps(real), json.dumps(rebuilt), diff, bill_id))
+    store.audit(by, "corrected a DISCO bill", site_id, {"bill_id": bill_id, "period": f"{first}..{p1}", "difference_pct": diff,
+                                                        "was": {"period": f"{r['period_start']}..{r['period_end']}", "real": json.loads(r["real"]),
+                                                                "difference_pct": r["difference_pct"]},
+                                                        "residuals": _residuals(_reconcile(real, rebuilt))})
+    old_end = date.fromisoformat(r["period_end"])
+    if old_end != p1:
+        _rechain(conn["id"], old_end, 0.0)  # the bill that followed the old period has no bill before it now
+    _rechain(conn["id"], p1, rebuilt.get("credit_carried_rs", 0.0))
+    return _bill_answer(bill_id)
+
+
+def delete_bill(site_id: str, bill_id: str, by: str) -> dict:
+    """Withdraw a bill entered by mistake; the audit line keeps what it was, and the bill after it no longer takes a credit from it."""
+    r = _bill_of(site_id, bill_id)
+    with store.connect() as con:
+        con.execute("DELETE FROM bills WHERE id = ?", (bill_id,))
+    store.audit(by, "deleted a DISCO bill", site_id, {"bill_id": bill_id, "period": f"{r['period_start']}..{r['period_end']}",
+                                                      "real": json.loads(r["real"]), "difference_pct": r["difference_pct"]})
+    _rechain(r["connection_id"], date.fromisoformat(r["period_end"]), 0.0)
+    return {"id": bill_id, "deleted": True}
+
+
+def _grid_covered(imp: np.ndarray, exp: np.ndarray) -> np.ndarray:
+    """The minutes a grid meter reading covers: a minute with an import or an export reading, and the minutes after it up to its source's next
+    reading (a 15-minute source's reading stands for its 15 minutes; forecast.sample_minutes)."""
+    known = ~np.isnan(imp) | ~np.isnan(exp)
+    covered = known.copy()
+    for k in range(1, forecast.sample_minutes(known)):
+        covered[k:] |= known[:-k]
+    return covered
+
+
+def _profile_fill(ts: np.ndarray, a: np.ndarray, covered: np.ndarray) -> tuple[np.ndarray, float]:
+    """A grid flow's minutes (kW) with the minutes no reading covers filled from the period's own profile: the mean power of the same quarter hour of
+    the day on the same kind of day (Sunday or not), else of that quarter hour on any day, else of every covered minute. A covered minute without a
+    value for this flow stays zero, as before (a blank export cell beside an import reading). Returns the filled series and the kWh the fill added."""
+    vals = np.where(np.isnan(a), 0.0, a)
+    gaps = ~covered
+    if not gaps.any() or not covered.any():
+        return vals, 0.0
+    local = np.asarray(ts, dtype=np.int64) + 5 * 3600
+    slot = (local % 86400) // 900
+    key = slot * 2 + (((local // 86400 + 3) % 7) == 6)  # 1 Jan 1970 was a Thursday: weekday 6 is Sunday
+    e_key, n_key = np.bincount(key[covered], vals[covered], 192), np.bincount(key[covered], minlength=192)
+    e_slot, n_slot = np.bincount(slot[covered], vals[covered], 96), np.bincount(slot[covered], minlength=96)
+    overall = float(vals[covered].sum() / covered.sum())
+    by_slot = np.where(n_slot > 0, e_slot / np.maximum(n_slot, 1), overall)
+    by_key = np.where(n_key > 0, e_key / np.maximum(n_key, 1), np.repeat(by_slot, 2))
+    fill = by_key[key[gaps]]
+    out = vals.copy()
+    out[gaps] = fill
+    return out, float(fill.sum() / 60.0)
+
+
+def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_exclusive: bool = False, power_factor_pct: float | None = None,
+                 credit_brought_forward_rs: float = 0.0) -> dict:
     """The connection's bill over [p0, p1] (both billed) rebuilt from telemetry; with period_start_exclusive, p0 is the previous reading date and
-    the bill starts the day after it (tariffs.rebuild's convention)."""
+    the bill starts the day after it (tariffs.rebuild's convention). Minutes no reading covers are filled from the period's own profile
+    (`_profile_fill`), never counted as zero import; `completeness` is the share of the period's minutes a grid reading covers and `filled_kwh`
+    what the fill added, and below BILL_COMPLETENESS_MIN the comparison gives no verdict (`_check`)."""
     first = p0 + timedelta(days=1) if period_start_exclusive else p0
     t0 = twin.day_start_utc(first)
     t1 = twin.day_start_utc(p1) + 86400
     g = telemetry.minute_grid(site_id, t0, t1)
-    f = telemetry.filled(g)
-    out = tariffs.rebuild(g["ts"], f["imp"], f["exp"], conn, p0, p1, period_start_exclusive=period_start_exclusive)
-    out["completeness"] = round(g["completeness"], 4)
+    covered = _grid_covered(g["imp"], g["exp"])
+    imp, filled_imp = _profile_fill(g["ts"], g["imp"], covered)
+    exp, filled_exp = _profile_fill(g["ts"], g["exp"], covered)
+    out = tariffs.rebuild(g["ts"], imp, exp, conn, p0, p1, period_start_exclusive=period_start_exclusive, power_factor_pct=power_factor_pct,
+                          credit_brought_forward_rs=credit_brought_forward_rs)
+    out["completeness"] = round(float(covered.mean()) if len(covered) else 0.0, 4)
+    out["filled_kwh"] = {"import": round(filled_imp, 3), "export": round(filled_exp, 3)}
     return out
 
 
 def _bill_row(r) -> dict:
-    return {**dict(r), "real": json.loads(r["real"]), "rebuilt": json.loads(r["rebuilt"])}
+    """A stored bill as the bill list answers it: the row, its printed figures compared line by line and its verdict (computed on read, so a bill
+    stored before these existed gets them too)."""
+    b = {**dict(r), "real": json.loads(r["real"]), "rebuilt": json.loads(r["rebuilt"])}
+    b["reconciliation"] = _reconcile(b["real"], b["rebuilt"])
+    b["check"] = _check(b["rebuilt"], b["difference_pct"], b["reconciliation"])
+    return b
 
 
 def bills(site_id: str) -> list[dict]:

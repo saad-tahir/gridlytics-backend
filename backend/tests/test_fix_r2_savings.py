@@ -331,8 +331,9 @@ def test_the_ledger_prices_a_legacy_surplus_period_at_the_surplus_rate(company):
     _flat_rows(sid, date(2026, 11, 1), 3, 100.0, export_kw=lambda m: 400.0 if 9 * 60 <= m < 15 * 60 else 0.0)  # off-peak exports beat imports
     day = date(2026, 11, 2)
     pr = verify._minute_prices(conn, day, sid)
-    assert pr["c_imp"][OFF] == pytest.approx(35.15)  # before: priced as a net import (about 39.5), the exports never passed
-    assert pr["c_exp"][OFF] == pytest.approx(35.15)  # the bill's own price: the optimiser's tie-break is not booked in the ledger
+    s_rate = 25.32  # the notified NAPPP since round 7 (audit engine-tariffs-04); the off-peak 35.15 before
+    assert pr["c_imp"][OFF] == pytest.approx(s_rate)  # before: priced as a net import (about 39.5), the exports never passed
+    assert pr["c_exp"][OFF] == pytest.approx(s_rate)  # the bill's own price: the optimiser's tie-break is not booked in the ledger
     tot = verify.month_totals(sid, conn, day)
     assert tot["export"]["off_peak"] > tot["import"]["off_peak"] and tot["export"]["peak"] == 0.0
     assert verify.month_imports(sid, conn, day) == tot["import"]
@@ -365,10 +366,17 @@ def test_a_bill_entered_with_its_printed_reading_dates_bills_the_reading_interva
     assert by_reading["rebuilt"]["days"] == 30 and by_reading["rebuilt"]["first_day"] == "2026-10-21"  # before: refused (no period_start)
     assert sum(by_reading["rebuilt"]["import_kwh"].values()) == pytest.approx(72_000.0)
     assert by_reading["real"]["previous_reading_date"] == "2026-10-20"
+    # one bill per period (round 7, audit flow-savings-pilot-bill-23: an overlapping bill is refused), so each form is entered after the one before
+    # is deleted
+    stored = {b["period_start"] for b in verify.bills(sid)}
+    verify.delete_bill(sid, by_reading["id"], "t")
     flagged = verify.add_bill(sid, {"period_start": "2026-10-20", "period_start_is_reading": True, "period_end": "2026-11-19", "total_rs": 2_000_000}, "t")
+    stored |= {b["period_start"] for b in verify.bills(sid)}
+    verify.delete_bill(sid, flagged["id"], "t")
     first_day = verify.add_bill(sid, {"period_start": "2026-10-21", "period_end": "2026-11-19", "total_rs": 2_000_000}, "t")  # the old call shape
+    stored |= {b["period_start"] for b in verify.bills(sid)}
     assert flagged["rebuilt"]["total_rs"] == first_day["rebuilt"]["total_rs"] == by_reading["rebuilt"]["total_rs"]
-    assert {b["period_start"] for b in verify.bills(sid)} == {"2026-10-21"}
+    assert stored == {"2026-10-21"}
     assert verify.rebuild_bill(sid, sites.connections(sid)[0], date(2026, 10, 20), date(2026, 11, 19))["days"] == 31  # positional calls unchanged
     with pytest.raises(ValueError):
         verify.add_bill(sid, {"previous_reading_date": "2026-11-19", "period_end": "2026-11-19", "total_rs": 1}, "t")
@@ -401,7 +409,8 @@ def test_a_legacy_site_never_plans_import_and_export_in_the_same_step(company):
     vec = tariffs.vectors(conn, datetime(2026, 11, 2, 0, 0, tzinfo=PKT).astimezone(timezone.utc), 96, {"peak": 400.0, "off_peak": 2000.0}, None, 1e9,
                           {"peak": 0.0, "off_peak": 2400.0}, None)
     s = OFF // 15
-    assert vec["c_imp"][s] == pytest.approx(35.15) and vec["c_exp"][s] == pytest.approx(35.15 - tariffs.LEGACY_EXPORT_TIE_BREAK)
+    s_rate = 25.32  # the notified NAPPP since round 7 (audit engine-tariffs-04); the off-peak 35.15 before
+    assert vec["c_imp"][s] == pytest.approx(s_rate) and vec["c_exp"][s] == pytest.approx(s_rate - tariffs.LEGACY_EXPORT_TIE_BREAK)
 
 
 # ------------------------------------------------------------------------------------------------ tariffs-adder-early-start-drops-previous

@@ -7,10 +7,40 @@ from datetime import date
 
 from fastapi import APIRouter, Body
 
-from . import auth, store, tariff_data, tariffs
+from . import auth, sites, store, tariff_data, tariffs
 from .routes_common import bad, out, parse_day, today
 
 router = APIRouter()
+
+
+def _agreements(on: date) -> list[dict]:
+    """Each connection under net billing or legacy net metering, with its agreement's dates, its state on the day (tariffs.agreement_state:
+    active, not_started, ended or unreadable) and the regime it is billed under that day (`billed_as`, tariffs.regime_on): its own while the
+    agreement is in force, net billing after a legacy agreement ends, else none, whose export earns nothing (plan 9.3 UI-03, "Regime expired")."""
+    rows = []
+    for s in sites.listing():
+        for c in sites.connections(s["id"]):
+            state = tariffs.agreement_state(c, on)
+            if state is None:
+                continue
+            d = c.get("data") or {}
+            rows.append({"site_id": s["id"], "site_name": s["name"], "connection_id": c["id"], "meter_ref": d.get("meter_ref") or "",
+                         "tariff_category": d.get("tariff_category"), "regime": d.get("regime"), "agreement_start": d.get("agreement_start"),
+                         "agreement_end": d.get("agreement_end"), "state": state, "billed_as": tariffs.regime_on(c, on)})
+    return sorted(rows, key=lambda x: (x["site_name"], x["connection_id"]))
+
+
+def _connections() -> list[dict]:
+    """Every grid connection of the company, by site: what a site override (kind "override", keyed by the connection) can name."""
+    rows = []
+    for s in sites.listing():
+        for c in sites.connections(s["id"]):
+            d = c.get("data") or {}
+            if d.get("regime") == "off_grid":
+                continue
+            rows.append({"connection_id": c["id"], "site_id": s["id"], "site_name": s["name"], "meter_ref": d.get("meter_ref") or "",
+                         "tariff_category": d.get("tariff_category")})
+    return sorted(rows, key=lambda x: (x["site_name"], x["connection_id"]))
 
 
 @router.get("/api/tariffs")
@@ -28,11 +58,15 @@ def tariffs_index(on: str | None = None):
     return {"on": d.isoformat(), "schedule": {k: card_v[k] for k in ("id", "effective_from", "source", "status", "hash")} if card_v else None,
             "cards": [{"category": k, "class": tariff_data.category_class(k), **v} for k, v in sorted(cards.items())],
             "calendars": {"xwdisco": (cal_x or {}).get("body"), "ke": (cal_k or {}).get("body")},
-            "adders": [{"key": a["key"], "name": a["name"], "rate": a["rate"], "billing_months": a["billing_months"]} for a in adders],
+            "adders": [{"key": a["key"], "name": a["name"], "rate": a["rate"], "billing_months": a["billing_months"], "exempt": a.get("exempt") or [],
+                        "category_rates": a.get("category_rates") or {}, "fca": tariffs.is_fca(a)} for a in adders],
             "tax": (tariffs.resolve("tax", "national", d) or {}).get("body"), "icp": (tariffs.resolve("icp", "national", d) or {}).get("body"),
             "prosumer": {k: (tariffs.resolve("prosumer", k, d) or {}).get("body") for k in ("net_billing", "net_metering_legacy")},
             # pending counts the versions an administrator can approve: a placeholder awaiting its notification is not one (approving it is a 422)
-            "versions": tariffs.provenance(), "pending": sum(1 for v in tariffs.versions() if v["status"] == "pending")}
+            "versions": tariffs.provenance(), "pending": sum(1 for v in tariffs.versions() if v["status"] == "pending"),
+            "agreements": _agreements(d), "connections": _connections(),
+            # a version awaiting its notification whose start has passed by the day (engine-tariffs-06): priced with the one still in force
+            "notices": tariffs.awaiting_notices(d)}
 
 
 @router.get("/api/tariffs/versions")
