@@ -14,6 +14,9 @@ A copy is one set (audit founder-console-01 and -12): the workspace file `<id>-<
 half of engine-delivery-13: a restore onto another machine needs the keys the edges were given) and the folder of the reports it made
 `<id>-reports-<stamp>-<kind>/` (the backup half of parity-architecture-11 and -16: a stored report is downloaded from its file). The four
 are listed, pruned and restored together; `scripts/restore_backup.py` restores one from the command line with the server stopped.
+
+The daily check copies the default database only when it lies in the data folder in use (audit performance-live-07): a scratch run sets
+GRIDLYTICS_DATA_DIR alone, and its store.DB_PATH is then another folder's file, which is never written here.
 """
 
 from __future__ import annotations
@@ -163,11 +166,13 @@ def _company_files() -> list[Path]:
 
 
 def daily_all(files=None, keep: int = KEEP) -> list[Path]:
-    """One check of the daily backup: today's copy of the default database, of every company's file `files()` gives (the registry's companies when
-    None) and of the registry itself, each made once a day. The copies made now; a copy that fails is logged and tried again at the next check, and
-    never stops the others."""
+    """One check of the daily backup: today's copy of the default database (when it lies in the data folder in use: a scratch run's store.DB_PATH is the
+    owner's file, audit performance-live-07), of every company's file `files()` gives (the registry's companies when None) and of the registry itself,
+    each made once a day. The copies made now; a copy that fails is logged and tried again at the next check, and never stops the others."""
     made, seen = [], set()
-    for path in [Path(store.DB_PATH), *(files or _company_files)()]:
+    default = Path(store.DB_PATH)
+    here = os.path.normcase(os.path.abspath(default.parent)) == os.path.normcase(os.path.abspath(platformdb.data_dir()))
+    for path in [*([default] if here else []), *(files or _company_files)()]:
         key = os.path.normcase(os.path.abspath(path))
         if key in seen:                     # a test's company names the default file (addendum item 3)
             continue

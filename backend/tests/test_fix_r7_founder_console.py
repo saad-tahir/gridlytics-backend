@@ -681,3 +681,21 @@ def test_a_copy_takes_the_companys_reports_and_a_restore_puts_them_back(fdb):
         held = {backups.companions(b["name"])[2] for b in backups.list_backups() if b["reports"]}
     assert {f.name for f in backups.folder(path).iterdir() if "-reports-" in f.name} == held and len(held) == backups.KEEP_MANUAL + 2   # 2 restore points
 
+
+def test_the_daily_copy_leaves_a_default_database_outside_the_data_folder_in_use_alone(fdb, monkeypatch, tmp_path):
+    """performance-live-07 (the backup half): a scratch run sets GRIDLYTICS_DATA_DIR only, so store.DB_PATH stays the owner's data/gridlytics.db, and
+    backups.daily_all copied it into the owner's data/backup every day. The default database is copied only when it lies in the data folder in use."""
+    owner = tmp_path / "owner-data"
+    owner.mkdir()
+    with closing(sqlite3.connect(owner / "gridlytics.db")) as con:
+        con.execute("CREATE TABLE sites (id TEXT)")
+        con.commit()
+    before = sorted(p.name for p in owner.iterdir())
+    monkeypatch.setattr(store, "DB_PATH", owner / "gridlytics.db")
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(tmp_path / "scratch"))
+    assert backups.daily_all(lambda: []) == []
+    assert sorted(p.name for p in owner.iterdir()) == before and not (owner / "backup").exists()
+    # with the data folder its own (no GRIDLYTICS_DATA_DIR), the default database is copied as before
+    monkeypatch.delenv("GRIDLYTICS_DATA_DIR")
+    made = backups.daily_all(lambda: [])
+    assert [p.parent for p in made] == [owner / "backup"] and made[0].name.startswith("gridlytics-")
