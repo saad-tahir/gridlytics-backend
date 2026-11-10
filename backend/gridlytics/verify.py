@@ -2260,6 +2260,13 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
 
 # ------------------------------------------------------------------------------------------------ switchback (Part 8.2)
 
+#: plan 8.2 / VER-08 (round 7, audit flow-savings-pilot-bill-25, pages-D-11): the block lengths each control tier runs. Tier 2 (advisory writes)
+#: switches by a table the installer keys in, so its blocks are 7 days (one table change per switch); tier 3 (closed loop) writes within its
+#: budget, so 3-day blocks too; a monitor site only recommends the plan, so no block of it would ever run the plan (R8 2.13: the calendar is
+#: disabled, and R8 2.12: switchback is unavailable there)
+BLOCK_DAYS_BY_TIER = {"monitor": (), "advisory_writes": (7,), "closed_loop": (3, 7)}
+
+
 def _paint_key(site_id: str) -> str:
     return f"switchback:{site_id}"
 
@@ -2337,6 +2344,57 @@ def switchback_blocks(site_id: str) -> list[dict]:
             b["painted_before_start"] = bool(on) and (b["block_start"], b["block_end"], b["arm"]) in drawn and b["block_start"] > on
         out.append(b)
     return out
+
+
+def calendar_checks(blocks: list[dict], tier: str, baseline_end: date | None, today: date, closures: list[dict], started: bool) -> list[dict]:
+    """The switchback calendar's rule checks (plan 8.2 and 9.3, R8 2.13, UI-13 tab C), as the start gates them (round 7, audit
+    flow-savings-pilot-bill-11, pages-D-18, flow-savings-pilot-bill-25): each {id, ok} with the facts its words need. Both arms equally often
+    ("balanced"); one block of each arm per pair, in random order ("paired"; `unit` "fortnight" for 7-day blocks, else "pair"); back to back
+    ("joined"); one length of 3 or 7 days ("length") that the control tier runs ("tier-length", BLOCK_DAYS_BY_TIER); enough days on each arm for
+    a result ("enough", SWITCHBACK_MIN_DAYS_PER_ARM); with a baseline window, a start after it ends ("after-baseline"); before the start, a first
+    block after today ("future"); with declared holiday closures, no block on one ("closures"). No blocks: no checks."""
+    blocks = sorted(blocks, key=lambda b: b["block_start"])
+    if not blocks:
+        return []
+    span = [(date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in blocks]
+    plan = [n for n, b in zip(span, blocks) if b["arm"] == "plan"]
+    native = [n for n, b in zip(span, blocks) if b["arm"] != "plan"]
+    lengths = sorted(set(span))
+    allowed = list(BLOCK_DAYS_BY_TIER.get(tier, ()))
+    first = blocks[0]["block_start"]
+    paired = len(blocks) % 2 == 0 and all(blocks[i]["arm"] != blocks[i + 1]["arm"] for i in range(0, len(blocks) - 1, 2))
+    joined = all(date.fromisoformat(b["block_start"]) == date.fromisoformat(a["block_end"]) + timedelta(days=1) for a, b in zip(blocks, blocks[1:]))
+    out = [{"id": "balanced", "ok": len(plan) == len(native), "plan_blocks": len(plan), "native_blocks": len(native)},
+           {"id": "paired", "ok": paired, "unit": "fortnight" if lengths == [7] else "pair"},
+           {"id": "joined", "ok": joined},
+           {"id": "length", "ok": len(lengths) == 1 and lengths[0] in (3, 7), "lengths": lengths},
+           {"id": "tier-length", "ok": len(lengths) == 1 and lengths[0] in allowed, "lengths": lengths, "allowed": allowed, "tier": tier},
+           {"id": "enough", "ok": min(sum(plan), sum(native)) >= SWITCHBACK_MIN_DAYS_PER_ARM, "plan_days": sum(plan), "native_days": sum(native),
+            "min_days": SWITCHBACK_MIN_DAYS_PER_ARM}]
+    if baseline_end is not None:
+        out.append({"id": "after-baseline", "ok": first > baseline_end.isoformat(), "baseline_end": baseline_end.isoformat(), "first_day": first})
+    if not started:
+        out.append({"id": "future", "ok": first > today.isoformat(), "first_day": first, "today": today.isoformat()})
+    if closures:
+        hits = [c for c in closures if any(b["block_start"] <= c["end"] and b["block_end"] >= c["start"] for b in blocks)]
+        out.append({"id": "closures", "ok": not hits, "hits": hits, "count": len(closures)})
+    return out
+
+
+def pilot_gates(site_id: str, pilot: dict, today: date, started: bool = False) -> tuple[list[dict], list[dict]]:
+    """What the pilot's start needs (round 7, audit flow-savings-pilot-bill-11, pages-D-18, pages-D-11), each {id, ok}: a control tier that can
+    run the plan ("tier": not monitor, where the plan is only recommended and every day is recommendation_only), the native capture ("capture"),
+    a baseline window ("baseline"), a painted calendar ("calendar") and its rule checks met ("rules", `failing` naming those that are not); and the
+    calendar's checks (calendar_checks)."""
+    tier = (sites.get(site_id) or {}).get("tier", "monitor")
+    blocks = switchback_blocks(site_id)
+    b0 = pilot.get("baseline_start")
+    b_end = date.fromisoformat(b0) + timedelta(days=int(pilot.get("baseline_days") or 14) - 1) if b0 else None
+    checks = calendar_checks(blocks, tier, b_end, today, [c for c in pilot.get("closures") or [] if isinstance(c, dict)], started)
+    gates = [{"id": "tier", "ok": tier != "monitor", "tier": tier}, {"id": "capture", "ok": sites.native_latest(site_id) is not None},
+             {"id": "baseline", "ok": bool(b0)}, {"id": "calendar", "ok": bool(blocks)},
+             {"id": "rules", "ok": all(c["ok"] for c in checks), "failing": [c["id"] for c in checks if not c["ok"]]}]
+    return gates, checks
 
 
 def arm_on(site_id: str, day: date) -> str | None:

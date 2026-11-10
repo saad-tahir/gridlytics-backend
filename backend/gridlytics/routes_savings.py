@@ -78,13 +78,26 @@ def switchback(site_id: str):
     return out(verify.switchback_result(site_id))
 
 
+#: the control tiers in words, for a refusal
+TIER_WORDS = {"monitor": "monitor", "advisory_writes": "advisory writes", "closed_loop": "closed loop"}
+
+
 @router.put("/api/sites/{site_id}/switchback")
 def switchback_paint(site_id: str, inp: dict = Body(...)):
-    """Tab C: paint the calendar (edit_sites), with a strict model (schemas.SwitchbackPaint). Round 7: the first day is after today, so no arm is
-    drawn over days already run (audit security-roles-06)."""
+    """Tab C: paint the calendar (edit_sites), with a strict model (schemas.SwitchbackPaint). Round 7: a monitor-tier site only recommends the plan,
+    so it has no switchback (audit pages-D-11); the block length is one the site's control tier runs (verify.BLOCK_DAYS_BY_TIER; audit
+    flow-savings-pilot-bill-25); the first day is after today, so no arm is drawn over days already run (audit security-roles-06)."""
     auth.need("edit_sites", "Painting the switchback calendar")
-    site_or_404(site_id)
+    site = site_or_404(site_id)
     req = check(SwitchbackPaint, inp)
+    tier = site.get("tier", "monitor")
+    allowed = verify.BLOCK_DAYS_BY_TIER.get(tier, ())
+    if not allowed:
+        raise Refusal(422, "A monitor-tier site only recommends the plan, so no switchback can run there: its saving is the counterfactual's alone",
+                      "monitor_tier")
+    if req.block_days not in allowed:
+        raise Refusal(422, f"At the {TIER_WORDS.get(tier, tier)} tier each block is {' or '.join(str(n) for n in allowed)} days: the installer changes "
+                           "the table once per switch", "invalid")
     start = date.fromisoformat(req.start)
     if start <= today():
         raise Refusal(422, "The calendar starts after today: no arm is drawn for a day that has begun", "invalid")
@@ -208,18 +221,28 @@ def _pilot_answer(site_id: str) -> dict:
         data["capture_pins"] = pins
         capture = verify.native_for_day(site_id, max(today(), date.fromisoformat(pins[-1]["from"])))
         newer = latest if latest and capture and latest["version"] > capture["version"] else None
+    tier = (sites.get(site_id) or {}).get("tier", "monitor")
+    gates, checks = verify.pilot_gates(site_id, data, today(), started=bool(r is not None and r["started"]))
     rec = verify.paint_record(site_id)
     return {"pilot": data, "started": r["started"] if r else None, "capture": capture or latest, "capture_newer": newer,
             "switchback": verify.switchback_blocks(site_id),
             # tab A: the window's completeness so far and the KPIs the pilot measures (round 7, audit pages-D-19)
             "baseline_quality": verify.baseline_quality(site_id, data["baseline_start"], data["baseline_days"], today()),
             "kpis": verify.pilot_kpis(site_id),
-            # the calendar's paint as stored (round 7, audit security-roles-06)
-            "calendar": {k: rec.get(k) for k in PAINT_FIELDS} if rec else None}
+            # tab C and the start (round 7, audit pages-D-11, flow-savings-pilot-bill-25, security-roles-06, flow-savings-pilot-bill-11): the
+            # control tier and the block lengths it runs, the calendar's paint as stored, its rule checks and what the start still needs
+            "tier": tier, "block_days_allowed": list(verify.BLOCK_DAYS_BY_TIER.get(tier, ())),
+            "calendar": {k: rec.get(k) for k in PAINT_FIELDS} if rec else None, "calendar_checks": checks, "start_gates": gates}
 
 
 #: the paint record's fields the pilot answers (the blocks it drew are the calendar's own)
 PAINT_FIELDS = ("painted_at", "painted_on", "by", "draw", "paint_count", "start", "pairs", "block_days")
+
+#: a calendar rule check in words, for the start's refusal
+CHECK_WORDS = {"balanced": "both arms equally often", "paired": "one block of each arm in each pair", "joined": "blocks back to back",
+               "length": "one block length of 3 or 7 days", "tier-length": "a block length the control tier runs",
+               "enough": f"at least {verify.SWITCHBACK_MIN_DAYS_PER_ARM} days on each arm", "after-baseline": "a start after the baseline window",
+               "future": "a start after today", "closures": "no block on a holiday closure"}
 
 
 @router.put("/api/sites/{site_id}/pilot")
@@ -267,6 +290,26 @@ def pilot_put(site_id: str, inp: dict = Body(...)):
     return pilot_get(site_id)
 
 
+def _start_gates(site_id: str, r) -> None:
+    """Refuse the start at the first gate not met (round 7, audit flow-savings-pilot-bill-11, pages-D-18, pages-D-11): a tier that runs the plan,
+    the capture, the baseline window, the calendar and its rule checks, in that order (before: the capture and any calendar, so a past calendar at a
+    monitor site with no window started). Called inside the start's write transaction, so a repaint cannot slip between the checks and the lock."""
+    gates = dict((g["id"], g) for g in verify.pilot_gates(site_id, _pilot_data(r), today())[0])
+    if not gates["tier"]["ok"]:
+        raise Refusal(422, "A monitor-tier site only recommends the plan, so no switchback can run there: raise its control tier to advisory writes "
+                           "before the pilot starts", "monitor_tier")
+    if not gates["capture"]["ok"]:
+        raise Refusal(422, "Capture the inverter's native settings first (tab B)", "no_capture")
+    if not gates["baseline"]["ok"]:
+        raise Refusal(422, "Choose the baseline window first (tab A)", "no_baseline")
+    if not gates["calendar"]["ok"]:
+        raise Refusal(422, "Paint the switchback calendar first (tab C)", "no_calendar")
+    if not gates["rules"]["ok"]:
+        failing = gates["rules"]["failing"]
+        raise Refusal(422, f"The switchback calendar does not meet {len(failing)} of its rule checks ({'; '.join(CHECK_WORDS.get(c, c) for c in failing)}): "
+                           "fix it in tab C", "calendar_rules")
+
+
 @router.post("/api/sites/{site_id}/pilot/start")
 def pilot_start(site_id: str, inp: dict = Body(default={})):
     """Sign off and start the pilot, once: the start time and the sign-off are the pre-registration, so a second start is refused rather than
@@ -274,14 +317,11 @@ def pilot_start(site_id: str, inp: dict = Body(default={})):
     auth.need("start_pilot", "Starting the pilot")
     site_or_404(site_id)
     name = check(PilotStart, inp).name
-    if not sites.native_latest(site_id):
-        raise Refusal(422, "Capture the inverter's native settings first (tab B)", "no_capture")
-    if not verify.switchback_blocks(site_id):
-        raise Refusal(422, "Paint the switchback calendar first (tab C)", "no_calendar")
     with store.write_transaction() as con:
         r = con.execute("SELECT * FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
         if r is not None and r["started"]:
             raise Refusal(409, "The pilot has already started: its start and sign-off stand, and a change is an amendment", "already_started")
+        _start_gates(site_id, r)
         now = store._now()
         # the capture the pilot is signed off on is pinned: a later one stands for a pilot day only once an amendment adopts it (round 7, audit
         # flow-savings-pilot-bill-12)

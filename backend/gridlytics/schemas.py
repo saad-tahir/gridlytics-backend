@@ -148,7 +148,8 @@ class PilotStart(Strict):
 
 class SwitchbackPaint(Strict):
     """`PUT /sites/:id/switchback`: the calendar's first day, its pairs of blocks (`fortnights`: a fortnight of 7-day blocks, six days of 3-day
-    ones) and the block length (round 7, audit security-roles-06). The route refuses a first day before tomorrow."""
+    ones) and the block length (round 7, audit security-roles-06, flow-savings-pilot-bill-25). The route refuses a first day before tomorrow and
+    a length the site's control tier does not run."""
 
     start: str
     fortnights: int = Field(4, ge=1, le=26, strict=True)

@@ -1074,7 +1074,9 @@ CRITERIA = {"min_saving_pct": 8.0, "max_unserved_kwh": 0.0, "reserve_adequacy_pc
 
 
 def _pilot_ready(w) -> str:
-    """The world's mill with a native capture and a switchback calendar painted a month ahead, so its pilot can start."""
+    """The world's mill at the advisory-writes tier with a native capture and a switchback calendar painted a month ahead, so its pilot can start
+    once a baseline window is chosen (`_start` chooses one where none is; audit flow-savings-pilot-bill-11, pages-D-11)."""
+    _tier(w, w.site, "advisory_writes")
     with w.use():
         sites.capture_native(w.site, {"source": "entered", "work_mode": "self_use"}, "t")
         verify.plan_switchback(w.site, date.today() + timedelta(days=30), 2, 7, "t", seed=1)
@@ -1089,7 +1091,12 @@ def _tier(w, sid: str, tier: str) -> None:
 
 
 def _start(w, sid: str, name: str = "Plant manager"):
-    return w.c["admin"].post(f"/api/sites/{sid}/pilot/start", json={"name": name})
+    """Start the pilot; a pilot that has neither started nor a baseline window gets one first (tomorrow, 14 days), since the start needs it."""
+    admin = w.c["admin"]
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    if not p["started"] and not p["pilot"]["baseline_start"]:
+        assert admin.put(f"/api/sites/{sid}/pilot", json={"baseline_start": (_pkt_today() + timedelta(days=1)).isoformat()}).status_code == 200
+    return admin.post(f"/api/sites/{sid}/pilot/start", json={"name": name})
 
 
 def test_the_pilot_put_takes_only_the_set_ups_own_fields_typed_and_in_range(world):
@@ -1295,18 +1302,144 @@ def test_the_pilot_answers_the_baseline_windows_completeness_so_far_and_the_kpis
 def test_holiday_closures_are_declared_in_the_pilot_typed_and_amended_with_a_reason(world):
     sid = _pilot_ready(world)
     admin = world.c["admin"]
-    eid = {"start": "2027-03-20", "end": "2027-03-23", "label": "Eid closure"}
-    xmas = {"start": "2026-12-24", "end": "2026-12-26", "label": "Year-end shutdown"}
+    # after the calendar (a month ahead, four weeks long), since a closure under a block holds the start (audit flow-savings-pilot-bill-11)
+    day = lambda n: (_pkt_today() + timedelta(days=n)).isoformat()  # noqa: E731
+    eid = {"start": day(130), "end": day(133), "label": "Eid closure"}
+    xmas = {"start": day(70), "end": day(72), "label": "Year-end shutdown"}
     for bad in ([{"start": "2026-12-26", "end": "2026-12-24"}], [{"start": "2026-12-01", "end": "2027-03-01"}], [{"start": "x", "end": "2026-12-24"}],
                 [{**xmas, "kind": "eid"}], [{**xmas, "label": "y" * 81}], [xmas] * 21, None, "Eid"):
         assert admin.put(f"/api/sites/{sid}/pilot", json={"closures": bad}).status_code == 422, bad
-    r = admin.put(f"/api/sites/{sid}/pilot", json={"closures": [eid, {"start": "2026-12-24", "end": "2026-12-26"}]})
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"closures": [eid, {"start": xmas["start"], "end": xmas["end"]}]})
     assert r.status_code == 200 and r.json()["pilot"]["closures"] == [{**xmas, "label": ""}, eid]  # kept in date order
     assert _start(world, sid).status_code == 200
     r = admin.put(f"/api/sites/{sid}/pilot", json={"closures": [xmas, eid], "reason": "The year-end shutdown was named"})
     assert r.status_code == 200
     (am,) = r.json()["pilot"]["amendments"]
     assert am["values"] == [{"field": "closures", "before": [{**xmas, "label": ""}, eid], "after": [xmas, eid]}]
+
+
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-11 (pages-D-18): the start's
+# ------------------------------------------------------------------------------------------------ gates: tier, capture, baseline window, calendar, rules
+
+def _gates(p: dict) -> dict:
+    return {g["id"]: g["ok"] for g in p["start_gates"]}
+
+
+def _checks(p: dict) -> dict:
+    return {c["id"]: c for c in p["calendar_checks"]}
+
+
+def test_the_pilot_starts_only_past_its_gates_and_says_which_one_holds_it(world):
+    sid, admin = world.site, world.c["admin"]
+    today = _pkt_today()
+    start = lambda: admin.post(f"/api/sites/{sid}/pilot/start", json={"name": "Plant manager"})  # noqa: E731
+    with world.use():
+        sites.capture_native(sid, {"source": "entered", "work_mode": "self_use"}, "t")
+        verify.plan_switchback(sid, today + timedelta(days=30), 2, 7, "t", seed=1)
+    # the world's mill is at the monitor tier, and no baseline window is chosen: the gates say so and the start is refused, tier first
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    assert _gates(p) == {"tier": False, "capture": True, "baseline": False, "calendar": True, "rules": False}
+    assert p["start_gates"][-1]["failing"] == ["tier-length"]  # no block length runs at the monitor tier
+    r = start()
+    assert r.status_code == 422 and r.json()["code"] == "monitor_tier", r.text
+    _tier(world, sid, "advisory_writes")
+    r = start()
+    assert r.status_code == 422 and r.json()["code"] == "no_baseline", r.text
+    # a baseline window that runs into the calendar: the rule check fails, the gate names it and the start is refused
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"baseline_start": (today + timedelta(days=20)).isoformat()}).status_code == 200
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    after = _checks(p)["after-baseline"]
+    assert after["ok"] is False and (after["baseline_end"], after["first_day"]) == ((today + timedelta(days=33)).isoformat(),
+                                                                                   (today + timedelta(days=30)).isoformat())
+    assert _gates(p)["rules"] is False and p["start_gates"][-1]["failing"] == ["after-baseline"]
+    r = start()
+    assert r.status_code == 422 and r.json()["code"] == "calendar_rules" and "after the baseline window" in r.json()["detail"], r.text
+    # a calendar that began yesterday (the engine paints it; the API refuses such a start): the 'future' check fails (before: started on it)
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"baseline_start": (today - timedelta(days=40)).isoformat()}).status_code == 200
+    with world.use():
+        verify.plan_switchback(sid, today - timedelta(days=1), 2, 7, "t", seed=1)
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    fut = _checks(p)["future"]
+    assert fut["ok"] is False and (fut["first_day"], fut["today"]) == ((today - timedelta(days=1)).isoformat(), today.isoformat())
+    r = start()
+    assert r.status_code == 422 and r.json()["code"] == "calendar_rules" and "after today" in r.json()["detail"], r.text
+    # a declared holiday closure under a block fails too
+    with world.use():
+        verify.plan_switchback(sid, today + timedelta(days=2), 2, 7, "t", seed=1)
+    eid = {"start": (today + timedelta(days=3)).isoformat(), "end": (today + timedelta(days=4)).isoformat(), "label": "Eid closure"}
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"closures": [eid]}).status_code == 200
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    assert _checks(p)["closures"]["ok"] is False and _checks(p)["closures"]["hits"] == [eid]
+    assert start().json()["code"] == "calendar_rules"
+    # nothing refused started anything or locked the calendar
+    with world.use():
+        assert not any(b["locked"] for b in verify.switchback_blocks(sid))
+    assert admin.get(f"/api/sites/{sid}/pilot").json()["started"] is None and _audit_lines(world, "started the pilot") == []
+    # every gate met: it starts
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"closures": []}).status_code == 200
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    assert all(_gates(p).values()) and all(c["ok"] for c in p["calendar_checks"])
+    assert {"balanced", "paired", "joined", "length", "tier-length", "enough", "after-baseline", "future"} == set(_checks(p))
+    r = start()
+    assert r.status_code == 200 and r.json()["started"], r.text
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-11: a monitor-tier site has no switchback
+
+def test_a_monitor_tier_site_paints_no_calendar_and_the_pilot_says_its_tier(world):
+    sid, admin, operator = world.site, world.c["admin"], world.c["operator"]
+    tomorrow = (_pkt_today() + timedelta(days=1)).isoformat()
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    assert (p["tier"], p["block_days_allowed"], p["calendar"]) == ("monitor", [], None)
+    for c in (admin, operator):
+        r = c.put(f"/api/sites/{sid}/switchback", json={"start": tomorrow, "fortnights": 2, "block_days": 7})
+        assert r.status_code == 422 and r.json()["code"] == "monitor_tier", r.text
+    with world.use():
+        assert verify.switchback_blocks(sid) == []
+    _tier(world, sid, "advisory_writes")
+    r = operator.put(f"/api/sites/{sid}/switchback", json={"start": tomorrow, "fortnights": 2, "block_days": 7})
+    assert r.status_code == 200 and len(r.json()) == 4
+    assert world.c["viewer"].put(f"/api/sites/{sid}/switchback", json={"start": tomorrow}).status_code == 403
+
+
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-25: 3-day blocks at the
+# ------------------------------------------------------------------------------------------------ closed-loop tier only
+
+def test_three_day_blocks_are_painted_at_the_closed_loop_tier_only(world):
+    sid, admin, operator = world.site, world.c["admin"], world.c["operator"]
+    tomorrow = _pkt_today() + timedelta(days=1)
+    paint = lambda **kw: operator.put(f"/api/sites/{sid}/switchback", json={"start": tomorrow.isoformat(), "fortnights": 2, **kw})  # noqa: E731
+    _tier(world, sid, "advisory_writes")
+    assert admin.get(f"/api/sites/{sid}/pilot").json()["block_days_allowed"] == [7]
+    r = paint(block_days=3)
+    assert r.status_code == 422 and "7 days" in r.json()["detail"], r.text
+    for bad in ({"block_days": 5}, {"block_days": "7"}, {"fortnights": 0}, {"fortnights": 27}, {"bogus": 1}):
+        r = paint(**bad)
+        assert r.status_code == 422 and r.json()["code"] == "invalid", (bad, r.text)
+    assert paint(block_days=7).status_code == 200
+    _tier(world, sid, "closed_loop")
+    assert admin.get(f"/api/sites/{sid}/pilot").json()["block_days_allowed"] == [3, 7]
+    r = paint(block_days=3)
+    assert r.status_code == 200
+    assert [(b["block_start"], b["block_end"]) for b in r.json()][:2] == [(tomorrow.isoformat(), (tomorrow + timedelta(days=2)).isoformat()),
+                                                                         ((tomorrow + timedelta(days=3)).isoformat(), (tomorrow + timedelta(days=5)).isoformat())]
+
+
+def test_a_calendars_checks_name_its_pair_and_hold_a_block_length_the_tier_does_not_run(world):
+    sid, admin, operator = _pilot_ready(world), world.c["admin"], world.c["operator"]
+    tomorrow = (_pkt_today() + timedelta(days=1)).isoformat()
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"baseline_start": (_pkt_today() - timedelta(days=30)).isoformat()}).status_code == 200
+    assert _checks(admin.get(f"/api/sites/{sid}/pilot").json())["paired"]["unit"] == "fortnight"
+    _tier(world, sid, "closed_loop")
+    assert operator.put(f"/api/sites/{sid}/switchback", json={"start": tomorrow, "fortnights": 2, "block_days": 3}).status_code == 200
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    assert _checks(p)["paired"]["unit"] == "pair" and _checks(p)["tier-length"]["ok"] is True and all(_gates(p).values())
+    # the tier lowered under a calendar of 3-day blocks: its tier-length check fails, so the start is refused
+    _tier(world, sid, "advisory_writes")
+    tl = _checks(admin.get(f"/api/sites/{sid}/pilot").json())["tier-length"]
+    assert (tl["ok"], tl["lengths"], tl["allowed"], tl["tier"]) == (False, [3], [7], "advisory_writes")
+    r = _start(world, sid)
+    assert r.status_code == 422 and r.json()["code"] == "calendar_rules" and "a block length the control tier runs" in r.json()["detail"], r.text
 
 
 # ------------------------------------------------------------------------------------------------ security-roles-06: the draw, the start after today,
