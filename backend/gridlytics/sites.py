@@ -314,6 +314,11 @@ GENSET_UPPER = {"c_start_rs": (1_000_000, "The cost per start is at most Rs 1,00
                 "tank_l": (1_000_000, "The tank holds at most 1,000,000 L")}
 
 
+def _num(x: float) -> str:
+    """A figure in a sentence: thousands separated, at most one decimal ("5,000", "266.4")."""
+    return f"{x:,.1f}".rstrip("0").rstrip(".")
+
+
 #: Each fuel's typical curve and tank, taken where a save leaves them out (audit flow-onboarding-10: a captive gas engine kept the diesel curve, 0.273 litres
 #: a kWh read as MMBtu, so its fuel cost came out about 35 times too high and the plan never ran it). Diesel is in litres; captive gas and RLNG are in
 #: MMBtu, the unit their price is set in (tariff_data's fuel prices), with the demo's gas engine's curve (0.0085 MMBtu a kWh, about 40 % efficient, and
@@ -342,6 +347,11 @@ class GensetFields(Strict):
     cap_hours_per_day: float = Field(24.0, ge=0, le=24)
     tank_l: float = Field(2000.0, ge=0)
     parallel_allowed: bool = False
+    #: the nameplate's rating in kVA and the power factor it is rated at (audit flow-onboarding-16: sets are sold and labelled in kVA, so a 250 kVA set
+    #: typed as 250 kW was overstated by a quarter): the plan counts on rated_kw, which is rated_kva x power_factor (taken from them when left out).
+    #: None: a rating given in kW only, as before
+    rated_kva: float | None = Field(None, gt=0, le=62500)
+    power_factor: float = Field(0.8, ge=0.5, le=1.0)
 
     @field_validator("c_start_rs", "c_runhr_rs", "c_om_rs_per_kwh", "tank_l")
     @classmethod
@@ -360,6 +370,26 @@ class GensetFields(Strict):
         if isinstance(v, dict) and v.get("fuel_kind") in FUEL_CURVES:
             v = {**{k: x for k, x in FUEL_CURVES[v["fuel_kind"]].items() if k not in v}, **v}
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _kw_from_kva(cls, v):
+        """A rating given in kVA alone: its kW at the power factor (0.8 where it is left out)."""
+        if isinstance(v, dict) and "rated_kw" not in v and isinstance(v.get("rated_kva"), (int, float)) and not isinstance(v.get("rated_kva"), bool):
+            pf = v.get("power_factor", 0.8)
+            if isinstance(pf, (int, float)) and not isinstance(pf, bool):
+                v = {**v, "rated_kw": round(float(v["rated_kva"]) * float(pf), 3)}
+        return v
+
+    @model_validator(mode="after")
+    def _kva_agrees(self):
+        """The kW the plan counts on is the nameplate's kVA times its power factor."""
+        if self.rated_kva is not None:
+            kw = self.rated_kva * self.power_factor
+            if abs(self.rated_kw - kw) > max(0.05, 0.001 * kw):
+                raise ValueError(f"A genset's rating in kW is its kVA times its power factor: {_num(self.rated_kva)} kVA at {self.power_factor:g} is "
+                                 f"{_num(kw)} kW")
+        return self
 
     @model_validator(mode="after")
     def _fuel_units(self):
@@ -393,7 +423,8 @@ _FIELD_WORDS = {"lat": "latitude", "lon": "longitude", "load_peak_kw": "typical 
                 "export_cap_kw": "export cap", "mdi_interval_min": "MDI interval", "kwp_dc": "DC size", "kw_ac": "AC size", "gamma_pdc": "temperature coefficient",
                 "losses_pct": "losses", "nameplate_kwh": "nameplate energy", "soh": "state of health", "p_ch_kw": "charge power", "p_dis_kw": "discharge power",
                 "eta_c": "charge efficiency", "eta_d": "discharge efficiency", "soc_min": "lowest state of charge", "soc_max": "highest state of charge",
-                "rated_kw": "rating", "f_min": "minimum loading", "tank_l": "tank", "min_up_h": "minimum run", "min_down_h": "minimum rest"}
+                "rated_kw": "rating", "f_min": "minimum loading", "tank_l": "tank", "min_up_h": "minimum run", "min_down_h": "minimum rest",
+                "rated_kva": "rating in kVA", "power_factor": "power factor"}
 
 
 class Changed(Exception):

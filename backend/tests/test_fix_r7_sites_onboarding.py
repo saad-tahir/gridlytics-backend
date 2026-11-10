@@ -38,6 +38,9 @@ names the categories the ICP applies to.
 flow-onboarding-10: a captive gas or RLNG genset kept the diesel fuel curve (0.273 litres a kWh read as MMBtu), so its fuel cost came out about 35 times
 too high and the plan never ran it. A gas genset now takes the gas curve in MMBtu and no tank where they are left out, and a curve in the other fuel's
 unit, or a tank on piped gas, is refused.
+
+flow-onboarding-16: the genset's rating was asked in kW only, though sets are sold and labelled in kVA. A genset may now be given its nameplate kVA and
+power factor (0.8 to start with): its kW is the kVA times the power factor, and a kW that disagrees with them is refused.
 """
 from __future__ import annotations
 
@@ -519,3 +522,27 @@ def test_a_gas_genset_takes_the_gas_curve_in_mmbtu_and_no_tank(world):
         r = put(**body)
         assert r.status_code == 422 and r.json()["detail"] == sentence, (body, r.text)
     assert sites.GensetFields.model_validate({"rated_kw": 1000, "fuel_kind": "gas_captive", "a": 0.0085, "b": 0.0010, "tank_l": 0}).a == 0.0085
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-16
+
+def test_a_gensets_rating_may_be_given_in_kva_at_its_power_factor(world):
+    a, sid = world.c["admin"], world.site
+    put = lambda **body: a.put(f"/api/sites/{sid}/assets/genset", json=body)  # noqa: E731
+    # a 250 kVA nameplate at the usual 0.8 is a 200 kW set: typing 250 as kW overstated it by a quarter
+    r = put(rated_kva=250)
+    assert r.status_code == 200, r.text
+    g = r.json()["assets"]["genset"]
+    assert (g["rated_kva"], g["power_factor"], g["rated_kw"]) == (250.0, 0.8, 200.0)
+    r = put(rated_kva=400, power_factor=0.85, rated_kw=340)
+    assert r.status_code == 200 and r.json()["assets"]["genset"]["rated_kw"] == 340.0, r.text
+    r = put(rated_kva=333, rated_kw=266.40000000000003)
+    assert r.status_code == 200, r.text
+    # a kW that disagrees with the kVA and the power factor is refused, as is a power factor out of its range
+    r = put(rated_kva=250, rated_kw=250)
+    assert r.status_code == 422 and r.json()["detail"] == "A genset's rating in kW is its kVA times its power factor: 250 kVA at 0.8 is 200 kW", r.text
+    r = put(rated_kva=250, power_factor=0.3)
+    assert r.status_code == 422 and "power factor" in r.json()["detail"].lower(), r.text
+    # a rating in kW alone is kept as before (no kVA recorded)
+    r = put(rated_kw=150)
+    assert r.status_code == 200 and r.json()["assets"]["genset"]["rated_kva"] is None and r.json()["assets"]["genset"]["rated_kw"] == 150.0, r.text
