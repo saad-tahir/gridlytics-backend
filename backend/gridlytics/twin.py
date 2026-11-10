@@ -427,8 +427,11 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                 bat = -max(0.0, min(pch, ch_room if m == 3 else ch_room_g, gcap[i] - net if net > 0 else gcap[i] + (-net)))
                 if m != 3 and net < 0:  # surplus PV beyond the grid-charge level still charges, up to the target
                     bat = -max(-bat, min(-net, pch, ch_room))
-            elif m == 5:  # export: discharge at the cap
-                bat = min(pdis, dis_room)
+            elif m == 5:
+                # export: discharge at the slot's power, but no more than the load and the export cap take (round 7: an inverter does not discharge
+                # into curtailment); surplus PV beyond the cap charges the battery instead
+                room = net + min(plant.x_max, xcap[i])
+                bat = min(pdis, dis_room, room) if room > 0 else -min(-room, pch, ch_room_abs)
             elif net > 0:
                 if m in (0, 1):
                     bat = min(net, pdis, dis_room_m)
@@ -455,6 +458,10 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                 exp = min(-flow, plant.x_max, xcap[i])
                 curtail = -flow - exp
                 out["exp"][i] = exp
+                if curtail > pv and bat > 0:  # battery output nobody takes is never discharged, and never booked as PV curtailment
+                    back = min(curtail - pv, bat)
+                    bat -= back
+                    curtail -= back
                 if curtail > pv and gen > 0:  # genset output nobody takes is not PV curtailment: the genset runs below its minimum load instead
                     over = min(curtail - pv, gen)
                     gen -= over

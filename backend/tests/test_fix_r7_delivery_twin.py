@@ -657,6 +657,7 @@ def test_a_held_mdi_cap_is_shaved_only_down_to_the_slots_floor_never_into_the_re
     assert float(sim["soc"][in_dis].min()) >= dis["soc_floor_pct"] / 100 - 1e-6
     assert float(sim["imp"][in_dis].max()) <= dis["grid_cap_w"] / 1000 + 1e-6     # with room above the floor it still shaves
 
+
 def test_the_native_replay_charges_at_the_captured_slots_power_not_at_the_batterys():
     """NativeCapture slots take max_charge_kw, and the native replay ignored it: a Deye table grid-charging 01:00-05:00 at 10 kW on a 100 kWh
     battery was replayed at its full 50 kW, five times faster, inflating the baseline's import peak and so the MDI lever credited to the plan."""
@@ -677,3 +678,25 @@ def test_the_native_replay_charges_at_the_captured_slots_power_not_at_the_batter
     assert float(sim["imp"][charge].max()) == pytest.approx(30.0)                  # the load and 10 kW; 70 kW before
     assert float(-sim["bat"][charge].min()) == pytest.approx(10.0)
 
+
+def test_an_export_slot_discharges_only_what_the_load_and_the_export_cap_take_and_books_no_battery_energy_as_curtailed_pv():
+    """The audit's probe: a 20 kW export cap, a 10 kW load, no PV, an export slot at 100 kW for an hour. The battery gave 100 kWh, 20 were exported,
+    10 served and 70 booked as 'curtailed' PV at night: battery energy that went nowhere, and the balance did not close (TWN-01)."""
+    import numpy as np
+
+    from gridlytics import twin
+    site = {"assets": {"battery": {"nameplate_kwh": 500, "soc_min": 0.1, "soc_max": 0.95, "p_ch_kw": 200, "p_dis_kw": 200, "eta_c": 0.95,
+                                   "eta_d": 0.95}},
+            "connections": [{"data": {"regime": "net_billing", "sanctioned_load_kw": 200, "export_cap_kw": 20}}], "data": {}}
+    ts = np.arange(T0, T0 + 3600, 60)
+    slots = [{"start_ts": T0, "end_ts": T0 + 3600, "mode": "export", "soc_floor_pct": 20.0, "soc_target_pct": 90.0, "max_discharge_w": 100_000,
+              "max_charge_w": None, "grid_charge": False, "grid_cap_w": None}]
+    series = _flat_series(ts, 10.0)
+    sim = twin.simulate(series, twin.slots_policy(slots, ts), twin.plant_of(site), 0.9)
+    kwh = lambda k: float(sim[k].sum() / 60)
+    assert kwh("bat") == pytest.approx(30.0) and kwh("exp") == pytest.approx(20.0) and kwh("curtail") == 0.0 and kwh("pv") == 0.0   # 100, 20, 70
+    balance = sim["pv"] + sim["imp"] + sim["bat"] + sim["gen"] - sim["served"] - sim["exp"]
+    assert float(np.abs(balance).max()) < 1e-3                                     # within 1 W every minute
+    # surplus PV beyond the cap in an export slot is stored, not curtailed, while the battery has room
+    sunny = twin.simulate(_flat_series(ts, 10.0, pv=60.0), twin.slots_policy(slots, ts), twin.plant_of(site), 0.5)
+    assert float(sunny["exp"].max()) == pytest.approx(20.0) and float(sunny["bat"].max()) <= 0.0 and float(sunny["curtail"].sum()) == 0.0
