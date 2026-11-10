@@ -23,6 +23,7 @@ EPS_CURTAIL = 0.05     # Rs/kWh: keep PV unless export is capped and the battery
 EPS_CHARGE = 0.001     # Rs/kWh: a tie-break against charging and discharging at once
 EPS_ORDER = 0.002      # Rs/kWh across the horizon: of two steps alike, discharge the earlier and charge the later (round 7: ties split by turns
                        # read as 0 / full / 0 / full runs, "Peak discharge" and "Wear > saving" alternating at one price)
+PKT_OFFSET_S = 5 * 3600  # Pakistan time (UTC+5, no daylight saving): a step's local day for the curtailment's price (`curtail_cost`)
 #: Behind an auto-start (AMF) panel the battery bridges only the panel's start delay (mains-fail confirmation, crank, warm-up and transfer: a minute at
 #: most) and, when the set fails to start, the critical load until someone starts it by hand (two steps, the cover the reserve kept before). One
 #: start in twenty fails (a set exercised weekly fails 1 to 5 % of its starts; the pessimistic end). Round 7, engine-plans-live-03
@@ -106,8 +107,9 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     m = Model()
     G = m.var("G", T, 0, g * p["G_max"], H * c_imp)
     X = m.var("X", T, 0, g * p["X_max"], -H * c_exp)
-    K = m.var("K", T, 0, PV, H * EPS_CURTAIL)
     bat, gen = p.get("battery"), p.get("genset")
+    k_cost = curtail_cost(p)
+    K = m.var("K", T, 0, PV, k_cost)
     lmode = int(p.get("load_mode", 0))
     W, forced, rm_floor = None, np.zeros(T, dtype=bool), {}
     e_gap_idx, e_gap_price = None, 0.0
@@ -191,7 +193,8 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         else:
             u = m.var("u", T, u_lb, u_ub, H * gen["c_runhr"], integer=True)
         v = m.var("v", T, 0, 1, gen["c_start"], integer=True)
-        W = m.var("W", T, 0, np.where(dump_ok, gen["f_min"] * S, 0.0), H * 2 * EPS_CURTAIL) if dump_ok.any() else None
+        # a dump costs more than a curtailment at the same step (curtail PV first, then dump: twin.simulate's order; `curtail_cost`)
+        W = m.var("W", T, 0, np.where(dump_ok, gen["f_min"] * S, 0.0), k_cost + H * EPS_CURTAIL) if dump_ok.any() else None
         # at a panel-started site the panel decides u: minimum up and down rows bind only the starts and stops the plan is free to make
         free_start = ~(auto & (u_lb >= 1))
         free_stop = ~(auto & (u_ub <= 0))
@@ -1247,6 +1250,32 @@ def genset_surplus_steps(p: dict) -> np.ndarray:
     if not (bat and gen and bat.get("a_gen_surplus") and not bat.get("a_gen")):
         return np.zeros(T, dtype=bool)
     return np.asarray(p["g"], dtype=float)[:T] < 0.5
+
+
+def curtail_cost(p: dict) -> np.ndarray:
+    """The objective's coefficient on curtailed PV (K, kW) per step: a tie-break that keeps PV unless it cannot be used, priced so that PV is
+    never curtailed while the battery has room to store it (round 7, engine-plans-live-16). Storing a kWh at a step costs the calendar ageing of
+    holding it (b_cal on E), so where PV would fill the battery later the same day, curtailing now and charging later saved those slopes (and
+    the order tie-break preferred the later charge): Faisalabad curtailed 54 to 67 kW from 12:00 with the battery at 78 % and charged inside
+    the afternoon's load-shedding window, on the median forecast's word that the afternoon would fill it. A kW curtailed therefore pays the
+    calendar cost of holding its charge to the end of its local day, and a tie-break falling over the horizon at twice the order's slope, so
+    charging now always costs less than curtailing now to charge later that day, as the inverter does on site (PV beyond the load charges a
+    battery with room). The genset's dump costs more still (`solve`: curtail PV first, then dump, twin.simulate's order)."""
+    T = int(p["T"])
+    cost = np.full(T, H * EPS_CURTAIL)
+    bat = p.get("battery")
+    if not bat or not T:
+        return cost
+    b_cal = np.asarray(bat.get("b_cal", np.zeros(T)), dtype=float)[:T]
+    b_cal = np.pad(b_cal, (0, T - len(b_cal)))
+    day = (np.asarray(p["ts"], dtype=np.int64)[:T] + PKT_OFFSET_S) // 86400
+    hold, acc = np.zeros(T), 0.0
+    for t in range(T - 1, -1, -1):
+        if t == T - 1 or day[t + 1] != day[t]:
+            acc = 0.0
+        acc += max(0.0, float(b_cal[t]))
+        hold[t] = acc
+    return cost + H * (2 * EPS_ORDER * (1.0 - np.arange(T) / T) + float(bat["eta_c"]) * hold)
 
 
 def genset_follow_cap(p: dict) -> np.ndarray:

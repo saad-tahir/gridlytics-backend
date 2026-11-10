@@ -1340,3 +1340,61 @@ def test_the_holding_time_runs_to_the_dearest_step_or_off_grid_to_the_first_step
     assert plans.terminal_cal_hold(b_cal, np.zeros(192), L, PV, off_grid=True) == pytest.approx(30 * 0.05)
     # a calendar cost switched off holds nothing
     assert plans.terminal_cal_hold(np.zeros(192), c_imp, L, PV, off_grid=False) == 0.0
+
+
+def _farm_day(c_next=400.0):
+    """The demo farm's sizes and day (test_fix_r5_genset): night 10 kW, a morning of 40 kW over 10 kW of PV, a noon of 20 kW under 40 kW."""
+    from test_fix_r5_genset import _day_shape, _farm_night
+
+    return _day_shape(_farm_night(c_next=c_next))
+
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-16
+
+def _sunny_zero_export():
+    """A zero-export day: 80 kW of PV over the 80 kW load from 11:00 to 16:00, the battery at 50 % at 00:00, and a calendar cost on the energy
+    it holds (Rs 0.05 per kWh per step)."""
+    p = _problem()
+    T = p["T"]
+    p["PV"] = np.zeros(T)
+    p["PV"][44:64] = 160.0
+    p["PVlo"] = p["PV"].copy()
+    p["battery"]["b_cal"] = np.full(T, 0.05)
+    return p
+
+
+@pytest.mark.parametrize("calendar", [True, False], ids=["calendar_cost", "no_calendar_cost"])
+def test_pv_is_never_curtailed_while_the_battery_has_room(calendar):
+    """Faisalabad, 8 Nov 12:00: 54 to 67 kW curtailed from 12:00 to 13:45 with the battery flat at 78 % and charging 0, the charge left to 14:00
+    inside the load-shedding window. Charging later saved Rs 20 of calendar ageing (and the order tie-break preferred a later charge) against the
+    risk that the afternoon's PV never fills the pack. On site the PV surplus charges the battery whenever it has room."""
+    p = _sunny_zero_export()
+    if not calendar:
+        p["battery"]["b_cal"] = np.zeros(p["T"])
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    s = r["sol"]
+    E, Emax = np.asarray(s["E"]), 0.95 * 200.0
+    curtailed = np.flatnonzero(s["K"] > 1e-3)
+    assert curtailed.size                                                       # the battery fills, and PV beyond it is curtailed
+    room = [t for t in curtailed if E[t + 1] < Emax - 1e-3 and s["C"][t] < p["battery"]["P_ch"] - 1e-3]
+    assert not room, room                                                       # before: 80 kW curtailed from 11:00 with the battery at 10 %
+    assert float(s["C"][44]) > 1.0                                              # the charge starts with the PV surplus
+
+
+def test_curtailing_with_the_battery_full_still_comes_before_dumping_the_sets_output():
+    """With a full battery the set's minimum-load surplus curtails PV first, then is dumped (twin.simulate's order): the price that keeps PV
+    while the battery has room keeps a dump dearer than a curtailment."""
+    p = _farm_day(c_next=0.0)
+    p["battery"]["E0"] = 0.95 * 120.0
+    p["battery"]["b_cal"] = np.full(p["T"], 0.08)
+    p["genset"]["u_prev"], p["genset"]["elapsed"], p["genset"]["UT"] = 1, 0, 48    # carried on: every step forced, so a dump is allowed
+    p["genset"]["control"] = "manual"
+    r = optimise.solve(p)
+    assert r["status"] in ("optimal", "feasible")
+    s = r["sol"]
+    W = np.asarray(s["W"])
+    noon = np.arange(32, 48)
+    assert float(np.sum(s["K"][noon])) > 0.0
+    # a step that dumps the set's output has no PV left to curtail
+    assert np.all((W[noon] < 1e-4) | (np.asarray(p["PV"])[noon] - s["K"][noon] < 1e-4))

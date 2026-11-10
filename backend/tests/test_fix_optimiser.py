@@ -332,9 +332,12 @@ def test_a_soc_threshold_set_runs_whenever_the_battery_is_under_its_threshold():
     r = optimise.solve(p)
     assert r["status"] == "optimal"
     _genset_invariants(p, r)
-    E, u = r["sol"]["E"], r["sol"]["u"]
+    E, u, v = r["sol"]["E"], r["sol"]["u"], r["sol"]["v"]
     under = [t for t in range(9, 32) if E[t] < 0.25 * 200 - 1e-3]
-    assert under and all(u[t] == 1 for t in under)
+    # the set runs in the outage, on every step under the threshold, and starts only at or under it (a start with the battery exactly at the
+    # threshold is the controller's too: which of the two equal-cost plans the solver returns is a tie-break)
+    assert u[9:32].any() and all(u[t] == 1 for t in under)
+    assert all(E[t] <= 0.25 * 200 + 1e-3 for t in range(9, 32) if v[t] > 0.5)
 
 
 # ------------------------------------------------------------------------------------------------ optimiser-icp-rest-per-day-divisor
