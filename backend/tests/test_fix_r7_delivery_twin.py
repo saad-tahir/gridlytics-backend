@@ -657,3 +657,23 @@ def test_a_held_mdi_cap_is_shaved_only_down_to_the_slots_floor_never_into_the_re
     assert float(sim["soc"][in_dis].min()) >= dis["soc_floor_pct"] / 100 - 1e-6
     assert float(sim["imp"][in_dis].max()) <= dis["grid_cap_w"] / 1000 + 1e-6     # with room above the floor it still shaves
 
+def test_the_native_replay_charges_at_the_captured_slots_power_not_at_the_batterys():
+    """NativeCapture slots take max_charge_kw, and the native replay ignored it: a Deye table grid-charging 01:00-05:00 at 10 kW on a 100 kWh
+    battery was replayed at its full 50 kW, five times faster, inflating the baseline's import peak and so the MDI lever credited to the plan."""
+    import numpy as np
+
+    from gridlytics import twin
+    slot = lambda start, mode, **k: {"start": start, "mode": mode, "soc_floor_pct": 20.0, "soc_target_pct": 95.0, "grid_charge": False, **k}
+    site = {"native": {"body": {"work_mode": "tou", "backup_soc_pct": 20.0, "slots": [
+        slot("00:00", "self_use"), slot("01:00", "charge_grid", grid_charge=True, max_charge_kw=10.0), slot("05:00", "self_use")]}},
+            "assets": {"battery": {"nameplate_kwh": 100, "soc_min": 0.1, "soc_max": 0.95, "p_ch_kw": 50, "p_dis_kw": 50, "eta_c": 0.95,
+                                   "eta_d": 0.95}},
+            "connections": [{"data": {"regime": "net_billing", "sanctioned_load_kw": 200, "export_cap_kw": 0}}], "data": {}}
+    ts = np.arange(T0, T0 + 86400, 60)
+    pol = twin.native_policy(site, ts)
+    charge = (ts >= T0 + 3600) & (ts < T0 + 5 * 3600)
+    assert (pol["max_ch"][charge] == 10.0).all() and np.isinf(pol["max_ch"][~charge]).all()
+    sim = twin.simulate(_flat_series(ts, 20.0), pol, twin.plant_of(site), 0.2)
+    assert float(sim["imp"][charge].max()) == pytest.approx(30.0)                  # the load and 10 kW; 70 kW before
+    assert float(-sim["bat"][charge].min()) == pytest.approx(10.0)
+

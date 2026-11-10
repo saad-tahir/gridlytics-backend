@@ -156,8 +156,9 @@ def truth(site: dict, day: date) -> dict:
 def native_policy(site: dict, ts: np.ndarray) -> dict:
     """The inverter's own table from the native capture (self-use with a backup floor when nothing was captured).
 
-    * Slots apply whenever the capture has them (a Deye-style TOU program is captured under the default work mode too), each with its floor, target and
-      grid-charge flag; the twin charges from the grid towards the slot's target where the flag is set.
+    * Slots apply whenever the capture has them (a Deye-style TOU program is captured under the default work mode too), each with its floor, target,
+      grid-charge flag and charge power (`max_charge_kw`, the battery's own where none was captured); the twin charges from the grid towards the
+      slot's target where the flag is set.
     * `backup` holds the battery while the grid is present (no discharge), charges it from the grid to the backup state of charge when grid charging is
       allowed, and discharges only in outages. Surplus PV still charges it to its maximum, as a backup-mode inverter does: the backup level is the
       grid-charge level (`grid_target`), not a ceiling.
@@ -171,6 +172,7 @@ def native_policy(site: dict, ts: np.ndarray) -> dict:
     mode = np.full(n, MODE_CODE["self_use"])
     floor = np.full(n, backup)
     target = np.full(n, 1.0)
+    max_ch = np.full(n, np.inf)
     grid_target = None
     gch = np.zeros(n, dtype=bool)
     export_first = np.full(n, work == "feed_in_first")
@@ -189,7 +191,9 @@ def native_policy(site: dict, ts: np.ndarray) -> dict:
             floor[i] = s["soc_floor_pct"] / 100.0
             target[i] = s["soc_target_pct"] / 100.0
             gch[i] = bool(s.get("grid_charge", False))
-    return {"mode": mode, "floor": floor, "target": target, "max_dis": np.full(n, np.inf), "max_ch": np.full(n, np.inf), "grid_charge": gch,
+            if s.get("max_charge_kw") is not None:  # the slot's captured charge power (round 7: the replay charged at the battery's own)
+                max_ch[i] = float(s["max_charge_kw"])
+    return {"mode": mode, "floor": floor, "target": target, "max_dis": np.full(n, np.inf), "max_ch": max_ch, "grid_charge": gch,
             "genset": np.full(n, -1), "export_first": export_first, "grid_target": target.copy() if grid_target is None else grid_target}
 
 
