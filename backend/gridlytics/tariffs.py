@@ -173,16 +173,21 @@ def resolve(kind: str, key: str, on: date | str) -> dict | None:
 
 #: A version's kind, and the keys the engine resolves, in words (a body without a name is shown by these, never by its raw key)
 _KIND_NAMES = {"schedule": "Uniform schedule", "tou": "Time-of-use calendar", "adder": "Adder", "tax": "Tax rules",
-               "icp": "Incremental consumption package (ICP)", "prosumer": "Prosumer regime"}
+               "icp": "Incremental consumption package (ICP)", "prosumer": "Prosumer regime", "override": "Site override"}
 _KEY_NAMES = {"xwdisco": "DISCOs except K-Electric", "ke": "K-Electric", "net_billing": "Net billing", "net_metering_legacy": "Legacy net metering"}
 _ABBREVIATIONS = ("fca", "fpa", "qta", "dss", "nj", "ptv", "icp")
 
 
-def version_name(v: dict) -> str:
+def version_name(v: dict, sites_by_connection: dict | None = None) -> str:
     """A version's name for people: its body's name; else its kind and what it covers in words ("Time-of-use calendar, K-Electric", "Net billing",
-    "Tax rules"); an adder by its key with the abbreviations in capitals ("FCA late")."""
+    "Tax rules"); an adder by its key with the abbreviations in capitals ("FCA late"); a site override by its site ("Site override, Mill One", the
+    body's name after it in brackets), never by the connection's id."""
     body = v.get("body") if isinstance(v.get("body"), dict) else {}
     name = body.get("name")
+    if v.get("kind") == "override":
+        site = (sites_by_connection or {}).get(v.get("key"))
+        words = "Site override" + (f", {site}" if site else "")
+        return words + (f" ({name.strip()})" if isinstance(name, str) and name.strip() else "")
     if isinstance(name, str) and name.strip():
         return name.strip()
     kind, key = str(v.get("kind") or ""), str(v.get("key") or "")
@@ -201,7 +206,7 @@ def version_name(v: dict) -> str:
 
 #: A placeholder's kind as a notice names it
 _KIND_WORDS = {"schedule": "uniform schedule", "tou": "time-of-use calendar", "adder": "adder", "tax": "tax rules",
-               "icp": "incremental consumption package", "prosumer": "prosumer regime"}
+               "icp": "incremental consumption package", "prosumer": "prosumer regime", "override": "site override"}
 
 
 def _day_words(d: date) -> str:
@@ -392,11 +397,40 @@ def validate_body(kind: str, key: str, body, effective_from: str | None = None) 
         bounds = [x["upto"] for x in slabs if isinstance(x, dict) and x.get("upto") is not None] if ok else []
         if not ok or bounds != sorted(bounds) or any(x.get("upto") is None for x in slabs[:-1]):
             raise ValueError("The extra tax slabs are a list of {upto (rupees, rising; none on the last), rate (a fraction between 0 and 1)}")
+    elif kind == "override":
+        _validate_override(body)
+
+
+#: What a site override may set (R9 12.6 and 13 step 3): the figures a site's own bill shows that differ from the national objects, and the MDI
+#: block mode and scope (R9 recommendation 3: site settings pending a bill)
+OVERRIDE_FIELDS = ("electricity_duty", "adders", "calendar", "mdi_block", "mdi_scope")
+MDI_BLOCKS = ("fixed", "sliding")
+MDI_SCOPES = ("all_hours", "peak")
+
+
+def _validate_override(body: dict) -> None:
+    extra = sorted(set(body) - {"name", *OVERRIDE_FIELDS})
+    if extra:
+        raise ValueError("A site override sets only the electricity duty, adder rates, the peak window calendar, the MDI block mode and the MDI scope "
+                         f"(not {', '.join(extra)})")
+    if not set(body) & set(OVERRIDE_FIELDS):
+        raise ValueError("A site override sets at least one figure the site's bill shows: electricity_duty, adders, calendar, mdi_block or mdi_scope")
+    if "electricity_duty" in body and (not _num(body["electricity_duty"]) or not 0 <= body["electricity_duty"] < 1):
+        raise ValueError("A site override's electricity_duty is a fraction between 0 and 1 (1.5 percent is 0.015)")
+    ads = body.get("adders", {})
+    if not isinstance(ads, dict) or not all(isinstance(k, str) and k.strip() and _num(r) and abs(r) <= 100 for k, r in ads.items()):
+        raise ValueError("A site override's adders is a map of adder key (for example dss) to its rate on the site's bill in Rs/kWh")
+    if "calendar" in body:
+        validate_body("tou", "xwdisco", body["calendar"])
+    if body.get("mdi_block", "fixed") not in MDI_BLOCKS:
+        raise ValueError("A site override's mdi_block is fixed or sliding (the meter's demand blocks)")
+    if body.get("mdi_scope", "all_hours") not in MDI_SCOPES:
+        raise ValueError("A site override's mdi_scope is all hours (all_hours) or the peak hours only (peak)")
 
 
 def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, by: str) -> dict:
     """A new version from a watcher or a person, pending until an administrator approves it."""
-    if kind not in ("schedule", "tou", "adder", "tax", "icp", "prosumer"):
+    if kind not in ("schedule", "tou", "adder", "tax", "icp", "prosumer", "override"):
         raise ValueError("Unknown tariff kind")
     if not isinstance(key, str) or not key.strip():
         raise ValueError("A version needs its key")
@@ -404,6 +438,8 @@ def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, 
     if not isinstance(body, dict) or not isinstance(source, dict) or source.get("verified") not in ("primary", "secondary", "unverified"):
         raise ValueError("A version carries a body and a source with verified: primary, secondary or unverified")
     validate_body(kind, key, body, effective_from)
+    if kind == "override" and key not in _sites_by_connection():
+        raise ValueError("A site override's key is the grid connection it applies to: one of this company's connections")
     _seeded()
     vid = store.new_id()
     with store.connect() as con:
@@ -531,7 +567,18 @@ def is_peak_local(calendar: dict, local: datetime) -> bool:
     return start <= m < end if start <= end else (m >= start or m < end)
 
 
+def site_override(conn: dict | None, on) -> dict:
+    """The site override of a connection in force on a day (R9 12.6: the figures its own bills show that differ from the national objects, and its
+    MDI block mode and scope), a versioned row keyed by the connection and approved like any version; {} when none is."""
+    cid = (conn or {}).get("id")
+    v = resolve("override", str(cid), on) if cid else None
+    return v["body"] if v else {}
+
+
 def calendar_for(conn: dict, on) -> dict:
+    ov = site_override(conn, on)
+    if isinstance(ov.get("calendar"), dict):
+        return ov["calendar"]  # the peak window the site's own bill shows
     v = resolve("tou", "ke" if conn["data"].get("disco_group") == "ke" else "xwdisco", on)
     return v["body"] if v else {"seasons": []}
 
@@ -601,10 +648,14 @@ def fca_billed(billing_month: str) -> bool:
     return any(is_fca(a) for a in adders_for(billing_month))
 
 
-def adder_rate(adder: dict, conn: dict | None) -> float | None:
+def adder_rate(adder: dict, conn: dict | None, override: dict | None = None) -> float | None:
     """An adder's Rs/kWh for a connection: None when its exemptions name the connection's tariff category or class (for example "agricultural");
     else its rate for that category, or for that class, from `category_rates` (the debt-service surcharge is 43 paisa for agricultural tube wells,
-    R9 section 7); else its rate. Exemptions that name a consumer kind (lifeline, prepaid, protected, evcs) match no category or class."""
+    R9 section 7); else its rate. Exemptions that name a consumer kind (lifeline, prepaid, protected, evcs) match no category or class. A site
+    override's rate for the adder's key (`override["adders"]`, from the site's own bill) comes before all of these."""
+    own = ((override or {}).get("adders") or {}).get(adder.get("key"))
+    if _num(own):
+        return float(own)
     cat = str((((conn or {}).get("data") or {}).get("tariff_category")) or "")
     cls = tariff_data.category_class(cat) if cat else ""
     exempt = adder.get("exempt") or []
@@ -755,12 +806,15 @@ def icp_baseline(conn: dict, month: int, year: int, period: str) -> float | None
 
 # ------------------------------------------------------------------------------------------------ the bill engine (R9 section 13)
 
-def _tax_factor(conn: dict, tax: dict) -> dict:
-    """The multipliers a tax version applies to variable charges, split into what the company bears and what it recovers."""
+def _tax_factor(conn: dict, tax: dict, override: dict | None = None) -> dict:
+    """The multipliers a tax version applies to variable charges, split into what the company bears and what it recovers; a site override's
+    electricity duty (from the site's own bill) in place of its province's and class's."""
     data = conn["data"]
     cls = tariff_data.category_class(data["tariff_category"])
     prov = (data.get("tax") or {}).get("province", "punjab")
     ed = tax.get("electricity_duty", {}).get(prov, {}).get(cls, 0.015)
+    if _num((override or {}).get("electricity_duty")):
+        ed = float(override["electricity_duty"])
     gst = tax.get("gst", 0.18)
     flags = data.get("tax") or {}
     further = tax.get("further_tax_no_strn", 0.03) if not flags.get("strn", True) and cls in ("industrial", "commercial") else 0.0
@@ -776,7 +830,7 @@ def _tax_factor(conn: dict, tax: dict) -> dict:
 
 def _tax_factor_energy(conn: dict, on) -> dict:
     """The multipliers the bill applies to variable charges on a day, split into what the company bears and what it recovers."""
-    return _tax_factor(conn, tax_rules(on))
+    return _tax_factor(conn, tax_rules(on), site_override(conn, on))
 
 
 def _tax_stack(tf: dict) -> float:
@@ -882,27 +936,58 @@ def day_versions(conn: dict, days: list[date]) -> list[dict]:
     data = conn["data"]
     cat = data["tariff_category"]
     exporter = data.get("regime") in EXPORT_REGIMES
+    cid = conn.get("id")
     found = {"schedule": _resolve_days("schedule", "national", days),
              "tou": _resolve_days("tou", "ke" if data.get("disco_group") == "ke" else "xwdisco", days),
              "tax": _resolve_days("tax", "national", days),
              "net_billing": _resolve_days("prosumer", "net_billing", days) if exporter else [None] * len(days),
-             "net_metering_legacy": _resolve_days("prosumer", "net_metering_legacy", days) if exporter else [None] * len(days)}
+             "net_metering_legacy": _resolve_days("prosumer", "net_metering_legacy", days) if exporter else [None] * len(days),
+             # the site's own override (site_override), keyed by its connection
+             "override": _resolve_days("override", str(cid), days) if cid else [None] * len(days)}
+    others = ("tou", "tax", "net_billing", "net_metering_legacy", "override")
     runs: list[dict] = []
     for i, d in enumerate(days):
         s = found["schedule"][i]
         if s is None or cat not in (s["body"].get("cards") or {}):
             raise NoTariffVersion(f"No rate card for {cat} on {d.isoformat()}: no tariff version in force for that day covers it")
-        bodies = {"card": s["body"]["cards"][cat], **{k: (found[k][i] or {}).get("body") for k in ("tou", "tax", "net_billing", "net_metering_legacy")}}
+        bodies = {"card": s["body"]["cards"][cat], **{k: (found[k][i] or {}).get("body") for k in others}}
         key = json.dumps(bodies, sort_keys=True)
-        used = [v for v in (s, *(found[k][i] for k in ("tou", "tax", "net_billing", "net_metering_legacy"))) if v is not None]
+        used = [v for v in (s, *(found[k][i] for k in others)) if v is not None]
         if runs and runs[-1]["key"] == key:
             runs[-1]["last"], runs[-1]["days"] = d, runs[-1]["days"] + 1
             runs[-1]["versions"].update({v["id"]: v for v in used})
             continue
+        ov = bodies["override"] or {}
         runs.append({"key": key, "first": d, "last": d, "days": 1, "schedule": s, "card": bodies["card"],
-                     "cal": bodies["tou"] or {"seasons": []}, "tax": bodies["tax"] or {}, "nb": bodies["net_billing"],
-                     "lg": bodies["net_metering_legacy"], "versions": {v["id"]: v for v in used}})
+                     "cal": ov["calendar"] if isinstance(ov.get("calendar"), dict) else bodies["tou"] or {"seasons": []}, "tax": bodies["tax"] or {},
+                     "nb": bodies["net_billing"], "lg": bodies["net_metering_legacy"], "ov": ov, "versions": {v["id"]: v for v in used}})
     return runs
+
+
+def _mdi(ts: np.ndarray, imp: np.ndarray, peak: np.ndarray | None, interval: int, block: str) -> float:
+    """The maximum demand (kW) of 1-minute imports: the largest mean over `interval` minutes, in fixed blocks aligned to the hour or in a window
+    sliding minute by minute; with `peak` (a minute mask) only the peak hours count: a fixed block by its peak minutes, a sliding window only where
+    every minute of it is a peak minute."""
+    if not len(ts):
+        return 0.0
+    if block == "sliding":
+        idx = ((ts - ts[0]) // 60).astype(np.int64)
+        dense = np.zeros(int(idx[-1]) + 1)
+        dense[idx] = imp
+        ok = np.zeros(len(dense), dtype=bool)
+        ok[idx] = True if peak is None else peak
+        if len(dense) < interval:
+            return 0.0
+        sums = np.convolve(dense, np.ones(interval), "valid")
+        full = np.convolve(ok.astype(float), np.ones(interval), "valid") >= interval - 0.5
+        return float(sums[full].max() / interval) if full.any() else 0.0
+    blocks = ((ts - ts[0] // 3600 * 3600) // (interval * 60)).astype(np.int64)
+    blocks -= blocks.min()
+    w = imp if peak is None else np.where(peak, imp, 0.0)
+    sums = np.bincount(blocks, weights=w)
+    counts = np.bincount(blocks, weights=np.ones(len(ts)) if peak is None else peak.astype(float))
+    means = sums[counts > 0] / interval
+    return float(means.max()) if len(means) else 0.0
 
 
 #: The two lines step 9 adds when a credit is carried between bills
@@ -953,7 +1038,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     runs = day_versions(conn, days)
     last = runs[-1]
     tax_end = last["tax"]
-    tf_end = _tax_factor(conn, tax_end)
+    tf_end = _tax_factor(conn, tax_end, last["ov"])
     billing_month = period_end.strftime("%Y-%m")
     t0 = datetime(period_start.year, period_start.month, period_start.day, tzinfo=PKT).timestamp()
     t1 = (datetime(period_end.year, period_end.month, period_end.day, tzinfo=PKT) + timedelta(days=1)).timestamp()
@@ -987,15 +1072,11 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     reg = _regime_minutes(conn, ts)
     in_legacy = reg == "net_metering_legacy"
     exp_nb = np.where(reg == "net_billing", exp, 0.0)
-    # 3. maximum demand: 30-minute fixed blocks aligned to the hour
+    # 3. maximum demand: blocks of the connection's interval, fixed and aligned to the hour (the default) or sliding minute by minute, over all
+    # hours (the default) or the peak hours only, as the billing month's site override sets them (R9 13 step 3: configurable pending a bill)
     interval = int(data.get("mdi_interval_min", 30))
-    mdi = 0.0
-    if len(ts):
-        blocks = ((ts - ts[0] // 3600 * 3600) // (interval * 60)).astype(np.int64)
-        sums = np.bincount(blocks - blocks.min(), weights=imp)
-        counts = np.bincount(blocks - blocks.min())
-        means = sums[counts > 0] / interval
-        mdi = float(means.max()) * mdi_scalar if len(means) else 0.0
+    block, scope = last["ov"].get("mdi_block", "fixed"), last["ov"].get("mdi_scope", "all_hours")
+    mdi = _mdi(ts, imp, cal_peak if scope == "peak" else None, interval, block) * mdi_scalar
     sl = float(data["sanctioned_load_kw"])
     # legacy net metering nets by period first (R9 section 8.3; marked unverified), over the days inside the agreement only: an import on a day
     # after it ends is billed in full, as under net billing
@@ -1098,7 +1179,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     adder_versions = []
     for a in adders_for(billing_month):
         adder_versions.append({"kind": "adder", "key": a["key"], "id": a["id"], "hash": a.get("hash")})
-        rate = adder_rate(a, conn)
+        rate = adder_rate(a, conn, last["ov"])
         if rate is None:  # the adder exempts the connection's category or class
             continue
         units = total_units if _charged_on_icp_units(a, rate) else total_units - inc_total
@@ -1108,7 +1189,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     # each run's part of the variable charges: its own energy, and of the ICP energy and the adders its share of the billed units
     w_run = [(sum(e_imp[p] * share(i, p) for p, _ in periods) / total_units) if total_units > 0 else runs[i]["days"] / n_days for i in range(len(runs))]
     var_run = [energy_run[i] + w_run[i] * (icp_energy + adders) for i in range(len(runs))]
-    tf_run = [_tax_factor(conn, r["tax"]) for r in runs]
+    tf_run = [_tax_factor(conn, r["tax"], r["ov"]) for r in runs]
     # 8. electricity duty on the variable subtotal, and Punjab's per-unit duty above 500 kVA on the billed grid units
     duty_run = [tf_run[i]["ed"] * var_run[i] for i in range(len(runs))]
     duty = sum(duty_run)
@@ -1198,7 +1279,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
            "first_day": period_start.isoformat(), "last_day": period_end.isoformat(),
            "versions": [{"kind": v["kind"], "key": v["key"], "id": v["id"], "hash": v["hash"], "effective_from": v["effective_from"]}
                         for v in sorted(versions.values(), key=lambda v: (v["kind"], v["key"], v["effective_from"]))] + adder_versions,
-           "series_hash": series_hash, "unpriced": unpriced,
+           "series_hash": series_hash, "unpriced": unpriced, "mdi_settings": {"interval_min": interval, "block": block, "scope": scope},
            # a version awaiting its notification whose start the period reaches: the bill is priced with the one still in force (engine-tariffs-06)
            "tariff_notices": awaiting_notices(period_end)}
     if _num(power_factor_pct):
@@ -1273,7 +1354,7 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
             d += timedelta(days=1)
     day_price: dict[date, tuple[float, float]] = {}
     for d, r in run_of.items():
-        tf = _tax_factor(conn, r["tax"])
+        tf = _tax_factor(conn, r["tax"], r["ov"])
         day_price[d] = ((1.0 + tf["ed"]) * _tax_stack(tf), _unit_duty(conn, r["tax"]) * _tax_stack(tf))
     card = run_of[on]["card"]
     ef, unit = day_price[on]
@@ -1282,7 +1363,9 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     in_bm0 = [b == bm0 for b in bms]
     out["billing_month_end_step"] = next((i for i, x in enumerate(in_bm0) if not x), steps)
     # each adder at the connection's own rate (its category's, or none where it is exempt); on ICP units only those the bill charges there
-    rated = {bm: [(a, r) for a in adders_for(bm) for r in (adder_rate(a, conn),) if r is not None] for bm in dict.fromkeys(bms or [bm0])}
+    # (with the site override of the horizon's last day in that billing month, as the bill takes the billing month's)
+    ov_bm = {bm: run_of[max(d for d, b in bm_by_day.items() if b == bm)]["ov"] for bm in dict.fromkeys(bms)} if bms else {bm0: run_of[on]["ov"]}
+    rated = {bm: [(a, r) for a in adders_for(bm) for r in (adder_rate(a, conn, ov_bm.get(bm)),) if r is not None] for bm in dict.fromkeys(bms or [bm0])}
     add_all = {bm: sum(r for _, r in ads) for bm, ads in rated.items()}
     add_icp = {bm: sum(r for a, r in ads if _charged_on_icp_units(a, r)) for bm, ads in rated.items()}
     bm0_day = date(int(bm0[:4]), int(bm0[5:7]), 1)
@@ -1349,11 +1432,21 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     if card["fixed_basis"] == "per_kw_month":
         out["mdi"] = {"rate_rs_per_kw": card["fixed"] * fixed_factor(conn, on) * _seasonal_factor(data, bm0_day.month),
                       "floor_kw": card["floor_share"] * float(data["sanctioned_load_kw"]),
-                      "interval_steps": max(1, int(data.get("mdi_interval_min", 30)) // 15)}
+                      "interval_steps": max(1, int(data.get("mdi_interval_min", 30)) // 15),
+                      # the site's MDI block mode and scope (site override; fixed and all hours by default) for the optimiser's MDI rows
+                      "block": run_of[on]["ov"].get("mdi_block", "fixed"), "scope": run_of[on]["ov"].get("mdi_scope", "all_hours")}
     return out
+
+
+def _sites_by_connection() -> dict[str, str]:
+    """Each grid connection's site name, by connection id (a site override is keyed by its connection)."""
+    with store.connect() as con:
+        rows = con.execute("SELECT c.id, s.name FROM connections c JOIN sites s ON s.id = c.site_id WHERE s.deleted IS NULL").fetchall()
+    return {r[0]: r[1] for r in rows}
 
 
 def provenance() -> list[dict]:
     """Every shipped and added number's source and status, for the tariff page's provenance view."""
+    names = _sites_by_connection()
     return [{"id": v["id"], "kind": v["kind"], "key": v["key"], "effective_from": v["effective_from"], "effective_to": v["effective_to"], "status": v["status"],
-             "name": version_name(v), "source": v["source"], "hash": v["hash"]} for v in versions()]
+             "name": version_name(v, names), "source": v["source"], "hash": v["hash"]} for v in versions()]

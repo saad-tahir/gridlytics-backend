@@ -30,6 +30,19 @@ def _agreements(on: date) -> list[dict]:
     return sorted(rows, key=lambda x: (x["site_name"], x["connection_id"]))
 
 
+def _connections() -> list[dict]:
+    """Every grid connection of the company, by site: what a site override (kind "override", keyed by the connection) can name."""
+    rows = []
+    for s in sites.listing():
+        for c in sites.connections(s["id"]):
+            d = c.get("data") or {}
+            if d.get("regime") == "off_grid":
+                continue
+            rows.append({"connection_id": c["id"], "site_id": s["id"], "site_name": s["name"], "meter_ref": d.get("meter_ref") or "",
+                         "tariff_category": d.get("tariff_category")})
+    return sorted(rows, key=lambda x: (x["site_name"], x["connection_id"]))
+
+
 @router.get("/api/tariffs")
 def tariffs_index(on: str | None = None):
     auth.need("see_costs", "Seeing the tariff library")
@@ -51,7 +64,7 @@ def tariffs_index(on: str | None = None):
             "prosumer": {k: (tariffs.resolve("prosumer", k, d) or {}).get("body") for k in ("net_billing", "net_metering_legacy")},
             # pending counts the versions an administrator can approve: a placeholder awaiting its notification is not one (approving it is a 422)
             "versions": tariffs.provenance(), "pending": sum(1 for v in tariffs.versions() if v["status"] == "pending"),
-            "agreements": _agreements(d),
+            "agreements": _agreements(d), "connections": _connections(),
             # a version awaiting its notification whose start has passed by the day (engine-tariffs-06): priced with the one still in force
             "notices": tariffs.awaiting_notices(d)}
 

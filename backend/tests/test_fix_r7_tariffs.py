@@ -30,6 +30,9 @@ Batch 4 (late findings; the golden of the dated diesel price is test_r7_tariffs_
 - tests-and-perf-25: a lookup checks that the shipped library is seeded once per company file and process, not on every call, and a fuel price
   entered on a fresh file no longer keeps the shipped prices out.
 
+Review (engine-tariffs-08 e and h): a site's own bill becomes a versioned override of its connection (kind "override": its electricity duty, an
+adder's rate, its peak window calendar, its MDI block mode and scope), applied to its bill, its price vector and its price page only.
+
 Each test fails on the code before its fix."""
 from __future__ import annotations
 
@@ -891,3 +894,103 @@ def test_a_fuel_price_entered_on_a_fresh_file_leaves_the_shipped_prices_in(compa
     assert tariffs.fuel_price("hsd", date(2026, 11, 6))[0] == 382.25
     assert tariffs.fuel_price("hsd", EARLY)[0] == 380.10
     assert len(tariffs.fuel_prices()) == len(tariff_data.FUEL_PRICES) + 1
+
+
+# ------------------------------------------------------------------------------------------------ review: engine-tariffs-08 (e) and (h), site overrides
+
+def _real_conn(name: str):
+    """A site with a stored grid connection (B-2(b), 400 kW, Punjab) and that connection, so an override can name it."""
+    sid = make_site(name=name, conn={"tariff_category": "B-2(b)", "sanctioned_load_kw": 400, "regime": "none"}, genset=False, battery=False)
+    return sid, sites.full(sid)["connections"][0]
+
+
+def _override(conn, body, start="2026-11-01"):
+    v = tariffs.propose("override", conn["id"], start, body, {**SRC, "ref": "DISCO bill of October 2026"}, "t")
+    return tariffs.approve(v["id"], "t")
+
+
+def test_a_site_override_from_a_bill_sets_its_duty_surcharge_and_peak_window(company):
+    # R9 12.6 and 13 step 15: a real bill that shows another duty rate, surcharge or peak window becomes a versioned override of that site, sourced to
+    # the bill and approved like any version, never a change of the national objects (before: no override existed; only a national version could)
+    sid, conn = _real_conn("Override Mill")
+    other = _conn("B-2(b)")  # another connection: the national figures
+    d0, d1 = date(2026, 11, 1), date(2026, 11, 30)
+    ts, imp, exp = _month_series(d0, 30)
+    before = tariffs.rebuild(ts, imp, exp, conn, d0, d1)
+    assert _lines(before, "Electricity duty")[0]["rate"] == 0.015 and before["import_kwh"]["peak"] == pytest.approx(12000.0, abs=0.5)  # 18:00-22:00
+    calendar = {"seasons": [{"months": list(range(1, 13)), "peak": ["16:00", "22:00"]}]}
+    pending = tariffs.propose("override", conn["id"], "2026-11-01", {"name": "From the October 2026 bill", "electricity_duty": 0.02,
+                                                                     "adders": {"dss": 3.0}, "calendar": calendar}, SRC, "t")
+    assert tariffs.rebuild(ts, imp, exp, conn, d0, d1)["lines"] == before["lines"]  # a draft changes nothing until it is approved
+    tariffs.approve(pending["id"], "t")
+    after = tariffs.rebuild(ts, imp, exp, conn, d0, d1)
+    assert _lines(after, "Electricity duty")[0]["rate"] == 0.02
+    assert _lines(after, "Debt service")[0]["rate"] == 3.0
+    assert after["import_kwh"]["peak"] == pytest.approx(18000.0, abs=0.5)  # the bill's own window, 16:00-22:00
+    assert any(v["kind"] == "override" and v["id"] == pending["id"] and v["hash"] for v in after["versions"])
+    assert tariffs.rebuild(ts, imp, exp, other, d0, d1)["lines"] == before["lines"]  # only that connection
+    # the price vector, the price page's factor and the month's peak split price that site as its bill does
+    assert tariffs.energy_factor(conn, NOV) / tariffs.energy_factor(other, NOV) == pytest.approx(1.02 / 1.015)
+    assert tariffs.calendar_for(conn, NOV) == calendar and tariffs.calendar_for(other, NOV) != calendar
+    day = date(2026, 11, 2)
+    tsd, impd, expd = _flat_day(day)
+    vec = _vec(conn, day)
+    assert bool(vec["peak"][16 * 4 + 2]) and not bool(_vec(other, day)["peak"][16 * 4 + 2])  # 16:30
+    assert vec["c_imp"][12] == pytest.approx(_bump(conn, tsd, impd, expd, day, day, OFF), abs=0.01)
+    assert vec["c_imp"][16 * 4 + 2] == pytest.approx(_bump(conn, tsd, impd, expd, day, day, 16 * 60 + 35), abs=0.01)
+    # a day before the override's start keeps the national figures
+    oct_bill = tariffs.rebuild(*_month_series(date(2026, 10, 1), 31), conn, date(2026, 10, 1), date(2026, 10, 31))
+    assert _lines(oct_bill, "Electricity duty")[0]["rate"] == 0.015
+
+
+def test_mdi_block_mode_and_peak_only_scope_are_site_settings_from_a_bill(company):
+    # R9 13 step 3 and recommendation 3: the MDI interval, fixed or sliding blocks, and all hours or peak only, as site settings pending a bill
+    # (before: only the interval; every bill took fixed blocks over all hours)
+    sid, conn = _real_conn("Demand Mill")
+    day = date(2026, 11, 2)
+    ts = _minutes(day, 1)
+    imp = np.full(len(ts), 50.0)
+    imp[10 * 60 + 15:10 * 60 + 45] = 150.0  # off-peak, across two fixed blocks
+    imp[19 * 60:19 * 60 + 30] = 90.0        # in November's peak, 18:00-22:00
+    exp = np.zeros(len(ts))
+    fixed = tariffs.rebuild(ts, imp, exp, conn, day, day)
+    assert fixed["mdi_kw"] == pytest.approx(100.0) and fixed["mdi_settings"] == {"interval_min": 30, "block": "fixed", "scope": "all_hours"}
+    _override(conn, {"mdi_block": "sliding"})
+    sliding = tariffs.rebuild(ts, imp, exp, conn, day, day)
+    assert sliding["mdi_kw"] == pytest.approx(150.0) and sliding["mdi_settings"]["block"] == "sliding"
+    assert _lines(sliding, "Fixed charges")[0]["billing_demand_kw"] == pytest.approx(150.0)
+    _override(conn, {"mdi_block": "fixed", "mdi_scope": "peak"})
+    assert tariffs.rebuild(ts, imp, exp, conn, day, day)["mdi_kw"] == pytest.approx(90.0)
+    _override(conn, {"mdi_block": "sliding", "mdi_scope": "peak"})
+    assert tariffs.rebuild(ts, imp, exp, conn, day, day)["mdi_kw"] == pytest.approx(90.0)
+    mdi = _vec(conn, day)["mdi"]
+    assert mdi["block"] == "sliding" and mdi["scope"] == "peak"  # for the optimiser's MDI rows
+
+
+def test_a_site_override_is_checked_before_it_is_stored(company):
+    sid, conn = _real_conn("Checked Mill")
+    for body, words in (({}, "at least one"), ({"name": "x"}, "at least one"), ({"electricity_duty": 2}, "fraction"),
+                        ({"adders": {"dss": "3"}}, "Rs/kWh"), ({"adders": []}, "Rs/kWh"),
+                        ({"calendar": {"seasons": [{"months": [1], "peak": ["17:00", "21:00"]}]}}, "every month"),
+                        ({"mdi_block": "rolling"}, "fixed or sliding"), ({"mdi_scope": "night"}, "all hours"), ({"gst": 0.2}, "sets only")):
+        with pytest.raises(ValueError, match=words):
+            tariffs.propose("override", conn["id"], "2026-11-01", body, SRC, "t")
+    with pytest.raises(ValueError, match="grid connection"):
+        tariffs.propose("override", "no-such-connection", "2026-11-01", {"electricity_duty": 0.02}, SRC, "t")
+
+
+def test_a_site_override_is_drafted_and_named_through_the_api(world):
+    analyst, admin = world.c["analyst"], world.c["admin"]
+    with world.use():
+        cid = sites.full(world.site)["connections"][0]["id"]
+    lib = admin.get("/api/tariffs", params={"on": "2026-11-09"}).json()
+    assert {"connection_id": cid, "site_id": world.site, "site_name": "Mill One"}.items() <= next(c for c in lib["connections"] if c["connection_id"] == cid).items()
+    r = analyst.post("/api/tariffs/versions", json={"kind": "override", "key": cid, "effective_from": "2026-11-01", "body": {"electricity_duty": 0.02},
+                                                    "source": {**SRC, "ref": "DISCO bill of October 2026"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "pending"
+    row = next(v for v in admin.get("/api/tariffs", params={"on": "2026-11-09"}).json()["versions"] if v["id"] == r.json()["id"])
+    assert row["name"] == "Site override, Mill One"  # never the connection's raw id
+    bad = analyst.post("/api/tariffs/versions", json={"kind": "override", "key": cid, "effective_from": "2026-11-01", "body": {"mdi_block": "rolling"},
+                                                      "source": SRC})
+    assert bad.status_code == 422 and "fixed or sliding" in bad.text
