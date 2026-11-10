@@ -14,7 +14,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import Field, StringConstraints
 from starlette.concurrency import run_in_threadpool
 
-from . import alerts, auth, battery, forecast, plans, sites, store, telemetry
+from . import alerts, auth, battery, forecast, optimise, plans, sites, store, telemetry
 from .routes_common import PKT, bad, full_or_404, now_ts, out, parse_day, parse_ts, site_or_404, today
 from .schemas import Refusal, Strict, check
 
@@ -348,6 +348,35 @@ def outage_cause(site_id: str, start: int, inp: dict = Body(...)):
 
 # ------------------------------------------------------------------------------------------------ battery (UI-10)
 
+def _battery_month(site_id: str, b: dict, e_nom: float, now: int) -> tuple[dict, dict]:
+    """The battery page's KPI figures (R8 2.10, round 7 pages-C-13): this Karachi month to now, from the stored minutes (energy discharged, equivalent
+    full cycles, the daily rate over the days with a battery power reading, hours above 90 % charge and 35 °C, the wear in rupees), and the battery's
+    life: the stored day rows before the month plus the month, counted since the first day that discharged. A figure without readings is unknown
+    (null), not zero; the daily rate waits for a day of readings (R8 2.10's "Needs 1 day"), and divides by the days that have them, which the answer
+    gives (role-owner-38: a 30-day title over 15 days of data read as a rate per calendar day)."""
+    local = datetime.fromtimestamp(now, PKT)
+    first = local.date().replace(day=1)
+    t0 = int(datetime(first.year, first.month, 1, tzinfo=PKT).timestamp())
+    tot = telemetry.battery_totals(site_id, t0, now)
+    days = tot["power_minutes"] / 1440
+    disch = tot["discharge_kwh"] if tot["power_minutes"] else None
+    cycles = disch / e_nom if disch is not None else None
+    hot = tot["hot_full_minutes"] / 60 if tot["temp_minutes"] and tot["soc_minutes"] else None
+    month = {"month": first.strftime("%Y-%m"), "start": t0, "end": now, "days_with_data": round(days, 2),
+             "throughput_kwh": None if disch is None else round(disch, 1), "cycles": None if cycles is None else round(cycles, 2),
+             "cycles_per_day": round(cycles / days, 2) if cycles is not None and days >= 1 else None,
+             "hot_full_hours": None if hot is None else round(hot, 1),
+             "wear_rs": None if disch is None else round(disch * optimise.wear_cost(b))}
+    before = [d for d in telemetry.days(site_id, "0000-01-01", (first - timedelta(days=1)).isoformat()) if d.get("discharge_kwh") is not None]
+    since = next((d["day"] for d in before if d["discharge_kwh"] > 0), None)
+    if since is None and tot["first_discharge_ts"] is not None:
+        since = datetime.fromtimestamp(tot["first_discharge_ts"], PKT).date().isoformat()
+    life = sum(d["discharge_kwh"] for d in before) + (disch or 0.0)
+    known = bool(before) or disch is not None
+    lifetime = {"cycles": round(life / e_nom, 1) if known else None, "throughput_kwh": round(life, 1) if known else None, "since": since}
+    return month, lifetime
+
+
 @router.get("/api/sites/{site_id}/battery")
 def battery_page(site_id: str):
     s = full_or_404(site_id)
@@ -362,8 +391,12 @@ def battery_page(site_id: str):
               for d in daily]
     soc = telemetry.series(site_id, now - 48 * 3600, now, ["battery_soc_est_pct", "battery_soc_bms_pct", "battery_temp_c", "battery_power_w"], "15m")
     plan = plans.current(site_id)
+    month, lifetime = _battery_month(site_id, s["assets"]["battery"], e_nom, now)
+    # the state of health is the pack's as entered: the state service does not estimate it yet (plan OPT-10), and the page says so (pages-C-13)
+    st = {**st, "soh_source": "entered"}
     return out({"battery": st, "pack": s["assets"]["battery"], "cycles": cycles, "cap_per_day": s["data"].get("cycle_cap_per_day"), "soc": soc,
-                "plan": [{"t": x["t"], "soc_pct": x["soc_pct"], "reserve_pct": x["reserve_pct"]} for x in (plan or {}).get("steps", [])]})
+                "plan": [{"t": x["t"], "soc_pct": x["soc_pct"], "reserve_pct": x["reserve_pct"]} for x in (plan or {}).get("steps", [])],
+                "month": month, "lifetime": lifetime})
 
 
 # ------------------------------------------------------------------------------------------------ genset (UI-11)

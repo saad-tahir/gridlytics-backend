@@ -864,6 +864,25 @@ def first_ts(site_id: str) -> int | None:
     return r[0] if r else None
 
 
+def battery_totals(site_id: str, t0: int, t1: int) -> dict:
+    """The battery's figures over [t0, t1) from the stored minutes in one aggregate query (the battery page's month, round 7 pages-C-13): the energy
+    discharged (kWh, as aggregate_day's discharge_kwh), the minutes with a battery power reading, a state-of-charge reading (the estimate, else the
+    BMS) and a temperature reading, the minutes above 90 % charge and 35 °C (battery.state's hot-and-full rule), and the first minute that discharged.
+    Each stored row is one minute (a coarser logger's rows are stored on the minutes they cover); a cell past CELL_MAX is no reading."""
+    soc = "COALESCE(battery_soc_est_pct, battery_soc_bms_pct)"
+    sql = ("SELECT SUM(CASE WHEN battery_power_w > 0 AND battery_power_w <= :m THEN battery_power_w END), "
+           "COUNT(CASE WHEN ABS(battery_power_w) <= :m THEN 1 END), "
+           f"COUNT(CASE WHEN ABS({soc}) <= :m THEN 1 END), "
+           "COUNT(CASE WHEN ABS(battery_temp_c) <= :m THEN 1 END), "
+           f"COUNT(CASE WHEN {soc} > 90 AND {soc} <= :m AND battery_temp_c > 35 AND battery_temp_c <= :m THEN 1 END), "
+           "MIN(CASE WHEN battery_power_w > 0 AND battery_power_w <= :m THEN ts END) "
+           "FROM minute WHERE site_id = :s AND ts >= :t0 AND ts < :t1")
+    with connect() as con:
+        r = con.execute(sql, {"m": CELL_MAX, "s": site_id, "t0": int(t0), "t1": int(t1)}).fetchone()
+    return {"discharge_kwh": float(r[0] or 0.0) / 60000.0, "power_minutes": int(r[1]), "soc_minutes": int(r[2]), "temp_minutes": int(r[3]),
+            "hot_full_minutes": int(r[4]), "first_discharge_ts": r[5]}
+
+
 def raw(site_id: str, t0: int, t1: int, columns: tuple = COLUMNS[3:]) -> dict:
     with connect() as con:
         rows = con.execute(f"SELECT ts, {', '.join(columns)} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",

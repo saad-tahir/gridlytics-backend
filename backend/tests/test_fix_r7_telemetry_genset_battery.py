@@ -17,6 +17,9 @@ formats read, and a file over the upload cap is told the importer's sentence how
 column mapping (column to key, unit, sign, date order) saved per site, guessed from the file's head, and a file without the keys is refused with the
 columns it has and the ones expected; a semicolon file with decimal commas is read (flow-telemetry-plan-control-12).
 
+Batch 4, the battery page: this Karachi month's cycles, throughput, hot-and-full hours and wear, the cycles over the battery's life, and the state of
+health named as entered (pages-C-13); the daily rate divided by the days with readings, which the answer gives (role-owner-38).
+
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
@@ -828,3 +831,65 @@ def test_the_mapping_is_saved_per_site_and_an_upload_reads_with_it(world):
     assert none.status_code == 422 and "mapping" in none.json()["detail"], none.text
     assert op.post(f"/api/sites/{sid}/telemetry/upload", params={"mapping": "mine"}, content=body,
                    headers={"content-type": "text/csv"}).status_code == 422
+
+
+# ================================================================================================ batch 4: the battery page
+
+PACK = {"nameplate_kwh": 100.0, "p_ch_kw": 50.0, "p_dis_kw": 50.0}
+#: 15 Nov 2026, 12:00 Karachi time: the month runs from 1 Nov
+B_NOW = T0 + 10 * 86400 + 12 * 3600
+NOV1 = int(datetime(2026, 11, 1, tzinfo=PKT).timestamp())
+OCT20 = int(datetime(2026, 10, 20, tzinfo=PKT).timestamp())
+
+
+def _battery_site(world, monkeypatch, name: str) -> str:
+    from gridlytics import routes_telemetry
+    monkeypatch.setattr(routes_telemetry, "now_ts", lambda: B_NOW)
+    monkeypatch.setattr(routes_telemetry, "today", lambda: datetime.fromtimestamp(B_NOW, PKT).date())
+    c = world.owner
+    sid = c.post("/api/sites", json={"name": name}).json()["id"]
+    assert c.put(f"/api/sites/{sid}/assets/battery", json=PACK).status_code == 200
+    return sid
+
+
+def test_the_battery_page_counts_this_month_and_the_battery_s_life_over_the_days_with_data(world, monkeypatch):
+    """pages-C-13 and role-owner-38: the KPI row reads this Karachi month (R8 2.10): 100 kWh discharged over the two days of November that have readings
+    is 1.0 cycle, 0.5 a day over 2.0 days with data (not 1.0 / 15 days, nor the rate under a "30 days" title); 90 minutes above 90 % charge and 35 °C
+    are 1.5 h this month; with 50 kWh on 20 October the battery's life holds 1.5 cycles since then; the wear is this month's and money (a viewer gets
+    the rest); the state of health says it is as entered, not estimated."""
+    from gridlytics import optimise
+    c = world.owner
+    sid = _battery_site(world, monkeypatch, "Monthly battery")
+    t = NOV1 + 9 * 86400  # 10 Nov, 00:00
+    with world.use():
+        _write(sid, OCT20, 60, battery_power_w=50000.0, battery_soc_bms_pct=60.0)
+        telemetry.aggregate_day(sid, date(2026, 10, 20))
+        _write(sid, t, 2 * 1440, grid_present=1, battery_power_w=lambda i: 50000.0 if i < 120 else 0.0,
+               battery_soc_bms_pct=lambda i: 95.0 if 600 <= i < 690 else 50.0, battery_temp_c=lambda i: 40.0 if i < 1440 else 30.0)
+        wear = optimise.wear_cost(sites.assets(sid)["battery"])
+    page = c.get(f"/api/sites/{sid}/battery").json()
+    m = page["month"]
+    assert (m["month"], m["start"], m["end"]) == ("2026-11", NOV1, B_NOW)
+    assert (m["days_with_data"], m["throughput_kwh"], m["cycles"], m["cycles_per_day"], m["hot_full_hours"]) == (2.0, 100.0, 1.0, 0.5, 1.5)
+    assert m["wear_rs"] == round(100.0 * wear)
+    assert page["lifetime"] == {"cycles": 1.5, "throughput_kwh": 150.0, "since": "2026-10-20"}
+    assert page["battery"]["soh_source"] == "entered"
+    v = world.role("viewer").get(f"/api/sites/{sid}/battery").json()
+    assert "wear_rs" not in v["month"] and v["month"]["cycles"] == 1.0 and v["lifetime"]["cycles"] == 1.5
+
+
+def test_a_month_without_battery_readings_or_temperature_says_unknown_not_zero(world, monkeypatch):
+    """pages-C-13: before any battery reading this month the month's figures are unknown (null), and a source that sends no temperature gives no
+    hot-and-full hours rather than 0 h; under a day of readings there is no daily rate yet (R8 2.10's "Needs 1 day")."""
+    c = world.owner
+    sid = _battery_site(world, monkeypatch, "Quiet battery")
+    page = c.get(f"/api/sites/{sid}/battery").json()
+    m = page["month"]
+    assert (m["days_with_data"], m["throughput_kwh"], m["cycles"], m["cycles_per_day"], m["hot_full_hours"], m["wear_rs"]) == (0.0, None, None, None,
+                                                                                                                               None, None)
+    assert page["lifetime"] == {"cycles": None, "throughput_kwh": None, "since": None}
+    with world.use():
+        _write(sid, B_NOW - 6 * 3600, 6 * 60, battery_power_w=20000.0, battery_soc_bms_pct=96.0)
+    m = c.get(f"/api/sites/{sid}/battery").json()["month"]
+    assert (m["days_with_data"], m["throughput_kwh"], m["cycles"], m["cycles_per_day"], m["hot_full_hours"]) == (0.25, 120.0, 1.2, None, None)
+
