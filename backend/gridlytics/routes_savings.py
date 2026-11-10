@@ -142,14 +142,47 @@ def _pilot_data(r) -> dict:
     got = data.get("criteria") if isinstance(data.get("criteria"), dict) else {}
     data["criteria"] = {k: float(got[k]) if isinstance(got.get(k), (int, float)) and not isinstance(got.get(k), bool) else v
                         for k, v in PILOT_DEFAULT["criteria"].items()}
-    if not isinstance(data.get("amendments"), list):
-        data["amendments"] = []
+    # an amendment recorded before round 7 names the keys sent, with no reason and no values (audit flow-savings-pilot-bill-30, pages-D-17)
+    data["amendments"] = [{**a, "reason": a.get("reason"), "changes": list(a.get("changes") or []), "values": list(a.get("values") or [])}
+                          for a in (data["amendments"] if isinstance(data.get("amendments"), list) else []) if isinstance(a, dict)]
     return data
+
+
+#: the pilot's fields only a role that sees the fee reads, in the set-up and in its amendments (owner's rule: no money ratio without the fee)
+PILOT_FEE_FIELDS = frozenset({"criteria.fee_multiple"})
+
+
+def _pilot_for_reader(ans: dict) -> dict:
+    """The pilot answer as the reader may see it: without `see_fee`, no fee multiple in the criteria nor in an amendment's changes and values."""
+    if auth.can("see_fee"):
+        return ans
+    p = ans["pilot"]
+    crit = {k: v for k, v in p["criteria"].items() if f"criteria.{k}" not in PILOT_FEE_FIELDS}
+    ams = [{**a, "changes": [c for c in a["changes"] if c not in PILOT_FEE_FIELDS],
+            "values": [v for v in a["values"] if v.get("field") not in PILOT_FEE_FIELDS]} for a in p["amendments"]]
+    return {**ans, "pilot": {**p, "criteria": crit, "amendments": ams}}
+
+
+def _pilot_values(before: dict, after: dict) -> list[dict]:
+    """Each changed field of the set-up with its value before and after ("criteria.min_saving_pct": 8.0 to 5.0); a field sent unchanged is no change."""
+    out = []
+    for k in ("baseline_start", "baseline_days"):
+        if before.get(k) != after.get(k):
+            out.append({"field": k, "before": before.get(k), "after": after.get(k)})
+    for k in PILOT_DEFAULT["criteria"]:
+        a, b = before["criteria"].get(k), after["criteria"].get(k)
+        if a != b:
+            out.append({"field": f"criteria.{k}", "before": a, "after": b})
+    return out
 
 
 @router.get("/api/sites/{site_id}/pilot")
 def pilot_get(site_id: str):
     site_or_404(site_id)
+    return _pilot_for_reader(_pilot_answer(site_id))
+
+
+def _pilot_answer(site_id: str) -> dict:
     with store.connect() as con:
         r = con.execute("SELECT * FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
     return {"pilot": _pilot_data(r), "started": r["started"] if r else None, "capture": sites.native_latest(site_id),
@@ -160,10 +193,13 @@ def pilot_get(site_id: str):
 def pilot_put(site_id: str, inp: dict = Body(...)):
     """Tabs A and D: the baseline window and the success criteria, typed and in range (schemas.PilotEdit). The sign-off and the amendments are the
     server's: the start writes the one, a change after the start appends to the other (round 7, audit pages-D-04, security-roles-05,
-    flow-savings-pilot-bill-10)."""
+    flow-savings-pilot-bill-10). Each change is audited with its fields' values before and after; once the pilot has started it is an amendment
+    that needs a reason and records those values, and a save that changes nothing is refused rather than recorded (audit flow-savings-pilot-bill-30,
+    pages-D-17)."""
     auth.need("start_pilot", "Editing the pilot")
     site_or_404(site_id)
     sent = check(PilotEdit, inp).model_dump(exclude_unset=True)
+    reason = sent.pop("reason", "").strip()
     with store.write_transaction() as con:
         r = con.execute("SELECT * FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
         data = _pilot_data(r)
@@ -173,10 +209,19 @@ def pilot_put(site_id: str, inp: dict = Body(...)):
         if "criteria" in sent:
             sent["criteria"] = {**data["criteria"], **sent["criteria"]}
         new = {**data, **sent}
+        values = _pilot_values(data, new)
         if started:
-            new["amendments"] = data["amendments"] + [{"at": store._now(), "by": auth.actor(), "changes": list(sent)}]
-        con.execute("INSERT INTO pilots (site_id, data, updated) VALUES (?,?,?) ON CONFLICT(site_id) DO UPDATE SET data = excluded.data, "
-                    "updated = excluded.updated", (site_id, json.dumps(new), store._now()))
+            if not values:
+                raise Refusal(422, "Nothing changed, so there is no amendment to record", "no_change")
+            if not reason:
+                raise Refusal(422, "Give the amendment's reason: it is recorded with the change", "reason_needed")
+            new["amendments"] = data["amendments"] + [{"at": store._now(), "by": auth.actor(), "reason": reason,
+                                                       "changes": [v["field"] for v in values], "values": values}]
+        if values:
+            con.execute("INSERT INTO pilots (site_id, data, updated) VALUES (?,?,?) ON CONFLICT(site_id) DO UPDATE SET data = excluded.data, "
+                        "updated = excluded.updated", (site_id, json.dumps(new), store._now()))
+            store.audit(auth.actor(), "amended the pilot" if started else "changed the pilot set-up", site_id,
+                        {"reason": reason, "values": values} if started else {"values": values}, con=con)
     return pilot_get(site_id)
 
 

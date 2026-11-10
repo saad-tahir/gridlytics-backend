@@ -1123,3 +1123,50 @@ def test_a_pilot_record_stored_with_bad_criteria_reads_back_as_an_object(world):
                          "2026-11-01T00:00:00+00:00"))
         got = world.c["admin"].get(f"/api/sites/{sid}/pilot").json()["pilot"]["criteria"]
         assert got == {**CRITERIA, **({"fidelity_pct": 70.0} if isinstance(bad_criteria, dict) else {})}
+
+
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-30, pages-D-17: an amendment
+# ------------------------------------------------------------------------------------------------ says what changed from what to what, and why
+
+def _audit_lines(w, action: str) -> list[dict]:
+    with w.use():
+        return [a for a in store.list_audit() if a["action"] == action]
+
+
+def test_an_amendment_records_its_reason_and_each_changed_fields_old_and_new_value_with_an_audit_line(world):
+    sid = _pilot_ready(world)
+    admin = world.c["admin"]
+    # before the start a change is no amendment, but it is audited with its values before and after
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"baseline_start": "2026-11-20", "baseline_days": 14, "criteria": CRITERIA})
+    assert r.status_code == 200 and r.json()["pilot"]["amendments"] == []
+    (line,) = _audit_lines(world, "changed the pilot set-up")
+    assert line["target"] == sid and line["detail"]["values"] == [{"field": "baseline_start", "before": None, "after": "2026-11-20"}]
+    assert _start(world, sid).status_code == 200
+    # after it, a change needs a reason, and a save that changes nothing records nothing (every save sends the whole criteria)
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"criteria": {"min_saving_pct": 5}})
+    assert r.status_code == 422 and r.json()["code"] == "reason_needed"
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"criteria": CRITERIA, "baseline_days": 14, "reason": "Saved again"})
+    assert r.status_code == 422 and r.json()["code"] == "no_change"
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"criteria": {**CRITERIA, "min_saving_pct": 5}, "reason": "  The customer accepted a lower bar  "})
+    assert r.status_code == 200
+    (am,) = r.json()["pilot"]["amendments"]
+    assert am["reason"] == "The customer accepted a lower bar" and am["by"] and am["at"]
+    assert am["changes"] == ["criteria.min_saving_pct"] and am["values"] == [{"field": "criteria.min_saving_pct", "before": 8.0, "after": 5.0}]
+    (line,) = _audit_lines(world, "amended the pilot")
+    assert line["detail"] == {"reason": "The customer accepted a lower bar", "values": am["values"]}
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"reason": "x" * 501, "baseline_days": 21})
+    assert r.status_code == 422
+
+
+def test_a_role_without_the_fee_reads_no_fee_multiple_in_the_pilot_nor_in_its_amendments(world):
+    sid = _pilot_ready(world)
+    admin = world.c["admin"]
+    assert _start(world, sid).status_code == 200
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"criteria": {"fee_multiple": 2.5}, "reason": "Fee renegotiated"}).status_code == 200
+    assert admin.get(f"/api/sites/{sid}/pilot").json()["pilot"]["criteria"]["fee_multiple"] == 2.5
+    for role in ("operator", "viewer"):
+        p = world.c[role].get(f"/api/sites/{sid}/pilot").json()["pilot"]
+        assert "fee_multiple" not in p["criteria"], role
+        (am,) = p["amendments"]
+        assert am["values"] == [] and am["changes"] == [] and am["reason"] == "Fee renegotiated", role
+    assert world.c["analyst"].get(f"/api/sites/{sid}/pilot").json()["pilot"]["amendments"][0]["values"][0]["after"] == 2.5

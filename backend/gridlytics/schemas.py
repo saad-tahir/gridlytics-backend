@@ -100,11 +100,13 @@ class PilotCriteriaEdit(Strict):
 
 class PilotEdit(Strict):
     """`PUT /sites/:id/pilot`: the fields of the set-up a person may change. The sign-off is written by the start alone and the amendments by the
-    server, so neither is a field here (an unknown field is refused)."""
+    server, so neither is a field here (an unknown field is refused). `reason` is the amendment's, needed once the pilot has started (round 7,
+    audit pages-D-17: "later edits create an amendment with a reason")."""
 
     baseline_start: str | None = None
     baseline_days: int = Field(None, ge=7, le=90)
     criteria: PilotCriteriaEdit = None
+    reason: str = Field("", max_length=500)
 
     @field_validator("baseline_start")
     @classmethod
