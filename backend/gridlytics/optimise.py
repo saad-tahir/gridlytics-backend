@@ -179,10 +179,14 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         forced = u_lb >= 1
         dump_ok = forced.copy()
         dump_ok[thr_t] = True
-        # with the grid down the set's output follows the load, never under its minimum (twin.simulate's outage branch): where the battery may take
-        # the minimum-load surplus (`genset_surplus_steps`), the output is capped at max(f_min S, served load - PV), so the battery takes the set's
-        # output only up to that surplus, never at full power (HANDOFF 8.A.1, round 5)
-        P_on = np.where(gen_surplus, genset_follow_cap(p), S)
+        # with the grid down the set's output follows the load, never under its minimum (twin.simulate's outage branch): its output is capped at
+        # max(f_min S, served load - PV), so the battery takes the set's output only up to its minimum-load surplus, never at full power (HANDOFF
+        # 8.A.1, round 5). On every grid-down step whatever the charging flag (round 7, engine-optimiser-06: with gen_charge_allowed off the cap
+        # was off too, and the plan ran the set at the whole load while PV charged the battery, genset charging in net terms the site's inverter
+        # never does); only a brand that can be told to charge from the set at full power (a_gen) runs it uncapped. Whether that surplus may
+        # reach the battery is the flag's (`genset_surplus_steps`, and the charge_pv_surplus rows below)
+        follow = (g < 0.5) & (not (bat and bat.get("a_gen")))
+        P_on = np.where(follow, genset_follow_cap(p), S)
         Pg = m.var("P", T, 0, P_on, H * gen["c_om"])
         F = m.var("F", T, 0, np.inf, gen["c_fuel"])
         if fix_u is not None:
@@ -347,6 +351,13 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                     cols.append(Pg[t])
                     vals.append(-1)
                 m.row(cols, vals, ub=max(0.0, float(PV[t] - L[t])), name=f"charge_surplus[{t}]")
+            if gen and g[t] < 0.5 and not (bat["a_gen"] or gen_surplus[t]):
+                # no genset charging, with the grid down: the load takes PV first (the set follows what it leaves), so the battery charges only
+                # from the PV beyond the load, never from the set's minimum-load surplus (round 7, engine-optimiser-06). The load served is the
+                # critical load with the set off at a grid-connected site, the whole load where the set carries it (load_mode 1) or off-grid
+                served_on = float(L[t] if (off_grid or lmode == 1) else Lc[t])
+                cap_off, cap_on = max(0.0, float(PV[t] - base_served[t])), max(0.0, float(PV[t]) - served_on)
+                m.row([C[t], u[t]], [1, cap_off - cap_on], ub=cap_off, name=f"charge_pv_surplus[{t}]")
         # the single recovery to the grid-up floor (see e_lb above): y = 1 once the battery is back at the floor, monotone over the run, one per
         # clock hour (a crossing within the hour waits for its end, a quarter of the binaries); while y = 0 there is no discharge
         rec_last = None                                  # the recovery binary of the horizon's last step, where it ends in such a run
@@ -830,10 +841,10 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
     - where a day's run-hour cap binds, the hours the threshold does not force count against it (as in the run_cap rows), and once it is used
       a run above the threshold stops, unless it is the plan's own start inside its minimum up time.
     A run the plan did not make follows the load (at least its minimum load). What the load leaves of PV and the set's output charges the
-    battery (from PV only, unless the genset may charge it: at full power, or its minimum-load surplus with the grid down), the rest is
-    curtailed, then dumped; with the set off the battery carries the load, and load is shed only for what its power or its energy above the
-    cut-off cannot carry. The last of the tank is burnt at the output it can still cover. A hold and a carried minimum up or down time are kept
-    (`u_lb`, `u_ub`). Returns the schedule `u` and the replayed `E`, `U`, `F` and `P`: a feasible point of the problem with the shed rule and
+    battery (from the PV beyond the load only, unless the genset may charge it: at full power, or its minimum-load surplus with the grid down),
+    the rest is curtailed, then dumped; with the set off the battery carries the load, and load is shed only for what its power or its energy
+    above the cut-off cannot carry. The last of the tank is burnt at the output it can still cover. A hold and a carried minimum up or down time
+    are kept (`u_lb`, `u_ub`). Returns the schedule `u` and the replayed `E`, `U`, `F` and `P`: a feasible point of the problem with the shed rule and
     that schedule."""
     T = int(p["T"])
     bat, gen = p["battery"], p["genset"]
@@ -897,7 +908,7 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
                 # never more than the load PV leaves plus what the battery can take (the PV the set frees for it, or the set's own output
                 # where the genset may charge it), and at least the minimum load: no fuel is burnt only to be dumped above that minimum
                 room_c = max(0.0, Emax - E) / (H * eta_c)
-                useful = net + min(ch_ub[t], room_c, np.inf if gen_ch[t] else float(PV[t]))
+                useful = net + min(ch_ub[t], room_c, np.inf if gen_ch[t] else max(0.0, -net))
                 P = min(S, max(f_min * S, min(float(P_plan[t]) if plan_on else net, useful)))
             burn = H * (a * P + b * S)
             if burn > fuel:
@@ -909,7 +920,8 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
             D = min(float(bat["P_dis"]), max(0.0, E - Emin) * eta_d / H, rest)
             Us[t] = rest - D
         else:
-            src = -rest if gen_ch[t] else min(-rest, float(PV[t]))
+            # without genset charging the battery takes only the PV beyond the load (round 7, engine-optimiser-06), never the set's surplus
+            src = -rest if gen_ch[t] else min(-rest, max(0.0, -net))
             C = min(ch_ub[t], max(0.0, Emax - E) / (H * eta_c), src)
         E += H * (eta_c * C - D / eta_d)
         fuel -= burn

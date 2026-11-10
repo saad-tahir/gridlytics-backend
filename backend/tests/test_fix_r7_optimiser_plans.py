@@ -1398,3 +1398,35 @@ def test_curtailing_with_the_battery_full_still_comes_before_dumping_the_sets_ou
     assert float(np.sum(s["K"][noon])) > 0.0
     # a step that dumps the set's output has no PV left to curtail
     assert np.all((W[noon] < 1e-4) | (np.asarray(p["PV"])[noon] - s["K"][noon] < 1e-4))
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-06
+
+def test_without_genset_charging_the_set_still_follows_the_load_and_pv_charges_only_what_the_load_leaves():
+    """The farm with gen_charge_allowed off: the follow cap max(f_min S, served - PV) was off with it, so on a morning of 40 kW over 10 kW of PV
+    the plan ran the set at the whole 40 kW and PV charged the battery 10 kW: genset charging in net terms, which the site's inverter (PV serves
+    the load first) never does. The cap now holds on every grid-down step, and the battery takes only the PV beyond the load."""
+    p = _farm_day()
+    p["battery"]["a_gen_surplus"] = False
+    assert not optimise.genset_surplus_steps(p).any()
+    r = optimise.solve(p)
+    assert r["status"] in ("optimal", "feasible")
+    s = r["sol"]
+    on = s["u"] > 0.5
+    L, PV = np.asarray(p["L"]), np.asarray(p["PV"])
+    assert on[16:32].any()                                                      # the set carries the morning
+    assert np.all(s["P"][on] <= np.maximum(14.4, (L - PV)[on]) + 1e-4)          # before: 40 kW against 30 kW to find
+    assert np.all(s["C"] <= np.maximum(0.0, PV - L) + 1e-4)                     # before: 10 kW from PV while the set carried the load
+    assert float(np.max(s["C"][16:32])) < 1e-4
+
+
+def test_with_genset_charging_the_battery_takes_the_sets_minimum_load_surplus_and_no_more():
+    """The flag decides only whether the minimum-load surplus reaches the battery (round 5): with it on, the night's surplus over 10 kW is stored,
+    and the morning's set still follows the load."""
+    p = _farm_day()
+    r = optimise.solve(p)
+    s = r["sol"]
+    on = s["u"] > 0.5
+    L, PV = np.asarray(p["L"]), np.asarray(p["PV"])
+    assert np.all(s["P"][on] <= np.maximum(14.4, (L - PV)[on]) + 1e-4)
+    assert np.allclose(s["C"][:16][on[:16]], 14.4 - 10.0, atol=1e-3)

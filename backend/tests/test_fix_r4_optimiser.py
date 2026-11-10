@@ -27,7 +27,8 @@ def company(tmp_path, monkeypatch):
 
 def _offgrid_toy(fuel: float) -> dict:
     """Twelve hours off-grid: 40 kW of load, no PV, the battery at 50 % over a 30 % threshold, a 100 kW set that may not charge the battery
-    (as no brand can be told to), on a soc_threshold controller."""
+    (as no brand can be told to), on a soc_threshold controller. The set follows the 40 kW load (round 7, engine-optimiser-06: it could run
+    above it before), so it burns at most 14.2 L an hour: the poor incumbent's tank (155 L, was 160) is one it can burn in the 11 hours left."""
     p = _problem(T=48, genset=True)
     p.update({"off_grid": True, "g": np.zeros(48), "G_max": 0.0, "X_max": 0.0, "c_imp": np.zeros(48), "c_exp": np.zeros(48), "voll": 500.0})
     p["L"][:], p["Lhi"][:], p["Lc"][:] = 40.0, 45.0, 20.0
@@ -66,10 +67,10 @@ def _poor_incumbent(monkeypatch, off: range, shed_kw: float, report: int = 1, bu
 
 
 def test_a_time_limited_plan_that_dodges_a_start_and_burns_its_whole_tank_is_repaired_by_the_threshold_controller(monkeypatch):
-    clean = optimise.solve(_offgrid_toy(160.0))
+    clean = optimise.solve(_offgrid_toy(155.0))
     assert clean["status"] in ("optimal", "feasible") and float(clean["sol"]["U"].sum()) * 0.25 < 1e-3  # solved properly, nothing is shed
     seen = _poor_incumbent(monkeypatch, range(10, 14), 20.0)
-    p = _offgrid_toy(160.0)
+    p = _offgrid_toy(155.0)
     r = optimise.solve(p)
     rep = r.get("threshold_repair")
     # before: the incumbent was published as it stood (20 kW shed for an hour with the set off, the battery above its cut-off and fuel in the
@@ -81,7 +82,7 @@ def test_a_time_limited_plan_that_dodges_a_start_and_burns_its_whole_tank_is_rep
     E, u = r["sol"]["E"], r["sol"]["u"]
     under = [t for t in range(1, 48) if E[t] < 60.0 - 1e-6]
     assert under and all(u[t] > 0.5 for t in under)                       # under its threshold the set always runs, as on site
-    assert float(r["sol"]["F"].sum()) <= 160.0 + 1e-6
+    assert float(r["sol"]["F"].sum()) <= 155.0 + 1e-6
     assert r["status"] == "feasible" and r["time_limited"] is True        # the schedule is the controller's, not proven by the solver
     assert r["mip_gap"] is not None and 0.0 <= r["mip_gap"] < 1.0
     assert rep["repair_seconds"] < 2.0                                     # the genset fixed: close to a linear programme
@@ -128,7 +129,7 @@ def test_an_optimal_first_plan_that_dodges_and_burns_its_whole_tank_is_repaired_
 
 def test_a_poor_first_plan_reported_optimal_is_repaired_as_one_that_stopped_at_its_limit(monkeypatch):
     seen = _poor_incumbent(monkeypatch, range(10, 14), 20.0, report=0)
-    p = _offgrid_toy(160.0)
+    p = _offgrid_toy(155.0)
     r = optimise.solve(p)
     rep = r.get("threshold_repair")
     assert rep and rep["first_status"] == "optimal" and rep["shed_steps"] >= 3 and len(seen) == 2
