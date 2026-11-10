@@ -430,7 +430,16 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         age = bs.get("reading_age_min")
         p["battery_state"] = {"soc_pct": round(soc * 100, 1), "sigma_pct": bs.get("sigma_pct"), "age_min": age,
                               "stale": bool(bs.get("stale", True)) if bs.get("soc_pct") is not None else True,
-                              "anchor_soc_pct": bs.get("anchor_soc_pct") if bs.get("anchor_due") else None}
+                              "anchor_soc_pct": bs.get("anchor_soc_pct") if bs.get("anchor_due") else None, "derate": None}
+        # the pack's temperature derating (round 7, brief-vs-build-05; R6 5.7: "a derate lowers P_dis at the next solve"): the limits its fresh
+        # temperature reading allows hold for the plan's first two hours, the rated powers after (each tick reads the temperature again)
+        lim_ch = float(bs.get("p_ch_limit_kw", b_asset["p_ch_kw"]))
+        lim_dis = float(bs.get("p_dis_limit_kw", b_asset["p_dis_kw"]))
+        if lim_ch < float(b_asset["p_ch_kw"]) - 1e-9 or lim_dis < float(b_asset["p_dis_kw"]) - 1e-9:
+            hold = min(steps, battery_service.DERATE_HOLD_STEPS)
+            bat["P_ch_t"], bat["P_dis_t"] = np.full(steps, float(b_asset["p_ch_kw"])), np.full(steps, float(b_asset["p_dis_kw"]))
+            bat["P_ch_t"][:hold], bat["P_dis_t"][:hold] = lim_ch, lim_dis
+            p["battery_state"]["derate"] = {"temp_c": bs.get("temp_c"), "p_ch_kw": lim_ch, "p_dis_kw": lim_dis, "until": int(t0 + hold * 900)}
         if floor_pct.any():
             # every manual floor (a caller that drops the overrides drops this key), and its two parts
             p["reserve_manual"] = floor_pct / 100.0 * e_nom

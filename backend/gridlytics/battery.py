@@ -20,6 +20,71 @@ UPPER_KNEE = 0.95
 #: stale: from then on sigma grows by R6 5.3's gap term, 1 point per 10 minutes, as well as by the hours since the anchor
 STALE_MINUTES = 15.0
 PKT_OFFSET_S = 5 * 3600
+#: a generic LFP pack's power limits against its temperature, as points (degrees C, share of the rated power), linear between and flat beyond
+#: (round 7, brief-vs-build-05; the deep review's "respect temperature derating from BMS telemetry"). LFP datasheets stop charging under 0
+#: degrees and over 55 and discharging under -20 and over 60, and derate near each limit; the figures are generic, UNVERIFIED for any pack. The
+#: BMS's own limits would replace the curve where telemetry carries them (R6 5.1's battery_charge_limit_a and battery_discharge_limit_a, which
+#: the telemetry contract does not hold yet)
+CHARGE_DERATE = ((0.0, 0.0), (10.0, 1.0), (45.0, 1.0), (55.0, 0.0))
+DISCHARGE_DERATE = ((-20.0, 0.0), (0.0, 1.0), (50.0, 1.0), (60.0, 0.0))
+#: R6 5.7's derate: the discharge limit under half its rating for over 30 minutes
+DERATE_ALERT_SHARE = 0.5
+DERATE_ALERT_MINUTES = 30.0
+#: the plan holds a derating for its first two hours: a pack cools over hours, and every 15-minute tick reads its temperature again
+DERATE_HOLD_STEPS = 8
+#: R6 5.7's capacity_drop: the BMS's state of health falls more than 3 points in a month (the 30 days the service reads)
+CAPACITY_DROP_POINTS = 3.0
+
+
+def derate_factors(temp_c: float) -> tuple[float, float]:
+    """The shares of its rated charge and discharge power a pack at `temp_c` may use (CHARGE_DERATE, DISCHARGE_DERATE)."""
+    t = float(temp_c)
+    return tuple(float(np.interp(t, [a for a, _ in pts], [b for _, b in pts])) for pts in (CHARGE_DERATE, DISCHARGE_DERATE))
+
+
+def _derating(b: dict, g: dict, now: int) -> tuple[dict, list]:
+    """The pack's power limits now from its temperature (the last reading, where it is fresh: not older than one control period) and the
+    `derate` alert where the discharge limit has been under half its rating for over 30 minutes."""
+    temp = g["temp"]
+    seen = np.flatnonzero(~np.isnan(temp))
+    p_ch, p_dis = float(b["p_ch_kw"]), float(b["p_dis_kw"])
+    if not len(seen) or (now - int(g["ts"][seen[-1]])) / 60.0 > STALE_MINUTES:
+        return {"temp_c": None, "p_ch_limit_kw": p_ch, "p_dis_limit_kw": p_dis, "derated": False}, []
+    t_now = float(temp[seen[-1]])
+    f_ch, f_dis = derate_factors(t_now)
+    info = {"temp_c": round(t_now, 1), "p_ch_limit_kw": round(p_ch * f_ch, 1), "p_dis_limit_kw": round(p_dis * f_dis, 1),
+            "derated": bool(f_ch < 1.0 or f_dis < 1.0)}
+    # how long the discharge limit has been under half its rating: back over the readings while it is, a gap longer than a control period
+    # ends the run
+    first, prev = None, None
+    for i in seen[::-1]:
+        if derate_factors(float(temp[i]))[1] >= DERATE_ALERT_SHARE or (prev is not None and (int(g["ts"][prev]) - int(g["ts"][i])) / 60.0
+                                                                        > STALE_MINUTES):
+            break
+        first, prev = i, i
+    alerts = []
+    if first is not None and (now - int(g["ts"][first])) / 60.0 > DERATE_ALERT_MINUTES:
+        alerts.append(("derate", f"The battery is at {t_now:.0f} degrees: the plan limits its discharge to {info['p_dis_limit_kw']:.0f} kW of its "
+                                 f"{p_dis:.0f} kW and its charge to {info['p_ch_limit_kw']:.0f} kW of its {p_ch:.0f} kW until it cools"))
+    return info, alerts
+
+
+def _capacity_drop(site_id: str, now: int) -> tuple[float | None, list]:
+    """The BMS's state of health now (the median of its last day of readings, battery_soh_pct) and the capacity_drop alert where it is more than
+    CAPACITY_DROP_POINTS under the median of the first day of the 30 days read. None and no alert without readings."""
+    d = telemetry.raw(site_id, now - 30 * 86400, now, ("battery_soh_pct",))
+    v = d["battery_soh_pct"]
+    ok = ~np.isnan(v)
+    if not ok.any():
+        return None, []
+    ts, v = d["ts"][ok], v[ok]
+    first = float(np.median(v[ts < ts[0] + 86400]))
+    last = float(np.median(v[ts > ts[-1] - 86400]))
+    days = int(round((int(ts[-1]) - int(ts[0])) / 86400))
+    alerts = []
+    if first - last > CAPACITY_DROP_POINTS:
+        alerts.append(("capacity_drop", f"The BMS's state of health fell from {first:.0f} % to {last:.0f} % in {days} days"))
+    return round(last, 1), alerts
 
 
 def _local_midnight(ts: int) -> int:
@@ -57,12 +122,16 @@ def state(site: dict, now: int | None = None) -> dict | None:
     # the kWh discharged since local midnight (Pakistan time), which the day's cycle cap counts first (round 7, brief-vs-build-04)
     today = g["ts"] >= _local_midnight(now)
     done = float(np.nansum(np.maximum(g["bat"][today], 0.0)) / 60.0)
+    # the pack's temperature derating and the BMS's state of health (round 7, brief-vs-build-05): the derate and capacity_drop alerts of R6 5.7
+    derate, pack_alerts = _derating(b, g, now)
+    soh_bms, drop = _capacity_drop(site["id"], now)
+    pack_alerts += drop
     out = {"e_nom_kwh": round(e_nom, 1), "c_cyc": round(optimise.wear_cost(b), 2), "soh_pct": round(b.get("soh", 1.0) * 100, 1),
            "p_ch_kw": b["p_ch_kw"], "p_dis_kw": b["p_dis_kw"], "soc_min_pct": b["soc_min"] * 100, "soc_max_pct": b["soc_max"] * 100,
-           "discharged_today_kwh": round(done, 2)}
+           "discharged_today_kwh": round(done, 2), **derate, "soh_bms_pct": soh_bms}
     if not known.any():
-        return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "trust_basis": None, "usable_kwh": None, "anchor": None, "alerts": [],
-                "waiting_for_anchor": True, "reading_age_min": None, "stale": True, "anchor_due": False, "anchor_soc_pct": None}
+        return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "trust_basis": None, "usable_kwh": None, "anchor": None,
+                "alerts": pack_alerts, "waiting_for_anchor": True, "reading_age_min": None, "stale": True, "anchor_due": False, "anchor_soc_pct": None}
     last = int(np.where(known)[0][-1])
     soc = float(est[last])
     # sigma at now, not at the last reading (round 7, engine-optimiser-07): it froze where the data stopped, so a plan started from a reading
@@ -115,6 +184,7 @@ def state(site: dict, now: int | None = None) -> dict | None:
     hot = np.nansum((est[day] > 0.9) & (g["temp"][day] > 35)) / 60.0
     if hot > 2:
         alerts.append(("hot_high_soc", f"{hot:.1f} hours above 90 percent charge above 35 degrees in the last day"))
+    alerts += pack_alerts
     disch = np.nansum(np.maximum(g["bat"], 0)) / 60.0
     days_seen = max(1.0, known.sum() / 1440)
     cycles = disch / max(e_nom, 1e-6)

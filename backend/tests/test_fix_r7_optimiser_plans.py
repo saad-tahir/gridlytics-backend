@@ -1700,3 +1700,111 @@ def test_a_tick_takes_the_sites_cycle_cap_and_counts_the_days_discharge_so_far(c
     out = plans.tick(sid, at=now, save=False)
     first = [s for s in out["steps"] if s["date"] == "2026-11-03" and s["grid_present"] > 0.5]
     assert sum(s["discharge_kw"] for s in first) * H <= 60.0 + 0.05
+
+
+# ------------------------------------------------------------------------------------------------ brief-vs-build-05
+
+PACK_COLS = SOC_COLS + ("battery_temp_c",)
+
+
+def _pack(sid, start, minutes, temp, soc=60.0, kw=0.0):
+    rows = [(sid, start + 60 * i, "edge", 1.0, soc, soc, kw * 1000.0, temp) for i in range(minutes)]
+    telemetry.write_rows(rows, PACK_COLS)
+
+
+def test_the_derating_curve_of_a_generic_lfp_pack():
+    from gridlytics import battery
+    assert battery.derate_factors(25.0) == (1.0, 1.0)
+    assert battery.derate_factors(-5.0) == (0.0, pytest.approx(0.75))       # no charge under 0 degrees
+    assert battery.derate_factors(5.0) == (pytest.approx(0.5), 1.0)
+    assert battery.derate_factors(50.0) == (pytest.approx(0.5), 1.0)
+    assert battery.derate_factors(57.0) == (0.0, pytest.approx(0.3))
+    assert battery.derate_factors(65.0) == (0.0, 0.0)
+
+
+def test_a_hot_pack_is_planned_at_its_derated_power_and_raises_derate(company):
+    """battery_temp_c was ingested and read by nothing that limits power: a hot pack was planned at its full rated power, and the derate alert
+    (R6 5.7: the discharge limit under half its rating for over 30 minutes, which lowers P_dis at the next solve) could never fire. The pack's
+    temperature now derates both powers for the next two hours of the plan, and the alert fires."""
+    from gridlytics import battery
+    sid = _battery_site()
+    start = twin.day_start_utc(date(2026, 11, 3)) + 12 * 3600
+    _pack(sid, start, 60, temp=57.0)                                             # an hour at 57 degrees
+    now = start + 3600
+    st = battery.state(sites.full(sid), now)
+    assert st["temp_c"] == pytest.approx(57.0)
+    assert st["p_dis_limit_kw"] == pytest.approx(30.0) and st["p_ch_limit_kw"] == pytest.approx(0.0)
+    text = dict(st["alerts"])["derate"]
+    assert "57" in text and "30 kW" in text and "100 kW" in text
+    t0 = now // 900 * 900
+    p = plans.build_problem(sites.full(sid), t0, forecast.issue(sites.full(sid), t0, save=False), 96)
+    b = p["battery"]
+    assert np.allclose(b["P_dis_t"][:8], 30.0) and np.allclose(b["P_dis_t"][8:], 100.0)
+    assert np.allclose(b["P_ch_t"][:8], 0.0) and np.allclose(b["P_ch_t"][8:], 100.0)
+    assert p["battery_state"]["derate"] == {"temp_c": 57.0, "p_ch_kw": 0.0, "p_dis_kw": 30.0, "until": t0 + 2 * 3600}
+    r = optimise.solve(p)
+    assert r["status"] in ("optimal", "feasible")
+    assert float(np.max(r["sol"]["D"][:8])) <= 30.0 + 1e-6 and float(np.max(r["sol"]["C"][:8])) <= 1e-6
+
+
+def test_a_short_hot_spell_derates_the_plan_without_the_alert_and_a_cool_or_stale_reading_derates_nothing(company):
+    from gridlytics import battery
+    sid = _battery_site()
+    start = twin.day_start_utc(date(2026, 11, 3)) + 12 * 3600
+    _pack(sid, start, 40, temp=30.0)
+    _pack(sid, start + 40 * 60, 20, temp=57.0)                                    # 20 minutes hot: under R6's 30
+    st = battery.state(sites.full(sid), start + 3600)
+    assert st["p_dis_limit_kw"] == pytest.approx(30.0) and "derate" not in dict(st["alerts"])
+    cool = _battery_site()
+    _pack(cool, start, 60, temp=30.0)
+    st = battery.state(sites.full(cool), start + 3600)
+    assert st["p_dis_limit_kw"] == 100.0 and st["p_ch_limit_kw"] == 100.0 and "derate" not in dict(st["alerts"])
+    t0 = (start + 3600) // 900 * 900
+    p = plans.build_problem(sites.full(cool), t0, forecast.issue(sites.full(cool), t0, save=False), 96)
+    assert "P_dis_t" not in p["battery"] and p["battery_state"].get("derate") is None
+    # a hot reading an hour old says nothing about the pack now
+    st = battery.state(sites.full(sid), start + 2 * 3600)
+    assert st["temp_c"] is None and st["p_dis_limit_kw"] == 100.0
+
+
+def test_a_derated_discharge_bounds_the_outage_reserve():
+    p = _problem(T=96)
+    p["p_start"] = np.full(96, 0.2)
+    free = optimise.solve(p)
+    p["battery"]["P_dis_t"] = np.full(96, 10.0)
+    r = optimise.solve(p)
+    assert float(np.max(r["R"])) < float(np.max(free["R"])) - 1.0
+    assert float(np.max(r["R"])) <= 10.0 * H * 8 / 0.95 + 1e-6                   # 8 steps of outage at the derated 10 kW
+
+
+def _soh(sid, start, days, first, last):
+    rows = [(sid, start + 3600 * h, "edge", 1.0, 60.0, 60.0, 0.0, first + (last - first) * h / (days * 24 - 1)) for h in range(days * 24)]
+    telemetry.write_rows(rows, SOC_COLS + ("battery_soh_pct",))
+    return start + 3600 * (days * 24 - 1) + 60
+
+
+def test_a_bms_state_of_health_falling_over_3_points_in_a_month_raises_capacity_drop(company):
+    """R6 5.7's capacity_drop (the BMS's state of health falls more than 3 points in a month) existed as a rule name only."""
+    from gridlytics import battery
+    sid = _battery_site()
+    now = _soh(sid, twin.day_start_utc(date(2026, 10, 8)), 28, 96.0, 92.0)
+    st = battery.state(sites.full(sid), now)
+    text = dict(st["alerts"])["capacity_drop"]
+    assert "96 %" in text and "92 %" in text and "28 days" in text
+    steady = _battery_site()
+    now = _soh(steady, twin.day_start_utc(date(2026, 10, 8)), 28, 96.0, 94.0)
+    assert "capacity_drop" not in dict(battery.state(sites.full(steady), now)["alerts"])
+    none = _battery_site()
+    _pack(none, now - 3600, 60, temp=30.0)                                       # no state of health reported: nothing to compare
+    assert "capacity_drop" not in dict(battery.state(sites.full(none), now)["alerts"])
+
+
+def test_the_derate_and_capacity_drop_alerts_reach_the_site(company):
+    from gridlytics import alerts
+    sid = _battery_site()
+    now = _soh(sid, twin.day_start_utc(date(2026, 10, 8)), 28, 96.0, 92.0)
+    _pack(sid, now - 3600, 60, temp=58.0)
+    alerts.evaluate(sid, now)
+    with store.connect() as con:
+        rules = {r["rule"] for r in con.execute("SELECT rule FROM alerts WHERE site_id = ? AND state = 'open'", (sid,)).fetchall()}
+    assert {"battery_derate", "battery_capacity_drop"} <= rules

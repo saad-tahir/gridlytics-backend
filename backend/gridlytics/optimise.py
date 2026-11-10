@@ -306,13 +306,12 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         En, E0 = bat["E_nom"], bat["E0"]
         Emin, Emax = bat["soc_min"] * En, bat["soc_max"] * En
         c_cyc = bat["c_cyc"]
-        ch_ub = np.full(T, bat["P_ch"])
+        ch_ub, d_ub = power_caps(bat, T)
         ch_ub[np.asarray(bat.get("charge_block", np.zeros(T, dtype=bool)), dtype=bool)] = 0
         # the order tie-break only where the grid is up: grid-down and off-grid steps keep their costs (the battery-inverter follows the load
         # there, and the off-grid threshold solves are timed to the second)
         ramp = np.where(g > 0.5, np.arange(T) / max(T, 1), 0.0)
         C = m.var("C", T, 0, ch_ub, H * (EPS_CHARGE + EPS_ORDER * np.where(g > 0.5, 1.0 - ramp, 0.0)))
-        d_ub = np.full(T, float(bat["P_dis"]))
         D = m.var("D", T, 0, d_ub, H * (c_cyc + EPS_ORDER * ramp))
         e_lb = np.full(T + 1, min(Emin, E0))
         e_ub = np.full(T + 1, max(Emax, E0))
@@ -461,7 +460,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         # what the battery can deliver in a step of an outage: the critical load less PV, never above its discharge power, nor above what the
         # inverter's kW AC leaves after PV (round 7, engine-plans-live-06: Lahore held 115 kWh for a 180 kW load on a 50 kW battery, of which
         # it could deliver 25 kWh in the 30 minutes the reserve covered)
-        out_kw = np.minimum(np.maximum(0.0, Lc - PVlo), float(bat["P_dis"]))
+        out_kw = np.minimum(np.maximum(0.0, Lc - PVlo), d_ub)   # under a temperature derating, the derated power (brief-vs-build-05)
         if inv_ac is not None:
             out_kw = np.minimum(out_kw, np.maximum(0.0, inv_ac - np.minimum(PVlo, Lc)))
         deficit = out_kw * H / bat["eta_d"]
@@ -554,7 +553,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 # adds no variables; on the farm's full tank (seven start hours, 10 s) every plan shed nothing, at objectives within 3 % of the
                 # first solve's. On a tank that runs dry it slows the solve past the limit, hence only in this re-solve
                 for k in shed_steps:
-                    cut = max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"])
+                    cut = max(0.0, float(base_served[k] - PV[k]) - d_ub[k])
                     if U_ub[k] <= cut:
                         continue
                     cols, vals = [U[k], u[k], u[k + 1]], [1, -(U_ub[k] - cut), -(U_ub[k] - cut)]
@@ -567,7 +566,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 # a guard only: every shed the rule allows is reachable without it, and at ten times VoLL it is never the cheap way round it
                 sv = m.var("thr_shed", len(shed_k), 0, np.inf, H * 10 * voll)
                 for i, k in enumerate(shed_k):
-                    cut = max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"])
+                    cut = max(0.0, float(base_served[k] - PV[k]) - d_ub[k])
                     cols, vals = [U[k], u[k], yv[i], sv[i]], [1, -U_ub[k], -U_ub[k], -1]
                     if k in thr_z:
                         cols.append(thr_z[k])
@@ -797,7 +796,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         tank_need = max(0.0, float(gen["fuel_available"]) - min_burn)
         burnt = np.concatenate([[0.0], np.cumsum(x[F])])
         dodges = [k for k in shed_steps
-                  if x[U[k]] > max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"]) + 1e-3 and x[u[k]] < 0.5 and x[u[k + 1]] < 0.5
+                  if x[U[k]] > max(0.0, float(base_served[k] - PV[k]) - d_ub[k]) + 1e-3 and x[u[k]] < 0.5 and x[u[k + 1]] < 0.5
                   and not (k in thr_z and burnt[k] >= tank_need - 1e-6)]
         left = float(gen["fuel_available"]) - float(np.sum(x[F]))
         resolved, resolve_limited = False, False
@@ -897,7 +896,7 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
     En = float(bat["E_nom"])
     Emin, Emax = bat["soc_min"] * En, bat["soc_max"] * En
     eta_c, eta_d = float(bat["eta_c"]), float(bat["eta_d"])
-    ch_ub = np.full(T, float(bat["P_ch"]))
+    ch_ub, d_ub = power_caps(bat, T)
     ch_ub[np.asarray(bat.get("charge_block", np.zeros(T, dtype=bool)), dtype=bool)[:T]] = 0.0
     S, f_min, a, b = float(gen["S"]), float(gen["f_min"]), float(gen["a"]), float(gen["b"])
     UT = 1 if relaxed else int(gen["UT"])
@@ -961,7 +960,7 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
         rest = net - P
         C = D = 0.0
         if rest > 0:
-            D = min(float(bat["P_dis"]), max(0.0, E - Emin) * eta_d / H, rest)
+            D = min(float(d_ub[t]), max(0.0, E - Emin) * eta_d / H, rest)
             Us[t] = rest - D
         else:
             # without genset charging the battery takes only the PV beyond the load (round 7, engine-optimiser-06), never the set's surplus
@@ -1362,7 +1361,7 @@ def shorten(p: dict, T: int) -> dict:
             q[k] = np.asarray(q[k])[:T]
     if q.get("battery"):
         b = dict(q["battery"])
-        for k in ("b_cal", "charge_block", "day_index"):
+        for k in ("b_cal", "charge_block", "day_index", "P_ch_t", "P_dis_t"):
             if k in b:
                 b[k] = np.asarray(b[k])[:T]
         q["battery"] = b
@@ -1378,6 +1377,19 @@ def shorten(p: dict, T: int) -> dict:
         md["month_end_step"] = min(md.get("month_end_step", T), T)
         q["mdi"] = md
     return q
+
+
+def power_caps(bat: dict, T: int) -> tuple[np.ndarray, np.ndarray]:
+    """The battery's charge and discharge limits per step (kW): its rated P_ch and P_dis, under the temperature derating where the problem
+    carries one (`P_ch_t`, `P_dis_t`; round 7, brief-vs-build-05)."""
+    caps = []
+    for rated, key in ((bat["P_ch"], "P_ch_t"), (bat["P_dis"], "P_dis_t")):
+        a = np.full(T, float(rated))
+        if bat.get(key) is not None:
+            v = np.asarray(bat[key], dtype=float)[:T]
+            a[:len(v)] = np.minimum(a[:len(v)], v)
+        caps.append(a)
+    return caps[0], caps[1]
 
 
 def mdi_floors(mdi: dict) -> tuple[float, float]:
