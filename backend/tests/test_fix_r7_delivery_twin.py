@@ -4,6 +4,8 @@ grammar's fields, the values keyed once beside them, and a sentence for what the
 something on site holds it. Each test fails on the code before its fix. Test data: synthetic compiled days and plan steps; nothing reads the network."""
 from __future__ import annotations
 
+import pytest
+
 from test_fix_api import world  # noqa: F401 (a fixture: a company of its own with a site and a client per role)
 from test_fix_optimiser import company  # noqa: F401 (a fixture: a company file of its own)
 
@@ -624,3 +626,34 @@ def test_a_keyed_table_has_no_expiry_it_repeats_its_day_by_clock_time():
     day1 = ts >= until
     for k in ("mode", "floor", "target", "grid_charge"):
         assert np.array_equal(pol[k][day1], pol[k][~day1]), k                  # tomorrow runs today's table, minute for minute
+
+
+# ------------------------------------------------------------------------------------------------ batch 3: the twin's fidelity (engine-delivery-15, -16, -20)
+
+def _flat_series(ts, load: float, pv: float = 0.0, grid: float = 1.0) -> dict:
+    import numpy as np
+    n = len(ts)
+    return {"ts": ts, "pv": np.full(n, pv), "load": np.full(n, load), "crit": np.full(n, min(load, 100.0)), "grid": np.full(n, grid),
+            "temp": np.full(n, 30.0)}
+
+
+def test_a_held_mdi_cap_is_shaved_only_down_to_the_slots_floor_never_into_the_reserve_it_holds():
+    """twin.simulate shaved to a slot's grid_cap_w in any mode, hold and charge included, down to the BMS floor: a load above the forecast in the
+    hold before the evening peak (Huawei holds the cap with its capacity control) drained the battery the plan held at 90 % to about 43 %. The floor
+    wins: the cap is held only with the energy above the slot's floor."""
+    import numpy as np
+
+    from gridlytics import twin
+    comp = delivery.compile_mode_a(_peak_day(), "huawei", BAT, 20.0, 10.0, 300.0, site=_mdi_site())
+    slots = [s for d in comp["days"] for s in d["slots"]]
+    hold, dis = slots[0], next(s for s in slots if s["mode"] == "discharge")
+    assert hold["mode"] == "hold" and hold["soc_floor_pct"] == 90.0 and hold["grid_cap_w"] == 400_000
+    ts = np.arange(T0, T0 + 86400, 60)
+    sim = twin.simulate(_flat_series(ts, 450.0), twin.slots_policy(slots, ts), twin.plant_of(_mdi_site()), 0.9)
+    in_hold = (ts >= hold["start_ts"]) & (ts < hold["end_ts"])
+    assert float(sim["soc"][in_hold].min()) >= 0.9 - 1e-6                          # 0.43 before
+    assert float(sim["imp"][in_hold].max()) == pytest.approx(450.0)                # the floor wins: the cap is not held there
+    in_dis = (ts >= dis["start_ts"]) & (ts < dis["end_ts"])
+    assert float(sim["soc"][in_dis].min()) >= dis["soc_floor_pct"] / 100 - 1e-6
+    assert float(sim["imp"][in_dis].max()) <= dis["grid_cap_w"] / 1000 + 1e-6     # with room above the floor it still shaves
+

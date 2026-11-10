@@ -434,8 +434,10 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
             else:
                 bat = -min(-net, pch, ch_room_abs if m in (0, 1) else ch_room)
             flow = served - pv - bat
-            if flow > gcap[i] and has_bat:  # peak shaving to the plan's MDI cap, down to the battery's own floor
-                extra = max(0.0, min(flow - gcap[i], plant.p_dis - max(bat, 0.0), dis_room_abs - max(bat, 0.0)))
+            if flow > gcap[i] and has_bat:
+                # peak shaving to the slot's grid cap (the plan's MDI cap where something on site holds it), never below the slot's floor (round 7:
+                # the BMS floor before, so a load above the forecast drained the level a hold keeps for an outage): the floor wins
+                extra = max(0.0, min(flow - gcap[i], plant.p_dis - max(bat, 0.0), dis_room_m - max(bat, 0.0)))
                 bat += extra
                 flow -= extra
             if gen_on:
