@@ -714,3 +714,24 @@ def test_a_capture_a_person_sends_cannot_claim_the_edge_read_it_back(world):
     with world.use():
         assert sites.capture_native(sid, {"source": "read_back", "work_mode": "self_use"}, "edge")["body"]["source"] == "read_back"
 
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-02, an active site's DISCO changed later
+
+def test_a_site_whose_disco_changed_after_its_connection_was_saved_is_told_in_every_answer(world):
+    # activation asks for the group to match, but a site already active whose DISCO is changed in Site settings General was priced on the other DISCO's
+    # peak windows with no word anywhere
+    a, sid = world.c["admin"], world.site
+    held = _site(a, sid)["connections"][0]
+    assert held["data"]["disco_group"] == "xwdisco"
+    warning = ("The grid connection is priced on the other DISCOs' time-of-use windows, but this site's DISCO is K-Electric: save the connection again "
+               "with K-Electric's (tab C, or Site settings Tariff)")
+    r = a.put(f"/api/sites/{sid}", json={"disco": "K-Electric"})
+    assert r.status_code == 200 and warning in r.json()["setup_warnings"], r.text
+    assert warning in _site(a, sid)["setup_warnings"]
+    r = a.put(f"/api/sites/{sid}/connection", json={"id": held["id"], "tariff_category": "B-2(b)", "sanctioned_load_kw": 400})
+    assert r.status_code == 200 and r.json()["connections"][0]["data"]["disco_group"] == "ke", r.text
+    assert not [w for w in r.json()["setup_warnings"] if "time-of-use windows" in w], r.text
+    # and the other way round
+    r = a.put(f"/api/sites/{sid}", json={"disco": "FESCO"})
+    assert ("The grid connection is priced on K-Electric's time-of-use windows, but this site's DISCO is FESCO: save the connection again with the other "
+            "DISCOs' (tab C, or Site settings Tariff)") in r.json()["setup_warnings"], r.text

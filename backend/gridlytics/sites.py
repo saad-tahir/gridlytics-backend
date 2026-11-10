@@ -675,6 +675,13 @@ def setup_warnings(site: dict) -> list[str]:
         if c.get("sanctioned_load_kw") and cap > c["sanctioned_load_kw"]:
             out.append(f"The export cap ({kw(cap)}) is above the sanctioned load ({kw(c['sanctioned_load_kw'])}): a net-metering or net-billing agreement "
                        "allows no more than the sanctioned load")
+        # the site's DISCO changed after the connection was saved (group_problem; activation asks for it, an active site is told here): it is priced on
+        # the other calendar's peak windows until the connection is saved again (audit flow-onboarding-02)
+        if c.get("regime") != "off_grid" and group_problem(c.get("disco_group"), d.get("disco")):
+            ke = group_for_disco(d.get("disco")) == "ke"
+            held, wanted = ("the other DISCOs'", "K-Electric's") if ke else ("K-Electric's", "the other DISCOs'")
+            out.append(f"The grid connection is priced on {held} time-of-use windows, but this site's DISCO is {d['disco']}: save the connection again "
+                       f"with {wanted} (tab C, or Site settings Tariff)")
     crit = max([float(x) for x in d.get("critical_load_kw") or [] if isinstance(x, (int, float))] or [0.0])
     if crit > 0 and bat.get("p_dis_kw"):
         by_inverter = bool(inv) and inv < bat["p_dis_kw"]
