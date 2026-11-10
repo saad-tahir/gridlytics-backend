@@ -46,6 +46,7 @@ PAGES = ["/api/sites/{s}", "/api/sites/{s}/now", "/api/sites/{s}/overview/chart"
          "/api/sites/{s}/forecasts/load", "/api/sites/{s}/forecasts/outage", "/api/sites/{s}/forecasts/scores", "/api/sites/{s}/savings",
          "/api/sites/{s}/switchback", "/api/sites/{s}/pilot", "/api/sites/{s}/edge", "/api/sites/{s}/native", "/api/sites/{s}/events", "/api/meta", "/api/fleet",
          "/api/sites", "/api/alerts", "/api/alerts/counts", "/api/reports", "/api/demo", "/api/fleet/savings", "/api/v1/fleet"]
+PAGES += ["/api/sites/{s}/plan/past"]  # the plan table's past rows (round 7, pages-B-07)
 
 
 @pytest.mark.parametrize("email", ["owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"])

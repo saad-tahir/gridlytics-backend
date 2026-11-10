@@ -378,6 +378,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     floor_pct = np.maximum(hold_pct, force_pct)
     # pause and release to native do not shape the solve (the tick holds the plan and the edge gets a release); the rest are operator holds
     p["override_mask"] = mask["genset_hold"] | mask["charge_block"] | mask["reserve"] | mask["force_charge"]
+    # each kind's own window, for the plan table's Flags column (round 7, pages-B-07; R8 2.9): every step names the overrides it lies inside
+    p["override_kinds"] = {k: m for k, m in mask.items() if m.any()}
     p["overrides"] = [{"kind": o["kind"], "value": o["value"], "until": o["until_ts"], "author": o["author"]} for o in ovs]
     gen = None
     # each step's local (Pakistan) day from t0's: the genset's run-hour cap and the battery's cycle cap are per day
@@ -483,6 +485,8 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
     r_rows, man = res.get("r") or {}, res.get("manual_floor") or {}
     r_gap = res.get("r_gap") or {}
     dump = s.get("W") if s.get("W") is not None else np.zeros(T)
+    # the override windows by kind (build_problem); a shortened (relaxed 24-hour) problem keeps the full masks, and only t < T is read
+    kinds = p.get("override_kinds") or {}
 
     E_up = float(res.get("E_floor_grid") or 0.0)
 
@@ -528,7 +532,8 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
                     "grid_charge_permitted": bool(bat.get("a_grid", True)) if bat else False,
                     "unserved_kw": round(float(s["U"][t]), 2), "curtail_kw": round(float(s["K"][t]), 2),
                     "p_down": round(float(bundle["outage"]["p_down"][t]), 3), "p_start": round(float(p["p_start"][t]), 3), "grid_present": float(p["g"][t]),
-                    "cost_rs": round(cost, 2), "cum_rs": round(cost_cum, 2), "reason": rsn["reason"], "detail": rsn["detail"]})
+                    "cost_rs": round(cost, 2), "cum_rs": round(cost_cum, 2), "reason": rsn["reason"], "detail": rsn["detail"],
+                    "flags": [k for k, m in kinds.items() if bool(m[t])]})
     return out
 
 
@@ -880,6 +885,50 @@ def time_limited_recent(site_id: str, hours: float = 24.0, now: int | None = Non
     n = len(rows)
     return {"site_id": site_id, "hours": float(hours), "since": since, "plans": n, "time_limited": len(items),
             "share": round(len(items) / n, 3) if n else 0.0, "items": items}
+
+
+#: GET /plan/past: the hours a request may ask for (the plan table shows the last 24, R8 2.9)
+PAST_HOURS = (1, 48)
+#: the 15-minute means a past step carries as measured: power in W (sent as kW), the state of charge (the estimate, else the BMS's) and the grid
+PAST_SERIES = ("pv_power_w", "load_power_w", "grid_power_w", "battery_power_w", "genset_power_w", "battery_soc_est_pct", "battery_soc_bms_pct",
+               "grid_present")
+
+
+def past_steps(site_id: str, now: int, hours: int = 24) -> dict:
+    """The plan table's past rows (round 7, pages-B-07; UI-09 and R8 2.9: "the past 24 hours ... greyed, with actuals beside plan"): every
+    15-minute step of the `hours` before the current one, as the plan in force then planned it (active_at: none under a pause or a release to
+    native, or before the first plan) and as measured (telemetry.series' 15-minute means; null where no reading arrived, never zeros). Battery
+    positive is discharging and grid positive importing, as in the plan's steps. Money is the caller's to filter (routes_common.out)."""
+    t1 = forecast.align(int(now))
+    t0 = t1 - int(hours) * 3600
+    act = telemetry.series(site_id, t0, t1, list(PAST_SERIES), "15m")
+    at = {int(t): i for i, t in enumerate(act["ts"])}
+    ser = act["series"]
+
+    def kw(name: str, i: int) -> float | None:
+        v = ser[name][i]
+        return None if v is None else round(v / 1000, 2)
+
+    steps_of: dict[str, dict[int, dict]] = {}
+    rows = []
+    for t in range(t0, t1, 900):
+        plan = active_at(site_id, t)
+        step = None
+        if plan is not None:
+            if plan["id"] not in steps_of:
+                steps_of[plan["id"]] = {int(x["t"]): x for x in plan.get("steps") or []}
+            step = steps_of[plan["id"]].get(t)
+        i = at.get(t)
+        actual = None
+        if i is not None:
+            soc = ser["battery_soc_est_pct"][i]
+            actual = {"pv_kw": kw("pv_power_w", i), "load_kw": kw("load_power_w", i), "grid_kw": kw("grid_power_w", i),
+                      "battery_kw": kw("battery_power_w", i), "genset_kw": kw("genset_power_w", i),
+                      "soc_pct": soc if soc is not None else ser["battery_soc_bms_pct"][i], "grid_present": ser["grid_present"][i]}
+        local = _local(t)
+        rows.append({"t": t, "local": local.strftime("%H:%M"), "date": local.date().isoformat(), "plan_id": plan["id"] if step is not None else None,
+                     "planned": step, "actual": actual})
+    return {"from": t0, "to": t1, "hours": int(hours), "steps": rows}
 
 
 def history(site_id: str, limit: int = 50) -> list[dict]:

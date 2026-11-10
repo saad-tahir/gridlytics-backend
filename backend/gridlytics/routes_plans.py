@@ -66,6 +66,16 @@ def plan_history(site_id: str, limit: int = 50):
     return out(plans.history(site_id, max(1, min(limit, 200))))
 
 
+@router.get("/api/sites/{site_id}/plan/past")
+def plan_past(site_id: str, hours: int = 24):
+    """The plan table's last `hours` (1 to 48; round 7, pages-B-07): each past quarter as the plan in force then planned it and as measured
+    (plans.past_steps), money for the roles that see it."""
+    site_or_404(site_id)
+    if not plans.PAST_HOURS[0] <= hours <= plans.PAST_HOURS[1]:
+        raise Refusal(422, "The hours are a whole number from 1 to 48", "invalid")
+    return out(plans.past_steps(site_id, now_ts(), hours))
+
+
 @router.get("/api/sites/{site_id}/plans/{plan_id}")
 def plan_get(site_id: str, plan_id: str):
     site_or_404(site_id)

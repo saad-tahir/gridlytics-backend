@@ -2,7 +2,9 @@
 plan's own MDI cap per step, grid charging in the peak window and the reason rules."""
 from __future__ import annotations
 
-from datetime import date
+import json
+import time
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pytest
@@ -1942,3 +1944,107 @@ def test_each_plan_gives_the_share_of_plans_that_stopped_at_their_time_limit_in_
     # a day later the first two are out of the window
     third = plans.tick(sid, at=T_LIM + 86400 + 1800)
     assert third["summary"]["time_limits_24h"] == {"hours": 24.0, "plans": 1, "time_limited": 1}
+
+
+# ------------------------------------------------------------------------------------------------ pages-B-07
+
+from test_fix_api import world  # noqa: E402,F401  (a fixture: a company with a mill, and a signed-in client per role)
+from gridlytics import routes_plans  # noqa: E402
+
+
+def _iso_utc(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat()
+
+
+def test_every_step_names_the_overrides_it_lies_inside(company):
+    """The plan table had no Flags column (R8 2.9: a glyph per manual override): the steps an override bounds were known to the solve only. Every
+    step now names the kinds of override whose window covers it, as build_problem bounded it."""
+    sid = _site()
+    q = forecast.align(int(time.time()))
+    sites.add_override(sid, {"kind": "reserve", "value": 60, "until": _iso_utc(q + 2 * 3600), "reason": "r7"}, "t")
+    sites.add_override(sid, {"kind": "charge_block", "until": _iso_utc(q + 3600), "reason": "r7"}, "t")
+    steps = plans.tick(sid, save=False)["steps"]
+    by = {s["t"]: s for s in steps}
+    assert sorted(by[q]["flags"]) == ["charge_block", "reserve"]
+    assert by[q + 3600 - 900]["flags"] and sorted(by[q + 3600 - 900]["flags"]) == ["charge_block", "reserve"]
+    assert by[q + 3600]["flags"] == ["reserve"] and by[q + 2 * 3600 - 900]["flags"] == ["reserve"]
+    assert all(s["flags"] == [] for s in steps if s["t"] >= q + 2 * 3600)
+
+
+def test_a_step_with_no_override_has_no_flags(company):
+    steps = plans.tick(_site(), save=False)["steps"]
+    assert steps and all(s["flags"] == [] for s in steps)
+
+
+def _past_world(world):
+    with world.use():
+        sites.put_asset(world.site, "pv", {"kwp_dc": 200, "kw_ac": 180}, "test")
+    return forecast.align(int(time.time()))
+
+
+def test_the_past_rows_give_the_plan_in_force_then_and_what_was_measured(world, monkeypatch):
+    """The table could not show the last 24 hours with actuals beside the plan (UI-09, R8 2.9): the plan answer starts at now and carries no
+    readings. GET /plan/past gives each past quarter as the plan in force then planned it and the 15-minute means measured, null where there
+    was no plan in force or no reading, never zeros."""
+    a, sid = world.c["admin"], world.site
+    q = _past_world(world)
+    monkeypatch.setattr(routes_plans, "now_ts", lambda: q + 30)
+    with world.use():
+        early = plans.tick(sid, at=q - 3 * 3600)
+        late = plans.tick(sid, at=q - 3600)
+        assert early["status"] == late["status"] == "active"
+        telemetry.ingest(sid, [{"ts": m, "grid_present": 1, "pv_power_w": 0, "load_power_w": 120_000, "grid_power_w": 100_000,
+                                "battery_power_w": 20_000, "battery_soc_est_pct": 55} for m in range(q - 1800, q, 60)], "edge")
+    r = a.get(f"/api/sites/{sid}/plan/past", params={"hours": 24})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    rows = body["steps"]
+    assert body["from"] == q - 86400 and body["to"] == q
+    assert len(rows) == 96 and rows[0]["t"] == q - 86400 and rows[-1]["t"] == q - 900
+    by = {x["t"]: x for x in rows}
+    assert by[q - 4 * 3600]["planned"] is None and by[q - 4 * 3600]["plan_id"] is None      # before the first plan none was in force
+    assert by[q - 2 * 3600]["plan_id"] == early["plan_id"] and by[q - 2 * 3600]["planned"]["t"] == q - 2 * 3600
+    assert by[q - 900]["plan_id"] == late["plan_id"] and by[q - 900]["planned"]["t"] == q - 900
+    assert "flags" in by[q - 900]["planned"]
+    act = by[q - 900]["actual"]
+    assert act["load_kw"] == pytest.approx(120.0) and act["grid_kw"] == pytest.approx(100.0) and act["battery_kw"] == pytest.approx(20.0)
+    assert act["pv_kw"] == pytest.approx(0.0) and act["soc_pct"] == pytest.approx(55.0) and act["grid_present"] == 1
+    assert act["genset_kw"] is None                                                          # no genset reading: unknown, not 0
+    assert by[q - 2 * 3600]["actual"] is None                                                # no reading at all: null, never zeros
+    assert by[q - 900]["local"] == datetime.fromtimestamp(q - 900, timezone(timedelta(hours=5))).strftime("%H:%M")
+
+
+def test_a_pause_leaves_no_plan_in_force_in_the_past_rows(world, monkeypatch):
+    a, sid = world.c["admin"], world.site
+    q = _past_world(world)
+    monkeypatch.setattr(routes_plans, "now_ts", lambda: q + 30)
+    with world.use():
+        assert plans.tick(sid, at=q - 3 * 3600)["status"] == "active"
+    monkeypatch.setattr(plans, "_released_at", lambda site_id, ts: q - 2 * 3600 <= ts < q - 3600)
+    by = {x["t"]: x for x in a.get(f"/api/sites/{sid}/plan/past").json()["steps"]}
+    assert by[q - 2 * 3600 - 900]["plan_id"] is not None
+    assert by[q - 2 * 3600]["planned"] is None and by[q - 3600 - 900]["planned"] is None
+    assert by[q - 3600]["plan_id"] is not None
+
+
+def test_a_viewer_s_past_rows_carry_the_energy_and_no_rupees(world, monkeypatch):
+    sid = world.site
+    q = _past_world(world)
+    monkeypatch.setattr(routes_plans, "now_ts", lambda: q + 30)
+    with world.use():
+        assert plans.tick(sid, at=q - 3600)["status"] == "active"
+    admin = world.c["admin"].get(f"/api/sites/{sid}/plan/past").json()["steps"]
+    viewer = world.c["viewer"].get(f"/api/sites/{sid}/plan/past").json()["steps"]
+    assert "c_imp" in admin[-1]["planned"] and "cost_rs" in admin[-1]["planned"]
+    planned = viewer[-1]["planned"]
+    assert planned is not None and "load_kw" in planned
+    for key in ("c_imp", "c_exp", "cost_rs", "cum_rs"):
+        assert key not in planned, key
+    assert "rs_per_kwh" not in json.dumps(viewer)
+
+
+@pytest.mark.parametrize("hours", [0, 49, -3])
+def test_the_past_rows_take_1_to_48_hours(world, hours):
+    r = world.c["admin"].get(f"/api/sites/{world.site}/plan/past", params={"hours": hours})
+    assert r.status_code == 422 and r.json()["detail"] == "The hours are a whole number from 1 to 48"
+
