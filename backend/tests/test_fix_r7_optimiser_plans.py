@@ -1515,3 +1515,113 @@ def test_the_grid_tied_terminal_value_takes_the_gensets_cost_where_an_outage_is_
     # nor behind an auto-start panel: the set takes the outage within a minute and follows the load, so a stored kWh spares it nothing
     sites.update(sid, {"reserve_policy": {"p_threshold": 0.2, "min_soc_pct": 20.0}, "genset_start_control": "auto_on_grid_loss"}, "t")
     assert plans.build_problem(sites.full(sid), t0, b, 192)["terminal"]["c_next"] == pytest.approx(peak)
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-05
+
+T_FUEL = twin.day_start_utc(date(2026, 11, 10)) + 7 * 3600
+
+
+def _fuel_site(tank=400.0, kind="hsd"):
+    sid = _site(genset_start_control="manual")
+    sites.put_asset(sid, "genset", {"rated_kw": 48, "f_min": 0.3, "fuel_kind": kind, "tank_l": tank}, "t")
+    return sid
+
+
+def _genset_minutes(sid, t_from, n, fuel=None, power_w=None, running=1):
+    telemetry.write_rows([(sid, t_from + 60 * i, "test", running, power_w, fuel) for i in range(n)],
+                         ("site_id", "ts", "source_id", "genset_running", "genset_power_w", "genset_fuel_l"))
+
+
+def _fill(sid, ts, litres):
+    """A fuel log, as POST /api/sites/{id}/genset/fuel writes it, logged at `ts`."""
+    import json
+
+    with store.connect() as con:
+        con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
+                    (sid, plans._iso(ts), "fuel_log", "t", json.dumps({"day": "2026-11-10", "litres": litres, "note": ""})))
+
+
+def test_the_fuel_in_the_tank_is_carried_from_logged_fills_less_the_burn(company):
+    """Part 4.1 and 4.8: fuel available is site state carried between ticks. Nothing wrote `fuel_l`, so every tick planned on a full tank (the
+    demo farm's 400 L whatever it had burnt). The level is now the last tick's, plus the fills logged since, less the litres metered since (or,
+    for a run with no litres read, the fuel curve at its metered power)."""
+    sid = _fuel_site()
+    first = plans.fuel_level(sites.full(sid), T_FUEL)
+    assert first["basis"] == "assumed_full" and first["litres"] == 400.0
+    sites.put_state(sid, fuel_l=100.0, fuel_ts=T_FUEL)
+    _genset_minutes(sid, T_FUEL, 10, fuel=0.25, power_w=24000.0)                 # 10 minutes metered: 2.5 L
+    _genset_minutes(sid, T_FUEL + 600, 5, power_w=24000.0)                       # 5 minutes at 24 kW with no litres read
+    _fill(sid, T_FUEL + 300, 50.0)
+    _fill(sid, T_FUEL - 300, 70.0)                                               # before the last tick: already in its level
+    t1 = T_FUEL + 900
+    lvl = plans.fuel_level(sites.full(sid), t1)
+    curve = 5 * (0.273 * 24.0 + 0.033 * 48.0) / 60.0
+    assert lvl["basis"] == "carried"
+    assert lvl["litres"] == pytest.approx(100.0 + 50.0 - 2.5 - curve, abs=1e-6)
+    full = sites.full(sid)
+    p = plans.build_problem(full, t1, forecast.issue(full, t1, save=False), 96)
+    assert p["genset"]["fuel_available"] == pytest.approx(lvl["litres"])        # before: 400 L at every tick
+    # never above the tank, never under empty
+    sites.put_state(sid, fuel_l=390.0, fuel_ts=T_FUEL)
+    assert plans.fuel_level(sites.full(sid), t1)["litres"] == 400.0
+    sites.put_state(sid, fuel_l=1.0, fuel_ts=T_FUEL - 1800)
+    _genset_minutes(sid, T_FUEL - 1800, 15, fuel=1.0)
+    assert plans.fuel_level(sites.full(sid), T_FUEL - 900)["litres"] == 0.0
+
+
+def test_minutes_with_no_genset_reading_take_the_litres_the_plan_in_force_asked_for(company, monkeypatch):
+    """A site with no genset signal would never burn its tank down: its unread minutes take the litres the plan in force planned for them."""
+    sid = _fuel_site()
+    sites.put_state(sid, fuel_l=200.0, fuel_ts=T_FUEL)
+    monkeypatch.setattr(plans, "active_at", lambda site_id, ts: {"steps": [{"t": T_FUEL, "litres": 3.0}, {"t": T_FUEL + 900, "litres": 6.0}]})
+    _genset_minutes(sid, T_FUEL, 5, fuel=0.2)                                    # five minutes read: 1 L
+    lvl = plans.fuel_level(sites.full(sid), T_FUEL + 1800)
+    assert lvl["litres"] == pytest.approx(200.0 - 1.0 - 3.0 * 10 / 15 - 6.0, abs=1e-6)
+
+
+def test_a_tick_writes_the_level_it_planned_on_and_an_empty_tank_runs_nothing(company):
+    """`or 1e9` made a carried level of 0 L, an empty tank, unlimited fuel."""
+    sid = _fuel_site()
+    r = plans.tick(sid, at=T_FUEL, steps=96)
+    st = sites.state(sid)
+    assert st["fuel_l"] == 400.0 and st["fuel_ts"] == T_FUEL
+    assert r["summary"]["fuel"] == {"basis": "assumed_full", "litres": 400.0, "tank_l": 400.0}
+    plans.tick(sid, at=T_FUEL + 900, steps=96, save=False)
+    assert sites.state(sid)["fuel_ts"] == T_FUEL                                 # a preview writes nothing
+    sites.put_state(sid, fuel_l=0.0, fuel_ts=T_FUEL)
+    full = sites.full(sid)
+    b = forecast.issue(full, T_FUEL, save=False)
+    b["outage"]["g"] = np.zeros(96)                                              # an outage the set would carry
+    p = plans.build_problem(full, T_FUEL, b, 96)
+    assert p["genset"]["fuel_available"] == 0.0
+    res = optimise.solve(p)
+    assert res["status"] in ("optimal", "feasible")
+    assert float(np.sum(res["sol"]["F"])) < 1e-6
+
+
+@pytest.mark.parametrize("kind,basis", [("hsd", "unknown"), ("gas_captive", "piped")])
+def test_a_tank_of_no_size_is_unknown_and_piped_gas_is_not_rationed(company, kind, basis):
+    """A tank_l of 0 (the demo's captive-gas set) was unlimited fuel through `or 1e9`, and so was a diesel set entered with 0. Piped gas is
+    explicitly unrationed (its fuel_kind), and a diesel tank of no size is unknown: the plan cannot ration it and says so."""
+    sid = _fuel_site(tank=0.0, kind=kind)
+    lvl = plans.fuel_level(sites.full(sid), T_FUEL)
+    assert lvl == {"basis": basis, "litres": None, "tank_l": None}
+    r = plans.tick(sid, at=T_FUEL, steps=96)
+    assert r["summary"]["fuel"]["basis"] == basis
+    assert "fuel_l" not in sites.state(sid)
+
+
+def test_the_demo_refills_a_tank_under_half_full(company):
+    """The demo's history plans every three hours from the twin's state: the twin burns the farm's 400 L in about a week and logs no fills, so
+    with the level carried the farm would plan on an empty tank. Its operator now keeps two days' diesel: a tank under half full, or under what
+    the plan in force means to burn, is refilled to the top (a logged fill)."""
+    from gridlytics import demo
+
+    sid = _fuel_site()
+    sites.put_state(sid, fuel_l=250.0, fuel_ts=T_FUEL)
+    demo._top_up(sid, T_FUEL + 900)
+    assert plans.fuel_level(sites.full(sid), T_FUEL + 900)["litres"] == pytest.approx(250.0)
+    sites.put_state(sid, fuel_l=180.0, fuel_ts=T_FUEL)
+    demo._top_up(sid, T_FUEL + 900 + 120)                                       # logged at the quarter, so the tick at that quarter counts it
+    assert plans.fuel_level(sites.full(sid), T_FUEL + 900)["litres"] == pytest.approx(400.0)

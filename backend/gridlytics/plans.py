@@ -144,6 +144,89 @@ def _carried_genset(site_id: str, t0: int) -> dict:
     return {"u_prev": int(last), "elapsed": int(elapsed_steps), "hours_today": hours_today, "unknown": False}
 
 
+#: the fuel kinds that come by pipe: no tank to run dry, so the plan does not ration them (an explicit kind, never a tank of 0 litres)
+PIPED_FUELS = ("gas_captive", "lng_captive")
+
+
+def fuel_level(site: dict, t0: int) -> dict | None:
+    """The fuel the genset's tank holds at t0, for the plan to ration (Part 4.1 "fuel available", carried between ticks as Part 4.8 asks; round
+    7, engine-optimiser-05). Nothing wrote the carried level before, so every tick planned on a full tank, and `or 1e9` made a tank of 0 litres,
+    or a carried level of 0, unlimited fuel. `basis`:
+    - `carried`: the level the last tick planned on (`state.fuel_l` at `state.fuel_ts`), plus the fills logged since (the fuel log, by the time
+      each was logged), less the litres burnt since (`_fuel_burnt`), never under empty nor over the tank;
+    - `assumed_full`: no level carried yet: a full tank, as before (the first tick of a site, or one whose level was never written);
+    - `unknown`: a diesel tank of no size (tank_l 0): there is nothing to ration against, and the plan says so;
+    - `piped`: captive gas or RLNG by pipe (`PIPED_FUELS`): not rationed.
+    `litres` and `tank_l` are null for the last two. None without a genset."""
+    g = (site.get("assets") or {}).get("genset")
+    if not g:
+        return None
+    if g.get("fuel_kind", "hsd") in PIPED_FUELS:
+        return {"basis": "piped", "litres": None, "tank_l": None}
+    tank = float(g.get("tank_l") or 0.0)
+    if tank <= 0:
+        return {"basis": "unknown", "litres": None, "tank_l": None}
+    st = site.get("state") or {}
+    if st.get("fuel_l") is None:
+        return {"basis": "assumed_full", "litres": tank, "tank_l": tank}
+    level = float(st["fuel_l"])
+    ts0 = st.get("fuel_ts")
+    if ts0 is not None and int(ts0) < int(t0):
+        level += _fuel_filled(site["id"], int(ts0), int(t0)) - _fuel_burnt(site["id"], g, int(ts0), int(t0))
+    return {"basis": "carried", "litres": min(tank, max(0.0, level)), "tank_l": tank}
+
+
+def _fuel_filled(site_id: str, a: int, b: int) -> float:
+    """The litres logged as put in the tank (POST .../genset/fuel) with their log time in (a, b]: each fill counts once, in the first tick after
+    it was logged, whatever day it names."""
+    with store.connect() as con:
+        rows = con.execute("SELECT ts, detail FROM events WHERE site_id = ? AND type = 'fuel_log' AND ts >= ?",
+                           (site_id, _iso(a - 86400))).fetchall()
+    total = 0.0
+    for r in rows:
+        at = _ts(r["ts"])
+        if at is None or not (a < at <= b):
+            continue
+        try:
+            total += max(0.0, float(json.loads(r["detail"] or "{}").get("litres") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _fuel_burnt(site_id: str, g: dict, a: int, b: int) -> float:
+    """The litres the genset burnt in [a, b): metered where the minute carries litres; for a run with no litres read, the fuel curve at its
+    metered power (three quarters of its rating where none is read either); and for the minutes with no genset reading at all, the litres the
+    plan in force at `a` planned for them, so a site with no genset signal still burns its tank down as it was asked to run. Each reading
+    stands for the minutes up to the next one, at most the source's own interval (the median between its readings: a 5-minute source's row
+    is five minutes) and never more than GAP_MINUTES."""
+    d = telemetry.raw(site_id, a, b, ("genset_running", "genset_power_w", "genset_fuel_l"))
+    ts = np.asarray(d["ts"], dtype=np.int64)
+    flag, p_kw, fuel = d["genset_running"], d["genset_power_w"] / 1000.0, d["genset_fuel_l"]
+    S, ga, gb = float(g["rated_kw"]), float(g["a"]), float(g["b"])
+    burnt = float(np.nansum(fuel))
+    known = ~(np.isnan(flag) & np.isnan(p_kw) & np.isnan(fuel))
+    span = np.zeros(len(ts))
+    if len(ts):
+        every = min(float(np.median(np.diff(ts[known]))), GAP_MINUTES * 60.0) if known.sum() > 1 else 60.0
+        span = np.minimum(np.diff(np.append(ts, b)), max(60.0, every)) / 60.0
+        on = np.where(~np.isnan(flag), flag > 0.5, np.where(~np.isnan(p_kw), p_kw > 0.0, np.nan_to_num(fuel) > 0.0)) & known
+        curve = on & np.isnan(fuel)
+        kw = np.where(np.isnan(p_kw), 0.75 * S, p_kw)
+        burnt += float(np.sum((ga * kw[curve] + gb * S) / 60.0 * span[curve]))
+    # the minutes no reading covers, per 15-minute step, at the planned litres of that step
+    covered: dict[int, float] = {}
+    for t, m in zip(ts[known] // 900 * 900, span[known]):
+        covered[int(t)] = covered.get(int(t), 0.0) + float(m)
+    steps = range(a // 900 * 900, b, 900)
+    unread = {s: max(0.0, (min(s + 900, b) - max(s, a)) / 60.0 - covered.get(s, 0.0)) for s in steps}
+    if any(v > 1e-9 for v in unread.values()):
+        plan = active_at(site_id, a)
+        planned = {int(x["t"]): float(x.get("litres") or 0.0) for x in (plan or {}).get("steps") or []}
+        burnt += sum(planned.get(s, 0.0) * m / 15.0 for s, m in unread.items())
+    return burnt
+
+
 RELEASE_REASONS = {"pause_control": "control_paused", "force_native": "released_to_native"}
 
 
@@ -298,6 +381,9 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     p["overrides"] = [{"kind": o["kind"], "value": o["value"], "until": o["until_ts"], "author": o["author"]} for o in ovs]
     gen = None
     if g_asset and d.get("genset_start_control", "none") != "none":
+        # the fuel the tank holds (fuel_level; round 7, engine-optimiser-05): piped gas and a tank of no size are not rationed
+        fuel = fuel_level(site, t0)
+        p["fuel"] = fuel
         kind = g_asset.get("fuel_kind", "hsd")
         price, _src = tariffs.fuel_price(kind, _local(t0).date())
         carried = _carried_genset(site["id"], t0)
@@ -310,7 +396,7 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                "c_runhr": g_asset["c_runhr_rs"], "c_om": c_om, "UT": max(1, int(math.ceil(g_asset["min_up_h"] * 4))),
                "DT": max(1, int(math.ceil(g_asset["min_down_h"] * 4))), "u_prev": carried["u_prev"], "elapsed": carried["elapsed"],
                "cap_hours": g_asset["cap_hours_per_day"], "hours_today": carried["hours_today"], "day_index": local_days,
-               "fuel_available": float(site.get("state", {}).get("fuel_l", g_asset["tank_l"]) or 1e9), "parallel": g_asset["parallel_allowed"],
+               "fuel_available": float(fuel["litres"]) if fuel and fuel["litres"] is not None else 1e9, "parallel": g_asset["parallel_allowed"],
                "control": control, "hold": mask["genset_hold"], "unknown": carried["unknown"],
                "soc_on": float((d.get("reserve_policy") or {}).get("min_soc_pct", 20.0)) / 100.0 + 0.05}  # twin.plant_of's start threshold
         p["genset"] = gen
@@ -525,6 +611,11 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     release = control_release(site_id, t0)
     p = build_problem(site, t0, bundle, steps)
     _ask_anchor(site, p, t0)
+    fuel = p.get("fuel")
+    if save and fuel and fuel["basis"] in ("carried", "assumed_full") and int((site.get("state") or {}).get("fuel_ts") or 0) <= t0:
+        # the level this tick plans on is the next tick's start (Part 4.8; round 7, engine-optimiser-05), written whatever the solve does: the
+        # fills and burn up to t0 are in it. Never moved back by a tick for an earlier time
+        sites.put_state(site_id, fuel_l=round(float(fuel["litres"]), 3), fuel_ts=int(t0))
     res = optimise.solve_with_policy(p, time_limit=time_limit)
     if res.get("sol") is not None and len(res["sol"]["G"]) != p["T"]:
         p = optimise.shorten(p, len(res["sol"]["G"]))  # the relaxed retry solved a shorter horizon: steps, slots and the guard follow it
@@ -536,6 +627,9 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "outage_now": bundle["outage"].get("observed"), "adherence": bundle["outage"].get("adherence"),
                "icp": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in (p.get("icp") or {}).items()},
                "overrides": p.get("overrides", []), "genset_state_unknown": bool(p.get("genset", {}) and p["genset"].get("unknown")),
+               # the fuel the plan rationed (fuel_level): carried, a full tank assumed, unknown (a tank of no size) or piped
+               "fuel": ({"basis": fuel["basis"], "litres": round(float(fuel["litres"]), 1) if fuel["litres"] is not None else None,
+                         "tank_l": fuel["tank_l"]} if fuel else None),
                # where an anchor charge is asked for, the end of the hour it is planned for and the kWh it stays short of the target
                "battery_state": ({**p["battery_state"], "anchor_t": (res.get("anchor") or {}).get("t"),
                                   "anchor_short_kwh": (res.get("anchor") or {}).get("short_kwh")}
