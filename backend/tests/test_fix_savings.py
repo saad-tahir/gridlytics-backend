@@ -463,12 +463,19 @@ def test_the_perfect_foresight_bound_prices_its_end_energy_and_ignores_todays_ov
 
     def fake_solve(p, time_limit=10.0, **kw):
         seen["p"] = p
-        return {"status": "optimal", "breakdown": {"energy_rs": 1000.0, "genset_rs": 0.0, "wear_rs": 50.0}, "sol": {"E": np.array([107.5, 21.5])}}
+        T = int(p["T"])
+        return {"status": "optimal", "time_limited": False, "M": [],
+                "breakdown": {"energy_rs": 1000.0, "genset_rs": 0.0, "wear_rs": 50.0, "unserved_rs": 0.0, "mdi_rise_rs": 0.0},
+                "sol": {"G": np.full(T, 1000.0 / (0.25 * 40.0 * T)), "X": np.zeros(T), "E": np.array([107.5, 21.5])}}
 
     monkeypatch.setattr(verify.optimise, "solve", fake_solve)
     s = _series(outage=None)
-    bound = verify._bound(sites.full(sid), WEEKDAY, s, {}, 0.5, 5000.0, e_end_native=107.5, c_next=40.0, v_end=30.0)
-    assert bound == pytest.approx(5000.0 - (1050.0 - (21.5 - 107.5) * 30.0))  # before: 3,950, the drained 86 kWh for free
+    # round 7 (audit engine-optimiser-14): the bound is the day's saving plus the hindsight plan's headroom over the actual arm, each priced on the
+    # solve's terms at the ledger's prices; here the actual arm cost 5,000 and ended where native did (107.5 kWh), the saving 0
+    pr = {"c_imp": np.full(1440, 40.0), "c_exp": np.zeros(1440), "peak": np.zeros(1440, dtype=bool)}
+    out = verify._bound(sites.full(sid), WEEKDAY, s, pr, 0.5, {"cost_rs": 5000.0, "unserved_kwh": 0.0, "peak_kw": 0.0}, 107.5, 0.0, c_next=40.0,
+                        v_end=30.0)
+    assert out["bound_rs"] == pytest.approx(5000.0 - (1050.0 - (21.5 - 107.5) * 30.0))  # before: 3,950, the drained 86 kWh for free
     p = seen["p"]
     assert p["terminal"]["c_next"] == 40.0 and p["terminal"]["H_peak"] >= 24
     assert not p["override_mask"].any() and "reserve_manual" not in p and not p["battery"]["charge_block"].any()

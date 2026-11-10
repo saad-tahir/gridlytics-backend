@@ -857,3 +857,99 @@ def test_the_tuned_baseline_at_a_genset_site_is_fitted_with_cycle_charging_and_c
     grid = make_site(name="No genset tuned r7", genset=False)
     twin_day(grid, D, 0.5)
     assert verify.compute_day(grid, D, with_bound=False, forward=False)["tuned"]["tuned_rule"]["cycle_soc_pct"] is None
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-14 (role-owner-05, role-operator-12,
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-06, engine-money-live-07)
+
+def _hindsight(seen: dict, status: str = "optimal", limited: bool = False, e_end: float = 21.5):
+    """A stand-in hindsight solve: 100 kW imported all day, an end energy of `e_end` kWh, and the breakdown's genset, wear, unserved and MDI terms."""
+    def solve(p, time_limit=10.0, **kw):
+        seen["p"], seen["time_limit"] = p, time_limit
+        T = int(p["T"])
+        return {"status": status, "time_limited": limited, "M": [120.0],
+                "breakdown": {"energy_rs": -1.0, "genset_rs": 0.0, "wear_rs": 50.0, "unserved_rs": 500.0, "mdi_rise_rs": 2_500.0},
+                "sol": {"G": np.full(T, 100.0), "X": np.zeros(T), "E": np.r_[np.full(T, 107.5), e_end]}}
+    return solve
+
+
+def test_the_bound_prices_every_term_the_solve_minimised_at_the_ledgers_prices_and_refuses_a_time_limited_solve(company, monkeypatch):
+    # Before: the bound's cost was energy + genset + wear at the solve's own (projected) prices, while the solve also traded against unserved load at
+    # VoLL and the rise of the month's maximum demand; it took a time-limited solve as a bound, and held it against the 1-minute native arm
+    from test_fix_savings import WEEKDAY, _series
+    sid = make_site(name="Bound terms r7", genset=False)
+    until = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(timespec="seconds")
+    sites.add_override(sid, {"kind": "reserve", "value": 80.0, "until": until}, "t")
+    seen: dict = {}
+    monkeypatch.setattr(verify.optimise, "solve", _hindsight(seen))
+    pr = {"c_imp": np.full(1440, 40.0), "c_exp": np.full(1440, 5.0), "peak": np.zeros(1440, dtype=bool)}
+    actual = {"cost_rs": 100_000.0, "unserved_kwh": 2.0, "peak_kw": 130.0}
+    out = verify._bound(sites.full(sid), WEEKDAY, _series(outage=None), pr, 0.5, actual, 50.0, 300.0, c_next=40.0, v_end=30.0)
+    p = seen["p"]
+    # the ledger's prices (the month's ICP case settled in them), no calendar ageing, today's override not applied to a past day
+    assert np.allclose(p["c_imp"], 40.0) and np.allclose(p["c_exp"], 5.0) and p["icp"] == {} and not p["battery"]["b_cal"].any()
+    assert not p["override_mask"].any() and "reserve_manual" not in p and p["terminal"]["c_next"] == 40.0 and p["terminal"]["H_peak"] >= 24
+    # golden: the hindsight plan on every term: 2,400 kWh at Rs 40, wear 50, unserved 500, MDI rise 2,500, less 21.5 kWh at Rs 30
+    hind = 96_000.0 + 50.0 + 500.0 + 2_500.0 - 30.0 * 21.5
+    # the actual arm on the same terms: its cost, 2 kWh unserved at the site's VoLL (Rs 500), its own rise above M0 or the floor, less its end energy
+    mdi = p["mdi"]
+    rise = mdi["rate"] * max(0.0, 130.0 - max(mdi["M0"], mdi["floor"]))
+    act = 100_000.0 + 500.0 * 2.0 + rise - 30.0 * 50.0
+    assert out["status"] == "optimal" and out["solved_headroom_rs"] == pytest.approx(act - hind, abs=0.01)
+    assert out["bound_rs"] == pytest.approx(300.0 + max(0.0, act - hind), abs=0.01) and out["mdi_m0_kw"] == pytest.approx(mdi["M0"], abs=0.01)
+    # a hindsight plan that does worse than the site did on these terms (the 15-minute model) is no headroom: the bound is the saving, never under 0
+    actual_cheap = {**actual, "cost_rs": 90_000.0}
+    low = verify._bound(sites.full(sid), WEEKDAY, _series(outage=None), pr, 0.5, actual_cheap, 50.0, 300.0, c_next=40.0, v_end=30.0)
+    assert low["solved_headroom_rs"] < 0 and low["headroom_rs"] == 0.0 and low["bound_rs"] == 300.0
+    assert verify._bound(sites.full(sid), WEEKDAY, _series(outage=None), pr, 0.5, actual_cheap, 50.0, -200.0, c_next=40.0, v_end=30.0)["bound_rs"] == 0.0
+    # a solve stopped at its time limit, or not solved, is no bound
+    for status, limited in (("feasible", True), ("not_solved", False)):
+        monkeypatch.setattr(verify.optimise, "solve", _hindsight(seen, status=status, limited=limited))
+        none = verify._bound(sites.full(sid), WEEKDAY, _series(outage=None), pr, 0.5, actual, 50.0, 300.0, c_next=40.0, v_end=30.0)
+        assert none["bound_rs"] is None and none["status"] == ("time_limited" if limited else "not_solved")
+
+
+def test_a_days_bound_is_never_below_its_saving_nor_zero(company):
+    # A monitor-tier grid site whose inverter ran its native settings (the actual arm is native), with outages and a manually started genset: the
+    # audit read -Rs 6,328 for such a day at Lahore. The bound is the realised saving plus the hindsight plan's headroom over the actual arm
+    sid = make_site(name="Bound real r7", tier="monitor", twin_extra={"windows": [["14:00", "15:30"]], "adherence": 1.0, "trips_per_day": 1.0})
+    twin_day(sid, D, 0.5)
+    n = verify.compute_day(sid, D, forward=False)["native"]
+    pf = n["perfect_foresight"]
+    assert pf["status"] == "optimal" and not pf["time_limited"], pf
+    assert n["perfect_foresight_rs"] >= max(0.0, n["saving_rs"]) - 0.01
+    assert n["perfect_foresight_rs"] == pytest.approx(max(0.0, n["saving_rs"] + pf["headroom_rs"]), abs=0.01)
+
+
+def _pf_day(saving: float, bound: float | None, fidelity: str = "confirmed", new: bool = True, carry: float = 0.0) -> dict:
+    """A day row with a bound: `carry` of its saving is its end gap at v_end (provisional while no later day is scored); `new` a bound by _bound."""
+    r = _day(_lv(peak_window=saving - carry, carry_over=carry), fidelity=fidelity, end_carry=carry)
+    r["perfect_foresight_rs"] = bound
+    if new:
+        r["perfect_foresight"] = {"bound_rs": bound, "headroom_rs": None if bound is None else bound - saving,
+                                  "status": "optimal" if bound is not None else "time_limited"}
+    return r
+
+
+def test_the_periods_bound_is_held_against_the_claim_of_the_same_days(company):
+    # Before: the summary added every day's bound, a native block's and a day that claims nothing's too (Faisalabad's 7 native block days against
+    # 1 verified day), and a bound stored by the earlier method: here 27,877 - 760 + 1,400 = 28,517 against a claim of 1,200
+    sid = make_site(name="Bound summary r7")
+    _put_rows(sid, {"2026-10-05": {b: _pf_day(0.0, 27_877.0, fidelity="native_block") for b in ("native", "tuned")},
+                    "2026-10-06": {b: _pf_day(800.0, None) for b in ("native", "tuned")},
+                    "2026-10-07": {b: _pf_day(500.0, -760.0, new=False) for b in ("native", "tuned")},
+                    # the last day: 300 of its 1,000 is carry-over no later day has used yet, out of the claim and out of the bound alike
+                    "2026-10-08": {b: _pf_day(1_000.0, 1_400.0, carry=300.0) for b in ("native", "tuned")}})
+    s = verify.summary(sid, "2026-10-05", "2026-10-08")
+    n = s["baselines"]["native"]
+    assert n["claimed_rs"] == 800.0 + 500.0 + 700.0 and n["carry_over_provisional_rs"] == 300.0
+    assert n["perfect_foresight_rs"] == 1_100.0 and n["perfect_foresight_claimed_rs"] == 700.0
+    assert n["perfect_foresight_days"] == 1 and n["perfect_foresight_missing_days"] == 2
+    assert n["perfect_foresight_rs"] >= n["perfect_foresight_claimed_rs"]
+    assert s["baselines"]["tuned"]["perfect_foresight_rs"] is None
+    # a period with no claiming day that has a bound shows none
+    assert verify.summary(sid, "2026-10-05", "2026-10-07")["baselines"]["native"]["perfect_foresight_rs"] is None
+    # a claiming day that lost money: a planner with hindsight could have run the native settings, so the bound is 0, not the claim's -800
+    _put_rows(sid, {"2026-10-10": {b: _pf_day(-500.0, 0.0, carry=300.0) for b in ("native", "tuned")}})
+    low = verify.summary(sid, "2026-10-10", "2026-10-10")["baselines"]["native"]
+    assert low["claimed_rs"] == -800.0 and low["perfect_foresight_claimed_rs"] == -800.0 and low["perfect_foresight_rs"] == 0.0

@@ -9,7 +9,8 @@ bearable-cost basis, with the dated fuel price and the same wear charge; the gap
 the terminal value, and a day's carry-over is the change of that valued gap over the day, so the days of a chain add up to one continuous replay with
 its end-of-period energy term (carry-over priced, not removed). Energy a claiming day hands to days the plan did not run (a switchback native
 block, control paused) is claimed at what those days realised with it once they are over, provisional until then (_handover). The
-perfect-foresight bound is a hindsight re-solve, labelled not achievable.
+perfect-foresight bound is a hindsight re-solve, labelled not achievable: the day's saving plus what the hindsight plan saves over the actual arm on
+every term it minimised (_bound).
 """
 from __future__ import annotations
 
@@ -1217,7 +1218,7 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
     sun = _sun_up(site, act["g"]["ts"])
     unread = _unread_minutes(act["g"], on_grid, sun, act.get("filled"))
     blank_inputs = _unread_minutes(act["g"], False, sun, act.get("filled"))
-    sims, chains, befores, handovers = {}, {}, {}, {}
+    sims, chains, handovers = {}, {}, {}
     for k, pol in policies.items():
         st = starts[k]
         if st["from"] == "previous_day":
@@ -1230,7 +1231,7 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
             sim = twin.simulate(series, pol, plant, soc0, gen0)
             on_before, soc_start, v_start = gen_before, soc0, 0.0
             start_state = {"soc": float(soc0), "gen_on": gen0, "gen_elapsed": 0, "outage_min": 0, "gen_rescue": False}
-        sims[k], befores[k] = sim, on_before
+        sims[k] = sim
         e_end_base = float(sim["soc"][-1]) * plant.e_nom
         arms[k] = price_arm(site, _grid_masked(sim, unresolved, series["pv"], known=charge_known, load=load_read), pr, day, e_end_base, v_end,
                             gen_before=on_before)
@@ -1336,12 +1337,11 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
     # the tuned baseline's rule (round 7, audit engine-savings-03): its table and, at a genset site, its cycle-charging set point
     rows["tuned"]["tuned_rule"] = tuned_rule
     if with_bound and b:
-        # the hindsight solve prices every minute: it is held against the native arm priced the same way
-        native_cost = (price_arm(site, sims["native"], pr, day, 0.0, 0.0, gen_before=befores["native"])["cost_rs"] if unresolved.any()
-                       else arms["native"]["cost_rs"])
-        rows["native"]["perfect_foresight_rs"] = _bound(site, day, series, pr, soc0, native_cost,
-                                                        e_end_native=float(sims["native"]["soc"][-1]) * plant.e_nom, c_next=c_next, v_end=v_end,
-                                                        carry_start=chains["native"]["start"]["carry_rs"])
+        # the day's realised saving plus what a hindsight plan saves over the actual arm on every term it minimised (_bound): never below the
+        # saving nor zero, and none where the solve was stopped at its limit (round 7, audit engine-optimiser-14)
+        pf = _bound(site, day, series, pr, soc0, arms["actual"], e_end_actual, rows["native"]["saving_rs"], c_next=c_next, v_end=v_end)
+        rows["native"]["perfect_foresight_rs"] = pf["bound_rs"]
+        rows["native"]["perfect_foresight"] = pf
     now = store._now()
     with store.connect() as con:
         for base, data in rows.items():
@@ -1447,18 +1447,34 @@ def _settle_months(site_id: str, day: date) -> None:
         store.set_setting(key, _month_fingerprint(site_id, conn, a, b))
 
 
-def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, native_cost: float, e_end_native: float | None = None,
-           c_next: float = 0.0, v_end: float = 0.0, carry_start: float = 0.0) -> float | None:
-    """A hindsight re-solve of the day on the realised PV, load and outages at 15 minutes: the upper bound, not achievable.
+#: the hindsight solve's wall-clock limit (s): a solve stopped at it is not proven optimal, so it gives no bound (round 7, audit engine-optimiser-14)
+BOUND_TIME_LIMIT_S = 5.0
 
-    The solve values the energy it leaves in the battery at the day's terminal value and the bound credits the difference from the native arm's end
-    energy at the same v_end, as the daily saving does (otherwise the bound earns free energy by draining the battery). The solve starts where the
-    actual arm started, so a chained native replay's start gap is charged as the daily saving charges it (`carry_start`, the day before's v_end x
-    (actual - native start energy)). The day is solved with its own inputs: overrides, a manual reserve and the tank level active today do not apply
-    to a past day."""
+
+def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, actual: dict, e_end_actual: float, saving_rs: float, c_next: float = 0.0,
+           v_end: float = 0.0) -> dict:
+    """The day's perfect-foresight bound (plan 8.2: a hindsight re-solve, the upper bound, not achievable), against the same baseline replay as the
+    day's saving. Returns {"bound_rs", "headroom_rs", "solved_headroom_rs", "status", "time_limited", "mdi_m0_kw"}; "bound_rs" is None where there is
+    no bound.
+
+    The day is re-solved at 15 minutes on its realised PV, load and outages from where the actual arm started (its state of charge and genset run),
+    at the ledger's own prices (`pr`: the month's settled ICP case, exports as billed), against the month's maximum demand before the day (M0), with
+    the energy left at the end valued at the ledger's v_end and no calendar ageing (the ledger prices none). The solve and the actual arm are then
+    priced on every term the solve minimised: energy, genset, wear, unserved load at the site's VoLL and the rise of the month's maximum demand above
+    M0 (or the floor), less the end energy at v_end. The bound is the day's realised saving plus the headroom, what the hindsight plan saves over the
+    actual arm on those terms; it carries the day's chained native replay, its start gap and its carry-over as the saving does. The actual's own
+    schedule and the native settings were both open to a planner with hindsight, so the bound is never below the realised saving nor below zero:
+    a negative headroom (the 15-minute model cannot follow a schedule the site ran minute by minute, a short genset run say) counts as none and is
+    kept as `solved_headroom_rs`. A solve stopped at its time limit, or not solved, is no bound. The day is solved with its own inputs: overrides,
+    a manual reserve and the tank level active today do not apply to a past day.
+
+    Before (round 7, audit engine-optimiser-14 and its duplicates): the bound priced energy, genset and wear only, while the solve also traded
+    against unserved load and the MDI rise, solved at the tariff's projected prices with today's M0, accepted a time-limited solve, and was held
+    against the 1-minute native arm, so it came out below the claim and negative (Karachi Rs 615 against Rs 43,594; Lahore -Rs 7,314)."""
+    out = {"bound_rs": None, "headroom_rs": None, "solved_headroom_rs": None, "status": "not_solved", "time_limited": False, "mdi_m0_kw": None}
     try:
         t0 = twin.day_start_utc(day)
-        q = lambda a: np.asarray(a).reshape(96, 15).mean(axis=1)
+        q = lambda a: np.asarray(a, dtype=float).reshape(96, 15).mean(axis=1)  # noqa: E731
         bundle = {"pv": {"q": {"q50": q(series["pv"]), "q25": q(series["pv"])}, "stage": 1},
                   "load": {"q": {"q50": q(series["load"]), "q75": q(series["load"])}, "crit": q(series["crit"]), "stage": 1},
                   "outage": {"g": (q(series["grid"]) > 0.5).astype(float), "p_start": np.zeros(96), "dur_steps": np.full(96, 4), "p_down": 1 - q(series["grid"])}}
@@ -1469,26 +1485,48 @@ def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, native_co
         p["override_mask"] = np.zeros(T, dtype=bool)
         p["overrides"] = []
         p.pop("reserve_manual", None)
+        # the ledger's prices: the month's settled ICP case is in them, so no uncertain-case rows; a legacy export's tie-break is the solver's
+        c_imp, c_exp = q(pr["c_imp"]), q(pr["c_exp"])
+        conn = (site.get("connections") or [None])[0]
+        p["c_imp"], p["peak"], p["icp"] = c_imp, np.asarray(pr["peak"], dtype=bool)[::15], {}
+        p["c_exp"] = c_exp - (tariffs.LEGACY_EXPORT_TIE_BREAK if _legacy(conn) else 0.0)
         if p.get("genset"):
             p["genset"]["hold"] = np.zeros(T, dtype=bool)
             p["genset"]["fuel_available"] = 1e9
+            # the set's O&M as the ledger prices it (_genset_cost), without the self-generation duty the live plan adds for a large set
+            p["genset"]["c_om"] = float(site["assets"]["genset"]["c_om_rs_per_kwh"])
         if p.get("battery"):
             p["battery"]["E0"] = soc0 * p["battery"]["E_nom"]
             p["battery"]["sigma0"] = 0.0
             p["battery"]["charge_block"] = np.zeros(T, dtype=bool)
-        valued = e_end_native is not None and v_end > 0
+            p["battery"]["b_cal"] = np.zeros(T)
+        valued = v_end > 0
         # H_peak of a day: the terminal value may cover the whole battery, as the ledger's carry-over does
         p["terminal"] = {"c_next": float(c_next) if valued else 0.0, "H_peak": 24.0 if valued else 0.0, "R_next": 0.0}
-        res = optimise.solve(p, time_limit=5.0)
-        if res["status"] == "not_solved":
-            return None
-        bd = res["breakdown"]
-        cost = bd["energy_rs"] + bd["genset_rs"] + bd["wear_rs"]
-        if p.get("battery") and e_end_native is not None:
-            cost -= (float(res["sol"]["E"][-1]) - float(e_end_native)) * v_end
-        return round(native_cost - cost - float(carry_start or 0.0), 2)
+        res = optimise.solve(p, time_limit=BOUND_TIME_LIMIT_S)
+        out["time_limited"] = bool(res.get("time_limited"))
+        if res["status"] != "optimal" or out["time_limited"]:
+            out["status"] = "time_limited" if out["time_limited"] else "not_solved"
+            return out
+        bd, sol = res["breakdown"], res["sol"]
+        voll = float(p["voll"])
+        mdi = p.get("mdi")
+        rise_a = 0.0
+        if mdi and res.get("M"):
+            above = max(float(mdi["M0"]), float(mdi["floor"]))
+            rise_a = float(mdi["rate"]) * max(0.0, float(actual["peak_kw"]) - above)
+            out["mdi_m0_kw"] = round(float(mdi["M0"]), 2)
+        e_end_h = float(sol["E"][-1]) if p.get("battery") else 0.0
+        energy_h = optimise.H * float(np.sum(c_imp * np.asarray(sol["G"]) - c_exp * np.asarray(sol["X"])))
+        hind = energy_h + bd["genset_rs"] + bd["wear_rs"] + bd["unserved_rs"] + bd["mdi_rise_rs"] - v_end * e_end_h
+        act = float(actual["cost_rs"]) + voll * float(actual["unserved_kwh"]) + rise_a - v_end * float(e_end_actual)
+        solved = act - hind
+        head = max(0.0, solved)
+        out.update({"status": "optimal", "solved_headroom_rs": round(solved, 2), "headroom_rs": round(head, 2),
+                    "bound_rs": round(max(0.0, float(saving_rs) + head), 2)})
+        return out
     except Exception:
-        return None
+        return out
 
 
 def _record_confirmation(applied: dict, cls: str, score: float | None, detail: dict) -> None:
@@ -1955,7 +1993,8 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         claiming_days = withheld_days = unclaimed_days = 0
         verified = 0
         gen_unknown_days = imp_unknown_days = 0
-        bound = 0.0
+        bound = bound_claimed = 0.0
+        bound_days = bound_missing = 0
         # per billing month: claimed rupees (MDI shares included), days whose saving is known, claiming days, MDI shares of the known days and of
         # the claiming days
         months: dict[str, list] = {}
@@ -1994,10 +2033,21 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             imp_unknown = bool(d.get("import_unknown"))
             imp_unknown_days += int(imp_unknown)
             verified += int(d["fidelity"] == "confirmed" and not imp_unknown and not d.get("claim_withheld"))
-            bound += d.get("perfect_foresight_rs") or 0.0
             # the day's share of its month's MDI lever goes where its saving goes: a withheld day's to no total, a day that claims nothing's not to the
             # claim (round 7, audit engine-savings-04: before, one claiming day claimed the whole month's lever, a withheld day's included)
             share = mdi_share(day, base)
+            # the bound is held against the claim: the claiming days with a bound by the current method (_bound), each on the claim's own terms
+            # (its provisional carry-over out, its hand-over's realised value in, its MDI share), beside what those days claim, so it is never
+            # below it; a claiming day with none (the solve stopped at its limit, or scored before) is counted apart. Days that claim nothing (a
+            # native block, the plan not in control) add nothing (round 7, audit engine-optimiser-14)
+            if claims:
+                pf = d.get("perfect_foresight_rs")
+                if isinstance(d.get("perfect_foresight"), dict) and pf is not None:
+                    bound += pf - prov + ho_adj + share
+                    bound_claimed += d["claimed_rs"] - prov + ho_adj + share
+                    bound_days += 1
+                else:
+                    bound_missing += 1
             closed = mdi_info[bill_month(day)]["closed"]
             m = months.setdefault(bill_month(day), [0.0, 0, 0, 0.0, 0.0])
             m[0] += d["claimed_rs"] - prov + ho_adj + (share if claims else 0.0)
@@ -2021,7 +2071,11 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                                   "carry_over_handover_adjustment_rs": round(ho_adj_total, 2),
                                   "claiming_days": claiming_days, "withheld_days": withheld_days,
                                   "unclaimed_days": unclaimed_days, "litres_saved": round(litres, 1), "verified_days": verified,
-                                  "perfect_foresight_rs": round(bound, 2) if base == "native" else None,
+                                  # a planner with hindsight could always have run the native settings: never below zero
+                                  "perfect_foresight_rs": round(max(0.0, bound), 2) if base == "native" and bound_days else None,
+                                  "perfect_foresight_claimed_rs": round(bound_claimed, 2) if base == "native" and bound_days else None,
+                                  "perfect_foresight_days": bound_days if base == "native" else None,
+                                  "perfect_foresight_missing_days": bound_missing if base == "native" else None,
                                   "mdi_months": {k: {"actual_kw": mdi_info[k]["by_base"][base]["actual_kw"],
                                                      "baseline_kw": mdi_info[k]["by_base"][base]["baseline_kw"], "floor_kw": mdi_info[k]["floor"],
                                                      "rate_rs_per_kw": mdi_info[k]["rate"], "tariff_version": mdi_info[k]["tariff_version"],
