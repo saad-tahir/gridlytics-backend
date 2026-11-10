@@ -1,6 +1,6 @@
 """The demo companies, people and passwords (the owner's decisions of 24 October 2026, section 6; stage D1 of the sign-in and split).
 
-    python -m gridlytics.seed_demo [--reset-passwords] [--from companies.csv users.csv] [--out <file>]
+    python -m gridlytics.seed_demo [--reset-passwords] [--from companies.csv users.csv] [--out <file>] [--no-demo-sites] [--demo-days N]
 
 Local mode only: in supabase mode the accounts are the Gridlytics project's, and the founder console makes them there. The seed does what the founder
 console and the companies' owners would do, with their own functions, so that the founder's audit and each company's audit read as theirs:
@@ -19,11 +19,15 @@ The list of what was made, with every password, the founder's code secret, its o
 `demo/DEMO_ACCOUNTS.local.md` (git-ignored), or beside the data when the data folder is not the repository's own `data/` (a test, the browser check), so
 that a scratch run never replaces the owner's list. Nothing printed holds a password or a secret.
 
-Running it again keeps what is there: a company, an account, its password (carried over from the list written before, where it still signs in), a
-membership and a role chosen since. `--reset-passwords` gives every account of the list, and the founder, a new password, which ends their sessions; the
-founder's code secret is kept, as the authenticator app holds it already, and the founder's session key is new.
+Then, for the decisions' list, the four demo sites of plan Part 9.6 go into the OnyxLeaf Demo company with their history (`demo.load`: `--demo-days`
+days, else GRIDLYTICS_DEMO_DAYS, else 21; `--no-demo-sites` leaves them out). They are not read from a file: their specs are `demo.DEMO_SITES`.
 
-`--from companies.csv users.csv` loads the owner's real list instead (the templates are `demo/companies.template.csv` and `demo/users.template.csv`):
+Running it again keeps what is there: a company, an account, its password (carried over from the list written before, where it still signs in), a
+membership, a role chosen since, and the demo sites. `--reset-passwords` gives every account of the list, and the founder, a new password, which
+ends their sessions; the founder's code secret is kept, as the authenticator app holds it already, and the founder's session key is new.
+
+`--from companies.csv users.csv` loads the owner's real list instead (the templates to copy are `demo/companies.template.csv` and
+`demo/users.template.csv` in this repository):
 companies with `name` and `seats` (empty: enough for its people), people with `email`, `name`, `company`, `company_role` (owner, admin or member; each
 company exactly one owner) and `role` (a Gridlytics role, empty for the default: the owner is the administrator, everyone else a viewer until the owner
 chooses). The whole list is checked before anything is written.
@@ -500,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="the owner's list instead of the demo's (templates: demo/companies.template.csv, demo/users.template.csv)")
     ap.add_argument("--out", help=f"where the accounts list goes (default demo/{ACCOUNTS_NAME}, or beside a data folder elsewhere)")
     ap.add_argument("--no-demo-sites", action="store_true", help="do not load the four twin sites into the OnyxLeaf Demo company")
-    ap.add_argument("--demo-days", type=int, default=None, help="days of generated history per demo site (default 21)")
+    ap.add_argument("--demo-days", type=int, default=None, help="days of generated history per demo site (default: GRIDLYTICS_DEMO_DAYS, else 21)")
     args = ap.parse_args(argv)
     try:
         _need_local()                                    # before the owner's list is read: in supabase mode there is nothing to check it for

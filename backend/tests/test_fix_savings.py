@@ -397,7 +397,8 @@ def test_the_fee_check_scales_part_months_and_takes_the_smaller_baseline(company
 # ------------------------------------------------------------------------------------------------ savings-genset-min-run-reset-per-tick
 
 def test_the_live_demo_keeps_a_minimum_run_across_its_15_minute_ticks(company):
-    sid = make_site(name="Ticks", control="manual", tier="advisory_writes", battery={"nameplate_kwh": 2000, "p_ch_kw": 100, "p_dis_kw": 100},
+    # closed loop: the edge runs each plan as it comes (round 7, audit engine-delivery-18: an advisory site runs only the table keyed in for the day)
+    sid = make_site(name="Ticks", control="manual", tier="closed_loop", battery={"nameplate_kwh": 2000, "p_ch_kw": 100, "p_dis_kw": 100},
                     twin_extra={"windows": [["10:00", "12:30"]], "adherence": 1.0, "trips_per_day": 0.0})
     site = sites.full(sid)
     day = WEEKDAY

@@ -30,7 +30,9 @@ def _farm(name: str) -> str:
     for role, fields in spec["assets"].items():
         sites.put_asset(sid, role, fields, "t")
     sites.set_tier_capable(sid, "closed_loop")
-    sites.set_tier_allowed(sid, spec["tier"], "t", "demo")
+    # closed loop, so a day the plan ran claims by construction (round 7, audit engine-delivery-18: a demo advisory day is confirmed only from its
+    # mark and telemetry, as any advisory day)
+    sites.set_tier_allowed(sid, "closed_loop", "t", "demo")
     sites.capture_native(sid, spec["native"], "t")
     return sid
 

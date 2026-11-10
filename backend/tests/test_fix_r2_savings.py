@@ -452,7 +452,9 @@ def test_the_live_demo_runs_the_native_settings_while_control_is_paused(company)
     a, b = now - 86400, now + 86400
     slots = [{"start_ts": a, "end_ts": b, "mode": "discharge", "soc_floor_pct": 20.0, "soc_target_pct": 100.0, "grid_charge": False,
               "max_discharge_w": None, "max_charge_w": None, "genset": None}]
-    _insert_plan(sid, day, slots, {"bat": np.zeros(1440)})
+    # the table keyed in and marked for the day: an advisory demo site runs that table, not any plan the moment it is made (round 7, audit
+    # engine-delivery-18)
+    _mark(sid, _insert_plan(sid, day, slots, {"bat": np.zeros(1440)}), day)
     plan = plans.current(sid)
     assert plan is not None
     site = sites.full(sid)

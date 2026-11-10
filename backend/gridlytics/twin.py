@@ -97,18 +97,71 @@ def _feeder_profile(site: dict) -> dict:
             "cloudiness": float(tw.get("cloudiness", 0.0))}
 
 
+def _sky_draws(rng: np.random.Generator, n: int, month: int, prof: dict) -> tuple[float, np.ndarray | None]:
+    """The day's sky draws, in truth()'s order: a daily clearness drawn by season (monsoon and winter fog are cloudier), and the minute noise's
+    innovations on a partly cloudy day (None on a clear one)."""
+    base = {1: .78, 2: .82, 3: .86, 4: .9, 5: .9, 6: .84, 7: .7, 8: .72, 9: .84, 10: .9, 11: .86, 12: .76}[month]
+    k_day = float(np.clip(rng.beta(8, 2) * (base / 0.8) - prof["cloudiness"], 0.15, 1.0))
+    return k_day, (rng.normal(0, 1, n) if k_day < 0.92 else None)
+
+
+def _load_draws(rng: np.random.Generator, n: int) -> tuple[float, np.ndarray]:
+    """The day's load draws, in truth()'s order: a day-level factor and the minute noise."""
+    factor = float(np.clip(rng.normal(1.0, 0.06), 0.8, 1.2))
+    return factor, rng.normal(0, 0.03, n)
+
+
+def _outage_draws(rng: np.random.Generator, ts: np.ndarray, prof: dict, month: int) -> tuple[np.ndarray, int]:
+    """The day's grid draws, in truth()'s order: the scheduled windows kept with the adherence rate, then random trips by hour (summer evenings trip
+    more often). Returns the minutes without grid, and how far past the day's midnight the latest of them runs (minutes; 0 when none does)."""
+    down = np.zeros(len(ts), dtype=bool)
+    over = 0
+    dow = ((ts[0] + 5 * 3600) // 86400 + 3) % 7
+    if dow != 6:
+        for w in prof["windows"]:
+            if rng.random() < prof["adherence"]:
+                a = int(w[0][:2]) * 60 + int(w[0][3:])
+                b = int(w[1][:2]) * 60 + int(w[1][3:])
+                a += int(rng.integers(-10, 11))
+                b += int(rng.integers(-5, 25))
+                down[max(0, a):min(1440, b)] = True
+                over = max(over, b - 1440)
+    hazard = np.ones(24)
+    hazard[17:23] = 2.5
+    if month in (5, 6, 7, 8):
+        hazard *= 1.6
+    hazard = hazard / hazard.sum() * prof["trips_per_day"]
+    for h in range(24):
+        if rng.random() < hazard[h]:
+            start = h * 60 + int(rng.integers(0, 60))
+            dur = int(np.clip(rng.lognormal(np.log(prof["trip_minutes"]), 0.6), 5, 360))
+            down[start:min(1440, start + dur)] = True
+            over = max(over, start + dur - 1440)
+    return down, over
+
+
+def _overrun(site: dict, day: date, prof: dict) -> int:
+    """How far past its midnight the day's last outage runs (minutes): the day's own draws replayed (the same seed and order as truth(), without the
+    PV and the minute noise that need no draws), so the next day carries it on (audit role-operator-29: every outage and the genset run covering it
+    ended at 00:00 sharp, skewing their lengths)."""
+    ts = minutes_of(day)
+    rng = np.random.default_rng(_seed(site["id"], day.isoformat()))
+    _sky_draws(rng, len(ts), day.month, prof)
+    _load_draws(rng, len(ts))
+    return _outage_draws(rng, ts, prof, day.month)[1]
+
+
 def truth(site: dict, day: date) -> dict:
-    """The site-day's real-world series at 1 minute: PV available (kW), load (kW), critical load (kW), grid present (0/1), air temperature."""
+    """The site-day's real-world series at 1 minute: PV available (kW), load (kW), critical load (kW), grid present (0/1), air temperature. An outage
+    of the day before that runs past midnight goes on into this day (a trip lasts up to six hours, so only the day before can reach it)."""
     ts = minutes_of(day)
     rng = np.random.default_rng(_seed(site["id"], day.isoformat()))
     month = day.month
     prof = _feeder_profile(site)
-    # sky: a daily clearness drawn by season (monsoon and winter fog are cloudier), then minute noise on partly cloudy days
-    base = {1: .78, 2: .82, 3: .86, 4: .9, 5: .9, 6: .84, 7: .7, 8: .72, 9: .84, 10: .9, 11: .86, 12: .76}[month]
-    k_day = float(np.clip(rng.beta(8, 2) * (base / 0.8) - prof["cloudiness"], 0.15, 1.0))
+    # sky: a daily clearness drawn by season, then minute noise on partly cloudy days
+    k_day, e = _sky_draws(rng, len(ts), month, prof)
     noise = np.zeros(len(ts))
-    if k_day < 0.92:
-        e = rng.normal(0, 1, len(ts))
+    if e is not None:
         for i in range(1, len(ts)):
             noise[i] = 0.97 * noise[i - 1] + 0.243 * e[i]
         noise *= (1 - k_day) * 0.5
@@ -117,36 +170,21 @@ def truth(site: dict, day: date) -> dict:
     lat, lon = site["data"].get("lat", 31.5), site["data"].get("lon", 74.3)
     pv = solar.pv_power(ts, lat, lon, pv_asset, clear, np.full(len(ts), month)) if pv_asset else np.zeros(len(ts))
     # load: template, a day-level factor and minute noise; Eid and public holidays are not modelled in v1's twin
-    load = load_template(site, ts) * float(np.clip(rng.normal(1.0, 0.06), 0.8, 1.2))
-    load = np.maximum(0.0, load * (1 + rng.normal(0, 0.03, len(ts))))
+    factor, load_noise = _load_draws(rng, len(ts))
+    load = load_template(site, ts) * factor
+    load = np.maximum(0.0, load * (1 + load_noise))
     hours = ((ts + 5 * 3600) % 86400) // 3600
     crit = critical_share(site)[hours]
     crit = np.minimum(crit, load)
-    # grid: off-grid sites have none; else scheduled windows kept with the adherence rate and random trips by hour
+    # grid: off-grid sites have none; else scheduled windows kept with the adherence rate and random trips by hour, and the day before's last
+    # outage carried on past midnight
     conns = site.get("connections") or []
     off_grid = not conns or conns[0]["data"].get("regime") == "off_grid"
     grid = np.zeros(len(ts)) if off_grid else np.ones(len(ts))
     if not off_grid:
-        dow = ((ts[0] + 5 * 3600) // 86400 + 3) % 7
-        if dow != 6:
-            for w in prof["windows"]:
-                if rng.random() < prof["adherence"]:
-                    a = int(w[0][:2]) * 60 + int(w[0][3:])
-                    b = int(w[1][:2]) * 60 + int(w[1][3:])
-                    a += int(rng.integers(-10, 11))
-                    b += int(rng.integers(-5, 25))
-                    grid[max(0, a):min(1440, b)] = 0
-        # summer evenings trip more often
-        hazard = np.ones(24)
-        hazard[17:23] = 2.5
-        if month in (5, 6, 7, 8):
-            hazard *= 1.6
-        hazard = hazard / hazard.sum() * prof["trips_per_day"]
-        for h in range(24):
-            if rng.random() < hazard[h]:
-                start = h * 60 + int(rng.integers(0, 60))
-                dur = int(np.clip(rng.lognormal(np.log(prof["trip_minutes"]), 0.6), 5, 360))
-                grid[start:min(1440, start + dur)] = 0
+        down, _ = _outage_draws(rng, ts, prof, month)
+        grid[down] = 0
+        grid[:min(len(ts), _overrun(site, day - timedelta(days=1), prof))] = 0
     temp = solar.air_temp(ts, np.full(len(ts), month - 1))
     return {"ts": ts, "pv": pv, "load": load, "crit": crit, "grid": grid, "temp": temp}
 
