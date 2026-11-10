@@ -1349,3 +1349,42 @@ def test_an_alert_is_assigned_to_a_member_who_acts_on_alerts_not_to_any_text(wor
     assert [p["name"] for p in op.get("/api/alerts/assignees").json()] == ["Operator"]
     r = op.post(f"/api/alerts/{aid}/assign", json={})
     assert r.status_code == 200 and (r.json()["assigned"], r.json()["assigned_id"]) == ("", ""), r.text
+
+
+# ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-08
+
+def test_a_closed_or_cleared_alert_is_not_acknowledged_assigned_or_closed_again(world):
+    """flow-reports-alerts-members-keys-08: acknowledging a closed alert (a second person's drawer opened before the close) set it back to
+    'acknowledged' with its closed_at kept, so the inbox held it beside the alert the still-true condition raised again."""
+    sid = world.site
+    for role in ROLES:
+        assert world.c[role].get("/api/alerts").status_code == 200         # each person's first sight makes their member row
+    with world.use():
+        alerts._open(sid, "data_stale", "Data", "warning", "No data for 40 minutes", {})
+        alerts._open(sid, "data_gap", "Data", "warning", "The data stopped for 2.0 hours", {})
+        ids = {a["rule"]: a["id"] for a in alerts.listing("active", sid)}
+        alerts._clear(sid, "data_gap")                                     # cleared by itself
+        from gridlytics import store_members
+        admin_id = next(m["user_id"] for m in store_members.members() if m["role"] == "admin")
+    admin, op = world.c["admin"], world.c["operator"]
+    assert admin.post(f"/api/alerts/{ids['data_stale']}/close", json={"note": "Logger replaced"}).status_code == 200
+    before = {a["id"]: a for a in admin.get(f"/api/alerts?state=&site_id={sid}").json()}
+    for aid, said in ((ids["data_stale"], "was closed on "), (ids["data_gap"], "cleared by itself on ")):
+        for action, body in (("acknowledge", {"note": "Looking at it"}), ("close", {"note": "Again"}), ("assign", {"member_id": admin_id})):
+            r = op.post(f"/api/alerts/{aid}/{action}", json=body)
+            assert r.status_code == 409 and r.json()["code"] == "alert_closed", (aid, action, r.text)
+            detail = r.json()["detail"]
+            assert said in detail and "(Karachi time)" in detail and not re.search(r"\d{4}-\d{2}-\d{2}", detail), detail
+    after = {a["id"]: a for a in admin.get(f"/api/alerts?state=&site_id={sid}").json()}
+    assert after == before                                                 # nothing changed: state, closed_at, note and history as they were
+    assert (after[ids["data_stale"]]["state"], after[ids["data_stale"]]["note"]) == ("closed", "Logger replaced")
+    assert after[ids["data_gap"]]["state"] == "resolved"
+    assert admin.get("/api/alerts/counts").json()["total"] == 0
+    # an alert still open is acknowledged as before
+    with world.use():
+        alerts._open(sid, "unserved", "Reserve", "critical", "1.0 kWh of critical load went unserved", {})
+        aid = next(a["id"] for a in alerts.listing("active", sid) if a["rule"] == "unserved")
+    assert op.post(f"/api/alerts/{aid}/acknowledge", json={}).json()["state"] == "acknowledged"
+    with world.use(), pytest.raises(alerts.AlertClosed):
+        alerts.act(ids["data_stale"], "acknowledge", "operator@r7.test")
+

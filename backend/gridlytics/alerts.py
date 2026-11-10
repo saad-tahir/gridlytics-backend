@@ -2,8 +2,8 @@
 after the nightly jobs (`nightly`), with each category's thresholds from the company's rules and a site's overrides (`site_rules`).
 
 Categories: Data, Control, Reserve, Battery, Genset, Forecast, Tariff, Savings, Product. An alert is raised once per (site, rule) while its condition
-holds and closed automatically when it clears; people acknowledge, assign and close them. Advice to start a genset is a request with a reason; the
-product never starts or stops a genset itself.
+holds and closed automatically when it clears; people acknowledge, assign and close them. A closed or cleared alert takes no further action
+(`AlertClosed`). Advice to start a genset is a request with a reason; the product never starts or stops a genset itself.
 """
 from __future__ import annotations
 
@@ -755,26 +755,56 @@ def _assignee(member_id: str, name: str) -> tuple[str, str]:
     return hit[0]["id"], hit[0]["name"]
 
 
+#: What each action does, for a refusal's sentence
+ACTION_DONE = {"acknowledge": "acknowledged", "assign": "assigned", "close": "closed again"}
+
+
+class AlertClosed(Refusal):
+    """An action on an alert that is no longer open or acknowledged (audit flow-reports-alerts-members-keys-08): a person closed it, or its condition
+    cleared by itself. Acknowledging it set it back to 'acknowledged' with its close kept, beside the alert its condition raised again. 409 through
+    the API's refusal handler; not a ValueError, so the route's 422 does not swallow it."""
+
+    def __init__(self, row, action: str) -> None:
+        done = ACTION_DONE.get(action, "changed")
+        when = ""
+        try:
+            t = datetime.fromisoformat(str(row["closed_at"])).astimezone(PKT)
+            when = f" on {_long(t.date())} at {t:%H:%M} (Karachi time)"
+        except (TypeError, ValueError):
+            pass
+        said = "cleared by itself" if row["state"] == "resolved" else "was closed"
+        super().__init__(409, f"This alert {said}{when}, so it is not {done}", "alert_closed")
+
+
+#: An alert people still act on
+_ACTIVE = "state IN ('open','acknowledged')"
+
+
 def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "", member_id: str = "") -> dict:
     with store.connect() as con:
         r = con.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
         if r is None or r["category"] not in reader_categories():
             raise KeyError(alert_id)               # an alert of a category the reader does not receive is not there for them
+        if action not in ACTION_DONE:
+            raise ValueError("The action is acknowledge, assign or close")
+        if r["state"] not in ("open", "acknowledged"):
+            raise AlertClosed(r, action)           # closed or cleared: nothing more is done to it (audit flow-reports-alerts-members-keys-08)
         # each action is an event of the alert's history, with who and when (audit pages-D-28); `note` is the latest note written, which an action
-        # without one leaves as it was
+        # without one leaves as it was. Each update holds only while the alert is still open or acknowledged, so a close by someone else in between
+        # is refused rather than undone.
         if action == "acknowledge":
-            con.execute(f"UPDATE alerts SET state = 'acknowledged', note = CASE WHEN ? = '' THEN note ELSE ? END, {_HISTORY} WHERE id = ?",
-                        (note, note, _event("acknowledged", by, note), alert_id))
+            cur = con.execute(f"UPDATE alerts SET state = 'acknowledged', note = CASE WHEN ? = '' THEN note ELSE ? END, {_HISTORY} "
+                              f"WHERE id = ? AND {_ACTIVE}", (note, note, _event("acknowledged", by, note), alert_id))
         elif action == "assign":
             # a member who acts on alerts, kept by id with their name (audit role-operator-31: any text was stored); empty takes the alert back
             who_id, who = _assignee(member_id, assignee)
-            con.execute(f"UPDATE alerts SET assigned = ?, assigned_id = ?, {_HISTORY} WHERE id = ?",
-                        (who, who_id, _event("assigned", by, assignee=who), alert_id))
-        elif action == "close":
-            con.execute(f"UPDATE alerts SET state = 'closed', closed_at = ?, note = CASE WHEN ? = '' THEN note ELSE ? END, {_HISTORY} WHERE id = ?",
-                        (store._now(), note, note, _event("closed", by, note), alert_id))
+            cur = con.execute(f"UPDATE alerts SET assigned = ?, assigned_id = ?, {_HISTORY} WHERE id = ? AND {_ACTIVE}",
+                              (who, who_id, _event("assigned", by, assignee=who), alert_id))
         else:
-            raise ValueError("The action is acknowledge, assign or close")
+            cur = con.execute(f"UPDATE alerts SET state = 'closed', closed_at = ?, note = CASE WHEN ? = '' THEN note ELSE ? END, {_HISTORY} "
+                              f"WHERE id = ? AND {_ACTIVE}", (store._now(), note, note, _event("closed", by, note), alert_id))
+        if cur.rowcount != 1:
+            raise AlertClosed(con.execute("SELECT state, closed_at FROM alerts WHERE id = ?", (alert_id,)).fetchone(), action)
     store.audit(by, f"{action}d an alert" if action != "assign" else "assigned an alert", r["site_id"], {"alert": alert_id})
     if action == "close":
         return {"id": alert_id, "state": "closed"}
