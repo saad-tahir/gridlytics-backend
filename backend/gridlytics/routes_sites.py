@@ -68,11 +68,16 @@ def _snapshot(last: dict | None) -> dict | None:
 MTD_SAVING_METHOD = "counterfactual"
 
 
-def _mtd_saving(site_id: str) -> tuple[float | None, str | None, list]:
+def _mtd_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple[float | None, str | None, list, dict]:
     """The month's claimed saving against the native settings, exactly as the Savings page's "This month" reads it (verify.summary from the 1st to
     today: the claimed days plus the month's MDI lever), when its days were computed, and the last 7 scored days for the sparkline (each day's claimed
     saving and the replay's figure). The figure is None while no day of the month is scored, never a zero (audit flow-savings-pilot-bill-02: the
-    daily claims alone left out the MDI lever, so Fleet and Overview read Rs 1,956 where Savings read Rs 43,594)."""
+    daily claims alone left out the MDI lever, so Fleet and Overview read Rs 1,956 where Savings read Rs 43,594).
+
+    Last, the month's energy behind the claim, which is not money, so a viewer reads it in place of the rupees (R8 2.1, "kWh shifted and litres instead";
+    audit pages-A-11): the grid import moved out of the peak window against the native replay and the diesel avoided, summed over the days that claim
+    their saving (a recommendation-only day or one whose claim is withheld adds nothing, as it adds no rupee). Each is None with no such day, at a site
+    without a grid (`grid`) or a genset (`genset`), or where no claimed day carries the figure (an unmetered genset's litres)."""
     t = today()
     summ = verify.summary(site_id, t.replace(day=1).isoformat(), t.isoformat())
     scored = any(d.get("saving_native_rs") is not None for d in summ["days"])
@@ -84,10 +89,20 @@ def _mtd_saving(site_id: str) -> tuple[float | None, str | None, list]:
     # each day's claimed saving beside the replay's own figure: the bars draw the claim, as the month column does, so a recommendation-only day's
     # replay noise (the Lahore mall's -Rs 0.09) is not drawn as a loss (audit role-analyst-14, flow-savings-pilot-bill-21, engine-money-live-14)
     spark = []
+    month = t.replace(day=1).isoformat()
+    peak = litres = None
     for r in rows:
         d = json.loads(r["data"])
         spark.append({"day": r["day_local"], "saving_rs": d.get("saving_rs"), "claimed_rs": d.get("claimed_rs")})
-    return mtd, (summ["computed"] or None) if scored else None, spark[-7:]
+        if r["day_local"] < month or d.get("fidelity") not in verify.CLAIMING or d.get("claim_withheld"):
+            continue
+        a, n = (d.get("actual") or {}).get("peak_import_kwh"), (d.get("baseline") or {}).get("peak_import_kwh")
+        if grid and a is not None and n is not None:
+            peak = (peak or 0.0) + n - a
+        if genset and d.get("litres_saved") is not None:
+            litres = (litres or 0.0) + d["litres_saved"]
+    energy = {"peak_kwh_avoided": None if peak is None else round(peak, 1), "litres_saved": None if litres is None else round(litres, 1)}
+    return mtd, (summ["computed"] or None) if scored else None, spark[-7:], energy
 
 
 def fleet_row(s: dict, now: int, counts: dict) -> dict:
@@ -95,19 +110,22 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
     first = telemetry.first_ts(s["id"])
     plan = plans.current(s["id"])
     nn = plans.now_and_next(plan, now)
-    mtd, computed, spark = _mtd_saving(s["id"])
     days_data = (now - first) / 86400 if first else 0
     conn = (sites.connections(s["id"]) or [None])[0]
     # off-grid is the site's own fact, as tab C and POST /activate read it (_grid_settled): a connection of regime off_grid, or none at a farm or a
     # site whose data says off_grid. A grid site whose connection is not saved yet has no category yet (null), and its outages count (audit pages-A-03)
     off_grid = _off_grid(s, conn)
+    has_genset = "genset" in sites.assets(s["id"])
+    mtd, computed, spark, energy = _mtd_saving(s["id"], grid=not off_grid, genset=has_genset)
     category = "Off-grid" if off_grid else conn["data"]["tariff_category"] if conn is not None else None
     return {"id": s["id"], "name": s["name"], "status": s["status"], "tier": s["tier"], "demo": bool(s.get("demo_link")), "city": s["data"].get("city"),
             "disco": s["data"].get("disco"), "category": category,
             "control": control_state(s, last, now), "last_data": last["ts"] if last else None, "now": _snapshot(last),
             "next_event": (nn or {}).get("next", [None])[0] if nn and nn.get("next") else None, "open_alerts": counts.get(s["id"], 0),
             "mtd_saving_rs": mtd, "mtd_saving_rs_method": MTD_SAVING_METHOD, "mtd_saving_rs_computed": computed, "spark": spark,
-            "collecting_day": None if days_data >= 14 else int(days_data) + 1 if first else 0}
+            "collecting_day": None if days_data >= 14 else int(days_data) + 1 if first else 0,
+            # the month's energy behind the claim: not money, so a viewer reads it in place of the rupees (R8 2.1; audit pages-A-11)
+            "mtd_peak_kwh_avoided": energy["peak_kwh_avoided"], "mtd_litres_saved": energy["litres_saved"]}
 
 
 @router.get("/api/fleet")
@@ -119,10 +137,12 @@ def fleet():
     stamps = [r["mtd_saving_rs_computed"] for r in rows if r["mtd_saving_rs_computed"]]
     # the sum of the sites' figures; None while no site has a scored day this month, never Rs 0 (audit frontend-states-formats-14)
     figures = [r["mtd_saving_rs"] for r in rows if r["mtd_saving_rs"] is not None]
+    total = lambda k: (round(sum(r[k] for r in rows if r[k] is not None), 1) if any(r[k] is not None for r in rows) else None)  # noqa: E731
     return out({"summary": {"sites": len(rows), "online": online, "alerts": c["total"], "critical": c["by_severity"].get("critical", 0),
                             "mtd_saving_rs": round(sum(figures), 0) if figures else None, "mtd_saving_rs_method": MTD_SAVING_METHOD,
                             "mtd_saving_rs_computed": max(stamps) if stamps else None,
-                            "in_outage": sum(1 for r in rows if r["now"] and r["now"]["grid_present"] == 0 and r["category"] != "Off-grid")},
+                            "in_outage": sum(1 for r in rows if r["now"] and r["now"]["grid_present"] == 0 and r["category"] != "Off-grid"),
+                            "mtd_peak_kwh_avoided": total("mtd_peak_kwh_avoided"), "mtd_litres_saved": total("mtd_litres_saved")},
                 "sites": rows})
 
 
@@ -455,7 +475,7 @@ def site_now(site_id: str):
     td = next((d for d in tdays if d["day"] == t.isoformat()), None)
     if td is None and last:
         td = telemetry.aggregate_day(site_id, t)
-    mtd, computed, spark = _mtd_saving(site_id)
+    mtd, computed, spark, _ = _mtd_saving(site_id)
     a = s.get("assets") or {}
     caps = {"pv_kw": (a.get("pv") or {}).get("kw_ac"), "battery_kw": (a.get("battery") or {}).get("p_dis_kw"), "genset_kw": (a.get("genset") or {}).get("rated_kw"),
             "grid_kw": (s["connections"][0]["data"]["sanctioned_load_kw"] if s.get("connections") else None)}

@@ -3,7 +3,8 @@ computation date (flow-savings-pilot-bill-02, its duplicates role-owner-01, role
 fleet is the site's own fact, so a grid site whose connection is not saved yet is not labelled Off-grid and its outage counts (pages-A-03,
 role-viewer-09). The Overview carries the plan's KPI tiles (today's solar used on site, battery cycles and outages covered), the peak window of
 its chart's actual steps and the genset start requests waiting for an answer, its quick action (pages-A-09). The Fleet's 7-day bars draw each day's
-claimed saving, as its month column, so a monitor site's replay noise is not a loss (role-analyst-14 and its duplicates)."""
+claimed saving, as its month column, so a monitor site's replay noise is not a loss (role-analyst-14 and its duplicates); a viewer reads the
+month's energy behind the claim, peak kWh moved and diesel avoided, in place of the rupees (pages-A-11, role-viewer-18)."""
 from __future__ import annotations
 
 import json
@@ -172,3 +173,40 @@ def test_the_fleet_s_7_day_bars_carry_each_day_s_claimed_saving_so_unclaimed_rep
     assert spark[0]["saving_rs"] == -0.09                                                  # the replay's own figure stays beside it
     # money both: a viewer's bars carry the days only
     assert [set(p) for p in _row(world.c["viewer"].get("/api/fleet").json(), sid)["spark"]] == [{"day"}, {"day"}]
+
+
+# ------------------------------------------------------------------------------------------------ pages-A-11, role-viewer-18
+
+def _claimed_day(claimed: float, peak_actual: float, peak_native: float, litres: float | None, fidelity: str = "confirmed") -> dict:
+    d = _day(claimed if fidelity == "confirmed" else 0.0, 300.0, 300.0, 1500.0)
+    d.update(fidelity=fidelity, litres_saved=litres, saving_rs=claimed)
+    d["actual"] = {**d["actual"], "peak_import_kwh": peak_actual}
+    d["baseline"] = {**d["baseline"], "peak_import_kwh": peak_native}
+    return d
+
+
+def test_a_viewer_reads_the_month_s_peak_energy_moved_and_diesel_avoided_in_place_of_the_rupees(world):
+    a, v, sid = world.c["admin"], world.c["viewer"], world.site          # Mill One: a grid connection and a genset
+    t = today()
+    first = t.replace(day=1)
+    days = {t.isoformat(): _claimed_day(700.0, 400.0, 520.0, 12.5),
+            (first - timedelta(days=1)).isoformat(): _claimed_day(900.0, 100.0, 900.0, 80.0)}    # last month's: not this month's
+    if first != t:                                                       # a recommendation-only day claims nothing, so its energy is not counted
+        days[first.isoformat()] = _claimed_day(500.0, 100.0, 900.0, 30.0, fidelity="recommendation_only")
+    with world.use():
+        _put_days(sid, days)
+    for c in (a, v):
+        fleet = c.get("/api/fleet").json()
+        row = _row(fleet, sid)
+        assert row["mtd_peak_kwh_avoided"] == 120.0 and row["mtd_litres_saved"] == 12.5          # energy, not money: every role reads it
+        assert fleet["summary"]["mtd_peak_kwh_avoided"] == 120.0 and fleet["summary"]["mtd_litres_saved"] == 12.5
+        other = _row(fleet, world.other)                                  # no claimed day: missing, never a zero
+        assert other["mtd_peak_kwh_avoided"] is None and other["mtd_litres_saved"] is None
+    assert "mtd_saving_rs" not in _row(v.get("/api/fleet").json(), sid)
+    # a site without a genset has no litres to avoid, and an off-grid one no peak import
+    with world.use():
+        _put_days(world.other, {t.isoformat(): _claimed_day(50.0, 0.0, 0.0, 0.0)})
+    other = _row(a.get("/api/fleet").json(), world.other)
+    assert other["mtd_litres_saved"] is None and other["mtd_peak_kwh_avoided"] == 0.0
+    assert a.put(f"/api/sites/{world.other}/connection", json={"regime": "off_grid"}).status_code == 200
+    assert _row(a.get("/api/fleet").json(), world.other)["mtd_peak_kwh_avoided"] is None
