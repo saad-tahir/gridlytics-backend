@@ -235,3 +235,20 @@ def test_the_fleet_counts_the_sites_on_a_plan_and_on_native_settings_and_names_t
     # the same for a viewer: none of it is money
     seen = world.c["viewer"].get("/api/fleet").json()
     assert seen["summary"]["on_native"] == 1 and _row(seen, sid)["has_genset"] is True
+
+
+def test_a_hold_at_the_monitor_tier_is_not_a_plan_in_force(world):
+    """Review of pages-A-17: control_state names a hold before the tier, so a hold at a monitor site read "hold" and the site was counted on a plan,
+    although at the monitor tier the plan is a recommendation and nothing reaches the inverter."""
+    a, sid = world.c["admin"], world.site                  # Mill One: the monitor tier
+    _fake_plan(world)
+    assert a.post(f"/api/sites/{sid}/control/hold", json={"hours": 2}).status_code == 200
+    fleet = a.get("/api/fleet").json()
+    row = _row(fleet, sid)
+    assert row["control"]["key"] == "hold" and row["tier"] == "monitor"
+    assert row["on_plan"] is False and fleet["summary"]["on_plan"] == 0
+    with world.use():                                      # above the monitor tier the same hold is a plan in force
+        sites.set_tier_capable(sid, "closed_loop")
+        sites.set_tier_allowed(sid, "closed_loop", "test")
+    fleet = a.get("/api/fleet").json()
+    assert _row(fleet, sid)["on_plan"] is True and fleet["summary"]["on_plan"] == 1

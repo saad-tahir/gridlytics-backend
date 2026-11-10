@@ -134,8 +134,9 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
             # the month's energy behind the claim: not money, so a viewer reads it in place of the rupees (R8 2.1; audit pages-A-11)
             "mtd_peak_kwh_avoided": energy["peak_kwh_avoided"], "mtd_litres_saved": energy["litres_saved"],
             # R8 2.1's summary and filters (audit pages-A-17): a plan in force at the inverter (following it or holding; not a monitor site's
-            # recommendation, a table not confirmed today, a release, a pause or an offline edge), and a genset on site
-            "on_plan": plan is not None and control["key"] in ON_PLAN, "has_genset": has_genset}
+            # recommendation, a table not confirmed today, a release, a pause or an offline edge), and a genset on site. control_state names a hold
+            # before the tier, so the tier is read here too: a hold at the monitor tier reaches no inverter
+            "on_plan": plan is not None and control["key"] in ON_PLAN and s["tier"] != "monitor", "has_genset": has_genset}
 
 
 @router.get("/api/fleet")
