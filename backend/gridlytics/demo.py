@@ -430,7 +430,7 @@ def load(by: str, days: int | None = None, background: bool = True) -> dict:
     lock = _lock_for(db)
     if not lock.acquire(blocking=False):
         return {"state": "running", "message": "The demo is already being built"}
-    days = int(days or default_days())
+    days = int(days) if days and int(days) > 0 else default_days()            # a count below 1 (the seed's --demo-days) builds the default
     _set_status(state="running", progress=0, total=days * len(DEMO_SITES), days=days, started=store._now(), message="Creating the demo sites")
 
     def run():

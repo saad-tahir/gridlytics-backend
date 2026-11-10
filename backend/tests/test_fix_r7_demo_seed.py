@@ -308,6 +308,11 @@ def test_the_demo_status_still_answers_when_the_days_setting_is_not_a_positive_n
     for bad in ("ninety", "", "0", "-3", "2.5"):
         monkeypatch.setenv("GRIDLYTICS_DEMO_DAYS", bad)
         assert demo.default_days() == 21 and routes_demo.status()["days"] == 21, bad   # before: ValueError (a 500) or 0 / -3 days
+    # nor does a day count asked for (the seed's --demo-days) below 1: before, -3 built the sites with today only and GET /api/demo said -3 days
+    monkeypatch.delenv("GRIDLYTICS_DEMO_DAYS")
+    monkeypatch.setattr(demo, "create_sites", lambda by, **k: [])
+    demo.load("t", -3, background=False)
+    assert demo.status()["days"] == 21 and demo.status()["total"] == 21 * len(demo.DEMO_SITES)
 
 
 def test_only_an_administrator_loads_the_demo_sites(world, monkeypatch):
