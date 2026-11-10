@@ -682,7 +682,8 @@ def test_the_control_state_says_what_the_edge_reports(world):
     pid = _fake_plan(world)
     with world.use():
         _closed_loop(sid)
-    assert _control(world, sid)["key"] == "following"
+    # no edge has reported yet: nothing reaches the inverter (batch 5, audit role-operator-11; this read "following" before)
+    assert _control(world, sid)["key"] == "edge_offline"
     beat = lambda n, state: world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json=_env(n, uptime_s=60, control_state=state))
     assert beat(1, "fallback").status_code == 200
     c = _control(world, sid)
@@ -1098,6 +1099,7 @@ def test_a_demo_site_says_its_control_state_as_a_customer_site_does(company):
     loop = sites.create({"name": "Karachi feed mill (demo)", "disco": "FESCO"}, "t", demo_link="demo")["id"]
     _tier(adv, "advisory_writes")
     _tier(loop, "closed_loop")
+    sites.put_state(loop, edge_last_seen=now - 4 * 3600)       # its edge has reported (one that never did reads "No edge device yet", batch 5)
     state = lambda sid, last: routes_sites.control_state(sites.get(sid), last, now)  # noqa: E731
     # before: "Following plan (table applied)" with nothing marked, and "Following plan" beside "No live data: the site is offline"
     assert state(adv, {"ts": now}) == {"key": "unconfirmed", "label": "Table not confirmed today"}
@@ -1431,22 +1433,122 @@ def test_an_override_the_site_has_no_equipment_for_is_refused(world, monkeypatch
 
 
 def test_a_forced_charge_and_a_genset_hold_reach_the_plan_at_once(world):
-    """The re-solve at once takes the new override: the forced charge's floor is in the plan in force, as is the genset hold."""
+    """The re-solve at once takes the new override: the forced charge's floor is in the re-solved plan, as is the genset hold. (Whether the wrong-plan
+    guard lets that plan into force is the guard's own matter: at some hours the solve sheds load with the grid up to keep its MDI cap while it
+    charges, and the guard holds such a plan, so the plan is read by its id, whatever its status.)"""
     sid, admin = world.site, world.c["admin"]
     with world.use():
         plans.tick(sid)
     r = admin.post(f"/api/sites/{sid}/control/force_charge", json={"hours": 3, "soc_pct": 80})
-    assert r.status_code == 200 and r.json()["resolve"]["status"] == "active", r.text
+    assert r.status_code == 200 and r.json()["resolve"]["status"] in ("active", "held"), r.text
     with world.use():
         (o,) = sites.overrides(sid)
-        plan = plans.current(sid)
-    assert plan["id"] == r.json()["resolve"]["plan_id"] and o["kind"] == "force_charge"
+        plan = plans.get(sid, r.json()["resolve"]["plan_id"])
+    assert o["kind"] == "force_charge"
     assert [(x["kind"], x["value"]) for x in plan["summary"]["overrides"]] == [("force_charge", 80.0)], plan["summary"]["overrides"]
     until = plans._ts(o["until_ts"])
     assert any(s["reserve_pct"] >= 80 for s in plan["steps"] if s["t"] < until), [(s["local"], s["reserve_pct"]) for s in plan["steps"][:12]]
     # a genset hold keeps the genset off in its window
     r = admin.post(f"/api/sites/{sid}/control/genset_hold", json={"hours": 2})
-    assert r.status_code == 200 and r.json()["resolve"]["status"] == "active", r.text
+    assert r.status_code == 200 and r.json()["resolve"]["status"] in ("active", "held"), r.text
     with world.use():
-        plan = plans.current(sid)
+        plan = plans.get(sid, r.json()["resolve"]["plan_id"])
     assert "genset_hold" in [x["kind"] for x in plan["summary"]["overrides"]]
+    assert not any(s["genset_on"] for s in plan["steps"] if s["t"] < _now() + 2 * 3600 - 900)
+
+
+# ------------------------------------------------------------------------------------------------ batch 5: role-operator-11 (role-analyst-12)
+
+def test_a_closed_loop_site_whose_edge_never_reported_says_so(world):
+    """Closed loop needs an edge device: with none ever heard from, nothing reaches the inverter, so the chip no longer reads "Following plan" on
+    the strength of the site's readings (the Karachi demo site did); once the edge reports it does."""
+    sid, kh = world.site, world.key(["telemetry:write"])
+    with world.use():
+        _closed_loop(sid)
+    assert _control(world, sid) == {"key": "edge_offline", "label": "No edge device yet"}
+    assert world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json=_env(1, uptime_s=60, control_state="executing")).status_code == 200
+    assert _control(world, sid)["key"] == "following"
+    with world.use():
+        _tier(sid, "advisory_writes")                                   # an advisory site keys its table in: no edge is needed
+    assert _control(world, sid)["key"] == "unconfirmed"
+
+
+def _ack_world(world):
+    """A closed-loop site with a plan sent to its edge and acknowledged in part: an items ack and a per_device ack."""
+    sid, kh = world.site, world.key(["telemetry:write", "plans:read"])
+    pid = _fake_plan(world)
+    with world.use():
+        _closed_loop(sid)
+    world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json=_env(1, uptime_s=60, control_state="executing", edge_id="edge-07"))
+    assert world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=kh).status_code == 200
+    ack = {"plan_id": pid, "status": "partial", "per_device": [{"device_id": "inv1", "status": "partial", "writes_used_today": {"tou_table": 1},
+           "applied": [{"primitive": "soc_floor_pct", "requested": 40, "written": 40, "readback": 40, "readback_ok": True},
+                       {"primitive": "max_charge_w", "requested": 9000, "written": 8000, "readback": 8000, "readback_ok": True}],
+           "rejected": [{"primitive": "gen_charge_allowed", "reason": "NOT_SUPPORTED"}]}]}
+    assert world.anon.post(f"/api/edge/{sid}/ack", headers=kh, json=_env(1, **ack)).status_code == 200
+    items = {"plan_id": pid, "status": "applied", "items": [{"device": "inv1", "primitive": "export_limit_w", "written": 0, "read_back": 500,
+                                                                "status": "failed", "codes": ["READBACK_MISMATCH"]}]}
+    return sid, pid, kh, items
+
+
+def test_the_read_back_says_per_primitive_what_was_asked_written_and_read_back(world):
+    sid, pid, kh, items = _ack_world(world)
+    rb = world.c["viewer"].get(f"/api/sites/{sid}/control/readback").json()
+    assert rb["plan_id"] == pid and rb["sent_at"] and rb["ack"]["outcome"] == "partial" and rb["ack"]["codes"] == ["NOT_SUPPORTED"], rb
+    lines = {ln["primitive"]: ln for ln in rb["lines"]}
+    assert lines["soc_floor_pct"] == {"device": "inv1", "primitive": "soc_floor_pct", "requested": 40, "written": 40, "read_back": 40, "match": True,
+                                      "status": "ok", "codes": []}
+    assert lines["max_charge_w"]["status"] == "clamped" and lines["max_charge_w"]["match"] is True      # written below what was asked
+    assert lines["gen_charge_allowed"] == {"device": "inv1", "primitive": "gen_charge_allowed", "requested": None, "written": None, "read_back": None,
+                                           "match": None, "status": "rejected", "codes": ["NOT_SUPPORTED"]}
+    assert rb["fidelity_today"] == "partial"
+    # this contract's items: a value read back that differs is a mismatch with its code
+    assert world.anon.post(f"/api/edge/{sid}/ack", headers=kh, json=_env(2, **items)).status_code == 200
+    rb = world.c["viewer"].get(f"/api/sites/{sid}/control/readback").json()
+    assert rb["lines"] == [{"device": "inv1", "primitive": "export_limit_w", "requested": None, "written": 0, "read_back": 500, "match": False,
+                            "status": "failed", "codes": ["READBACK_MISMATCH"]}], rb
+    # before any send there is nothing to read back
+    with world.use(), store.connect() as con:
+        con.execute("DELETE FROM plan_messages")
+    assert world.c["viewer"].get(f"/api/sites/{sid}/control/readback").json() == {"plan_id": None, "sent_at": None, "ack": None, "lines": [],
+                                                                                    "fidelity_today": "partial"}
+
+
+def test_the_write_log_lists_the_days_writes_who_why_and_the_result(world, monkeypatch):
+    _no_ticks(monkeypatch)
+    sid, pid, kh, items = _ack_world(world)
+    op, admin = world.c["operator"], world.c["admin"]
+    assert op.post(f"/api/sites/{sid}/control/hold", json={"hours": 2, "soc_pct": 60, "reason": "Feeder trip expected"}).status_code == 200
+    with world.use():
+        (hold,) = sites.overrides(sid)
+    assert admin.delete(f"/api/sites/{sid}/overrides/{hold['id']}").status_code == 200
+    # a repeat pull of the same table is no write; the release that follows is one
+    assert world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=kh).status_code == 200
+    assert world.anon.post(f"/api/edge/{sid}/ack", headers=kh, json=_env(2, **items)).status_code == 200
+    log = world.c["analyst"].get(f"/api/sites/{sid}/control/writes").json()
+    assert log["day"] == datetime.now(PKT).date().isoformat()
+    rows = log["rows"]
+    assert [r["at"] for r in rows] == sorted((r["at"] for r in rows), reverse=True)                 # newest first
+    kinds = [r["kind"] for r in rows]
+    assert kinds.count("sent") == 1, kinds                                                         # two pulls of one table: one write
+    sent = next(r for r in rows if r["kind"] == "sent")
+    assert sent["source"] == "cloud" and sent["plan_id"] == pid and sent["release_reason"] is None
+    placed = next(r for r in rows if r["kind"] == "override_placed")
+    assert placed == {**placed, "source": "person", "who": "Operator", "override_kind": "reserve", "value": 60.0,
+                      "why": "Feeder trip expected"}, placed
+    cleared = next(r for r in rows if r["kind"] == "override_cleared")
+    assert cleared["who"] == "Admin" and cleared["override_kind"] == "reserve", cleared
+    writes = [r for r in rows if r["kind"] == "write"]
+    assert {(w["primitive"], w["status"], w["match"]) for w in writes} == {("soc_floor_pct", "ok", True), ("max_charge_w", "clamped", True),
+                                                                           ("gen_charge_allowed", "rejected", None), ("export_limit_w", "failed", False)}
+    assert all(w["source"] == "edge" and w["who"] == "edge-07" for w in writes), writes
+    acks = [r for r in rows if r["kind"] == "ack"]
+    assert sorted(a["outcome"] for a in acks) == ["partial", "partial"] and all(a["plan_id"] == pid for a in acks), acks
+    # filtered by primitive and by day; a day with nothing written is empty; a bad day is one sentence
+    only = world.c["viewer"].get(f"/api/sites/{sid}/control/writes", params={"primitive": "export_limit_w"}).json()["rows"]
+    assert [(r["kind"], r["primitive"]) for r in only] == [("write", "export_limit_w")], only
+    assert world.c["viewer"].get(f"/api/sites/{sid}/control/writes", params={"day": "2020-01-01"}).json() == {"day": "2020-01-01", "rows": []}
+    r = world.c["viewer"].get(f"/api/sites/{sid}/control/writes", params={"day": "yesterday"})
+    assert r.status_code == 422 and r.json()["detail"] == "The day is a date written YYYY-MM-DD", r.text
+    # no money in the log: a table issue's rupee gain stays on the control answer, for a role that sees money
+    assert "_rs" not in json.dumps(rows)

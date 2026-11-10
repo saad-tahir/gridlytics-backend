@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 from fastapi import APIRouter, Body
@@ -264,6 +264,29 @@ def control(site_id: str, day: int = 0):
                 "issued": issued, "reissue": plans.reissue_held(site_id, (p or {}).get("id"), today()) if issued is not None else None,
                 # the overrides the site has the equipment for (a genset hold needs a genset, a charging block and a forced charge a battery)
                 "placeable": [k for k, (asset, _, _) in OVERRIDE_ACTIONS.items() if (s.get("assets") or {}).get(asset)]})
+
+
+@router.get("/api/sites/{site_id}/control/readback")
+def control_readback(site_id: str):
+    """The read-back panel of a closed-loop site (plan Part 9.3, UI-15; audit role-operator-11): the last plan sent to the edge, the edge's latest ack
+    of it per primitive (asked, written, read back, match, status, codes) and today's fidelity (plans.readback). No money."""
+    site_or_404(site_id)
+    return plans.readback(site_id)
+
+
+@router.get("/api/sites/{site_id}/control/writes")
+def control_writes(site_id: str, day: str | None = None, primitive: str | None = None):
+    """The write log of a Karachi day (today when left out), newest first: the persons' overrides and marks, the tables issued, the sends that changed
+    what the inverter runs, the edge's acks and writes per primitive and its events (plans.write_log; audit role-operator-11). `primitive` keeps that
+    primitive's rows. No money: a table issue's rupee gain stays on GET /control."""
+    site_or_404(site_id)
+    try:
+        d = date.fromisoformat(day) if day else today()
+    except ValueError:
+        raise Refusal(422, "The day is a date written YYYY-MM-DD", "invalid") from None
+    if primitive is not None and len(primitive) > 60:
+        raise Refusal(422, "The primitive is a name of at most 60 characters", "invalid")
+    return {"day": d.isoformat(), "rows": plans.write_log(site_id, d, primitive)}
 
 
 @router.post("/api/sites/{site_id}/control/{action}")

@@ -68,6 +68,10 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
         until = kinds["reserve"]["until_ts"]
         return {"key": "hold", "label": f"Hold until {until_words(until, now)}", "until": until}
     # a demo site says its state as a customer site does (round 7, audit role-owner-08): its chip, its alerts and its applied log agree
+    if tier == "closed_loop" and not sites.state(site["id"]).get("edge_last_seen"):
+        # closed loop runs through an edge device: with none ever heard from nothing reaches the inverter, whatever the readings say (round 7, audit
+        # role-operator-11: the Karachi demo site read "Following plan")
+        return {"key": "edge_offline", "label": "No edge device yet"}
     if tier == "closed_loop" and age is not None and age > 5:
         return {"key": "edge_offline", "label": "Edge offline"}
     if tier == "closed_loop":

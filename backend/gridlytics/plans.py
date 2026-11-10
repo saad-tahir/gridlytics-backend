@@ -1412,3 +1412,156 @@ def early_check(site_id: str, now: int | None = None, site: dict | None = None) 
         reason = "native_alike"
     return _keep_early(row["id"], {**out, "verdict": verdict, "reason": reason, "max_discharge_kw": round(max(float(np.max(bat[after])), 0.0), 1),
                                    "checked": store._now()})
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the closed-loop read-back and write log
+
+def _same(a, b) -> bool:
+    """Whether a value written and a value read back (or asked and written) are the same: numbers to within a millionth, anything else as is."""
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
+        return abs(float(a) - float(b)) < 1e-6
+    return a == b
+
+
+def ack_lines(body: dict) -> list[dict]:
+    """An ack's lines per primitive (the read-back panel and the write log, plan Part 9.3 UI-15; audit role-operator-11): {device, primitive,
+    requested, written, read_back, match, status, codes}. This contract's `items` say what was written and read back, with ok, clamped or failed and
+    their codes; U3's `per_device` says what was asked, written and read back (`applied`: failed when the read-back differs, clamped when the value
+    written is not the one asked) and what was refused (`rejected`, with its reason code). `match` is None where nothing was read back."""
+    out = []
+    for it in body.get("items") or []:
+        w, rb = it.get("written"), it.get("read_back")
+        out.append({"device": it.get("device"), "primitive": it.get("primitive"), "requested": None, "written": w, "read_back": rb,
+                    "match": None if w is None or rb is None else _same(w, rb), "status": it.get("status"), "codes": list(it.get("codes") or [])})
+    for d in body.get("per_device") or []:
+        for a in d.get("applied") or []:
+            req, w, rb = a.get("requested"), a.get("written"), a.get("readback")
+            match = a.get("readback_ok") if a.get("readback_ok") is not None else (None if w is None or rb is None else _same(w, rb))
+            status = "failed" if match is False else "clamped" if req is not None and w is not None and not _same(req, w) else "ok"
+            out.append({"device": d.get("device_id"), "primitive": a.get("primitive"), "requested": req, "written": w, "read_back": rb, "match": match,
+                        "status": status, "codes": []})
+        for r in d.get("rejected") or []:
+            out.append({"device": d.get("device_id"), "primitive": r.get("primitive"), "requested": None, "written": None, "read_back": None,
+                        "match": None, "status": "rejected", "codes": [r["reason"]] if r.get("reason") else []})
+    return out
+
+
+def readback(site_id: str, now: int | None = None) -> dict:
+    """The read-back panel (UI-15, closed loop; audit role-operator-11): the last plan message sent to the edge (a release aside), the edge's latest
+    ack of that plan ({received_at, status, outcome, codes, detail}: contract.ack_outcome) with its lines per primitive (ack_lines), and today's
+    fidelity from what the edge reported (edge_fidelity). plan_id, sent_at and ack are None before the first send."""
+    from . import contract
+
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    with store.connect() as con:
+        sent = con.execute("SELECT plan_id, sent_at FROM plan_messages WHERE site_id = ? AND plan_id != 'release' ORDER BY sent_at DESC, rowid DESC "
+                           "LIMIT 1", (site_id,)).fetchone()
+        ack = con.execute("SELECT body, status, received_at FROM acks WHERE site_id = ? AND plan_id = ? ORDER BY received_at DESC, rowid DESC LIMIT 1",
+                          (site_id, sent["plan_id"])).fetchone() if sent else None
+    out = {"plan_id": sent["plan_id"] if sent else None, "sent_at": sent["sent_at"] if sent else None, "ack": None, "lines": [],
+           "fidelity_today": edge_fidelity(site_id, _local(now).date())}
+    if ack is not None:
+        body = json.loads(ack["body"])
+        outcome, codes = contract.ack_outcome(body)
+        out["ack"] = {"received_at": ack["received_at"], "status": ack["status"], "outcome": outcome, "codes": codes, "detail": body.get("detail")}
+        out["lines"] = ack_lines(body)
+    return out
+
+
+#: The edge's events the write log lists: what it says of its writes and of its control (U3 5.5; U3's names for them too)
+WRITE_LOG_EVENTS = ("readback_mismatch", "write_failed", "budget_exhausted", "local_override", "override_local", "fallback_engaged", "fallback_cleared",
+                    "control_disabled", "control_enabled", "template_change", "template_change_detected", "firmware_change", "firmware_change_detected")
+
+
+def write_log(site_id: str, day: date, primitive: str | None = None) -> list[dict]:
+    """The write log of a Karachi day (UI-15; U3 3.3's audit log and the evidence in a savings dispute; audit role-operator-11), newest first. Each
+    row is {at, source (person, cloud or edge), who, kind, why, primitive} and the fields of its kind:
+    - override_placed {override_kind, value, until} and override_cleared {override_kind}: a person's hold, release, pause, genset hold, charging
+      block or forced charge (or the edge's own pause), with its reason as `why`;
+    - marked_applied {plan_id, for_day, method}: a person keyed a table in;
+    - table_issued {plan_id, for_day, reason}: the table issued for a day (no rupee gain: the log carries no money);
+    - sent {plan_id, release_reason, before}: a send that changed what the inverter runs (a release is one; a repeat pull of the same table is not);
+    - ack {plan_id, status, outcome, codes} and write {plan_id, device, requested, written, read_back, match, status, codes}: what the edge
+      acknowledged, and per primitive what it wrote and read back;
+    - event {event, detail}: what the edge reported of its writes and its control (WRITE_LOG_EVENTS).
+    `primitive` keeps only the rows of that primitive."""
+    from . import contract
+
+    lo, hi = karachi_day_bounds(day)
+    t0, t1 = _ts(lo), _ts(hi)
+    with store.connect() as con:
+        ovs = con.execute("SELECT * FROM overrides WHERE site_id = ? AND ((created >= ? AND created < ?) OR (cleared >= ? AND cleared < ?))",
+                          (site_id, lo, hi, lo, hi)).fetchall()
+        clears = con.execute("SELECT at, actor, detail FROM audit WHERE target = ? AND action = 'cleared an override' AND at >= ? AND at < ?",
+                             (site_id, lo, hi)).fetchall()
+        marks = con.execute("SELECT plan_id, day_local, by, method, created FROM applied WHERE site_id = ? AND created >= ? AND created < ?",
+                            (site_id, lo, hi)).fetchall()
+        issues = con.execute("SELECT plan_id, day_local, issued_at, reason FROM table_issues WHERE site_id = ? AND issued_at >= ? AND issued_at < ?",
+                             (site_id, lo, hi)).fetchall()
+        prev = con.execute("SELECT plan_id, body, sent_at FROM plan_messages WHERE site_id = ? AND sent_at < ? ORDER BY sent_at DESC, rowid DESC LIMIT 1",
+                           (site_id, lo)).fetchone()
+        sent = con.execute("SELECT plan_id, body, sent_at FROM plan_messages WHERE site_id = ? AND sent_at >= ? AND sent_at < ? ORDER BY sent_at, rowid",
+                           (site_id, lo, hi)).fetchall()
+        acks = con.execute("SELECT plan_id, status, body, received_at FROM acks WHERE site_id = ? AND received_at >= ? AND received_at < ?",
+                           (site_id, lo, hi)).fetchall()
+        evs = con.execute(f"SELECT ts, type, source, detail FROM events WHERE site_id = ? AND type IN ({','.join('?' * len(WRITE_LOG_EVENTS))})",
+                          (site_id, *WRITE_LOG_EVENTS)).fetchall()
+    edge_who = (sites.state(site_id).get("edge_heartbeat") or {}).get("edge_id") or "Edge device"
+    rows: list[dict] = []
+
+    def add(at: str, source: str, who: str, kind: str, why: str | None = None, primitive_: str | None = None, **fields) -> None:
+        rows.append({"at": at, "source": source, "who": who, "kind": kind, "why": why or None, "primitive": primitive_, **fields})
+
+    cleared_by = {}
+    for c in clears:
+        oid = (json.loads(c["detail"] or "{}") or {}).get("override_id")
+        if oid:
+            cleared_by[oid] = c["actor"]
+    for o in ovs:
+        src = "edge" if o["author"] == "edge" else "person"
+        if lo <= o["created"] < hi:
+            add(o["created"], src, o["author"], "override_placed", o["reason"], override_kind=o["kind"], value=o["value"], until=o["until_ts"])
+        if o["cleared"] and lo <= o["cleared"] < hi:
+            add(o["cleared"], "person", cleared_by.get(o["id"], "–"), "override_cleared", override_kind=o["kind"])
+    for m in marks:
+        add(m["created"], "person", m["by"], "marked_applied", plan_id=m["plan_id"], for_day=m["day_local"], method=m["method"])
+    for i in issues:
+        add(i["issued_at"], "cloud", "Gridlytics", "table_issued", plan_id=i["plan_id"], for_day=i["day_local"], reason=i["reason"])
+
+    def written(r) -> tuple[str, dict]:
+        try:
+            body = json.loads(r["body"])
+        except (TypeError, ValueError):
+            return "", {}
+        if body.get("type") == "release":
+            return "release:" + str((body.get("release") or {}).get("reason")), body
+        on = _local(_ts(r["sent_at"])).date().isoformat()
+        return _table_key(next((x.get("slots") for x in (body.get("mode_a") or {}).get("days") or [] if x.get("date") == on), None)), body
+
+    last, before = (written(prev)[0], prev["plan_id"]) if prev else (None, None)
+    for r in sent:
+        k, body = written(r)
+        if k == last:
+            continue                                   # a repeat pull of the table the inverter already runs is no write
+        rel = (body.get("release") or {}) if body.get("type") == "release" else None
+        add(r["sent_at"], "cloud", "Gridlytics", "sent", plan_id=None if rel is not None else r["plan_id"],
+            release_reason=(rel or {}).get("reason") if rel is not None else None, before=before)
+        last, before = k, r["plan_id"]
+    for a in acks:
+        body = json.loads(a["body"])
+        outcome, codes = contract.ack_outcome(body)
+        add(a["received_at"], "edge", edge_who, "ack", body.get("detail"), plan_id=a["plan_id"], status=a["status"], outcome=outcome, codes=codes)
+        for ln in ack_lines(body):
+            add(a["received_at"], "edge", edge_who, "write", None, ln["primitive"], plan_id=a["plan_id"],
+                **{k: ln[k] for k in ("device", "requested", "written", "read_back", "match", "status", "codes")})
+    for e in evs:
+        at = contract.epoch(e["ts"])
+        if at is None or not t0 <= at < t1:
+            continue
+        detail = json.loads(e["detail"] or "{}") or {}
+        add(_iso_utc(at), "edge", edge_who if e["source"] in ("edge", "") else str(e["source"]).removeprefix("edge:"), "event",
+            str(detail.get("reason") or detail.get("cause") or "") or None, detail.get("primitive"), event=contract.event_meaning(e["type"]),
+            detail={k: detail[k] for k in ("requested", "readback", "action") if k in detail})
+    if primitive:
+        rows = [r for r in rows if r["primitive"] == primitive]
+    return sorted(rows, key=lambda r: (_ts(r["at"]) or 0, r["kind"] == "write"), reverse=True)
