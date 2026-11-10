@@ -1388,3 +1388,86 @@ def test_a_closed_or_cleared_alert_is_not_acknowledged_assigned_or_closed_again(
     with world.use(), pytest.raises(alerts.AlertClosed):
         alerts.act(ids["data_stale"], "acknowledge", "operator@r7.test")
 
+
+# ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-09
+
+def _rows(sid: str, rule: str) -> list[dict]:
+    with store.connect() as con:
+        return [dict(r) for r in con.execute("SELECT id, state, severity, title, note, history FROM alerts WHERE site_id = ? AND rule = ? "
+                                             "ORDER BY opened_at, rowid", (sid, rule))]
+
+
+def test_a_person_closing_an_alert_whose_condition_still_holds_is_not_undone_at_the_next_tick(world):
+    """flow-reports-alerts-members-keys-09: Lahore's agreement alert was closed with a note at 07:42 and raised again at 07:45 under a new id, without
+    the note: closing a condition that still held only reset its history."""
+    sid, now = world.site, _now()
+    today = datetime.fromtimestamp(now, PKT).date()
+    with world.use():
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "regime": "net_billing", "agreement_end": (today + timedelta(days=30)).isoformat()}, "test",
+                             conn_id=conn["id"])
+        alerts.evaluate(sid, now)
+        rule = f"regime_expiring_{conn['id']}"
+        aid = next(a["id"] for a in alerts.listing("active", sid) if a["rule"] == rule)
+    r = world.c["admin"].post(f"/api/alerts/{aid}/close", json={"note": "Renewal filed with the DISCO"})
+    assert r.status_code == 200, r.text
+    with world.use():
+        for tick in range(3):
+            alerts.evaluate(sid, now + 900 * (tick + 1))
+        got = _rows(sid, rule)
+    assert [(g["id"], g["state"], g["note"]) for g in got] == [(aid, "closed", "Renewal filed with the DISCO")], got
+    assert world.c["admin"].get("/api/alerts/counts").json()["total"] == sum(
+        1 for a in world.c["admin"].get(f"/api/alerts?site_id={sid}").json())          # the closed alert is not counted
+    assert rule not in _rules_of(world.c["admin"].get(f"/api/alerts?site_id={sid}").json())
+    # the agreement then ends: the condition is more severe (a critical 'ended'), so a new alert is raised
+    with world.use():
+        sites.put_connection(sid, {**conn["data"], "regime": "net_billing", "agreement_end": (today - timedelta(days=1)).isoformat()}, "test",
+                             conn_id=conn["id"])
+        alerts.evaluate(sid, now + 4 * 900)
+        got = _rows(sid, rule)
+    assert [(g["state"], g["severity"]) for g in got] == [("closed", "warning"), ("open", "critical")], got
+
+
+def test_a_closed_alert_comes_back_once_its_condition_cleared_changed_or_became_more_severe(world):
+    """flow-reports-alerts-members-keys-09: the close holds while the condition holds; the condition clearing (said in the closed alert's history), a
+    new day, event or bill (what the detail dates), or a higher severity raises a new alert."""
+    sid = world.site
+    with world.use():
+        alerts._open(sid, "unserved", "Reserve", "warning", "2.0 kWh of critical load went unserved in the day to 9 Nov 10:00", {})
+        first = alerts.listing("active", sid)[0]["id"]
+        alerts.act(first, "close", "Admin", "Load moved to the other feeder")
+        # the same condition, its figures moving tick by tick: held back
+        alerts._open(sid, "unserved", "Reserve", "warning", "2.4 kWh of critical load went unserved in the day to 9 Nov 10:15", {})
+        assert [r["state"] for r in _rows(sid, "unserved")] == ["closed"]
+        # more severe: raised
+        alerts._open(sid, "unserved", "Reserve", "critical", "9.0 kWh of critical load went unserved in the day to 9 Nov 10:30", {})
+        assert [(r["state"], r["severity"]) for r in _rows(sid, "unserved")] == [("closed", "warning"), ("open", "critical")]
+        second = _rows(sid, "unserved")[1]["id"]
+        alerts.act(second, "close", "Admin", "")
+        alerts._open(sid, "unserved", "Reserve", "critical", "9.5 kWh of critical load went unserved in the day to 9 Nov 10:45", {})
+        assert len(_rows(sid, "unserved")) == 2
+        # the condition clears: the closed alert's history says so, once, and the next time it holds a new alert is raised
+        alerts._clear(sid, "unserved")
+        alerts._clear(sid, "unserved")
+        held = _rows(sid, "unserved")[1]
+        events = json.loads(held["history"])
+        assert held["state"] == "closed" and [e["action"] for e in events] == ["closed", "condition_cleared"], events
+        assert events[-1]["by"] == "" and events[-1]["note"] == "Condition cleared"
+        alerts._open(sid, "unserved", "Reserve", "warning", "0.6 kWh of critical load went unserved in the day to 10 Nov 09:00", {})
+        assert [r["state"] for r in _rows(sid, "unserved")] == ["closed", "closed", "open"]
+        # a new day of a rule raised per day is a new condition, though the rule holds on without clearing
+        alerts._open(sid, "savings_negative", "Savings", "warning", "On 3 November the site did worse", {"day": "2026-11-03", "saving_rs": -40})
+        day1 = _rows(sid, "savings_negative")[0]["id"]
+        alerts.act(day1, "close", "Admin", "The genset test day")
+        alerts._open(sid, "savings_negative", "Savings", "warning", "On 3 November the site did worse", {"day": "2026-11-03", "saving_rs": -42})
+        assert [r["state"] for r in _rows(sid, "savings_negative")] == ["closed"]
+        alerts._open(sid, "savings_negative", "Savings", "warning", "On 4 November the site did worse", {"day": "2026-11-04", "saving_rs": -10})
+        assert [r["state"] for r in _rows(sid, "savings_negative")] == ["closed", "open"]
+        # an alert closed before closes held anything back (its close is not marked) is raised again as before; so is one an answer closed
+        with store.connect() as con:
+            con.execute("INSERT INTO alerts (id, site_id, rule, category, severity, title, state, opened_at, closed_at, history) VALUES "
+                        "('old1', ?, 'data_stale', 'Data', 'warning', 'No data', 'closed', '2026-11-01T10:00:00+00:00', '2026-11-01T11:00:00+00:00', ?)",
+                        (sid, json.dumps([{"at": "2026-11-01T11:00:00+00:00", "action": "closed", "by": "Ali", "note": ""}])))
+        alerts._open(sid, "data_stale", "Data", "warning", "No data for 40 minutes", {"last_ts": None, "source": None})
+        assert [r["state"] for r in _rows(sid, "data_stale")] == ["closed", "open"]
+

@@ -2,8 +2,10 @@
 after the nightly jobs (`nightly`), with each category's thresholds from the company's rules and a site's overrides (`site_rules`).
 
 Categories: Data, Control, Reserve, Battery, Genset, Forecast, Tariff, Savings, Product. An alert is raised once per (site, rule) while its condition
-holds and closed automatically when it clears; people acknowledge, assign and close them. A closed or cleared alert takes no further action
-(`AlertClosed`). Advice to start a genset is a request with a reason; the product never starts or stops a genset itself.
+holds and closed automatically when it clears; people acknowledge, assign and close them. A person's close holds while the condition does: the alert is
+raised again only once the condition clears and comes back, changes (another day, event or bill) or becomes more severe (`_held_back`). A closed or
+cleared alert takes no further action (`AlertClosed`). Advice to start a genset is a request with a reason; the product never starts or stops a genset
+itself.
 """
 from __future__ import annotations
 
@@ -56,20 +58,57 @@ def _row(r, site_name: str) -> dict:
     return {**dict(r), "detail": json.loads(r["detail"] or "{}"), "history": json.loads(r["history"] or "[]"), "site_name": site_name}
 
 
+SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
+#: The detail keys that date a condition: the day, month, event, gap, bill period, agreement end or start it is about. A rule that holds on while one of
+#: these moves (a negative saving on the 3rd, then on the 4th; a second edge event; the next bill) holds a new condition, which a person's close of the
+#: earlier one does not hold back (audit flow-reports-alerts-members-keys-09). The other keys are figures that move tick by tick (minutes, kWh).
+CONDITION_KEYS = ("day", "month", "at", "gap_from", "gap_to", "ended_at", "agreement_end", "ended", "period_start", "period_end", "due_on", "ended_on",
+                  "billing_month", "price_from", "requested_start", "start", "last_ts", "last_seen", "from_stage", "to_stage")
+
+
+def _held_back(row, severity: str, detail: dict) -> bool:
+    """True when the (site, rule)'s latest alert was closed by a person while its condition held, and the condition the rule sees now is that same one,
+    no more severe (audit flow-reports-alerts-members-keys-09: the close was undone at the next tick by a new alert under a new id, without its note).
+    The close holds until the condition clears (`_clear` then says so in its history), changes (`CONDITION_KEYS`) or becomes more severe. A close
+    made before a close held the condition back carries no `held` mark, so it holds nothing back."""
+    if row is None or row["state"] != "closed":
+        return False
+    events = json.loads(row["history"] or "[]")
+    if not events or events[-1].get("action") != "closed" or not events[-1].get("held"):
+        return False
+    if SEVERITY_RANK.get(severity, 0) > SEVERITY_RANK.get(row["severity"], 0):
+        return False
+    was = json.loads(row["detail"] or "{}")
+    return all(was.get(k) == detail.get(k) for k in CONDITION_KEYS if k in was or k in detail)
+
+
 def _open(site_id: str, rule: str, category: str, severity: str, title: str, detail: dict | None = None) -> None:
+    detail = detail or {}
     with store.connect() as con:
         r = con.execute("SELECT id FROM alerts WHERE site_id = ? AND rule = ? AND state IN ('open','acknowledged')", (site_id, rule)).fetchone()
         if r:
-            con.execute("UPDATE alerts SET title = ?, detail = ?, severity = ? WHERE id = ?", (title, json.dumps(detail or {}), severity, r["id"]))
-        else:
-            con.execute("INSERT INTO alerts (id, site_id, rule, category, severity, title, detail, opened_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (store.new_id(), site_id, rule, category, severity, title, json.dumps(detail or {}), store._now()))
+            con.execute("UPDATE alerts SET title = ?, detail = ?, severity = ? WHERE id = ?", (title, json.dumps(detail), severity, r["id"]))
+            return
+        last = con.execute("SELECT state, severity, detail, history FROM alerts WHERE site_id = ? AND rule = ? ORDER BY opened_at DESC, rowid DESC "
+                           "LIMIT 1", (site_id, rule)).fetchone()
+        if _held_back(last, severity, detail):
+            return
+        con.execute("INSERT INTO alerts (id, site_id, rule, category, severity, title, detail, opened_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (store.new_id(), site_id, rule, category, severity, title, json.dumps(detail), store._now()))
+
+
+#: An alert a person closed while its condition held, whose condition has not cleared since (`_held_back`): its last event is that close
+_HELD = "state = 'closed' AND json_extract(history, '$[#-1].action') = 'closed' AND json_extract(history, '$[#-1].held') = 1"
 
 
 def _clear(site_id: str, rule: str) -> None:
     with store.connect() as con:
         con.execute(f"UPDATE alerts SET state = 'resolved', closed_at = ?, note = 'Condition cleared', {_HISTORY} WHERE site_id = ? AND rule = ? "
                     "AND state IN ('open','acknowledged')", (store._now(), _event("resolved", note="Condition cleared"), site_id, rule))
+        # a person's close held the condition back while it held: it has cleared, so its next start raises a new alert (audit
+        # flow-reports-alerts-members-keys-09), and the closed alert's history says when it cleared
+        con.execute(f"UPDATE alerts SET {_HISTORY} WHERE site_id = ? AND rule = ? AND {_HELD}",
+                    (_event("condition_cleared", note="Condition cleared"), site_id, rule))
 
 
 def _set(cond: bool, site_id: str, rule: str, category: str, severity: str, title: str, detail: dict | None = None) -> None:
@@ -801,8 +840,9 @@ def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "",
             cur = con.execute(f"UPDATE alerts SET assigned = ?, assigned_id = ?, {_HISTORY} WHERE id = ? AND {_ACTIVE}",
                               (who, who_id, _event("assigned", by, assignee=who), alert_id))
         else:
+            # a person's close holds while the condition does (`held`: audit flow-reports-alerts-members-keys-09, `_held_back`)
             cur = con.execute(f"UPDATE alerts SET state = 'closed', closed_at = ?, note = CASE WHEN ? = '' THEN note ELSE ? END, {_HISTORY} "
-                              f"WHERE id = ? AND {_ACTIVE}", (store._now(), note, note, _event("closed", by, note), alert_id))
+                              f"WHERE id = ? AND {_ACTIVE}", (store._now(), note, note, _event("closed", by, note, held=True), alert_id))
         if cur.rowcount != 1:
             raise AlertClosed(con.execute("SELECT state, closed_at FROM alerts WHERE id = ?", (alert_id,)).fetchone(), action)
     store.audit(by, f"{action}d an alert" if action != "assign" else "assigned an alert", r["site_id"], {"alert": alert_id})
