@@ -1186,3 +1186,71 @@ def test_a_second_start_is_refused_and_the_start_and_sign_off_stand(world):
     now = admin.get(f"/api/sites/{sid}/pilot").json()
     assert now["started"] == first["started"] and now["pilot"]["signoff"] == first["pilot"]["signoff"]
     assert len(_audit_lines(world, "started the pilot")) == 1
+
+
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-12: the pilot's native
+# ------------------------------------------------------------------------------------------------ capture is pinned at the start
+
+def _pkt_today() -> date:
+    return datetime.now(timezone(timedelta(hours=5))).date()
+
+
+def test_the_start_pins_the_capture_a_later_one_waits_for_an_amendment_and_verify_replays_the_pinned_one(world):
+    sid = _pilot_ready(world)
+    admin, operator = world.c["admin"], world.c["operator"]
+    today = _pkt_today()
+    p = _start(world, sid).json()
+    assert p["capture"]["version"] == 1 and p["capture_newer"] is None and p["pilot"]["capture_pins"] == [{"version": 1, "from": today.isoformat()}]
+    # the operator records a new capture after the start: it is kept, shown as not adopted, and the pilot still replays version 1
+    r = operator.post(f"/api/sites/{sid}/native", json={"source": "entered", "work_mode": "backup", "backup_soc_pct": 90})
+    assert r.status_code == 200 and r.json()["version"] == 2
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    assert p["capture"]["version"] == 1 and p["capture_newer"]["version"] == 2 and p["pilot"]["amendments"] == []
+    with world.use():
+        assert verify.native_for_day(sid, today)["version"] == 1
+        assert verify.native_for_day(sid, today + timedelta(days=20))["version"] == 1
+        conn = sites.connections(sid)[0]
+        before = verify._month_fingerprint(sid, conn, today.replace(day=1), today)
+    # only an amendment with a reason adopts it, from the day it was captured; an older or unknown version, or the operator, cannot
+    assert operator.put(f"/api/sites/{sid}/pilot", json={"capture_version": 2, "reason": "x"}).status_code == 403
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"capture_version": 2}).json()["code"] == "reason_needed"
+    for v in (1, 3, 0):
+        assert admin.put(f"/api/sites/{sid}/pilot", json={"capture_version": v, "reason": "x"}).status_code == 422, v
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"capture_version": 2, "reason": "The installer set backup mode at 90 %"})
+    assert r.status_code == 200
+    p = r.json()
+    assert p["capture"]["version"] == 2 and p["capture_newer"] is None
+    assert p["pilot"]["capture_pins"] == [{"version": 1, "from": today.isoformat()}, {"version": 2, "from": today.isoformat()}]
+    (am,) = p["pilot"]["amendments"]
+    assert am["values"] == [{"field": "capture_version", "before": 1, "after": 2}] and am["reason"] == "The installer set backup mode at 90 %"
+    assert _audit_lines(world, "amended the pilot")[0]["detail"]["values"] == am["values"]
+    with world.use():
+        assert verify.native_for_day(sid, today)["version"] == 2
+        # the month's fingerprint moves with the pins, so the nightly settle re-scores the days the adopted capture now stands for
+        assert verify._month_fingerprint(sid, conn, today.replace(day=1), today) != before
+
+
+def test_a_capture_is_adopted_only_by_a_started_pilot_and_a_pilot_started_before_pins_replays_the_capture_of_its_start(world):
+    sid = _pilot_ready(world)
+    admin = world.c["admin"]
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"capture_version": 1})
+    assert r.status_code == 422 and r.json()["code"] == "not_started"
+    # a pilot started before the start pinned its capture: the capture latest at its start stands for every day from it
+    with world.use():
+        sites.capture_native(sid, {"source": "entered", "work_mode": "backup", "backup_soc_pct": 90}, "t")
+        with store.connect() as con:
+            con.execute("UPDATE native_settings SET captured_at = ? WHERE site_id = ? AND version = 1", ("2026-10-01T00:00:00+00:00", sid))
+            con.execute("UPDATE native_settings SET captured_at = ? WHERE site_id = ? AND version = 2", ("2026-10-20T08:00:00+00:00", sid))
+            con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?)",
+                        (sid, json.dumps({"baseline_start": None, "baseline_days": 14, "criteria": CRITERIA, "signoff": None, "amendments": []}),
+                         "2026-10-10T20:00:00+00:00", "2026-10-10T20:00:00+00:00"))
+        assert verify.pilot_capture_pins(sid) == [{"version": 1, "from": "2026-10-11"}]  # 20:00 UTC is 01:00 the next day in Pakistan
+        assert verify.native_for_day(sid, date(2026, 10, 25))["version"] == 1
+        assert verify.native_for_day(sid, date(2026, 10, 5))["version"] == 1  # before the start: the capture in force that day, as before
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    assert p["capture"]["version"] == 1 and p["capture_newer"]["version"] == 2
+    # with no pilot, a day takes the capture in force by its end (plan 8.1, 8.4), unchanged
+    with world.use():
+        with store.connect() as con:
+            con.execute("DELETE FROM pilots WHERE site_id = ?", (sid,))
+        assert verify.native_for_day(sid, date(2026, 10, 25))["version"] == 2

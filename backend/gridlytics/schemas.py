@@ -107,6 +107,8 @@ class PilotEdit(Strict):
     baseline_days: int = Field(None, ge=7, le=90)
     criteria: PilotCriteriaEdit = None
     reason: str = Field("", max_length=500)
+    #: a started pilot adopts a later native capture by its version, as an amendment (round 7, audit flow-savings-pilot-bill-12)
+    capture_version: int = Field(None, ge=1)
 
     @field_validator("baseline_start")
     @classmethod

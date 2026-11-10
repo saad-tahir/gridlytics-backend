@@ -580,12 +580,46 @@ def _gen_from_balance(g: dict, f: dict, bat: np.ndarray, plant: twin.Plant,
     return closed, on, gen, fuel, unseen
 
 
+def pilot_capture_pins(site_id: str) -> list[dict]:
+    """The native captures a started pilot replays, oldest first: [{version, from}], `from` the first local day each stands for. The start pins the
+    capture the pilot was signed off on, from the start's day; an amendment adopts a later capture from the day it was captured (round 7, audit
+    flow-savings-pilot-bill-12: a capture recorded after the start changes no baseline by itself). A pilot started before the start stored its pin
+    is pinned to the capture that was the latest at its start. No pilot started: []."""
+    with store.connect() as con:
+        r = con.execute("SELECT data, started FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
+        if r is None or not r["started"]:
+            return []
+        try:
+            data = json.loads(r["data"])
+        except ValueError:
+            data = {}
+        pins = data.get("capture_pins") if isinstance(data, dict) else None
+        if isinstance(pins, list) and pins:
+            return [{"version": int(p["version"]), "from": str(p["from"])[:10]} for p in pins if isinstance(p, dict) and p.get("version") and p.get("from")]
+        v = con.execute("SELECT MAX(version) FROM native_settings WHERE site_id = ? AND captured_at <= ?", (site_id, r["started"])).fetchone()[0]
+    if v is None:
+        return []
+    return [{"version": int(v), "from": local_day(r["started"]).isoformat()}]
+
+
+def local_day(stamp: str) -> date:
+    """The Pakistan day of a stored UTC time stamp."""
+    t = datetime.fromisoformat(stamp)
+    return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(PKT).date()
+
+
 def native_for_day(site_id: str, day: date) -> dict | None:
     """The native capture in force on a day: the latest captured by the day's end, else the first one (the onboarding capture stands for the days before
-    it was recorded). Plan 8.1 and 8.4: a later installer change is a new dated capture, and a day is re-scored with that day's inputs."""
+    it was recorded). Plan 8.1 and 8.4: a later installer change is a new dated capture, and a day is re-scored with that day's inputs. From a
+    pilot's start on, the capture the pilot pinned (pilot_capture_pins): a later capture stands for a pilot day only once an amendment adopts it."""
+    pin = next((p for p in reversed(pilot_capture_pins(site_id)) if p["from"] <= day.isoformat()), None)
     end = datetime.fromtimestamp(twin.day_start_utc(day) + 86400, timezone.utc).isoformat(timespec="seconds")
     with store.connect() as con:
-        r = con.execute("SELECT * FROM native_settings WHERE site_id = ? AND captured_at <= ? ORDER BY version DESC LIMIT 1", (site_id, end)).fetchone()
+        r = None
+        if pin is not None:
+            r = con.execute("SELECT * FROM native_settings WHERE site_id = ? AND version = ?", (site_id, pin["version"])).fetchone()
+        if r is None:
+            r = con.execute("SELECT * FROM native_settings WHERE site_id = ? AND captured_at <= ? ORDER BY version DESC LIMIT 1", (site_id, end)).fetchone()
         if r is None:
             r = con.execute("SELECT * FROM native_settings WHERE site_id = ? ORDER BY version ASC LIMIT 1", (site_id,)).fetchone()
     if r is None:
@@ -1369,8 +1403,8 @@ def _price_basis(pr: dict, fuel: float | None) -> str:
 
 def _month_fingerprint(site_id: str, conn: dict | None, p0: date, p1: date) -> str:
     """What a billing month's stored days were priced and replayed on, short of reading its minutes: every tariff version (rates, calendars, taxes,
-    the ICP rule, the adders, such as an FCA approved after the month), the dated fuel prices, the connection's settings, the native captures and
-    the month's telemetry day totals (late data re-aggregates them). While it is unchanged, a settled month needs no re-scoring."""
+    the ICP rule, the adders, such as an FCA approved after the month), the dated fuel prices, the connection's settings, the native captures (and
+    those a started pilot pinned) and the month's telemetry day totals (late data re-aggregates them). While it is unchanged, a settled month needs no re-scoring."""
     with store.connect() as con:
         tv = [list(r) for r in con.execute("SELECT id, status, effective_from, effective_to FROM tariff_versions ORDER BY id")]
         fuel = [list(r) for r in con.execute("SELECT kind, valid_from, price FROM fuel_prices ORDER BY kind, valid_from")]
@@ -1378,6 +1412,9 @@ def _month_fingerprint(site_id: str, conn: dict | None, p0: date, p1: date) -> s
     td = [[d["day"], d.get("import_kwh"), d.get("completeness"), d.get("import_completeness")]
           for d in telemetry.days(site_id, p0.isoformat(), p1.isoformat())]
     body = {"tariffs": tv, "fuel": fuel, "conn": (conn or {}).get("data"), "native": nv, "telemetry": td}
+    pins = pilot_capture_pins(site_id)
+    if pins:  # the captures a started pilot replays (round 7, audit flow-savings-pilot-bill-12); absent without a pilot, so other months keep theirs
+        body["pilot_pins"] = pins
     return hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
 
 

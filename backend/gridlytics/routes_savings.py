@@ -176,6 +176,20 @@ def _pilot_values(before: dict, after: dict) -> list[dict]:
     return out
 
 
+def _adopt_capture(site_id: str, version: int) -> tuple[list[dict], dict]:
+    """A started pilot's pins with a later capture adopted, from the day it was captured (it stood for that day's end; never before the last pin),
+    and the amendment's value. Only a capture newer than the one the pilot replays now can be adopted (round 7, audit flow-savings-pilot-bill-12)."""
+    pins = verify.pilot_capture_pins(site_id)
+    cur = pins[-1]["version"] if pins else None
+    row = next((v for v in sites.native_versions(site_id) if v["version"] == version), None)
+    if row is None:
+        raise Refusal(422, f"There is no capture version {version}", "invalid")
+    if cur is not None and version <= cur:
+        raise Refusal(422, f"The pilot replays version {cur}: only a later capture can be adopted", "invalid")
+    since = max(verify.local_day(row["captured_at"]).isoformat(), pins[-1]["from"] if pins else "")
+    return pins + [{"version": version, "from": since}], {"field": "capture_version", "before": cur, "after": version}
+
+
 @router.get("/api/sites/{site_id}/pilot")
 def pilot_get(site_id: str):
     site_or_404(site_id)
@@ -183,9 +197,18 @@ def pilot_get(site_id: str):
 
 
 def _pilot_answer(site_id: str) -> dict:
+    """The set-up, its start, the capture the pilot replays and the calendar. Once started, `capture` is the pinned capture in force now
+    (verify.pilot_capture_pins) and `capture_newer` a later capture no amendment has adopted yet (round 7, audit flow-savings-pilot-bill-12)."""
     with store.connect() as con:
         r = con.execute("SELECT * FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
-    return {"pilot": _pilot_data(r), "started": r["started"] if r else None, "capture": sites.native_latest(site_id),
+    data = _pilot_data(r)
+    latest, capture, newer = sites.native_latest(site_id), None, None
+    pins = verify.pilot_capture_pins(site_id) if r is not None and r["started"] else []
+    if pins:
+        data["capture_pins"] = pins
+        capture = verify.native_for_day(site_id, max(today(), date.fromisoformat(pins[-1]["from"])))
+        newer = latest if latest and capture and latest["version"] > capture["version"] else None
+    return {"pilot": data, "started": r["started"] if r else None, "capture": capture or latest, "capture_newer": newer,
             "switchback": verify.switchback_blocks(site_id)}
 
 
@@ -208,8 +231,14 @@ def pilot_put(site_id: str, inp: dict = Body(...)):
             raise Refusal(422, "A started pilot keeps its baseline window: change its first day instead", "invalid")
         if "criteria" in sent:
             sent["criteria"] = {**data["criteria"], **sent["criteria"]}
+        adopt = sent.pop("capture_version", None)
         new = {**data, **sent}
         values = _pilot_values(data, new)
+        if adopt is not None:
+            if not started:
+                raise Refusal(422, "Until the pilot starts it uses the latest capture; a capture is adopted only by a started pilot", "not_started")
+            new["capture_pins"], value = _adopt_capture(site_id, adopt)
+            values.append(value)
         if started:
             if not values:
                 raise Refusal(422, "Nothing changed, so there is no amendment to record", "no_change")
@@ -241,11 +270,14 @@ def pilot_start(site_id: str, inp: dict = Body(default={})):
         if r is not None and r["started"]:
             raise Refusal(409, "The pilot has already started: its start and sign-off stand, and a change is an amendment", "already_started")
         now = store._now()
-        data = {**_pilot_data(r), "signoff": {"by": auth.actor(), "at": now, "name": name}}
+        # the capture the pilot is signed off on is pinned: a later one stands for a pilot day only once an amendment adopts it (round 7, audit
+        # flow-savings-pilot-bill-12)
+        pin = {"version": sites.native_latest(site_id)["version"], "from": verify.local_day(now).isoformat()}
+        data = {**_pilot_data(r), "signoff": {"by": auth.actor(), "at": now, "name": name}, "capture_pins": [pin]}
         con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?) ON CONFLICT(site_id) DO UPDATE SET data = excluded.data, "
                     "started = excluded.started, updated = excluded.updated", (site_id, json.dumps(data), now, now))
         con.execute("UPDATE switchback SET locked = 1 WHERE site_id = ?", (site_id,))
-        store.audit(auth.actor(), "started the pilot", site_id, {"name": name}, con=con)
+        store.audit(auth.actor(), "started the pilot", site_id, {"name": name, "capture_version": pin["version"]}, con=con)
     return pilot_get(site_id)
 
 
