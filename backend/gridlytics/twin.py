@@ -265,7 +265,8 @@ def plant_of(site: dict) -> Plant:
         p.gen_control = d.get("genset_start_control", "manual")
         p.gen_min_run = int(round(g.get("min_up_h", 1.0) * 60))
         p.parallel = bool(g.get("parallel_allowed"))
-    p.gen_soc_on = (d.get("reserve_policy") or {}).get("min_soc_pct", 20.0) / 100.0 + 0.05
+    from .sites import genset_start_soc  # the site's controller threshold, as the plan models it (audit flow-onboarding-11)
+    p.gen_soc_on = genset_start_soc(d)
     p.load_mode = int(d.get("outage_load_mode", 0))
     return p
 

@@ -41,6 +41,9 @@ unit, or a tank on piped gas, is refused.
 
 flow-onboarding-16: the genset's rating was asked in kW only, though sets are sold and labelled in kVA. A genset may now be given its nameplate kVA and
 power factor (0.8 to start with): its kW is the kVA times the power factor, and a kW that disagrees with them is refused.
+
+flow-onboarding-11: a site's genset start method had no threshold, so a set started by a controller at a battery level was planned at the reserve floor
+plus 5 points whatever the controller did. A site now records the state of charge its controller starts the genset at, and the plan and the twin use it.
 """
 from __future__ import annotations
 
@@ -546,3 +549,30 @@ def test_a_gensets_rating_may_be_given_in_kva_at_its_power_factor(world):
     # a rating in kW alone is kept as before (no kVA recorded)
     r = put(rated_kw=150)
     assert r.status_code == 200 and r.json()["assets"]["genset"]["rated_kva"] is None and r.json()["assets"]["genset"]["rated_kw"] == 150.0, r.text
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-11
+
+def test_a_soc_threshold_genset_starts_at_the_battery_level_the_site_records(world):
+    op, sid = world.c["operator"], world.site
+    # how the genset is started is the site's hardware, not a control limit: an operator records it with the threshold its controller starts at
+    r = op.put(f"/api/sites/{sid}", json={"genset_start_control": "soc_threshold", "genset_start_soc_pct": 35})
+    assert r.status_code == 200 and r.json()["data"]["genset_start_soc_pct"] == 35.0, r.text
+    with world.use():
+        from datetime import datetime, timezone
+        from gridlytics import forecast, plans, twin
+        full = sites.full(sid)
+        assert sites.genset_start_soc(full["data"]) == pytest.approx(0.35)
+        assert twin.plant_of(full).gen_soc_on == pytest.approx(0.35)
+        t0 = forecast.align(datetime.now(timezone.utc).timestamp())
+        p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 96)
+        assert p["genset"]["control"] == "soc_threshold" and p["genset"]["soc_on"] == pytest.approx(0.35)
+    # none recorded: the reserve floor plus 5 points, as before (the web app marks it Preliminary)
+    r = op.put(f"/api/sites/{sid}", json={"genset_start_soc_pct": None})
+    assert r.status_code == 200, r.text
+    with world.use():
+        full = sites.full(sid)
+        assert sites.genset_start_soc(full["data"]) == pytest.approx(0.25) and twin.plant_of(full).gen_soc_on == pytest.approx(0.25)
+    for bad in (0, 101):
+        r = op.put(f"/api/sites/{sid}", json={"genset_start_soc_pct": bad})
+        assert r.status_code == 422, (bad, r.text)

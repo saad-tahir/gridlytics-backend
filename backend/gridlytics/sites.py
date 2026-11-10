@@ -58,6 +58,9 @@ class SiteFields(Strict):
     site_type: Literal[SITE_TYPES] = "industrial_2_shift"
     outage_unit: OutageUnit = OutageUnit()
     genset_start_control: Literal["auto_on_grid_loss", "soc_threshold", "manual", "none"] = "none"
+    #: the battery state of charge (%) at which a soc_threshold controller starts the genset (audit flow-onboarding-11: never asked, so the plan assumed
+    #: the reserve floor plus 5 points whatever the controller did); None: that assumption (genset_start_soc), which the web app marks Preliminary
+    genset_start_soc_pct: float | None = Field(None, gt=0, le=100)
     outage_load_mode: Literal[0, 1] = 0
     critical_load_kw: list[float] = Field(default_factory=lambda: [0.0] * 24, min_length=24, max_length=24)
     voll_rs_per_kwh: float = Field(500.0, ge=0.0, le=10000.0)
@@ -76,6 +79,15 @@ class SiteFields(Strict):
     #: a site without any grid connection (plan Part 9.3), stored for activation and settings
     off_grid: bool = False
     data_source: DataSource | None = None
+
+
+def genset_start_soc(data: dict) -> float:
+    """The state of charge (a share) at which the site's soc_threshold controller starts the genset, as the plan (plans.build_problem) and the twin
+    (twin.plant_of) model it: the site's own threshold, else the reserve floor plus 5 points."""
+    own = (data or {}).get("genset_start_soc_pct")
+    if isinstance(own, (int, float)) and not isinstance(own, bool) and own > 0:
+        return float(own) / 100.0
+    return float(((data or {}).get("reserve_policy") or {}).get("min_soc_pct", 20.0)) / 100.0 + 0.05
 
 
 #: The highest tier a source that is not an edge device supports by itself (plan Part 2.3, 7.5 and 7.6; audit flow-onboarding-03: a CSV or cloud site
@@ -424,7 +436,8 @@ _FIELD_WORDS = {"lat": "latitude", "lon": "longitude", "load_peak_kw": "typical 
                 "losses_pct": "losses", "nameplate_kwh": "nameplate energy", "soh": "state of health", "p_ch_kw": "charge power", "p_dis_kw": "discharge power",
                 "eta_c": "charge efficiency", "eta_d": "discharge efficiency", "soc_min": "lowest state of charge", "soc_max": "highest state of charge",
                 "rated_kw": "rating", "f_min": "minimum loading", "tank_l": "tank", "min_up_h": "minimum run", "min_down_h": "minimum rest",
-                "rated_kva": "rating in kVA", "power_factor": "power factor"}
+                "rated_kva": "rating in kVA", "power_factor": "power factor",
+                "genset_start_control": "genset start method", "genset_start_soc_pct": "genset start threshold"}
 
 
 class Changed(Exception):
