@@ -438,7 +438,8 @@ def test_the_command_line_makes_the_hash_the_code_secret_and_the_current_code(fd
 # ================================================================== companies (R-405: made with their owner)
 
 def _company(c: TestClient, name: str = "Boxlytics Internal", owner=None, seats: int = 5, enabled: bool = True) -> dict:
-    return _ok(c.post("/api/founder/companies", json={"name": name, "seats": seats, "enabled": enabled, "owner": owner or dict(OWNER)}), 201)
+    # the owner keeps the first password (one_time false), as these tests sign in with it; a one-time first password is test_fix_r7_auth_security's
+    return _ok(c.post("/api/founder/companies", json={"name": name, "seats": seats, "enabled": enabled, "owner": owner or {**OWNER, "one_time": False}}), 201)
 
 
 def test_a_company_is_made_with_its_owner_together_or_not_at_all(fdb):
@@ -586,7 +587,7 @@ def test_an_account_is_made_with_a_first_password_reset_disabled_and_enabled(fdb
     c = _console()
     cid = _company(c)["company"]["id"]
     made = _ok(c.post("/api/founder/users", json={"email": "Sunia@Meow.test", "name": "Sunia Ahmed", "password": "sunia first password",
-                                                   "company_id": cid, "company_role": "member"}), 201)["user"]
+                                                   "company_id": cid, "company_role": "member", "one_time": False}), 201)["user"]
     assert made["email"] == "sunia@meow.test" and made["disabled"] is False and set(made) == {"id", "email", "name", "disabled", "created", "archived", "memberships"}
     assert made["memberships"] == [{"company_id": cid, "company_name": "Boxlytics Internal", "company_role": "member", "status": "active"}]
     for body, words in (({"email": "sunia@meow.test", "name": "Sunia", "password": "another password 1"}, "account"),
@@ -668,7 +669,8 @@ def test_the_member_row_in_the_companys_file_follows_the_founders_change_of_the_
     c = _console()
     made = _company(c, seats=2)
     cid, owner = made["company"]["id"], made["owner"]
-    sunia = _ok(c.post("/api/founder/users", json={"email": "sunia@meow.test", "name": "Sunia Ahmed", "password": "sunia first password", "company_id": cid}), 201)["user"]
+    sunia = _ok(c.post("/api/founder/users", json={"email": "sunia@meow.test", "name": "Sunia Ahmed", "password": "sunia first password", "company_id": cid,
+                                                    "one_time": False}), 201)["user"]
     token = identity.issue_local(sunia["id"], sunia["email"], sunia["name"], 60)
     _ok(_client().get("/api/sites", headers=identities.headers(identity.issue_local(owner["id"], owner["email"], owner["name"], 60))))
     _ok(_client().get("/api/sites", headers=identities.headers(token)))
@@ -683,7 +685,8 @@ def test_the_member_row_in_the_companys_file_follows_the_founders_change_of_the_
     found, seated = row()
     assert found["disabled"] is True and found["disabled_reason"] == "membership suspended" and seated == 1
     # a newcomer takes the seat she left
-    maaz = _ok(c.post("/api/founder/users", json={"email": "maaz@meow.test", "name": "Maaz Ali", "password": "maaz first password", "company_id": cid}), 201)["user"]
+    maaz = _ok(c.post("/api/founder/users", json={"email": "maaz@meow.test", "name": "Maaz Ali", "password": "maaz first password", "company_id": cid,
+                                                   "one_time": False}), 201)["user"]
     _ok(_client().get("/api/sites", headers=identities.headers(identity.issue_local(maaz["id"], maaz["email"], maaz["name"], 60))))
     _ok(c.patch(f"/api/founder/users/{sunia['id']}/memberships/{cid}", json={"status": "active"}))
     assert row()[0]["disabled_reason"] == "no seat"

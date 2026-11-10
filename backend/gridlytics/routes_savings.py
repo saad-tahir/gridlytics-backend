@@ -38,8 +38,9 @@ def savings(site_id: str, start: str | None = None, end: str | None = None):
         except Exception:  # noqa: BLE001  (the figure is a label; never fail the page for it)
             pass
     if not auth.can("see_costs"):
-        summ = {"from": summ["from"], "to": summ["to"], "energy": summ["energy"], "preliminary": summ["preliminary"], "hidden_for_role": True,
-                "days": [{"day": d["day"], "fidelity": d["fidelity"], "peak_kw": d["peak_kw"]} for d in summ["days"]]}
+        # a viewer reads the energy, the litres (saved and burnt) and the day counts, none of them money; the filter takes out every rupee figure, the
+        # levers and the fee (audit role-viewer-19)
+        summ["hidden_for_role"] = True
     return out(summ)
 
 

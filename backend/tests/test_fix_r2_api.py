@@ -63,7 +63,7 @@ def test_an_operator_cannot_reset_money_settings_by_deleting_the_equipment(world
     assert operator.delete(f"/api/sites/{sid}/assets/battery").status_code == 403
     assert operator.delete(f"/api/sites/{sid}/assets/genset").status_code == 403
     r = operator.put(f"/api/sites/{sid}/assets/battery", json=pack)          # re-saving without the money fields keeps them
-    assert r.status_code == 200 and r.json()["assets"]["battery"]["replacement_cost_per_kwh"] == 90000
+    assert r.status_code == 200 and "replacement_cost_per_kwh" not in r.json()["assets"]["battery"]   # an operator is not shown it (round 7)
     with world.use():
         a = sites.assets(sid)
         assert a["battery"]["replacement_cost_per_kwh"] == 90000 and a["battery"]["warranted_cycles"] == 3000

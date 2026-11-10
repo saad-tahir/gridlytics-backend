@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -22,19 +23,21 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, apikeys, auth, backups, companies, identity, store, store_members, version
+from . import __version__, apikeys, auth, backups, companies, identity, money, store, store_members, version
 from . import platform as platformdb
 from .schemas import Refusal
 
 log = logging.getLogger("gridlytics")
 if not log.handlers and os.environ.get("GRIDLYTICS_LOGS", "1") == "1":
     try:
-        _logs = store.DB_PATH.parent / "logs"
+        # the data folder in use (GRIDLYTICS_DATA_DIR, else the default database's folder): a scratch run's log is the scratch folder's, never the
+        # owner's data/ (audit parity-architecture-05)
+        _logs = platformdb.data_dir() / "logs"
         _logs.mkdir(parents=True, exist_ok=True)
         _handler = RotatingFileHandler(_logs / "gridlytics.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8")
         _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -124,7 +127,8 @@ PUBLIC_POSTS: set[str] = set()
 LOCAL_POSTS = {"/api/local/session", "/api/local/refresh", "/api/local/logout"}
 if identity.MODE == "local":
     PUBLIC_POSTS |= LOCAL_POSTS
-IDENTITY_PATHS = {"/api/auth/state", "/api/local/context", "/api/local/password", "/api/local/logout", "/api/local/refresh"}
+IDENTITY_PATHS = {"/api/auth/state", "/api/local/context", "/api/local/password", "/api/local/logout", "/api/local/refresh", "/api/local/sessions",
+                  "/api/local/sessions/end", "/api/local/sessions/end-others"}
 FOUNDER_PREFIX = "/api/founder/"
 #: A machine key reaches only its own site: the path's site id, when the path names one, must be the key's (plan Part 10.5)
 _SITE_IN_PATH = re.compile(r"^/api/(?:sites|edge)/([^/]+)")
@@ -266,6 +270,8 @@ async def _guarded(request, call_next, rid: str):
         needed = apikeys.scope_needed(request.method, path)
         if needed is None or needed not in key["scopes"]:
             return _refusal(rid, 403, f"This API key may not make this request: it holds {', '.join(key['scopes'])}", "out_of_scope")
+        if (why := apikeys.kind_refusal(key.get("kind", "edge"), path)) is not None:
+            return _refusal(rid, 403, why, "out_of_scope")
         named = _SITE_IN_PATH.match(path)
         if named is None:
             # a key is bound to one site (plan Part 10.5): it reaches only paths that name a site, never a collection of the company's sites
@@ -314,6 +320,8 @@ async def _guarded(request, call_next, rid: str):
         return _refusal(rid, 403, "Choose a company first", "no_company")
     try:
         response = await call_next(request)
+        if user is not None and money.filtered_reader():
+            response = await _without_money(response)
     except Exception as exc:
         record = {"event": "unanswered_request", "request_id": rid, "method": request.method, "path": path, "user": request.state.user_id,
                   "error": type(exc).__name__, "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
@@ -324,6 +332,20 @@ async def _guarded(request, call_next, rid: str):
     if user is not None and not user.get("api_key") and path.startswith("/api/"):
         response.headers["X-Gridlytics-Role"] = user["role"]
     return response
+
+
+async def _without_money(response):
+    """The money filter, for every route (plan Part 10.5; audit security-roles-02): a JSON answer to a reader who may not see every money field (a viewer,
+    an operator for the fee, a machine key) is sent as `money.filter_json` leaves it, so a route that forgets `out()` sends no rupee either. Other answers
+    (a CSV, a PDF, a calendar file) pass as the route made them."""
+    if not (response.headers.get("content-type") or "").startswith("application/json"):
+        return response
+    raw = b"".join([part async for part in response.body_iterator])
+    clean = money.filter_json(raw)
+    body = raw if clean is None else clean
+    sent = Response(content=body, status_code=response.status_code)
+    sent.raw_headers = [(k, v) for k, v in response.raw_headers if k.lower() != b"content-length"] + [(b"content-length", str(len(body)).encode("latin-1"))]
+    return sent
 
 
 class _VersionedPath:
@@ -423,10 +445,21 @@ def _member_out(m: dict) -> dict:
             "seen": seen}
 
 
-def _not_seen() -> list[dict]:
+def _not_seen(request: Request | None = None) -> list[dict]:
+    """The people the company has who may sign in (an active membership) and have no member row here yet, as the users list says a member, with the role
+    their first sign-in would give them (companies._first_sight): the owner an administrator, pinned; else an unused preset's role; else a viewer. Local mode:
+    platform.db's memberships. Supabase mode (lifted from solarlytics-backend c853130, api.py `_not_seen`; audit parity-supabase-auth-05): the project's
+    rpc/company_list_members, which answers only the company's owner or an admin, asked with the caller's own token; for anyone else nobody, as while the
+    project does not answer: the people seen are listed then."""
     company_id = auth.company.get()["id"]
-    people = [{"id": m["user_id"], "email": m["email"], "name": m["name"], "company_role": m["role"]}
-              for m in platformdb.company_members(company_id) if m["status"] == "active" and not m["disabled"]]
+    if identity.MODE == "local":
+        people = [{"id": m["user_id"], "email": m["email"], "name": m["name"], "company_role": m["role"]}
+                  for m in platformdb.company_members(company_id) if m["status"] == "active" and not m["disabled"]]
+    elif request is not None and (auth.current.get() or {}).get("company_role") in ("owner", "admin"):
+        bearer = request.headers.get("authorization") or ""
+        people = _project_members(bearer[7:].strip(), company_id)
+    else:
+        people = []
     known = {m["user_id"] for m in store_members.members()}
     out = []
     for p in people:
@@ -440,12 +473,80 @@ def _not_seen() -> list[dict]:
     return out
 
 
+#: The most the project's list of a company's members may weigh: some hundreds of bytes a person
+MAX_MEMBERS_BYTES = 1024 * 1024
+
+
+def _project_members(token: str, company_id: str) -> list[dict]:
+    """The company's active memberships from the Supabase project's rpc/company_list_members (Solarlytics' supabase/ migration, which founder-console ports),
+    asked with the person's own token and the project's public anon key, never the service-role key, which is the founder console's: each {id, email, name,
+    company_role}. Nobody when the project refuses (the caller is not the company's owner or an admin there), cannot be reached, or answers something that is
+    not the list (lifted from solarlytics-backend c853130, api.py `_project_members`)."""
+    import http.client
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(f"{identity.SUPABASE_URL}/rest/v1/rpc/company_list_members", data=json.dumps({"p_company_id": company_id}).encode(),
+                                     method="POST", headers={"apikey": identity.SUPABASE_ANON_KEY, "Authorization": f"Bearer {token}",
+                                                             "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with companies._urlopen(request, companies.FETCH_TIMEOUT) as res:
+            body = res.read(MAX_MEMBERS_BYTES + 1)
+        rows = json.loads(body.decode("utf-8")) if len(body) <= MAX_MEMBERS_BYTES else None
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        log.warning("the members of company %s could not be read from %s: it answered %s", company_id, identity.SUPABASE_URL, exc.code)
+        return []
+    # as companies._fetch_context: an address that cannot be reached, a broken answer or one that is not JSON lists the people seen, never a 500
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        log.warning("the members of company %s could not be read from %s: %s", company_id, identity.SUPABASE_URL, str(exc) or type(exc).__name__)
+        return []
+    if not isinstance(rows, list):
+        log.warning("the members of company %s could not be read from %s: the answer is not a list", company_id, identity.SUPABASE_URL)
+        return []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict) or r.get("status") != "active" or r.get("role") not in platformdb.COMPANY_ROLES:
+            continue
+        user_id, email = companies._uuid(r.get("user_id")), r.get("email")
+        if user_id is None or not isinstance(email, str) or not email.strip():
+            continue
+        email = email.strip().lower()
+        name = " ".join(n.strip() for n in (r.get("first_name"), r.get("last_name")) if isinstance(n, str) and n.strip())[:80]
+        out.append({"id": user_id, "email": email, "name": name or email, "company_role": r["role"]})
+    return out
+
+
+def _registry_places() -> dict[str, dict] | None:
+    """Local mode: who is in the company by the registry (platform.db), each account's membership by its id; None in supabase mode, where the project keeps
+    the memberships. A member row of someone the founder removed stays in the company's file (its history), but they are not the company's any more."""
+    if identity.MODE != "local":
+        return None
+    return {m["user_id"]: m for m in platformdb.company_members(auth.company.get()["id"])}
+
+
+def _not_in_company(m: dict, places: dict[str, dict] | None) -> None:
+    """Refuse a change to a member whose place in the company is not active by the registry (audit flow-reports-alerts-members-keys-07): switching them on
+    would give a seat to someone outside the company, and only OnyxLeaf adds people, makes their place active again or removes them."""
+    place = None if places is None else places.get(m["user_id"], {"status": "removed"})
+    if place is None or place["status"] == "active":
+        return
+    who, company = m["name"] or m["email"], auth.company.get()["name"]
+    detail = {"removed": f"{who} is no longer in {company}: OnyxLeaf adds and removes people, so ask us to add them again",
+              "suspended": f"{who}'s place in {company} is suspended by OnyxLeaf: ask us to make it active before changing their role or access"
+              }.get(place["status"], f"{who}'s place in {company} is not active yet: ask OnyxLeaf to make it active before changing their role or access")
+    raise Refusal(409, detail, "not_a_member")
+
+
 @app.get("/api/users")
-def users_list():
+def users_list(request: Request):
+    """The company's people: its members, then the people it has who have not signed in yet. In local mode a person the founder removed from the company is
+    not listed (audit flow-reports-alerts-members-keys-07); one whose place is suspended is, switched off. People are added and removed by OnyxLeaf, never
+    here (accounts are preassigned)."""
     auth.need("manage_users")
     if auth.company.get() is None:
         return []
-    return [*(_member_out(m) for m in store_members.members()), *_not_seen()]
+    places = _registry_places()
+    return [*(_member_out(m) for m in store_members.members() if places is None or m["user_id"] in places), *_not_seen(request)]
 
 
 def _account(inp) -> dict:
@@ -460,6 +561,8 @@ def _account(inp) -> dict:
         if not isinstance(inp["disabled"], bool):
             _fail("Disabled must be yes or no")
         out["disabled"] = 1 if inp["disabled"] else 0
+    # no member is granted a permission beyond the role, the costs least of all: a viewer never sees money (the owner's rule; review of audit
+    # security-roles-16), so "grants" is an unknown field like any other
     extra = sorted(set(inp) - {"role", "disabled"})
     if extra:
         _fail(f"Unknown field '{extra[0]}': a member's role and access can be changed here")
@@ -473,11 +576,15 @@ def users_edit(user_id: str, request: Request = None, inp: dict = Body(...)):
     if auth.company.get() is None:
         raise HTTPException(status_code=404, detail="No such user")
     if isinstance(inp, dict) and {"name", "email", "password"} & set(inp):
-        _fail("The name, the email address and the password are kept by the sign-in service: change them in My account")
+        # accounts are preassigned (OnyxLeaf makes them): a member's name and address are OnyxLeaf's to change, and a forgotten password is Sign-in help's
+        # one-time password (plan Part 9.3; audit parity-supabase-auth-02)
+        _fail("OnyxLeaf changes a member's name or email address: ask us. For a forgotten password, use Sign-in help on the member's row")
     fields = _account(inp)
     person = None
-    if store_members.member(user_id) is None:
-        person = next((p for p in _not_seen() if p["id"] == user_id), None)
+    if (held_row := store_members.member(user_id)) is not None:
+        _not_in_company(held_row, _registry_places())
+    else:
+        person = next((p for p in _not_seen(request) if p["id"] == user_id), None)
         if person is None:
             raise HTTPException(status_code=404, detail="No such user")
     by = auth.actor()
@@ -512,6 +619,62 @@ def users_edit(user_id: str, request: Request = None, inp: dict = Body(...)):
             made = store_members.update_member(user_id, **changes, by=by) if changes else found
     store.audit(by, "changed a user", before["email"], {**fields, **({"role_before": before["role"]} if "role" in fields else {})})
     return _member_out(made)
+
+
+# ------------------------------------------------------------------------------------------------ an administrator helps a member sign in (plan Part 9.3)
+
+#: The letters of a one-time password: none reads as another (0 and o, 1 and l and i), so it can be read out on the phone. Four groups of four: 19 characters
+#: with the dashes (a password needs 10), about 79 bits
+_ONE_TIME_LETTERS = "abcdefghjkmnpqrstuvwxyz23456789"
+
+
+def _one_time_password() -> str:
+    return "-".join("".join(secrets.choice(_ONE_TIME_LETTERS) for _ in range(4)) for _ in range(4))
+
+
+def _helped(user_id: str, doing: str, inp) -> dict:
+    """The account an administrator may help sign in until PLT-11 brings email (plan Part 9.3; audit pages-A-02): in local mode, an active member of this
+    company and of no other (an administrator here never takes over a person's access to another company: OnyxLeaf does that); never the company's owner,
+    whose password OnyxLeaf resets; never oneself (My account changes one's own). The request carries no body: the server makes the password."""
+    auth.need("manage_users", doing)
+    if inp:
+        _fail("Send nothing: Gridlytics makes the one-time password and shows it once")
+    company = auth.company.get()
+    held = platformdb.membership(user_id, company["id"]) if company is not None and isinstance(user_id, str) and len(user_id) <= 64 else None
+    found = platformdb.account(user_id) if held is not None and held["status"] == "active" else None
+    if found is None:
+        raise HTTPException(status_code=404, detail="No such user")
+    if identity.MODE != "local":
+        raise Refusal(409, "With this sign-in service a forgotten password is reset by email: ask OnyxLeaf", "not_local_mode")
+    if user_id == (auth.current.get() or {}).get("id"):
+        _fail("Change your own password in My account")
+    if held["role"] == "owner":
+        raise Refusal(409, "The company's owner asks OnyxLeaf for a new password or to clear a lockout", "owner")
+    if any(m["company_id"] != company["id"] for m in platformdb.memberships(user_id)):
+        raise Refusal(409, f"{found['name']} is also in another company: OnyxLeaf gives them a new password or clears their lockout", "other_company")
+    return found
+
+
+@app.post("/api/users/{user_id}/password")
+def users_password(user_id: str, inp: dict | None = Body(None)):
+    """A one-time password for a member (plan Part 9.3; audit pages-A-02): every session of the account ends, its sign-in lockout is cleared, and the
+    password is in this answer only (kept as its hash, never in an audit line). Until the person chooses their own, only the sign-in's own paths answer
+    (platform.signed_in)."""
+    found = _helped(user_id, "Giving a member a one-time password", inp)
+    password = _one_time_password()
+    platformdb.set_password(found["id"], password, one_time=True)
+    platformdb.clear_lock(found["email"], found["id"], auth.actor())
+    store.audit(auth.actor(), "issued a one-time password", found["email"])
+    return {"password": password, "user_id": found["id"]}
+
+
+@app.post("/api/users/{user_id}/unlock")
+def users_unlock(user_id: str, inp: dict | None = Body(None)):
+    """Clear a member's sign-in lockout (plan Part 9.3): the refused tries recorded before now stop counting, from every address."""
+    found = _helped(user_id, "Clearing a member's sign-in lockout", inp)
+    platformdb.clear_lock(found["email"], found["id"], auth.actor())
+    store.audit(auth.actor(), "cleared a sign-in lockout", found["email"])
+    return {"cleared": True}
 
 
 @app.get("/api/audit")

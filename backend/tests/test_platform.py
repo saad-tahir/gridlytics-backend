@@ -75,9 +75,9 @@ def issued(monkeypatch):
     monkeypatch.setenv("GRIDLYTICS_LOCAL_JWT_SECRET", "made-up-local-secret-for-tests-0123456789abcdef")
     real = identity.issue_local
 
-    def recording(user_id, email, name, minutes=60):
+    def recording(user_id, email, name, minutes=60, **session):
         calls.append((user_id, email, name, minutes))
-        return real(user_id, email, name, minutes)
+        return real(user_id, email, name, minutes, **session)
 
     monkeypatch.setattr(identity, "issue_local", recording)
     return calls
@@ -291,7 +291,8 @@ def test_a_wrong_password_an_unknown_email_and_a_disabled_account_get_one_refusa
     plat.set_account_disabled(account["id"], True)
     disabled = _sign_in(client)
     assert disabled.status_code == 401 and disabled.json()["detail"] == wrong.json()["detail"]
-    assert plat.events("nobody@example.pk") == []                                # tries for an address with no account are not recorded
+    # tries for an address with no account are recorded too, naming no account, so they are locked out as an account's are (audit parity-supabase-auth-08)
+    assert [(e["event"], e["account_id"]) for e in plat.events("nobody@example.pk")] == [("sign-in refused", "")]
     assert [e["event"] for e in plat.events("saad@example.pk")] == ["sign-in refused", "sign-in refused"]
 
 
@@ -355,7 +356,12 @@ def test_the_tokens_of_ended_sessions_are_cleared_at_a_sign_in(plat, monkeypatch
     monkeypatch.setattr(plat, "_clock", lambda: start + plat.SESSION_DAYS * 86400 + 1)
     plat.new_refresh(account["id"])
     with closing(sqlite3.connect(plat.db_path())) as con:
-        assert con.execute("SELECT COUNT(*) FROM refresh_tokens").fetchone()[0] == 2        # its two tokens went; the second session and the new one stay
+        # ended, but kept an access token's life, so a signed-out session's access tokens stay refused until they run out (round 7 review)
+        assert con.execute("SELECT COUNT(*) FROM refresh_tokens").fetchone()[0] == 4
+    monkeypatch.setattr(plat, "_clock", lambda: start + plat.SESSION_DAYS * 86400 + plat.ACCESS_MINUTES * 60 + 1)
+    plat.new_refresh(account["id"])
+    with closing(sqlite3.connect(plat.db_path())) as con:
+        assert con.execute("SELECT COUNT(*) FROM refresh_tokens").fetchone()[0] == 3        # its two tokens went; the second session and the new ones stay
 
 
 def test_a_refresh_token_ends_unused_after_its_hours_and_a_session_after_its_days(client, plat, monkeypatch):
@@ -541,7 +547,9 @@ def test_a_person_changes_their_own_password_and_their_other_sessions_end(client
     assert _sign_in(client).status_code == 401 and _sign_in(client, password=new).status_code == 200
     # an access token minted before the change is no longer taken (stage B3 asks the same with signed_in)
     assert plat.account(account["id"])["sessions_from"] >= started
-    assert plat.signed_in(account["id"], iat=started - 1) is None and plat.signed_in(account["id"], iat=_claims(out["access_token"])["iat"])
+    # the new session's token is told by when its session started, which is after the change, though in the change's second (audit parity-supabase-auth-01)
+    mine = _claims(out["access_token"])
+    assert plat.signed_in(account["id"], iat=started - 1) is None and plat.signed_in(account["id"], iat=mine["iat"], session=mine["session_id"])
     events = [e["event"] for e in plat.events("saad@example.pk")]
     assert "changed their password" in events
     refused = [e for e in plat.events("saad@example.pk") if e["event"] == "sign-in refused"]
@@ -593,7 +601,8 @@ def test_the_local_routes_are_mounted_through_program_routes(issued):
     from gridlytics import routes_local
     mine = {(r.path, m) for r in routes_local.router.routes for m in r.methods}
     assert mine == {("/api/local/session", "POST"), ("/api/local/refresh", "POST"), ("/api/local/logout", "POST"), ("/api/local/context", "GET"),
-                    ("/api/local/password", "POST")}
+                    ("/api/local/password", "POST"), ("/api/local/sessions", "GET"), ("/api/local/sessions/end", "POST"),
+                    ("/api/local/sessions/end-others", "POST")}
     # stage B4a mounts them, in local mode (the mode of the tests), as the program's other routes are
     assert {(r.path, m) for r in api.app.routes if getattr(r, "path", "").startswith("/api/local") for m in r.methods} == mine
     assert routes_local in api.PROGRAM_ROUTES

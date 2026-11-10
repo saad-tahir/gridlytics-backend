@@ -231,7 +231,7 @@ def _may_refetch(user_id: str) -> bool:
 
 def _local_context(ident: identity.Identity) -> dict | None:
     """The person's context from platform.db, read now: None when the account is gone or disabled, or the token is older than its last password change."""
-    account = platformdb.signed_in(ident.user_id, ident.claims.get("iat"))
+    account = platformdb.signed_in(ident.user_id, ident.claims.get("iat"), session=ident.claims.get("session_id"))
     if account is None:
         return None
     return {"profile": {"id": account["id"], "email": account["email"], "name": account["name"]}, "memberships": platformdb.memberships(account["id"])}

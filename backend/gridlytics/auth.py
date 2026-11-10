@@ -18,7 +18,8 @@ from fastapi import HTTPException
 
 ROLES = {"admin": "Administrator", "operator": "Operator", "analyst": "Analyst", "viewer": "Viewer"}
 
-#: Who may do what (plan Part 10.5). A viewer reads energy figures only: every money field is stripped from its answers by type (`money.strip_for`).
+#: Who may do what (plan Part 10.5). A viewer reads energy figures only: every money field is stripped from its answers by name (`money.for_reader`, which
+#: the API's guard runs on every JSON answer: api._without_money).
 PERMISSIONS = {
     "manage_members": {"admin"},
     "manage_users": {"admin"},
@@ -37,11 +38,19 @@ PERMISSIONS = {
     "export": {"admin", "analyst"},
     "see_costs": {"admin", "operator", "analyst"},
     "see_fee": {"admin", "analyst"},
+    #: the money settings (the value of lost load, the battery's replacement cost and the wear price made from it, the genset's start, run-hour and
+    #: upkeep costs): plan 9.4 gives the operator "costs but not money settings or the fee", and UI-10 the battery's economics card to owner and analyst
+    #: (audit role-operator-06). Changing one is still edit_money_settings.
+    "see_money_settings": {"admin", "analyst"},
     "start_pilot": {"admin"},
     "run_jobs": {"admin", "operator", "analyst"},
     #: the energy-only report carries no money (plan Part 8.5: the viewer-safe report), so every member may generate it, a viewer included
     "energy_report": {"admin", "operator", "analyst", "viewer"},
 }
+#: No member holds a permission beyond the role: plan Part 10.5's "a named viewer may be granted see_costs by an admin" is not offered, because the owner's
+#: rule is that a viewer never sees money (review of audit security-roles-16, deferred to the owner). Someone who must read costs is given the operator's or
+#: the analyst's role.
+
 #: A session of local sign-in (its refresh tokens, platform.py) ends this many hours unused, and however active, this many days after sign-in (review of batch
 #: 1, for the cookie sessions of before)
 SESSION_HOURS = 12
@@ -54,6 +63,11 @@ ITERATIONS = 200_000
 #: the codes since package P20)
 MAX_TRIES = 5
 LOCK_MINUTES = 15
+#: Wrong passwords for one account from every address together, in LOCK_MINUTES, before the account's sign-in is stopped for as long (audit
+#: security-roles-10): the per-address count alone let N addresses buy 5N guesses. Well under the 100 consecutive failures NIST SP 800-63B (section 5.2.2)
+#: caps an account at [recalled; verify]. An address the account signed in from in the last SESSION_DAYS is not stopped by it (its own count still holds),
+#: so a stranger guessing cannot lock the person out where they work; a good sign-in, or an administrator or the founder clearing the lockout, ends it
+ACCOUNT_TRIES = 20
 #: Wrong codes from every address together, in LOCK_MINUTES, before the code step is stopped for as long (P20's repairs; the founder's code step since stage
 #: B6): without it, N addresses would buy 5N guesses. The program's choice, well under the 100 consecutive failures NIST SP 800-63B (section 5.2.2) caps an
 #: account at [recalled; verify]
@@ -76,8 +90,14 @@ def _env_int(name: str, default: int) -> int:
 #: person working, a page polling a job and the tests never meet them: they stop a script. GRIDLYTICS_RATE_USER, GRIDLYTICS_RATE_ADDRESS and
 #: GRIDLYTICS_RATE_PUBLIC change them; 0 turns one off.
 RATE_WINDOW = 60
+#: Besides them, the sign-ins (POST /api/local/session) from one address, whatever the email, in 5 minutes (audit parity-supabase-auth-08): each costs
+#: a PBKDF2 hash, and the public rate let one address buy 1,200 a minute. Supabase Auth's default for its sign-in endpoints, 30 per 5 minutes per
+#: address (config.toml `sign_in_sign_ups`) [recalled; verify], so either sign-in mode stops a script alike. GRIDLYTICS_RATE_SIGN_IN changes it; 0 turns
+#: it off.
 RATE_LIMITS = {"user": _env_int("GRIDLYTICS_RATE_USER", 6000), "address": _env_int("GRIDLYTICS_RATE_ADDRESS", 20000),
-               "public": _env_int("GRIDLYTICS_RATE_PUBLIC", 1200)}
+               "public": _env_int("GRIDLYTICS_RATE_PUBLIC", 1200), "sign_in": _env_int("GRIDLYTICS_RATE_SIGN_IN", 30)}
+#: A limit's window in seconds when it is not RATE_WINDOW
+RATE_WINDOWS = {"sign_in": 300}
 _limiter = None
 
 
@@ -93,7 +113,7 @@ def limiter():
 def rate_wait(kind: str, key: str) -> int:
     """Seconds to wait before this request may go on (0 when it may), counting it."""
     limit = RATE_LIMITS.get(kind, 0)
-    return limiter().hit(("api", kind, key), limit, RATE_WINDOW) if limit and key else 0
+    return limiter().hit(("api", kind, key), limit, RATE_WINDOWS.get(kind, RATE_WINDOW)) if limit and key else 0
 
 
 def new_link() -> tuple[str, str]:

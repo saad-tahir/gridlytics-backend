@@ -3,9 +3,13 @@
     POST /api/local/session   {email, password} -> {access_token, token_type, expires_in, expires_at, refresh_token, user}
     POST /api/local/refresh   {refresh_token}   -> the same, with a new refresh token (the one sent is used up); 409 session_renewed when another window
                                                    renewed it a moment ago
-    POST /api/local/logout    {refresh_token}   -> {signed_out: true}; the session of that token ends
+    POST /api/local/logout    {refresh_token}   -> {signed_out: true}; the session of that token ends, its access tokens with it, and the session of the
+                                                   access token sent, when one is
     GET  /api/local/context                     -> {profile, memberships, pending_invites_for_email}, the shape of Supabase's get_my_context
-    POST /api/local/password  {current, new}    -> {changed: true, ...a new session}; every other session ends
+    POST /api/local/password  {current, new}    -> {changed: true, ...a new session}; every other session ends, and a one-time password is replaced
+    GET  /api/local/sessions                    -> {sessions: [{id, current, started, last_active, ends, address, device}]}, the person's open sessions
+    POST /api/local/sessions/end  {id}          -> {ended: 1}; one of the person's sessions ends (404 for an id that is not one of theirs)
+    POST /api/local/sessions/end-others         -> {ended: n}; every session of the person's but this one ends
 
 `expires_at` is in unix seconds. A refresh token travels only in a JSON body, never in a path or a query, which the access log keeps. The access token is
 identity.issue_local's (stage B1), signed with GRIDLYTICS_LOCAL_JWT_SECRET, for one hour.
@@ -39,31 +43,54 @@ def _session(account: dict, refresh_token: str) -> dict:
     """A session's answer, in the shape of a Supabase session: a one-hour access token and the refresh token that renews it."""
     from . import identity              # stage B1's, imported when a token is made
     started = int(time.time())
-    token = identity.issue_local(account["id"], account["email"], account["name"], platformdb.ACCESS_MINUTES)
+    token = identity.issue_local(account["id"], account["email"], account["name"], platformdb.ACCESS_MINUTES, session_id=platformdb.session_id(refresh_token))
     return {"access_token": token, "token_type": "bearer", "expires_in": platformdb.ACCESS_MINUTES * 60,
             "expires_at": started + platformdb.ACCESS_MINUTES * 60, "refresh_token": refresh_token,
             "user": {k: account[k] for k in ("id", "email", "name", "created")}}
 
 
-def _locked(email: str, address: str) -> None:
-    """Five wrong passwords for one account from one address stop that address for 15 minutes from the fifth (auth.MAX_TRIES, auth.LOCK_MINUTES)."""
-    wait = platformdb.lock_wait(email, address)
+def _too_many_sign_ins(address: str) -> None:
+    """auth.RATE_LIMITS["sign_in"] sign-ins from one address in 5 minutes, whatever the email (audit parity-supabase-auth-08): each is a PBKDF2 hash."""
+    wait = auth.rate_wait("sign_in", address)
     if wait:
         minutes = math.ceil(wait / 60)
-        raise HTTPException(status_code=429, detail=f"Too many attempts from here; wait {minutes} minute{'s' if minutes != 1 else ''}",
+        raise HTTPException(status_code=429, detail=f"Too many sign-in attempts from here; wait {minutes} minute{'s' if minutes != 1 else ''}",
                             headers={"Retry-After": str(wait)})
+
+
+def _locked(email: str, address: str) -> None:
+    """Five wrong passwords for one account from one address stop that address for 15 minutes from the fifth (auth.MAX_TRIES, auth.LOCK_MINUTES); twenty
+    from every address together stop the account for as long, but for an address it signed in from lately (auth.ACCOUNT_TRIES, audit security-roles-10)."""
+    wait, why = platformdb.sign_in_wait(email, address)
+    if wait:
+        minutes = math.ceil(wait / 60)
+        wait_words = f"wait {minutes} minute{'s' if minutes != 1 else ''}"
+        detail = (f"Too many attempts from here; {wait_words}" if why == "address" else
+                  f"Too many wrong passwords for this account from several places; {wait_words}, or ask your company's administrator to clear the lockout")
+        raise HTTPException(status_code=429, detail=detail, headers={"Retry-After": str(wait)})
 
 
 def _person(request: Request) -> dict:
     """The signed-in person's account, from the identity the guard checked; 401 when there is none, or the account is disabled or its sessions were ended
-    after the token was made."""
+    after the token was made. A person signed in with a one-time password (plan Part 9.3) is let in here: these are the paths that change it."""
     identity = getattr(request.state, "identity", None)
     iat = (getattr(identity, "claims", None) or {}).get("iat")
     # A token without its issue time could never be told from one made before a password change: refused
-    found = platformdb.signed_in(getattr(identity, "user_id", None), iat) if identity is not None and iat is not None else None
+    found = (platformdb.signed_in(getattr(identity, "user_id", None), iat, session=identity.claims.get("session_id"), one_time_ok=True)
+             if identity is not None and iat is not None else None)
     if found is None:
         raise HTTPException(status_code=401, detail="Sign in first")
     return found
+
+
+def _agent(request: Request) -> str:
+    """The browser a session is signed in from, as its User-Agent says (My account shows it to the person: UI-18)."""
+    return request.headers.get("user-agent") or ""
+
+
+def _session_of(request: Request) -> str | None:
+    """The id of the session the request's access token belongs to (its `session_id`: platform.session_id)."""
+    return (getattr(getattr(request.state, "identity", None), "claims", None) or {}).get("session_id")
 
 
 def _refresh_token(inp: dict, needed: bool) -> str | None:
@@ -75,8 +102,9 @@ def _refresh_token(inp: dict, needed: bool) -> str | None:
 
 @router.post("/api/local/session")
 def local_session(request: Request, inp: dict = Body(...)):
-    """Sign in with an email and a password. A wrong password, an email with no account and a disabled account get one answer, and take as long. Tries for
-    an email with no account are not recorded; five refused for one account from one address stop that address."""
+    """Sign in with an email and a password. A wrong password, an email with no account and a disabled account get one answer, and take as long. Five
+    refused for one email from one address stop that address, whether the email has an account or not (a lockout told before which ones had one: audit
+    parity-supabase-auth-08); and thirty sign-ins from one address in five minutes stop it, whatever the emails."""
     global _dummy_hash
     email, password = inp.get("email"), inp.get("password")
     # A body without the two texts is refused before any account is looked at, so its answer and its time are the same for every email
@@ -84,19 +112,24 @@ def local_session(request: Request, inp: dict = Body(...)):
         _api._fail("Give your email address and your password")
     email = email.strip().lower()
     address = platformdb.client_address(request)
+    _too_many_sign_ins(address)
     _locked(email, address)
     found = platformdb.account_by_email(email) if email else None
     account = platformdb.check_sign_in(email, password) if found else None
     if account is None:
-        if found:
-            platformdb.record(platformdb.REFUSED, email, address, found["id"])
-        else:
+        if email:
+            platformdb.record(platformdb.REFUSED, email, address, found["id"] if found else "")
+        if not found:
             # The same PBKDF2 work as a real check, so that the time of the answer does not say whether the email has an account
             _dummy_hash = _dummy_hash or auth.hash_password(secrets.token_urlsafe(16))
             auth.check_password(password, _dummy_hash)
         raise schemas.Refusal(401, _WRONG, "invalid_credentials")
+    refresh_token = platformdb.new_refresh(account["id"], address, _agent(request), checked=account)
+    if refresh_token is None:
+        # the password was changed, or the account disabled, while this sign-in was checked: no session (audit parity-supabase-auth-01)
+        raise schemas.Refusal(401, _WRONG, "invalid_credentials")
     platformdb.record(platformdb.SIGNED_IN, email, address, account["id"])
-    return _session(account, platformdb.new_refresh(account["id"]))
+    return _session(account, refresh_token)
 
 
 @router.post("/api/local/refresh")
@@ -114,11 +147,15 @@ def local_refresh(inp: dict = Body(...)):
 
 
 @router.post("/api/local/logout")
-def local_logout(inp: dict = Body(...)):
-    """Sign out: the session of the refresh token sent ends. Without one, or with one already ended, there is nothing to end, and the answer is the same."""
-    token = _refresh_token(inp, needed=False)
+def local_logout(request: Request, inp: dict | None = Body(None)):
+    """Sign out: the session of the refresh token sent ends, and its access tokens with it (audit security-roles-09); so does the session of the access token
+    sent, when one is. Without either, or with one already ended, there is nothing to end, and the answer is the same."""
+    token = _refresh_token(inp, needed=False) if inp is not None else None
     if token:
         platformdb.end_session(token)
+    ident = getattr(request.state, "identity", None)
+    if ident is not None:
+        platformdb.end_session_id(ident.user_id, (getattr(ident, "claims", None) or {}).get("session_id"))
     return {"signed_out": True}
 
 
@@ -150,4 +187,38 @@ def local_password(request: Request, inp: dict = Body(...)):
         _api._fail("The new password must be different from the current one")
     account = platformdb.set_password(me["id"], new)
     platformdb.record("changed their password", me["email"], address, me["id"])
-    return {"changed": True, **_session(account, platformdb.new_refresh(me["id"]))}
+    refresh_token = platformdb.new_refresh(me["id"], address, _agent(request), checked=account)
+    if refresh_token is None:                      # disabled, or the password set again, a moment after this change
+        raise schemas.Refusal(401, _ENDED, "session_ended")
+    return {"changed": True, **_session(account, refresh_token)}
+
+
+# ------------------------------------------------------------------------------------------------ the person's sessions (UI-18 My account; audit role-analyst-32)
+
+@router.get("/api/local/sessions")
+def local_sessions(request: Request):
+    """The signed-in person's open sessions, the last renewed first, the one of this request marked `current`: where (address, browser) and when each
+    started, when it was last renewed, and when it ends unless renewed again (unix seconds)."""
+    me = _person(request)
+    mine = _session_of(request)
+    return {"sessions": [{**s, "current": s["id"] == mine} for s in platformdb.open_sessions(me["id"])]}
+
+
+@router.post("/api/local/sessions/end")
+def local_session_end(request: Request, inp: dict = Body(...)):
+    """Sign out one of the person's sessions, by its id: its refresh tokens and its access tokens end at once. This device's own is ended by signing out."""
+    me = _person(request)
+    if set(inp) != {"id"} or not isinstance(inp.get("id"), str):
+        _api._fail("Send the id of the session to sign out, and nothing else")
+    if not platformdb.end_session_id(me["id"], inp["id"]):
+        raise schemas.Refusal(404, "That is not one of your open sessions", "not_found")
+    return {"ended": 1}
+
+
+@router.post("/api/local/sessions/end-others")
+def local_sessions_end_others(request: Request, inp: dict | None = Body(None)):
+    """Sign out every session of the person's but this one (UI-18): their refresh tokens and access tokens end at once; this device stays signed in."""
+    me = _person(request)
+    if inp:
+        _api._fail("Send nothing: every session but this one is signed out")
+    return {"ended": platformdb.end_other_sessions(me["id"], _session_of(request))}

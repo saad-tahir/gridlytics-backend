@@ -12,11 +12,16 @@ In local mode (GRIDLYTICS_AUTH_MODE, the default) the backend is the sign-in ser
 PBKDF2 hash; a membership gives it a company role (owner, admin or member) and a status (pending, active or suspended) in one company; the founder switches
 Gridlytics on or off per company. A session is a one-hour access token (identity.issue_local) and a refresh token, kept only as its hash, replaced at every
 use, ending 12 hours unused and 7 days after the sign-in (auth.SESSION_HOURS, auth.SESSION_DAYS).
+
+Until PLT-11 brings email (plan Part 9.3), a person who forgot their password is helped by a company's administrator or the founder: they issue a one-time
+password (`set_password(..., one_time=True)`, the account's `must_change`), with which only the sign-in's own paths answer until the person chooses their
+own, and they clear a sign-in lockout (`clear_lock`).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -28,9 +33,9 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import auth, store
+from . import auth, identity, store
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 #: An access token's life (Supabase's default, decisions-v2 section 1)
 ACCESS_MINUTES = 60
 #: A refresh token not used for this long has ended; a session ends this many days after its sign-in, however used (the cookie sessions' rules)
@@ -48,10 +53,17 @@ INDEX_TABLES = ("share_index", "api_key_index")
 #: The record's words for a refused and a good sign-in: the lockout counts the first, from the last of the second
 REFUSED = "sign-in refused"
 SIGNED_IN = "signed in"
+#: The record's word for a lockout an administrator or the founder cleared (plan Part 9.3; audit pages-A-02): the refusals before it stop counting, from
+#: every address
+LOCK_CLEARED = "lockout cleared"
+#: What a person signed in with a one-time password is told by every path but the sign-in's own (api.IDENTITY_PATHS), until they choose their own
+ONE_TIME = "You signed in with a one-time password: choose your own password first, under My account"
 #: The shape of an email address, as the workspace's users have it, but with a domain that may be a single name: the decisions' demo user is dev@localhost
 _EMAIL = re.compile(r"[^@\s]{1,64}@[^@\s.][^@\s]{0,189}")
 _lock = threading.Lock()
 _clock = time.time
+#: Whether the log has said that a proxy's header arrived untrusted (said once a process: client_address)
+_proxy_said = False
 
 
 # ------------------------------------------------------------------------------------------------ where the files are (addendum item 1)
@@ -122,6 +134,15 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
         con.execute("CREATE INDEX IF NOT EXISTS account_events_email ON account_events(email, event, at)")
         for table in INDEX_TABLES:
             con.execute(f"CREATE TABLE IF NOT EXISTS {table} (token_hash TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id))")
+    if version < 2:
+        # a one-time password an administrator or the founder issued (plan Part 9.3; audit pages-A-02): the person chooses their own at the next sign-in.
+        # _connect() has copied the file to backup/ before this runs
+        con.execute("ALTER TABLE accounts ADD COLUMN must_change INTEGER NOT NULL DEFAULT 0")
+    if version < 3:
+        # where and when a session started, carried from token to token (UI-18 My account's sessions; audit role-analyst-32): the address and the browser
+        # of the sign-in, never shown to anyone but the person
+        for column, kind in (("started", "REAL"), ("address", "TEXT NOT NULL DEFAULT ''"), ("agent", "TEXT NOT NULL DEFAULT ''")):
+            con.execute(f"ALTER TABLE refresh_tokens ADD COLUMN {column} {kind}")
     con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -266,7 +287,7 @@ def _account(r) -> dict | None:
     if r is None:
         return None
     return {"id": r["id"], "email": r["email"], "name": r["name"], "disabled": bool(r["disabled"]), "created": r["created"], "updated": r["updated"],
-            "sessions_from": r["sessions_from"]}
+            "sessions_from": r["sessions_from"], "must_change": bool(r["must_change"])}
 
 
 def _email(email) -> str:
@@ -333,27 +354,49 @@ def check_sign_in(email: str, password: str) -> dict | None:
     return _account(r)
 
 
-def signed_in(account_id: str, iat: int | None = None) -> dict | None:
-    """The account an access token names, while it may act: it exists, it is not disabled, and the token (`iat`, its issue time in unix seconds) is not
-    older than the account's last password change or disabling. Local revocation is immediate (addendum item 17): stage B3 asks this on every request."""
+def signed_in(account_id: str, iat: int | None = None, *, session: str | None = None, one_time_ok: bool = False) -> dict | None:
+    """The account an access token names, while it may act: it exists, it is not disabled, and the token is not older than the account's last password
+    change or disabling (`sessions_from`, to a fraction of a second). Local revocation is immediate (addendum item 17): stage B3 asks this on every request.
+    A token of a known session (`session`, its `session_id`) is as old as the session, which started when its sign-in was made (to a fraction of a second); one
+    naming no session is told by `iat`, its issue time in whole seconds, and is refused when it falls in the second of the change, as it may be older (a
+    token of the same second passed before: audit parity-supabase-auth-01).
+    An account signed in with a one-time password (`must_change`, plan Part 9.3) is refused 403 `password_change_required` (identity.Refused) unless
+    `one_time_ok`: only the sign-in's own paths (the context, the password change) take it."""
     found = account(account_id) if isinstance(account_id, str) else None
     if found is None or found["disabled"]:
         return None
-    if iat is not None and (not isinstance(iat, (int, float)) or iat < found["sessions_from"]):
-        return None
+    if iat is not None:
+        if not isinstance(iat, (int, float)) or isinstance(iat, bool):
+            return None
+        started = _session_started(found["id"], session)
+        if (started if started is not None else iat) < found["sessions_from"]:
+            return None
+    if found["must_change"] and not one_time_ok:
+        raise identity.Refused(403, "password_change_required", ONE_TIME)
     return found
 
 
-def set_password(account_id: str, password: str) -> dict | None:
-    """A new password for an account (the founder's reset, or the person's own change): every session of the account ends, its refresh tokens and the
-    access tokens made before now."""
+def set_password(account_id: str, password: str, *, one_time: bool = False) -> dict | None:
+    """A new password for an account (the founder's reset, an administrator's one-time password, or the person's own change): every session of the account
+    ends, its refresh tokens and the access tokens made before now. `one_time`: a password someone else chose for the person (plan Part 9.3), which they
+    must replace at their next sign-in; any other set, the person's own change above all, clears the mark."""
     if (problem := password_problem(password)):
         raise ValueError(problem)
+    if not isinstance(one_time, bool):
+        raise ValueError("One-time must be yes or no")
     with _write() as con:
-        con.execute("UPDATE accounts SET password = ?, updated = ?, sessions_from = ? WHERE id = ?",
-                    (auth.hash_password(password), _now(), int(_clock()), account_id))
+        # to a fraction of a second: a token of the same second is told from one made after (audit parity-supabase-auth-01)
+        con.execute("UPDATE accounts SET password = ?, updated = ?, sessions_from = ?, must_change = ? WHERE id = ?",
+                    (auth.hash_password(password), _now(), _clock(), int(one_time), account_id))
         con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?", (account_id,))
     return account(account_id)
+
+
+def mark_one_time(account_id: str) -> None:
+    """A first password someone else chose (the founder console's new account, or a company's new owner; plan Part 9.3, audit founder-console-08): the
+    person chooses their own at their first sign-in, as after a one-time password (`must_change`). The demo's accounts, made by the store, keep theirs."""
+    with _write() as con:
+        con.execute("UPDATE accounts SET must_change = 1, updated = ? WHERE id = ?", (_now(), account_id))
 
 
 def set_account_disabled(account_id: str, disabled: bool) -> dict | None:
@@ -362,7 +405,7 @@ def set_account_disabled(account_id: str, disabled: bool) -> dict | None:
         raise ValueError("Disabled must be yes or no")
     with _write() as con:
         if disabled:
-            con.execute("UPDATE accounts SET disabled = 1, updated = ?, sessions_from = ? WHERE id = ?", (_now(), int(_clock()), account_id))
+            con.execute("UPDATE accounts SET disabled = 1, updated = ?, sessions_from = ? WHERE id = ?", (_now(), _clock(), account_id))
             con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?", (account_id,))
         else:
             con.execute("UPDATE accounts SET disabled = 0, updated = ? WHERE id = ?", (_now(), account_id))
@@ -454,14 +497,15 @@ def company_members(company_id: str) -> list[dict]:
 def context(user_id: str) -> dict | None:
     """What Supabase's `get_my_context` gives a signed-in person, from the registry: the profile, every membership with its company, and no pending
     invitations (people are added by the founder, never invited). Every company the founder made is `verified`; `enabled` says whether Gridlytics is on
-    for it. None for an account that does not exist or is disabled."""
-    found = signed_in(user_id)
+    for it. None for an account that does not exist or is disabled. `must_change_password` (Gridlytics' own, plan Part 9.3): signed in with a one-time
+    password, so nothing but the password change opens until the person chooses their own."""
+    found = signed_in(user_id, one_time_ok=True)
     if found is None:
         return None
     first, *last = found["name"].split(None, 1)
     profile = {"id": found["id"], "email": found["email"], "name": found["name"], "first_name": first, "last_name": last[0] if last else None, "avatar_url": None,
                "is_super_admin": False, "assignment_status": "none", "requested_company_name": None, "created_at": found["created"],
-               "updated_at": found["updated"]}
+               "updated_at": found["updated"], "must_change_password": found["must_change"]}
     return {"profile": profile, "memberships": [{k: v for k, v in m.items() if k not in ("user_id", "company_id")} for m in memberships(user_id)],
             "pending_invites_for_email": []}
 
@@ -473,20 +517,35 @@ class Renewed(Exception):
     window that sent it takes the session the other one stored."""
 
 
-def _add_refresh(con: sqlite3.Connection, user_id: str, family: str, session_ends: float) -> str:
+#: The most of a browser's User-Agent kept for a session (My account shows it to the person)
+AGENT_CHARS = 200
+
+
+def _add_refresh(con: sqlite3.Connection, user_id: str, family: str, session_ends: float, started: float | None = None, address: str = "",
+                 agent: str = "") -> str:
     token = secrets.token_urlsafe(32)
     now = _clock()
-    con.execute("INSERT INTO refresh_tokens (token_hash, user_id, family, created, expires, session_ends) VALUES (?,?,?,?,?,?)",
-                (auth.token_hash(token), user_id, family, now, min(now + REFRESH_HOURS * 3600, session_ends), session_ends))
+    con.execute("INSERT INTO refresh_tokens (token_hash, user_id, family, created, expires, session_ends, started, address, agent) VALUES (?,?,?,?,?,?,?,?,?)",
+                (auth.token_hash(token), user_id, family, now, min(now + REFRESH_HOURS * 3600, session_ends), session_ends,
+                 started if started is not None else now, (address or "")[:64], " ".join(str(agent or "").split())[:AGENT_CHARS]))
     return token
 
 
-def new_refresh(user_id: str) -> str:
-    """The refresh token of a new session of an account (a sign-in), kept as its hash. The tokens of sessions past their last day go: nothing can renew
-    them, so the table holds a week of sessions, not every one ever made."""
+def new_refresh(user_id: str, address: str = "", agent: str = "", *, checked: dict | None = None) -> str | None:
+    """The refresh token of a new session of an account (a sign-in), kept as its hash, with the address and the browser (`agent`, its User-Agent) it was
+    made from. The tokens of sessions past their last day by more than an access token's life go: nothing can renew them, so the table holds a week of
+    sessions, not every one ever made.
+    `checked` is the account as the sign-in's password check read it: None, and no session, when the account was disabled or its password changed since,
+    so a reset landing between the check and this leaves no session behind it (audit parity-supabase-auth-01)."""
     with _write() as con:
-        con.execute("DELETE FROM refresh_tokens WHERE session_ends < ?", (_clock(),))
-        return _add_refresh(con, user_id, uuid.uuid4().hex, _clock() + SESSION_DAYS * 86400)
+        if checked is not None:
+            now = con.execute("SELECT disabled, sessions_from FROM accounts WHERE id = ?", (user_id,)).fetchone()
+            if now is None or now["disabled"] or now["sessions_from"] != checked["sessions_from"]:
+                return None
+        # kept an access token's life past the session's end: a session signed out in its last hour keeps its access tokens refused until they run out
+        # (session_ended reads these rows; round 7 review of audit security-roles-09)
+        con.execute("DELETE FROM refresh_tokens WHERE session_ends < ?", (_clock() - ACCESS_MINUTES * 60,))
+        return _add_refresh(con, user_id, uuid.uuid4().hex, _clock() + SESSION_DAYS * 86400, address=address, agent=agent)
 
 
 def rotate_refresh(token: str) -> tuple[dict, str] | None:
@@ -512,19 +571,96 @@ def rotate_refresh(token: str) -> tuple[dict, str] | None:
             a = con.execute("SELECT * FROM accounts WHERE id = ?", (r["user_id"],)).fetchone()
             if a is not None and not a["disabled"]:
                 con.execute("UPDATE refresh_tokens SET used = ? WHERE token_hash = ?", (now, r["token_hash"]))
-                return _account(a), _add_refresh(con, a["id"], r["family"], r["session_ends"])
+                return _account(a), _add_refresh(con, a["id"], r["family"], r["session_ends"], r["started"] if r["started"] is not None else r["created"],
+                                                 r["address"], r["agent"])
     if raced:
         raise Renewed()
     return None
 
 
 def end_session(token: str) -> bool:
-    """Sign out: the session the refresh token belongs to ends, every token of it."""
+    """Sign out: the session the refresh token belongs to ends, every token of it, and with them the session's access tokens (`session_ended`)."""
     if not isinstance(token, str) or not token:
         return False
     with _write() as con:
         r = con.execute("SELECT family FROM refresh_tokens WHERE token_hash = ?", (auth.token_hash(token),)).fetchone()
         return bool(r) and con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE family = ?", (r["family"],)).rowcount > 0
+
+
+# A session's id is its refresh tokens' family, as a uuid: the access tokens of the session carry it as their `session_id` (identity.issue_local), so a
+# session that ends (a sign-out, its refresh token used again, a password change, the account disabled) refuses its access tokens at once, not an hour
+# later (audit security-roles-09). A token whose id names no family (one made before this, or by a test) has no session to end.
+
+def _family(session: str | None) -> str | None:
+    try:
+        return uuid.UUID(session).hex if isinstance(session, str) and len(session) <= 64 else None
+    except ValueError:
+        return None
+
+
+def session_id(refresh_token: str) -> str | None:
+    """The id of the session a refresh token belongs to: its family, as a uuid; None for a token that is not known."""
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
+    with _read() as con:
+        r = con.execute("SELECT family FROM refresh_tokens WHERE token_hash = ?", (auth.token_hash(refresh_token),)).fetchone()
+    return str(uuid.UUID(r["family"])) if r and _family(r["family"]) else None
+
+
+def _session_started(user_id: str, session: str | None) -> float | None:
+    """When the account's session `session` started (its sign-in, in unix seconds with their fraction); None when it names no session of the account."""
+    family = _family(session)
+    if family is None:
+        return None
+    with _read() as con:
+        r = con.execute("SELECT MIN(COALESCE(started, created)) AS started FROM refresh_tokens WHERE family = ? AND user_id = ?", (family, user_id)).fetchone()
+    return r["started"] if r is not None else None
+
+
+def session_ended(session: str | None) -> bool:
+    """Whether the session an access token names has ended: any of its refresh tokens revoked. False for an id that names no session, and while there is
+    no registry (nothing has been signed in to)."""
+    family = _family(session)
+    if family is None or not db_path().exists():
+        return False
+    with _read() as con:
+        return con.execute("SELECT 1 FROM refresh_tokens WHERE family = ? AND revoked = 1 LIMIT 1", (family,)).fetchone() is not None
+
+
+def open_sessions(user_id: str) -> list[dict]:
+    """An account's open sessions, the last renewed first (UI-18 My account; audit role-analyst-32): each session's id, when it started, when it was last
+    renewed (`last_active`), when it ends unless renewed again (`ends`), all in unix seconds, and the address and browser it was signed in from. A session
+    is open while its newest refresh token is unused, not revoked and not past its time."""
+    now = _clock()
+    with _read() as con:
+        rows = con.execute("SELECT * FROM refresh_tokens WHERE user_id = ? AND revoked = 0 AND used IS NULL AND expires > ? AND session_ends > ? "
+                           "ORDER BY created DESC", (user_id, now, now)).fetchall()
+    out, seen = [], set()
+    for r in rows:
+        if r["family"] in seen or _family(r["family"]) is None:
+            continue
+        seen.add(r["family"])
+        out.append({"id": str(uuid.UUID(r["family"])), "started": r["started"] if r["started"] is not None else r["created"], "last_active": r["created"],
+                    "ends": r["expires"], "address": r["address"], "device": r["agent"]})
+    return out
+
+
+def end_other_sessions(user_id: str, keep: str | None) -> int:
+    """Every session of an account but the one `keep` names (the device asking) ends, and their access tokens with them: how many open ones ended."""
+    family = _family(keep) or ""
+    ended = sum(1 for s in open_sessions(user_id) if _family(s["id"]) != family)
+    with _write() as con:
+        con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0 AND family != ?", (user_id, family))
+    return ended
+
+
+def end_session_id(user_id: str, session: str | None) -> bool:
+    """End one of an account's sessions by its id (a sign-out with the access token alone): every token of it."""
+    family = _family(session)
+    if family is None or not isinstance(user_id, str):
+        return False
+    with _write() as con:
+        return con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE family = ? AND user_id = ? AND revoked = 0", (family, user_id)).rowcount > 0
 
 
 def end_sessions(user_id: str) -> int:
@@ -539,17 +675,31 @@ def client_address(request) -> str:
     """The address a request counts under for the lockout. A proxy's X-Forwarded-For or Forwarded header is believed only where the server says it runs
     behind a proxy it trusts (GRIDLYTICS_TRUST_PROXY=1, with uvicorn's --forwarded-allow-ips naming it): otherwise uvicorn's default takes the header from
     any client on this machine, and a new address per try bought five more (R-235). A request that carries such a header untrusted counts as "forwarded"."""
+    global _proxy_said
     host = request.client.host if request.client else ""
     if os.environ.get("GRIDLYTICS_TRUST_PROXY") != "1" and (request.headers.get("x-forwarded-for") or request.headers.get("forwarded")):
+        if not _proxy_said:
+            # behind a proxy that was not declared, every client shares the "forwarded" count, and five wrong passwords lock an account for all of them
+            # (audit security-roles-10): said once, loudly, with what to set
+            _proxy_said = True
+            logging.getLogger("gridlytics").warning(
+                "a sign-in carried X-Forwarded-For or Forwarded, but GRIDLYTICS_TRUST_PROXY is not 1: every client behind that proxy counts as one address "
+                "for the sign-in lockout. Behind a proxy you trust, set GRIDLYTICS_TRUST_PROXY=1 and run uvicorn with --forwarded-allow-ips set to the "
+                "proxy's address")
         return "forwarded"
     return host
 
 
 def record(event: str, email: str, address: str = "", account_id: str = "", detail: dict | None = None) -> None:
-    """One line of the record of sign-ins: a refusal the lockout counts, a sign-in that clears the count, or an account's own change."""
+    """One line of the record of sign-ins: a refusal the lockout counts, a sign-in that clears the count, or an account's own change. A refusal for an email
+    with no account (audit parity-supabase-auth-08) is kept only while the lockout counts it (LOCK_MINUTES): the record never fills with made-up emails."""
+    now = _clock()
     with _write() as con:
+        if event == REFUSED and not account_id:
+            con.execute("DELETE FROM account_events WHERE event = ? AND account_id = '' AND email LIKE '%@%' AND at < ?",
+                        (REFUSED, now - auth.LOCK_MINUTES * 60))
         con.execute("INSERT INTO account_events (at, email, address, event, account_id, detail) VALUES (?,?,?,?,?,?)",
-                    (_clock(), (email or "").strip().lower(), address or "", event, account_id or "", json.dumps(detail or {})))
+                    (now, (email or "").strip().lower(), address or "", event, account_id or "", json.dumps(detail or {})))
 
 
 def events(email: str, limit: int = 200) -> list[dict]:
@@ -563,8 +713,9 @@ def events(email: str, limit: int = 200) -> list[dict]:
 
 def lock_wait(email: str, address: str | None, refused: str = REFUSED, cleared: str = SIGNED_IN, tries: int | None = None) -> int:
     """Seconds before an account may be tried again from an address (0 when it may now). `tries` refusals within LOCK_MINUTES stop it for LOCK_MINUTES from
-    the last of them; a good sign-in from the address clears the count (R-235: the count outlived a success, and the wait ran from each new try). With
-    `address` None, the refusals from every address together (the founder's code step, R-271)."""
+    the last of them; a good sign-in from the address clears the count (R-235: the count outlived a success, and the wait ran from each new try), and so
+    does a lockout an administrator or the founder cleared, from every address (`clear_lock`, plan Part 9.3). With `address` None, the refusals from every
+    address together (the founder's code step, R-271)."""
     if not email or not db_path().exists():
         return 0
     tries = tries or auth.MAX_TRIES
@@ -572,10 +723,35 @@ def lock_wait(email: str, address: str | None, refused: str = REFUSED, cleared: 
     where, args = ("email = ?", [email.strip().lower()]) if address is None else ("email = ? AND address = ?", [email.strip().lower(), address])
     with _read() as con:
         last_good = con.execute(f"SELECT MAX(at) FROM account_events WHERE {where} AND event = ?", (*args, cleared)).fetchone()[0] or 0
+        last_good = max(last_good, con.execute("SELECT MAX(at) FROM account_events WHERE email = ? AND event = ?",
+                                               (email.strip().lower(), LOCK_CLEARED)).fetchone()[0] or 0)
         times = [r[0] for r in con.execute(f"SELECT at FROM account_events WHERE {where} AND event = ? AND at > ? ORDER BY at DESC LIMIT ?",
                                            (*args, refused, last_good, tries))]
     left = times[0] + window - _clock() if len(times) == tries and times[0] - times[-1] < window else 0
     return max(1, round(left)) if left > 0 else 0
+
+
+def sign_in_wait(email: str, address: str) -> tuple[int, str]:
+    """Seconds before a password may be tried for an account from an address, and why: "address" (MAX_TRIES refused from this address) or "account"
+    (ACCOUNT_TRIES refused from every address together, audit security-roles-10); (0, "") when it may now. The account-wide count does not stop an
+    address the account signed in from in the last SESSION_DAYS."""
+    wait = lock_wait(email, address)
+    if wait:
+        return wait, "address"
+    wait = lock_wait(email, None, tries=auth.ACCOUNT_TRIES)
+    if wait and address and address != "forwarded":
+        with _read() as con:
+            known = con.execute("SELECT 1 FROM account_events WHERE email = ? AND address = ? AND event = ? AND at > ? LIMIT 1",
+                                (email.strip().lower(), address, SIGNED_IN, _clock() - SESSION_DAYS * 86400)).fetchone()
+        if known:
+            return 0, ""
+    return (wait, "account") if wait else (0, "")
+
+
+def clear_lock(email: str, account_id: str, by: str) -> None:
+    """An administrator or the founder clears an account's sign-in lockout (plan Part 9.3; audit pages-A-02): the refusals recorded before now stop
+    counting, from every address."""
+    record(LOCK_CLEARED, email, "", account_id, {"by": by})
 
 
 # ------------------------------------------------------------------------------------------------ the founder's audit (decisions-v2 section 4)
