@@ -1844,6 +1844,14 @@ def _handover(day: str, row: dict, after: dict[str, dict], blocks: list[dict]) -
     return {"days": n, "v_end_rs": round(credit, 2), "realised_rs": round(credit + total, 2) if settled else None, "settled": settled}
 
 
+def _earlier_method(by: dict[str, dict]) -> bool:
+    """Whether a day's rows were scored before round 6's chained replays (round 7, audit pr-review-04): such a row has no `chain`, and its
+    carry-over is the whole end-of-day gap in stored energy at v_end, not the change of the valued gap over the day, so a period mixing it with
+    chained days does not add up as one replay. It is never stale by the chain's rules (_start_matches reads it as a start from the actual arm, and
+    the day after it restarts from the measured state, "no_state"), so it is named apart until the period is recomputed."""
+    return any(isinstance(row, dict) and "chain" not in row for row in by.values())
+
+
 def _day_withheld(d: dict) -> bool:
     """A priced day whose claim is withheld for missing data (`claim_withheld`, or a row from before it with its import unknown): its saving is not
     known, only some of its levers."""
@@ -1929,7 +1937,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
     for r in rows:
         days.setdefault(r["day_local"], {})[r["baseline"]] = json.loads(r["data"])
         computed = max(computed or "", r["computed"])
-    out = {"from": d0, "to": d1, "computed": computed, "days": [], "baselines": {}, "chain_stale_days": _chain_stale(site_id, days)}
+    out = {"from": d0, "to": d1, "computed": computed, "days": [], "baselines": {}, "chain_stale_days": _chain_stale(site_id, days),
+           # round 7 (audit pr-review-04): the days scored by the method before chained replays, until the period is recomputed
+           "earlier_method_days": [d for d in sorted(days) if _earlier_method(days[d])]}
     native_capture = sites.native_latest(site_id) is not None
     conns = sites.connections(site_id) if site else []
     on_grid = bool(conns) and conns[0]["data"].get("regime") != "off_grid"
@@ -2113,7 +2123,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "litres_native": (n.get("baseline") or {}).get("litres"), "peak_kw": (n.get("actual") or {}).get("peak_kw"),
                             "peak_import_kwh": (n.get("actual") or {}).get("peak_import_kwh"), "levers": n.get("levers"),
                             "import_unknown": bool(n.get("import_unknown")), "claim_withheld": n.get("claim_withheld"),
-                            "baseline_start": (n.get("chain") or {}).get("from"),
+                            "baseline_start": (n.get("chain") or {}).get("from"), "earlier_method": _earlier_method(by),
                             # round 7: the day's share of its billing month's MDI lever (in its saving where the day's saving counts), and whether
                             # the month is still open
                             "mdi_month": bill_month(day), "mdi_share_native_rs": round(mdi_share(day, "native"), 2) if n else None,

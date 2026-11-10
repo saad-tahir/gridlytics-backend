@@ -953,3 +953,45 @@ def test_the_periods_bound_is_held_against_the_claim_of_the_same_days(company):
     _put_rows(sid, {"2026-10-10": {b: _pf_day(-500.0, 0.0, carry=300.0) for b in ("native", "tuned")}})
     low = verify.summary(sid, "2026-10-10", "2026-10-10")["baselines"]["native"]
     assert low["claimed_rs"] == -800.0 and low["perfect_foresight_claimed_rs"] == -800.0 and low["perfect_foresight_rs"] == 0.0
+
+
+# ------------------------------------------------------------------------------------------------ pr-review-04 (and pr-review-09's legacy row):
+# ------------------------------------------------------------------------------------------------ rows stored before round 6's chained replays
+
+def _as_v1(sid: str, day: date) -> None:
+    """A day's rows as v1-build stored them: no chain, the day's carry-over the whole end gap at v_end."""
+    with store.connect() as con:
+        for r in con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ? AND day_local = ?", (sid, day.isoformat())).fetchall():
+            d = json.loads(r["data"])
+            d.pop("chain", None)
+            d.pop("handover", None)
+            con.execute("UPDATE savings_days SET data = ? WHERE site_id = ? AND day_local = ? AND baseline = ?",
+                        (json.dumps(d), sid, day.isoformat(), r["baseline"]))
+
+
+def test_rows_scored_by_the_earlier_method_are_named_until_recomputed_and_the_next_day_restarts_from_the_measured_state(company):
+    # Before: a period mixed v1-build's whole-gap carry-over with chained days under one label, and nothing said so (chain_stale_days treats a row
+    # with no chain as one that started from the actual arm, so no "Recompute needed" either)
+    sid = make_site(name="Legacy rows r7")
+    days3 = [P, D, D + timedelta(days=1)]
+    soc = 0.5
+    for i, d in enumerate(days3):
+        _, sim, _ = twin_day(sid, d, soc, seed=i + 1)
+        soc = float(sim["soc"][-1])
+    for d in days3[:2]:
+        verify.compute_day(sid, d, with_bound=False, forward=False)
+        _as_v1(sid, d)
+    span = (P.isoformat(), D.isoformat())
+    s = verify.summary(sid, *span)
+    assert s["earlier_method_days"] == [P.isoformat(), D.isoformat()] and s["chain_stale_days"] == []
+    assert [x["earlier_method"] for x in s["days"]] == [True, True] and all(x["baseline_start"] is None for x in s["days"])
+    # the first day scored after them restarts from the measured state: a row with no chain has no end state to carry on from
+    third = verify.compute_day(sid, days3[2], with_bound=False, forward=False)["native"]
+    assert third["chain"]["from"] == "actual" and third["chain"]["reset"] == "no_state" and third["chain"]["start"]["gap_kwh"] == 0.0
+    s = verify.summary(sid, P.isoformat(), days3[2].isoformat())
+    assert s["earlier_method_days"] == [P.isoformat(), D.isoformat()] and [x["earlier_method"] for x in s["days"]] == [True, True, False]
+    # recomputed oldest first, the period is chained and named no more
+    assert verify.compute_range(sid, P, days3[2]) == 3
+    s = verify.summary(sid, P.isoformat(), days3[2].isoformat())
+    assert s["earlier_method_days"] == [] and not any(x["earlier_method"] for x in s["days"]) and s["chain_stale_days"] == []
+    assert [x["baseline_start"] for x in s["days"]] == ["actual", "previous_day", "previous_day"]
