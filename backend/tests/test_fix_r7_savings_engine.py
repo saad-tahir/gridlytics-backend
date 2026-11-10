@@ -1421,8 +1421,8 @@ def test_three_day_blocks_are_painted_at_the_closed_loop_tier_only(world):
     assert admin.get(f"/api/sites/{sid}/pilot").json()["block_days_allowed"] == [3, 7]
     r = paint(block_days=3)
     assert r.status_code == 200
-    assert [(b["block_start"], b["block_end"]) for b in r.json()][:2] == [(tomorrow.isoformat(), (tomorrow + timedelta(days=2)).isoformat()),
-                                                                         ((tomorrow + timedelta(days=3)).isoformat(), (tomorrow + timedelta(days=5)).isoformat())]
+    day = lambda n: (tomorrow + timedelta(days=n)).isoformat()  # noqa: E731
+    assert [(b["block_start"], b["block_end"]) for b in r.json()][:2] == [(day(0), day(2)), (day(3), day(5))]
 
 
 def test_a_calendars_checks_name_its_pair_and_hold_a_block_length_the_tier_does_not_run(world):
