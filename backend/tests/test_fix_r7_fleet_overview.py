@@ -4,7 +4,8 @@ fleet is the site's own fact, so a grid site whose connection is not saved yet i
 role-viewer-09). The Overview carries the plan's KPI tiles (today's solar used on site, battery cycles and outages covered), the peak window of
 its chart's actual steps and the genset start requests waiting for an answer, its quick action (pages-A-09). The Fleet's 7-day bars draw each day's
 claimed saving, as its month column, so a monitor site's replay noise is not a loss (role-analyst-14 and its duplicates); a viewer reads the
-month's energy behind the claim, peak kWh moved and diesel avoided, in place of the rupees (pages-A-11, role-viewer-18)."""
+month's energy behind the claim, peak kWh moved and diesel avoided, in place of the rupees (pages-A-11, role-viewer-18). The fleet says which sites
+run a plan, which are handed back to their native settings and which have a genset, for the summary strip and the filters of R8 2.1 (pages-A-17)."""
 from __future__ import annotations
 
 import json
@@ -14,7 +15,7 @@ import numpy as np
 
 from gridlytics import alerts, plans, routes_sites, sites, store, telemetry
 from gridlytics.routes_common import PKT, today
-from test_fix_api import _genset_plan, _now, world  # noqa: F401  (world is a fixture)
+from test_fix_api import _fake_plan, _genset_plan, _now, world  # noqa: F401  (world is a fixture)
 
 
 def _row(fleet: dict, site_id: str) -> dict:
@@ -210,3 +211,27 @@ def test_a_viewer_reads_the_month_s_peak_energy_moved_and_diesel_avoided_in_plac
     assert other["mtd_litres_saved"] is None and other["mtd_peak_kwh_avoided"] == 0.0
     assert a.put(f"/api/sites/{world.other}/connection", json={"regime": "off_grid"}).status_code == 200
     assert _row(a.get("/api/fleet").json(), world.other)["mtd_peak_kwh_avoided"] is None
+
+
+# ------------------------------------------------------------------------------------------------ pages-A-17
+
+def test_the_fleet_counts_the_sites_on_a_plan_and_on_native_settings_and_names_those_with_a_genset(world):
+    a, sid = world.c["admin"], world.site
+    fleet = a.get("/api/fleet").json()
+    assert _row(fleet, sid)["has_genset"] is True and _row(fleet, world.other)["has_genset"] is False
+    assert _row(fleet, sid)["on_plan"] is False and fleet["summary"]["on_plan"] == 0 and fleet["summary"]["on_native"] == 0
+    _fake_plan(world)
+    assert _row(a.get("/api/fleet").json(), sid)["on_plan"] is False        # at the monitor tier a plan is a recommendation only
+    with world.use():
+        sites.set_tier_capable(sid, "closed_loop")
+        sites.set_tier_allowed(sid, "closed_loop", "test")
+    fleet = a.get("/api/fleet").json()
+    assert _row(fleet, sid)["on_plan"] is True and fleet["summary"]["on_plan"] == 1
+    # released to its native settings: no longer on a plan, and counted as handed back
+    until = datetime.fromtimestamp(_now() + 7200, PKT).isoformat()
+    assert a.post(f"/api/sites/{sid}/overrides", json={"kind": "force_native", "until": until}).status_code == 200
+    fleet = a.get("/api/fleet").json()
+    assert _row(fleet, sid)["on_plan"] is False and fleet["summary"]["on_plan"] == 0 and fleet["summary"]["on_native"] == 1
+    # the same for a viewer: none of it is money
+    seen = world.c["viewer"].get("/api/fleet").json()
+    assert seen["summary"]["on_native"] == 1 and _row(seen, sid)["has_genset"] is True

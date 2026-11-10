@@ -105,6 +105,12 @@ def _mtd_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple[f
     return mtd, (summ["computed"] or None) if scored else None, spark[-7:], energy
 
 
+#: The control states in which a plan is in force at the inverter (R8 2.1's "sites on a plan"), and those that hand the inverter back to its native
+#: settings (a release or a pause: "sites on native mode")
+ON_PLAN = ("following", "hold")
+HANDED_BACK = ("native", "paused")
+
+
 def fleet_row(s: dict, now: int, counts: dict) -> dict:
     last = telemetry.latest(s["id"])
     first = telemetry.first_ts(s["id"])
@@ -118,14 +124,18 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
     has_genset = "genset" in sites.assets(s["id"])
     mtd, computed, spark, energy = _mtd_saving(s["id"], grid=not off_grid, genset=has_genset)
     category = "Off-grid" if off_grid else conn["data"]["tariff_category"] if conn is not None else None
+    control = control_state(s, last, now)
     return {"id": s["id"], "name": s["name"], "status": s["status"], "tier": s["tier"], "demo": bool(s.get("demo_link")), "city": s["data"].get("city"),
             "disco": s["data"].get("disco"), "category": category,
-            "control": control_state(s, last, now), "last_data": last["ts"] if last else None, "now": _snapshot(last),
+            "control": control, "last_data": last["ts"] if last else None, "now": _snapshot(last),
             "next_event": (nn or {}).get("next", [None])[0] if nn and nn.get("next") else None, "open_alerts": counts.get(s["id"], 0),
             "mtd_saving_rs": mtd, "mtd_saving_rs_method": MTD_SAVING_METHOD, "mtd_saving_rs_computed": computed, "spark": spark,
             "collecting_day": None if days_data >= 14 else int(days_data) + 1 if first else 0,
             # the month's energy behind the claim: not money, so a viewer reads it in place of the rupees (R8 2.1; audit pages-A-11)
-            "mtd_peak_kwh_avoided": energy["peak_kwh_avoided"], "mtd_litres_saved": energy["litres_saved"]}
+            "mtd_peak_kwh_avoided": energy["peak_kwh_avoided"], "mtd_litres_saved": energy["litres_saved"],
+            # R8 2.1's summary and filters (audit pages-A-17): a plan in force at the inverter (following it or holding; not a monitor site's
+            # recommendation, a table not confirmed today, a release, a pause or an offline edge), and a genset on site
+            "on_plan": plan is not None and control["key"] in ON_PLAN, "has_genset": has_genset}
 
 
 @router.get("/api/fleet")
@@ -142,7 +152,8 @@ def fleet():
                             "mtd_saving_rs": round(sum(figures), 0) if figures else None, "mtd_saving_rs_method": MTD_SAVING_METHOD,
                             "mtd_saving_rs_computed": max(stamps) if stamps else None,
                             "in_outage": sum(1 for r in rows if r["now"] and r["now"]["grid_present"] == 0 and r["category"] != "Off-grid"),
-                            "mtd_peak_kwh_avoided": total("mtd_peak_kwh_avoided"), "mtd_litres_saved": total("mtd_litres_saved")},
+                            "mtd_peak_kwh_avoided": total("mtd_peak_kwh_avoided"), "mtd_litres_saved": total("mtd_litres_saved"),
+                            "on_plan": sum(1 for r in rows if r["on_plan"]), "on_native": sum(1 for r in rows if r["control"]["key"] in HANDED_BACK)},
                 "sites": rows})
 
 
