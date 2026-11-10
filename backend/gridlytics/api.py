@@ -460,12 +460,37 @@ def _not_seen() -> list[dict]:
     return out
 
 
+def _registry_places() -> dict[str, dict] | None:
+    """Local mode: who is in the company by the registry (platform.db), each account's membership by its id; None in supabase mode, where the project keeps
+    the memberships. A member row of someone the founder removed stays in the company's file (its history), but they are not the company's any more."""
+    if identity.MODE != "local":
+        return None
+    return {m["user_id"]: m for m in platformdb.company_members(auth.company.get()["id"])}
+
+
+def _not_in_company(m: dict, places: dict[str, dict] | None) -> None:
+    """Refuse a change to a member whose place in the company is not active by the registry (audit flow-reports-alerts-members-keys-07): switching them on
+    would give a seat to someone outside the company, and only OnyxLeaf adds people, makes their place active again or removes them."""
+    place = None if places is None else places.get(m["user_id"], {"status": "removed"})
+    if place is None or place["status"] == "active":
+        return
+    who, company = m["name"] or m["email"], auth.company.get()["name"]
+    detail = {"removed": f"{who} is no longer in {company}: OnyxLeaf adds and removes people, so ask us to add them again",
+              "suspended": f"{who}'s place in {company} is suspended by OnyxLeaf: ask us to make it active before changing their role or access"
+              }.get(place["status"], f"{who}'s place in {company} is not active yet: ask OnyxLeaf to make it active before changing their role or access")
+    raise Refusal(409, detail, "not_a_member")
+
+
 @app.get("/api/users")
 def users_list():
+    """The company's people: its members, then the people it has who have not signed in yet. In local mode a person the founder removed from the company is
+    not listed (audit flow-reports-alerts-members-keys-07); one whose place is suspended is, switched off. People are added and removed by OnyxLeaf, never
+    here (accounts are preassigned)."""
     auth.need("manage_users")
     if auth.company.get() is None:
         return []
-    return [*(_member_out(m) for m in store_members.members()), *_not_seen()]
+    places = _registry_places()
+    return [*(_member_out(m) for m in store_members.members() if places is None or m["user_id"] in places), *_not_seen()]
 
 
 def _account(inp) -> dict:
@@ -505,7 +530,9 @@ def users_edit(user_id: str, request: Request = None, inp: dict = Body(...)):
         _fail("OnyxLeaf changes a member's name or email address: ask us. For a forgotten password, use Sign-in help on the member's row")
     fields = _account(inp)
     person = None
-    if store_members.member(user_id) is None:
+    if (held_row := store_members.member(user_id)) is not None:
+        _not_in_company(held_row, _registry_places())
+    else:
         person = next((p for p in _not_seen() if p["id"] == user_id), None)
         if person is None:
             raise HTTPException(status_code=404, detail="No such user")

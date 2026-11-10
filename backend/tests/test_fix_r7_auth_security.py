@@ -655,3 +655,40 @@ def test_a_token_of_the_same_second_as_a_reset_or_a_disable_is_refused(world, mo
     assert platformdb.signed_in(op, claims["iat"], session=claims["session_id"])
     assert platformdb.signed_in(op, claims["iat"], session=jwt.decode(before["access_token"], options={"verify_signature": False})["session_id"]) is None
     assert sessions_from != int(sessions_from) or claims["iat"] >= sessions_from   # whole seconds no longer
+
+
+# ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-07
+
+def test_a_person_the_founder_removed_leaves_members_and_cannot_be_switched_on_or_promoted(world):
+    """The founder's removal took the person out of the registry, but their member row stayed in Members, and the owner could switch them on (a seat of the
+    company's held by someone outside it) and make them administrator. Members is the registry's people: a removed person is not listed and cannot be
+    changed; a suspended one is listed, switched off, and is not switched on here."""
+    from gridlytics import platform as platformdb
+    from gridlytics import store_founder
+    a, cid = world.c["admin"], world.company["id"]
+    viewer, analyst = (_member(world, e)["id"] for e in ("viewer@fix.test", "analyst@fix.test"))
+    assert a.put(f"/api/users/{viewer}", json={"disabled": True}).status_code == 200            # switched off here first, as in the audit
+    used = a.get("/api/platform/org").json()["seats_used"]
+    for who in (viewer, analyst):
+        platformdb.remove_membership(who, cid)                                                   # the founder's DELETE .../memberships/{company}
+        store_founder.follow_membership(cid, who, "removed")
+    listed = {u["id"] for u in a.get("/api/users").json()}
+    assert viewer not in listed and analyst not in listed
+    for who in (viewer, analyst):
+        for body in ({"disabled": False}, {"role": "admin"}, {"grants": []}):
+            r = a.put(f"/api/users/{who}", json=body)
+            assert r.status_code == 409 and r.json()["code"] == "not_a_member" and "OnyxLeaf" in r.json()["detail"], (body, r.text)
+    assert a.get("/api/platform/org").json()["seats_used"] == used - 1                         # the analyst's seat is freed, and nobody takes it back
+    # suspended by the founder: still listed, switched off, and not switched on here
+    op = _member(world, "operator@fix.test")["id"]
+    platformdb.set_membership(op, cid, status="suspended")
+    store_founder.follow_membership(cid, op, "suspended")
+    row = next(u for u in a.get("/api/users").json() if u["id"] == op)
+    assert row["disabled"] is True and row["disabled_reason"]
+    r = a.put(f"/api/users/{op}", json={"disabled": False})
+    assert r.status_code == 409 and r.json()["code"] == "not_a_member" and "suspended" in r.json()["detail"], r.text
+    # given back by the founder: listed again and changed as before
+    platformdb.add_membership(viewer, cid, "member", "active")
+    store_founder.follow_membership(cid, viewer, "active")
+    assert viewer in {u["id"] for u in a.get("/api/users").json()}
+    assert a.put(f"/api/users/{viewer}", json={"role": "analyst"}).status_code == 200
