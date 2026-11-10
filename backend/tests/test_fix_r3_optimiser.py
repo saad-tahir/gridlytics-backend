@@ -173,8 +173,10 @@ def test_a_limited_off_grid_plan_that_burns_its_whole_tank_is_repaired(monkeypat
 
 def test_an_icp_eligible_legacy_site_never_plans_import_and_export_at_once(company):
     sid = _site(genset=False)
+    # baselines in the uncertain middle of the month's imports: the two days read at 60 kW, scaled to the month so far (the 1st to the 18th are
+    # unknown, not zero import: round 7, engine-optimiser-13), plus the rest at the same rate (it was 2,000 and 8,000 kWh, against 2 days read)
     full = _connection(sid, regime="net_metering_legacy", export_cap_kw=200,
-                       icp={"eligible": True, "peak": {"11": 2000.0}, "off_peak": {"11": 8000.0}})
+                       icp={"eligible": True, "peak": {"11": 6000.0}, "off_peak": {"11": 30000.0}})
     t0 = twin.day_start_utc(date(2026, 11, 20))
     rows = [(sid, int(t), "test", 1.0, 1000.0, 0.0, 60000.0) for t in range(t0 - 2 * 86400, t0, 60)]
     telemetry.write_rows(rows, ("site_id", "ts", "source_id", "grid_present", "grid_import_wh", "grid_export_wh", "load_power_w"))
