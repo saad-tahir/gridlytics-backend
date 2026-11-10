@@ -1,6 +1,7 @@
 """Savings (UI-12), the pilot set-up (UI-13), switchback, bills and the fee check; the fleet roll-up."""
 from __future__ import annotations
 
+import copy
 import json
 from datetime import date, timedelta
 
@@ -9,7 +10,7 @@ from fastapi.responses import PlainTextResponse
 
 from . import auth, sites, store, telemetry, verify
 from .routes_common import bad, full_or_404, out, parse_day, site_or_404, today
-from .schemas import Refusal
+from .schemas import PilotEdit, Refusal, check
 
 router = APIRouter()
 
@@ -133,26 +134,49 @@ PILOT_DEFAULT = {"baseline_start": None, "baseline_days": 14, "criteria": {"min_
                  "signoff": None, "amendments": []}
 
 
+def _pilot_data(r) -> dict:
+    """The stored set-up over the defaults. A row stored before the request model (round 7, audit pages-D-04) may hold criteria that are not a set of
+    numbers (null crashed the page); each criterion that is not a number reads as its default."""
+    stored = json.loads(r["data"]) if r else {}
+    data = {**copy.deepcopy(PILOT_DEFAULT), **(stored if isinstance(stored, dict) else {})}
+    got = data.get("criteria") if isinstance(data.get("criteria"), dict) else {}
+    data["criteria"] = {k: float(got[k]) if isinstance(got.get(k), (int, float)) and not isinstance(got.get(k), bool) else v
+                        for k, v in PILOT_DEFAULT["criteria"].items()}
+    if not isinstance(data.get("amendments"), list):
+        data["amendments"] = []
+    return data
+
+
 @router.get("/api/sites/{site_id}/pilot")
 def pilot_get(site_id: str):
     site_or_404(site_id)
     with store.connect() as con:
         r = con.execute("SELECT * FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
-    data = json.loads(r["data"]) if r else dict(PILOT_DEFAULT)
-    return {"pilot": data, "started": r["started"] if r else None, "capture": sites.native_latest(site_id), "switchback": verify.switchback_blocks(site_id)}
+    return {"pilot": _pilot_data(r), "started": r["started"] if r else None, "capture": sites.native_latest(site_id),
+            "switchback": verify.switchback_blocks(site_id)}
 
 
 @router.put("/api/sites/{site_id}/pilot")
 def pilot_put(site_id: str, inp: dict = Body(...)):
+    """Tabs A and D: the baseline window and the success criteria, typed and in range (schemas.PilotEdit). The sign-off and the amendments are the
+    server's: the start writes the one, a change after the start appends to the other (round 7, audit pages-D-04, security-roles-05,
+    flow-savings-pilot-bill-10)."""
     auth.need("start_pilot", "Editing the pilot")
     site_or_404(site_id)
-    cur = pilot_get(site_id)
-    data = {**cur["pilot"], **{k: v for k, v in inp.items() if k in PILOT_DEFAULT}}
-    if cur["started"]:
-        data["amendments"] = (cur["pilot"].get("amendments") or []) + [{"at": store._now(), "by": auth.actor(), "changes": list(inp.keys())}]
-    with store.connect() as con:
-        con.execute("INSERT INTO pilots (site_id, data, updated) VALUES (?,?,?) ON CONFLICT(site_id) DO UPDATE SET data = excluded.data, updated = excluded.updated",
-                    (site_id, json.dumps(data), store._now()))
+    sent = check(PilotEdit, inp).model_dump(exclude_unset=True)
+    with store.write_transaction() as con:
+        r = con.execute("SELECT * FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
+        data = _pilot_data(r)
+        started = r["started"] if r else None
+        if started and "baseline_start" in sent and sent["baseline_start"] is None:
+            raise Refusal(422, "A started pilot keeps its baseline window: change its first day instead", "invalid")
+        if "criteria" in sent:
+            sent["criteria"] = {**data["criteria"], **sent["criteria"]}
+        new = {**data, **sent}
+        if started:
+            new["amendments"] = data["amendments"] + [{"at": store._now(), "by": auth.actor(), "changes": list(sent)}]
+        con.execute("INSERT INTO pilots (site_id, data, updated) VALUES (?,?,?) ON CONFLICT(site_id) DO UPDATE SET data = excluded.data, "
+                    "updated = excluded.updated", (site_id, json.dumps(new), store._now()))
     return pilot_get(site_id)
 
 

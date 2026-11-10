@@ -1064,3 +1064,62 @@ def test_a_day_beyond_the_forward_walk_is_listed_stale_until_recomputed(company,
     verify.compute_day(sid, DAYS[1], with_bound=False)
     assert verify.summary(sid, *span)["chain_stale_days"] == []
     assert _rows(sid, DAYS[2])["native"]["chain"]["start"]["state"] == _rows(sid, DAYS[1])["native"]["chain"]["end"]["state"]
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-04 (security-roles-05,
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-10): the pilot's request model
+
+CRITERIA = {"min_saving_pct": 8.0, "max_unserved_kwh": 0.0, "reserve_adequacy_pct": 90.0, "fidelity_pct": 80.0, "fee_multiple": 3.0,
+            "forecast_pv_nrmse_max": 0.35}
+
+
+def _pilot_ready(w) -> str:
+    """The world's mill with a native capture and a switchback calendar painted a month ahead, so its pilot can start."""
+    with w.use():
+        sites.capture_native(w.site, {"source": "entered", "work_mode": "self_use"}, "t")
+        verify.plan_switchback(w.site, date.today() + timedelta(days=30), 2, 7, "t", seed=1)
+    return w.site
+
+
+def _start(w, sid: str, name: str = "Plant manager"):
+    return w.c["admin"].post(f"/api/sites/{sid}/pilot/start", json={"name": name})
+
+
+def test_the_pilot_put_takes_only_the_set_ups_own_fields_typed_and_in_range(world):
+    sid = _pilot_ready(world)
+    admin = world.c["admin"]
+    fresh = admin.get(f"/api/sites/{sid}/pilot").json()["pilot"]
+    for body in ({"signoff": {"by": "someone else", "at": "2026-01-01", "name": "X"}}, {"amendments": [{"at": "2026-01-01", "by": "x", "changes": []}]},
+                 {"criteria": "abc"}, {"criteria": None}, {"baseline_days": -5}, {"baseline_days": 1000}, {"baseline_days": 14.5},
+                 {"baseline_start": 12345}, {"baseline_start": "2026-02-30"}, {"baseline_start": "20261120"},
+                 {"criteria": {"min_saving_pct": "lots"}}, {"criteria": {"foo": -1}}, {"criteria": {"min_saving_pct": 101}},
+                 {"criteria": {"fidelity_pct": None}}, {"bogus_field": 1}):
+        r = admin.put(f"/api/sites/{sid}/pilot", json=body)
+        assert r.status_code == 422 and r.json()["code"] == "invalid", (body, r.status_code, r.text)
+        assert "\n" not in r.json()["detail"] and "pydantic" not in r.json()["detail"], r.text  # one sentence, no stack
+    assert admin.get(f"/api/sites/{sid}/pilot").json()["pilot"] == fresh
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"baseline_start": "2026-11-20", "baseline_days": 14})
+    assert r.status_code == 200 and (r.json()["pilot"]["baseline_start"], r.json()["pilot"]["baseline_days"]) == ("2026-11-20", 14)
+    # one criterion changes alone; the others keep their values
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"criteria": {"min_saving_pct": 5}})
+    assert r.status_code == 200 and r.json()["pilot"]["criteria"] == {**CRITERIA, "min_saving_pct": 5.0}
+    # the sign-off is the start's alone, and stays as the start wrote it
+    assert _start(world, sid).status_code == 200
+    signed = admin.get(f"/api/sites/{sid}/pilot").json()["pilot"]["signoff"]
+    assert signed["name"] == "Plant manager" and signed["by"]
+    for body in ({"signoff": {"by": "Customer CEO", "at": "2026-10-01T00:00:00+00:00", "name": "CEO"}}, {"signoff": None}, {"amendments": []}):
+        assert admin.put(f"/api/sites/{sid}/pilot", json=body).status_code == 422
+    after = admin.get(f"/api/sites/{sid}/pilot").json()["pilot"]
+    assert after["signoff"] == signed and after["amendments"] == []
+
+
+def test_a_pilot_record_stored_with_bad_criteria_reads_back_as_an_object(world):
+    # a row the old PUT stored with criteria null (or text) no longer reaches the page as such: it read p.pilot.criteria[key] and crashed
+    sid = _pilot_ready(world)
+    for bad_criteria in (None, "abc", {"min_saving_pct": "lots", "fidelity_pct": 70}):
+        with world.use(), store.connect() as con:
+            con.execute("INSERT INTO pilots (site_id, data, updated) VALUES (?,?,?) ON CONFLICT(site_id) DO UPDATE SET data = excluded.data",
+                        (sid, json.dumps({"baseline_start": None, "baseline_days": 14, "criteria": bad_criteria, "signoff": None, "amendments": []}),
+                         "2026-11-01T00:00:00+00:00"))
+        got = world.c["admin"].get(f"/api/sites/{sid}/pilot").json()["pilot"]["criteria"]
+        assert got == {**CRITERIA, **({"fidelity_pct": 70.0} if isinstance(bad_criteria, dict) else {})}

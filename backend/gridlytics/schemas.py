@@ -65,3 +65,48 @@ def check(model: type[BaseModel], body: Any, **context) -> Any:
         return model.model_validate(body, context=context)
     except ValidationError as exc:
         raise Refusal(422, message(exc), "invalid") from exc
+
+
+# ------------------------------------------------------------------------------------------------ the pilot set-up (UI-13; round 7, audit pages-D-04)
+
+from datetime import date as _date  # noqa: E402  (this section's own imports, so the shared head of the file stays as it was)
+
+from pydantic import Field, field_validator  # noqa: E402
+
+
+def _iso_day(v: str | None, what: str) -> str | None:
+    """A date written YYYY-MM-DD that is a real day, else a refusal naming `what`."""
+    if v is None:
+        return v
+    try:
+        if len(v) != 10:
+            raise ValueError
+        _date.fromisoformat(v)
+    except ValueError:
+        raise ValueError(f"{what} is a date written YYYY-MM-DD") from None
+    return v
+
+
+class PilotCriteriaEdit(Strict):
+    """The success criteria a change sets (tab D): any of them, each a number in the range the tab allows; the ones not sent keep their values."""
+
+    min_saving_pct: float = Field(None, ge=0, le=100)
+    max_unserved_kwh: float = Field(None, ge=0, le=1_000_000)
+    reserve_adequacy_pct: float = Field(None, ge=0, le=100)
+    fidelity_pct: float = Field(None, ge=0, le=100)
+    fee_multiple: float = Field(None, ge=0, le=100)
+    forecast_pv_nrmse_max: float = Field(None, ge=0, le=1)
+
+
+class PilotEdit(Strict):
+    """`PUT /sites/:id/pilot`: the fields of the set-up a person may change. The sign-off is written by the start alone and the amendments by the
+    server, so neither is a field here (an unknown field is refused)."""
+
+    baseline_start: str | None = None
+    baseline_days: int = Field(None, ge=7, le=90)
+    criteria: PilotCriteriaEdit = None
+
+    @field_validator("baseline_start")
+    @classmethod
+    def _start(cls, v):
+        return _iso_day(v, "The baseline window's first day")
