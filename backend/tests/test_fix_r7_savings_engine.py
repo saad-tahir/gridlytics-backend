@@ -995,3 +995,72 @@ def test_rows_scored_by_the_earlier_method_are_named_until_recomputed_and_the_ne
     s = verify.summary(sid, P.isoformat(), days3[2].isoformat())
     assert s["earlier_method_days"] == [] and not any(x["earlier_method"] for x in s["days"]) and s["chain_stale_days"] == []
     assert [x["baseline_start"] for x in s["days"]] == ["actual", "previous_day", "previous_day"]
+
+
+# ------------------------------------------------------------------------------------------------ pr-review-09: the paths round 6 left untested
+
+def test_a_chained_days_bound_solves_from_the_actual_start_and_carries_the_chained_saving(company, monkeypatch):
+    # Round 6 subtracted the chained start gap inside the bound (carry_start) with no test: flip its sign and the suite still passed. The bound is
+    # now the day's saving, which carries the chain's start gap, plus the hindsight plan's headroom over the actual arm, solved from where the actual
+    # arm started
+    sid = _farm("Farm bound chained r7")
+    _run(sid, [LEAD] + DAYS, _night_runs)
+    verify.compute_day(sid, DAYS[0], with_bound=False, forward=False)
+    seen: dict = {}
+    real = verify.optimise.solve
+
+    def spy(p, **kw):
+        seen["p"] = p
+        return real(p, **kw)
+
+    monkeypatch.setattr(verify.optimise, "solve", spy)
+    n = verify.compute_day(sid, DAYS[1], forward=False)["native"]
+    ch = n["chain"]
+    # a chained day whose native replay started emptier than the battery the plan's night run left: its start gap is charged in its saving
+    assert ch["from"] == "previous_day" and ch["start"]["gap_kwh"] > 1.0 and ch["start"]["carry_rs"] > 1.0
+    assert n["levers"]["carry_over"] == pytest.approx(ch["end"]["carry_rs"] - ch["start"]["carry_rs"], abs=0.01)
+    # the hindsight solve starts where the actual arm started, not where the chained native replay did
+    assert seen["p"]["battery"]["E0"] == pytest.approx(ch["start"]["actual_e_kwh"], abs=1e-6)
+    assert abs(seen["p"]["battery"]["E0"] - ch["start"]["baseline_e_kwh"]) > 1.0
+    pf = n["perfect_foresight"]
+    assert pf["status"] == "optimal" and pf["headroom_rs"] >= 0.0
+    assert n["perfect_foresight_rs"] == pytest.approx(max(0.0, n["saving_rs"] + pf["headroom_rs"]), abs=0.01)
+    assert n["perfect_foresight_rs"] >= n["saving_rs"] - 0.01
+
+
+def test_a_blank_grid_presence_on_a_day_that_claims_nothing_restarts_the_next_day(company):
+    # _unread_mask's grid branch: at a grid site a blank grid presence is carried forward, so an outage there is unseen and native's end state is
+    # not its own. It does not withhold the day (load and PV were read), but the day after one that claims nothing restarts from the measured state
+    sid = make_site(name="Grid blank r7", tier="monitor")
+    soc = 0.5
+    for i, d in enumerate((P, D)):
+        _, sim, _ = twin_day(sid, d, soc, seed=i + 1)
+        soc = float(sim["soc"][-1])
+    first = verify.compute_day(sid, P, with_bound=False, forward=False)["native"]
+    assert first["fidelity"] == "recommendation_only" and first["chain"]["end"]["unread_min"] == 0
+    assert verify.compute_day(sid, D, with_bound=False, forward=False)["native"]["chain"]["from"] == "previous_day"
+    assert _blank_evening(sid, P, 10.0, 12.0, cols=("grid_present",)) == 120
+    first = verify.compute_day(sid, P, with_bound=False, forward=False)["native"]
+    assert first["chain"]["end"]["unread_min"] == 120 and first["inputs_unread_min"] == 0 and first["claim_withheld"] is None
+    nxt = verify.compute_day(sid, D, with_bound=False, forward=False)["native"]
+    assert nxt["chain"]["from"] == "actual" and nxt["chain"]["reset"] == "unread_inputs" and nxt["chain"]["start"]["gap_kwh"] == 0.0
+
+
+def test_a_day_beyond_the_forward_walk_is_listed_stale_until_recomputed(company, monkeypatch):
+    # FORWARD_MAX_DAYS: a re-scored day walks at most that many later days; one beyond keeps its old start and the summary names it
+    sid = _farm("Farm walk r7")
+    _run(sid, [LEAD] + DAYS, _night_runs)
+    for d in DAYS:
+        verify.compute_day(sid, d, with_bound=False, forward=False)
+    span = (DAYS[0].isoformat(), DAYS[2].isoformat())
+    assert verify.summary(sid, *span)["chain_stale_days"] == []
+    # the first day's evening goes blank: it claims nothing over unread inputs, so the second day restarts and its end moves, and so the third's start
+    monkeypatch.setattr(verify, "FORWARD_MAX_DAYS", 1)
+    _blank_evening(sid, DAYS[0], 19.0, 23.0)
+    verify.compute_day(sid, DAYS[0], with_bound=False)
+    assert _rows(sid, DAYS[1])["native"]["chain"]["reset"] == "unread_inputs"  # within the walk: re-scored
+    assert verify.summary(sid, *span)["chain_stale_days"] == [DAYS[2].isoformat()]  # beyond it: stale
+    monkeypatch.setattr(verify, "FORWARD_MAX_DAYS", 62)
+    verify.compute_day(sid, DAYS[1], with_bound=False)
+    assert verify.summary(sid, *span)["chain_stale_days"] == []
+    assert _rows(sid, DAYS[2])["native"]["chain"]["start"]["state"] == _rows(sid, DAYS[1])["native"]["chain"]["end"]["state"]
