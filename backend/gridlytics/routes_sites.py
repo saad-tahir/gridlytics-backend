@@ -28,7 +28,10 @@ def meta():
             "override_kinds": sites.OVERRIDE_KINDS, "role": (auth.current.get() or {}).get("role"),
             "permissions": {p: auth.can(p) for p in auth.PERMISSIONS},
             # the categories the ICP applies to, so tab C asks for the ICP baseline only there (audit engine-tariffs-05)
-            "icp_categories": _icp_categories()}
+            "icp_categories": _icp_categories(),
+            # what every plan falls back to when no newer one arrives (delivery's fallback block, the floor being the site's reserve floor), for tab D
+            # to show (plan 9.3 tab D "fallback"; audit flow-onboarding-22)
+            "fallback": {"on_expiry": "inverter_native", "revert_after_hours": delivery.FALLBACK_HOURS}}
 
 
 def _icp_categories() -> list[str]:
@@ -229,6 +232,16 @@ def _grid_settled(site: dict, connections: list[dict]) -> bool:
     return bool(connections) or data.get("site_type") == "farm" or bool(data.get("off_grid"))
 
 
+@router.post("/api/sites/{site_id}/source/test")
+def site_source_test(site_id: str):
+    """The data source's test (plan 9.3 tab A, R8 2.2 "Test connection"; audit flow-onboarding-22): the minutes received in the last day of data, the
+    points they carry and whether grid presence is among them (sites.source_test). Nothing is changed: activation refuses a grid-connected site whose
+    data carries no grid presence."""
+    auth.need("edit_sites", "Testing the data source")
+    site_or_404(site_id)
+    return sites.source_test(site_id)
+
+
 @router.post("/api/sites/{site_id}/activate")
 def site_activate(site_id: str):
     auth.need("manage_sites", "Activating a site")
@@ -241,6 +254,10 @@ def site_activate(site_id: str):
         # plan 9.3 tab A: without a grid-presence signal outages cannot be seen and the reserve cannot be planned (audit flow-onboarding-08: a site with no
         # source, or an unconfirmed one, was activated and planned)
         missing.append("the data source, with its grid-presence signal confirmed (tab A)")
+    elif sites.grid_connected(s) and sites.source_test(site_id)["grid_signal"] == "missing":
+        # the source's test (plan 9.3: "refuses a source without a grid-present signal"; audit flow-onboarding-22): data arrived, and none of it says
+        # whether the grid is up, whatever the tick says
+        missing.append("the grid-presence signal to the data the source sends (the data received has neither grid_present nor the grid voltage; tab A)")
     if not (s.get("assets") or {}).get("inverter"):
         missing.append("the inverter (tab B)")
     if not _grid_settled(s, s.get("connections") or []):

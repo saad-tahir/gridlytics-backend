@@ -8,13 +8,14 @@ advisory writes for a CSV or cloud source, SOURCE_CAPABLE; else `monitor`), and
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import date, datetime, timezone
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from . import store, tariff_data
+from . import store, tariff_data, telemetry
 from .schemas import Strict, check
 
 TIERS = ("monitor", "advisory_writes", "closed_loop")
@@ -687,7 +688,61 @@ def setup_warnings(site: dict) -> list[str]:
     if on_grid and not str((d.get("outage_unit") or {}).get("code") or "").strip():
         out.append("No feeder or transformer code is given: the outage forecast learns from this site's own outages only, not from the company's other "
                    "sites on its feeder")
+    # Mode B is set-points an edge device writes (plan Part 7.2): a CSV or cloud source has no writer, so its plans arrive as slot tables (audit
+    # flow-onboarding-22: chosen for a CSV site without a word)
+    if d.get("control_mode") == "mode_b" and (d.get("data_source") or {}).get("kind") in SOURCE_CAPABLE:
+        out.append(MODE_B_WITHOUT_EDGE)
     return list(dict.fromkeys(out))
+
+
+MODE_B_WITHOUT_EDGE = ("Mode B (set-points written by the edge device) needs an edge device: with a CSV or cloud source the plan reaches the inverter as "
+                       "slot tables a person keys in, so choose Mode A or advisory")
+
+
+# ------------------------------------------------------------------------------------------------ the data source's test (audit flow-onboarding-22)
+
+#: The points a source test looks for in the data received (plan 9.3 tab A and R8 2.2, "Test connection": the rows received and the detected points),
+#: grid presence first: without it outages cannot be seen and the reserve cannot be planned
+SOURCE_POINTS = ("grid_present", "grid_voltage_v", "grid_power_w", "pv_power_w", "load_power_w", "battery_power_w", "battery_soc_bms_pct",
+                 "genset_running", "inverter_mode_active")
+GRID_POINTS = ("grid_present", "grid_voltage_v")
+#: How far back from the last minute received the test reads: a day of minutes
+SOURCE_TEST_S = 86400
+SOURCE_NO_DATA = "No data has arrived from this site yet: test the source again once its first readings are in"
+SOURCE_NO_GRID = ("The data received carries no grid presence (grid_present or the grid voltage): outages cannot be seen and the reserve cannot be "
+                  "planned. Add the point to the source, or choose a source that reports it")
+
+
+def _iso(ts) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat()
+
+
+def source_test(site_id: str) -> dict:
+    """What the site's data source has sent (plan 9.3 tab A: a connection test that refuses a source without a grid-present signal; until then the
+    wizard had only the person's tick): the minutes received in the day up to the last one, the points among SOURCE_POINTS that carry a value, and
+    `grid_signal`: "found" (grid_present or the grid voltage is among them), "missing" (data arrived without either) or "no_data" (nothing yet: a site
+    is set up before its data flows, so this is no refusal). Times are ISO, UTC."""
+    kind = (((get(site_id) or {}).get("data") or {}).get("data_source") or {}).get("kind")
+    last = telemetry.latest(site_id)
+    if not last:
+        return {"kind": kind, "grid_signal": "no_data", "rows": 0, "first_at": None, "last_at": None, "points": [], "sentence": SOURCE_NO_DATA}
+    got = telemetry.raw(site_id, int(last["ts"]) - SOURCE_TEST_S + 60, int(last["ts"]) + 60, columns=SOURCE_POINTS)
+    ts = got["ts"]
+
+    def carried(name: str) -> bool:
+        return any(v not in (None, "") for v in got[name]) if name == "inverter_mode_active" else any(not math.isnan(v) for v in got[name])
+
+    points = [p for p in SOURCE_POINTS if carried(p)]
+    grid = [p for p in GRID_POINTS if p in points]
+    return {"kind": kind, "grid_signal": "found" if grid else "missing", "rows": len(ts), "first_at": _iso(ts[0]), "last_at": _iso(ts[-1]),
+            "points": points,
+            "sentence": f"Grid presence is in the data received ({', '.join(grid)}), so outages can be seen" if grid else SOURCE_NO_GRID}
+
+
+def grid_connected(site: dict) -> bool:
+    """Whether the site (full()) draws on a grid it can lose: not off-grid, with a connection of another regime than off_grid."""
+    d = site.get("data") or {}
+    return not d.get("off_grid") and any((c.get("data") or {}).get("regime") != "off_grid" for c in site.get("connections") or [])
 
 
 # ------------------------------------------------------------------------------------------------ carried state (plan Part 4.8)

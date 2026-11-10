@@ -48,12 +48,17 @@ plus 5 points whatever the controller did. A site now records the state of charg
 flow-onboarding-09 and flow-onboarding-17: equipment that disagreed with the inverter (a 5 kW inverter with a 5,000 kW battery, PV 900 kW AC from 10 kWp
 DC, an export cap above the sanctioned load) and a blank feeder code were saved with no word. Every site answer now carries `setup_warnings`: sentences
 that say so, without refusing the save (a site may really have PV on inverters of its own).
+
+flow-onboarding-22: plan 9.3's tab A asks for a connection test that refuses a source without a grid-present signal, and tab D shows the write budget and
+the fallback; the wizard had a self-declared tick only, and Mode B could be chosen for a CSV site without a word. `POST /api/sites/:id/source/test` now
+says what the data received carries (the minutes, the points, whether grid presence is among them), activation refuses a grid-connected site whose data
+carries no grid presence, Mode B with a CSV or cloud source is a setup warning, and GET /api/meta gives the fallback every plan carries.
 """
 from __future__ import annotations
 
 import pytest
 
-from gridlytics import sites
+from gridlytics import delivery, sites, telemetry
 from gridlytics.schemas import Refusal
 from test_fix_api import world  # noqa: F401  (world is a fixture)
 
@@ -623,3 +628,66 @@ def test_the_site_answer_says_where_the_equipment_disagrees_and_when_no_feeder_i
     # an off-grid site has no feeder to pool
     other = world.other
     assert a.put(f"/api/sites/{other}", json={"off_grid": True}).json()["setup_warnings"] == []
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-22
+
+def test_a_source_test_says_what_the_data_carries_and_a_source_without_grid_presence_is_not_activated(world):
+    a, op, v, sid = world.c["admin"], world.c["operator"], world.c["viewer"], world.site
+    assert v.post(f"/api/sites/{sid}/source/test").status_code == 403
+    # nothing received yet: said so, and nothing is refused on that account (a site is set up before its data flows)
+    r = op.post(f"/api/sites/{sid}/source/test")
+    assert r.status_code == 200, r.text
+    t = r.json()
+    assert (t["kind"], t["grid_signal"], t["rows"], t["first_at"], t["last_at"], t["points"]) == (None, "no_data", 0, None, None, [])
+    assert t["sentence"] == "No data has arrived from this site yet: test the source again once its first readings are in"
+    assert a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "csv", "grid_signal_confirmed": True}}).status_code == 200
+    with world.use():
+        sites.put_asset(sid, "inverter", {"kw_ac": 100}, "test")
+        now = telemetry._now_ts() // 60 * 60
+        telemetry.ingest(sid, [{"ts": now - 60 * i, "pv_power_w": 900, "load_power_w": 1500} for i in range(1, 31)], "csv")
+    # data without grid presence: the test says so, and activation is refused although the tick says it is there
+    t = op.post(f"/api/sites/{sid}/source/test").json()
+    assert (t["kind"], t["grid_signal"], t["rows"]) == ("csv", "missing", 30), t
+    assert t["points"] == ["pv_power_w", "load_power_w"]
+    assert t["first_at"] < t["last_at"] and t["last_at"].endswith("+00:00")
+    assert t["sentence"] == ("The data received carries no grid presence (grid_present or the grid voltage): outages cannot be seen and the reserve "
+                             "cannot be planned. Add the point to the source, or choose a source that reports it")
+    r = a.post(f"/api/sites/{sid}/activate")
+    assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
+    assert r.json()["detail"] == ("Add the grid-presence signal to the data the source sends (the data received has neither grid_present nor the grid "
+                                  "voltage; tab A) before activating")
+    # the grid voltage counts (ingest reads grid presence from it): found, and the site is activated
+    with world.use():
+        telemetry.ingest(sid, [{"ts": now, "pv_power_w": 900, "grid_voltage_v": 231}], "csv")
+    t = op.post(f"/api/sites/{sid}/source/test").json()
+    assert (t["grid_signal"], t["rows"]) == ("found", 31), t
+    assert t["points"] == ["grid_present", "grid_voltage_v", "pv_power_w", "load_power_w"]
+    assert t["sentence"] == "Grid presence is in the data received (grid_present, grid_voltage_v), so outages can be seen"
+    r = a.post(f"/api/sites/{sid}/activate")
+    assert r.status_code == 200 and r.json()["status"] == "active", r.text
+
+
+def test_an_off_grid_site_needs_no_grid_presence_in_its_data(world):
+    a, other = world.c["admin"], world.other
+    assert a.put(f"/api/sites/{other}", json={"off_grid": True, "data_source": {"kind": "csv", "grid_signal_confirmed": True}}).status_code == 200
+    with world.use():
+        sites.put_asset(other, "inverter", {"kw_ac": 20}, "test")
+        telemetry.ingest(other, [{"ts": telemetry._now_ts() // 60 * 60 - 60, "pv_power_w": 900}], "csv")
+    assert a.post(f"/api/sites/{other}/source/test").json()["grid_signal"] == "missing"
+    r = a.post(f"/api/sites/{other}/activate")
+    assert r.status_code == 200, r.text
+
+
+def test_mode_b_without_an_edge_device_is_a_setup_warning_and_meta_gives_the_fallback(world):
+    a, sid = world.c["admin"], world.site
+    warning = ("Mode B (set-points written by the edge device) needs an edge device: with a CSV or cloud source the plan reaches the inverter as "
+               "slot tables a person keys in, so choose Mode A or advisory")
+    r = a.put(f"/api/sites/{sid}", json={"control_mode": "mode_b", "data_source": {"kind": "csv", "grid_signal_confirmed": True}})
+    assert r.status_code == 200 and warning in r.json()["setup_warnings"], r.text
+    assert warning in a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}}).json()["setup_warnings"]
+    assert warning not in a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "edge", "grid_signal_confirmed": True}}).json()["setup_warnings"]
+    assert warning not in a.put(f"/api/sites/{sid}", json={"control_mode": "mode_a", "data_source": {"kind": "csv", "grid_signal_confirmed": True}}).json()[
+        "setup_warnings"]
+    # what every plan falls back to (delivery's fallback block), for tab D to show
+    assert a.get("/api/meta").json()["fallback"] == {"on_expiry": "inverter_native", "revert_after_hours": delivery.FALLBACK_HOURS}
