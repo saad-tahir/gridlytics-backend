@@ -65,7 +65,7 @@ UPLOAD_EARLIEST = datetime(2015, 1, 1, tzinfo=timezone.utc)
 UPLOAD_MAX_DAYS = 400
 
 
-def _upload_window(content: bytes, tz_offset_h: float) -> None:
+def _upload_window(content: bytes, tz_offset_h: float, ts_format: str = "auto") -> None:
     """Refuses (ValueError, in words) a file whose header names a column twice, a file with a row before 2015, a row more than a day ahead, or rows
     spanning more than UPLOAD_MAX_DAYS. Reads only the ts column, as the import reads it; rows whose ts does not parse are left to the import, which skips
     them. The import reads rows by column name and keeps the last of two columns with one name, so a repeated name is refused outright: this check and
@@ -82,29 +82,28 @@ def _upload_window(content: bytes, tz_offset_h: float) -> None:
         return
     col = head.index("ts")
     try:
-        tz = timezone(timedelta(hours=tz_offset_h))
+        timezone(timedelta(hours=tz_offset_h))
     except (ValueError, OverflowError):
         raise ValueError("The timezone offset is hours from UTC, between -23 and 23") from None
-    latest = datetime.now(timezone.utc) + timedelta(days=1)
+    earliest = int(UPLOAD_EARLIEST.timestamp())
+    latest = int((datetime.now(timezone.utc) + timedelta(days=1)).timestamp())
     first = last = None
     early = late = 0
     for row in reader:
         cell = (row[col] if col < len(row) else "") or ""
         try:
-            t = datetime.fromisoformat(cell.strip().replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        try:
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=tz)
-            if t < UPLOAD_EARLIEST:
-                early += 1
-                continue
-            if t > latest:
-                late += 1
-                continue
+            # read as the import reads it (telemetry.csv_time: ISO 8601 or epoch seconds), so an epoch row dated 1970 is refused here too
+            t = telemetry.csv_time(cell, tz_offset_h, ts_format)
         except OverflowError:                       # a time at the very edge of the calendar
             early += 1
+            continue
+        if t is None:
+            continue
+        if t < earliest:
+            early += 1
+            continue
+        if t > latest:
+            late += 1
             continue
         first = t if first is None or t < first else first
         last = t if last is None or t > last else last
@@ -112,8 +111,8 @@ def _upload_window(content: bytes, tz_offset_h: float) -> None:
         raise ValueError(f"{early + late} row{'s are' if early + late != 1 else ' is'} dated "
                          + ("before 2015" if early and not late else "in the future" if late and not early else "before 2015 or in the future")
                          + ": check the logger's clock (and the timezone) and upload again")
-    if first is not None and (last - first).days > UPLOAD_MAX_DAYS:
-        raise ValueError(f"The file spans {(last - first).days} days; upload at most {UPLOAD_MAX_DAYS} days per file")
+    if first is not None and (last - first) // 86400 > UPLOAD_MAX_DAYS:
+        raise ValueError(f"The file spans {(last - first) // 86400} days; upload at most {UPLOAD_MAX_DAYS} days per file")
 
 
 def _takes_file_name() -> bool:

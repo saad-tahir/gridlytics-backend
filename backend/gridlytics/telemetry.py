@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import math
+import re
 import sqlite3
 import threading
 import time
@@ -163,6 +164,62 @@ UPLOAD_MAX_DAYS = 400
 FLAG_WORDS = {"on": "1", "off": "0", "true": "1", "false": "0", "yes": "1", "no": "0"}
 #: a CSV's rows are at most this many minutes apart (an hourly logger); rows further apart are refused, as no minute between them can be filled
 STEP_MAX_MIN = 60
+#: one CSV upload carries at most this many bytes: the API's body limit (api.MAX_BODY), which answers a larger upload with TOO_LARGE too, so the page, the
+#: API and the importer give one limit in one sentence (flow-telemetry-plan-control-25)
+UPLOAD_MAX_BYTES = 25_000_000
+TOO_LARGE = "The file is larger than 25 MB, the most one upload can carry; split it by month"
+#: the ways a CSV's ts column is read: "auto" reads ISO 8601 (a time without an offset is in the chosen zone) and epoch seconds or milliseconds (UTC, as
+#: on the edge path); "dmy" and "mdy" read day-first and month-first dates such as 06/11/2026 09:00, which the column mapping chooses between, as no
+#: reader can tell 06/11 from 11/06
+TS_FORMATS = ("auto", "dmy", "mdy")
+_SLASHED = re.compile(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?\s*([AaPp][Mm])?)?$")
+_NUMBER = re.compile(r"^\d+(\.\d+)?$")
+#: an epoch number at or above this is in milliseconds (1e11 seconds is the year 5138)
+_EPOCH_MS = 1e11
+_FORMATS_READ = "times must be ISO 8601, e.g. 2026-11-06T09:00 or 2026-11-06 09:00, or epoch seconds"
+
+
+def csv_time(cell, tz_offset_h: float = 0.0, fmt: str = "auto") -> int | None:
+    """A CSV ts cell as epoch seconds UTC, or None when it is not a time in `fmt` (see TS_FORMATS); a time past the calendar's edge raises OverflowError,
+    as the callers count it apart. An epoch number reads as UTC whatever the zone chosen; an ISO time with its own offset reads as written."""
+    text = str(cell if cell is not None else "").strip()
+    if not text:
+        return None
+    if _NUMBER.match(text):
+        x = float(text)
+        return int(x / 1000) if x >= _EPOCH_MS else int(x)
+    tz = timezone(timedelta(hours=tz_offset_h))
+    m = _SLASHED.match(text) if fmt in ("dmy", "mdy") else None
+    if m:
+        a, b, year, hh, mm, ss, half = m.groups()
+        day, month = (int(a), int(b)) if fmt == "dmy" else (int(b), int(a))
+        hour = int(hh or 0)
+        if half:
+            if not 1 <= hour <= 12:
+                return None
+            hour = hour % 12 + (12 if half.lower() == "pm" else 0)
+        try:
+            return int(datetime(int(year), month, day, hour, int(mm or 0), int(ss or 0), tzinfo=tz).timestamp())
+        except ValueError:
+            return None
+    try:
+        t = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int((t if t.tzinfo else t.replace(tzinfo=tz)).timestamp())
+
+
+def _no_times(first: str | None, fmt: str) -> str:
+    """The refusal of a file in which no row's time can be read, naming the first cell and the formats read (flow-telemetry-plan-control-25)."""
+    if not first:
+        return f"No row has a time in its ts column: {_FORMATS_READ}"
+    if fmt == "auto" and _SLASHED.match(first):
+        return (f"No row's time could be read: the file writes times as {first} (a day and a month in an order the import cannot tell); write them as "
+                f"ISO 8601, e.g. 2026-11-06T09:00, or as epoch seconds, or choose day first or month first in the column mapping")
+    if fmt in ("dmy", "mdy"):
+        order = "day first, e.g. 06/11/2026 09:00" if fmt == "dmy" else "month first, e.g. 11/06/2026 09:00"
+        return f"No row's time could be read (the first ts is {first!r}): the mapping reads dates {order}; {_FORMATS_READ}"
+    return f"No row's time could be read (the first ts is {first!r}): {_FORMATS_READ}"
 
 
 def _now_ts() -> int:
@@ -399,7 +456,7 @@ def _zone_warning(records: list[dict], spans: list[int]) -> str | None:
 
 
 def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
-               file_name: str | None = None) -> dict:
+               file_name: str | None = None, ts_format: str = "auto") -> dict:
     """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
     `duplicates` the rows dropped, both in the notes); rows 2 to 60 minutes apart are stored as the minutes each covers (`step_min`, `minutes`; see
     ingest), rows further apart are refused; gaps over 5 minutes (or over the step) are reported. A file in which no row's grid_present (or
@@ -409,9 +466,12 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
 
     The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
     nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
-    rows are aggregated. The imports row keeps the uploaded range (`from_ts`, `to_ts`) and the file's name when given (`file_name`, see _file_name)."""
-    if len(content) > 30_000_000:
-        raise ValueError("The file is larger than 30 MB; split it by month")
+    rows are aggregated. Times are read by csv_time in `ts_format` (ISO 8601 or epoch seconds by default); a file in which none can be read is refused
+    with the formats read, and a file over UPLOAD_MAX_BYTES with TOO_LARGE. The imports row keeps the uploaded range (`from_ts`, `to_ts`) and the file's name when given (`file_name`, see _file_name)."""
+    if len(content) > UPLOAD_MAX_BYTES:
+        raise ValueError(TOO_LARGE)
+    if ts_format not in TS_FORMATS:
+        raise ValueError(f"The time format is one of {', '.join(TS_FORMATS)}")
     text = content.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames or "ts" not in [(mapping or {}).get(f, f) for f in reader.fieldnames]:
@@ -429,18 +489,19 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         log.append("No grid_import_wh or grid_export_wh column: import and export are read from grid_power_w (positive is import)"
                    if "grid_power_w" in names.values() else
                    "No grid_import_wh, grid_export_wh or grid_power_w column: grid import and export are missing for this file, not zero")
-    bad_ts = 0
+    bad_ts, first_bad = 0, None
     for line in reader:
         rec = {names[k]: v for k, v in line.items() if k in names and names[k] in CSV_COLUMNS}
         ts = rec.get("ts") or ""  # a short row leaves its missing trailing cells as None
         try:
-            t = datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00"))
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone(timedelta(hours=tz_offset_h)))
-            rec["ts"] = int(t.timestamp())
+            t = csv_time(ts, tz_offset_h, ts_format)
         except (ValueError, TypeError, OverflowError):
+            t = None
+        if t is None:
             bad_ts += 1
+            first_bad = first_bad or str(ts).strip() or None
             continue
+        rec["ts"] = t
         for flag in ("grid_present", "genset_running"):
             word = str(rec.get(flag) or "").strip().lower()
             if word in FLAG_WORDS:
@@ -449,7 +510,7 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
             rec.pop("genset_running", None)
         records.append(rec)
     if not records:
-        raise ValueError("No rows with a readable ts were found")
+        raise ValueError(_no_times(first_bad, ts_format))
     now = _now_ts() if now is None else int(now)
     _check_window([r["ts"] for r in records], now)  # before anything is written
     if bad_ts:

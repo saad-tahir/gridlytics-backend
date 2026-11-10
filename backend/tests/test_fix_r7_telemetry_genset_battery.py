@@ -12,7 +12,8 @@ day's price (role-owner-07); the KPI row's cost per kWh, hours below the minimum
 measured points and refit (pages-C-16).
 
 Batch 3, CSV mapping, refusals, data quality and series: today's completeness is counted over the minutes elapsed so far, not the whole day
-(role-viewer-07, and its duplicate role-analyst-09).
+(role-viewer-07, and its duplicate role-analyst-09); a file's times may be epoch seconds or milliseconds, a refusal of unreadable times names the
+formats read, and a file over the upload cap is told the importer's sentence however it arrives (flow-telemetry-plan-control-25).
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -629,3 +630,52 @@ def test_the_quality_route_counts_today_so_far(world, monkeypatch):
     assert (last["day"], last["completeness"], last["in_progress"]) == (DAY, 1.0, True)
     viewer = world.role("viewer").get(f"/api/sites/{sid}/telemetry/quality")
     assert viewer.status_code == 200 and viewer.json()["days"][-1]["completeness"] == 1.0
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-25: format hints, size
+
+def test_epoch_seconds_and_milliseconds_are_read_as_times(company):
+    """C6_epoch_ts.csv was refused ("No rows with a readable ts were found") although the edge path reads epoch seconds; both are read now, as UTC
+    whatever zone is chosen (an epoch time names its own zone)."""
+    t = T0 + 9 * 3600
+    for scale, name in ((1, "seconds"), (1000, "milliseconds")):
+        sid = _site(f"Epoch {name}")
+        res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), [((t + 60 * i) * scale, 1, 40000) for i in range(30)]), 5,
+                                   now=NOW)
+        assert (res["rows"], res["from_ts"], res["to_ts"]) == (30, t, t + 29 * 60), name
+
+
+def test_day_first_dates_and_unreadable_times_are_refused_with_the_formats_read(company):
+    """C3_ddmmyyyy_timestamps.csv: refused with the formats the import reads and the way to read day-first dates, not 'no readable ts'."""
+    sid = _site("Formats")
+    with pytest.raises(ValueError) as e:
+        telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), [(f"06/11/2026 09:{i:02d}", 1, 40000) for i in range(30)]), 5,
+                             now=NOW)
+    msg = str(e.value)
+    assert "06/11/2026 09:00" in msg and "2026-11-06T09:00" in msg and "epoch seconds" in msg and "day first" in msg, msg
+    with pytest.raises(ValueError) as e:
+        telemetry.import_csv(sid, _file(("ts", "grid_present"), [("yesterday", 1), ("today", 1)]), 5, now=NOW)
+    msg = str(e.value)
+    assert "'yesterday'" in msg and "ISO 8601" in msg and "epoch seconds" in msg, msg
+    # the upload's own window check reads epoch times as the import does: a 1970 epoch row is refused before anything is read
+    from gridlytics import routes_telemetry
+    with pytest.raises(ValueError, match="before 2015"):
+        routes_telemetry._upload_window(_file(("ts", "grid_present"), [(60, 1), (T0, 1)]), 5)
+
+
+def test_a_file_over_the_upload_cap_is_told_the_importer_s_sentence(world):
+    """A 26 MB upload answered a bare 413 "The request is too large", and import_csv's own "larger than 30 MB" could never be reached. One cap now, the
+    API's body limit, with one sentence, through the route and from import_csv alike."""
+    from gridlytics import api
+    assert telemetry.UPLOAD_MAX_BYTES == api.MAX_BODY
+    with world.use():
+        sid = _site("Big")
+        with pytest.raises(ValueError, match="larger than 25 MB"):
+            telemetry.import_csv(sid, b"ts,grid_present\n" + b"x" * telemetry.UPLOAD_MAX_BYTES, 5, now=NOW)
+    c = world.owner
+    sid = c.post("/api/sites", json={"name": "Big route"}).json()["id"]
+    big = b"ts,grid_present\n" + b"2026-11-05T00:00,1\n" * (telemetry.UPLOAD_MAX_BYTES // 19 + 2)
+    r = c.post(f"/api/sites/{sid}/telemetry/upload", content=big, headers={"content-type": "text/csv"})
+    assert r.status_code == 413 and r.json()["detail"] == telemetry.TOO_LARGE, r.text
+    other = c.put(f"/api/sites/{sid}/outages/schedule", content=b"{" + b" " * api.MAX_BODY + b"}", headers={"content-type": "application/json"})
+    assert other.status_code == 413 and other.json()["detail"] == "The request is too large"
