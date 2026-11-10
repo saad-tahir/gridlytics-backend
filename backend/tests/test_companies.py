@@ -90,6 +90,11 @@ def _aged(token: str, seconds: int) -> str:
     return jwt.encode(claims, SECRET, algorithm="HS256")
 
 
+def _issued(token: str, iat: int) -> str:
+    """The same local token, issued at the unix second `iat` (signed again with the test's secret)."""
+    return _aged(token, jwt.decode(token, SECRET, algorithms=["HS256"], audience="authenticated")["iat"] - iat)
+
+
 def _file(company: dict) -> Path:
     return platformdb.company_file(company["id"])
 
@@ -212,9 +217,11 @@ def test_revocation_in_local_mode_is_at_once_for_a_token_made_before_the_change(
     assert companies.resolve(before, None)
     platformdb.set_password(sunia["id"], "another long password")
     assert _refused(401, "session_ended", before).detail == identity.ENDED
-    # a token naming no session, made in the second of the change, may be older than it: refused (audit parity-supabase-auth-01); one of the next second is not
-    _refused(401, "session_ended", _token(sunia))
-    fresh = _aged(_token(sunia), -1)
+    # a token naming no session, made in the second of the change, may be older than it: refused (audit parity-supabase-auth-01); one of the next second is
+    # not. Issued at the change's own second, not "now": a token made a moment later can fall in the next second (review: it did, under load)
+    changed = int(platformdb.account(sunia["id"])["sessions_from"])
+    _refused(401, "session_ended", _issued(_token(sunia), changed))
+    fresh = _issued(_token(sunia), changed + 1)
     assert companies.resolve(fresh, None)
     later = time.time() + 5
     monkeypatch.setattr(platformdb, "_clock", lambda: later)
