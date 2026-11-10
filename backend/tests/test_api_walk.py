@@ -96,7 +96,16 @@ def test_an_edge_key_reaches_only_its_own_site(world):
     assert client.post(f"/api/edge/{ids[0]}/telemetry", headers=kh, json=batch).json()["accepted"] == 1
     assert client.post(f"/api/edge/{ids[0]}/telemetry", headers=kh, json=batch).json()["duplicate"] is True
     assert client.post(f"/api/edge/{ids[1]}/telemetry", headers=kh, json=batch).status_code == 403
-    msg = client.get(f"/api/sites/{ids[0]}/plans/current/message", headers=kh).json()
+    # only a closed-loop site's edge is sent a plan (round 7): the first site is advisory, so its key gets a refusal and no table
+    tiers = {s["id"]: s["tier"] for s in client.get("/api/fleet", headers=h).json()["sites"]}
+    r = client.get(f"/api/sites/{ids[0]}/plans/current/message", headers=kh)
+    if tiers[ids[0]] == "closed_loop":
+        assert r.json()["signature"]["alg"] == "Ed25519"
+    else:
+        assert r.status_code == 409 and r.json()["code"] == "not_closed_loop", r.text
+    loop = next(i for i, t in tiers.items() if t == "closed_loop")
+    k2 = client.post("/api/platform/keys", headers=h, json={"name": "edge2", "role": "operator", "scopes": ["plans:read"], "site_id": loop, "kind": "edge"})
+    msg = client.get(f"/api/sites/{loop}/plans/current/message", headers={"Authorization": "Bearer " + k2.json()["token"]}).json()
     assert msg["signature"]["alg"] == "Ed25519"
     bad = dict(batch, seq=2, columns=["ts", "pv_power_w"], rows=[[1794000060, 1]])
     assert client.post(f"/api/edge/{ids[0]}/telemetry", headers=kh, json=bad).status_code == 422

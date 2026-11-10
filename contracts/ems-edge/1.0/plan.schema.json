@@ -1,0 +1,510 @@
+{
+  "$defs": {
+    "ApplyPolicy": {
+      "additionalProperties": false,
+      "description": "U3 5.4's mode_a.apply_policy: the edge writes a table only when it changed, at most this many a day, within the local window.",
+      "properties": {
+        "apply_window_local": {
+          "anyOf": [
+            {
+              "maxLength": 20,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Apply Window Local"
+        },
+        "max_table_writes_per_day": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Max Table Writes Per Day",
+          "type": "integer"
+        },
+        "write_if_changed_only": {
+          "default": true,
+          "title": "Write If Changed Only",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_table_writes_per_day"
+      ],
+      "title": "ApplyPolicy",
+      "type": "object"
+    },
+    "ModeA": {
+      "additionalProperties": false,
+      "properties": {
+        "apply_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApplyPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "days": {
+          "items": {
+            "$ref": "#/$defs/PlanDay"
+          },
+          "maxItems": 4,
+          "title": "Days",
+          "type": "array"
+        }
+      },
+      "required": [
+        "days"
+      ],
+      "title": "ModeA",
+      "type": "object"
+    },
+    "PlanDay": {
+      "additionalProperties": false,
+      "properties": {
+        "date": {
+          "maxLength": 10,
+          "title": "Date",
+          "type": "string"
+        },
+        "slots": {
+          "items": {
+            "$ref": "#/$defs/PlanSlot"
+          },
+          "maxItems": 96,
+          "title": "Slots",
+          "type": "array"
+        }
+      },
+      "required": [
+        "date",
+        "slots"
+      ],
+      "title": "PlanDay",
+      "type": "object"
+    },
+    "PlanSlot": {
+      "additionalProperties": true,
+      "description": "A Mode A slot as the compiler writes it (delivery.compile_mode_a); further fields the compiler adds are carried.",
+      "properties": {
+        "end": {
+          "maxLength": 40,
+          "title": "End",
+          "type": "string"
+        },
+        "end_ts": {
+          "title": "End Ts",
+          "type": "integer"
+        },
+        "export_allowed": {
+          "default": false,
+          "title": "Export Allowed",
+          "type": "boolean"
+        },
+        "grid_charge": {
+          "default": false,
+          "title": "Grid Charge",
+          "type": "boolean"
+        },
+        "max_charge_w": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Charge W"
+        },
+        "max_discharge_w": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Discharge W"
+        },
+        "mode": {
+          "maxLength": 40,
+          "title": "Mode",
+          "type": "string"
+        },
+        "soc_floor_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Soc Floor Pct"
+        },
+        "soc_target_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Soc Target Pct"
+        },
+        "start": {
+          "maxLength": 40,
+          "title": "Start",
+          "type": "string"
+        },
+        "start_ts": {
+          "title": "Start Ts",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start",
+        "end",
+        "start_ts",
+        "end_ts",
+        "mode"
+      ],
+      "title": "PlanSlot",
+      "type": "object"
+    },
+    "Signature": {
+      "additionalProperties": false,
+      "properties": {
+        "alg": {
+          "const": "Ed25519",
+          "title": "Alg",
+          "type": "string"
+        },
+        "key_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Key Id",
+          "type": "string"
+        },
+        "value": {
+          "maxLength": 200,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "alg",
+        "key_id",
+        "value"
+      ],
+      "title": "Signature",
+      "type": "object"
+    },
+    "Target": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Device Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_id"
+      ],
+      "title": "Target",
+      "type": "object"
+    },
+    "WriteBudget": {
+      "additionalProperties": false,
+      "description": "R6 3.6's write budget: the table and event writes a day the cloud plans for (at most the edge's cap).",
+      "properties": {
+        "event_writes_per_day": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Event Writes Per Day",
+          "type": "integer"
+        },
+        "table_writes_per_day": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Table Writes Per Day",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "table_writes_per_day",
+        "event_writes_per_day"
+      ],
+      "title": "WriteBudget",
+      "type": "object"
+    }
+  },
+  "$id": "ems-edge/1.0/plan.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The signed plan message an edge pulls (GET /api/sites/{id}/plans/current/message): a plan, or a release while control is paused or released\nto native or on a native-block day. U3 5.4's envelope fields are at the top level beside the body's (this contract signs the whole message but\n`signature`, not a nested body: README).",
+  "properties": {
+    "capabilities_fit": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Capabilities Fit"
+    },
+    "capabilities_seq": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Capabilities Seq"
+    },
+    "clock": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Clock"
+    },
+    "contract": {
+      "const": "ems-edge/1.0",
+      "title": "Contract",
+      "type": "string"
+    },
+    "edge_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Edge Id"
+    },
+    "fallback": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Fallback"
+    },
+    "issued_at": {
+      "maxLength": 40,
+      "title": "Issued At",
+      "type": "string"
+    },
+    "mode": {
+      "enum": [
+        "a",
+        "b"
+      ],
+      "title": "Mode",
+      "type": "string"
+    },
+    "mode_a": {
+      "$ref": "#/$defs/ModeA"
+    },
+    "mode_b": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Mode B"
+    },
+    "msg_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Msg Id",
+      "type": "string"
+    },
+    "msg_type": {
+      "const": "plan",
+      "title": "Msg Type",
+      "type": "string"
+    },
+    "notes": {
+      "additionalProperties": true,
+      "title": "Notes",
+      "type": "object"
+    },
+    "plan_id": {
+      "anyOf": [
+        {
+          "maxLength": 120,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Plan Id"
+    },
+    "release": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Release"
+    },
+    "sent_at": {
+      "maxLength": 40,
+      "title": "Sent At",
+      "type": "string"
+    },
+    "seq": {
+      "maximum": 9007199254740991,
+      "minimum": 1,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "signature": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Signature"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "site_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Site Id",
+      "type": "string"
+    },
+    "supersedes": {
+      "anyOf": [
+        {
+          "maxLength": 120,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Supersedes"
+    },
+    "targets": {
+      "items": {
+        "$ref": "#/$defs/Target"
+      },
+      "maxItems": 20,
+      "title": "Targets",
+      "type": "array"
+    },
+    "timezone": {
+      "const": "Asia/Karachi",
+      "title": "Timezone",
+      "type": "string"
+    },
+    "type": {
+      "enum": [
+        "plan",
+        "release"
+      ],
+      "title": "Type",
+      "type": "string"
+    },
+    "valid_from": {
+      "maxLength": 40,
+      "title": "Valid From",
+      "type": "string"
+    },
+    "valid_until": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Valid Until"
+    },
+    "write_budget": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WriteBudget"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "contract",
+    "msg_type",
+    "msg_id",
+    "type",
+    "plan_id",
+    "site_id",
+    "seq",
+    "sent_at",
+    "issued_at",
+    "valid_from",
+    "valid_until",
+    "timezone",
+    "mode",
+    "mode_a"
+  ],
+  "title": "PlanMessage",
+  "type": "object"
+}

@@ -11,16 +11,16 @@ import base64
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Literal
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from pydantic import BaseModel, ConfigDict, Field
 
 from . import platform as platformdb
 from . import store, twin
+from .contract import canonical_json as _jcs
 
 PKT = timezone(timedelta(hours=5))
 CONTRACT = "ems-edge/1.0"
@@ -967,112 +967,295 @@ def mode_b(steps: list[dict]) -> dict:
 # ------------------------------------------------------------------------------------------------ signing (Ed25519, one key per site)
 
 def _key_dir() -> Path:
-    d = platformdb.data_dir() / "keys" / store.db_path().stem
-    d.mkdir(parents=True, exist_ok=True)
+    """The company's keys folder, <data folder>/keys/<its file's stem>: the owner's alone (0700), as each key in it is (0600; plan Part 2.8)."""
+    root = platformdb.data_dir() / "keys"
+    d = root / store.db_path().stem
+    for folder in (root, d):
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name != "nt" and folder.stat().st_mode & 0o077:
+            try:
+                os.chmod(folder, 0o700)          # a folder made open before round 7
+            except OSError:
+                pass
     return d
 
 
-def _site_key(site_id: str) -> tuple[str, Ed25519PrivateKey]:
-    with store.connect() as con:
-        r = con.execute("SELECT key_id, private_path FROM site_keys WHERE site_id = ? AND retired IS NULL ORDER BY created DESC LIMIT 1",
-                        (site_id,)).fetchone()
-    if r and Path(r["private_path"]).exists():
-        return r["key_id"], serialization.load_pem_private_key(Path(r["private_path"]).read_bytes(), password=None)
+def _write_key(path: Path, key: Ed25519PrivateKey) -> None:
+    """The private key written owner-only from its first byte (plan Part 2.8: private keys in 0600 files; audit security-roles-11): the file is made
+    with its mode (os.open, O_EXCL: never over a file there), never written open and narrowed after, where a refused chmod would leave it readable."""
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(pem)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+class KeyMissing(RuntimeError):
+    """The site's signing key on record is not in the keys folder, or the file there is not that key (audit engine-delivery-13). It is never
+    replaced on its own: a new key would sign plans that no edge given the old public key accepts. The keys folder is restored from the backup, or
+    an administrator replaces the key (`replace_key`, POST /api/sites/{id}/edge/key) and the new public key is provisioned on the edge."""
+
+    def __init__(self, site_id: str, key_id: str, why: str = "is missing from the keys folder"):
+        self.site_id, self.key_id = site_id, key_id
+        super().__init__(f"The site's signing key {key_id} {why}, so no plan is signed: restore the keys folder from the backup, or an administrator "
+                         "replaces the key and the new public key is provisioned on the edge")
+
+
+#: The site's key in force: its newest key not retired (one at most since round 7; a tie of two made at once before is broken by its id)
+_IN_FORCE = "SELECT key_id, public_key, private_path FROM site_keys WHERE site_id = ? AND retired IS NULL ORDER BY created DESC, key_id DESC LIMIT 1"
+
+
+def _public_b64(key: Ed25519PrivateKey) -> str:
+    return base64.b64encode(key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+
+
+def _key_file(kept: str) -> Path:
+    """Where a key kept as `kept` is. A key is kept by its file name in the company's keys folder, which is read in today's data folder, so a moved
+    or restored data folder still finds it (audit engine-delivery-13). A key kept before round 7 holds the absolute path of its time (a Windows one
+    on a Linux host, say): its name is read in today's keys folder, and the old path only while the file is not there."""
+    name = PureWindowsPath(kept).name                 # a Windows path or a POSIX one: both separators are taken
+    here = _key_dir() / name
+    return here if here.exists() or name == kept else Path(kept)
+
+
+def _load(site_id: str, row) -> Ed25519PrivateKey:
+    """The private key of a site_keys row; KeyMissing when its file is not there, does not read, or is not the key whose public half is on record."""
+    try:
+        key = serialization.load_pem_private_key(_key_file(row["private_path"]).read_bytes(), password=None)
+    except FileNotFoundError:
+        raise KeyMissing(site_id, row["key_id"]) from None
+    except (OSError, ValueError, TypeError, UnsupportedAlgorithm):
+        raise KeyMissing(site_id, row["key_id"], "in the keys folder does not read") from None
+    if not isinstance(key, Ed25519PrivateKey) or _public_b64(key) != row["public_key"]:
+        raise KeyMissing(site_id, row["key_id"], "in the keys folder is not the key on record")
+    return key
+
+
+def _new_key(con, site_id: str) -> tuple[str, Ed25519PrivateKey]:
+    """A new key for the site, written to the keys folder and recorded (by its file name, never a path) in the caller's write transaction."""
     key = Ed25519PrivateKey.generate()
     kid = store.new_id(8)
-    path = _key_dir() / f"{site_id}-{kid}.pem"
-    path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    with store.connect() as con:
-        con.execute("INSERT INTO site_keys (site_id, key_id, public_key, private_path, created) VALUES (?,?,?,?,?)",
-                    (site_id, kid, base64.b64encode(pub).decode(), str(path), store._now()))
+    name = f"{site_id}-{kid}.pem"
+    _write_key(_key_dir() / name, key)
+    con.execute("INSERT INTO site_keys (site_id, key_id, public_key, private_path, created) VALUES (?,?,?,?,?)",
+                (site_id, kid, _public_b64(key), name, store._now()))
     return kid, key
 
 
+def _site_key(site_id: str) -> tuple[str, Ed25519PrivateKey]:
+    """The site's signing key in force. The first signing makes it, once however many ask at once (the check and the insert are one write
+    transaction, so a second caller waits and reads the first one's key); after that it is never made again on its own: a key on record whose file
+    is missing, or is not that key, raises KeyMissing (audit engine-delivery-13)."""
+    with store.connect() as con:
+        r = con.execute(_IN_FORCE, (site_id,)).fetchone()
+    if r is None:
+        with store.write_transaction() as con:
+            r = con.execute(_IN_FORCE, (site_id,)).fetchone()
+            if r is None:
+                return _new_key(con, site_id)
+    return r["key_id"], _load(site_id, r)
+
+
 def public_key(site_id: str) -> dict:
-    kid, key = _site_key(site_id)
-    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    return {"key_id": kid, "alg": "Ed25519", "public_key": base64.b64encode(pub).decode()}
+    """The site's public key in force, {key_id, alg, public_key, missing}: the key on record (the one its edge was given), with `missing` true when
+    its private key is not in the keys folder or is not that key, so nothing is signed until it is restored or replaced. The first call makes the
+    key, as the first signing does."""
+    with store.connect() as con:
+        r = con.execute(_IN_FORCE, (site_id,)).fetchone()
+    if r is None:
+        kid, key = _site_key(site_id)
+        return {"key_id": kid, "alg": "Ed25519", "public_key": _public_b64(key), "missing": False}
+    try:
+        _load(site_id, r)
+        missing = False
+    except KeyMissing:
+        missing = True
+    return {"key_id": r["key_id"], "alg": "Ed25519", "public_key": r["public_key"], "missing": missing}
+
+
+def replace_key(site_id: str, by: str, reason: str) -> tuple[dict, list[str]]:
+    """A new signing key for the site, every key in force retired (plan Part 2.8: on a lost key and on a handover): an administrator's action, in
+    the audit trail with its reason. A retired key's file is kept, so the plan messages it signed still verify for a dispute. The edge refuses the
+    plans signed with the new key until its public key is provisioned there. Returns the new public key and the key ids retired."""
+    with store.write_transaction() as con:
+        retired = [r["key_id"] for r in con.execute("SELECT key_id FROM site_keys WHERE site_id = ? AND retired IS NULL ORDER BY created, key_id",
+                                                    (site_id,))]
+        con.execute("UPDATE site_keys SET retired = ? WHERE site_id = ? AND retired IS NULL", (store._now(), site_id))
+        kid, key = _new_key(con, site_id)
+        store.audit(by, "replaced the site's signing key", site_id, {"key_id": kid, "retired": retired, "reason": reason}, con=con)
+    return {"key_id": kid, "alg": "Ed25519", "public_key": _public_b64(key), "missing": False}, retired
 
 
 def canonical(body: dict) -> bytes:
+    """The bytes a plan message's signature covers: the RFC 8785 canonical JSON of the message without `signature` (contract.canonical_json), which
+    an edge in any language reproduces from the message as it parses it (audit engine-delivery-22)."""
+    return _jcs(body)
+
+
+def _legacy_canonical(body: dict) -> bytes:
+    """What a plan message was signed over before round 7 (Python's json.dumps, which only a Python edge reproduces): read only by `verify`, so a
+    message stored before still verifies for a dispute."""
     return json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()
 
 
+def _plain(v):
+    """A value as the JSON the API sends of it: a numpy scalar is its number, a datetime or other object its text (as signed before)."""
+    return v.item() if isinstance(v, np.generic) else str(v)
+
+
 def sign(site_id: str, body: dict) -> dict:
+    """The message signed with the site's key in force. The body is first made the plain JSON it is sent as (a numpy number its number, a tuple a
+    list), so the message returned, stored and sent is the very value whose canonical bytes were signed."""
     kid, key = _site_key(site_id)
-    return {**body, "signature": {"alg": "Ed25519", "key_id": kid, "value": base64.b64encode(key.sign(canonical(body))).decode()}}
+    plain = json.loads(json.dumps(body, default=_plain, allow_nan=False))
+    return {**plain, "signature": {"alg": "Ed25519", "key_id": kid, "value": base64.b64encode(key.sign(canonical(plain))).decode()}}
 
 
 def verify(message: dict, public_b64: str) -> bool:
+    """Whether the message's signature is the key's over its canonical bytes (or, for a message signed before round 7, over Python's json.dumps)."""
     body = {k: v for k, v in message.items() if k != "signature"}
     try:
-        Ed25519PublicKey.from_public_bytes(base64.b64decode(public_b64)).verify(base64.b64decode(message["signature"]["value"]), canonical(body))
-        return True
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(public_b64))
+        sig = base64.b64decode(message["signature"]["value"])
     except Exception:
         return False
+    for form in (canonical, _legacy_canonical):
+        try:
+            pub.verify(sig, form(body))
+            return True
+        except Exception:
+            continue
+    return False
 
 
 # ------------------------------------------------------------------------------------------------ ems-edge/1.0 messages (strict; the one validator)
 
-class _Msg(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    contract: Literal["ems-edge/1.0"] = CONTRACT
-    seq: int = Field(ge=0)
-    sent_at: str
+# The message models live in contract.py (plan DAT-02), with the JSON Schema files generated from them; they are named here as before
+from .contract import (Ack, AckItem, Capabilities, Device, Event, EventBatch, Heartbeat, PlanMessage, TelemetryBatch,  # noqa: E402,F401
+                       INVERTER_ROLES)
 
 
-class TelemetryBatch(_Msg):
-    columns: list[str] = Field(min_length=2, max_length=40)
-    rows: list[list[float | int | str | None]] = Field(max_length=1440)
-    quality: dict = Field(default_factory=dict)
+def latest_capabilities(site_id: str) -> dict | None:
+    """The site's current capabilities message (the newest by its sent_at, whatever its sequence: routes_edge.edge_caps), with `seq`; None when the
+    edge has sent none."""
+    with store.connect() as con:
+        r = con.execute("SELECT seq, body FROM capabilities WHERE site_id = ? ORDER BY sent_ts IS NULL, sent_ts DESC, received_at DESC LIMIT 1",
+                        (site_id,)).fetchone()
+    if r is None:
+        return None
+    body = json.loads(r["body"])
+    return {**body, "seq": int(r["seq"])}
 
 
-class Heartbeat(_Msg):
-    uptime_s: int = Field(ge=0)
-    active_plan: str | None = None
-    valid_until: str | None = None
-    control_state: Literal["following_plan", "native", "hold", "released", "disabled"] = "native"
-    queue_depth: int = Field(0, ge=0)
-    clock_offset_s: float = 0.0
+def targets(caps: dict | None) -> list[dict]:
+    """The devices a plan targets (U3 5.4 `targets`): the inverters the capabilities name."""
+    return [{"device_id": d["device_id"]} for d in (caps or {}).get("devices") or [] if d.get("role") in INVERTER_ROLES and d.get("device_id")]
 
 
-class Event(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    ts: str
-    type: Literal["outage_start", "outage_end", "genset_start", "genset_stop", "plan_received", "plan_rejected", "plan_applied", "plan_expired",
-                  "fallback_engaged", "fallback_cleared", "readback_mismatch", "write_failed", "budget_exhausted", "local_override",
-                  "template_change", "firmware_change", "control_disabled", "control_enabled", "reboot", "link_lost", "clock_unsynced",
-                  "battery_trust_low", "physics_check_failed", "data_gap", "installer_session"]
-    detail: dict = Field(default_factory=dict)
+class NotWritable(ValueError):
+    """A table the device's capabilities cannot take as it stands (more slots than its slot model holds): it is not signed (R6 C1)."""
 
 
-class EventBatch(_Msg):
-    events: list[Event] = Field(max_length=500)
+def fit_to_capabilities(days: list[dict], caps: dict | None) -> tuple[list[dict], dict | None]:
+    """The Mode A days as the target inverter can write them (R6 C1, brief: Product 1 compiles only what the device reports writable; audit
+    brief-vs-build-12). From the first inverter in the current capabilities that names its primitives: a grid-charge, generator-charge or export flag
+    the device cannot write is dropped (the slot runs without it), a power limit is held to battery_power_w's range, and a floor or target to its
+    primitive's range. A day with more slots than the device's slot model holds raises NotWritable. A device that names no primitives (an edge that
+    reports none) gets the table unchanged, as before. Returns the days and what was fitted ({device_id, capabilities_seq, not_writable, clamped}),
+    or None when nothing changed."""
+    dev = next((d for d in (caps or {}).get("devices") or [] if d.get("role") in INVERTER_ROLES and d.get("primitives")), None)
+    if dev is None:
+        return days, None
+    prims, model = dev["primitives"], dev.get("slot_model") or {}
+    dropped, clamped = set(), set()
+
+    def held(s: dict, key: str, lo, hi, name: str) -> None:
+        v = s.get(key)
+        if v is None:
+            return
+        x = min(max(float(v), lo if lo is not None else float(v)), hi if hi is not None else float(v))
+        if x != float(v):
+            s[key] = round(x) if isinstance(v, int) else x
+            clamped.add(name)
+
+    out = []
+    for day in days:
+        cap = model.get("max_slots")
+        if cap and len(day.get("slots") or []) > int(cap):
+            raise NotWritable(f"The table of {day.get('date')} has {len(day['slots'])} slots and the device {dev['device_id']} takes {int(cap)}")
+        slots = []
+        for s in day.get("slots") or []:
+            s = dict(s)
+            for flag, prim in (("grid_charge", "grid_charge_allowed"), ("gen_charge", "gen_charge_allowed"), ("export_allowed", "export_limit_w")):
+                if s.get(flag) and prim not in prims:
+                    s[flag] = False
+                    dropped.add(prim)
+            power = prims.get("battery_power_w")
+            if power is not None:
+                hi, lo = power.get("max"), power.get("min")
+                held(s, "max_discharge_w", None, hi, "battery_power_w")
+                held(s, "max_charge_w", None, abs(lo) if lo is not None else None, "battery_power_w")
+            for key in ("soc_floor_pct", "soc_target_pct"):
+                r = prims.get(key)
+                if r is not None:
+                    held(s, key, r.get("min"), r.get("max"), key)
+            slots.append(s)
+        out.append({**day, "slots": slots})
+    if not dropped and not clamped:
+        return days, None
+    return out, {"device_id": dev["device_id"], "capabilities_seq": (caps or {}).get("seq"), "not_writable": sorted(dropped), "clamped": sorted(clamped)}
 
 
-class AckItem(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    device: str = Field(max_length=60)
-    primitive: str = Field(max_length=60)
-    written: float | str | None = None
-    read_back: float | str | None = None
-    status: Literal["ok", "clamped", "failed"]
-    codes: list[str] = Field(default_factory=list, max_length=10)
+#: The slot modes that avoid the peak by discharging: those R6 C10 widens when the inverter clock is off
+PEAK_MODES = ("discharge", "export")
 
 
-class Ack(_Msg):
-    plan_id: str
-    status: Literal["received", "applied", "rejected", "expired"]
-    items: list[AckItem] = Field(default_factory=list, max_length=200)
-
-
-class Capabilities(_Msg):
-    edge_version: str = Field(max_length=40)
-    clock_synced: bool = True
-    tier: Literal["monitor", "advisory_writes", "closed_loop"] = "monitor"
-    devices: list[dict] = Field(default_factory=list, max_length=20)
+def widen_peak_slots(days: list[dict], minutes: int = 15, min_slot_minutes: int = 15) -> list[dict]:
+    """The Mode A days with every discharge or export slot started `minutes` early and ended `minutes` late (R6 C10: an inverter clock more than 300 s
+    off shifts every boundary; being early costs a little stored energy, being late costs the peak tariff; audit engine-delivery-10). The slots beside
+    it give up that time (never more than they hold), and one left shorter than the device's shortest slot (`min_slot_minutes`) gives the rest of its
+    time to the discharge beside it. A charge slot's charge_end is kept within the slot. The local HH:MM times follow the new boundaries."""
+    step = int(minutes) * 60
+    hhmm = lambda t: datetime.fromtimestamp(int(t), PKT).strftime("%H:%M")
+    out = []
+    for day in days:
+        slots = sorted((dict(s) for s in day.get("slots") or []), key=lambda s: s["start_ts"])
+        peak = [s.get("mode") in PEAK_MODES for s in slots]
+        if not any(peak):
+            out.append(day)
+            continue
+        for i, s in enumerate(slots):
+            if not peak[i]:
+                continue
+            if i > 0 and not peak[i - 1]:
+                s["start_ts"] = max(slots[i - 1]["start_ts"], s["start_ts"] - step)
+                slots[i - 1]["end_ts"] = s["start_ts"]
+            if i + 1 < len(slots) and not peak[i + 1]:
+                s["end_ts"] = min(slots[i + 1]["end_ts"], s["end_ts"] + step)
+                slots[i + 1]["start_ts"] = s["end_ts"]
+        kept: list[tuple[dict, bool]] = []
+        for i, s in enumerate(slots):
+            if not peak[i] and s["end_ts"] - s["start_ts"] < int(min_slot_minutes) * 60:
+                if i + 1 < len(slots) and peak[i + 1]:
+                    slots[i + 1]["start_ts"] = s["start_ts"]
+                elif kept:
+                    kept[-1][0]["end_ts"] = s["end_ts"]
+                elif i + 1 < len(slots):
+                    slots[i + 1]["start_ts"] = s["start_ts"]
+                else:
+                    kept.append((s, peak[i]))
+                continue
+            kept.append((s, peak[i]))
+        new = []
+        for s, _ in kept:
+            s["start"], s["end"] = hhmm(s["start_ts"]), hhmm(s["end_ts"])
+            if s.get("charge_end_ts") is not None and s["charge_end_ts"] > s["end_ts"]:
+                s["charge_end_ts"] = s["end_ts"]
+                if "charge_end" in s:
+                    s["charge_end"] = hhmm(s["end_ts"])
+            new.append(s)
+        out.append({**day, "slots": new})
+    return out

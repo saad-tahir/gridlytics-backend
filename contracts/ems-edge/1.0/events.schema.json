@@ -1,0 +1,172 @@
+{
+  "$defs": {
+    "Event": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "additionalProperties": true,
+          "description": "Free-form: at most 4096 bytes of compact JSON",
+          "maxProperties": 64,
+          "title": "Detail",
+          "type": "object"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source"
+        },
+        "ts": {
+          "maxLength": 40,
+          "title": "Ts",
+          "type": "string"
+        },
+        "type": {
+          "description": "One of the known event types (examples); an unknown one is stored and named in the answer",
+          "examples": [
+            "outage_start",
+            "outage_end",
+            "genset_start",
+            "genset_stop",
+            "plan_received",
+            "plan_rejected",
+            "plan_applied",
+            "plan_expired",
+            "fallback_engaged",
+            "fallback_cleared",
+            "readback_mismatch",
+            "write_failed",
+            "budget_exhausted",
+            "local_override",
+            "template_change",
+            "firmware_change",
+            "control_disabled",
+            "control_enabled",
+            "reboot",
+            "link_lost",
+            "clock_unsynced",
+            "battery_trust_low",
+            "physics_check_failed",
+            "data_gap",
+            "installer_session",
+            "override_local",
+            "template_change_detected",
+            "firmware_change_detected",
+            "edge_reboot",
+            "installer_session_start",
+            "installer_session_end"
+          ],
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ts",
+        "type"
+      ],
+      "title": "Event",
+      "type": "object"
+    }
+  },
+  "$id": "ems-edge/1.0/events.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "ems-edge/1.0",
+      "default": "ems-edge/1.0",
+      "title": "Contract",
+      "type": "string"
+    },
+    "edge_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Edge Id"
+    },
+    "events": {
+      "items": {
+        "$ref": "#/$defs/Event"
+      },
+      "maxItems": 500,
+      "title": "Events",
+      "type": "array"
+    },
+    "msg_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Id"
+    },
+    "msg_type": {
+      "anyOf": [
+        {
+          "const": "events",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Type"
+    },
+    "sent_at": {
+      "maxLength": 40,
+      "title": "Sent At",
+      "type": "string"
+    },
+    "seq": {
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "site_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Site Id"
+    }
+  },
+  "required": [
+    "seq",
+    "sent_at",
+    "events"
+  ],
+  "title": "EventBatch",
+  "type": "object"
+}

@@ -1,0 +1,83 @@
+{
+  "contract": "ems-edge/1.0",
+  "msg_type": "ack",
+  "msg_id": "...",
+  "site_id": "pk-lhr-0007",
+  "edge_id": "edge-00a1b2",
+  "sent_at": "2026-11-06T13:05:03Z",
+  "seq": 2210,
+  "plan_id": "pk-lhr-0007:2026-11-06T13:00Z:v1",
+  "status": "partial",
+  "received_at": "2026-11-06T13:00:09Z",
+  "applied_at": "2026-11-06T13:05:00Z",
+  "per_device": [
+    {
+      "device_id": "inv1",
+      "status": "partial",
+      "writes_used_today": {
+        "tou_table": 2
+      },
+      "applied": [
+        {
+          "primitive": "slot_table",
+          "requested_hash": "sha256:ab12",
+          "written": {
+            "prog": [
+              [
+                "00:00",
+                0,
+                40,
+                0
+              ],
+              [
+                "05:30",
+                6000,
+                95,
+                0
+              ],
+              [
+                "10:00",
+                0,
+                60,
+                0
+              ],
+              [
+                "17:00",
+                0,
+                85,
+                0
+              ],
+              [
+                "18:30",
+                0,
+                20,
+                0
+              ],
+              [
+                "23:00",
+                3000,
+                40,
+                1
+              ]
+            ]
+          },
+          "readback_ok": true
+        },
+        {
+          "primitive": "export_limit_w",
+          "requested": 0,
+          "written": 0,
+          "readback": 0,
+          "readback_ok": true
+        }
+      ],
+      "rejected": [
+        {
+          "primitive": "gen_charge_allowed",
+          "reason": "NOT_SUPPORTED",
+          "detail": "template has no gen input on this model"
+        }
+      ]
+    }
+  ]
+}

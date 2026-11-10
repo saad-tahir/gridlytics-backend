@@ -1,0 +1,45 @@
+{
+  "contract": "ems-edge/1.0",
+  "canonicalization": "RFC 8785 (JSON Canonicalization Scheme): no whitespace, members sorted by their names' UTF-16 code units, strings and numbers as ECMAScript's JSON.stringify writes them, UTF-8",
+  "signed_bytes": "The plan message without its `signature` member, canonicalised; `signature.value` is the base64 Ed25519 signature of those bytes by the site's key `signature.key_id`. Parse the message as sent, remove `signature`, canonicalise the rest and verify.",
+  "canonical": [
+    {
+      "name": "RFC 8785 3.2.2: numbers, escapes and literals",
+      "json": "{\"numbers\": [333333333.33333329, 1E30, 4.50, 2e-3, 0.000000000000000000000000001], \"string\": \"\\u20ac$\\u000F\\u000aA'\\u0042\\u0022\\u005c\\\\\\\"\\/\", \"literals\": [null, true, false]}",
+      "canonical": "{\"literals\":[null,true,false],\"numbers\":[333333333.3333333,1e+30,4.5,0.002,1e-27],\"string\":\"\u20ac$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}"
+    },
+    {
+      "name": "RFC 8785 3.2.3: members sorted by UTF-16 code units",
+      "json": "{\"\\u20ac\": \"Euro Sign\", \"\\r\": \"Carriage Return\", \"\\ufb33\": \"Hebrew Letter Dalet With Dagesh\", \"1\": \"One\", \"\\ud83d\\ude00\": \"Emoji: Grinning Face\", \"\\u0080\": \"Control\", \"\\u00f6\": \"Latin Small Letter O With Diaeresis\"}",
+      "canonical": "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\u0080\":\"Control\",\"\u00f6\":\"Latin Small Letter O With Diaeresis\",\"\u20ac\":\"Euro Sign\",\"\ud83d\ude00\":\"Emoji: Grinning Face\",\"\ufb33\":\"Hebrew Letter Dalet With Dagesh\"}"
+    },
+    {
+      "name": "RFC 8785 Appendix B: the shortest form, the exponent past 1e21 and under 1e-6",
+      "json": "[0, -0, 5e-324, 1.7976931348623157e+308, 9007199254740992, 295147905179352830000, 1e+23, 999999999999999700000, 1e21, 9.999999999999997e-7, 0.000001, 333333333.33333325, -0.0000033333333333333333, 1424953923781206.2]",
+      "canonical": "[0,0,5e-324,1.7976931348623157e+308,9007199254740992,295147905179352830000,1e+23,999999999999999700000,1e+21,9.999999999999997e-7,0.000001,333333333.33333325,-0.0000033333333333333333,1424953923781206.2]"
+    },
+    {
+      "name": "Whole-number floats are written as integers, as JavaScript writes them",
+      "json": "{\"soc_floor_pct\": 20.0, \"min_soc_floor_pct\": 20.0, \"max_discharge_w\": 50000.0, \"soc_target_pct\": 100.0}",
+      "canonical": "{\"max_discharge_w\":50000,\"min_soc_floor_pct\":20,\"soc_floor_pct\":20,\"soc_target_pct\":100}"
+    },
+    {
+      "name": "Small and inexact numbers",
+      "json": "{\"a\": 1e-05, \"b\": 0.1, \"c\": 0.30000000000000004, \"d\": -2.5e-07, \"e\": 1.5e+300}",
+      "canonical": "{\"a\":0.00001,\"b\":0.1,\"c\":0.30000000000000004,\"d\":-2.5e-7,\"e\":1.5e+300}"
+    },
+    {
+      "name": "Nesting, Unicode as itself, an empty object and array",
+      "json": "{\"z\": {\"y\": [], \"x\": {}}, \"a\": [{\"b\": \"Lahore \\u2013 Multan\", \"c\": \"\\u0627\\u0631\\u062f\\u0648\"}], \"slots\": [{\"end\": \"19:00\", \"start\": \"17:00\"}]}",
+      "canonical": "{\"a\":[{\"b\":\"Lahore \u2013 Multan\",\"c\":\"\u0627\u0631\u062f\u0648\"}],\"slots\":[{\"end\":\"19:00\",\"start\":\"17:00\"}],\"z\":{\"x\":{},\"y\":[]}}"
+    }
+  ],
+  "signature": {
+    "note": "RFC 8032 7.1 TEST 1's key, published in the RFC: never a site's key",
+    "alg": "Ed25519",
+    "key_id": "example-key",
+    "public_key": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+    "message_json": "{\n  \"contract\": \"ems-edge/1.0\",\n  \"msg_type\": \"plan\",\n  \"msg_id\": \"8a6d3f0e-2b1c-4e5f-9a7b-0c1d2e3f4a5b\",\n  \"type\": \"plan\",\n  \"plan_id\": \"plan-example\",\n  \"site_id\": \"example-site\",\n  \"seq\": 7,\n  \"sent_at\": \"2026-11-10T12:00:05+00:00\",\n  \"issued_at\": \"2026-11-10T12:00:00+00:00\",\n  \"valid_from\": \"2026-11-10T12:00:00+00:00\",\n  \"valid_until\": \"2026-11-11T12:00:00+00:00\",\n  \"timezone\": \"Asia/Karachi\",\n  \"mode\": \"a\",\n  \"fallback\": {\n    \"on_expiry\": \"inverter_native\",\n    \"min_soc_floor_pct\": 20.0,\n    \"revert_after_hours\": 3\n  },\n  \"mode_a\": {\n    \"days\": [\n      {\n        \"date\": \"2026-11-10\",\n        \"slots\": [\n          {\n            \"start\": \"17:00\",\n            \"end\": \"21:00\",\n            \"start_ts\": 1794312000,\n            \"end_ts\": 1794326400,\n            \"mode\": \"discharge\",\n            \"soc_floor_pct\": 20.0,\n            \"soc_target_pct\": 20.0,\n            \"max_discharge_w\": 50000.0,\n            \"max_charge_w\": 0.0,\n            \"grid_charge\": false,\n            \"export_allowed\": false\n          }\n        ]\n      }\n    ]\n  },\n  \"notes\": {\n    \"reason\": \"Following\"\n  },\n  \"signature\": {\n    \"alg\": \"Ed25519\",\n    \"key_id\": \"example-key\",\n    \"value\": \"bcWhw4e8pUlymYsknEC7UXItpwopBklMb5p9snGZ9fwbZ+YwGXp6UpKpnJxUEsPcqxhLyJ0Gc/6jXYebyLWxAg==\"\n  }\n}",
+    "signed_text": "{\"contract\":\"ems-edge/1.0\",\"fallback\":{\"min_soc_floor_pct\":20,\"on_expiry\":\"inverter_native\",\"revert_after_hours\":3},\"issued_at\":\"2026-11-10T12:00:00+00:00\",\"mode\":\"a\",\"mode_a\":{\"days\":[{\"date\":\"2026-11-10\",\"slots\":[{\"end\":\"21:00\",\"end_ts\":1794326400,\"export_allowed\":false,\"grid_charge\":false,\"max_charge_w\":0,\"max_discharge_w\":50000,\"mode\":\"discharge\",\"soc_floor_pct\":20,\"soc_target_pct\":20,\"start\":\"17:00\",\"start_ts\":1794312000}]}]},\"msg_id\":\"8a6d3f0e-2b1c-4e5f-9a7b-0c1d2e3f4a5b\",\"msg_type\":\"plan\",\"notes\":{\"reason\":\"Following\"},\"plan_id\":\"plan-example\",\"sent_at\":\"2026-11-10T12:00:05+00:00\",\"seq\":7,\"site_id\":\"example-site\",\"timezone\":\"Asia/Karachi\",\"type\":\"plan\",\"valid_from\":\"2026-11-10T12:00:00+00:00\",\"valid_until\":\"2026-11-11T12:00:00+00:00\"}"
+  }
+}

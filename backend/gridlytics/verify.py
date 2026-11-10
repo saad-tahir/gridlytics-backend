@@ -870,9 +870,9 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
                                "v_rs_per_kwh": v_start, "carry_rs": v_start * gap_start},
                      "end": {"state": _end_state(sim), "baseline_e_kwh": e_end_base, "actual_e_kwh": e_end_actual, "gap_kwh": gap_end,
                              "v_rs_per_kwh": v_end, "carry_rs": v_end * gap_end, "unread_min": unread}}
-    # fidelity gates the claim (plan 8.4): a monitor site only recommends, even in the demo; closed loop (the demo's twin included) follows the plan by
-    # construction; in tier advisory a day counts only once telemetry confirms the keyed table (plan 7.6), never on the mark alone, at a demo site too
-    # (audit engine-delivery-18: every demo day was confirmed, marked or not)
+    # fidelity gates the claim (plan 8.4): a monitor site only recommends, even in the demo; a closed-loop day by what its edge reported
+    # (plans.edge_fidelity; the demo's edge is the twin); in tier advisory a day counts only once telemetry confirms the keyed table (plan 7.6), never
+    # on the mark alone, at a demo site too (audit engine-delivery-18: every demo day was confirmed, marked or not)
     tier = site.get("tier", "monitor")
     with store.connect() as con:
         applied = con.execute("SELECT * FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1",
@@ -886,7 +886,8 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
     elif tier == "monitor":
         fidelity = "recommendation_only"
     elif tier == "closed_loop":
-        fidelity = "confirmed"
+        # what the edge reported decides: a day it ran on fallback, with control disabled or the plan refused claims nothing (audit engine-delivery-12)
+        fidelity = plans.edge_fidelity(site_id, day)
     elif tier == "advisory_writes":
         if applied is None:
             fidelity = "not_applied"

@@ -118,6 +118,11 @@ def _carried_genset(site_id: str, t0: int) -> dict:
 
 
 RELEASE_REASONS = {"pause_control": "control_paused", "force_native": "released_to_native"}
+#: the held reason of a day in a native block of the switchback calendar (plan 8.2, VER-08: a baseline block plans "native"); it holds the plan as a
+#: pause does, but comes from the calendar, not from an override, so no person resumes it: the block's end does
+SWITCHBACK_REASON = "switchback_native"
+#: every held reason under which no plan is in force because the inverter runs its own settings
+RELEASED_REASONS = (*RELEASE_REASONS.values(), SWITCHBACK_REASON)
 
 
 def _ts(iso: str | None) -> int | None:
@@ -138,15 +143,17 @@ def _override_steps(o: dict, ts: np.ndarray) -> np.ndarray:
 
 
 def control_release(site_id: str, at: int | None = None) -> dict | None:
-    """The pause (pause_control) or release to native (force_native) in force at `at` (now by default), else None. While one is in force no
-    plan is in force: the tick stores its plan as held and the edge is sent a release instead of the slots (Part 7.3)."""
+    """The pause (pause_control) or release to native (force_native) in force at `at` (now by default), else, on a day in a native block of the
+    switchback calendar, that block (`switchback_release`), else None. While one is in force no plan is in force: the tick stores its plan as held
+    and the edge is sent a release instead of the slots (Part 7.3). A person's pause or release comes first: it names who placed it and can be
+    resumed, which a calendar block cannot."""
     at = int(at if at is not None else datetime.now(timezone.utc).timestamp())
     ovs = sites.overrides(site_id)
     for kind in ("pause_control", "force_native"):
         for o in ovs:
             if o["kind"] == kind and bool(_override_steps(o, np.array([forecast.align(at)]))[0]):
                 return {"reason": RELEASE_REASONS[kind], "kind": kind, "until": o["until_ts"], "author": o["author"], "override_id": o["id"]}
-    return None
+    return switchback_release(site_id, forecast.align(at))
 
 
 def offgrid_c_next(g_asset: dict, fuel_price: float, load: np.ndarray, pv: np.ndarray) -> float:
@@ -328,29 +335,86 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
     return out
 
 
-def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict]) -> str | None:
-    """The wrong-plan guard (Part 7.1 step 8): refuse a plan whose compiled table is not safe to repeat (delivery.table_safety, step 6), then
-    replay the compiled table through the twin on the forecast and refuse a plan that crosses the floor, imports in a forecast outage or exceeds
-    its own MDI cap."""
+#: the wrong-plan guard's tolerances: state of charge (a fraction of the battery: the twin's minutes against the plan's quarters; at the Lahore demo
+#: a 3 kW peak shave past a 20 % floor dipped 2.1 points, which is not a wrong plan), energy over the horizon (kWh, and a share of the critical
+#: energy of the forecast outages) and an MDI block's mean (kW)
+GUARD_SOC_TOL = 0.05
+GUARD_KWH_TOL, GUARD_OUTAGE_SHARE = 2.0, 0.05
+GUARD_MDI_TOL_KW = 1.0
+
+
+def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict], res: dict | None = None) -> str | None:
+    """The wrong-plan guard (Part 7.1 step 8, R6 rule C2): check the plan and its compiled table, replayed through the twin on the plan's own
+    forecast, and refuse the plan (the previous one stays in force) when either would do what the plan may not. The first rule broken is the
+    reason:
+    - `unsafe_table`: the compiled table is not safe to repeat with no new plan (delivery.table_safety, step 6: a floor under the fallback's,
+      a discharging tail under the day's reserve, or a whole day's table that meets a forecast outage short of the reserve when run again);
+    - `slot_floor_below_fallback`: a slot's floor is under the fallback's minimum state of charge (the whole-table safety of step 6);
+    - `replayed_soc_below_floor`: with the grid up, the table discharges the battery under that fallback floor (an outage may use the reserve
+      down to the battery's own floor; a grid-up hour may not);
+    - `unserved_in_outage`: in the forecast outages the table leaves more critical load unserved than the plan did (the reserve was spent before);
+    - `mdi_cap_exceeded`: the plan's own grid draw over an MDI block, with any load it sheds while the grid is up added back (the site's meter
+      reads that load), exceeds the plan's MDI cap (`res["M"]`; the first block carries its minutes already elapsed, as the plan's row does);
+    - `sheds_load_with_grid_up`: the plan sheds load with the grid up that the site would in fact serve from the grid (the replay serves it);
+    - `genset_slot_with_grid`: a genset slot lies wholly where the grid is expected present, at a site whose genset may not run beside the grid;
+    - `export_not_allowed`: an export slot at a connection that may export nothing.
+    None when every rule holds, or the site has no battery (no table to replay)."""
     bat = p.get("battery")
     if not bat:
         return None
     if (compiled.get("safety") or {}).get("ok") is False:  # Part 7.1 steps 6 and 8: a table that is not safe to repeat is not signed
         return "unsafe_table"
     T = p["T"]
+    slots = [s for d in compiled["days"] for s in d["slots"]]
+    fallback = float(((compiled.get("fallback") or {}).get("min_soc_floor_pct") or 0.0)) / 100.0
+    if any(float(s["soc_floor_pct"]) / 100.0 < fallback - 1e-6 for s in slots):
+        return "slot_floor_below_fallback"
     ts = np.repeat(p["ts"], 15) + np.tile(np.arange(15) * 60, T)
     series = {"pv": np.repeat(p["PV"], 15), "load": np.repeat(p["L"], 15), "crit": np.repeat(p["Lc"], 15), "grid": np.repeat(p["g"], 15),
               "ts": ts, "temp": np.full(len(ts), 30.0)}
-    slots = [s for d in compiled["days"] for s in d["slots"]]
     pol = twin.slots_policy(slots, ts)
     plant = twin.plant_of(site)
     soc0 = bat["E0"] / bat["E_nom"]
     sim = twin.simulate(series, pol, plant, soc0)
-    # a battery that starts below the band is planned towards it, never refused (Part 4.3): the floor is the lower of the band and the start
-    if float(np.min(sim["soc"])) < min(bat["soc_min"], soc0) - 0.02:
+    up = series["grid"] > 0.5
+    # the fallback floor with the grid up: a battery already under it (a start below the band, or the end of an outage) may stay there, but the
+    # table must not discharge it further
+    if np.any(up & (sim["bat"] > 1e-3) & (sim["soc"] < fallback - GUARD_SOC_TOL)):
         return "replayed_soc_below_floor"
-    if float(np.max(np.where(series["grid"] < 0.5, sim["imp"], 0.0))) > 1e-6:
-        return "import_in_outage"
+    planned = {k: np.array([float(s.get(k) or 0.0) for s in steps_out[:T]]) for k in ("unserved_kw", "grid_present", "grid_import_kw")}
+    down_q = planned["grid_present"] < 0.5
+    unserved_out = float(sim["unserved"][~up].sum() / 60)
+    planned_out = float(planned["unserved_kw"][down_q].sum() * H)
+    crit_out = float(series["crit"][~up].sum() / 60)
+    if unserved_out > planned_out + max(GUARD_KWH_TOL, GUARD_OUTAGE_SHARE * crit_out):
+        return "unserved_in_outage"
+    shed_q = np.where(down_q, 0.0, planned["unserved_kw"])
+    caps = (res or {}).get("M") or []
+    mdi = p.get("mdi")
+    if mdi and caps:
+        n = max(1, int(mdi["n_mdi"]))
+        draw = planned["grid_import_kw"] + shed_q
+        blocks = (np.asarray(p["ts"]) // (n * 900)).astype(np.int64)
+        month_end = int(mdi.get("month_end_step", T))
+        for bid in np.unique(blocks):
+            st = np.flatnonzero(blocks == bid)
+            cap = caps[0] if st[0] < month_end else (caps[1] if len(caps) > 1 else None)
+            if cap is None:
+                continue
+            elapsed = float(mdi.get("G_elapsed") or 0.0) * float(mdi.get("n_elapsed") or 0) if st[0] == 0 else 0.0
+            if (float(draw[st].sum()) + elapsed) / n > cap + GUARD_MDI_TOL_KW:
+                return "mdi_cap_exceeded"
+    if float(shed_q.sum() * H) > float(sim["unserved"][up].sum() / 60) + GUARD_KWH_TOL:
+        return "sheds_load_with_grid_up"
+    if not plant.parallel and not p.get("off_grid"):
+        g_q = np.asarray(p["g"], dtype=float)
+        for s in slots:
+            if s.get("genset"):
+                sel = (np.asarray(p["ts"]) >= s["start_ts"]) & (np.asarray(p["ts"]) < s["end_ts"])
+                if sel.any() and bool(np.all(g_q[sel] > 0.5)):
+                    return "genset_slot_with_grid"
+    if float(p.get("X_max") or 0.0) <= 0.0 and any(s.get("mode") == "export" for s in slots):
+        return "export_not_allowed"
     return None
 
 
@@ -457,7 +521,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     fallback_floor = float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
     bms_low = ((site.get("assets") or {}).get("battery") or {}).get("soc_min", 0.1) * 100
     compiled = delivery.compile_mode_a(steps_out, brand, p.get("battery"), fallback_floor, bms_low, res["M"][0] if res.get("M") else None, site=site)
-    guard = _guard(site, p, compiled, steps_out)
+    guard = _guard(site, p, compiled, steps_out, res)
     summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(res["M"][0], 1) if res.get("M") else None,
                     "v_end": round(res.get("v_end", 0.0), 2), "guard": guard})
     # a pause or a release to native means no plan is in force: the plan is kept for reading, held, and the previous one stops being active
@@ -500,11 +564,15 @@ def _plan_out(r, with_steps: bool = True) -> dict:
     return d
 
 
-def current(site_id: str) -> dict | None:
+def current(site_id: str, now: int | None = None) -> dict | None:
+    """The plan in force: the latest active plan, while `now` (the clock by default) is before its valid_until. A plan past its valid_until is
+    not in force (Part 2.4: a failed tick keeps the previous plan only until then), so it is neither served to the edge nor keyed in; held_info
+    names it (plan_expired)."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
     with store.connect() as con:
         r = con.execute("SELECT * FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
         last = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
-    if r is None:
+    if r is None or _past_valid_until(r["valid_until"], now):
         return None
     out = _plan_out(r)
     if last and last["status"] in ("failed", "held") and last["id"] != out["id"]:
@@ -519,18 +587,25 @@ def held_info(site_id: str, now: int | None = None) -> dict | None:
       `kind`, `author` and `override_id` of the override.
     - Otherwise, with no plan active, the latest plan when its guard held it: the guard's reason, `until` None and its id. After a pause has ended
       and before the next tick, this is the pause's held plan under the pause's reason.
-    - Otherwise None: a plan is in force, none was made yet, or the latest solve failed."""
+    - Otherwise, when the active plan has passed its valid_until (the ticks stopped or every solve since failed): `plan_expired`, `until` None,
+      the expired plan's id and `since`, its valid_until. The edge then runs its fallback (the inverter's native settings).
+    - Otherwise None: a plan is in force, none was made yet, or the latest solve failed.
+    A day in a native block of the switchback calendar is a release (control_release): reason switchback_native, `until` the block's end, kind
+    `switchback`, no override."""
     now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
     rel = control_release(site_id, now)
     with store.connect() as con:
         last = con.execute("SELECT id, status, reason FROM plans WHERE site_id = ? ORDER BY generated_at DESC, rowid DESC LIMIT 1", (site_id,)).fetchone()
-        active = con.execute("SELECT 1 FROM plans WHERE site_id = ? AND status = 'active' LIMIT 1", (site_id,)).fetchone()
+        active = con.execute("SELECT id, valid_until FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1",
+                             (site_id,)).fetchone()
     held = last is not None and last["status"] == "held"
     if rel:
         return {"reason": rel["reason"], "until": rel["until"], "plan_id": last["id"] if held and last["reason"] == rel["reason"] else None,
                 "kind": rel["kind"], "author": rel["author"], "override_id": rel["override_id"]}
     if active is None and held:
         return {"reason": last["reason"] or "held", "until": None, "plan_id": last["id"]}
+    if active is not None and _past_valid_until(active["valid_until"], now):
+        return {"reason": EXPIRED_REASON, "until": None, "plan_id": active["id"], "since": active["valid_until"]}
     return None
 
 
@@ -599,7 +674,9 @@ def history(site_id: str, limit: int = 50) -> list[dict]:
 def _released_at(site_id: str, ts: int) -> bool:
     """Whether a pause or a release to native was in force at the instant `ts`, from the override history: from its creation (from_ts) to its end,
     or to when it was cleared if that came first. The instant, not its quarter: a plan published after a pause was cleared mid-quarter is in force
-    from then on."""
+    from then on. A day in a native block of the switchback calendar is released all day (switchback_release)."""
+    if switchback_release(site_id, ts) is not None:
+        return True
     for o in sites.overrides(site_id, active_only=False):
         if o.get("kind") not in RELEASE_REASONS:
             continue
@@ -614,23 +691,25 @@ def _released_at(site_id: str, ts: int) -> bool:
 def active_at(site_id: str, ts: int) -> dict | None:
     """The plan that was in force at an instant: the latest generated at or before it (belief time not after it). None while a pause or a release
     to native was in force: the tick then stores its plan as held (or, when the solve failed, a failed row noting the release), and no plan is in
-    force; a guard hold or a failed tick otherwise leaves the previous plan in force."""
+    force; a guard hold or a failed tick otherwise leaves the previous plan in force, up to its valid_until (after it, None)."""
     if _released_at(site_id, ts):
         return None
     with store.connect() as con:
         # the latest rows first (the light columns only): a held or failed row of a pause ends the search with no plan in force
-        rows = con.execute("SELECT id, status, reason, summary FROM plans WHERE site_id = ? AND belief_time <= ? "
+        rows = con.execute("SELECT id, status, reason, summary, valid_until FROM plans WHERE site_id = ? AND belief_time <= ? "
                            "ORDER BY belief_time DESC, generated_at DESC, rowid DESC LIMIT 200", (site_id, _iso(ts))).fetchall()
         for r in rows:
             if r["status"] in ("active", "superseded"):
+                if _past_valid_until(r["valid_until"], ts):
+                    return None
                 return _plan_out(con.execute("SELECT * FROM plans WHERE id = ?", (r["id"],)).fetchone())
-            if r["status"] == "held" and r["reason"] in RELEASE_REASONS.values():
+            if r["status"] == "held" and r["reason"] in RELEASED_REASONS:
                 return None
             if r["status"] == "failed" and (json.loads(r["summary"] or "{}") or {}).get("control_release"):
                 return None
         r = con.execute("SELECT * FROM plans WHERE site_id = ? AND status IN ('active','superseded') AND belief_time <= ? ORDER BY belief_time DESC LIMIT 1",
                         (site_id, _iso(ts))).fetchone()
-    return _plan_out(r) if r else None
+    return _plan_out(r) if r and not _past_valid_until(r["valid_until"], ts) else None
 
 
 def now_and_next(plan: dict | None, now: int | None = None) -> dict | None:
@@ -654,22 +733,52 @@ def mark_applied(site_id: str, plan_id: str, day_local: str, by: str, method: st
         raise ValueError("The method is one of installer_keyed, vendor_app, edge_ack or owner_keyed")
     if photo and not photo.startswith(("data:image/png;base64,", "data:image/jpeg;base64,")):
         raise ValueError("The photograph must be a PNG or JPEG image")
-    if get(site_id, plan_id) is None:
+    if len(photo) > 7_000_000:
+        raise ValueError("The photograph is larger than 5 MB")     # refused, not cut short (a cut image does not open)
+    try:
+        day_local = date.fromisoformat(str(day_local)).isoformat()
+    except ValueError:
+        raise ValueError("The day is a date written YYYY-MM-DD") from None
+    plan = get(site_id, plan_id)
+    if plan is None:
         raise KeyError(plan_id)
+    # a day the plan has no table for is never confirmed: control_state and the alerts read today's row, verify scores the day's slots
+    days = [d.get("date") for d in ((plan.get("slots") or {}).get("days") or [])]
+    if day_local not in days:
+        raise ValueError(f"This plan has no table for {day_local}" + (f"; its days are {', '.join(days)}" if days else ""))
     aid = store.new_id()
     with store.connect() as con:
         con.execute("INSERT INTO applied (id, site_id, plan_id, day_local, by, method, photo, created) VALUES (?,?,?,?,?,?,?,?)",
-                    (aid, site_id, plan_id, day_local, by, method, photo[:7_000_000], store._now()))
+                    (aid, site_id, plan_id, day_local, by, method, photo, store._now()))
         con.execute("UPDATE plans SET applied = 1 WHERE id = ?", (plan_id,))
     store.audit(by, "marked a plan as applied", site_id, {"plan_id": plan_id, "day": day_local, "method": method})
     return {"id": aid, "plan_id": plan_id, "day_local": day_local, "method": method, "confirmation": "pending"}
 
 
 def applied_rows(site_id: str, limit: int = 30) -> list[dict]:
+    """The applied log, newest first. Each row says which table was keyed (`table`, round 7: audit pages-B-02): the issue of its plan for its day
+    ({issued_at, reason, superseded: a later issue for the day names another plan}), None when that plan's table was never issued for the day; and
+    its early verdict (`early_check`, the "it took" card: early_check, audit pages-B-08), None before one."""
     with store.connect() as con:
-        rows = con.execute("SELECT id, plan_id, day_local, by, method, confirmation, fidelity, created FROM applied WHERE site_id = ? ORDER BY created DESC LIMIT ?",
-                           (site_id, limit)).fetchall()
-    return [dict(r) for r in rows]
+        rows = con.execute("SELECT id, plan_id, day_local, by, method, confirmation, fidelity, data, created FROM applied WHERE site_id = ? "
+                           "ORDER BY created DESC LIMIT ?", (site_id, limit)).fetchall()
+        days = sorted({r["day_local"] for r in rows})
+        issues = con.execute("SELECT plan_id, day_local, issued_at, reason FROM table_issues WHERE site_id = ? AND day_local IN "
+                             f"({','.join('?' * len(days))}) ORDER BY issued_at, rowid", (site_id, *days)).fetchall() if days else []
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            extra = json.loads(d.pop("data") or "{}")
+        except (TypeError, ValueError):
+            extra = {}
+        d["early_check"] = extra.get("early_check") if isinstance(extra, dict) else None
+        day = [i for i in issues if i["day_local"] == d["day_local"]]
+        mine = [i for i in day if i["plan_id"] == d["plan_id"]]
+        d["table"] = ({"issued_at": mine[0]["issued_at"], "reason": mine[0]["reason"], "superseded": day[-1]["plan_id"] != d["plan_id"]}
+                      if mine else None)
+        out.append(d)
+    return out
 
 
 def _no_money(body: dict) -> dict:
@@ -685,8 +794,9 @@ def _record_send(site_id: str, plan_id: str, msg: dict) -> None:
 
 
 def _release_message(site_id: str, rel: dict, record: bool = True) -> dict:
-    """A signed release while control is paused or released to native: the same keys as a plan message, no slots and no steps, and a
-    `release` block; the edge runs the inverter's native settings until the override ends and a fresh plan is issued (Part 7.3)."""
+    """A signed release while control is paused or released to native, or on a native-block day of the switchback calendar: the same keys as a
+    plan message, no slots and no steps, and a `release` block; the edge runs the inverter's native settings until the override or the block
+    ends and a fresh plan is issued (Part 7.3)."""
     site = sites.full(site_id) or {"data": {}}
     floor = float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
     bms_low = ((site.get("assets") or {}).get("battery") or {}).get("soc_min", 0.1) * 100
@@ -698,9 +808,10 @@ def _release_message(site_id: str, rel: dict, record: bool = True) -> dict:
             "mode": "b" if site["data"].get("control_mode") == "mode_b" else "a",
             "fallback": delivery.fallback_block(site, floor, bms_low),
             "mode_a": {"days": []}, "mode_b": None,
-            "notes": {"reason": {"control_paused": "Control paused", "released_to_native": "Released to native"}[rel["reason"]]},
-            "release": {"reason": rel["reason"], "until": rel["until"], "by": rel["author"]}}
-    msg = delivery.sign(site_id, _no_money(body))
+            "notes": {"reason": {"control_paused": "Control paused", "released_to_native": "Released to native",
+                                 SWITCHBACK_REASON: "Switchback native block"}[rel["reason"]]},
+            "release": {"reason": rel["reason"], "until": rel["until"], "by": rel["author"]}, **_edge_envelope(site_id, None)}
+    msg = delivery.sign(site_id, _checked(_no_money(body)))
     if record:
         _record_send(site_id, "release", msg)
     return msg
@@ -708,22 +819,846 @@ def _release_message(site_id: str, rel: dict, record: bool = True) -> dict:
 
 def signed_message(site_id: str, record: bool = True) -> dict | None:
     """The current plan as the ems-edge/1.0 plan message, signed with the site's key; a signed release instead while control is paused or
-    released to native. The body carries no money field (the plan's rupees stay on the plan page). `record` writes the plan_messages row that
-    the edge page lists as a send: the edge's own pull (the key-only route) records it; any other caller passes record=False."""
+    released to native, or on a native-block day of the switchback calendar. The body carries no money field (the plan's rupees stay on the plan
+    page). `record` writes the plan_messages row that the edge page lists as a send: the edge's own pull (the key-only route) records it; any other
+    caller passes record=False. None when no plan is in force (none yet, or the last one is past its valid_until).
+    Only a closed-loop site's edge applies plans (plan Part 2.3): below it (the effective tier, monitor or advisory_writes) nothing is signed or
+    sent and NotClosedLoop is raised, so a plans:read key at a monitor site gets no actionable table and no send is counted."""
+    tier = (sites.get(site_id) or {}).get("tier", "monitor")
+    if tier != "closed_loop":
+        raise NotClosedLoop(tier)
     rel = control_release(site_id)
     if rel:
         return _release_message(site_id, rel, record=record)
+    clock = clock_info(site_id)
+    if clock and clock["level"] == "demoted":
+        raise ClockDemoted(clock["offset_s"])
     plan = current(site_id)
     if plan is None:
         return None
+    caps = delivery.latest_capabilities(site_id)
+    full = sites.full(site_id)
+    compiled = plan.get("slots") or {}
+    if plan["mode"] == "a" and issues_tables(full):
+        # the table issued for each day, not each quarter's draft: the nightly table, re-issued only when worth a write (Part 7.1 step 7)
+        compiled, _ = issued_view(site_id, compiled)
+    days = [{"date": d["date"], "slots": [{k: v for k, v in s.items() if k not in ("intent",)} for s in d["slots"]]}
+            for d in compiled.get("days", [])]
+    try:
+        # only what the target inverter can write (R6 C1): the plan page keeps the optimiser's table, the message carries what was fitted
+        days, fit = delivery.fit_to_capabilities(days, caps)
+    except delivery.NotWritable as exc:
+        raise CapsMismatch(str(exc)) from None
     body = {"contract": delivery.CONTRACT, "type": "plan", "plan_id": plan["id"], "site_id": site_id, "issued_at": plan["generated_at"],
             "valid_from": plan["valid_from"], "valid_until": plan["valid_until"], "timezone": "Asia/Karachi", "mode": plan["mode"],
-            "fallback": (plan.get("slots") or {}).get("fallback"),
-            "mode_a": {"days": [{"date": d["date"], "slots": [{k: v for k, v in s.items() if k not in ("intent",)} for s in d["slots"]]}
-                                for d in (plan.get("slots") or {}).get("days", [])]},
+            "fallback": (plan.get("slots") or {}).get("fallback"), "mode_a": {"days": days, "apply_policy": write_policy(full)[0]},
+            "write_budget": write_policy(full)[1],
             "mode_b": delivery.mode_b(plan["steps"]) if plan["mode"] == "b" else None,
-            "notes": {"reason": plan["summary"].get("status_label")}}
-    msg = delivery.sign(site_id, _no_money(body))
+            "notes": {"reason": plan["summary"].get("status_label")}, **_edge_envelope(site_id, plan["id"], caps)}
+    if fit:
+        body["capabilities_fit"] = fit
+    if clock and clock["level"] == "widen":
+        # the inverter clock is more than 300 s off: every discharge slot starts 15 minutes early and ends 15 minutes late (R6 C10)
+        grammar = (plan.get("slots") or {}).get("grammar") or {}
+        body["mode_a"] = {**body["mode_a"], "days": delivery.widen_peak_slots(days, CLOCK_WIDEN_MIN, int(grammar.get("min_slot_minutes") or 15))}
+        body["clock"] = {"offset_s": clock["offset_s"], "widened_min": CLOCK_WIDEN_MIN}
+    msg = delivery.sign(site_id, _checked(_no_money(body)))
     if record:
         _record_send(site_id, plan["id"], msg)
     return msg
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): what reaches the device
+
+#: the held reason when the plan in force has passed its valid_until and no newer plan replaced it (Part 2.4)
+EXPIRED_REASON = "plan_expired"
+
+
+class NotClosedLoop(Exception):
+    """A signed plan message asked for at a site whose effective control tier is below closed loop: nothing is sent to its edge (plan Part 2.3,
+    monitor: recommendations only; advisory_writes: a person keys the table in)."""
+
+    def __init__(self, tier: str):
+        self.tier = tier
+        words = {"monitor": "monitor", "advisory_writes": "advisory writes"}.get(tier, str(tier).replace("_", " "))
+        how = ("the plan is a recommendation" if tier == "monitor" else "a person keys the table in")
+        super().__init__(f"The site's control tier is {words}, so no plan is sent to its edge: {how}")
+
+
+class CapsMismatch(Exception):
+    """The plan in force does not fit the device the edge's current capabilities describe (more slots than its slot model holds): it is not signed
+    (R6 C1: a table the edge would refuse is a cloud bug), and the edge keeps what it runs."""
+
+
+def _past_valid_until(valid_until: str | None, ts: int) -> bool:
+    """Whether the instant `ts` is at or after a plan's valid_until (a plan with none never expires)."""
+    end = _ts(valid_until)
+    return end is not None and int(ts) >= end
+
+
+def switchback_release(site_id: str, at: int | None = None) -> dict | None:
+    """The native block of the switchback calendar that holds the Pakistan-time day of `at` (now by default), as a release, else None: on such a
+    day the inverter runs its own settings (plan 8.2, VER-08: a baseline block plans "native"), so the tick holds its plan, the edge is sent a
+    release and an advisory site is not asked to key a table. `until` is the block's end (midnight after its last day, Pakistan time); `author` the
+    calendar. The arm is verify.arm_on's (a locked block first), so the live site and the savings ledger read the same calendar."""
+    from . import verify  # verify imports plans at module load
+
+    at = int(at if at is not None else datetime.now(timezone.utc).timestamp())
+    day = _local(at).date()
+    if verify.arm_on(site_id, day) != "native":
+        return None
+    with store.connect() as con:
+        r = con.execute("SELECT block_start, block_end FROM switchback WHERE site_id = ? AND block_start <= ? AND block_end >= ? "
+                        "ORDER BY locked DESC, block_start DESC LIMIT 1", (site_id, day.isoformat(), day.isoformat())).fetchone()
+    end_day = date.fromisoformat(r["block_end"]) + timedelta(days=1)
+    until = datetime(end_day.year, end_day.month, end_day.day, tzinfo=PKT).astimezone(timezone.utc).isoformat(timespec="seconds")
+    return {"reason": SWITCHBACK_REASON, "kind": "switchback", "until": until, "author": "switchback calendar", "override_id": None,
+            "block_start": r["block_start"], "block_end": r["block_end"]}
+
+
+def _edge_envelope(site_id: str, plan_id: str | None, caps: dict | None = None) -> dict:
+    """U3 5.1 and 5.4's envelope of a plan message (audit engine-delivery-11): msg_type, a fresh msg_id, the edge it is for (the edge_id of its
+    current capabilities or last heartbeat), the message's sequence (one more than the messages sent to the site so far), sent_at, the plan this one
+    supersedes (the last other plan sent to the edge, so it can drop older queued plans after link loss), the capabilities sequence the plan was
+    checked against (CAPS_STALE) and the devices it targets."""
+    import uuid
+
+    caps = caps if caps is not None else delivery.latest_capabilities(site_id)
+    beat = sites.state(site_id).get("edge_heartbeat") or {}
+    with store.connect() as con:
+        sent = con.execute("SELECT count(*) FROM plan_messages WHERE site_id = ?", (site_id,)).fetchone()[0]
+        prev = con.execute("SELECT plan_id FROM plan_messages WHERE site_id = ? AND plan_id NOT IN ('release', ?) ORDER BY sent_at DESC, rowid DESC "
+                           "LIMIT 1", (site_id, plan_id or "")).fetchone()
+    return {"msg_type": "plan", "msg_id": str(uuid.uuid4()), "edge_id": (caps or {}).get("edge_id") or beat.get("edge_id"), "seq": int(sent) + 1,
+            "sent_at": store._now(), "supersedes": prev["plan_id"] if prev and plan_id else None,
+            "capabilities_seq": caps["seq"] if caps else None, "targets": delivery.targets(caps)}
+
+
+def _checked(body: dict) -> dict:
+    """The plan message body checked against the contract's model before it is signed (R6 C1: a message the edge would refuse for its shape is a
+    cloud bug, never signed)."""
+    delivery.PlanMessage.model_validate(body)
+    return body
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): what the edge reports
+
+#: A heartbeat speaks for the edge for this long (the edge sends one a minute; five minutes is the edge-offline mark)
+HEARTBEAT_FRESH_S = 300
+#: The heartbeat states in which the edge does not run the cloud's plan, as a control state
+_EDGE_STATES = {"disabled": ("edge_disabled", "Edge disabled control"),
+                "fallback": ("edge_fallback", "Edge on fallback: the inverter runs its own settings"),
+                "native": ("edge_fallback", "Edge on fallback: the inverter runs its own settings"),
+                "released": ("edge_released", "Edge released the inverter to its own settings"),
+                "hold": ("edge_hold", "Edge holding the battery")}
+#: The events with which the edge says it does not run the plan, and the events that end each state (R6 E18, 4.4)
+_OFF_EVENTS = {"control_disabled": ("disabled", True), "control_enabled": ("disabled", False),
+               "fallback_engaged": ("fallback", True), "fallback_cleared": ("fallback", False), "plan_rejected": ("rejected", None)}
+
+
+def edge_view(site_id: str, now: int | None = None) -> dict | None:
+    """What the edge itself reports when it is not running the plan in force (audit engine-delivery-12), as a control state {key, label}, else None:
+    control it disabled (a control_disabled event not yet followed by control_enabled, or a fresh heartbeat saying so), a fallback (fallback_engaged
+    not yet cleared, or a fresh heartbeat in fallback or native), a release or hold of its own, or the plan in force refused (a rejected or expired
+    ack) or applied in part (a partial ack, or a primitive clamped, failed or refused). A heartbeat older than HEARTBEAT_FRESH_S says nothing."""
+    from . import contract
+
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    st = sites.state(site_id)
+    reports = st.get("edge_reports") or {}
+    off = reports.get("disabled") or {}
+    if off.get("on"):
+        return {"key": "edge_disabled", "label": "Edge disabled control" + (f": {off['cause']}" if off.get("cause") else "")}
+    beat, at = st.get("edge_heartbeat") or {}, st.get("edge_heartbeat_at")
+    state = beat.get("control_state") if at is not None and now - int(at) <= HEARTBEAT_FRESH_S else None
+    if (reports.get("fallback") or {}).get("on") and state not in contract.FOLLOWING_STATES:
+        state = "fallback"
+    if state in _EDGE_STATES:
+        key, label = _EDGE_STATES[state]
+        return {"key": key, "label": label}
+    plan = current(site_id, now)
+    if plan is None:
+        return None
+    with store.connect() as con:
+        r = con.execute("SELECT body FROM acks WHERE site_id = ? AND plan_id = ? ORDER BY received_at DESC, rowid DESC LIMIT 1",
+                        (site_id, plan["id"])).fetchone()
+    if r is None:
+        return None
+    outcome, codes = contract.ack_outcome(json.loads(r["body"]))
+    why = f" ({', '.join(codes)})" if codes else ""
+    if outcome == "rejected":
+        return {"key": "edge_refused", "label": f"Edge refused the plan{why}"}
+    if outcome == "expired":
+        return {"key": "edge_fallback", "label": "Edge reports the plan ran out: the inverter runs its own settings"}
+    if outcome == "partial":
+        return {"key": "edge_partial", "label": f"Edge applied part of the plan{why}"}
+    return None
+
+
+def edge_fidelity(site_id: str, day: date) -> str:
+    """A closed-loop day's fidelity from what the edge reported (audit engine-delivery-12; R6 C13: acks and events feed the fidelity), not 'confirmed'
+    by construction: 'not_applied' when at any time of the Pakistan-time day control was disabled or the edge was on fallback (a report before the day
+    counts until the event that ends it), or the edge rejected a plan or reported one expired; 'partial' when it applied a plan in part; else
+    'confirmed'."""
+    from . import contract
+
+    t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    t1 = t0 + 86400
+    with store.connect() as con:
+        evs = con.execute(f"SELECT ts, type FROM events WHERE site_id = ? AND type IN ({','.join('?' * len(_OFF_EVENTS))})",
+                          (site_id, *_OFF_EVENTS)).fetchall()
+        acks = con.execute("SELECT body, received_at FROM acks WHERE site_id = ? AND received_at >= ? AND received_at < ?",
+                           (site_id, _iso_utc(t0 - 86400), _iso_utc(t1 + 86400))).fetchall()
+    on = {"disabled": False, "fallback": False}
+    for at, kind in sorted((contract.epoch(e["ts"]), e["type"]) for e in evs if contract.epoch(e["ts"]) is not None):
+        if at >= t1:
+            break
+        if at >= t0 and any(on.values()):
+            return "not_applied"                      # in that state when the day began
+        key, state = _OFF_EVENTS[kind]
+        if key == "rejected":
+            if at >= t0:
+                return "not_applied"
+            continue
+        if at >= t0 and state:
+            return "not_applied"
+        on[key] = state
+    if any(on.values()):
+        return "not_applied"                          # in that state since before the day began, or from within it
+    partial = False
+    for a in acks:
+        at = contract.epoch(a["received_at"])
+        if at is None or not t0 <= at < t1:
+            continue
+        outcome, _ = contract.ack_outcome(json.loads(a["body"]))
+        if outcome in ("rejected", "expired"):
+            return "not_applied"
+        partial |= outcome == "partial"
+    return "partial" if partial else "confirmed"
+
+
+def _iso_utc(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat(timespec="seconds")
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the clock-offset ladder
+
+#: R6 C10 (plan Part 7.3): over CLOCK_WARN_S the cloud raises clock_unsynced; over CLOCK_WIDEN_S the plan message widens every discharge slot by
+#: CLOCK_WIDEN_MIN each side and the control state asks for the inverter clock to be set; over CLOCK_DEMOTE_S control is demoted (no table is sent)
+#: until the offset is back under CLOCK_WARN_S
+CLOCK_WARN_S, CLOCK_WIDEN_S, CLOCK_DEMOTE_S, CLOCK_WIDEN_MIN = 120, 300, 900, 15
+
+
+def clock_level(offset_s: float, demoted: bool = False) -> str:
+    """The ladder's step for the worst clock offset (seconds, either sign): 'ok', 'unsynced', 'widen' or 'demoted'; a demoted site stays demoted
+    until the offset is under CLOCK_WARN_S."""
+    off = abs(float(offset_s))
+    if off >= CLOCK_DEMOTE_S or (demoted and off >= CLOCK_WARN_S):
+        return "demoted"
+    return "widen" if off >= CLOCK_WIDEN_S else "unsynced" if off >= CLOCK_WARN_S else "ok"
+
+
+def clock_info(site_id: str) -> dict | None:
+    """The site's clock offset when the ladder acts on it ({offset_s, level, source}: the worst of the edge's heartbeat and the inverter's own clock
+    reported in telemetry, routes_edge), else None."""
+    c = sites.state(site_id).get("edge_clock") or {}
+    if c.get("level", "ok") == "ok":
+        return None
+    return {"offset_s": float(c["offset_s"]), "level": c["level"], "source": c.get("source")}
+
+
+def clock_words(offset_s: float) -> str:
+    off = abs(float(offset_s))
+    return f"{off / 60:.0f} min" if off >= 90 else f"{off:.0f} s"
+
+
+class ClockDemoted(Exception):
+    """The site's clock is off by CLOCK_DEMOTE_S or more (or has not come back under CLOCK_WARN_S since): control is demoted and no table is signed."""
+
+    def __init__(self, offset_s: float):
+        self.offset_s = offset_s
+        super().__init__(f"The inverter clock is {clock_words(offset_s)} off, so control is demoted and no plan is sent until the clock is within "
+                         f"{CLOCK_WARN_S} seconds")
+
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): Karachi days of stored stamps
+
+def karachi_day_bounds(day: date) -> tuple[str, str]:
+    """The stored UTC stamps (store._now()'s form) at which a Karachi day starts and the next one starts: a stamp s is on the day when lo <= s < hi.
+    A stored stamp's first ten characters are its UTC date, which is the Karachi date only from 05:00, so a local day is never matched on them
+    (audit pages-B-06)."""
+    lo = datetime(day.year, day.month, day.day, tzinfo=PKT).astimezone(timezone.utc)
+    return lo.isoformat(timespec="seconds"), (lo + timedelta(days=1)).isoformat(timespec="seconds")
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the table issued to the inverter
+
+#: Plan Part 7.1 step 7 and R6 4.5 (audit pages-B-02): the Mode A table that reaches the inverter (keyed in by a person at the advisory tier, written by
+#: the edge at closed loop) is issued once a day, by the nightly job after the 23:00 solve (scheduler, 23:05) for the next day; a day that began with
+#: none (a new site, a pause, a missed nightly job) takes the table of its first plan in force. A later plan re-issues today's table only when it is
+#: worth REISSUE_GAIN_RS more over the plan's horizon, the day's table writes are under the brand's budget and the last issue is REISSUE_SPACING_S
+#: old; a hold or a resume issues it at once (the budget card's "unless a hold or release needs it").
+REISSUE_GAIN_RS = 500.0
+REISSUE_SPACING_S = 3600
+#: U3 5.4's apply_policy (the edge's own cap of table writes a day, written only on a change, never across midnight) and R6 3.6's write budget, of
+#: which the cloud uses the brand's table_writes_per_day (at most the edge's cap)
+EDGE_TABLE_WRITE_CAP = 4
+EVENT_WRITES_PER_DAY = 2
+APPLY_WINDOW_LOCAL = "00:05-23:50"
+#: why a table was issued: the nightly job, a day's first, a later plan worth its write (event), a hold or a resume
+ISSUE_REASONS = ("nightly", "first", "event", "hold", "resume")
+
+
+def issues_tables(site: dict | None) -> bool:
+    """Whether a site's plan reaches its inverter as an issued Mode A table: a person keys it at the advisory tier, the edge writes it at closed loop
+    (unless the site runs Mode B setpoints). Nothing is written at the monitor tier."""
+    if not site:
+        return False
+    tier = site.get("tier", "monitor")
+    return tier == "advisory_writes" or (tier == "closed_loop" and (site.get("data") or {}).get("control_mode") != "mode_b")
+
+
+def table_budget(site: dict | None) -> int:
+    """The table writes a day the cloud uses at a site: its inverter brand's (delivery.BRANDS), at most the edge's cap."""
+    brand = (((site or {}).get("assets") or {}).get("inverter") or {}).get("brand", "other")
+    return min(int(delivery.BRANDS.get(brand, delivery.BRANDS["other"])["table_writes_per_day"]), EDGE_TABLE_WRITE_CAP)
+
+
+def issued_tables(site_id: str, day_local: str) -> list[dict]:
+    """The tables issued for a Karachi day, oldest first: {id, plan_id, day_local, issued_at, reason, gain_rs}."""
+    with store.connect() as con:
+        rows = con.execute("SELECT id, plan_id, day_local, issued_at, reason, gain_rs FROM table_issues WHERE site_id = ? AND day_local = ? "
+                           "ORDER BY issued_at, rowid", (site_id, day_local)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def issued_for(site_id: str, day_local: str) -> dict | None:
+    """The table to write for a Karachi day: its latest issue, else None (none issued yet: the plan in force's table is a draft)."""
+    rows = issued_tables(site_id, day_local)
+    return rows[-1] if rows else None
+
+
+def _write_issue(site_id: str, day_local: str, plan_id: str, reason: str, at: int, gain_rs: float | None = None) -> dict:
+    row = {"id": store.new_id(), "plan_id": plan_id, "day_local": day_local, "issued_at": _iso(at), "reason": reason, "gain_rs": gain_rs}
+    with store.connect() as con:
+        con.execute("INSERT INTO table_issues (id, site_id, day_local, plan_id, issued_at, reason, gain_rs) VALUES (?,?,?,?,?,?,?)",
+                    (row["id"], site_id, day_local, plan_id, row["issued_at"], reason, gain_rs))
+    return row
+
+
+def _day_slots(plan: dict | None, day_local: str) -> list[dict] | None:
+    """A plan's compiled slots for one Karachi day, else None."""
+    return next((d["slots"] for d in ((plan or {}).get("slots") or {}).get("days") or [] if d.get("date") == day_local), None)
+
+
+def _table_key(slots: list[dict] | None) -> str:
+    """A day's table as the inverter holds it: its slots without their epoch stamps (the same ring on two days is the same table) or the intent words."""
+    return json.dumps([{k: v for k, v in s.items() if k not in ("start_ts", "end_ts", "intent")} for s in slots or []], sort_keys=True, default=str)
+
+
+def reissue_gain(site: dict, plan: dict, issued_slots: list[dict], day_local: str) -> float:
+    """What the plan's table for `day_local` saves over the issued one, in rupees: both replayed through the twin on the plan's own forecast over its
+    horizon from its starting state of charge, with the plan's other days behind each (so the energy either leaves in the battery is priced on the
+    days after); priced as the compare drawer prices energy (import less export credit), plus the critical load left unserved at the site's value
+    of lost load, so a table that no longer holds the reserve for a forecast outage is worth re-issuing."""
+    steps = plan.get("steps") or []
+    if not steps:
+        return 0.0
+    ts = np.repeat([int(s["t"]) for s in steps], 15) + np.tile(np.arange(15) * 60, len(steps))
+
+    def rep(k: str, default: float = 0.0) -> np.ndarray:
+        return np.repeat([float(default if s.get(k) is None else s[k]) for s in steps], 15)
+
+    series = {"ts": ts, "pv": rep("pv_forecast_kw"), "load": rep("load_kw"), "crit": rep("critical_kw"), "grid": rep("grid_present", 1.0),
+              "temp": np.full(len(ts), 30.0)}
+    c_imp, c_exp = rep("c_imp"), rep("c_exp")
+    voll = float((site.get("data") or {}).get("voll_rs_per_kwh", 500.0))
+    plant = twin.plant_of(site)
+    soc0 = float(steps[0].get("soc_start_pct") or 50.0) / 100.0
+    later = [s for d in (plan.get("slots") or {}).get("days") or [] if d.get("date") != day_local for s in d.get("slots") or []]
+
+    def cost(day_slots: list[dict]) -> float:
+        sim = twin.simulate(series, twin.slots_policy(list(day_slots) + later, ts), plant, soc0)
+        return float((c_imp * sim["imp"] - c_exp * sim["exp"] + voll * sim["unserved"]).sum() / 60)
+
+    return cost(issued_slots) - cost(_day_slots(plan, day_local) or [])
+
+
+def writes_used(site_id: str, day: date, site: dict | None = None) -> int:
+    """The table writes of a Karachi day (audit pages-B-02, pages-B-06), never the edge's pulls:
+    - advisory tier: the distinct tables issued for the day or marked applied for it (each is a table a person keys in);
+    - closed loop: the most of the tables issued for the day, the day's sends that changed the table the inverter runs (the day's table at the send;
+      a repeat pull of the same table is not a write, a release is one) and the count the edge itself reports in the day's acks (writes_used_today);
+    - monitor tier: none."""
+    site = site if site is not None else sites.full(site_id)
+    tier = (site or {}).get("tier", "monitor")
+    if tier == "monitor":
+        return 0
+    d = day.isoformat()
+    with store.connect() as con:
+        issued = {r[0] for r in con.execute("SELECT plan_id FROM table_issues WHERE site_id = ? AND day_local = ?", (site_id, d)).fetchall()}
+        if tier == "advisory_writes":
+            marked = {r[0] for r in con.execute("SELECT plan_id FROM applied WHERE site_id = ? AND day_local = ?", (site_id, d)).fetchall()}
+            return len(issued | marked)
+        lo, hi = karachi_day_bounds(day)
+        prev = con.execute("SELECT body, sent_at FROM plan_messages WHERE site_id = ? AND sent_at < ? ORDER BY sent_at DESC, rowid DESC LIMIT 1",
+                           (site_id, lo)).fetchone()
+        sent = con.execute("SELECT body, sent_at FROM plan_messages WHERE site_id = ? AND sent_at >= ? AND sent_at < ? ORDER BY sent_at, rowid",
+                           (site_id, lo, hi)).fetchall()
+        acks = con.execute("SELECT body FROM acks WHERE site_id = ? AND received_at >= ? AND received_at < ?", (site_id, lo, hi)).fetchall()
+
+    def written(r) -> str:
+        try:
+            body = json.loads(r["body"])
+        except (TypeError, ValueError):
+            return ""
+        if body.get("type") == "release":
+            return "release"
+        on = _local(_ts(r["sent_at"])).date().isoformat()
+        return _table_key(next((x.get("slots") for x in (body.get("mode_a") or {}).get("days") or [] if x.get("date") == on), None))
+
+    changes, last = 0, written(prev) if prev else None
+    for r in sent:
+        k = written(r)
+        if k != last:
+            changes, last = changes + 1, k
+    edge = 0
+    for a in acks:
+        try:
+            body = json.loads(a["body"])
+        except (TypeError, ValueError):
+            continue
+        for dev in body.get("per_device") or []:
+            edge = max(edge, int((dev.get("writes_used_today") or {}).get("tou_table") or 0))
+    return max(len(issued), changes, edge)
+
+
+def issue_nightly(site_id: str, now: int | None = None) -> dict | None:
+    """The nightly job (scheduler, 23:05 Pakistan time, after the 23:00 solve): the next day's table from the plan in force, when it has one, none is
+    issued for that day yet and no pause or release is in force at its start. Returns the issue, else None."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    site = sites.full(site_id)
+    if not issues_tables(site):
+        return None
+    nxt = _local(now).date() + timedelta(days=1)
+    plan = current(site_id, now)
+    if plan is None or _day_slots(plan, nxt.isoformat()) is None or issued_for(site_id, nxt.isoformat()) is not None:
+        return None
+    if control_release(site_id, int(datetime(nxt.year, nxt.month, nxt.day, tzinfo=PKT).timestamp())) is not None:
+        return None
+    return _write_issue(site_id, nxt.isoformat(), plan["id"], "nightly", now)
+
+
+def issue_tables(site_id: str, now: int | None = None, force: str | None = None) -> dict | None:
+    """After a solve (each scheduler tick, a manual re-solve, a control action): today's table.
+    - None issued for today: the plan in force's table is issued ('first').
+    - The plan in force has another table: `force` ('hold' or 'resume', a control action that needs the table now) issues it at once; otherwise it
+      is re-issued ('event') only when reissue_gain reaches REISSUE_GAIN_RS, writes_used is under table_budget and the last issue is
+      REISSUE_SPACING_S old. The decision is kept in the site's state (`table_reissue`) for GET /control.
+    Returns {plan_id, day, reason (when issued), gain_rs, issued, blocked: below_threshold, budget_used, too_soon or None, at}; None when nothing was
+    in question: no table is issued below the advisory tier or at a Mode B site, nor while no plan is in force (a pause, a release, a native-block
+    day, a plan past its valid_until), and the plan in force's table is the issued one."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    site = sites.full(site_id)
+    if not issues_tables(site) or control_release(site_id, now) is not None:
+        return None
+    plan = current(site_id, now)
+    day = _local(now).date()
+    today = day.isoformat()
+    slots = _day_slots(plan, today)
+    if plan is None or slots is None:
+        return None
+    cur = issued_for(site_id, today)
+    old = _day_slots(get(site_id, cur["plan_id"]), today) if cur else None
+    out = {"plan_id": plan["id"], "day": today, "gain_rs": None, "issued": True, "blocked": None, "at": _iso(now)}
+    if cur is None or old is None:
+        # nothing issued for today yet (or the issued plan is no longer readable): the day's first table
+        _write_issue(site_id, today, plan["id"], "first", now)
+        return {**out, "reason": "first"}
+    if cur["plan_id"] == plan["id"] or _table_key(old) == _table_key(slots):
+        return None
+    if force in ("hold", "resume"):
+        _write_issue(site_id, today, plan["id"], force, now)
+        return {**out, "reason": force}
+    gain = round(reissue_gain(site, plan, old, today), 0)
+    since = now - (_ts(cur["issued_at"]) or 0)
+    blocked = ("below_threshold" if gain < REISSUE_GAIN_RS else "budget_used" if writes_used(site_id, day, site) >= table_budget(site)
+               else "too_soon" if since < REISSUE_SPACING_S else None)
+    out = {**out, "gain_rs": gain, "issued": blocked is None, "blocked": blocked}
+    if blocked is None:
+        _write_issue(site_id, today, plan["id"], "event", now, gain)
+        out["reason"] = "event"
+    sites.put_state(site_id, table_reissue=out)
+    return out
+
+
+def issued_view(site_id: str, compiled: dict) -> tuple[dict, list[dict]]:
+    """The compiled table as it reaches the inverter: each day from the plan issued for it (the plan in force's draft where none is issued yet), and
+    per day its issue: {day, plan_id (None for a draft), issued_at, reason, gain_rs}."""
+    days, info = [], []
+    for d in compiled.get("days") or []:
+        iss = issued_for(site_id, d["date"])
+        slots = _day_slots(get(site_id, iss["plan_id"]), d["date"]) if iss else None
+        days.append({**d, "slots": slots} if slots is not None else d)
+        info.append({"day": d["date"], "plan_id": iss["plan_id"], "issued_at": iss["issued_at"], "reason": iss["reason"], "gain_rs": iss["gain_rs"]}
+                    if slots is not None else {"day": d["date"], "plan_id": None})
+    return {**compiled, "days": days}, info
+
+
+def reissue_held(site_id: str, plan_id: str | None, day: date) -> dict | None:
+    """The plan in force's re-issue decision for today when it was held back (GET /control's `reissue`), else None."""
+    st = sites.state(site_id).get("table_reissue") or {}
+    if not plan_id or st.get("plan_id") != plan_id or st.get("day") != day.isoformat() or st.get("issued"):
+        return None
+    return {k: st.get(k) for k in ("plan_id", "day", "gain_rs", "issued", "blocked", "at")}
+
+
+def write_policy(site: dict | None) -> tuple[dict, dict]:
+    """The plan message's U3 5.4 mode_a.apply_policy and R6 3.6 write_budget (audit engine-delivery-09)."""
+    return ({"write_if_changed_only": True, "max_table_writes_per_day": EDGE_TABLE_WRITE_CAP, "apply_window_local": APPLY_WINDOW_LOCAL},
+            {"table_writes_per_day": table_budget(site), "event_writes_per_day": EVENT_WRITES_PER_DAY})
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the "it took" card
+
+#: Plan Part 9.5 and 7.6 (audit pages-B-08): the early verdict on a keyed table comes this long after its first discharge slot in the peak starts
+EARLY_CHECK_S = 1800
+#: the verdicts that are kept and not computed again
+EARLY_FINAL = ("took", "did_not_take", "no_evidence", "no_peak_slot")
+_DISCHARGING = ("discharge", "export")
+
+
+def _keep_early(applied_id: str, check: dict) -> dict:
+    """The early verdict written to the applied row's data (`early_check`), what else the row holds kept (the nightly confirmation's detail)."""
+    with store.write_transaction() as con:
+        r = con.execute("SELECT data FROM applied WHERE id = ?", (applied_id,)).fetchone()
+        try:
+            data = json.loads((r["data"] if r else None) or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        con.execute("UPDATE applied SET data = ? WHERE id = ?", (json.dumps({**data, "early_check": check}), applied_id))
+    return check
+
+
+def early_check(site_id: str, now: int | None = None, site: dict | None = None) -> dict | None:
+    """The "it took" or "it did not take" card (plan Part 9.5): today's keyed table at an advisory site, read from telemetry 30 minutes after its first
+    discharge (or export) slot that starts in the peak window (any discharge start at a site with no peak window), from a quarter before the mark on
+    (a table cannot be followed before it is keyed). The test is the nightly confirmation's boundary test (verify.confirm_applied: discharge above 10
+    percent of rated within 30 minutes of the start, grid present). The table and the native capture in force are replayed through the twin over the
+    hour round the start from the measured state of charge: where the table would not discharge there either there is no evidence (the battery
+    near its floor), and where the native settings would discharge too, the measured energy over the hour must be nearer one replay than the other
+    by 2 percent of the battery (the nightly not-applied margin).
+
+    Kept on the latest mark of today as `early_check` ({verdict, reason, boundary_ts, due_ts, slot_start, plan_id, max_discharge_kw, checked}).
+    Verdicts: waiting (before the due time, or no battery reading for the window yet: a CSV source uploads later), took, did_not_take, no_evidence,
+    no_peak_slot; a final one is not computed again. It never sets the day's class, its fidelity or its claim: the nightly confirm_applied does.
+    None when the site is not at the advisory tier or today has no mark."""
+    from . import verify  # verify imports plans at module load
+
+    site = site or sites.full(site_id)
+    if site is None or site.get("tier") != "advisory_writes":
+        return None
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    day = _local(now).date()
+    with store.connect() as con:
+        row = con.execute("SELECT id, plan_id, data, created FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1",
+                          (site_id, day.isoformat())).fetchone()
+    if row is None:
+        return None
+    try:
+        prior = (json.loads(row["data"] or "{}") or {}).get("early_check") or {}
+    except (TypeError, ValueError, AttributeError):
+        prior = {}
+    if prior.get("verdict") in EARLY_FINAL and prior.get("plan_id") == row["plan_id"]:
+        return prior
+    plan = get(site_id, row["plan_id"])
+    t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    every = sorted((s for d in ((plan or {}).get("slots") or {}).get("days") or [] for s in d.get("slots") or []), key=lambda s: int(s["start_ts"]))
+    marked = _ts(row["created"]) or now
+    conn = (site.get("connections") or [None])[0]
+    quarters = np.arange(t0, t0 + 86400, 900, dtype=np.int64)
+    pk = np.asarray(peak_mask(conn, quarters), dtype=bool) if conn else np.zeros(len(quarters), dtype=bool)
+    cur = next((c for prev, c in zip(every, every[1:]) if c["mode"] in _DISCHARGING and prev["mode"] not in _DISCHARGING
+                and t0 <= int(c["start_ts"]) < t0 + 86400 and int(c["start_ts"]) >= marked - 900
+                and (not pk.any() or bool(pk[(int(c["start_ts"]) - t0) // 900]))), None)
+    if cur is None:
+        return _keep_early(row["id"], {"verdict": "no_peak_slot", "reason": None, "plan_id": row["plan_id"], "checked": store._now()})
+    bnd = int(cur["start_ts"])
+    out = {"boundary_ts": bnd, "due_ts": bnd + EARLY_CHECK_S, "slot_start": cur.get("start"), "plan_id": row["plan_id"]}
+    if now < bnd + EARLY_CHECK_S:
+        return _keep_early(row["id"], {**out, "verdict": "waiting", "reason": None})
+    g = telemetry.minute_grid(site_id, bnd - EARLY_CHECK_S, bnd + EARLY_CHECK_S)
+    f = telemetry.filled(g)
+    ts = g["ts"]
+    bat = np.asarray(g["bat"], dtype=float)
+    seen = ~np.isnan(bat) & (np.asarray(f["grid"]) > 0.5)
+    after = seen & (ts >= bnd)
+    soc = verify._soc(g)
+    with_soc = np.flatnonzero(~np.isnan(soc))
+    plant = twin.plant_of(site)
+    if int(after.sum()) < 10 or not with_soc.size or plant.e_nom <= 0:
+        # no battery reading for the window yet: the next tick tries again; the nightly check decides the day
+        return _keep_early(row["id"], {**out, "verdict": "waiting", "reason": "no_battery_power"})
+    p_dis = max(plant.p_dis, 1e-6)
+    measured = bool(np.any(bat[after] > 0.10 * p_dis))
+    k = int(with_soc[0])
+    hours = ((ts + 5 * 3600) % 86400) // 3600
+    load = f["load"] + f["unserved"]
+    series = {"ts": ts[k:], "pv": (f["pv"] + f["curtail"])[k:], "load": load[k:], "grid": f["grid"][k:],
+              "crit": np.minimum(twin.critical_share(site)[hours], load)[k:], "temp": np.nan_to_num(g["temp"], nan=30.0)[k:]}
+    native_site = {**site, "native": verify.native_for_day(site_id, day) or site.get("native")}
+    sims = {"table": twin.simulate(series, twin.slots_policy(every, series["ts"]), plant, float(soc[k])),
+            "native": twin.simulate(series, twin.native_policy(native_site, series["ts"]), plant, float(soc[k]))}
+    win = (series["ts"] >= bnd) & (np.asarray(series["grid"]) > 0.5)
+    shows = {name: bool(np.any(np.asarray(sim["bat"])[win] > 0.10 * p_dis)) for name, sim in sims.items()}
+    if not shows["table"]:
+        verdict, reason = "no_evidence", "no_observable_change"          # the table itself would not discharge there (the battery near its floor)
+    elif not shows["native"]:
+        verdict, reason = ("took" if measured else "did_not_take"), None
+    else:
+        # the native settings would discharge there too: the measured energy over the hour says which the battery followed
+        w = seen[k:]
+        e_meas = float(np.sum(bat[k:][w]) / 60)
+        d_tab = abs(float(np.sum(np.asarray(sims["table"]["bat"])[w]) / 60) - e_meas)
+        d_nat = abs(float(np.sum(np.asarray(sims["native"]["bat"])[w]) / 60) - e_meas)
+        margin = 0.02 * plant.e_nom
+        verdict = "took" if d_tab + margin < d_nat else "did_not_take" if d_nat + margin < d_tab else "no_evidence"
+        reason = "native_alike"
+    return _keep_early(row["id"], {**out, "verdict": verdict, "reason": reason, "max_discharge_kw": round(max(float(np.max(bat[after])), 0.0), 1),
+                                   "checked": store._now()})
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the closed-loop read-back and write log
+
+def _same(a, b) -> bool:
+    """Whether a value written and a value read back (or asked and written) are the same: numbers to within a millionth, anything else as is."""
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
+        return abs(float(a) - float(b)) < 1e-6
+    return a == b
+
+
+def ack_lines(body: dict) -> list[dict]:
+    """An ack's lines per primitive (the read-back panel and the write log, plan Part 9.3 UI-15; audit role-operator-11): {device, primitive,
+    requested, written, read_back, match, status, codes}. This contract's `items` say what was written and read back, with ok, clamped or failed and
+    their codes; U3's `per_device` says what was asked, written and read back (`applied`: failed when the read-back differs, clamped when the value
+    written is not the one asked) and what was refused (`rejected`, with its reason code). `match` is None where nothing was read back."""
+    out = []
+    for it in body.get("items") or []:
+        w, rb = it.get("written"), it.get("read_back")
+        out.append({"device": it.get("device"), "primitive": it.get("primitive"), "requested": None, "written": w, "read_back": rb,
+                    "match": None if w is None or rb is None else _same(w, rb), "status": it.get("status"), "codes": list(it.get("codes") or [])})
+    for d in body.get("per_device") or []:
+        for a in d.get("applied") or []:
+            req, w, rb = a.get("requested"), a.get("written"), a.get("readback")
+            match = a.get("readback_ok") if a.get("readback_ok") is not None else (None if w is None or rb is None else _same(w, rb))
+            status = "failed" if match is False else "clamped" if req is not None and w is not None and not _same(req, w) else "ok"
+            out.append({"device": d.get("device_id"), "primitive": a.get("primitive"), "requested": req, "written": w, "read_back": rb, "match": match,
+                        "status": status, "codes": []})
+        for r in d.get("rejected") or []:
+            out.append({"device": d.get("device_id"), "primitive": r.get("primitive"), "requested": None, "written": None, "read_back": None,
+                        "match": None, "status": "rejected", "codes": [r["reason"]] if r.get("reason") else []})
+    return out
+
+
+def readback(site_id: str, now: int | None = None) -> dict:
+    """The read-back panel (UI-15, closed loop; audit role-operator-11): the last plan message sent to the edge (a release aside), the edge's latest
+    ack of that plan ({received_at, status, outcome, codes, detail}: contract.ack_outcome) with its lines per primitive (ack_lines), and today's
+    fidelity from what the edge reported (edge_fidelity). plan_id, sent_at and ack are None before the first send."""
+    from . import contract
+
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    with store.connect() as con:
+        sent = con.execute("SELECT plan_id, sent_at FROM plan_messages WHERE site_id = ? AND plan_id != 'release' ORDER BY sent_at DESC, rowid DESC "
+                           "LIMIT 1", (site_id,)).fetchone()
+        ack = con.execute("SELECT body, status, received_at FROM acks WHERE site_id = ? AND plan_id = ? ORDER BY received_at DESC, rowid DESC LIMIT 1",
+                          (site_id, sent["plan_id"])).fetchone() if sent else None
+    out = {"plan_id": sent["plan_id"] if sent else None, "sent_at": sent["sent_at"] if sent else None, "ack": None, "lines": [],
+           "fidelity_today": edge_fidelity(site_id, _local(now).date())}
+    if ack is not None:
+        body = json.loads(ack["body"])
+        outcome, codes = contract.ack_outcome(body)
+        out["ack"] = {"received_at": ack["received_at"], "status": ack["status"], "outcome": outcome, "codes": codes, "detail": body.get("detail")}
+        out["lines"] = ack_lines(body)
+    return out
+
+
+#: The edge's events the write log lists: what it says of its writes and of its control (U3 5.5; U3's names for them too)
+WRITE_LOG_EVENTS = ("readback_mismatch", "write_failed", "budget_exhausted", "local_override", "override_local", "fallback_engaged", "fallback_cleared",
+                    "control_disabled", "control_enabled", "template_change", "template_change_detected", "firmware_change", "firmware_change_detected")
+
+
+def write_log(site_id: str, day: date, primitive: str | None = None) -> list[dict]:
+    """The write log of a Karachi day (UI-15; U3 3.3's audit log and the evidence in a savings dispute; audit role-operator-11), newest first. Each
+    row is {at, source (person, cloud or edge), who, kind, why, primitive} and the fields of its kind:
+    - override_placed {override_kind, value, until} and override_cleared {override_kind}: a person's hold, release, pause, genset hold, charging
+      block or forced charge (or the edge's own pause), with its reason as `why`;
+    - marked_applied {plan_id, for_day, method}: a person keyed a table in;
+    - table_issued {plan_id, for_day, reason}: the table issued for a day (no rupee gain: the log carries no money);
+    - sent {plan_id, release_reason, before}: a send that changed what the inverter runs (a release is one; a repeat pull of the same table is not);
+    - ack {plan_id, status, outcome, codes} and write {plan_id, device, requested, written, read_back, match, status, codes}: what the edge
+      acknowledged, and per primitive what it wrote and read back;
+    - event {event, detail}: what the edge reported of its writes and its control (WRITE_LOG_EVENTS).
+    `primitive` keeps only the rows of that primitive."""
+    from . import contract
+
+    lo, hi = karachi_day_bounds(day)
+    t0, t1 = _ts(lo), _ts(hi)
+    with store.connect() as con:
+        ovs = con.execute("SELECT * FROM overrides WHERE site_id = ? AND ((created >= ? AND created < ?) OR (cleared >= ? AND cleared < ?))",
+                          (site_id, lo, hi, lo, hi)).fetchall()
+        clears = con.execute("SELECT at, actor, detail FROM audit WHERE target = ? AND action = 'cleared an override' AND at >= ? AND at < ?",
+                             (site_id, lo, hi)).fetchall()
+        marks = con.execute("SELECT plan_id, day_local, by, method, created FROM applied WHERE site_id = ? AND created >= ? AND created < ?",
+                            (site_id, lo, hi)).fetchall()
+        issues = con.execute("SELECT plan_id, day_local, issued_at, reason FROM table_issues WHERE site_id = ? AND issued_at >= ? AND issued_at < ?",
+                             (site_id, lo, hi)).fetchall()
+        prev = con.execute("SELECT plan_id, body, sent_at FROM plan_messages WHERE site_id = ? AND sent_at < ? ORDER BY sent_at DESC, rowid DESC LIMIT 1",
+                           (site_id, lo)).fetchone()
+        sent = con.execute("SELECT plan_id, body, sent_at FROM plan_messages WHERE site_id = ? AND sent_at >= ? AND sent_at < ? ORDER BY sent_at, rowid",
+                           (site_id, lo, hi)).fetchall()
+        acks = con.execute("SELECT plan_id, status, body, received_at FROM acks WHERE site_id = ? AND received_at >= ? AND received_at < ?",
+                           (site_id, lo, hi)).fetchall()
+        evs = con.execute(f"SELECT ts, type, source, detail FROM events WHERE site_id = ? AND type IN ({','.join('?' * len(WRITE_LOG_EVENTS))})",
+                          (site_id, *WRITE_LOG_EVENTS)).fetchall()
+    edge_who = (sites.state(site_id).get("edge_heartbeat") or {}).get("edge_id") or "Edge device"
+    rows: list[dict] = []
+
+    def add(at: str, source: str, who: str, kind: str, why: str | None = None, primitive_: str | None = None, **fields) -> None:
+        rows.append({"at": at, "source": source, "who": who, "kind": kind, "why": why or None, "primitive": primitive_, **fields})
+
+    cleared_by = {}
+    for c in clears:
+        oid = (json.loads(c["detail"] or "{}") or {}).get("override_id")
+        if oid:
+            cleared_by[oid] = c["actor"]
+    for o in ovs:
+        src = "edge" if o["author"] == "edge" else "person"
+        if lo <= o["created"] < hi:
+            add(o["created"], src, o["author"], "override_placed", o["reason"], override_kind=o["kind"], value=o["value"], until=o["until_ts"])
+        if o["cleared"] and lo <= o["cleared"] < hi:
+            add(o["cleared"], "person", cleared_by.get(o["id"], "–"), "override_cleared", override_kind=o["kind"])
+    for m in marks:
+        add(m["created"], "person", m["by"], "marked_applied", plan_id=m["plan_id"], for_day=m["day_local"], method=m["method"])
+    for i in issues:
+        add(i["issued_at"], "cloud", "Gridlytics", "table_issued", plan_id=i["plan_id"], for_day=i["day_local"], reason=i["reason"])
+
+    def written(r) -> tuple[str, dict]:
+        try:
+            body = json.loads(r["body"])
+        except (TypeError, ValueError):
+            return "", {}
+        if body.get("type") == "release":
+            return "release:" + str((body.get("release") or {}).get("reason")), body
+        on = _local(_ts(r["sent_at"])).date().isoformat()
+        return _table_key(next((x.get("slots") for x in (body.get("mode_a") or {}).get("days") or [] if x.get("date") == on), None)), body
+
+    last, before = (written(prev)[0], prev["plan_id"]) if prev else (None, None)
+    for r in sent:
+        k, body = written(r)
+        if k == last:
+            continue                                   # a repeat pull of the table the inverter already runs is no write
+        rel = (body.get("release") or {}) if body.get("type") == "release" else None
+        add(r["sent_at"], "cloud", "Gridlytics", "sent", plan_id=None if rel is not None else r["plan_id"],
+            release_reason=(rel or {}).get("reason") if rel is not None else None, before=before)
+        last, before = k, r["plan_id"]
+    for a in acks:
+        body = json.loads(a["body"])
+        outcome, codes = contract.ack_outcome(body)
+        add(a["received_at"], "edge", edge_who, "ack", body.get("detail"), plan_id=a["plan_id"], status=a["status"], outcome=outcome, codes=codes)
+        for ln in ack_lines(body):
+            add(a["received_at"], "edge", edge_who, "write", None, ln["primitive"], plan_id=a["plan_id"],
+                **{k: ln[k] for k in ("device", "requested", "written", "read_back", "match", "status", "codes")})
+    for e in evs:
+        at = contract.epoch(e["ts"])
+        if at is None or not t0 <= at < t1:
+            continue
+        detail = json.loads(e["detail"] or "{}") or {}
+        add(_iso_utc(at), "edge", edge_who if e["source"] in ("edge", "") else str(e["source"]).removeprefix("edge:"), "event",
+            str(detail.get("reason") or detail.get("cause") or "") or None, detail.get("primitive"), event=contract.event_meaning(e["type"]),
+            detail={k: detail[k] for k in ("requested", "readback", "action") if k in detail})
+    if primitive:
+        rows = [r for r in rows if r["primitive"] == primitive]
+    return sorted(rows, key=lambda r: (_ts(r["at"]) or 0, r["kind"] == "write"), reverse=True)
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the fallback test (UI-15)
+
+#: Plan Part 9.3 UI-15: "Test fallback" (an administrator's, closed loop) releases the inverter and verifies the restore (audit
+#: flow-telemetry-plan-control-19). The release lasts FALLBACK_TEST_MIN; the edge must report the inverter's own settings during it (or within
+#: FALLBACK_GRACE_S after: it beats once a minute) and the plan again within FALLBACK_RESTORE_S of its end (the next tick publishes a fresh plan within
+#: 15 minutes and the edge pulls it).
+FALLBACK_TEST_MIN, FALLBACK_GRACE_S, FALLBACK_RESTORE_S = 15, 300, 1800
+FALLBACK_TEST_REASON = "Fallback test"
+#: The heartbeat states in which the inverter runs its own settings
+NATIVE_STATES = ("native", "released", "fallback")
+
+
+def start_fallback_test(site_id: str, by: str, now: int | None = None) -> dict:
+    """Starts a fallback test: a release to native (force_native, reason FALLBACK_TEST_REASON) for FALLBACK_TEST_MIN, and the test kept in the site's
+    state (`fallback_test`: {id, override_id, by, started_at, until, released_at, restored_at}). The caller checks the tier, the edge and that no
+    release is in force, and re-solves at once so the edge is sent the release."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    until = _iso_utc(now + FALLBACK_TEST_MIN * 60)
+    o = sites.add_override(site_id, {"kind": "force_native", "until": until, "reason": FALLBACK_TEST_REASON}, by)
+    test = {"id": store.new_id(), "override_id": o["id"], "by": by, "started_at": _iso_utc(now), "until": until, "released_at": None,
+            "restored_at": None}
+    sites.put_state(site_id, fallback_test=test)
+    store.audit(by, "started a fallback test", site_id, {"until": until})
+    return test
+
+
+def fallback_test_step(test: dict, control_state: str | None, at: int) -> dict | None:
+    """What a heartbeat's control state at `at` adds to a fallback test: `released_at` the first time the edge reports the inverter's own settings
+    from the test's start to FALLBACK_GRACE_S after its end, then `restored_at` the first time it reports the plan again from the end to
+    FALLBACK_RESTORE_S after it; else None."""
+    from . import contract
+
+    if not test or test.get("restored_at"):
+        return None
+    start, until = _ts(test["started_at"]), _ts(test["until"])
+    if not test.get("released_at"):
+        return {"released_at": _iso_utc(at)} if control_state in NATIVE_STATES and start <= at < until + FALLBACK_GRACE_S else None
+    if control_state in contract.FOLLOWING_STATES and until <= at < until + FALLBACK_RESTORE_S:
+        return {"restored_at": _iso_utc(at)}
+    return None
+
+
+def fallback_test_status(test: dict, now: int) -> dict:
+    """The test with its `status`: running (no release reported yet), released (reported, the release still in force), restoring (the release over,
+    the plan not yet reported), passed, or failed with its `cause`: not_released (nothing reported by FALLBACK_GRACE_S after the end) or not_restored
+    (no plan reported by FALLBACK_RESTORE_S after it)."""
+    until = _ts(test["until"])
+    if test.get("restored_at"):
+        status, cause = "passed", None
+    elif not test.get("released_at"):
+        status, cause = ("failed", "not_released") if now >= until + FALLBACK_GRACE_S else ("running", None)
+    elif now >= until + FALLBACK_RESTORE_S:
+        status, cause = "failed", "not_restored"
+    else:
+        status, cause = ("released" if now < until else "restoring"), None
+    return {**test, "status": status, "cause": cause}
+
+
+def fallback_test(site_id: str, now: int | None = None) -> dict | None:
+    """The site's last fallback test with its status (fallback_test_status), else None."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    test = sites.state(site_id).get("fallback_test")
+    return fallback_test_status(test, now) if test else None
+
+
+def fallback_test_observe(site_id: str, control_state: str | None, at: int | None = None) -> dict | None:
+    """A heartbeat's control state applied to the site's fallback test (routes_edge's heartbeat), read and written in one write transaction on the
+    site's state; a restore says so in the audit trail. The test's change, else None."""
+    at = int(at if at is not None else datetime.now(timezone.utc).timestamp())
+    with store.write_transaction() as con:
+        r = con.execute("SELECT data FROM site_state WHERE site_id = ?", (site_id,)).fetchone()
+        cur = json.loads(r["data"]) if r else {}
+        step = fallback_test_step(cur.get("fallback_test") or {}, control_state, at)
+        if step:
+            cur["fallback_test"] = {**cur["fallback_test"], **step}
+            con.execute("UPDATE site_state SET data = ?, updated = ? WHERE site_id = ?", (json.dumps(cur, default=str), store._now(), site_id))
+    if step and step.get("restored_at"):
+        store.audit("edge", "passed a fallback test", site_id, {"released_at": cur["fallback_test"].get("released_at"), "restored_at": step["restored_at"]})
+    return step

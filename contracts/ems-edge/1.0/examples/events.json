@@ -1,0 +1,59 @@
+{
+  "contract": "ems-edge/1.0",
+  "msg_type": "events",
+  "msg_id": "...",
+  "site_id": "pk-lhr-0007",
+  "edge_id": "edge-00a1b2",
+  "sent_at": "2026-11-06T13:07:41Z",
+  "seq": 5532,
+  "events": [
+    {
+      "ts": "2026-11-06T13:07:12Z",
+      "type": "outage_start",
+      "source": "met1",
+      "detail": {
+        "grid_voltage_v": 0,
+        "last_good_ts": "2026-11-06T13:07:07Z"
+      }
+    },
+    {
+      "ts": "2026-11-06T13:07:40Z",
+      "type": "genset_start",
+      "source": "gen1",
+      "detail": {
+        "trigger": "unknown",
+        "soc_at_start_pct": 61
+      }
+    },
+    {
+      "ts": "2026-11-06T13:05:00Z",
+      "type": "plan_applied",
+      "source": "inv1",
+      "detail": {
+        "plan_id": "pk-lhr-0007:2026-11-06T13:00Z:v1",
+        "writes": 2
+      }
+    },
+    {
+      "ts": "2026-11-06T12:50:11Z",
+      "type": "readback_mismatch",
+      "source": "inv1",
+      "detail": {
+        "primitive": "soc_floor_pct",
+        "requested": 40,
+        "readback": 35,
+        "action": "released"
+      }
+    },
+    {
+      "ts": "2026-11-06T12:30:00Z",
+      "type": "override_local",
+      "source": "inv1",
+      "detail": {
+        "register": "prog3_capacity",
+        "before": 60,
+        "after": 50
+      }
+    }
+  ]
+}

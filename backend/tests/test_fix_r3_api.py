@@ -174,17 +174,20 @@ def test_an_events_batch_whose_re_solve_cannot_be_held_is_answered_failed_with_i
 
     monkeypatch.setattr(routes_edge, "_merge_pending", broken)
     _, post_e = _posts(world, sid, kh)
-    r = post_e(1, [{"ts": _iso(_now()), "type": "outage_start"}])
+    events = [{"ts": _iso(_now()), "type": "outage_start"}]
+    r = post_e(1, events)
     assert r.status_code == 200 and r.json()["stored"] == 1 and r.json()["resolve"] == "failed", r.text
-    assert post_e(1, [{"ts": _iso(_now()), "type": "outage_start"}]).json()["duplicate"] is True
+    assert post_e(1, events).json()["duplicate"] is True                # the same message sent again
 
 
 # ------------------------------------------------------------------------------------------------ plan held
 
 def _plan_row(w, sid, pid, status, reason, generated):
+    # valid for the 48 hours a tick's plan is (a plan past its valid_until is not in force: round 7, engine-delivery-24)
+    until = (datetime.fromisoformat(generated) + timedelta(hours=48)).isoformat(timespec="seconds")
     with w.use(), store.connect() as con:
         con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, reason) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (pid, sid, generated, generated, generated, generated, "a", status, reason))
+                    (pid, sid, generated, generated, generated, until, "a", status, reason))
 
 
 def test_the_plan_answer_says_why_no_plan_is_in_force(world, monkeypatch):
@@ -361,7 +364,7 @@ def test_a_workspace_file_of_schema_1_gains_the_reports_preliminary_column(tmp_p
     with store.use_company(path):
         rows = {r["id"]: r for r in reports.listing()}
         with store.connect() as con:
-            assert con.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 2
+            assert con.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION >= 2
     assert rows["r1"]["preliminary"] is True and rows["r2"]["preliminary"] is None    # October not over when made; September unknown
     assert list((tmp_path / "backup").glob("old-*-schema-v1.db"))                     # the copy before the migration
 

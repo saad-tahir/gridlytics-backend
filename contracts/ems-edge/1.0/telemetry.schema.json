@@ -1,0 +1,244 @@
+{
+  "$id": "ems-edge/1.0/telemetry.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One-minute rows (U3 5.2). Either `rows` with a ts column, or U3's `data` with ts_start and interval_s (and `rows` as its count).",
+  "properties": {
+    "aggregation": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "maxLength": 20,
+            "type": "string"
+          },
+          "maxProperties": 64,
+          "propertyNames": {
+            "maxLength": 60
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Aggregation"
+    },
+    "columns": {
+      "items": {
+        "maxLength": 60,
+        "type": "string"
+      },
+      "maxItems": 64,
+      "minItems": 1,
+      "title": "Columns",
+      "type": "array"
+    },
+    "contract": {
+      "const": "ems-edge/1.0",
+      "default": "ems-edge/1.0",
+      "title": "Contract",
+      "type": "string"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "items": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "maxItems": 1440,
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Data"
+    },
+    "edge_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Edge Id"
+    },
+    "interval_s": {
+      "anyOf": [
+        {
+          "maximum": 86400,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Interval S"
+    },
+    "msg_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Id"
+    },
+    "msg_type": {
+      "anyOf": [
+        {
+          "const": "telemetry",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Type"
+    },
+    "quality": {
+      "additionalProperties": true,
+      "description": "Free-form: at most 4096 bytes of compact JSON",
+      "maxProperties": 64,
+      "title": "Quality",
+      "type": "object"
+    },
+    "rows": {
+      "anyOf": [
+        {
+          "items": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "maxItems": 1440,
+          "type": "array"
+        },
+        {
+          "maximum": 1440,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Rows"
+    },
+    "sample_period_s": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sample Period S"
+    },
+    "sent_at": {
+      "maxLength": 40,
+      "title": "Sent At",
+      "type": "string"
+    },
+    "seq": {
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "site_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Site Id"
+    },
+    "ts_start": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Ts Start"
+    }
+  },
+  "required": [
+    "seq",
+    "sent_at",
+    "columns"
+  ],
+  "title": "TelemetryBatch",
+  "type": "object"
+}

@@ -28,27 +28,76 @@ def meta():
             "permissions": {p: auth.can(p) for p in auth.PERMISSIONS}}
 
 
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def until_words(iso: str, now: int) -> str:
+    """An end time in Pakistan time for a control label: "19:07" on the day of `now`, else with its day, "Tue 10 Nov, 19:07" (a hold runs up to 72
+    hours and the edge's pause seven days, so a time alone can be tomorrow's or next week's)."""
+    end = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    end = (end if end.tzinfo else end.replace(tzinfo=timezone.utc)).astimezone(PKT)
+    if end.date() == datetime.fromtimestamp(now, PKT).date():
+        return f"{end:%H:%M}"
+    return f"{_WEEKDAYS[end.weekday()]} {end.day} {_MONTHS[end.month - 1]}, {end:%H:%M}"
+
+
 def control_state(site: dict, last: dict | None, now: int) -> dict:
+    """The control chip: `key`, `label` (in words, an end with its day when it is not today) and, for a pause, a release, a forced charge or a hold,
+    `until`."""
     ovs = sites.overrides(site["id"])
     kinds = {o["kind"]: o for o in ovs}
     tier = site.get("tier", "monitor")
     age = (now - last["ts"]) / 60 if last else None
     if "pause_control" in kinds:
-        return {"key": "paused", "label": "Control paused", "until": kinds["pause_control"]["until_ts"]}
+        until = kinds["pause_control"]["until_ts"]
+        return {"key": "paused", "label": f"Control paused until {until_words(until, now)}", "until": until}
     if "force_native" in kinds:
-        return {"key": "native", "label": "Released to native", "until": kinds["force_native"]["until_ts"]}
+        until = kinds["force_native"]["until_ts"]
+        # a fallback test is a release that says what it is for (round 7, audit flow-telemetry-plan-control-19)
+        what = "Fallback test: released to native" if kinds["force_native"].get("reason") == plans.FALLBACK_TEST_REASON else "Released to native"
+        return {"key": "native", "label": f"{what} until {until_words(until, now)}", "until": until}
+    block = plans.switchback_release(site["id"], now)
+    if block:
+        # a native block of the switchback calendar: the inverter runs its own settings all day, so no table is keyed in or followed
+        return {"key": "native_block", "label": "Switchback: native settings today", "until": block["until"]}
+    if "force_charge" in kinds:
+        # a forced charge says so (round 7, audit flow-telemetry-plan-control-17: the chip read "Recommendation only"); it outranks a hold's floor
+        o = kinds["force_charge"]
+        target = 100.0 if o["value"] is None else float(o["value"])
+        return {"key": "force_charge", "label": f"Forced charge to {target:.0f} % until {until_words(o['until_ts'], now)}", "until": o["until_ts"]}
     if "reserve" in kinds:
-        until = datetime.fromisoformat(kinds["reserve"]["until_ts"]).astimezone(PKT).strftime("%H:%M")
-        return {"key": "hold", "label": f"Hold until {until}", "until": kinds["reserve"]["until_ts"]}
-    if tier == "closed_loop" and age is not None and age > 5 and not site.get("demo_link"):
+        until = kinds["reserve"]["until_ts"]
+        return {"key": "hold", "label": f"Hold until {until_words(until, now)}", "until": until}
+    # a demo site says its state as a customer site does (round 7, audit role-owner-08): its chip, its alerts and its applied log agree
+    if tier == "closed_loop" and not sites.state(site["id"]).get("edge_last_seen"):
+        # closed loop runs through an edge device: with none ever heard from nothing reaches the inverter, whatever the readings say (round 7, audit
+        # role-operator-11: the Karachi demo site read "Following plan")
+        return {"key": "edge_offline", "label": "No edge device yet"}
+    if tier == "closed_loop" and age is not None and age > 5:
         return {"key": "edge_offline", "label": "Edge offline"}
+    if tier == "closed_loop":
+        clock = plans.clock_info(site["id"])
+        if clock and clock["level"] == "demoted":
+            return {"key": "clock_demoted", "label": f"Control demoted: the inverter clock is {plans.clock_words(clock['offset_s'])} off"}
+        # what the edge itself reports (a fallback, control it disabled, the plan refused or applied in part) comes before "Following plan"
+        edge = plans.edge_view(site["id"], now)
+        if edge:
+            return edge
+        if clock and clock["level"] == "widen":
+            return {"key": "following", "label": f"Following plan (set the inverter clock: it is {plans.clock_words(clock['offset_s'])} off)"}
     if tier == "monitor":
         return {"key": "recommendation", "label": "Recommendation only"}
     if tier == "advisory_writes":
+        day = today().isoformat()
         with store.connect() as con:
-            ok = con.execute("SELECT 1 FROM applied WHERE site_id = ? AND day_local = ?", (site["id"], today().isoformat())).fetchone()
-        return {"key": "following" if ok or site.get("demo_link") else "unconfirmed",
-                "label": "Following plan (table applied)" if ok or site.get("demo_link") else "Table not confirmed today"}
+            marks = con.execute("SELECT plan_id, created FROM applied WHERE site_id = ? AND day_local = ?", (site["id"], day)).fetchall()
+        ok = bool(marks)
+        issued = plans.issued_for(site["id"], day) if ok else None
+        if issued and issued["plan_id"] not in {m["plan_id"] for m in marks} and issued["issued_at"] > max(m["created"] for m in marks):
+            # today's table was issued again after the mark (round 7, audit pages-B-02): what the inverter runs is the table keyed before it
+            return {"key": "unconfirmed", "label": "New table issued: key it in and mark it"}
+        return {"key": "following" if ok else "unconfirmed", "label": "Following plan (table applied)" if ok else "Table not confirmed today"}
     return {"key": "following", "label": "Following plan"}
 
 

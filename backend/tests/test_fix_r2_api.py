@@ -483,9 +483,10 @@ def test_resume_re_solves_at_once_and_a_failed_tick_does_not_undo_it(world, monk
     assert admin.post(f"/api/sites/{sid}/control/pause", json={"hours": 2}).json()["control"]["key"] == "paused"
     r = admin.post(f"/api/sites/{sid}/control/resume", json={})
     assert r.status_code == 200 and r.json()["control"]["key"] != "paused", r.text
-    assert ticks == [sid] and r.json()["resolve"] == {"status": "active", "plan_id": "p-resume", "reason": None}
+    # the pause re-solved at once too (round 7, audit flow-telemetry-plan-control-15: every control action takes effect at once)
+    assert ticks == [sid, sid] and r.json()["resolve"] == {"status": "active", "plan_id": "p-resume", "reason": None}
     # nothing to resume: no solve
-    assert "resolve" not in admin.post(f"/api/sites/{sid}/control/resume", json={}).json() and ticks == [sid]
+    assert "resolve" not in admin.post(f"/api/sites/{sid}/control/resume", json={}).json() and ticks == [sid, sid]
 
     def broken(site_id, *a, **k):
         raise RuntimeError("solver crashed")

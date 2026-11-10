@@ -271,9 +271,10 @@ def _insert_plan(sid, day, slots, sim):
     steps = [{"t": t0 + 900 * i, "discharge_kw": float(max(q[i], 0.0)), "charge_kw": float(max(-q[i], 0.0)), "genset_on": False} for i in range(96)]
     pid = store.new_id()
     now = store._now()
+    until = (datetime.fromisoformat(now) + timedelta(hours=48)).isoformat(timespec="seconds")   # a tick's 48 hours (round 7: valid_until is read)
     with store.connect() as con:
         con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, steps, slots) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (pid, sid, now, now, now, now, "mode_a", "active", json.dumps(steps), json.dumps({"days": [{"day": day.isoformat(), "slots": slots}]})))
+                    (pid, sid, now, now, now, until, "mode_a", "active", json.dumps(steps), json.dumps({"days": [{"day": day.isoformat(), "slots": slots}]})))
     return pid
 
 

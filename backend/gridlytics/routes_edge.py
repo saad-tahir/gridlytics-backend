@@ -1,13 +1,17 @@
 """The ems-edge/1.0 HTTPS path (plan Part 7.3 and 7.5): telemetry batches, heartbeats, events, acks and capabilities from a site-bound API key.
 
 The guard has already checked the key, its scope and that the site in the path is the key's own (403 wrong_site otherwise); a person's session never
-reaches these routes (the guard refuses it with 403 key_required, and each route checks again). Idempotent by (site, stream, sequence): a repeated
-sequence is acknowledged and not written twice. A sequence counts as received only once its batch is stored, so a batch that fails is never later
-acknowledged as a duplicate; an events batch claims its sequence in the transaction that stores it. A malformed batch (an unknown or repeated column, a
+reaches these routes (the guard refuses it with 403 key_required, and each route checks again). Idempotent by (site, stream, sequence, content): a
+message is acknowledged as a duplicate, and not written twice, only when the same message (the same sequence and the same digest of its content, sent_at
+and msg_id aside) was stored before (`edge_seen`). A batch below the last sequence that was never stored (a retry after a later batch went through) is
+stored, and so is a counter that restarted (a replaced box, a reboot that lost it). A message counts as received only once it is stored, so a batch
+that fails is never later acknowledged as a duplicate; an events batch is marked in the transaction that stores it. A malformed batch (an unknown or repeated column, a
 ts outside 2015 to a day from now) is refused with 422 every time it is sent. An outage event re-solves the plan once telemetry shows it (OPT-15).
+A message is at most 1 MiB however it is sent (413 too_large, DAT-03), and its free-form parts are bounded by the contract's models.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -16,26 +20,32 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
-from fastapi import APIRouter, BackgroundTasks, Body, HTTPException
-from pydantic import ValidationError
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request
+from pydantic import Field, ValidationError
 
-from . import auth, delivery, demo, forecast, money, plans, sites, store, telemetry
+from . import alerts, auth, contract, delivery, demo, forecast, money, plans, sites, store, telemetry
 from .routes_common import full_or_404, now_ts, out, put_state, site_or_404, state_change
-from .schemas import Refusal
+from .schemas import Refusal, Strict, check
 
 router = APIRouter()
 log = logging.getLogger("gridlytics.edge")
 
 #: The largest sequence number taken: the seq table keeps a 64-bit integer, and a JSON number above 2**53 is no longer exact everywhere
-SEQ_MAX = 2 ** 53 - 1
+SEQ_MAX = contract.SEQ_MAX
 
 #: A telemetry row's ts must lie between this instant and a day from now (as the CSV upload's window): a ts that is not finite, or one past SQLite's
 #: 64-bit integer (1e20), would otherwise fail the write on every retry of its batch, and a millisecond or unset clock would store rows decades away
 TS_EARLIEST = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
 TS_AHEAD_S = 86400
 
-#: Events that put the site in an unknown state: control pauses until a person resumes it
-PAUSE_EVENTS = ("readback_mismatch", "local_override", "template_change")
+#: Events that put the site in an unknown state: control pauses until a person resumes it (U3's names for them act alike: contract.event_meaning). A
+#: firmware change may move the register map under the template as a template change does (R6 C8): the cloud stops writing until a person resumes
+PAUSE_EVENTS = ("readback_mismatch", "local_override", "template_change", "firmware_change")
+#: Events with which the edge says it stopped running the plan, and the event that ends each state (R6 E18, 4.4): kept in the site's state
+#: (`edge_reports`, the newest report by its ts wins) for the control state, and read from the events table for the day's fidelity
+#: (plans.edge_fidelity)
+REPORT_EVENTS = {"control_disabled": ("disabled", True), "control_enabled": ("disabled", False),
+                 "fallback_engaged": ("fallback", True), "fallback_cleared": ("fallback", False)}
 PAUSE_REASON = "Edge reported an unknown device state"
 
 #: Event re-solves (plan Part 2.4, OPT-15: an outage event re-solves within a minute). The tick reads the grid state from telemetry, and only the whole
@@ -61,14 +71,53 @@ _last_event_solve: dict[str, float] = {}
 _solve_lock = threading.Lock()
 
 
-def _check(model, body):
+#: The largest edge message (plan DAT-03, R7 4: 413 above 1 MiB), however it is sent: one site key cannot fill the workspace file or the site's
+#: carried state, which every tick and page reads (audit engine-delivery-23; the API's own cap for every other path is api.MAX_BODY)
+EDGE_MAX_BODY = 1_048_576
+TOO_LARGE = "An edge message is at most 1 MiB: send the rows or events in smaller batches"
+#: The edge routes' body in the API description (they read it themselves, `_edge_body`)
+_JSON_BODY = {"requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object"}}}}}
+
+
+async def _edge_body(request: Request) -> dict:
+    """The edge message's JSON object, read up to EDGE_MAX_BODY: a Content-Length over it is refused before a byte is read, and a body sent in chunks
+    is counted as it arrives and refused once over, never read whole or parsed (413 too_large). A body that is not a JSON object is a 422 in one
+    sentence, as a message that breaks the contract is."""
+    try:
+        announced = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        announced = 0
+    if announced > EDGE_MAX_BODY:
+        raise Refusal(413, TOO_LARGE, "too_large")
+    chunks, seen = [], 0
+    async for chunk in request.stream():
+        seen += len(chunk)
+        if seen > EDGE_MAX_BODY:
+            raise Refusal(413, TOO_LARGE, "too_large")
+        chunks.append(chunk)
+    try:
+        body = json.loads(b"".join(chunks))
+    except (ValueError, RecursionError):
+        raise Refusal(422, "The message is not JSON", "SCHEMA") from None
+    if not isinstance(body, dict):
+        raise Refusal(422, "The message must be a JSON object", "SCHEMA")
+    return body
+
+
+def _check(model, body, site_id: str | None = None):
+    """The message validated by its contract model (422 SCHEMA with the first error otherwise); an envelope site_id that is not the path's site (the
+    key's own: the guard checked it) is refused with 403 wrong_site (DAT-03)."""
     try:
         msg = model.model_validate(body)
     except ValidationError as exc:
         e = exc.errors()[0]
-        raise Refusal(422, f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}", "SCHEMA") from None
+        where = ".".join(str(x) for x in e["loc"])
+        text = str(e["msg"]).removeprefix("Value error, ")
+        raise Refusal(422, f"{where}: {text}" if where and not text.startswith(f"{where}:") else text, "SCHEMA") from None
     if getattr(msg, "seq", 0) > SEQ_MAX:
         raise Refusal(422, f"seq: at most {SEQ_MAX}", "SCHEMA")
+    if site_id is not None and getattr(msg, "site_id", None) not in (None, site_id):
+        raise Refusal(403, "The message names another site than the one its key is for", "wrong_site")
     return msg
 
 
@@ -80,16 +129,32 @@ def _key_only(detail: str = "The edge paths take the site's API key") -> dict:
     return user
 
 
-def _seq_last(site_id: str, stream: str) -> int:
-    """The last sequence the telemetry file records for the stream (-1 for none)."""
-    with telemetry.connect() as con:
-        r = con.execute("SELECT last FROM seq WHERE site_id = ? AND stream = ?", (site_id, stream)).fetchone()
-    return int(r["last"]) if r else -1
+#: How long a stored message's sequence and digest are kept: well past the edge's 7-day store-and-forward (U3 5.1), so every retry it can still send
+#: is recognised. Older rows are pruned now and then (one message in SEEN_PRUNE_EVERY)
+SEEN_KEEP_DAYS = 30
+SEEN_PRUNE_EVERY = 64
 
 
-def _seq_check(site_id: str, stream: str, seq: int) -> bool:
-    """True when the sequence is new for the stream (nothing is recorded here: `telemetry.next_seq` records it once the message is stored)."""
-    return seq > _seq_last(site_id, stream)
+def _digest(msg) -> str:
+    """The digest of an edge message's content: the whole message but sent_at and msg_id, which an edge may stamp again on a retry. Two messages of a
+    stream with the same sequence and digest are the same message (audit engine-delivery-03)."""
+    body = msg.model_dump(exclude={"sent_at", "msg_id"})
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def _was_stored(con, site_id: str, stream: str, seq: int, digest: str) -> bool:
+    """Whether this very message (stream, sequence and digest) was stored before."""
+    return con.execute("SELECT 1 FROM edge_seen WHERE site_id = ? AND stream = ? AND seq = ? AND digest = ?",
+                       (site_id, stream, seq, digest)).fetchone() is not None
+
+
+def _mark_stored(con, site_id: str, stream: str, seq: int, digest: str) -> None:
+    """Records the message as stored, in the caller's transaction (the one that stored it, where there is one)."""
+    con.execute("INSERT OR IGNORE INTO edge_seen (site_id, stream, seq, digest, received_at) VALUES (?,?,?,?,?)",
+                (site_id, stream, seq, digest, store._now()))
+    if seq % SEEN_PRUNE_EVERY == 0:
+        old = (datetime.now(timezone.utc) - timedelta(days=SEEN_KEEP_DAYS)).isoformat(timespec="seconds")
+        con.execute("DELETE FROM edge_seen WHERE site_id = ? AND stream = ? AND received_at < ?", (site_id, stream, old))
 
 
 def _state_change(site_id: str, change) -> tuple[dict, object]:
@@ -139,18 +204,18 @@ def _row_time(v) -> float | None:
     return None
 
 
-def _check_times(msg) -> None:
+def _check_times(columns: list[str], rows: list[list]) -> None:
     """Refuses (422) a batch with a row whose ts is not finite or lies outside 2015 to a day from now, before anything is written: such a batch is answered
     the same way every time it is sent, so the edge drops it instead of retrying it for ever."""
-    col = msg.columns.index("ts")
+    col = columns.index("ts")
     latest = now_ts() + TS_AHEAD_S
     bad = []
-    for n, row in enumerate(msg.rows):
+    for n, row in enumerate(rows):
         t = _row_time(row[col] if col < len(row) else None)
         if t is not None and (not math.isfinite(t) or t < TS_EARLIEST or t > latest):
             bad.append(n)
     if bad:
-        first = msg.rows[bad[0]][col]
+        first = rows[bad[0]][col]
         raise Refusal(422, f"{len(bad)} row{'s have' if len(bad) != 1 else ' has'} a ts that is not a time from 2015 to a day from now (the first is row "
                            f"{bad[0] + 1}: {first!r}); ts is epoch seconds or ISO 8601, UTC", "SCHEMA")
 
@@ -256,30 +321,41 @@ def _resolve_pending(site_id: str, state: dict | None, background: BackgroundTas
     return "waiting_for_telemetry"
 
 
-@router.post("/api/edge/{site_id}/telemetry")
-def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(...)):
+@router.post("/api/edge/{site_id}/telemetry", openapi_extra=_JSON_BODY)
+def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Depends(_edge_body)):
     _key_only()
     site = site_or_404(site_id)
-    msg = _check(delivery.TelemetryBatch, inp)
+    msg = _check(delivery.TelemetryBatch, inp, site_id)
     _seen(site_id)
     # the batch is checked before its sequence is looked at, and the sequence is recorded only after the rows are written: a refused or failed batch is
     # answered as such every time it is sent, never acknowledged later as a duplicate (the minute table is idempotent by site and minute, so a batch
-    # written twice by two concurrent sends stores the same rows)
-    unknown = [c for c in msg.columns if c != "ts" and c not in telemetry.ALL]
-    if "ts" not in msg.columns or unknown:
-        raise Refusal(422, f"Unknown columns: {', '.join(unknown)}" if unknown else "The batch needs a ts column", "SCHEMA")
-    twice = sorted({c for c in msg.columns if msg.columns.count(c) > 1})
+    # written twice by two concurrent sends stores the same rows). U3's form (data stamped from ts_start every interval_s) is read as rows with a ts
+    columns, rows = msg.table()
+    ignored = [c for c in columns if c in contract.POINTS_NOT_STORED and c not in telemetry.ALL]
+    unknown = [c for c in columns if c != "ts" and c not in telemetry.ALL and c not in ignored]
+    if unknown:
+        raise Refusal(422, f"Unknown columns: {', '.join(unknown)}", "SCHEMA")
+    twice = sorted({c for c in columns if columns.count(c) > 1})
     if twice:
         raise Refusal(422, f"Columns named more than once: {', '.join(twice)}", "SCHEMA")
-    if "grid_present" not in msg.columns and "grid_voltage_v" not in msg.columns:
+    if "grid_present" not in columns and "grid_voltage_v" not in columns:
         raise Refusal(422, "Every batch carries grid_present (or grid_voltage_v)", "SCHEMA")
-    _check_times(msg)
-    if not _seq_check(site_id, "telemetry", msg.seq):
-        return {"ack": msg.seq, "duplicate": True}
-    records = [dict(zip(msg.columns, row)) for row in msg.rows]
+    _check_times(columns, rows)
+    digest = _digest(msg)
+    with store.connect() as con:
+        if _was_stored(con, site_id, "telemetry", msg.seq, digest):
+            return {"ack": msg.seq, "duplicate": True}
+    records = [{c: v for c, v in zip(columns, row) if c not in ignored} for row in rows]
     res = telemetry.ingest(site_id, records, "edge")
-    telemetry.next_seq(site_id, "telemetry", msg.seq)
-    answer = {"ack": msg.seq, **res}
+    with store.connect() as con:
+        _mark_stored(con, site_id, "telemetry", msg.seq, digest)
+    if "inverter_clock_offset_s" in columns:
+        # the inverter's own clock (R6 C10 b): its newest reading in the batch moves the clock ladder as the heartbeat's does
+        k = columns.index("inverter_clock_offset_s")
+        seen = [float(r[k]) for r in rows if k < len(r) and isinstance(r[k], (int, float)) and not isinstance(r[k], bool) and math.isfinite(r[k])]
+        if seen:
+            _clock_update(site_id, seen[-1], "inverter")
+    answer = {"ack": msg.seq, **res, **({"ignored_columns": ignored} if ignored else {})}
     # an outage event waiting for this batch (the minute that shows the grid lost or back) re-solves now; the batch is stored either way. The pending
     # re-solve is read now, after the batch is stored, not from the state at the request's start: an event stored meanwhile is the one that decides
     try:
@@ -292,18 +368,51 @@ def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(.
     return answer
 
 
-@router.post("/api/edge/{site_id}/heartbeat")
-def edge_heartbeat(site_id: str, inp: dict = Body(...)):
+@router.post("/api/edge/{site_id}/heartbeat", openapi_extra=_JSON_BODY)
+def edge_heartbeat(site_id: str, inp: dict = Depends(_edge_body)):
     _key_only()
     site_or_404(site_id)
-    msg = _check(delivery.Heartbeat, inp)
-    _put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump())
-    warn = None
-    if abs(msg.clock_offset_s) >= 900:
-        warn = "clock_offset_900s: control demoted until the clock is set"
-    elif abs(msg.clock_offset_s) >= 300:
-        warn = "clock_offset_300s: peak slots are widened by 15 minutes"
-    return {"ack": msg.seq, "warning": warn}
+    msg = _check(delivery.Heartbeat, inp, site_id)
+    _put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump(), edge_heartbeat_at=now_ts())
+    try:
+        # a fallback test in progress reads the edge's state from its heartbeats (round 7, audit flow-telemetry-plan-control-19)
+        plans.fallback_test_observe(site_id, msg.control_state, now_ts())
+    except Exception:
+        log.exception("could not record the fallback test's progress for site %s", site_id)
+    level, worst = _clock_update(site_id, msg.clock_offset_s, "edge")
+    return {"ack": msg.seq, "warning": _clock_warning(level, worst)}
+
+
+def _clock_warning(level: str, offset_s: float) -> str | None:
+    off = f"the clock is {abs(offset_s):.0f} s off"
+    return {"unsynced": f"clock_offset_120s: {off}; the cloud raised clock_unsynced. Set the clock",
+            "widen": f"clock_offset_300s: {off}; the next plan message starts every discharge slot 15 minutes early and ends it 15 minutes late. "
+                     "Set the inverter clock",
+            "demoted": f"clock_offset_900s: {off}; control is demoted and no plan is sent until the offset is under {plans.CLOCK_WARN_S} s. "
+                       "Set the inverter clock"}.get(level)
+
+
+def _clock_update(site_id: str, offset_s: float, source: str) -> tuple[str, float]:
+    """Records a clock offset (the edge's from its heartbeat, the inverter's from telemetry's inverter_clock_offset_s) and moves the site along R6
+    C10's ladder on the worst of them (plans.clock_level; audit engine-delivery-10): clock_unsynced is raised as an event when the offset first goes
+    over 120 s, and an audit line says when control is demoted (900 s) and restored (back under 120 s). The level now, and the worst offset."""
+    def change(cur):
+        c = dict(cur.get("edge_clock") or {})
+        offsets = {**(c.get("offsets") or {}), source: round(float(offset_s), 1)}
+        src, worst = max(offsets.items(), key=lambda kv: abs(kv[1]))
+        before = c.get("level", "ok")
+        level = plans.clock_level(worst, before == "demoted")
+        return {"edge_clock": {"offsets": offsets, "offset_s": worst, "source": src, "level": level, "at": now_ts()}}, (before, level, worst)
+    _, (before, level, worst) = _state_change(site_id, change)
+    if before == "ok" and level != "ok":
+        with store.connect() as con:
+            con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
+                        (site_id, store._now(), "clock_unsynced", "cloud", json.dumps({"offset_s": worst, "from": source})))
+    if level == "demoted" and before != "demoted":
+        store.audit("edge", "demoted control: the clock is off", site_id, {"offset_s": worst, "from": source})
+    elif before == "demoted" and level != "demoted":
+        store.audit("edge", "restored control: the clock is set", site_id, {"offset_s": worst, "from": source})
+    return level, worst
 
 
 def _pause_in(con, site_id: str) -> None:
@@ -315,32 +424,27 @@ def _pause_in(con, site_id: str) -> None:
     store.audit("edge", "set an override", site_id, {"kind": "pause_control", "value": None, "until": until}, con=con)
 
 
-@router.post("/api/edge/{site_id}/events")
-def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Body(...)):
-    """An event batch, stored once. The sequence is claimed in the same workspace-file transaction (BEGIN IMMEDIATE) that stores the events and any
-    pause they call for, so two identical batches sent at once, or a retry after a failure, never store the events or the pause twice; a batch that
-    fails stores nothing and is stored when sent again. An outage starting or ending re-solves the plan (OPT-15)."""
+@router.post("/api/edge/{site_id}/events", openapi_extra=_JSON_BODY)
+def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Depends(_edge_body)):
+    """An event batch, stored once. The message is marked stored (`edge_seen`) in the same workspace-file transaction (BEGIN IMMEDIATE) that stores
+    the events and any pause they call for, so two identical batches sent at once, or a retry after a failure, never store the events or the pause
+    twice; a batch that fails stores nothing and is stored when sent again. An outage starting or ending re-solves the plan (OPT-15)."""
     _key_only()
     site = site_or_404(site_id)
-    msg = _check(delivery.EventBatch, inp)
+    msg = _check(delivery.EventBatch, inp, site_id)
     _seen(site_id)
-    floor = _seq_last(site_id, "events")      # the sequence the telemetry file recorded before the claim moved into the workspace file
-    claim = f"edge_seq:{site_id}:events"
+    digest = _digest(msg)
     with store.write_transaction() as con:
-        r = con.execute("SELECT value FROM settings WHERE key = ?", (claim,)).fetchone()
-        if msg.seq <= max(floor, int(json.loads(r["value"])) if r else -1):
+        if _was_stored(con, site_id, "events", msg.seq, digest):
             return {"ack": msg.seq, "duplicate": True}
         for e in msg.events:
-            con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)", (site_id, e.ts, e.type, "edge", json.dumps(e.detail)))
-        con.execute("INSERT INTO settings (key, value, updated) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
-                    "updated = excluded.updated", (claim, json.dumps(msg.seq), store._now()))
+            # stored as sent (U3's name or this contract's), with the device the edge names as its source
+            con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
+                        (site_id, e.ts, e.type, f"edge:{e.source}" if e.source else "edge", json.dumps(e.detail)))
+        _mark_stored(con, site_id, "events", msg.seq, digest)
         # read-back mismatch, a local override or a template change put the site in unknown state: pause control until a person resumes it
-        if any(e.type in PAUSE_EVENTS for e in msg.events):
+        if any(contract.event_meaning(e.type) in PAUSE_EVENTS for e in msg.events):
             _pause_in(con, site_id)
-    try:
-        telemetry.next_seq(site_id, "events", msg.seq)    # kept in step for any reader of the telemetry file's sequences; the claim above decides
-    except Exception:
-        log.warning("could not record the events sequence of site %s in the telemetry file", site_id, exc_info=True)
     resolve = None
     outs = [e for e in msg.events if e.type in RESOLVE_EVENTS]
     if outs and site.get("status") == "active":
@@ -353,7 +457,33 @@ def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Body(...)
         except Exception:
             log.exception("could not start the event re-solve for site %s", site_id)
             resolve = "failed"
-    return {"ack": msg.seq, "stored": len(msg.events), "resolve": resolve}
+    reports = [e for e in msg.events if e.type in REPORT_EVENTS]
+    if reports:
+        try:
+            _state_change(site_id, lambda cur: (_merge_reports(cur.get("edge_reports"), reports), None))
+        except Exception:
+            log.exception("could not record the edge's control reports for site %s", site_id)
+    answer = {"ack": msg.seq, "stored": len(msg.events), "resolve": resolve}
+    unknown = msg.unknown_types()
+    if unknown:
+        answer["unknown_types"] = unknown       # stored; a newer edge's event types never void its batch (1.x adds optional things only)
+    return answer
+
+
+def _merge_reports(held, events) -> dict | None:
+    """The site's `edge_reports` after an events batch: per state (disabled, fallback) the newest report by its ts, {on, at, cause}; a report older than
+    the one held (sent late) changes nothing. None when nothing changes."""
+    cur = dict(held) if isinstance(held, dict) else {}
+    changed = False
+    for e in sorted(events, key=_event_minute):
+        key, on = REPORT_EVENTS[e.type]
+        at = _event_minute(e)
+        if at < int((cur.get(key) or {}).get("at", -1)):
+            continue
+        cause = e.detail.get("cause") or e.detail.get("reason")
+        cur[key] = {"on": on, "at": at, "cause": str(cause)[:120] if on and cause else None}
+        changed = True
+    return {"edge_reports": cur} if changed else None
 
 
 def _merge_pending(held, cands: list[tuple[int, int, str]], now: int) -> dict:
@@ -372,29 +502,44 @@ def _merge_pending(held, cands: list[tuple[int, int, str]], now: int) -> dict:
     return {"minute": minute, "event": event, "since": min(int(held.get("since", now)), now) if same else now}
 
 
-@router.post("/api/edge/{site_id}/ack")
-def edge_ack(site_id: str, inp: dict = Body(...)):
+@router.post("/api/edge/{site_id}/ack", openapi_extra=_JSON_BODY)
+def edge_ack(site_id: str, inp: dict = Depends(_edge_body)):
     _key_only()
     site_or_404(site_id)
-    msg = _check(delivery.Ack, inp)
+    msg = _check(delivery.Ack, inp, site_id)
     _seen(site_id)
-    with store.connect() as con:
+    digest = _digest(msg)
+    with store.write_transaction() as con:
+        if _was_stored(con, site_id, "ack", msg.seq, digest):
+            return {"ack": msg.seq, "duplicate": True}
         con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
                     (store.new_id(), site_id, msg.plan_id, msg.status, json.dumps(msg.model_dump()), store._now()))
+        _mark_stored(con, site_id, "ack", msg.seq, digest)
     return {"ack": msg.seq}
 
 
-@router.post("/api/edge/{site_id}/capabilities")
-def edge_caps(site_id: str, inp: dict = Body(...)):
+@router.post("/api/edge/{site_id}/capabilities", openapi_extra=_JSON_BODY)
+def edge_caps(site_id: str, inp: dict = Depends(_edge_body)):
     _key_only()
     site_or_404(site_id)
-    msg = _check(delivery.Capabilities, inp)
-    with store.connect() as con:
-        con.execute("INSERT OR REPLACE INTO capabilities (site_id, seq, received_at, body) VALUES (?,?,?,?)",
-                    (site_id, msg.seq, store._now(), json.dumps(msg.model_dump())))
-    sites.set_tier_capable(site_id, msg.tier)
+    msg = _check(delivery.Capabilities, inp, site_id)
     _seen(site_id)
-    return {"ack": msg.seq, "tier_capable": msg.tier}
+    digest = _digest(msg)
+    sent = _row_time(msg.sent_at)
+    sent = int(sent) if sent is not None and math.isfinite(sent) else now_ts()
+    with store.write_transaction() as con:
+        if _was_stored(con, site_id, "capabilities", msg.seq, digest):
+            cur = con.execute("SELECT tier_capable FROM sites WHERE id = ?", (site_id,)).fetchone()
+            return {"ack": msg.seq, "duplicate": True, "tier_capable": cur["tier_capable"] if cur else None}
+        con.execute("INSERT OR REPLACE INTO capabilities (site_id, seq, digest, received_at, sent_ts, body) VALUES (?,?,?,?,?,?)",
+                    (site_id, msg.seq, digest, store._now(), sent, json.dumps(msg.model_dump())))
+        _mark_stored(con, site_id, "capabilities", msg.seq, digest)
+        # the newest message by its sent_at is the current one, whatever its sequence (a counter that restarted sends 0 on boot); a late retry of an
+        # older message is kept for the record and sets nothing
+        newer = con.execute("SELECT 1 FROM capabilities WHERE site_id = ? AND sent_ts > ? LIMIT 1", (site_id, sent)).fetchone()
+    if newer is None:
+        sites.set_tier_capable(site_id, msg.control_tier)
+    return {"ack": msg.seq, "tier_capable": (sites.get(site_id) or {}).get("tier_capable", msg.control_tier)}
 
 
 def _without_money(site_id: str, msg: dict) -> dict:
@@ -408,13 +553,35 @@ def _without_money(site_id: str, msg: dict) -> dict:
 @router.get("/api/sites/{site_id}/plans/current/message")
 def plan_message(site_id: str):
     """The signed plan message: what an edge (a plans:read key) pulls. Only a key pulls it, so each pull recorded in plan_messages is a real send (a
-    person reads the plan at /plan)."""
+    person reads the plan at /plan). 409 `not_closed_loop` below the closed-loop tier (nothing is sent to the edge of a monitor or advisory site);
+    404 `plan_expired` when the last plan is past its valid_until, `no_plan` before the first plan; 409 `signing_key_missing` (and a critical Control
+    alert) when the site's signing key is not in the keys folder (audit engine-delivery-13)."""
     _key_only("The signed plan message is pulled by the site's edge with its API key; the plan itself is at /plan")
     site_or_404(site_id)
-    msg = plans.signed_message(site_id)
+    try:
+        msg = plans.signed_message(site_id)
+        if msg is not None:
+            msg = _without_money(site_id, msg)
+    except delivery.KeyMissing as exc:
+        # never a new key in its place (the edge holds the old public key): the edge is refused in words, and the site's people are told at once
+        log.error("site %s: %s", site_id, exc)
+        alerts._open(site_id, KEY_ALERT, "Control", "critical", "The plan-signing key is missing, so no plan reaches the edge: restore the keys "
+                     "folder from the backup, or an administrator replaces the key", {"key_id": exc.key_id})
+        raise Refusal(409, str(exc), "signing_key_missing") from None
+    except plans.NotClosedLoop as exc:
+        # only a closed-loop site's edge applies plans: below it the edge gets no table to write (and no send is counted)
+        raise Refusal(409, str(exc), "not_closed_loop") from None
+    except plans.CapsMismatch as exc:
+        raise Refusal(409, f"{exc}, so the plan is not sent", "caps_mismatch") from None
+    except plans.ClockDemoted as exc:
+        raise Refusal(409, str(exc), "clock_unsynced") from None
     if msg is None:
+        held = plans.held_info(site_id) or {}
+        if held.get("reason") == plans.EXPIRED_REASON:
+            raise Refusal(404, "The last plan has run out and no newer plan is in force, so the edge runs its fallback", "plan_expired")
         raise Refusal(404, "No active plan yet", "no_plan")
-    return _without_money(site_id, msg)
+    _key_restored(site_id)
+    return msg
 
 
 @router.get("/api/sites/{site_id}/edge")
@@ -422,11 +589,49 @@ def edge_status(site_id: str):
     s = full_or_404(site_id)
     st = s.get("state") or {}
     with store.connect() as con:
-        cap = con.execute("SELECT * FROM capabilities WHERE site_id = ? ORDER BY seq DESC LIMIT 1", (site_id,)).fetchone()
+        cap = con.execute("SELECT * FROM capabilities WHERE site_id = ? ORDER BY sent_ts IS NULL, sent_ts DESC, received_at DESC LIMIT 1",
+                          (site_id,)).fetchone()
         acks = con.execute("SELECT plan_id, status, body, received_at FROM acks WHERE site_id = ? ORDER BY received_at DESC LIMIT 20", (site_id,)).fetchall()
         sent = con.execute("SELECT plan_id, key_id, sent_at FROM plan_messages WHERE site_id = ? ORDER BY sent_at DESC LIMIT 20", (site_id,)).fetchall()
     last = st.get("edge_last_seen")
     fresh = demo.EDGE_FRESH_S if s.get("demo_link") else 300                   # a demo site's edge is the twin, run every 15 minutes
     return out({"last_seen": last, "online": bool(last and now_ts() - last < fresh), "heartbeat": st.get("edge_heartbeat"),
                 "capabilities": json.loads(cap["body"]) if cap else None, "acks": [{**dict(a), "body": json.loads(a["body"])} for a in acks],
-                "sent": [dict(r) for r in sent], "public_key": delivery.public_key(site_id) if auth.can("edit_sites") else None})
+                "sent": [dict(r) for r in sent], "public_key": delivery.public_key(site_id) if auth.can("edit_sites") else None,
+                # what the edge reports when it is not running the plan in force, and the clock-offset ladder's step (audit engine-delivery-10, 12)
+                "reports": plans.edge_view(site_id), "clock": plans.clock_info(site_id)})
+
+
+# ------------------------------------------------------------------------------------------------ the site's signing key (audit engine-delivery-13)
+
+#: The alert raised while the site's signing key is missing (the edge's pull is refused) and cleared when an administrator replaces the key
+KEY_ALERT = "signing_key_missing"
+
+
+def _key_restored(site_id: str) -> None:
+    """A message was signed: an open missing-key alert is closed (the keys folder was restored). One read a pull; a write only when one is open."""
+    with store.connect() as con:
+        held = con.execute("SELECT 1 FROM alerts WHERE site_id = ? AND rule = ? AND state IN ('open','acknowledged') LIMIT 1",
+                           (site_id, KEY_ALERT)).fetchone()
+    if held:
+        alerts._clear(site_id, KEY_ALERT)
+
+
+class KeyFields(Strict):
+    """POST /edge/key: why the key is replaced (kept in the audit trail)."""
+    reason: str = Field(min_length=1, max_length=300)
+
+
+@router.post("/api/sites/{site_id}/edge/key")
+def edge_key_replace(site_id: str, inp: dict = Body(default={})):
+    """A new signing key for the site, the key in force retired (plan Part 2.8: when the key is lost, and on a handover): an administrator's, with a
+    reason, never a key's. The permission, then the body are checked (a 403, then a 422 in one sentence). The answer is the new public key, the key
+    ids retired and what to do next: the edge refuses the plans signed with the new key until its public key is provisioned there."""
+    site_or_404(site_id)
+    auth.need("change_tier", "Replacing the site's signing key")
+    f = check(KeyFields, inp)
+    new, retired = delivery.replace_key(site_id, auth.actor(), f.reason)
+    alerts._clear(site_id, KEY_ALERT)
+    return {"public_key": new, "retired": retired,
+            "detail": "A new signing key is made and the old one retired: provision the new public key on the site's edge, which refuses the plans "
+                      "signed with it until then"}

@@ -1,0 +1,173 @@
+{
+  "$id": "ems-edge/1.0/heartbeat.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Every 60 s (U3 5.7). active_plan_id and plan_valid_until are U3's names for active_plan and valid_until.",
+  "properties": {
+    "active_plan": {
+      "anyOf": [
+        {
+          "maxLength": 120,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Active Plan"
+    },
+    "active_plan_id": {
+      "anyOf": [
+        {
+          "maxLength": 120,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Active Plan Id"
+    },
+    "clock_offset_s": {
+      "default": 0.0,
+      "maximum": 1000000000.0,
+      "minimum": -1000000000.0,
+      "title": "Clock Offset S",
+      "type": "number"
+    },
+    "contract": {
+      "const": "ems-edge/1.0",
+      "default": "ems-edge/1.0",
+      "title": "Contract",
+      "type": "string"
+    },
+    "control_state": {
+      "default": "native",
+      "enum": [
+        "following_plan",
+        "executing",
+        "native",
+        "fallback",
+        "hold",
+        "released",
+        "disabled"
+      ],
+      "title": "Control State",
+      "type": "string"
+    },
+    "edge_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Edge Id"
+    },
+    "msg_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Id"
+    },
+    "msg_type": {
+      "anyOf": [
+        {
+          "const": "heartbeat",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Msg Type"
+    },
+    "plan_valid_until": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Plan Valid Until"
+    },
+    "queue_depth": {
+      "default": 0,
+      "maximum": 1000000000,
+      "minimum": 0,
+      "title": "Queue Depth",
+      "type": "integer"
+    },
+    "sent_at": {
+      "maxLength": 40,
+      "title": "Sent At",
+      "type": "string"
+    },
+    "seq": {
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "title": "Seq",
+      "type": "integer"
+    },
+    "site_id": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Site Id"
+    },
+    "uptime_s": {
+      "maximum": 10000000000,
+      "minimum": 0,
+      "title": "Uptime S",
+      "type": "integer"
+    },
+    "valid_until": {
+      "anyOf": [
+        {
+          "maxLength": 40,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Valid Until"
+    }
+  },
+  "required": [
+    "seq",
+    "sent_at",
+    "uptime_s"
+  ],
+  "title": "Heartbeat",
+  "type": "object"
+}
