@@ -58,9 +58,11 @@ def _snapshot(last: dict | None) -> dict | None:
     w = lambda k: None if last.get(k) is None else round(last[k] / 1000, 2)
     # the estimate where the source sends one, else the BMS's own reading (a CSV history or an OEM cloud often carries only the BMS)
     soc = last.get("battery_soc_est_pct") if last.get("battery_soc_est_pct") is not None else last.get("battery_soc_bms_pct")
+    # which of the two it is, so Fleet and Overview mark it as the Battery page does (plan 9.7; round 7, frontend-states-formats-19)
+    source = "estimate" if last.get("battery_soc_est_pct") is not None else "bms" if last.get("battery_soc_bms_pct") is not None else None
     return {"ts": last["ts"], "pv_kw": w("pv_power_w"), "load_kw": w("load_power_w"), "grid_kw": w("grid_power_w"), "battery_kw": w("battery_power_w"),
             "genset_kw": w("genset_power_w"), "soc_pct": soc, "grid_present": last.get("grid_present"),
-            "genset_running": last.get("genset_running"), "mode": last.get("inverter_mode_active")}
+            "genset_running": last.get("genset_running"), "mode": last.get("inverter_mode_active"), "soc_source": source}
 
 
 #: How the month-to-date saving on Fleet and Overview is worked out (plan 9.7: every money figure with its method and computation date): the

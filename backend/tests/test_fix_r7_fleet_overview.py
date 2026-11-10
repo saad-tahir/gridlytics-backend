@@ -254,3 +254,21 @@ def test_a_hold_at_the_monitor_tier_is_not_a_plan_in_force(world):
         sites.set_tier_allowed(sid, "closed_loop", "test")
     fleet = a.get("/api/fleet").json()
     assert _row(fleet, sid)["on_plan"] is True and fleet["summary"]["on_plan"] == 1
+
+
+# ------------------------------------------------------------------------------------------------ frontend-states-formats-19 (pages-A-08's duplicate)
+
+def test_the_reading_now_says_whether_its_state_of_charge_is_the_estimate_or_the_bms_s(world):
+    """The SoC on Fleet and Overview is the estimate where the source sends one, else the BMS's own reading (_snapshot): the snapshot says which, so
+    the pages mark it, as the Battery page does (plan 9.7, "Estimated" on estimated SoC)."""
+    a, v, sid = world.c["admin"], world.c["viewer"], world.site
+    t = _now() // 60 * 60
+    with world.use():
+        telemetry.ingest(sid, [{"ts": t - 180, "grid_present": 1, "battery_soc_bms_pct": 61.0}], "edge")
+    assert a.get(f"/api/sites/{sid}/now").json()["now"]["soc_source"] == "bms"
+    assert _row(a.get("/api/fleet").json(), sid)["now"]["soc_source"] == "bms"
+    with world.use():
+        telemetry.ingest(sid, [{"ts": t - 60, "grid_present": 1, "battery_soc_bms_pct": 62.0, "battery_soc_est_pct": 60.5}], "edge")
+    now = v.get(f"/api/sites/{sid}/now").json()["now"]                     # not money: a viewer reads it too
+    assert now["soc_pct"] == 60.5 and now["soc_source"] == "estimate"
+    assert _row(v.get("/api/fleet").json(), world.other)["now"] is None      # no reading, no snapshot
