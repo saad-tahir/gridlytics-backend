@@ -872,9 +872,10 @@ def _battery_site(soc_max=0.95, **extra):
     return sid
 
 
-def _daily_cycles(sid, start, days, top, bottom=30.0, est=True, bms_off=0.0, until=None):
+def _daily_cycles(sid, start, days, top, bottom=30.0, est=True, bms_off=0.0, until=None, down=None):
     """Minute rows of a pack that charges from `bottom` to `top` percent over 08:00-12:00 local, holds there to 14:00, and discharges back to
-    `bottom` by midnight, every day (the estimate column, or the BMS alone with est=False)."""
+    `bottom` by midnight, every day (the estimate column, or the BMS alone with est=False); the grid is down over `down`, a pair of minutes after
+    local midnight, every day."""
     rows = []
     for i in range(days * 1440):
         m = i % 1440                                                   # minutes after local midnight (start is a local midnight)
@@ -887,7 +888,8 @@ def _daily_cycles(sid, start, days, top, bottom=30.0, est=True, bms_off=0.0, unt
         else:
             soc, kw = top - (top - bottom) * (m - 840) / 600, (top - bottom) * 2.0 / 10
         if until is None or start + 60 * i < until:
-            rows.append((sid, start + 60 * i, "edge", 1.0, soc if est else None, soc + bms_off, kw * 1000))
+            grid = 0.0 if down and down[0] <= m < down[1] else 1.0
+            rows.append((sid, start + 60 * i, "edge", grid, soc if est else None, soc + bms_off, kw * 1000))
     telemetry.write_rows(rows, SOC_COLS)
 
 
@@ -1077,3 +1079,42 @@ def test_an_anchor_deadline_sooner_than_any_hour_end_keeps_the_first_hour_end():
     hour = np.asarray(p["ts"]) // 3600
     first = next(t for t in range(p["T"]) if hour[t + 1] != hour[t])
     assert r["status"] == "optimal" and r["anchor"]["step"] == first
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-09 (the plans against native)
+
+def _compare(sid, monkeypatch):
+    """The plan page's Compare with native (routes_plans.plan_compare: both replayed through the twin on the plan's own forecast), rupees kept."""
+    from gridlytics import routes_plans
+    monkeypatch.setattr(routes_plans, "out", lambda o: o)
+    return routes_plans.plan_compare(sid)["compare"]
+
+
+@pytest.mark.parametrize("kind", ["textile", "mall"])
+def test_a_pack_that_charges_to_its_top_each_day_is_used_in_the_peak_and_the_plan_costs_no_more_than_native(company, monkeypatch, kind):
+    """Faisalabad (215 kWh, manual genset, 70 kW critical) and Lahore (100 kWh at 50 kW behind an auto-start panel, 180 kW critical): sigma at
+    its cap (no anchor at 95 %) widened the reserve past the usable band, so both plans held 95 % for 48 hours, discharged 0 to 2 kWh, and
+    cost Rs 2,700 to 4,100 more than native. A pack that reaches its 95 % top every day now anchors there, and the plan discharges in the
+    peak and costs no more than native."""
+    if kind == "textile":
+        sid = _battery_site(critical_load_kw=[70.0] * 24, genset_start_control="manual")
+        sites.put_asset(sid, "battery", {"nameplate_kwh": 215, "p_ch_kw": 100, "p_dis_kw": 100}, "t")
+    else:
+        sid = _battery_site(critical_load_kw=[180.0] * 24, genset_start_control="auto_on_grid_loss", outage_load_mode=1)
+        sites.put_asset(sid, "battery", {"nameplate_kwh": 100, "p_ch_kw": 50, "p_dis_kw": 50}, "t")
+        sites.put_asset(sid, "genset", {"rated_kw": 640, "f_min": 0.25, "fuel_kind": "hsd", "min_up_h": 0.5, "tank_l": 4000}, "t")
+    sites.put_asset(sid, "pv", {"kwp_dc": 200, "kw_ac": 180}, "t")
+    sites.capture_native(sid, {"source": "read_back", "work_mode": "self_use", "backup_soc_pct": 30}, "t")
+    if kind == "textile":
+        forecast.set_schedule(sid, [["14:00", "16:00", "weekdays"]], "entered", "t")
+    start = twin.day_start_utc(date(2026, 11, 3))
+    now = start + 2 * 86400 + 16 * 3600 + 900                         # 16:15 on the third day
+    _daily_cycles(sid, start, 3, top=95.0, until=now, down=(840, 960) if kind == "textile" else None)
+    out = plans.tick(sid, at=now)
+    assert out["status"] == "active"
+    assert out["summary"]["battery_state"]["sigma_pct"] < 4.0          # anchored this afternoon at the pack's own top
+    assert sum(s["discharge_kw"] for s in out["steps"] if s["peak"]) * H > 40.0
+    arms = _compare(sid, monkeypatch)
+    # before: sigma at 15 points, and the mill's plan cost about Rs 900 more than native over the 48 hours (it bought energy to hold above the band)
+    assert arms["plan"]["energy_rs"] <= arms["native"]["energy_rs"]
+    assert arms["plan"]["unserved_kwh"] <= arms["native"]["unserved_kwh"]
