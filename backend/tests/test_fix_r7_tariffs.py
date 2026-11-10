@@ -19,6 +19,9 @@ Batch 2, bill rebuild and bill comparison:
 - flow-savings-pilot-bill-08 (with engine-money-live-08): gaps are filled from the profile, and the verdict is withheld below 90 % data;
 - flow-savings-pilot-bill-23: an overlapping bill is refused, a bill can be corrected or deleted, and the fixed charge shows its proration.
 
+Batch 3 (the hand-worked goldens of engine-tariffs-07 are test_r7_tariffs_golden.py):
+- role-owner-25: every version in the library has a readable name, never a raw key.
+
 Each test fails on the code before its fix."""
 from __future__ import annotations
 
@@ -737,3 +740,21 @@ def test_a_blank_export_cell_beside_an_import_reading_is_not_a_gap(company):
     assert gap["completeness"] == pytest.approx(0.75, abs=1e-3)
     assert gap["filled_kwh"]["export"] == pytest.approx(sum(full["export_kwh"].values()) / 3, rel=1e-3)  # one noon hour, not a day of exports
     assert gap["filled_kwh"]["import"] == pytest.approx(sum(full["import_kwh"].values()) / 3, rel=1e-3)
+
+
+# ------------------------------------------------------------------------------------------------ batch 3, role-owner-25: readable version names
+
+def test_every_version_in_the_library_has_a_readable_name(company):
+    """The Versions table showed the raw keys of the versions whose body has no name ('national', 'net_billing', 'ke', 'xwdisco'): each now reads in
+    words, its kind and what it covers."""
+    names = {(v["kind"], v["key"], v["effective_from"]): v["name"] for v in tariffs.provenance()}
+    assert names[("tou", "xwdisco", "2023-07-14")] == "Time-of-use calendar, DISCOs except K-Electric"
+    assert names[("tou", "ke", "2019-01-01")] == "Time-of-use calendar, K-Electric"
+    assert names[("tax", "national", "2025-07-01")] == "Tax rules"
+    assert names[("icp", "national", "2025-12-01")] == "Incremental consumption package (ICP)"
+    assert names[("prosumer", "net_billing", "2026-02-09")] == "Net billing"
+    assert names[("prosumer", "net_metering_legacy", "2015-09-01")] == "Legacy net metering"
+    assert names[("schedule", "national", "2026-02-12")] == "Uniform schedule CY2026 (SRO 279(I)/2026)"  # a body's own name stands
+    assert not set(names.values()) & {"national", "xwdisco", "ke", "net_billing", "net_metering_legacy"}
+    tariffs.propose("adder", "fca_late", "2026-12-01", {"rate": 0.5, "billing_months": ["2026-12"]}, SRC, "t")
+    assert next(v["name"] for v in tariffs.provenance() if v["key"] == "fca_late") == "FCA late"

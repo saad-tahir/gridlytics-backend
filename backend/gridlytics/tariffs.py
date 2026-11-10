@@ -137,6 +137,34 @@ def resolve(kind: str, key: str, on: date | str) -> dict | None:
     return _ver(r) if r else None
 
 
+#: A version's kind, and the keys the engine resolves, in words (a body without a name is shown by these, never by its raw key)
+_KIND_NAMES = {"schedule": "Uniform schedule", "tou": "Time-of-use calendar", "adder": "Adder", "tax": "Tax rules",
+               "icp": "Incremental consumption package (ICP)", "prosumer": "Prosumer regime"}
+_KEY_NAMES = {"xwdisco": "DISCOs except K-Electric", "ke": "K-Electric", "net_billing": "Net billing", "net_metering_legacy": "Legacy net metering"}
+_ABBREVIATIONS = ("fca", "fpa", "qta", "dss", "nj", "ptv", "icp")
+
+
+def version_name(v: dict) -> str:
+    """A version's name for people: its body's name; else its kind and what it covers in words ("Time-of-use calendar, K-Electric", "Net billing",
+    "Tax rules"); an adder by its key with the abbreviations in capitals ("FCA late")."""
+    body = v.get("body") if isinstance(v.get("body"), dict) else {}
+    name = body.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    kind, key = str(v.get("kind") or ""), str(v.get("key") or "")
+    if kind == "prosumer" and key in _KEY_NAMES:
+        return _KEY_NAMES[key]
+    if kind == "adder":
+        parts = [p.upper() if p.lower() in _ABBREVIATIONS else p.lower() for p in re.split(r"[_\s-]+", key) if p]
+        if not parts:
+            return "Adder"
+        return " ".join([parts[0][:1].upper() + parts[0][1:], *parts[1:]])
+    words = _KIND_NAMES.get(kind, kind.capitalize() or "Version")
+    if key and key != "national":
+        words += f", {_KEY_NAMES.get(key, key.replace('_', ' '))}"
+    return words
+
+
 # The keys the engine resolves for each kind (an adder's key is free: qta, fca, dss, nj, ...)
 _KEYS = {"schedule": ("national",), "tou": ("xwdisco", "ke"), "tax": ("national",), "icp": ("national",), "prosumer": ("net_billing", "net_metering_legacy")}
 _BASES = ("per_kw_month", "sanctioned_kw_month", "per_consumer_month")
@@ -1237,4 +1265,4 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
 def provenance() -> list[dict]:
     """Every shipped and added number's source and status, for the tariff page's provenance view."""
     return [{"id": v["id"], "kind": v["kind"], "key": v["key"], "effective_from": v["effective_from"], "effective_to": v["effective_to"], "status": v["status"],
-             "name": v["body"].get("name", v["key"]), "source": v["source"], "hash": v["hash"]} for v in versions()]
+             "name": version_name(v), "source": v["source"], "hash": v["hash"]} for v in versions()]
