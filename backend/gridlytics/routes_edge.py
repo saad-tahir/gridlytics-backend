@@ -82,7 +82,7 @@ def _key_only(detail: str = "The edge paths take the site's API key") -> dict:
 
 def _seq_last(site_id: str, stream: str) -> int:
     """The last sequence the telemetry file records for the stream (-1 for none)."""
-    with telemetry.connect() as con:
+    with telemetry.reading() as con:
         r = con.execute("SELECT last FROM seq WHERE site_id = ? AND stream = ?", (site_id, stream)).fetchone()
     return int(r["last"]) if r else -1
 

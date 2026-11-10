@@ -21,6 +21,9 @@ Batch 4, the battery page: this Karachi month's cycles, throughput, hot-and-full
 health named as entered (pages-C-13); the daily rate divided by the days with readings, which the answer gives (role-owner-38); the state of charge
 named by its source, the estimate or the BMS, and the outages for the chart (pages-C-14).
 
+Batch 5, the telemetry file's cost: a read takes a deferred (read) transaction, never the write lock, so readers neither wait for a writer nor make one
+wait, and the export formats its CSV outside any transaction (performance-live-03, and its duplicate tests-and-perf-04).
+
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
@@ -914,3 +917,110 @@ def test_the_state_of_charge_names_its_source_and_the_chart_gets_the_outages(wor
         _write(sid, B_NOW - 60 * 60, 30, battery_soc_bms_pct=56.0, battery_soc_est_pct=58.0)
     b = c.get(f"/api/sites/{sid}/battery").json()["battery"]
     assert (b["soc_pct"], b["soc_source"]) == (58.0, "estimate")
+
+
+# ------------------------------------------------------------------------------------------------ performance-live-03: reads never take the write lock
+
+def _traced(monkeypatch) -> list:
+    """Every telemetry connection opened from here on, with the statements it runs (seen[i] = (connection, [statements]))."""
+    seen = []
+    real = telemetry._open
+
+    def traced():
+        con = real()
+        sql: list[str] = []
+        con.set_trace_callback(sql.append)
+        seen.append((con, sql))
+        return con
+    monkeypatch.setattr(telemetry, "_open", traced)
+    return seen
+
+
+def test_telemetry_reads_take_a_read_transaction_and_only_writers_take_the_write_lock(company, monkeypatch):
+    """Every reader of the telemetry file (the pages' series, the battery and genset figures, the export, the forecast issues, the outages' grid signal and
+    the edge's sequence check) ran BEGIN IMMEDIATE, the write lock, so a company's readers and writers ran one at a time. A read now begins a deferred
+    transaction; the writes (ingest, write_rows, the sequence, the forecast issues, a site's removal) still take the write lock."""
+    from gridlytics import routes_edge, routes_telemetry
+    sid = _genset_site("Reads")
+    telemetry.ingest(sid, [{"ts": T0 + 60 * i, "grid_present": 1, "load_power_w": 1000.0, "genset_running": 0} for i in range(30)], "edge", now=NOW)
+    telemetry.save_forecast(sid, "pv", T0, 1, "v", {"q50": [0.0]})
+    seen = _traced(monkeypatch)
+    readers = {
+        "latest": lambda: telemetry.latest(sid), "first_ts": lambda: telemetry.first_ts(sid),
+        "battery_totals": lambda: telemetry.battery_totals(sid, T0, T0 + 3600), "soc_reading": lambda: telemetry.soc_reading(sid, T0),
+        "raw": lambda: telemetry.raw(sid, T0, T0 + 3600), "minute_grid": lambda: telemetry.minute_grid(sid, T0, T0 + 3600),
+        "series": lambda: telemetry.series(sid, T0, T0 + 3600, ["load_power_w"]), "heatmap": lambda: telemetry.heatmap(sid, "load_power_w"),
+        "quality_days": lambda: telemetry.quality_days(sid, date(2026, 11, 5), date(2026, 11, 5), T0 + 7200),
+        "export_csv": lambda: telemetry.export_csv(sid, T0, T0 + 3600), "latest_forecast": lambda: telemetry.latest_forecast(sid, "pv"),
+        "outages": lambda: telemetry.outages(sid, T0, T0 + 3600), "genset_runs": lambda: _runs(sid),
+        "grid_signal": lambda: routes_telemetry._grid_signal(sid, T0 + 3600), "seq_last": lambda: routes_edge._seq_last(sid, "telemetry"),
+    }
+    for name, read in readers.items():
+        seen.clear()
+        read()
+        sql = [s for _, run in seen for s in run]
+        assert sql, name
+        assert not any(s.strip().upper().startswith("BEGIN IMMEDIATE") for s in sql), (name, sql)
+        assert any(s.strip().upper() == "BEGIN" for s in sql), (name, sql)
+    writers = {
+        "ingest": lambda: telemetry.ingest(sid, [{"ts": T0 + 3600, "grid_present": 1}], "edge", now=NOW),
+        "write_rows": lambda: _write(sid, T0 + 7200, 1, grid_present=1), "next_seq": lambda: telemetry.next_seq(sid, "telemetry", 1),
+        "save_forecast": lambda: telemetry.save_forecast(sid, "pv", T0 + 900, 1, "v", {"q50": [0.0]}),
+        "delete_site": lambda: telemetry.delete_site("gone"),
+    }
+    for name, write in writers.items():
+        seen.clear()
+        write()
+        assert any(s.strip().upper().startswith("BEGIN IMMEDIATE") for _, run in seen for s in run), name
+
+
+def test_a_reader_does_not_wait_for_a_writer_and_sees_the_last_committed_minute(company):
+    """The audit's three threads: a read 0.2 s after a writer took the file waited 1.2 s behind it. A writer now holds the file for up to 2 s while a
+    reader reads the minute: the read answers at once, with the value committed before the writer began."""
+    import contextvars
+    import threading
+    import time
+    sid = _site("Waiting")
+    telemetry.ingest(sid, [{"ts": T0, "grid_present": 1, "load_power_w": 1000.0}], "edge", now=NOW)
+    entered, release = threading.Event(), threading.Event()
+
+    def hold():
+        with telemetry.connect() as con:
+            con.execute("UPDATE minute SET load_power_w = 2 WHERE site_id = ?", (sid,))
+            entered.set()
+            release.wait(2.0)
+    writer = threading.Thread(target=contextvars.copy_context().run, args=(hold,))
+    writer.start()
+    try:
+        assert entered.wait(5.0)
+        t = time.monotonic()
+        row = telemetry.latest(sid)
+        took = time.monotonic() - t
+    finally:
+        release.set()
+        writer.join()
+    assert took < 1.0, f"the read waited {took:.2f} s for the writer"
+    assert row["load_power_w"] == 1000.0
+    assert telemetry.latest(sid)["load_power_w"] == 2
+
+
+def test_the_export_formats_its_csv_outside_any_transaction(company, monkeypatch):
+    """export_csv formatted the whole file inside the lock (0.47 s for 32 days). It now reads the rows, closes its read, and formats them after."""
+    import sqlite3
+    sid = _site("Export")
+    telemetry.ingest(sid, [{"ts": T0 + 60 * i, "grid_present": 1, "load_power_w": 1000.0 + i} for i in range(10)], "edge", now=NOW)
+    seen = _traced(monkeypatch)
+    open_while_formatting = []
+    real_cell = telemetry._csv_cell
+
+    def cell(v):
+        for con, _ in seen:
+            try:
+                open_while_formatting.append(con.in_transaction)
+            except sqlite3.ProgrammingError:  # closed: no transaction
+                open_while_formatting.append(False)
+        return real_cell(v)
+    monkeypatch.setattr(telemetry, "_csv_cell", cell)
+    text = telemetry.export_csv(sid, T0, T0 + 3600)
+    assert text.count("\n") == 11 and "1009.0" in text
+    assert open_while_formatting and not any(open_while_formatting)

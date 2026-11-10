@@ -102,9 +102,29 @@ def _open() -> sqlite3.Connection:
 
 @contextmanager
 def connect():
+    """A write to the telemetry file: BEGIN IMMEDIATE, the file's one write lock, taken at the start so a read-then-write (the sequence check) never
+    fails half-way. Reads use reading()."""
     con = _open()
     try:
         con.execute("BEGIN IMMEDIATE")
+        yield con
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
+@contextmanager
+def reading():
+    """A read of the telemetry file: a deferred transaction, so the statements inside it see one snapshot of the file and, in WAL mode, never take the
+    write lock, never wait for a writer and never make one wait. Every read took BEGIN IMMEDIATE before (audit R7 performance-live-03), so a company's
+    page reads, ticks, CSV imports and edge batches ran one at a time behind one lock. Nothing inside it may write: a write belongs in connect()."""
+    con = _open()
+    try:
+        con.execute("BEGIN")
         yield con
         con.execute("COMMIT")
     except BaseException:
@@ -853,13 +873,13 @@ def _finite(v):
 
 
 def latest(site_id: str) -> dict | None:
-    with connect() as con:
+    with reading() as con:
         r = con.execute("SELECT * FROM minute WHERE site_id = ? ORDER BY ts DESC LIMIT 1", (site_id,)).fetchone()
     return {k: _finite(v) for k, v in dict(r).items()} if r else None
 
 
 def first_ts(site_id: str) -> int | None:
-    with connect() as con:
+    with reading() as con:
         r = con.execute("SELECT MIN(ts) FROM minute WHERE site_id = ?", (site_id,)).fetchone()
     return r[0] if r else None
 
@@ -877,7 +897,7 @@ def battery_totals(site_id: str, t0: int, t1: int) -> dict:
            f"COUNT(CASE WHEN {soc} > 90 AND {soc} <= :m AND battery_temp_c > 35 AND battery_temp_c <= :m THEN 1 END), "
            "MIN(CASE WHEN battery_power_w > 0 AND battery_power_w <= :m THEN ts END) "
            "FROM minute WHERE site_id = :s AND ts >= :t0 AND ts < :t1")
-    with connect() as con:
+    with reading() as con:
         r = con.execute(sql, {"m": CELL_MAX, "s": site_id, "t0": int(t0), "t1": int(t1)}).fetchone()
     return {"discharge_kwh": float(r[0] or 0.0) / 60000.0, "power_minutes": int(r[1]), "soc_minutes": int(r[2]), "temp_minutes": int(r[3]),
             "hot_full_minutes": int(r[4]), "first_discharge_ts": r[5]}
@@ -886,14 +906,14 @@ def battery_totals(site_id: str, t0: int, t1: int) -> dict:
 def soc_reading(site_id: str, ts: int) -> dict | None:
     """The stored state-of-charge readings of the minute starting at ts (a minute grid's cell: minute_grid's cells start where the caller's t0 put
     them, so the row is the one inside [ts, ts + 60)): which of the estimate and the BMS that minute holds."""
-    with connect() as con:
+    with reading() as con:
         r = con.execute("SELECT battery_soc_est_pct, battery_soc_bms_pct FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts LIMIT 1",
                         (site_id, int(ts), int(ts) + 60)).fetchone()
     return {"est": _finite(r[0]), "bms": _finite(r[1])} if r else None
 
 
 def raw(site_id: str, t0: int, t1: int, columns: tuple = COLUMNS[3:]) -> dict:
-    with connect() as con:
+    with reading() as con:
         rows = con.execute(f"SELECT ts, {', '.join(columns)} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
                            (site_id, int(t0), int(t1))).fetchall()
     out = {"ts": np.array([r[0] for r in rows], dtype=np.int64)}
@@ -981,7 +1001,7 @@ def series(site_id: str, t0: int, t1: int, names: list[str], res: str = "auto") 
         parts.append(f"{fn}({n})")
     sql = (f"SELECT ((ts + {off}) / {step}) * {step} - {off} AS b, {', '.join(parts)} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? "
            f"GROUP BY b ORDER BY b")
-    with connect() as con:
+    with reading() as con:
         rows = con.execute(sql, (site_id, int(t0), int(t1))).fetchall()
     return {"resolution": res, "ts": [r[0] for r in rows],
             "series": {n: [None if r[i + 1] is None or not math.isfinite(float(r[i + 1])) else round(float(r[i + 1]), 3) for r in rows]
@@ -997,7 +1017,7 @@ def heatmap(site_id: str, name: str, days: int = 28) -> dict:
     sql = (f"SELECT ((ts + 18000) / 86400 + 3) % 7 AS dow, ((ts + 18000) % 86400) / 3600 AS h, AVG({name}) FROM minute WHERE site_id = ? AND ts >= ? "
            f"GROUP BY dow, h")
     grid = [[None] * 24 for _ in range(7)]
-    with connect() as con:
+    with reading() as con:
         for dow, h, v in con.execute(sql, (site_id, t0)).fetchall():
             grid[int(dow)][int(h)] = None if v is None or not math.isfinite(float(v)) else round(v, 2)
     # rows Monday..Sunday: 1970-01-01 was a Thursday, so (days since the epoch + 3) % 7 already gives 0 = Monday and 6 = Sunday, as in
@@ -1281,7 +1301,7 @@ def quality_days(site_id: str, d0: date, d1: date, now: int) -> list[dict]:
         row = {"day": day.isoformat()}
         out.append(row)
     upto = max(upto, t0 + 60)
-    with connect() as con:
+    with reading() as con:
         n = con.execute("SELECT COUNT(*) FROM minute WHERE site_id = ? AND ts >= ? AND ts < ?", (site_id, t0, upto)).fetchone()[0]
     row["completeness"] = round(min(1.0, n / ((upto - t0) // 60)), 4)
     row["in_progress"] = True
@@ -1301,13 +1321,16 @@ def _csv_cell(v):
 
 
 def export_csv(site_id: str, t0: int, t1: int) -> str:
+    """The stored minutes of [t0, t1) as CSV. The rows are fetched in one read and formatted after it has closed, so the formatting (about half a second
+    for 32 days) holds no transaction open (performance-live-03)."""
+    with reading() as con:
+        rows = con.execute(f"SELECT ts, {', '.join(COLUMNS[3:])} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+                           (site_id, int(t0), int(t1))).fetchall()
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["ts_utc"] + list(COLUMNS[3:]))
-    with connect() as con:
-        for r in con.execute(f"SELECT ts, {', '.join(COLUMNS[3:])} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
-                             (site_id, int(t0), int(t1))):
-            w.writerow([datetime.fromtimestamp(r[0], timezone.utc).isoformat().replace("+00:00", "Z")] + [_csv_cell(_finite(v)) for v in r[1:]])
+    for r in rows:
+        w.writerow([datetime.fromtimestamp(r[0], timezone.utc).isoformat().replace("+00:00", "Z")] + [_csv_cell(_finite(v)) for v in r[1:]])
     return buf.getvalue()
 
 
@@ -1328,7 +1351,7 @@ def save_forecast(site_id: str, kind: str, belief_time: int, stage: int, version
 
 
 def latest_forecast(site_id: str, kind: str, at_or_before: int | None = None) -> dict | None:
-    with connect() as con:
+    with reading() as con:
         if at_or_before is None:
             r = con.execute("SELECT * FROM forecast_issues WHERE site_id = ? AND kind = ? ORDER BY belief_time DESC LIMIT 1", (site_id, kind)).fetchone()
         else:

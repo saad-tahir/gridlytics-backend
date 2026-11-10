@@ -277,7 +277,7 @@ SIGNAL_WINDOW_S = 7 * 86400
 def _grid_signal(site_id: str, now: int) -> dict:
     """The source's grid signal: the latest grid-present reading of the last SIGNAL_WINDOW_S, {grid_present: bool, last_seen: its ts}, or
     {grid_present: null, last_seen: null} when the source sent none (the page's blocking notice: a source without a grid signal)."""
-    with telemetry.connect() as con:
+    with telemetry.reading() as con:
         r = con.execute("SELECT ts, grid_present FROM minute WHERE site_id = ? AND ts >= ? AND grid_present IS NOT NULL ORDER BY ts DESC LIMIT 1",
                         (site_id, now - SIGNAL_WINDOW_S)).fetchone()
     if r is None or not isinstance(r["grid_present"], (int, float)) or not math.isfinite(r["grid_present"]):
