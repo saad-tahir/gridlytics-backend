@@ -11,9 +11,10 @@ import base64
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import numpy as np
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
@@ -270,27 +271,100 @@ def _write_key(path: Path, key: Ed25519PrivateKey) -> None:
         raise
 
 
-def _site_key(site_id: str) -> tuple[str, Ed25519PrivateKey]:
-    with store.connect() as con:
-        r = con.execute("SELECT key_id, private_path FROM site_keys WHERE site_id = ? AND retired IS NULL ORDER BY created DESC LIMIT 1",
-                        (site_id,)).fetchone()
-    if r and Path(r["private_path"]).exists():
-        return r["key_id"], serialization.load_pem_private_key(Path(r["private_path"]).read_bytes(), password=None)
+class KeyMissing(RuntimeError):
+    """The site's signing key on record is not in the keys folder, or the file there is not that key (audit engine-delivery-13). It is never
+    replaced on its own: a new key would sign plans that no edge given the old public key accepts. The keys folder is restored from the backup, or
+    an administrator replaces the key (`replace_key`, POST /api/sites/{id}/edge/key) and the new public key is provisioned on the edge."""
+
+    def __init__(self, site_id: str, key_id: str, why: str = "is missing from the keys folder"):
+        self.site_id, self.key_id = site_id, key_id
+        super().__init__(f"The site's signing key {key_id} {why}, so no plan is signed: restore the keys folder from the backup, or an administrator "
+                         "replaces the key and the new public key is provisioned on the edge")
+
+
+#: The site's key in force: its newest key not retired (one at most since round 7; a tie of two made at once before is broken by its id)
+_IN_FORCE = "SELECT key_id, public_key, private_path FROM site_keys WHERE site_id = ? AND retired IS NULL ORDER BY created DESC, key_id DESC LIMIT 1"
+
+
+def _public_b64(key: Ed25519PrivateKey) -> str:
+    return base64.b64encode(key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+
+
+def _key_file(kept: str) -> Path:
+    """Where a key kept as `kept` is. A key is kept by its file name in the company's keys folder, which is read in today's data folder, so a moved
+    or restored data folder still finds it (audit engine-delivery-13). A key kept before round 7 holds the absolute path of its time (a Windows one
+    on a Linux host, say): its name is read in today's keys folder, and the old path only while the file is not there."""
+    name = PureWindowsPath(kept).name                 # a Windows path or a POSIX one: both separators are taken
+    here = _key_dir() / name
+    return here if here.exists() or name == kept else Path(kept)
+
+
+def _load(site_id: str, row) -> Ed25519PrivateKey:
+    """The private key of a site_keys row; KeyMissing when its file is not there, does not read, or is not the key whose public half is on record."""
+    try:
+        key = serialization.load_pem_private_key(_key_file(row["private_path"]).read_bytes(), password=None)
+    except FileNotFoundError:
+        raise KeyMissing(site_id, row["key_id"]) from None
+    except (OSError, ValueError, TypeError, UnsupportedAlgorithm):
+        raise KeyMissing(site_id, row["key_id"], "in the keys folder does not read") from None
+    if not isinstance(key, Ed25519PrivateKey) or _public_b64(key) != row["public_key"]:
+        raise KeyMissing(site_id, row["key_id"], "in the keys folder is not the key on record")
+    return key
+
+
+def _new_key(con, site_id: str) -> tuple[str, Ed25519PrivateKey]:
+    """A new key for the site, written to the keys folder and recorded (by its file name, never a path) in the caller's write transaction."""
     key = Ed25519PrivateKey.generate()
     kid = store.new_id(8)
-    path = _key_dir() / f"{site_id}-{kid}.pem"
-    _write_key(path, key)
-    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    with store.connect() as con:
-        con.execute("INSERT INTO site_keys (site_id, key_id, public_key, private_path, created) VALUES (?,?,?,?,?)",
-                    (site_id, kid, base64.b64encode(pub).decode(), str(path), store._now()))
+    name = f"{site_id}-{kid}.pem"
+    _write_key(_key_dir() / name, key)
+    con.execute("INSERT INTO site_keys (site_id, key_id, public_key, private_path, created) VALUES (?,?,?,?,?)",
+                (site_id, kid, _public_b64(key), name, store._now()))
     return kid, key
 
 
+def _site_key(site_id: str) -> tuple[str, Ed25519PrivateKey]:
+    """The site's signing key in force. The first signing makes it, once however many ask at once (the check and the insert are one write
+    transaction, so a second caller waits and reads the first one's key); after that it is never made again on its own: a key on record whose file
+    is missing, or is not that key, raises KeyMissing (audit engine-delivery-13)."""
+    with store.connect() as con:
+        r = con.execute(_IN_FORCE, (site_id,)).fetchone()
+    if r is None:
+        with store.write_transaction() as con:
+            r = con.execute(_IN_FORCE, (site_id,)).fetchone()
+            if r is None:
+                return _new_key(con, site_id)
+    return r["key_id"], _load(site_id, r)
+
+
 def public_key(site_id: str) -> dict:
-    kid, key = _site_key(site_id)
-    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    return {"key_id": kid, "alg": "Ed25519", "public_key": base64.b64encode(pub).decode()}
+    """The site's public key in force, {key_id, alg, public_key, missing}: the key on record (the one its edge was given), with `missing` true when
+    its private key is not in the keys folder or is not that key, so nothing is signed until it is restored or replaced. The first call makes the
+    key, as the first signing does."""
+    with store.connect() as con:
+        r = con.execute(_IN_FORCE, (site_id,)).fetchone()
+    if r is None:
+        kid, key = _site_key(site_id)
+        return {"key_id": kid, "alg": "Ed25519", "public_key": _public_b64(key), "missing": False}
+    try:
+        _load(site_id, r)
+        missing = False
+    except KeyMissing:
+        missing = True
+    return {"key_id": r["key_id"], "alg": "Ed25519", "public_key": r["public_key"], "missing": missing}
+
+
+def replace_key(site_id: str, by: str, reason: str) -> tuple[dict, list[str]]:
+    """A new signing key for the site, every key in force retired (plan Part 2.8: on a lost key and on a handover): an administrator's action, in
+    the audit trail with its reason. A retired key's file is kept, so the plan messages it signed still verify for a dispute. The edge refuses the
+    plans signed with the new key until its public key is provisioned there. Returns the new public key and the key ids retired."""
+    with store.write_transaction() as con:
+        retired = [r["key_id"] for r in con.execute("SELECT key_id FROM site_keys WHERE site_id = ? AND retired IS NULL ORDER BY created, key_id",
+                                                    (site_id,))]
+        con.execute("UPDATE site_keys SET retired = ? WHERE site_id = ? AND retired IS NULL", (store._now(), site_id))
+        kid, key = _new_key(con, site_id)
+        store.audit(by, "replaced the site's signing key", site_id, {"key_id": kid, "retired": retired, "reason": reason}, con=con)
+    return {"key_id": kid, "alg": "Ed25519", "public_key": _public_b64(key), "missing": False}, retired
 
 
 def canonical(body: dict) -> bytes:

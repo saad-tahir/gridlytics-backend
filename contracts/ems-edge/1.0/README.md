@@ -56,3 +56,12 @@ the edge pulls its plan with GET `/api/sites/{site_id}/plans/current/message` (`
   `plan_id` is the plan in force while a day's slots can be an earlier plan's. `mode_a.apply_policy` is U3's (`write_if_changed_only` true,
   `max_table_writes_per_day` 4, `apply_window_local` "00:05-23:50") and `write_budget` R6 3.6's (`table_writes_per_day` the brand's, at most 4,
   and `event_writes_per_day` 2).
+
+## The signing key
+
+- Each site has one Ed25519 key in force; the edge is given its public key (`key_id` and the raw 32-byte key in base64) at enrolment, and every plan
+  message names the `key_id` that signed it. The private key never leaves the cloud's keys folder.
+- A key is never replaced on its own. While the site's private key is missing from the keys folder (a data folder moved or restored without it), the
+  pull is answered 409 `signing_key_missing` and nothing is signed: the edge keeps running its last plan until `valid_until`, then its fallback. The
+  cloud's people restore the keys folder, or an administrator replaces the key (the old one is retired), and the new public key is provisioned on
+  the edge, which refuses the plans signed with it until then.

@@ -1658,3 +1658,145 @@ def test_a_new_signing_key_is_made_owner_only_and_a_failed_chmod_cannot_leave_it
     made = [o for o in opened if o[0] == str(path)]
     assert made and made[0][1] & os.O_EXCL and made[0][1] & os.O_CREAT and made[0][2] == 0o600, opened
     assert stat.S_IMODE(delivery._key_dir().stat().st_mode) & 0o077 == 0     # and the keys folder is the owner's alone
+
+
+# ------------------------------------------------------------------------------------------------ batch 6: engine-delivery-13
+
+def test_the_signing_key_is_found_by_its_name_in_the_keys_folder_after_the_data_folder_moves(tmp_path, monkeypatch):
+    import shutil
+    first, second = tmp_path / "first", tmp_path / "second"
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(first))
+    (first / "companies").mkdir(parents=True)
+    with store.use_company(first / "companies" / "c.db"):
+        sid = _site(genset=False)
+        before = delivery.public_key(sid)
+        assert [r["private_path"] for r in _key_rows(sid)] == [f"{sid}-{before['key_id']}.pem"]   # its name in the keys folder, never a path
+    shutil.copytree(first, second)
+    shutil.rmtree(first)                                                   # the folder moved (or was restored onto another machine)
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(second))
+    with store.use_company(second / "companies" / "c.db"):
+        msg = delivery.sign(sid, {"contract": "ems-edge/1.0", "plan_id": "p1"})
+        assert msg["signature"]["key_id"] == before["key_id"]               # the same key signs: every edge given its public key still accepts
+        assert delivery.verify(msg, before["public_key"])
+        assert len(_key_rows(sid)) == 1
+        # a key kept before round 7 holds the absolute path of its time (here a Windows one): it is read by its name in today's keys folder
+        with store.connect() as con:
+            con.execute("UPDATE site_keys SET private_path = ? WHERE site_id = ?", (rf"C:\Users\someone\gridlytics\data\keys\c\{sid}-{before['key_id']}.pem", sid))
+        assert delivery.sign(sid, {"plan_id": "p2"})["signature"]["key_id"] == before["key_id"]
+
+
+def test_a_missing_signing_key_is_an_error_and_never_silently_replaced(company):
+    sid = _site(genset=False)
+    before = delivery.public_key(sid)
+    (delivery._key_dir() / f"{sid}-{before['key_id']}.pem").unlink()
+    with pytest.raises(delivery.KeyMissing) as missing:
+        delivery.sign(sid, {"plan_id": "p1"})
+    assert missing.value.key_id == before["key_id"] and "restore" in str(missing.value)
+    assert len(_key_rows(sid)) == 1                                        # no second key was made in its place
+    now = delivery.public_key(sid)
+    assert now["key_id"] == before["key_id"] and now["public_key"] == before["public_key"] and now["missing"] is True
+    # a file that is not the recorded key is refused as well: it would sign plans no edge accepts
+    other = delivery.Ed25519PrivateKey.generate().private_bytes(delivery.serialization.Encoding.PEM, delivery.serialization.PrivateFormat.PKCS8,
+                                                                delivery.serialization.NoEncryption())
+    (delivery._key_dir() / f"{sid}-{before['key_id']}.pem").write_bytes(other)
+    with pytest.raises(delivery.KeyMissing):
+        delivery.sign(sid, {"plan_id": "p1"})
+    assert delivery.public_key(sid)["missing"] is True and len(_key_rows(sid)) == 1
+
+
+def test_two_first_signings_at_once_make_one_key(company, monkeypatch):
+    import threading
+    sid = _site(genset=False)
+    meet = threading.Barrier(2)
+    real = delivery.Ed25519PrivateKey.generate
+
+    def slow_generate():
+        try:
+            meet.wait(timeout=0.5)                     # both callers inside key making at once, if nothing keeps the second out
+        except threading.BrokenBarrierError:
+            pass
+        return real()
+
+    monkeypatch.setattr(delivery.Ed25519PrivateKey, "generate", staticmethod(slow_generate))
+    got, errors = [], []
+    db = store.db_path()
+
+    def first_sign():
+        try:
+            with store.use_company(db):
+                got.append(delivery.sign(sid, {"plan_id": "p1"})["signature"]["key_id"])
+        except Exception as exc:                       # pragma: no cover - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=first_sign) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert len(set(got)) == 1 and len(_key_rows(sid)) == 1, (got, _key_rows(sid))
+
+
+def test_a_missing_key_refuses_the_edge_raises_an_alert_and_an_administrator_replaces_it(world):
+    sid = world.site
+    _fake_plan(world)
+    kh = world.key(["plans:read"], role="viewer")
+    with world.use():
+        _closed_loop(sid)
+        before = delivery.public_key(sid)
+    assert world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=kh).status_code == 200
+    with world.use():
+        (delivery._key_dir() / f"{sid}-{before['key_id']}.pem").unlink()
+    r = world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=kh)
+    assert r.status_code == 409 and r.json()["code"] == "signing_key_missing", r.text
+    assert before["key_id"] in r.json()["detail"] and "restore" in r.json()["detail"]
+    with world.use():
+        assert len(_key_rows(sid)) == 1
+        with store.connect() as con:
+            alert = con.execute("SELECT category, severity, state FROM alerts WHERE site_id = ? AND rule = 'signing_key_missing'", (sid,)).fetchone()
+    assert dict(alert) == {"category": "Control", "severity": "critical", "state": "open"}
+    edge = world.c["admin"].get(f"/api/sites/{sid}/edge").json()
+    assert edge["public_key"]["key_id"] == before["key_id"] and edge["public_key"]["missing"] is True
+    # replacing the key is an administrator's, with a reason, in a strict body
+    for role in ("operator", "analyst", "viewer"):
+        r = world.c[role].post(f"/api/sites/{sid}/edge/key", json={"reason": "lost in a move"})
+        assert r.status_code == 403 and r.json()["detail"] == "Replacing the site's signing key is for an administrator", (role, r.text)
+    assert world.anon.post(f"/api/sites/{sid}/edge/key", headers=world.key(["plans:read"]), json={"reason": "x"}).status_code == 403
+    for body, said in (({}, "reason"), ({"reason": "lost", "key_id": "k"}, "key_id"), ({"reason": ""}, "reason")):
+        r = world.c["admin"].post(f"/api/sites/{sid}/edge/key", json=body)
+        assert r.status_code == 422 and said in r.json()["detail"].lower(), (body, r.text)
+    with world.use():
+        assert len(_key_rows(sid)) == 1
+    r = world.c["admin"].post(f"/api/sites/{sid}/edge/key", json={"reason": "The keys folder was lost in a move"})
+    assert r.status_code == 200, r.text
+    new = r.json()["public_key"]
+    assert new["key_id"] != before["key_id"] and new["missing"] is False and "new public key" in r.json()["detail"]
+    with world.use():
+        rows = {k["key_id"]: k for k in _key_rows(sid)}
+        assert rows[before["key_id"]]["retired"] and rows[new["key_id"]]["retired"] is None
+        line = [a for a in store.list_audit() if a["action"] == "replaced the site's signing key"]
+        assert line and line[0]["detail"]["retired"] == [before["key_id"]] and line[0]["detail"]["key_id"] == new["key_id"], line
+        with store.connect() as con:
+            assert con.execute("SELECT state FROM alerts WHERE site_id = ? AND rule = 'signing_key_missing'", (sid,)).fetchone()["state"] == "resolved"
+    msg = world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=kh).json()
+    assert msg["signature"]["key_id"] == new["key_id"] and delivery.verify(msg, new["public_key"])
+
+
+def test_a_restored_keys_folder_signs_again_and_closes_the_alert(world):
+    sid = world.site
+    _fake_plan(world)
+    kh = world.key(["plans:read"], role="viewer")
+    with world.use():
+        _closed_loop(sid)
+        kid = delivery.public_key(sid)["key_id"]
+        path = delivery._key_dir() / f"{sid}-{kid}.pem"
+        kept = path.read_bytes()
+        path.unlink()
+    assert world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=kh).status_code == 409
+    with world.use():
+        path.write_bytes(kept)                                             # the keys folder restored from the backup
+    msg = world.anon.get(f"/api/sites/{sid}/plans/current/message", headers=kh).json()
+    assert msg["signature"]["key_id"] == kid
+    with world.use(), store.connect() as con:
+        assert [r["state"] for r in con.execute("SELECT state FROM alerts WHERE site_id = ? AND rule = 'signing_key_missing'", (sid,))] == ["resolved"]
+        assert con.execute("SELECT count(*) FROM site_keys WHERE site_id = ?", (sid,)).fetchone()[0] == 1

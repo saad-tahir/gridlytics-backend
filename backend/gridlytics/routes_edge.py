@@ -20,11 +20,11 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
-from . import auth, contract, delivery, forecast, money, plans, sites, store, telemetry
+from . import alerts, auth, contract, delivery, forecast, money, plans, sites, store, telemetry
 from .routes_common import full_or_404, now_ts, out, put_state, site_or_404, state_change
-from .schemas import Refusal
+from .schemas import Refusal, Strict, check
 
 router = APIRouter()
 log = logging.getLogger("gridlytics.edge")
@@ -520,11 +520,20 @@ def _without_money(site_id: str, msg: dict) -> dict:
 def plan_message(site_id: str):
     """The signed plan message: what an edge (a plans:read key) pulls. Only a key pulls it, so each pull recorded in plan_messages is a real send (a
     person reads the plan at /plan). 409 `not_closed_loop` below the closed-loop tier (nothing is sent to the edge of a monitor or advisory site);
-    404 `plan_expired` when the last plan is past its valid_until, `no_plan` before the first plan."""
+    404 `plan_expired` when the last plan is past its valid_until, `no_plan` before the first plan; 409 `signing_key_missing` (and a critical Control
+    alert) when the site's signing key is not in the keys folder (audit engine-delivery-13)."""
     _key_only("The signed plan message is pulled by the site's edge with its API key; the plan itself is at /plan")
     site_or_404(site_id)
     try:
         msg = plans.signed_message(site_id)
+        if msg is not None:
+            msg = _without_money(site_id, msg)
+    except delivery.KeyMissing as exc:
+        # never a new key in its place (the edge holds the old public key): the edge is refused in words, and the site's people are told at once
+        log.error("site %s: %s", site_id, exc)
+        alerts._open(site_id, KEY_ALERT, "Control", "critical", "The plan-signing key is missing, so no plan reaches the edge: restore the keys "
+                     "folder from the backup, or an administrator replaces the key", {"key_id": exc.key_id})
+        raise Refusal(409, str(exc), "signing_key_missing") from None
     except plans.NotClosedLoop as exc:
         # only a closed-loop site's edge applies plans: below it the edge gets no table to write (and no send is counted)
         raise Refusal(409, str(exc), "not_closed_loop") from None
@@ -537,7 +546,8 @@ def plan_message(site_id: str):
         if held.get("reason") == plans.EXPIRED_REASON:
             raise Refusal(404, "The last plan has run out and no newer plan is in force, so the edge runs its fallback", "plan_expired")
         raise Refusal(404, "No active plan yet", "no_plan")
-    return _without_money(site_id, msg)
+    _key_restored(site_id)
+    return msg
 
 
 @router.get("/api/sites/{site_id}/edge")
@@ -555,3 +565,38 @@ def edge_status(site_id: str):
                 "sent": [dict(r) for r in sent], "public_key": delivery.public_key(site_id) if auth.can("edit_sites") else None,
                 # what the edge reports when it is not running the plan in force, and the clock-offset ladder's step (audit engine-delivery-10, 12)
                 "reports": plans.edge_view(site_id), "clock": plans.clock_info(site_id)})
+
+
+# ------------------------------------------------------------------------------------------------ the site's signing key (audit engine-delivery-13)
+
+#: The alert raised while the site's signing key is missing (the edge's pull is refused) and cleared when an administrator replaces the key
+KEY_ALERT = "signing_key_missing"
+
+
+def _key_restored(site_id: str) -> None:
+    """A message was signed: an open missing-key alert is closed (the keys folder was restored). One read a pull; a write only when one is open."""
+    with store.connect() as con:
+        held = con.execute("SELECT 1 FROM alerts WHERE site_id = ? AND rule = ? AND state IN ('open','acknowledged') LIMIT 1",
+                           (site_id, KEY_ALERT)).fetchone()
+    if held:
+        alerts._clear(site_id, KEY_ALERT)
+
+
+class KeyFields(Strict):
+    """POST /edge/key: why the key is replaced (kept in the audit trail)."""
+    reason: str = Field(min_length=1, max_length=300)
+
+
+@router.post("/api/sites/{site_id}/edge/key")
+def edge_key_replace(site_id: str, inp: dict = Body(default={})):
+    """A new signing key for the site, the key in force retired (plan Part 2.8: when the key is lost, and on a handover): an administrator's, with a
+    reason, never a key's. The permission, then the body are checked (a 403, then a 422 in one sentence). The answer is the new public key, the key
+    ids retired and what to do next: the edge refuses the plans signed with the new key until its public key is provisioned there."""
+    site_or_404(site_id)
+    auth.need("change_tier", "Replacing the site's signing key")
+    f = check(KeyFields, inp)
+    new, retired = delivery.replace_key(site_id, auth.actor(), f.reason)
+    alerts._clear(site_id, KEY_ALERT)
+    return {"public_key": new, "retired": retired,
+            "detail": "A new signing key is made and the old one retired: provision the new public key on the site's edge, which refuses the plans "
+                      "signed with it until then"}
