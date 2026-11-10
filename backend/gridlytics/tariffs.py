@@ -16,6 +16,7 @@ import calendar as _calendar
 import hashlib
 import json
 import math
+import os
 import re
 from datetime import date, datetime, timedelta, timezone
 
@@ -77,10 +78,35 @@ def _shipped_todo(con) -> list[tuple[dict, object]]:
     return todo
 
 
+#: The company files whose shipped library this process has checked, each as (path, device, inode): a lookup checks a file the first time this
+#: process reads it, not on every call (audit tests-and-perf-25: the check cost a connection and a scan of every version, 6 to 8 times a price
+#: vector). The shipped library cannot change while a process runs, so a newer build checks each file again when it starts. The app never deletes a
+#: company's file and a backup is restored with the server stopped; a file moved aside and made again at its path has a new inode and is checked
+#: again. `ensure_shipped` itself always checks.
+_SEEDED: set[tuple[str, int, int]] = set()
+
+
+def _file_key() -> tuple[str, int, int] | None:
+    path = store.db_path()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None  # no file yet: the check makes it
+    return str(path), st.st_dev, st.st_ino
+
+
+def _seeded() -> None:
+    """Check the current company file's shipped library once per process (`ensure_shipped`), before a lookup reads it."""
+    key = _file_key()
+    if key is None or key not in _SEEDED:
+        ensure_shipped()
+
+
 def ensure_shipped() -> None:
     """Seed the shipped versions and fuel prices into the company's file the first time it is used, add a shipped version that a newer build ships
     and the file lacks (matched on kind, key and start; a start the company already holds a version for is never doubled), and apply a newer build's
     correction of a shipped body (`_shipped_todo`): the old shipped row is superseded, as an approved correction for the same start supersedes it.
+    The lookups run it once per file and process (`_seeded`); called directly it always checks.
 
     The cheap check runs unlocked; the seeding runs inside an immediate write transaction that checks again, so callers racing on a fresh file (two
     requests, a request and the scheduler tick) seed it once: the first seeds, the rest find the rows."""
@@ -88,6 +114,7 @@ def ensure_shipped() -> None:
         todo = _shipped_todo(con)
         fuel = con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is not None
     if not todo and fuel:
+        _remember_seeded()
         return
     with store.write_transaction() as con:
         for v, old in _shipped_todo(con):
@@ -107,6 +134,13 @@ def ensure_shipped() -> None:
             for kind, day, price in tariff_data.FUEL_PRICES:
                 con.execute("INSERT OR IGNORE INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?)",
                             (kind, day, price, json.dumps(tariff_data.FUEL_SOURCE[kind])))
+    _remember_seeded()
+
+
+def _remember_seeded() -> None:
+    key = _file_key()
+    if key is not None:
+        _SEEDED.add(key)
 
 
 def _ver(r) -> dict:
@@ -116,7 +150,7 @@ def _ver(r) -> dict:
 
 
 def versions(kind: str | None = None) -> list[dict]:
-    ensure_shipped()
+    _seeded()
     with store.connect() as con:
         if kind:
             rows = con.execute("SELECT * FROM tariff_versions WHERE kind = ? ORDER BY key, effective_from", (kind,)).fetchall()
@@ -128,7 +162,7 @@ def versions(kind: str | None = None) -> list[dict]:
 def resolve(kind: str, key: str, on: date | str) -> dict | None:
     """The active version of (kind, key) in force on a date: the latest effective_from not after it and not closed before it (of two with the same
     start, the one created last)."""
-    ensure_shipped()
+    _seeded()
     day = on.isoformat() if isinstance(on, date) else str(on)[:10]
     with store.connect() as con:
         r = con.execute("SELECT * FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' AND effective_from <= ? "
@@ -181,7 +215,7 @@ def awaiting_notices(on) -> list[dict]:
     version in force, so the price vector, a plan, a rebuilt bill and the tariff library carry these to say their rupees rest on a version that the
     notification may change. Each names the version still in use (`in_use`, None when none is in force). Words and dates only, no rate or rupee:
     every role may read it. The alert for it is the alert rules'."""
-    ensure_shipped()
+    _seeded()
     day = on.isoformat() if isinstance(on, date) else str(on)[:10]
     with store.connect() as con:
         rows = con.execute("SELECT * FROM tariff_versions WHERE status = 'awaiting_notification' AND effective_from <= ? "
@@ -370,7 +404,7 @@ def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, 
     if not isinstance(body, dict) or not isinstance(source, dict) or source.get("verified") not in ("primary", "secondary", "unverified"):
         raise ValueError("A version carries a body and a source with verified: primary, secondary or unverified")
     validate_body(kind, key, body, effective_from)
-    ensure_shipped()
+    _seeded()
     vid = store.new_id()
     with store.connect() as con:
         con.execute("INSERT INTO tariff_versions (id, kind, key, effective_from, effective_to, known_from, status, supersedes, body, source, hash, created, by) "
@@ -442,7 +476,7 @@ def fuel_price(kind: str, on: date | str) -> tuple[float, dict]:
     with no entry of its own keeps the one before). A day before the first entry has no fuel price (audit engine-money-live-15): the first price
     stands in, so that a plan never runs on free fuel, and its source says so (`stands_in`, `first_from` and a `note` in words); the savings ledger
     then claims nothing on fuel priced with it (verify.compute_day, claim_withheld "no_fuel_price")."""
-    ensure_shipped()
+    _seeded()
     day = on.isoformat() if isinstance(on, date) else str(on)[:10]
     with store.connect() as con:
         r = con.execute("SELECT price, source FROM fuel_prices WHERE kind = ? AND valid_from <= ? ORDER BY valid_from DESC LIMIT 1", (kind, day)).fetchone()
@@ -457,9 +491,12 @@ def fuel_price(kind: str, on: date | str) -> tuple[float, dict]:
 
 
 def add_fuel_price(kind: str, valid_from: str, price: float, by: str) -> None:
+    """Enter a fuel price from a day (a day already priced takes the new price). The shipped prices are seeded first: they go only into a file
+    with no fuel price, so a price entered on a fresh file would otherwise keep them out for good."""
     if kind not in ("hsd", "gas_captive", "lng_captive") or not (0 < price < 100000):
         raise ValueError("A fuel price needs a kind (hsd, gas_captive, lng_captive) and a positive price")
     valid_from = _canonical_day(valid_from, "A fuel price's start")
+    _seeded()
     with store.connect() as con:
         con.execute("INSERT INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?) ON CONFLICT(kind, valid_from) DO UPDATE SET "
                     "price = excluded.price, source = excluded.source", (kind, valid_from, price, json.dumps({"kind": "manual", "ref": by, "verified": "primary"})))
@@ -467,7 +504,7 @@ def add_fuel_price(kind: str, valid_from: str, price: float, by: str) -> None:
 
 
 def fuel_prices(kind: str | None = None) -> list[dict]:
-    ensure_shipped()
+    _seeded()
     with store.connect() as con:
         rows = con.execute("SELECT * FROM fuel_prices" + (" WHERE kind = ?" if kind else "") + " ORDER BY kind, valid_from",
                            ((kind,) if kind else ())).fetchall()
@@ -527,7 +564,7 @@ def adders_for(billing_month: str) -> list[dict]:
     of one key that cover the month the latest start wins, and of two with the same start the one created last, so a new or corrected version
     replaces the one before it instead of stacking on it (a same-start correction also marks the old one superseded); two months' FCAs billed together
     are two keys. A malformed row is skipped rather than failing every bill."""
-    ensure_shipped()
+    _seeded()
     first, last = _month_bounds(billing_month)
     with store.connect() as con:
         rows = con.execute("SELECT * FROM tariff_versions WHERE kind = 'adder' AND status = 'active' AND effective_from <= ? "
@@ -819,7 +856,7 @@ def _tou(card: dict) -> bool:
 
 def _resolve_days(kind: str, key: str, days: list[date]) -> list[dict | None]:
     """The active version of (kind, key) in force on each day, picked as `resolve` picks it, from one read of the versions."""
-    ensure_shipped()
+    _seeded()
     with store.connect() as con:
         rows = con.execute("SELECT * FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' "
                            "ORDER BY effective_from DESC, created DESC, rowid DESC", (kind, key)).fetchall()

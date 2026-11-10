@@ -26,7 +26,9 @@ Batch 3 (the hand-worked goldens of engine-tariffs-07 are test_r7_tariffs_golden
 
 Batch 4 (late findings; the golden of the dated diesel price is test_r7_tariffs_golden.py):
 - engine-money-live-15: a genset day before the first entered fuel price has no fuel price: the first price stands in only with a flag that says so,
-  and a day whose fuel (or whose carry-over, off grid) rests on it claims nothing (claim_withheld "no_fuel_price") until a price is entered for it.
+  and a day whose fuel (or whose carry-over, off grid) rests on it claims nothing (claim_withheld "no_fuel_price") until a price is entered for it;
+- tests-and-perf-25: a lookup checks that the shipped library is seeded once per company file and process, not on every call, and a fuel price
+  entered on a fresh file no longer keeps the shipped prices out.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -845,3 +847,47 @@ def test_a_day_before_the_first_fuel_price_whose_genset_did_not_run_claims_as_be
     assert rows["native"]["actual"]["litres"] == 0 and rows["native"]["baseline"]["litres"] == 0
     assert rows["native"]["claim_withheld"] is None
 
+
+# ------------------------------------------------------------------------------------------------ batch 4, tests-and-perf-25: the seeding check once
+
+def test_a_lookup_checks_the_shipped_library_once_per_company_file_and_process(company, monkeypatch):
+    tariffs.resolve("schedule", "national", NOV)  # the first lookup on this file in this process checks it (and seeds it)
+    runs, opened = [], []
+    ensure, connect = tariffs.ensure_shipped, store._connect
+    monkeypatch.setattr(tariffs, "ensure_shipped", lambda: runs.append(1) or ensure())
+    monkeypatch.setattr(store, "_connect", lambda: opened.append(1) or connect())
+    assert tariffs.resolve("schedule", "national", NOV) is not None
+    assert len(opened) == 1  # its own query only; before: a second connection for the seeding check
+    tariffs.adders_for("2026-11")
+    tariffs.fuel_price("hsd", NOV)
+    tariffs.fuel_prices()
+    tariffs.versions("adder")
+    tariffs.card_for("B-2(b)", NOV)
+    tariffs.awaiting_notices(NOV)
+    _vec(_conn())
+    assert runs == []  # before: one check per lookup, 6 to 8 for one price vector
+    # another company's file is checked and seeded on its first lookup, without an explicit ensure_shipped
+    other = company.parent / "other.db"
+    with store.use_company(other):
+        assert tariffs.resolve("schedule", "national", NOV) is not None
+        assert tariffs.fuel_price("hsd", NOV)[0] == 402.96
+    assert len(runs) == 1
+    # a new file put in place of this one (the old one moved aside, so the two cannot share an inode) is seeded on its first lookup
+    company.rename(company.with_name("aside.db"))
+    assert tariffs.resolve("schedule", "national", NOV) is not None
+    assert len(runs) == 2
+    # a new process (nothing remembered) checks again: a version a newer build ships is added to the file on its first lookup
+    with store.connect() as con:
+        con.execute("DELETE FROM tariff_versions WHERE kind = 'schedule' AND effective_from = '2025-07-01'")
+    tariffs._SEEDED.clear()
+    assert tariffs.card_for("B-2(b)", date(2025, 12, 20))[1]["effective_from"] == "2025-07-01"
+    assert len(runs) == 3
+
+
+def test_a_fuel_price_entered_on_a_fresh_file_leaves_the_shipped_prices_in(company):
+    # the shipped prices go only into a file with no fuel price: entered first, before any lookup had checked the file, a price kept them out for good
+    # (before: 6 Nov priced at the entered 380.10, not the shipped 382.25)
+    tariffs.add_fuel_price("hsd", "2026-10-01", 380.10, "t")
+    assert tariffs.fuel_price("hsd", date(2026, 11, 6))[0] == 382.25
+    assert tariffs.fuel_price("hsd", EARLY)[0] == 380.10
+    assert len(tariffs.fuel_prices()) == len(tariff_data.FUEL_PRICES) + 1
