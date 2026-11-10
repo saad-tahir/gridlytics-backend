@@ -11,9 +11,9 @@ import pytest
 from test_fix_api import world  # noqa: F401 (a fixture)
 from test_fix_r2_savings import NIGHT_CHARGER, D, P
 from test_fix_r6_savings import DAYS, LEAD, _blank_evening, _continuous, _farm, _night_runs, _rows, _run
-from test_fix_savings import _put_rows, company, make_site, twin_day  # noqa: F401 (company is a fixture)
+from test_fix_savings import _put_rows, company, make_site, standing_plan, twin_day  # noqa: F401 (company is a fixture)
 
-from gridlytics import sites, store, tariffs, telemetry, twin, verify
+from gridlytics import demo, money, sites, store, tariffs, telemetry, twin, verify
 
 
 def _iso(ts: float) -> str:
@@ -857,6 +857,107 @@ def test_the_tuned_baseline_at_a_genset_site_is_fitted_with_cycle_charging_and_c
     grid = make_site(name="No genset tuned r7", genset=False)
     twin_day(grid, D, 0.5)
     assert verify.compute_day(grid, D, with_bound=False, forward=False)["tuned"]["tuned_rule"]["cycle_soc_pct"] is None
+
+
+# ------------------------------------------------------------------------------------------------ engine-money-live-11: the tuned baseline is never
+# ------------------------------------------------------------------------------------------------ worse than the native capture on its fit window
+
+#: an installer's hand-tuned table (plan 8.1: "owners already hand-tune their inverters"): the grid charges the battery to 90 % overnight, it holds
+#: from 06:00 while PV tops it up, discharges to 40 % in the evening peak and then runs self-use at its 30 % backup floor
+HAND_TUNED = {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 30, "slots": [
+    {"start": "00:00", "mode": "charge_grid", "soc_floor_pct": 30, "soc_target_pct": 90, "grid_charge": True},
+    {"start": "06:00", "mode": "hold", "soc_floor_pct": 30, "soc_target_pct": 100, "grid_charge": False},
+    {"start": "18:00", "mode": "discharge", "soc_floor_pct": 40, "soc_target_pct": 100, "grid_charge": False},
+    {"start": "22:00", "mode": "self_use", "soc_floor_pct": 30, "soc_target_pct": 100, "grid_charge": False}]}
+#: the observation week before November (the fit's window for a November day) and the scored days
+WEEK = [date(2026, 10, 25) + timedelta(days=i) for i in range(7)]
+NOV = [date(2026, 11, 1), date(2026, 11, 2)]
+
+
+def _mall(name: str, native: dict, conn: dict | None = None) -> str:
+    """The demo mall (100 kWh at 50 kW, 200 kWp, an auto-start set) with a fixed id, on a B-2(b) connection with no export unless `conn` says."""
+    spec = next(s for s in demo.DEMO_SITES if s["key"] == "mall")
+    s = sites.create({**spec["site"], "name": name}, "t", site_id="t-" + name.lower().replace(" ", "-"), demo_link=demo.DEMO_LINK)
+    sid = s["id"]
+    with store.connect() as con:
+        con.execute("UPDATE sites SET data = ?, status = 'active' WHERE id = ?", (json.dumps({**s["data"], **spec["extra"]}), sid))
+    sites.put_connection(sid, conn or {"tariff_category": "B-2(b)", "sanctioned_load_kw": 650, "regime": "none"}, "t")
+    for role, fields in spec["assets"].items():
+        sites.put_asset(sid, role, fields, "t")
+    sites.set_tier_capable(sid, "closed_loop")
+    sites.set_tier_allowed(sid, "monitor", "t", "demo")
+    sites.capture_native(sid, native, "t")
+    standing_plan(sid)
+    return sid
+
+
+def _window_costs(sid: str, day: date, policies: dict) -> dict:
+    """What each policy costs over the fit window of `day` (the 7 days before its month starts), replayed from each day's measured start and each
+    day's stored-energy change valued at the ledger's v_end, as the ledger values it."""
+    site = {**sites.full(sid), "native": verify.native_for_day(sid, day)}
+    conn = site["connections"][0]
+    plant = twin.plant_of(site)
+    out = dict.fromkeys(policies, 0.0)
+    for d in WEEK:
+        series, act = verify._replay_inputs(site, d)
+        soc0 = verify._soc_start(sid, twin.day_start_utc(d), act["g"], act["f"], plant)
+        tot = verify.month_totals(sid, conn, d)
+        pr = verify._minute_prices(conn, d, sid, tot.get("import"), tot.get("export"))
+        v_end = verify._terminal_value(site, d, series, pr)[1]
+        for k, pol in policies.items():
+            sim = twin.simulate(series, pol(site, series["ts"]), plant, soc0)
+            e_end = float(sim["soc"][-1]) * plant.e_nom
+            out[k] += verify.price_arm(site, sim, pr, d, e_end, v_end)["cost_rs"] - v_end * (e_end - soc0 * plant.e_nom)
+    return out
+
+
+def test_the_tuned_baseline_is_never_worse_than_the_native_capture_on_its_window(company):
+    # Lahore's tuned table cost Rs 294 a day more than its native settings: the fit tried only the eight TOU tables, each forcing a peak discharge,
+    # none plain self-use and never the capture itself. Here the installer's own table beats every one of the eight over the observation week
+    sid = _mall("Mall hand tuned r7", HAND_TUNED)
+    _run(sid, WEEK + NOV, lambda s, ts: twin.native_policy(s, ts))  # the site ran its own settings
+    rows = verify.compute_day(sid, NOV[1], with_bound=False, forward=False)
+    rule = rows["tuned"]["tuned_rule"]
+    window = tariffs.peak_window(tariffs.calendar_for(sites.full(sid)["connections"][0], NOV[1]), 11)
+    pols = {"native": twin.native_policy, "rule": lambda s, ts: verify.tuned_policy(rule, ts)}
+    pols.update({v: (lambda s, ts, v=v: twin.table_policy(verify.tuned_table(s, v, window), ts)) for v in verify.TUNED_VARIANTS})
+    cost = _window_costs(sid, NOV[1], pols)
+    grid_best = min(cost[v] for v in verify.TUNED_VARIANTS)
+    assert grid_best > cost["native"] + 1_000.0  # the case: the best of the eight costs over Rs 1,000 more on the week than the capture
+    # the rule is never worse than the capture on its window (plan VER-12); here it is the capture itself
+    assert cost["rule"] <= cost["native"] + 0.01
+    assert rule["kind"] == "native_capture" and rule["native"] == verify.native_for_day(sid, NOV[1])["body"] and rule["cycle_soc_pct"] is None
+    assert rule["fit"] == {"days": [d.isoformat() for d in sorted(WEEK, reverse=True)], "cost_rs": pytest.approx(cost["rule"], abs=0.01),
+                           "native_cost_rs": pytest.approx(cost["native"], abs=0.01)}
+    # golden: on the scored day both baselines replay the capture from the same start, so they cost the same to the paisa and save the same
+    n, t = rows["native"], rows["tuned"]
+    assert t["baseline"]["cost_rs"] == n["baseline"]["cost_rs"] and t["saving_rs"] == n["saving_rs"]
+    s = verify.summary(sid, NOV[1].isoformat(), NOV[1].isoformat())["baselines"]["tuned"]
+    assert s["rule_kind"] == "native_capture" and s["rule_fit"]["days"] == rule["fit"]["days"]
+    # a viewer and an API key read the window's days but not its rupees
+    assert money.for_key(s)["rule_fit"] == {"days": rule["fit"]["days"]}
+
+
+def test_the_native_like_self_use_table_is_fitted_where_the_tou_tables_lose(company, monkeypatch):
+    # Lahore's case: on A-2(c), grid charging off-peak at Rs 39.48 to discharge at Rs 48.28 loses after the round trip and the wear, so the tables
+    # that force it cost more than none. With the grid held to the four tables that grid-charge and a capture that charges to 100 % every night,
+    # the native-like self-use table (self-use at the capture's backup floor) is the rule: before, there was no such candidate
+    monkeypatch.setattr(verify, "TUNED_VARIANTS", [(fp, hb, 80) for fp in (20, 40) for hb in (False, True)])
+    night = {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 30, "slots": [
+        {"start": "00:00", "mode": "charge_grid", "soc_floor_pct": 30, "soc_target_pct": 100, "grid_charge": True},
+        {"start": "06:00", "mode": "self_use", "soc_floor_pct": 30, "soc_target_pct": 100, "grid_charge": False}]}
+    sid = _mall("Mall night charger r7", night, conn={"tariff_category": "A-2(c)", "sanctioned_load_kw": 650, "regime": "net_metering_legacy",
+                                                       "export_cap_kw": 180, "agreement_start": "2019-07-01", "agreement_end": "2027-07-01"})
+    _run(sid, WEEK + NOV, lambda s, ts: twin.native_policy(s, ts))
+    rule = verify.compute_day(sid, NOV[1], with_bound=False, forward=False)["tuned"]["tuned_rule"]
+    assert rule["kind"] == "self_use" and rule["table"] == [{"start": "00:00", "mode": "self_use", "soc_floor_pct": 30.0, "soc_target_pct": 100.0,
+                                                             "grid_charge": False}]
+    window = tariffs.peak_window(tariffs.calendar_for(sites.full(sid)["connections"][0], NOV[1]), 11)
+    pols = {"native": twin.native_policy, "table": lambda s, ts: twin.table_policy(rule["table"], ts)}
+    pols.update({v: (lambda s, ts, v=v: twin.table_policy(verify.tuned_table(s, v, window), ts)) for v in verify.TUNED_VARIANTS})
+    cost = _window_costs(sid, NOV[1], pols)
+    assert cost["table"] < min(cost[v] for v in verify.TUNED_VARIANTS) and cost["table"] < cost["native"] - 1_000.0
+    assert rule["fit"]["cost_rs"] <= rule["fit"]["native_cost_rs"] - 1_000.0
 
 
 # ------------------------------------------------------------------------------------------------ engine-optimiser-14 (role-owner-05, role-operator-12,

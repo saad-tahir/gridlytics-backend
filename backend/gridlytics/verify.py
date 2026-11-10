@@ -702,9 +702,32 @@ def tuned_table(site: dict, variant: tuple, peak_window: tuple[int, int]) -> lis
     return sorted(rows, key=lambda r: r["start"])
 
 
+def self_use_table(site: dict) -> list[dict]:
+    """The native-like self-use table: self-use all day at the native capture's backup floor, no grid charging and no forced discharge (round 7,
+    audit engine-money-live-11: every TUNED_VARIANTS table forces a discharge in the peak window, and none was plain self-use)."""
+    backup = float(((site.get("native") or {}).get("body") or {}).get("backup_soc_pct", 20.0))
+    return [{"start": "00:00", "mode": "self_use", "soc_floor_pct": backup, "soc_target_pct": 100.0, "grid_charge": False}]
+
+
+def tuned_candidates(site: dict, peak_window: tuple[int, int]) -> list[dict]:
+    """The rules the tuned fit tries, in order (a later one replaces an earlier one only when it is cheaper on the window): the native capture
+    itself (`kind` "native_capture", its body under `native`: the installer's own table or mode is a static table of the brand grammar, so the best
+    one is never worse than it), the native-like self-use table ("self_use") and the grid of TOU tables ("tou_variant", TUNED_VARIANTS). Round 7
+    (audit engine-money-live-11): before, only the grid was tried, so a hand-tuned capture beat the "best" table and the tuned arm could cost more
+    than native (plan VER-12: the fitted table replays to a lower bill than the native capture)."""
+    body = (site.get("native") or {}).get("body") or {"work_mode": "self_use", "backup_soc_pct": 20.0, "slots": []}
+    return ([{"kind": "native_capture", "table": None, "native": body, "cycle_soc_pct": None},
+             {"kind": "self_use", "table": self_use_table(site), "cycle_soc_pct": None}]
+            + [{"kind": "tou_variant", "table": tuned_table(site, v, peak_window), "cycle_soc_pct": None} for v in TUNED_VARIANTS])
+
+
 def tuned_policy(rule: dict, ts: np.ndarray) -> dict:
-    """The tuned baseline's per-minute policy (fit_tuned's rule): its static table, and at a genset site its cycle-charging set point, if any."""
-    pol = twin.table_policy(rule["table"], ts)
+    """The tuned baseline's per-minute policy (fit_tuned's rule): its static table (or, where the native capture is the best, the capture as the
+    inverter holds it), and at a genset site its cycle-charging set point, if any."""
+    if rule.get("native") is not None:
+        pol = twin.native_policy({"native": {"body": rule["native"]}}, ts)
+    else:
+        pol = twin.table_policy(rule["table"], ts)
     if rule.get("cycle_soc_pct") is not None:
         pol["cycle_soc"] = np.full(len(ts), float(rule["cycle_soc_pct"]) / 100.0)
     return pol
@@ -716,18 +739,22 @@ def _cycles(plant: twin.Plant) -> bool:
 
 
 def _tuned_key(site: dict, day: date) -> str:
-    """The tuned rule's cache key: per month and per native capture (its backup floor shapes the table); `cc` since the rule carries cycle charging
-    (round 7: a table cached before is fitted again)."""
-    return f"tuned:{site['id']}:{day.strftime('%Y-%m')}:v{(site.get('native') or {}).get('version', 0)}:cc"
+    """The tuned rule's cache key: per month and per native capture (its backup floor shapes the table, and the capture is a candidate); `cc` since
+    the rule carries cycle charging, `nc` since the native capture and the self-use table are candidates (round 7: a rule cached before either is
+    fitted again)."""
+    return f"tuned:{site['id']}:{day.strftime('%Y-%m')}:v{(site.get('native') or {}).get('version', 0)}:cc:nc"
 
 
 def fit_tuned(site: dict, day: date) -> dict:
-    """The tuned baseline's rule, {"table", "cycle_soc_pct"}: the best static table on the observation window (the 7 days before the month starts,
-    else the first 7 measured days), cached per month and capture. At a genset site with a battery (plan 8.1) the best table is then tried with HOMER
-    cycle charging at each of CYCLE_SET_POINTS (twin.simulate's `cycle_soc`: a running set charges the battery near its rating and stops at the set
-    point), and the cheapest of these on the window is the rule; `cycle_soc_pct` is None where the table alone is cheapest or there is no genset.
-    Before (round 7, audit engine-savings-03), the tuned arm ran the operator's genset rule, so at an off-grid site, where the table's modes do not
-    apply, it was the native arm minute for minute."""
+    """The tuned baseline's rule, {"kind", "table", "native", "cycle_soc_pct", "fit"}: the cheapest of tuned_candidates on the observation window
+    (the 7 days before the month starts, else the first 7 measured days), cached per month and capture. At a genset site with a battery (plan 8.1)
+    the best rule is then tried with HOMER cycle charging at each of CYCLE_SET_POINTS (twin.simulate's `cycle_soc`: a running set charges the
+    battery near its rating and stops at the set point), and the cheapest of these on the window is the rule; `cycle_soc_pct` is None where the rule
+    alone is cheapest or there is no genset. Before (round 7, audit engine-savings-03), the tuned arm ran the operator's genset rule, so at an
+    off-grid site, where the table's modes do not apply, it was the native arm minute for minute.
+
+    `fit` holds the window's days and what the rule and the native capture cost over them, each day's stored-energy change valued as the ledger
+    values it: the rule's is never above the capture's, since the capture is a candidate (round 7, audit engine-money-live-11)."""
     key = _tuned_key(site, day)
     held = store.get_setting(key)
     if held:
@@ -743,7 +770,7 @@ def fit_tuned(site: dict, day: date) -> dict:
     if not inputs:
         inputs = [(d, *_replay_inputs(site, d)) for d in (day - timedelta(days=i) for i in range(0, 7))]
         inputs = [x for x in inputs if x[1] is not None]
-    plain = {"table": tuned_table(site, (20, False, 0), window), "cycle_soc_pct": None}
+    plain = {"kind": "tou_variant", "table": tuned_table(site, (20, False, 0), window), "cycle_soc_pct": None}
     if not inputs or not (site.get("assets") or {}).get("battery"):
         return plain
     on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
@@ -773,18 +800,21 @@ def fit_tuned(site: dict, day: date) -> dict:
             total += price_arm(site, sim, pr, d, e_end, v_end)["cost_rs"] - v_end * (e_end - soc0 * plant.e_nom)
         return total
 
-    best, best_cost = None, None
-    for v in TUNED_VARIANTS:
-        rule = {"table": tuned_table(site, v, window), "cycle_soc_pct": None}
+    best, best_cost, native_cost = None, None, None
+    for rule in tuned_candidates(site, window):
         total = window_cost(rule)
+        if rule["kind"] == "native_capture":
+            native_cost = total
         if best_cost is None or total < best_cost:
             best, best_cost = rule, total
     if _cycles(plant):
         for sp in sorted({min(p, plant.soc_max * 100.0) for p in CYCLE_SET_POINTS}):
-            rule = {"table": best["table"], "cycle_soc_pct": round(sp, 1)}
+            rule = {**best, "cycle_soc_pct": round(sp, 1)}
             total = window_cost(rule)
             if total < best_cost:
                 best, best_cost = rule, total
+    best = {**best, "fit": {"days": [d.isoformat() for d, *_ in prepared], "cost_rs": round(float(best_cost), 2),
+                    "native_cost_rs": round(float(native_cost), 2)}}
     store.set_setting(key, best)
     return best
 
@@ -2189,6 +2219,10 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             rule = next((by["tuned"].get("tuned_rule") for _, by in sorted(days.items(), reverse=True) if (by.get("tuned") or {}).get("tuned_rule")),
                         None)
             out["baselines"][base]["cycle_charge_soc_pct"] = (rule or {}).get("cycle_soc_pct")
+            # round 7 (audit engine-money-live-11): which candidate the rule is (the native capture, the self-use table or a TOU table; None on a
+            # rule fitted before) and its fit window, with what the rule and the native capture cost over it (money: hidden from a viewer)
+            out["baselines"][base]["rule_kind"] = (rule or {}).get("kind")
+            out["baselines"][base]["rule_fit"] = (rule or {}).get("fit")
     for day, by in sorted(days.items()):
         n = by.get("native", {})
         t = by.get("tuned") or {}
