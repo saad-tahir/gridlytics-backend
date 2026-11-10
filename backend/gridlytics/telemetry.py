@@ -883,6 +883,15 @@ def battery_totals(site_id: str, t0: int, t1: int) -> dict:
             "hot_full_minutes": int(r[4]), "first_discharge_ts": r[5]}
 
 
+def soc_reading(site_id: str, ts: int) -> dict | None:
+    """The stored state-of-charge readings of the minute starting at ts (a minute grid's cell: minute_grid's cells start where the caller's t0 put
+    them, so the row is the one inside [ts, ts + 60)): which of the estimate and the BMS that minute holds."""
+    with connect() as con:
+        r = con.execute("SELECT battery_soc_est_pct, battery_soc_bms_pct FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts LIMIT 1",
+                        (site_id, int(ts), int(ts) + 60)).fetchone()
+    return {"est": _finite(r[0]), "bms": _finite(r[1])} if r else None
+
+
 def raw(site_id: str, t0: int, t1: int, columns: tuple = COLUMNS[3:]) -> dict:
     with connect() as con:
         rows = con.execute(f"SELECT ts, {', '.join(columns)} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",

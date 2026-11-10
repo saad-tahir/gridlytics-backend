@@ -377,6 +377,17 @@ def _battery_month(site_id: str, b: dict, e_nom: float, now: int) -> tuple[dict,
     return month, lifetime
 
 
+def _soc_source(site_id: str, st: dict) -> str | None:
+    """Where battery.state's soc_pct came from (round 7 pages-C-14): "estimate" where its minute holds the estimate, "bms" where only the BMS read
+    (a CSV history, a BMS-only source); the state service takes the estimate first and the BMS where it is missing."""
+    if st.get("soc_pct") is None or not st.get("last_ts"):
+        return None
+    r = telemetry.soc_reading(site_id, st["last_ts"])
+    if not r:
+        return None
+    return "estimate" if r["est"] is not None else "bms" if r["bms"] is not None else None
+
+
 @router.get("/api/sites/{site_id}/battery")
 def battery_page(site_id: str):
     s = full_or_404(site_id)
@@ -389,13 +400,16 @@ def battery_page(site_id: str):
     e_nom = st["e_nom_kwh"] or 1
     cycles = [{"day": d["day"], "cycles": round((d.get("discharge_kwh") or 0) / e_nom, 2), "min_soc": d.get("min_soc"), "max_soc": d.get("max_soc")}
               for d in daily]
-    soc = telemetry.series(site_id, now - 48 * 3600, now, ["battery_soc_est_pct", "battery_soc_bms_pct", "battery_temp_c", "battery_power_w"], "15m")
+    # grid_present (each 15-minute bucket's minimum) shades the outages on the state-of-charge chart (round 7 pages-C-14)
+    soc = telemetry.series(site_id, now - 48 * 3600, now, ["battery_soc_est_pct", "battery_soc_bms_pct", "battery_temp_c", "battery_power_w",
+                                                           "grid_present"], "15m")
     plan = plans.current(site_id)
     month, lifetime = _battery_month(site_id, s["assets"]["battery"], e_nom, now)
     # the state of health is the pack's as entered: the state service does not estimate it yet (plan OPT-10), and the page says so (pages-C-13)
-    st = {**st, "soh_source": "entered"}
+    st = {**st, "soc_source": _soc_source(site_id, st), "soh_source": "entered"}
     return out({"battery": st, "pack": s["assets"]["battery"], "cycles": cycles, "cap_per_day": s["data"].get("cycle_cap_per_day"), "soc": soc,
-                "plan": [{"t": x["t"], "soc_pct": x["soc_pct"], "reserve_pct": x["reserve_pct"]} for x in (plan or {}).get("steps", [])],
+                "plan": [{"t": x["t"], "soc_pct": x["soc_pct"], "reserve_pct": x["reserve_pct"], "grid_present": x.get("grid_present")}
+                         for x in (plan or {}).get("steps", [])],
                 "month": month, "lifetime": lifetime})
 
 

@@ -18,7 +18,8 @@ column mapping (column to key, unit, sign, date order) saved per site, guessed f
 columns it has and the ones expected; a semicolon file with decimal commas is read (flow-telemetry-plan-control-12).
 
 Batch 4, the battery page: this Karachi month's cycles, throughput, hot-and-full hours and wear, the cycles over the battery's life, and the state of
-health named as entered (pages-C-13); the daily rate divided by the days with readings, which the answer gives (role-owner-38).
+health named as entered (pages-C-13); the daily rate divided by the days with readings, which the answer gives (role-owner-38); the state of charge
+named by its source, the estimate or the BMS, and the outages for the chart (pages-C-14).
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -893,3 +894,23 @@ def test_a_month_without_battery_readings_or_temperature_says_unknown_not_zero(w
     m = c.get(f"/api/sites/{sid}/battery").json()["month"]
     assert (m["days_with_data"], m["throughput_kwh"], m["cycles"], m["cycles_per_day"], m["hot_full_hours"]) == (0.25, 120.0, 1.2, None, None)
 
+
+def test_the_state_of_charge_names_its_source_and_the_chart_gets_the_outages(world, monkeypatch):
+    """pages-C-14: a source that sends the BMS reading alone gives a state of charge read from the BMS (soc_source "bms"), not an estimate; once the
+    estimate arrives it is "estimate"; the 48-hour series carries grid_present, so the chart can shade the outages, and the plan steps carry theirs."""
+    c = world.owner
+    sid = _battery_site(world, monkeypatch, "Sourced battery")
+    with world.use():
+        _write(sid, B_NOW - 3 * 3600, 120, battery_soc_bms_pct=55.0, grid_present=lambda i: 0 if 30 <= i < 60 else 1)
+    from gridlytics import routes_telemetry
+    step = {"t": B_NOW + 900, "soc_pct": 50.0, "reserve_pct": 20.0, "grid_present": 0.0, "cost_rs": 12.0}
+    monkeypatch.setattr(routes_telemetry.plans, "current", lambda site_id: {"steps": [step]})
+    page = c.get(f"/api/sites/{sid}/battery").json()
+    assert (page["battery"]["soc_pct"], page["battery"]["soc_source"]) == (55.0, "bms")
+    present = page["soc"]["series"]["grid_present"]
+    assert 0 in present and 1 in present
+    assert page["plan"] == [{"t": B_NOW + 900, "soc_pct": 50.0, "reserve_pct": 20.0, "grid_present": 0.0}]
+    with world.use():
+        _write(sid, B_NOW - 60 * 60, 30, battery_soc_bms_pct=56.0, battery_soc_est_pct=58.0)
+    b = c.get(f"/api/sites/{sid}/battery").json()["battery"]
+    assert (b["soc_pct"], b["soc_source"]) == (58.0, "estimate")
