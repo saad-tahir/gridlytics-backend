@@ -414,8 +414,12 @@ def build_history(site_id: str, days: int, progress=None) -> None:
 
 def default_days() -> int:
     """The days of history a load builds when none is asked for: GRIDLYTICS_DEMO_DAYS, else 21 (DESIGN_LOG, v1 build, Demo: the plan says 90,
-    which took too long to seed)."""
-    return int(os.environ.get("GRIDLYTICS_DEMO_DAYS", "21"))
+    which took too long to seed). GET /api/demo names it on every read, so a setting that is not a whole number above 0 leaves the default."""
+    try:
+        n = int(os.environ.get("GRIDLYTICS_DEMO_DAYS", "21"))
+    except ValueError:
+        return 21
+    return n if n > 0 else 21
 
 
 def load(by: str, days: int | None = None, background: bool = True) -> dict:

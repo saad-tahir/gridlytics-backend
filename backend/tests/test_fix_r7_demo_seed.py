@@ -302,6 +302,14 @@ def test_the_demo_status_names_the_days_of_history_a_build_makes(company, monkey
     assert demo.status()["days"] == 5 and routes_demo.status()["days"] == 5
 
 
+def test_the_demo_status_still_answers_when_the_days_setting_is_not_a_positive_number(company, monkeypatch):
+    """GET /api/demo now reads GRIDLYTICS_DEMO_DAYS on every call (every empty state polls it), so a bad value must not fail the read, nor promise a
+    history of no days or of negative days: the default stands (review of pages-A-04)."""
+    for bad in ("ninety", "", "0", "-3", "2.5"):
+        monkeypatch.setenv("GRIDLYTICS_DEMO_DAYS", bad)
+        assert demo.default_days() == 21 and routes_demo.status()["days"] == 21, bad   # before: ValueError (a 500) or 0 / -3 days
+
+
 def test_only_an_administrator_loads_the_demo_sites(world, monkeypatch):
     calls = []
     monkeypatch.setattr(demo, "load", lambda by, days=None, background=True: calls.append(by) or {"state": "running"})
