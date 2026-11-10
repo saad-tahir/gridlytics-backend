@@ -912,17 +912,24 @@ def preliminary(site_id: str, stage: int | None) -> dict:
     return {"preliminary": stage is None or int(stage) < 1 or n < PRELIMINARY_DAYS, "verified_days": n, "verified_days_needed": PRELIMINARY_DAYS}
 
 
+#: whether the forecasts read a weather feed (plan 9.3 UI-08's data-provider status): not yet, FOR-02 waits on the owner's Open-Meteo licence, so the PV
+#: chain is the clear sky times a clearness distribution (the month's, then the site's) with the last hour's sky for two hours, and load and outages
+#: read no weather either; every forecast page says so (`weather_feed`)
+WEATHER_FEED = False
+
+
 def page(site: dict, kind: str) -> dict:
     """The latest issue of a kind with the actuals so far (15-minute means) for the forecast page, and `past`: the 24 hours before its belief time with
     their actuals and the issue held a day before over them, so the chart shows how the forecast tracked. The tick re-issues every 15 minutes, so the
     latest issue's own actuals are at most one step. `preliminary` follows the design rules (see preliminary()), with `verified_days` and
-    `verified_days_needed` beside it. An outage page also carries `announced`: the announced windows over the chart's span (announced_blocks)."""
+    `verified_days_needed` beside it. An outage page also carries `announced`: the announced windows over the chart's span (announced_blocks). Every
+    page says whether the forecasts read a weather feed (`weather_feed`, WEATHER_FEED)."""
     na = not_applicable(site, kind)
     if na:
-        return {"kind": kind, "issue": None, "not_applicable": na, "stage": None, "preliminary": False}
+        return {"kind": kind, "issue": None, "not_applicable": na, "stage": None, "preliminary": False, "weather_feed": WEATHER_FEED}
     f = telemetry.latest_forecast(site["id"], kind)
     if f is None:
-        return {"kind": kind, "issue": None, "not_applicable": None}
+        return {"kind": kind, "issue": None, "not_applicable": None, "weather_feed": WEATHER_FEED}
     t0 = f["belief_time"]
     t = step_times(t0)
     now = int(datetime.now(timezone.utc).timestamp())
@@ -930,7 +937,8 @@ def page(site: dict, kind: str) -> dict:
     actual = _actual15(site["id"], kind, t0, t1) if kind in PAST_KEYS else None
     out = {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
            "issue": {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version")}, "actual": actual,
-           **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None, "not_applicable": None}
+           **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None, "not_applicable": None,
+           "weather_feed": WEATHER_FEED}
     if kind == "outage":
         # the announced windows over the chart's span, the past 24 hours and the issue's 48, from the schedule in force now (pages-C-19)
         sch = schedule(site["id"])

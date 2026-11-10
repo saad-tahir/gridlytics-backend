@@ -1122,3 +1122,18 @@ def test_the_day_s_band_coverage_and_pinball_loss_are_scored(company):
     assert cal["coverage_80"]["last30"] == 0.0 and cal["coverage_80"]["target"] == 0.8 and cal["coverage_80"]["tolerance"] == 0.05
     assert cal["coverage_90"]["last30"] == 1.0 and cal["coverage_90"]["target"] == 0.9 and cal["pinball"]["n"] == 1
 
+
+# ------------------------------------------------------------------------------------------------ pages-C-09
+
+def test_the_forecast_page_says_there_is_no_weather_feed(company):
+    """Plan 9.3 UI-08 asks for 'the data-provider status'; there is no weather feed yet (FOR-02 waits on the owner's Open-Meteo licence), so every
+    forecast page says so (`weather_feed` false) and the page can tell an operator the PV forecast is the clear sky times a clearness distribution."""
+    sid = "no-weather"
+    site = _pv_site(sid)
+    for kind in ("pv", "load", "outage"):  # before the first issue
+        assert forecast.page(site, kind)["weather_feed"] is False, kind
+    forecast.issue(site, _midnight(date(2026, 11, 9)))
+    for kind in ("pv", "load", "outage"):
+        assert forecast.page(site, kind)["weather_feed"] is False, kind
+    # a kind that does not apply says so too (the page still shows its notice)
+    assert forecast.page({**site, "assets": {}}, "pv")["weather_feed"] is False
