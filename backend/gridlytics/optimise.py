@@ -605,17 +605,22 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             m.row(cols, vals, lb=-inv_ac - float(PV[t]), ub=inv_ac - float(PV[t]), name=f"inverter_ac[{t}]")
     # ---------------------------------------------------------------- MDI
     mdi = p.get("mdi")
-    M_idx = []
+    M_idx, M_lb = [], []
     if mdi and not off_grid and g.sum() > 0:
         n_blk = mdi["n_mdi"]
-        Mv = m.var("M", 1, max(mdi["M0"], mdi["floor"]), np.inf, mdi["rate"])[0]
+        # never under the month's expected peak (mdi_floors; round 7, engine-optimiser-02): at a month's start M0 is near nothing, and M2 was
+        # bounded by the floor alone, so every kW above the floor was priced as a whole month's demand charge
+        lb_M, lb_M2 = mdi_floors(mdi)
+        Mv = m.var("M", 1, lb_M, np.inf, mdi["rate"])[0]
         M_idx.append(Mv)
+        M_lb.append(lb_M)
         M2 = None
         blocks = (np.asarray(p["ts"]) // (n_blk * 900)).astype(np.int64)
         month_end = mdi.get("month_end_step", T)
         if month_end < T:
-            M2 = m.var("M2", 1, mdi["floor"], np.inf, mdi["rate"])[0]
+            M2 = m.var("M2", 1, lb_M2, np.inf, mdi["rate"])[0]
             M_idx.append(M2)
+            M_lb.append(lb_M2)
         extra = np.where(g > 0.5, np.maximum(0.0, Lhi - L), 0.0)
         for bid in np.unique(blocks):
             steps = np.where(blocks == bid)[0]
@@ -706,6 +711,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     out["r_gap_price"] = dict(r_gap_price) if bat else {}
     out["manual_floor"] = dict(rm_floor)
     out["M"] = [float(x[i]) for i in M_idx]
+    out["M_lb"] = list(M_lb)  # each peak's lower bound: the month so far, the floor and the expected month peak (mdi_floors)
     out["v_end"] = v_end if bat else 0.0
     # the energy the terminal value credits (the next peak's use, above the grid-up floor and under its cap), and that floor in kWh
     out["E_use"] = float(x[E_use]) if bat else 0.0
@@ -960,6 +966,14 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
     amf = bool(gen and gen.get("control") == "auto_on_grid_loss")
     margin = 2 * float(bat.get("sigma0", 0.0)) * En if bat else 0.0   # every reserve row's widening for the SoC estimate (Part 4.3)
     tol = 0.02 * En
+    Ms = out.get("M") or []
+    month_end = int((p.get("mdi") or {}).get("month_end_step", T))
+
+    def cap_at(t: int) -> float | None:
+        """The MDI cap step t is held under: the billing month's peak M, or M2 in the next month (round 7, engine-optimiser-02)."""
+        if not Ms:
+            return None
+        return float(Ms[1] if (t >= month_end and len(Ms) > 1) else Ms[0])
 
     def binds(k: int) -> bool:
         """The reserve row of step k holds the battery: its energy after the step is at or under the reserve it asks for."""
@@ -1077,9 +1091,9 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
                 d = {"rs_per_kwh": round(float(p["c_imp"][t]), 2)}
             elif icp.get(per, {}).get("case") == "above":
                 r = "icp_flat_price"
-            elif p.get("mdi") and G > 0.8 * (out["M"][0] if out.get("M") else 1e9):
+            elif p.get("mdi") and G > 0.8 * (cap_at(t) or 1e9):
                 r = "mdi_cap"
-                d = {"kw": round(out["M"][0], 1)}
+                d = {"kw": round(cap_at(t), 1)}
             else:
                 r = "self_consumption"
         elif C > 0.1:
@@ -1260,6 +1274,14 @@ def shorten(p: dict, T: int) -> dict:
         md["month_end_step"] = min(md.get("month_end_step", T), T)
         q["mdi"] = md
     return q
+
+
+def mdi_floors(mdi: dict) -> tuple[float, float]:
+    """The lower bounds of the billing month's peak M and of the next month's M2 (kW): the floor, the month's expected peak (`M_exp`,
+    plans.month_to_date: the rest of the month almost surely reaches it, so a kW under it costs nothing; round 7, engine-optimiser-02) and, for
+    M, the month's peak so far."""
+    exp = float(mdi.get("M_exp") or 0.0)
+    return max(float(mdi["M0"]), float(mdi["floor"]), exp), max(float(mdi["floor"]), exp)
 
 
 def wear_cost(battery: dict) -> float:

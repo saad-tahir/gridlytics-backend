@@ -1162,3 +1162,94 @@ def test_month_to_date_reads_missing_minutes_as_unknown_not_zero(company):
     assert total == pytest.approx((t0 - ms) / 3600 * 100.0 + extra, rel=0.002)  # before: a whole day (2,400 kWh) and the gaps short
     # the open block (10:00-10:15, its last 5 minutes missing): the mean of the 10 minutes known, not 2/3 of it
     assert m["n_elapsed"] == 1 and m["G_elapsed"] == pytest.approx(100.0)
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-02, engine-plans-live-07
+
+def _month_end(p, end=48, M0=100.0, floor=50.0, M_exp=None):
+    """The MDI month ends at step `end`: M covers the steps before it, M2 the new month's after it (floor 50 kW, Rs 1,250 per kW)."""
+    p["mdi"] = {"rate": 1250.0, "M0": M0, "floor": floor, "n_mdi": 2, "G_elapsed": 0.0, "n_elapsed": 0, "month_end_step": end}
+    if M_exp is not None:
+        p["mdi"]["M_exp"] = M_exp
+    return p
+
+
+def test_a_new_months_steps_are_free_up_to_the_expected_month_peak_and_the_battery_is_kept_for_the_peak():
+    """The mall's plan made on 30 Oct: M2 (the new month's peak) was bounded only by the 25 % floor, so every kW above it on 1 Nov was priced as
+    a whole month's demand charge, and the plan drained the battery off-peak from 95 % to 10 % to hold 1 Nov's blocks at the floor, leaving
+    nothing for the evening peak. The month will reach its expected peak anyway (the second-highest day's peak of the last seven), so a kW
+    under it costs nothing: M and M2 are bounded below by it, and the battery discharges in the peak window."""
+    p = _month_end(_problem(), M_exp=120.0)
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    D = np.asarray(r["sol"]["D"])
+    pk = np.asarray(p["peak"], dtype=bool)
+    new_off_peak = (np.arange(96) >= 48) & ~pk
+    assert float(np.sum(D[new_off_peak])) * H < 1e-3                  # before: about 70 kWh discharged off-peak on the new month's first morning
+    assert float(np.sum(D[pk])) * H > 50.0
+    assert r["M"] == [pytest.approx(120.0), pytest.approx(120.0)]
+    # where the expected peak is under the month so far, the month so far bounds M, and the expected peak M2
+    q = optimise.solve(_month_end(_problem(), M0=150.0, M_exp=120.0))
+    assert q["M"] == [pytest.approx(150.0), pytest.approx(120.0)]
+
+
+def test_month_to_date_gives_the_expected_month_peak_from_the_last_seven_days(company):
+    """At a month's start M0 is near nothing (Karachi's plans of 1 Nov held 797 kW on a Sunday, then the weekdays reached 902 kW, above
+    October's 861). The expected month peak is the second-highest day's peak of the seven days before (one odd day does not set it); it bounds
+    the plan's M and M2 from below, and once the seven days lie inside the month the month so far covers it."""
+    sid = _site()
+    conn = sites.full(sid)["connections"][0]
+    t0 = twin.day_start_utc(date(2026, 11, 3)) + 10 * 3600 + 15 * 60     # 10:15 on 3 Nov
+    peaks = {date(2026, 10, 28): 500.0, date(2026, 10, 30): 480.0, date(2026, 11, 2): 300.0}
+    blocks = {twin.day_start_utc(d) + 10 * 3600: kw for d, kw in peaks.items()}
+
+    def kw(t):
+        b = t // 1800 * 1800
+        return blocks.get(b, 100.0)
+
+    _import_minutes(sid, t0 - 8 * 86400, t0, kw)
+    m = plans.month_to_date(sid, conn, t0)
+    assert m["M0"] == pytest.approx(300.0)
+    assert m["M_exp"] == pytest.approx(480.0)
+    full = sites.full(sid)
+    p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 96)
+    assert p["mdi"]["M_exp"] == pytest.approx(480.0)
+    assert optimise.mdi_floors(p["mdi"]) == (pytest.approx(480.0), pytest.approx(480.0))
+    # a week later the seven days are inside the month: the month so far (500 kW on the 5th) covers them
+    later = t0 + 7 * 86400
+    blocks[twin.day_start_utc(date(2026, 11, 5)) + 10 * 3600] = 500.0
+    _import_minutes(sid, t0, later, kw)
+    m = plans.month_to_date(sid, conn, later)
+    assert m["M_exp"] <= m["M0"] and m["M0"] == pytest.approx(500.0)
+
+
+def test_slots_in_the_next_billing_month_carry_its_own_cap(company, monkeypatch):
+    """plans.tick compiled every slot with M, the month ending's cap, so the new month's slots shaved to the old month's peak. A horizon that
+    crosses the month's end compiles the new month's days with M2's cap, and the summary gives it."""
+    from gridlytics import delivery
+    sid = _site()
+    t0 = twin.day_start_utc(date(2026, 10, 31)) + 10 * 3600             # 10:00 on 31 Oct: 14 hours of October, then November
+    hot = twin.day_start_utc(date(2026, 10, 30)) + 10 * 3600            # October's peak, 400 kW, on the 30th; 150 kW otherwise
+    _import_minutes(sid, t0 - 8 * 86400, t0, lambda t: 400.0 if hot <= t < hot + 1800 else 150.0)
+    seen = []
+    real = delivery.compile_mode_a
+
+    def spy(steps, brand, battery, fallback, bms_low=10.0, mdi_cap_kw=None):
+        seen.append(({plans._local(s["t"]).date() for s in steps}, mdi_cap_kw))
+        return real(steps, brand, battery, fallback, bms_low, mdi_cap_kw)
+
+    monkeypatch.setattr(delivery, "compile_mode_a", spy)
+    out = plans.tick(sid, at=t0, save=False)
+    assert out["status"] in ("active", "held")
+    M, M2 = out["summary"]["mdi_cap_kw"], out["summary"]["mdi_cap_next_kw"]
+    assert M >= 400.0 - 0.1 and M2 is not None and M2 < M - 100.0
+    assert len(seen) == 2
+    (before, cap1), (after, cap2) = seen
+    assert before == {date(2026, 10, 31)} and cap1 == pytest.approx(M, abs=0.1)
+    assert min(after) == date(2026, 11, 1) and cap2 == pytest.approx(M2, abs=0.1)
+    # and the compiled days are those of both calls, in order
+    assert [d["date"] for d in out["slots"]["days"]] == ["2026-10-31", "2026-11-01", "2026-11-02"]
+    for d in out["slots"]["days"][1:]:
+        for s in d["slots"]:
+            if s["mode"].startswith("charge"):
+                assert s["grid_cap_w"] == round(cap2 * 1000)

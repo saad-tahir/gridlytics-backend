@@ -98,11 +98,23 @@ def month_to_date(site_id: str, conn: dict | None, t0: int) -> dict:
 
     _, means = block_means(in_month)
     m0 = float(means.max()) if len(means) else 0.0
+    # the month's expected peak (round 7, engine-optimiser-02, engine-plans-live-07): the second-highest local day's peak of the seven days
+    # before t0, so one odd day does not set it. At a month's start M0 is near nothing, and every kW above the floor was priced as a whole
+    # month's demand charge: the plan drained the battery off-peak on the 1st to hold a peak the month's weekdays then passed anyway (Karachi:
+    # 797 kW on Sunday 1 Nov, 902 kW by the 4th). The rest of a month almost surely reaches the peak of the second-busiest of its last seven
+    # days, so a kW under it costs nothing; it bounds M (and M2, the next month's peak) from below. Once the seven days lie inside the month,
+    # the month so far covers it
+    starts, wk_means = block_means(week)
+    m_exp = 0.0
+    if len(starts):
+        days = (starts + 5 * 3600) // 86400
+        day_peaks = np.sort(np.array([float(wk_means[days == d].max()) for d in np.unique(days)]))[::-1]
+        m_exp = float(day_peaks[1]) if len(day_peaks) >= 2 else 0.0
     blk_start = t0 // (interval * 60) * (interval * 60)
     el_known = k_imp & (g["ts"] >= blk_start)
     n_el_steps = (t0 - blk_start) // 900
     g_el = float(imp[el_known].mean()) if el_known.any() else 0.0
-    return {"mtd": mtd, "per_day": per_day, "M0": m0, "G_elapsed": g_el, "n_elapsed": int(n_el_steps), "mtd_export": mtd_exp,
+    return {"mtd": mtd, "per_day": per_day, "M0": m0, "M_exp": m_exp, "G_elapsed": g_el, "n_elapsed": int(n_el_steps), "mtd_export": mtd_exp,
             "per_day_export": per_day_exp, "period_start": ms, "period_end": me}
 
 
@@ -244,7 +256,9 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     if vec["mdi"] and mtd:
         month_end = int(vec["billing_month_end_step"]) if "billing_month_end_step" in vec else (int(np.argmin(in_month)) if not in_month.all() else steps)
         p["mdi"] = {"rate": vec["mdi"]["rate_rs_per_kw"], "M0": mtd["M0"], "floor": vec["mdi"]["floor_kw"], "n_mdi": vec["mdi"]["interval_steps"],
-                    "G_elapsed": mtd["G_elapsed"], "n_elapsed": mtd["n_elapsed"], "month_end_step": month_end}
+                    "G_elapsed": mtd["G_elapsed"], "n_elapsed": mtd["n_elapsed"], "month_end_step": month_end,
+                    # the month's expected peak (month_to_date): M and M2 are never bounded under it (round 7, engine-optimiser-02)
+                    "M_exp": mtd.get("M_exp", 0.0)}
     # overrides as bounds (Part 4.8)
     ovs = sites.overrides(site["id"])
     mask = {k: np.zeros(steps, dtype=bool) for k in ("genset_hold", "charge_block", "reserve", "pause_control", "force_native", "force_charge")}
@@ -529,11 +543,21 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                 sites.put_state(site_id, active_plan=None, last_tick=_iso(t0))
         return {"status": "failed", "reason": reason, "control_release": release}
     steps_out = _steps_out(p, res, bundle)
-    # the slots' floors are max(bms_low + 2, fallback floor): delivered_floor_pct, the floor the plan held on its grid-up steps
-    compiled = delivery.compile_mode_a(steps_out, brand, p.get("battery"), fallback_floor_pct(site), bms_low_pct(site),
-                                       res["M"][0] if res.get("M") else None)
+    # the slots' floors are max(bms_low + 2, fallback floor): delivered_floor_pct, the floor the plan held on its grid-up steps. A horizon that
+    # crosses the billing month's end compiles the new month's days with its own cap, M2 (round 7, engine-optimiser-02: every slot carried M,
+    # so the new month's shaved to the old month's peak). The month ends at a local midnight and slots are per local day, so the two compiles
+    # give the days a single one would, each with its month's cap
+    Ms = res.get("M") or []
+    split = int((p.get("mdi") or {}).get("month_end_step", p["T"])) if len(Ms) > 1 else p["T"]
+    compiled = delivery.compile_mode_a(steps_out[:split], brand, p.get("battery"), fallback_floor_pct(site), bms_low_pct(site),
+                                       Ms[0] if Ms else None)
+    if split < len(steps_out):
+        nxt = delivery.compile_mode_a(steps_out[split:], brand, p.get("battery"), fallback_floor_pct(site), bms_low_pct(site), Ms[1])
+        compiled = {**compiled, "days": compiled["days"] + nxt["days"]}
     guard = _guard(site, p, compiled, steps_out)
-    summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(res["M"][0], 1) if res.get("M") else None,
+    summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(Ms[0], 1) if Ms else None,
+                    # the next billing month's cap where the horizon crosses into it (its days' slots carry it), else null
+                    "mdi_cap_next_kw": round(Ms[1], 1) if len(Ms) > 1 else None,
                     "v_end": round(res.get("v_end", 0.0), 2), "guard": guard})
     # a pause or a release to native means no plan is in force: the plan is kept for reading, held, and the previous one stops being active
     # (so nothing stale is served or keyed in when the pause ends; the next tick publishes a fresh plan)
