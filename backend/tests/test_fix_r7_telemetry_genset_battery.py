@@ -24,7 +24,8 @@ named by its source, the estimate or the BMS, and the outages for the chart (pag
 Batch 5, the telemetry file's cost: a read takes a deferred (read) transaction, never the write lock, so readers neither wait for a writer nor make one
 wait, and the export formats its CSV outside any transaction (performance-live-03, and its duplicate tests-and-perf-04); a chart series never answers
 more than SERIES_MAX_POINTS (2,000) points, an explicit resolution that would is coarsened for every role, and the automatic one is the finest within the
-cap (tests-and-perf-05, and its duplicate performance-live-13).
+cap (tests-and-perf-05, and its duplicate performance-live-13); a CSV upload is parsed once, in one streamed pass into columns, with memory a small multiple
+of the file, and written one Karachi day per transaction (performance-live-04, and its duplicate tests-and-perf-23).
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -668,10 +669,10 @@ def test_day_first_dates_and_unreadable_times_are_refused_with_the_formats_read(
         telemetry.import_csv(sid, _file(("ts", "grid_present"), [("yesterday", 1), ("today", 1)]), 5, now=NOW)
     msg = str(e.value)
     assert "'yesterday'" in msg and "ISO 8601" in msg and "epoch seconds" in msg, msg
-    # the upload's own window check reads epoch times as the import does: a 1970 epoch row is refused before anything is read
-    from gridlytics import routes_telemetry
+    # the upload's window check (the import's own since performance-live-04) reads epoch times as times: a 1970 epoch row is refused, nothing stored
     with pytest.raises(ValueError, match="before 2015"):
-        routes_telemetry._upload_window(_file(("ts", "grid_present"), [(60, 1), (T0, 1)]), 5)
+        telemetry.import_csv(sid, _file(("ts", "grid_present"), [(60, 1), (T0, 1)]), 5, now=NOW)
+    assert telemetry.latest(sid) is None
 
 
 def test_a_file_over_the_upload_cap_is_told_the_importer_s_sentence(world):
@@ -779,10 +780,9 @@ def test_a_semicolon_file_with_decimal_commas_is_read(company):
     assert np.all(d["load_power_w"] == 40000.5) and np.all(d["pv_power_w"] == 1500.25)
     g = telemetry.guess_mapping(body.decode())
     assert (g["delimiter"], g["decimal"]) == (";", ",")
-    # the upload's window check splits the header the same way: a semicolon file dated 1971 is refused there
-    from gridlytics import routes_telemetry
+    # the window check splits the header the same way: a semicolon file dated 1971 is refused
     with pytest.raises(ValueError, match="before 2015"):
-        routes_telemetry._upload_window(b"ts;grid_present\n1971-01-02T00:00:00;1\n", 5)
+        telemetry.import_csv(_site("Semicolon 1971"), b"ts;grid_present\n1971-01-02T00:00:00;1\n", 5, now=NOW)
 
 
 def test_two_columns_read_as_one_key_are_refused(company):
@@ -1070,3 +1070,84 @@ def test_an_explicit_resolution_past_the_cap_is_coarsened_for_every_role(world):
         assert len(body["ts"]) <= 2000
     r = viewer.get(f"/api/sites/{sid}/telemetry", params={"res": "10s"})
     assert r.status_code == 422 and "5m" in r.json()["detail"]
+
+
+# ------------------------------------------------------------------------------------------------ performance-live-04: one streamed parse, day-sized writes
+
+_LOGGER = ("ts", "grid_present", "grid_power_w", "grid_import_wh", "grid_export_wh", "grid_voltage_v", "pv_power_w", "load_power_w", "battery_power_w",
+           "battery_voltage_v", "battery_current_a", "battery_temp_c", "battery_soc_bms_pct", "genset_running", "genset_power_w", "genset_fuel_l",
+           "inverter_mode_active")
+
+
+def _logger_file(t0: int, n: int) -> bytes:
+    """A 1-minute logger's export of n rows from t0 (Karachi time, no offset), every key a CSV may carry, about 100 bytes a row; PV from 06:00 to
+    18:00."""
+    def pv(t: int) -> float:
+        return 15000.25 if 6 <= datetime.fromtimestamp(t, PKT).hour < 18 else 0
+    return _file(_LOGGER, [(_local(t), 1, 1234.5, 20.6, 0, 231.2, pv(t), 40000.5, -2000.5, 51.2, -40.1, 31.5, 65.5, 0, 0, 0, "self_use")
+                           for t in range(t0, t0 + 60 * n, 60)])
+
+
+def test_an_upload_is_parsed_once(world, monkeypatch):
+    """The route parsed every row for its date window, then import_csv parsed them all again. Each row's time is read once now: the window is the
+    import's own check (before anything is stored), and the route reads only the header, for a column named twice."""
+    c = world.owner
+    sid = c.post("/api/sites", json={"name": "Parsed once"}).json()["id"]
+    start = (int(datetime.now(timezone.utc).timestamp()) // 86400 - 2) * 86400
+    calls = []
+    real = telemetry.csv_time
+    monkeypatch.setattr(telemetry, "csv_time", lambda *a, **k: calls.append(1) or real(*a, **k))
+    body = _file(("ts", "grid_present", "load_power_w"), [(datetime.fromtimestamp(start + 60 * i, timezone.utc).isoformat(), 1, 40000) for i in range(90)])
+    r = c.post(f"/api/sites/{sid}/telemetry/upload", content=body, headers={"content-type": "text/csv"}, params={"tz_offset_h": 0})
+    assert r.status_code == 200 and r.json()["rows"] == 90, r.text
+    assert len(calls) == 90
+    # the window is still judged before anything is stored, and a column named twice is still refused by the route
+    old = _file(("ts", "grid_present"), [("1971-01-02T00:00:00", 1), (datetime.fromtimestamp(start, timezone.utc).isoformat(), 1)])
+    r = c.post(f"/api/sites/{sid}/telemetry/upload", content=old, headers={"content-type": "text/csv"})
+    assert r.status_code == 422 and "before 2015" in r.json()["detail"], r.text
+    r = c.post(f"/api/sites/{sid}/telemetry/upload", content=b"ts;grid_present;ts\n2026-11-01T00:00:00;1;2026-11-01T00:00:00\n",
+               headers={"content-type": "text/csv"})
+    assert r.status_code == 422 and "more than once" in r.json()["detail"], r.text
+    r = c.post(f"/api/sites/{sid}/telemetry/upload", content=body, headers={"content-type": "text/csv"}, params={"tz_offset_h": 30})
+    assert r.status_code == 422 and "between -23 and 23" in r.json()["detail"], r.text
+    # a multipart form's file part is cut out once, exactly, with its name, beside another field
+    from gridlytics import routes_telemetry
+    part, name = routes_telemetry._file_part(b"--xx\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nmill\r\n--xx\r\nContent-Disposition: "
+                                             b"form-data; name=\"file\"; filename=\"a.csv\"\r\n\r\nts,grid_present\r\n1,1\r\n\r\n--xx--\r\n", b"xx")
+    assert (part, name) == (b"ts,grid_present\r\n1,1\r\n", "a.csv")
+    assert routes_telemetry._file_part(b"--xx\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nmill\r\n--xx--\r\n", b"xx") == (b"", None)
+    r = c.post(f"/api/sites/{sid}/telemetry/upload", files={"file": ("logger.csv", body, "text/csv")}, data={"note": "mill"})
+    assert r.status_code == 200 and (r.json()["rows"], r.json()["overlap"], r.json()["file_name"]) == (90, 90, "logger.csv"), r.text
+
+
+def test_an_upload_s_memory_is_a_small_multiple_of_the_file(company):
+    """The audit's 23.5 MB file raised the API's memory by 544 MB (23 times the file): the text decoded twice, a dict per row, then a tuple per row for
+    one write. The rows are now read in one streamed pass into a column of numbers per key, so the import's peak allocation stays within six times the
+    file (it was 24 times)."""
+    import tracemalloc
+    sid = _site("Memory")
+    body = _logger_file(T0, 20000)
+    tracemalloc.start()
+    try:
+        res = telemetry.import_csv(sid, body, 5, now=T0 + 20 * 86400)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert res["rows"] == 20000 and res["minutes"] == 20000 and res["status"] == "done", res["warnings"]
+    assert peak < 6 * len(body), f"peak {peak / 1e6:.1f} MB for a {len(body) / 1e6:.1f} MB file ({peak / len(body):.1f} times)"
+    d = telemetry.raw(sid, T0, T0 + 3600, ("load_power_w", "grid_import_wh", "inverter_mode_active"))
+    assert np.all(d["load_power_w"] == 40000.5) and np.all(d["grid_import_wh"] == 20.6) and d["inverter_mode_active"][0] == "self_use"
+
+
+def test_an_upload_is_written_one_karachi_day_per_transaction(company, monkeypatch):
+    """The whole file went in one executemany under one BEGIN IMMEDIATE, so every reader and edge batch of the company waited for all of it. Each
+    Karachi day's minutes are now one write transaction, at most 1,440 rows, the day aggregated after it."""
+    sid = _site("Days")
+    seen = _traced(monkeypatch)
+    res = telemetry.import_csv(sid, _logger_file(T0 + 12 * 3600, 2 * 1440), 5, now=NOW)  # noon on 5 Nov to noon on 7 Nov: three Karachi days
+    assert res["minutes"] == 2 * 1440
+    writes = [sum(1 for x in run if x.startswith("INSERT INTO minute")) for _, run in seen if any(x.startswith("BEGIN IMMEDIATE") for x in run)]
+    writes = [n for n in writes if n]
+    assert writes == [720, 1440, 720], writes
+    for day, n in (("2026-11-05", 720), ("2026-11-06", 1440), ("2026-11-07", 720)):
+        assert _day(sid, day)["completeness"] == round(n / 1440, 4), day

@@ -60,63 +60,18 @@ def quality(site_id: str, days: int = 14):
     return {"days": rows, "first_data": first, "imports": imports}
 
 
-#: An upload's rows must lie between this day and a day from now, and one file may span at most UPLOAD_MAX_DAYS: the import aggregates every day it covers,
-#: so a row dated 1970 or 9999 (a logger with an unset clock, or a crafted file) would otherwise hold a worker for hours (plan Part 2.8: uploaded CSV is
-#: untrusted input, parsed with size and time caps)
-UPLOAD_EARLIEST = datetime(2015, 1, 1, tzinfo=timezone.utc)
-UPLOAD_MAX_DAYS = 400
-
-
-def _upload_window(content: bytes, tz_offset_h: float, ts_format: str = "auto", mapping: dict | None = None) -> None:
-    """Refuses (ValueError, in words) a file whose header names a column twice, a file with a row before 2015, a row more than a day ahead, or rows
-    spanning more than UPLOAD_MAX_DAYS. Reads only the ts column, as the import reads it; rows whose ts does not parse are left to the import, which skips
-    them. The import reads rows by column name and keeps the last of two columns with one name, so a repeated name is refused outright: this check and
-    the import then always read the same ts column."""
+def _upload_head(content: bytes) -> None:
+    """Refuses (ValueError, in words) a file whose header names a column twice: the import reads a repeated name's last column, which the person
+    uploading would not expect. Only the header is read (audit R7 performance-live-04: the route parsed every row for the date window and the import
+    parsed them all again). The rows' window (2015 to a day from now, at most telemetry.UPLOAD_MAX_DAYS: plan Part 2.8, uploaded CSV is untrusted input
+    parsed with size and time caps) is telemetry.import_csv's, judged from the rows it parses once, before it stores anything."""
     import csv
     import io
-    text = content.decode("utf-8-sig", errors="replace")
-    # the file's own separator and the column the mapping reads as ts, as the import reads them (flow-telemetry-plan-control-12)
-    reader = csv.reader(io.StringIO(text), delimiter=telemetry._dialect(text)[0])
-    head = next(reader, None) or []
-    twice = sorted({h for h in head if h.strip() and head.count(h) > 1})
+    head = content[:65536].decode("utf-8-sig", errors="replace")
+    row = next(csv.reader(io.StringIO(head), delimiter=telemetry._dialect(head)[0]), None) or []
+    twice = sorted({h for h in row if h.strip() and row.count(h) > 1})
     if twice:
         raise ValueError(f"The header names {', '.join(twice[:5])} more than once: give each column once and upload again")
-    ts_name = telemetry.ts_column(head, mapping)
-    if ts_name is None:
-        return
-    col = head.index(ts_name)
-    try:
-        timezone(timedelta(hours=tz_offset_h))
-    except (ValueError, OverflowError):
-        raise ValueError("The timezone offset is hours from UTC, between -23 and 23") from None
-    earliest = int(UPLOAD_EARLIEST.timestamp())
-    latest = int((datetime.now(timezone.utc) + timedelta(days=1)).timestamp())
-    first = last = None
-    early = late = 0
-    for row in reader:
-        cell = (row[col] if col < len(row) else "") or ""
-        try:
-            # read as the import reads it (telemetry.csv_time: ISO 8601 or epoch seconds), so an epoch row dated 1970 is refused here too
-            t = telemetry.csv_time(cell, tz_offset_h, ts_format)
-        except OverflowError:                       # a time at the very edge of the calendar
-            early += 1
-            continue
-        if t is None:
-            continue
-        if t < earliest:
-            early += 1
-            continue
-        if t > latest:
-            late += 1
-            continue
-        first = t if first is None or t < first else first
-        last = t if last is None or t > last else last
-    if early or late:
-        raise ValueError(f"{early + late} row{'s are' if early + late != 1 else ' is'} dated "
-                         + ("before 2015" if early and not late else "in the future" if late and not early else "before 2015 or in the future")
-                         + ": check the logger's clock (and the timezone) and upload again")
-    if first is not None and (last - first) // 86400 > UPLOAD_MAX_DAYS:
-        raise ValueError(f"The file spans {(last - first) // 86400} days; upload at most {UPLOAD_MAX_DAYS} days per file")
 
 
 def _takes_file_name() -> bool:
@@ -128,7 +83,7 @@ def _takes_file_name() -> bool:
 
 def _import(site_id: str, body: bytes, tz_offset_h: float, file_name: str | None = None, mapping: dict | None = None) -> dict:
     m = telemetry.mapping_of(mapping) if mapping else None
-    _upload_window(body, tz_offset_h, m["ts_format"] if m else "auto", m)
+    _upload_head(body)
     extra = {"mapping": m} if m else {}
     try:
         # the uploaded file's name goes with the import (the quality page's imports rows) where telemetry.import_csv takes it
@@ -150,6 +105,23 @@ def _clean_file_name(name) -> str | None:
     return name[:FILE_NAME_MAX] or None
 
 
+def _file_part(body: bytes, boundary: bytes) -> tuple[bytes, str | None]:
+    """A multipart body's file part (the first part whose headers name a filename) and that name, copying the file once: the body was split into
+    copies of every part before (performance-live-04). (b"", None) when no part carries a file."""
+    sep = b"--" + boundary
+    i = body.find(sep)
+    while i != -1:
+        j = body.find(sep, i + len(sep))
+        end = len(body) if j == -1 else j
+        head_end = body.find(b"\r\n\r\n", i, end)
+        if head_end != -1 and b"filename=" in body[i:head_end]:
+            m = re.search(rb'filename="([^"]*)"', body[i:head_end])
+            stop = body.rfind(b"\r\n", head_end + 4, end)  # the line break before the next boundary belongs to the multipart framing
+            return body[head_end + 4:stop if stop != -1 else end], (m.group(1).decode("utf-8", errors="replace") if m else None)
+        i = j
+    return b"", None
+
+
 @router.post("/api/sites/{site_id}/telemetry/upload")
 async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0, file_name: str | None = None, mapping: str | None = None):
     """A CSV upload: the file as the request body (its name in `file_name`), or as the file part of a multipart form (its name from the part). With
@@ -166,13 +138,8 @@ async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0, file_
     body = await request.body()
     ctype = request.headers.get("content-type", "")
     if ctype.startswith("multipart/form-data"):
-        boundary = ctype.split("boundary=")[-1].strip().strip('"').encode()
-        parts = body.split(b"--" + boundary)
-        part = next((p.split(b"\r\n\r\n", 1) for p in parts if b"\r\n\r\n" in p and b"filename=" in p.split(b"\r\n\r\n", 1)[0]), None)
-        body = part[1].rsplit(b"\r\n", 1)[0] if part else b""
-        if part and not file_name:
-            m = re.search(rb'filename="([^"]*)"', part[0])
-            file_name = m.group(1).decode("utf-8", errors="replace") if m else None
+        body, part_name = _file_part(body, ctype.split("boundary=")[-1].strip().strip('"').encode())
+        file_name = file_name or part_name
     if not body:
         raise Refusal(422, "Send the CSV file as the request body", "invalid")
     file_name = _clean_file_name(file_name)
