@@ -1190,3 +1190,21 @@ def test_the_forecast_page_says_there_is_no_weather_feed(company):
         assert forecast.page(site, kind)["weather_feed"] is False, kind
     # a kind that does not apply says so too (the page still shows its notice)
     assert forecast.page({**site, "assets": {}}, "pv")["weather_feed"] is False
+
+
+def test_a_grid_site_whose_connection_is_not_saved_yet_is_not_off_grid_on_the_forecasts():
+    """Integration of fleet-overview and forecasts-outages (audit pages-A-03, role-viewer-09): forecast.off_grid follows routes_sites._off_grid, so
+    only a connection of regime off_grid, a farm or a site whose data says off_grid is off-grid; a grid site with no saved connection is not."""
+    from gridlytics import forecast, routes_sites
+    cases = [
+        ({"data": {"site_type": "industrial_2_shift"}, "connections": []}, False),
+        ({"data": {"site_type": "farm"}, "connections": []}, True),
+        ({"data": {"site_type": "office", "off_grid": True}, "connections": []}, True),
+        ({"data": {"site_type": "office"}, "connections": [{"data": {"regime": "off_grid"}}]}, True),
+        ({"data": {"site_type": "office"}, "connections": [{"data": {"regime": "net_billing"}}]}, False),
+    ]
+    for site, want in cases:
+        assert forecast.off_grid(site) is want, site
+        conn = site["connections"][0] if site["connections"] else None
+        assert routes_sites._off_grid(site, conn) is want, site
+        assert (forecast.not_applicable({**site, "assets": {}}, "outage") == "off_grid") is want

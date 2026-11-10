@@ -64,9 +64,14 @@ def _local_midnight(ts: int) -> int:
 
 
 def off_grid(site: dict) -> bool:
-    """A site without a grid connection (none, or an off-grid regime): its grid always reads 0."""
+    """An off-grid site, its grid always reading 0, by the rule the rest of the app uses (routes_sites._off_grid, tab C and POST /activate): a
+    connection of regime off_grid, or no connection at a farm or at a site whose data says off_grid. A grid site whose connection is not saved yet is
+    not off-grid (audit pages-A-03, role-viewer-09: its Forecasts page must not say so)."""
     conns = site.get("connections") or []
-    return not conns or conns[0]["data"].get("regime") == "off_grid"
+    if conns:
+        return conns[0]["data"].get("regime") == "off_grid"
+    data = site.get("data") or {}
+    return data.get("site_type") == "farm" or bool(data.get("off_grid"))
 
 
 def not_applicable(site: dict, kind: str) -> str | None:
