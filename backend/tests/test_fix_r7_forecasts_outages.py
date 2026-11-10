@@ -907,6 +907,27 @@ def test_an_outage_starting_a_few_minutes_before_an_announced_window_is_that_win
         assert o["cause"] == ("scheduled" if announced else ""), a
 
 
+def test_the_outage_model_leaves_a_window_s_early_start_out_of_the_unscheduled_hazard(company):
+    """Review of role-analyst-15: the model reads an announced window's shedding by the log's rule. 28 days of a LESCO feeder shedding 13:52 to 16:00
+    against its 14:00-16:00 window: no unscheduled start, so the hazard stays on the DISCO's prior (lam_day = 0.35 x 7 / 35) and the windows are kept
+    (36 / 38). A trip 20 minutes before the window, into it, is still a trip. Before the review, the hazard counted each early start as a trip at 13:00
+    (lam_day 0.87, a 128-minute median)."""
+    windows = [["14:00", "16:00", "daily"]]
+    t0 = int(datetime(2026, 11, 9, tzinfo=PKT).timestamp())
+    ts = np.arange(t0 - 28 * 86400, t0, 60, dtype=np.int64)
+    _, minute = _local(ts)
+    for sid, start in (("early-shed", 13 * 60 + 52), ("trip-into", 13 * 60 + 40)):
+        site = _grid_site(sid)
+        _write_grid(sid, ts, np.where((minute >= start) & (minute < 16 * 60), 0.0, 1.0))
+        forecast.set_schedule(sid, windows, "manual", "t")
+        o = forecast.outage(site, t0)
+        assert o["adherence"] == pytest.approx(36 / 38, abs=1e-3)
+        if sid == "early-shed":
+            assert o["lam_day"] == pytest.approx(0.35 * 7 / 35, abs=0.005) and o["median_minutes"] == 75.0
+        else:
+            assert o["lam_day"] == pytest.approx((28 + 0.35 * 7) / 35, abs=0.01) and o["median_minutes"] == 140.0
+
+
 # ------------------------------------------------------------------------------------------------ pages-C-07
 
 def _plan_before(sid: str, step_start: int, reserve_pct: float, p_start: float, modelled: bool = False, n: int = 192) -> None:

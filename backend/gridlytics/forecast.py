@@ -704,8 +704,9 @@ def _outage_events(grid: np.ndarray, ts: np.ndarray, windows: list) -> dict:
     of _outage_runs (the censoring's runs: unknown minutes up to OUTAGE_GAP_MINUTES and grid-up flickers of up to FLICKER_MINUTES samples inside an
     outage continue it), so a lost row is not a restoration and a 5- or 15-minute source's outage is one event; its length runs to its last grid-down
     sample plus the source's interval. A run starting at the grid's first known sample began before it (not a start); one still running at the end
-    (its last sample within OUTAGE_GAP_MINUTES of it) is a start whose length is not known yet. A run starting inside an announced window is
-    scheduled and left out."""
+    (its last sample within OUTAGE_GAP_MINUTES of it) is a start whose length is not known yet. A run of an announced window is scheduled and left
+    out, by the log's rule (in_announced_window): it starts inside a window, or up to ANNOUNCED_EARLY_MIN minutes before one opens and is still down
+    when it does."""
     known = ~np.isnan(grid)
     counts = np.zeros(24)
     durs: list[int] = []
@@ -715,7 +716,7 @@ def _outage_events(grid: np.ndarray, ts: np.ndarray, windows: list) -> dict:
     iv = sample_minutes(known)
     in_win = _window_mask(windows, ts) if windows else np.zeros(len(grid), dtype=bool)
     for s, e in _outage_runs(grid):
-        if s == kidx[0] or in_win[s]:
+        if s == kidx[0] or in_win[s:min(e + iv, s + ANNOUNCED_EARLY_MIN + 1)].any():
             continue
         counts[int(((int(ts[s]) + 5 * 3600) % 86400) // 3600)] += 1
         if not (e == kidx[-1] and len(grid) - 1 - e <= OUTAGE_GAP_MINUTES):
