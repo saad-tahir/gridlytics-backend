@@ -184,8 +184,13 @@ def file_name(r: dict, which: str) -> str:
     return "-".join(x for x in ("gridlytics", slug, kind, str(r.get("period") or "")) if x) + f".{which}"
 
 
+def _folder() -> str:
+    """The company's report folder inside the data folder, as a row keeps it: "reports/<the company file's name>"."""
+    return f"reports/{store.db_path().stem}"
+
+
 def _dir() -> Path:
-    d = platformdb.data_dir() / "reports" / store.db_path().stem
+    d = platformdb.data_dir() / _folder()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -958,17 +963,18 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     if site:
         span = f"For {day_words(p0)}." if kind == "daily_operations" else f"{start:%d %B %Y} to {p1:%d %B %Y}."
         doc.story[sub_at:sub_at] = [Paragraph(_text(f"{span} {_connection_words(site)} {made}"), doc.styles["Normal"]), Spacer(1, 4 * mm)]
-    pdf_path = _dir() / f"{rid}.pdf"
-    csv_path = _dir() / f"{rid}.csv"
+    folder = _dir()
+    pdf_path, csv_path = folder / f"{rid}.pdf", folder / f"{rid}.csv"
     SimpleDocTemplate(str(pdf_path), pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
                       title=title, author="Gridlytics").build(doc.story)
     csv_path.write_text(doc.buf.getvalue(), encoding="utf-8", newline="")  # the csv writer ends rows with CRLF already: no blank line between rows
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()[:16]
     with store.connect() as con:
-        # who generated it, for the list's "By" column (audit pages-D-25)
+        # who generated it, for the list's "By" column (audit pages-D-25); the files by their path inside the data folder, never an absolute one
+        # (audit parity-architecture-11: a moved or restored data folder still serves every stored download)
         con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary, generated_by) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rid, site_id, kind, period, store._now(), h, str(pdf_path), str(csv_path), "done",
-                                                       None if prelim is None else int(prelim), str(by or "")[:120]))
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rid, site_id, kind, period, store._now(), h, f"{_folder()}/{rid}.pdf", f"{_folder()}/{rid}.csv",
+                                                       "done", None if prelim is None else int(prelim), str(by or "")[:120]))
     replaced = _prune(kind, site_id, period)
     store.audit(by, f"generated a {kind.replace('_', ' ')} report", site_id, {"period": period, "report": rid, **({"replaced": replaced} if replaced else {})})
     return get(rid)
@@ -979,9 +985,23 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
 KEEP_COPIES = 3
 
 
-def _stored(path: str) -> Path:
-    """A report file's path as the row keeps it."""
-    return Path(path)
+def _stored(path: str) -> Path | None:
+    """A report file as its row names it, in the data folder as it is at this call (platform.data_dir()). A row keeps the path inside the data folder
+    ("reports/<company>/<id>.pdf"), so a data folder moved to another machine or volume, or a company file restored on another host, still serves every
+    stored download (audit parity-architecture-11: rows kept the absolute path, and every download failed after a move). A row kept before holds the
+    absolute path of the folder it was made in, this machine's or a Windows one's: its last three parts, reports/<company>/<file>, are read in the data
+    folder now. None for a path that leads out of the reports folder, whatever the row says."""
+    text = str(path or "")
+    parts = [x for x in re.split(r"[\\/]+", text) if x]
+    if re.match(r"[\\/]|[A-Za-z]:", text):  # an absolute path, of this system or of Windows
+        if len(parts) < 3 or parts[-3] != "reports":
+            return None
+        parts = parts[-3:]
+    if not parts:
+        return None
+    root = (platformdb.data_dir() / "reports").resolve()
+    full = platformdb.data_dir().joinpath(*parts).resolve()
+    return full if full.is_relative_to(root) and full != root else None
 
 
 def _prune(kind: str, site_id: str, period: str) -> list[str]:
@@ -992,9 +1012,9 @@ def _prune(kind: str, site_id: str, period: str) -> list[str]:
         for r in old:
             con.execute("DELETE FROM reports WHERE id = ?", (r["id"],))
     for r in old:
-        for p in (r["pdf_path"], r["csv_path"]):
-            if p:
-                _stored(p).unlink(missing_ok=True)
+        for p in (_stored(r["pdf_path"]), _stored(r["csv_path"])):
+            if p is not None:
+                p.unlink(missing_ok=True)
     return [r["id"] for r in reversed(old)]
 
 
@@ -1042,4 +1062,4 @@ def file_path(rid: str, which: str) -> Path | None:
     if r is None:
         return None
     p = _stored(r["pdf_path"] if which == "pdf" else r["csv_path"])
-    return p if p.exists() else None
+    return p if p is not None and p.is_file() else None

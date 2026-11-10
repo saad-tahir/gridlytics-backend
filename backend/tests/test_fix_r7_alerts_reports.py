@@ -1113,7 +1113,6 @@ def test_one_person_generates_one_report_at_a_time(world, monkeypatch):
 
 
 def test_only_the_newest_copies_of_a_report_are_kept(world, monkeypatch):
-    from pathlib import Path
     from gridlytics import reports
     sid, month = world.site, _past_month()
     monkeypatch.setattr(reports, "KEEP_COPIES", 2)
@@ -1127,7 +1126,8 @@ def test_only_the_newest_copies_of_a_report_are_kept(world, monkeypatch):
         assert reports.get(other["id"]) is not None and reports.file_path(other["id"], "pdf") is not None
         for old in made[:2]:
             assert reports.get(old["id"]) is None and reports.file_path(old["id"], "pdf") is None
-        files = sorted(p.name for p in Path(paths[made[3]["id"]][0]).parent.iterdir())
+        assert paths[made[3]["id"]][0] == f"reports/{world.db.stem}/{made[3]['id']}.pdf", paths   # inside the data folder (parity-architecture-11)
+        files = sorted(p.name for p in (platformdb.data_dir() / paths[made[3]["id"]][0]).parent.iterdir())
         assert files == sorted(f"{rid}.{ext}" for rid in (made[2]["id"], made[3]["id"], other["id"]) for ext in ("pdf", "csv")), files
         acts = [r["detail"] for r in store.list_audit() if r["action"].startswith("generated a")]
         assert any(d.get("replaced") == [made[1]["id"]] for d in acts), acts
@@ -1510,3 +1510,52 @@ def test_every_bad_rule_is_refused_in_a_sentence_and_nothing_is_stored(world):
     # the editor's own body still saves, every known category included
     r = admin.put("/api/alerts/rules", json={c: {**v, "channels": ["in_app", "sms"]} for c, v in before.items()})
     assert r.status_code == 200 and set(r.json()) == set(alerts.CATEGORIES) and r.json()["Data"]["channels"] == ["in_app", "sms"], r.text
+
+
+# ------------------------------------------------------------------------------------------------ parity-architecture-11
+
+def test_report_files_are_kept_inside_the_data_folder_and_still_served_after_it_moves(world, tmp_path, tmp_path_factory, monkeypatch):
+    """parity-architecture-11: a report row kept its files by absolute path ('/home/.../.scratch/data/reports/<company>/<id>.pdf'), so once the data
+    folder moved to another machine or volume, or a company file was restored on another host, every stored download failed. A row now keeps the
+    path inside the data folder, read through platform.data_dir() at each use; a row kept before still finds its file by its reports/<company>/
+    part (a Windows path included), and a path that leads out of the reports folder is never served."""
+    import shutil
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    a = world.c["admin"]
+    new, old, win = (a.post("/api/reports", json={"kind": kind, "site_id": sid, "period": period}).json()
+                     for kind, period in (("energy_only", month), ("monthly_savings", month), ("daily_operations", datetime.now(PKT).date().isoformat())))
+    stem = world.db.stem
+    with world.use(), store.connect() as con:
+        row = con.execute("SELECT pdf_path, csv_path FROM reports WHERE id = ?", (new["id"],)).fetchone()
+        assert (row["pdf_path"], row["csv_path"]) == (f"reports/{stem}/{new['id']}.pdf", f"reports/{stem}/{new['id']}.csv"), dict(row)
+        # rows kept before this round: the absolute paths of the folder they were made in, on this machine and on the Windows build machine
+        con.execute("UPDATE reports SET pdf_path = ?, csv_path = ? WHERE id = ?",
+                    (f"{tmp_path}/reports/{stem}/{old['id']}.pdf", f"{tmp_path}/reports/{stem}/{old['id']}.csv", old["id"]))
+        con.execute("UPDATE reports SET pdf_path = ?, csv_path = ? WHERE id = ?",
+                    (f"C:\\Users\\builder\\gridlytics-backend\\data\\reports\\{stem}\\{win['id']}.pdf",
+                     f"C:\\Users\\builder\\gridlytics-backend\\data\\reports\\{stem}\\{win['id']}.csv", win["id"]))
+    # the data folder moves: copied to another volume, and the old one is gone
+    moved = tmp_path_factory.mktemp("moved") / "data"
+    shutil.copytree(tmp_path, moved)
+    shutil.rmtree(tmp_path / "reports")
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(moved))
+    monkeypatch.setattr(store, "DB_PATH", moved / "workspace.db")
+    for rid in (new["id"], old["id"], win["id"]):
+        for which in ("pdf", "csv"):
+            r = a.get(f"/api/reports/{rid}/{which}")
+            assert r.status_code == 200, (rid, which, r.text)
+        assert a.get(f"/api/reports/{rid}/pdf").content[:4] == b"%PDF"
+    with store.use_company(platformdb.company_file(world.company)):
+        with store.connect() as con:
+            kept = {r["id"]: r["pdf_path"] for r in con.execute("SELECT id, pdf_path FROM reports")}
+        assert kept[old["id"]].startswith(str(tmp_path)) and kept[win["id"]].startswith("C:\\"), kept     # the old rows were read as they are
+        # a path that leads out of the reports folder is never served, whatever the row says
+        (moved / "outside.pdf").write_bytes(b"%PDF outside")
+        for bad in ("reports/../platform.secret", "reports/../outside.pdf", "../outside.pdf", "/etc/passwd", f"{moved}/outside.pdf",
+                    f"{moved}/reports/../outside.pdf", "", "reports"):
+            with store.connect() as con:
+                con.execute("UPDATE reports SET pdf_path = ? WHERE id = ?", (bad, new["id"]))
+            assert reports.file_path(new["id"], "pdf") is None, bad
+            r = a.get(f"/api/reports/{new['id']}/pdf")
+            assert r.status_code == 404 and "missing" in r.json()["detail"], (bad, r.status_code)
