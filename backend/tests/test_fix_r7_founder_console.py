@@ -340,8 +340,9 @@ def _as(who: dict) -> TestClient:
 
 
 def _person(c, email: str, name: str, cid: str, company_role: str = "member") -> dict:
+    # the person keeps the first password (one_time false), as these tests work with it; a one-time first password is test_fix_r7_auth_security's
     return _ok(c.post("/api/founder/users", json={"email": email, "name": name, "password": f"{name.split()[0].lower()} first password",
-                                                   "company_id": cid, "company_role": company_role}), 201)["user"]
+                                                   "company_id": cid, "company_role": company_role, "one_time": False}), 201)["user"]
 
 
 def _role_on_users(c, user_id: str, cid: str) -> str | None:
