@@ -1808,3 +1808,137 @@ def test_the_derate_and_capacity_drop_alerts_reach_the_site(company):
     with store.connect() as con:
         rules = {r["rule"] for r in con.execute("SELECT rule FROM alerts WHERE site_id = ? AND state = 'open'", (sid,)).fetchall()}
     assert {"battery_derate", "battery_capacity_drop"} <= rules
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-08
+
+REAL_POLICY = optimise.solve_with_policy
+T_LIM = twin.day_start_utc(date(2026, 11, 3)) + 10 * 3600
+
+
+def _far_from_its_bound(monkeypatch, gap=0.3):
+    """Every solve stops at its wall-clock limit with an incumbent `gap` from the solver's bound, as on a loaded machine."""
+    def far(p, time_limit=10.0):
+        r = REAL_POLICY(p, time_limit=time_limit)
+        return {**r, "status": "feasible", "time_limited": True, "mip_gap": gap} if r.get("status") in ("optimal", "feasible") else r
+
+    monkeypatch.setattr(optimise, "solve_with_policy", far)
+
+
+def test_a_time_limited_plan_far_from_its_bound_does_not_replace_the_plan_in_force(company, monkeypatch):
+    """plans.tick published every plan that passed the guard: a 30 % gap replaced an optimal plan made 15 minutes before, and the device's table
+    and the genset requests followed it, so plan quality (money, genset operations) followed the machine's load. Such a plan is now kept for
+    reading, held, while a recent plan solved within 5 % stays in force."""
+    sid = _site()
+    first = plans.tick(sid, at=T_LIM)
+    assert first["status"] == "active"
+    _far_from_its_bound(monkeypatch)
+    second = plans.tick(sid, at=T_LIM + 900)
+    assert second["status"] == "held"
+    assert second["summary"]["time_limit_kept"] == {"plan_id": first["plan_id"], "mip_gap": 0.3, "gap_limit": 0.05}
+    cur = plans.current(sid)
+    assert cur["id"] == first["plan_id"] and cur["latest_attempt"]["reason"] == "time_limited_gap"
+    assert plans.active_at(sid, T_LIM + 1000)["id"] == first["plan_id"]
+    assert sites.state(sid)["active_plan"] == first["plan_id"]
+    # within 5 % of its bound a time-limited plan replaces it
+    _far_from_its_bound(monkeypatch, gap=0.01)
+    third = plans.tick(sid, at=T_LIM + 1800)
+    assert third["status"] == "active" and plans.current(sid)["id"] == third["plan_id"]
+
+
+def test_a_time_limited_plan_far_from_its_bound_is_published_where_nothing_better_alike_and_recent_is_in_force(company, monkeypatch):
+    _far_from_its_bound(monkeypatch)
+    sid = _site()
+    assert plans.tick(sid, at=T_LIM)["status"] == "active"                      # nothing in force
+    assert plans.tick(sid, at=T_LIM + 900)["status"] == "active"                # the plan in force is no better
+    monkeypatch.setattr(optimise, "solve_with_policy", REAL_POLICY)
+    old, moved = _site(), _site()
+    plans.tick(old, at=T_LIM)
+    plans.tick(moved, at=T_LIM)
+    _far_from_its_bound(monkeypatch)
+    assert plans.tick(old, at=T_LIM + 3 * 3600)["status"] == "active"           # made over two hours before
+    sites.add_override(moved, {"kind": "charge_block", "until": "2099-01-01T00:00:00+00:00", "reason": "test"}, "t")
+    assert plans.tick(moved, at=T_LIM + 900)["status"] == "active"              # an override since: the plan in force did not know it
+
+
+def test_a_relaxed_retry_after_a_time_out_does_not_replace_a_recent_plan(company, monkeypatch):
+    from test_fix_r4_optimiser import _first_times_out_without_a_plan
+
+    sid = _site()
+    first = plans.tick(sid, at=T_LIM)
+    _first_times_out_without_a_plan(monkeypatch)
+    r = plans.tick(sid, at=T_LIM + 900)
+    assert r["summary"]["solver"]["first_time_limited"] is True and "relaxed_retry" in r["summary"]["notes"]
+    assert r["status"] == "held" and r["summary"]["time_limit_kept"]["mip_gap"] is None
+    assert plans.current(sid)["id"] == first["plan_id"]
+
+
+def _runs_of(u) -> list[tuple[int, int]]:
+    u, out, t = np.round(np.asarray(u)) > 0.5, [], 0
+    while t < len(u):
+        if u[t]:
+            a = t
+            while t < len(u) and u[t]:
+                t += 1
+            out.append((a, t))
+        else:
+            t += 1
+    return out
+
+
+def test_the_relaxed_retry_keeps_the_gensets_minimum_run_time(monkeypatch):
+    """The relaxed 24-hour retry drops the minimum up and down times (Part 4.5), so it published 15-minute runs, and a manual-start operator was
+    asked for a quarter hour on a set whose minimum run is two hours. Its runs are now held to the set's minimum up and down times and the
+    problem solved again with that schedule fixed (near a linear programme, fast)."""
+    p = _spike_night(UT=8)
+    T = p["T"]
+    loose = optimise.solve(p, relaxed=True)
+    assert any(b - a < 8 and b < T for a, b in _runs_of(loose["sol"]["u"]))     # the relaxed rows run the set a quarter hour
+    real = optimise.solve
+
+    def first_fails(q, time_limit=10.0, gap=1e-3, relaxed=False, shed_rule=False, fix_u=None):
+        if not relaxed:
+            return {"status": "not_solved", "solver_status": 1, "message": "Time limit reached", "relaxed": False, "notes": [], "config_hash": "x",
+                    "time_limited": True, "solve_seconds": 10.0}
+        return real(q, time_limit=time_limit, gap=gap, relaxed=relaxed, shed_rule=shed_rule, fix_u=fix_u)
+
+    monkeypatch.setattr(optimise, "solve", first_fails)
+    r = optimise.solve_with_policy(p)
+    assert r["status"] in ("optimal", "feasible") and r["relaxed"] is True
+    assert "relaxed_retry" in r["notes"] and "min_run_repair" in r["notes"]
+    assert all(b - a >= 8 or b == T for a, b in _runs_of(r["sol"]["u"])), _runs_of(r["sol"]["u"])
+    assert float(r["sol"]["U"].sum()) * H < 1e-6
+    assert r["first_time_limited"] is True and r["time_limited"] is True
+    assert r["solve_seconds"] >= 10.0
+
+
+def test_min_run_schedule_runs_short_runs_on_and_short_stops_through():
+    p = _spike_night(UT=4)
+    p["genset"]["DT"] = 3
+    u = np.zeros(p["T"])
+    u[[0, 10, 11, 12, 13, 15, 16, 17, 18]] = 1                                # a quarter hour, then two runs a 15-minute stop apart
+    out = optimise.min_run_schedule(p, u)
+    assert _runs_of(out) == [(0, 4), (10, 19)]
+    ok = np.zeros(p["T"])
+    ok[4:12] = 1
+    assert optimise.min_run_schedule(p, ok) is None                             # already within both
+    p["genset"]["control"] = "auto_on_grid_loss"
+    assert optimise.min_run_schedule(p, u) is None                              # the panel decides its runs
+
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-19
+
+def test_each_plan_gives_the_share_of_plans_that_stopped_at_their_time_limit_in_the_24_hours_to_it(company, monkeypatch):
+    """plans.time_limited_recent counted the time-limited plans and nothing called it: no route, page or alert said when load degraded the
+    plans. Each plan's summary now carries the count over the 24 hours to it, itself included, which the plan page shows."""
+    sid = _site()
+    first = plans.tick(sid, at=T_LIM)
+    assert first["summary"]["time_limits_24h"] == {"hours": 24.0, "plans": 1, "time_limited": int(first["summary"]["solver"]["time_limited"])}
+    _far_from_its_bound(monkeypatch, gap=0.01)
+    second = plans.tick(sid, at=T_LIM + 900)
+    n = int(first["summary"]["solver"]["time_limited"])
+    assert second["summary"]["time_limits_24h"] == {"hours": 24.0, "plans": 2, "time_limited": n + 1}
+    assert plans.get(sid, second["plan_id"])["summary"]["time_limits_24h"]["time_limited"] == n + 1
+    # a day later the first two are out of the window
+    third = plans.tick(sid, at=T_LIM + 86400 + 1800)
+    assert third["summary"]["time_limits_24h"] == {"hours": 24.0, "plans": 1, "time_limited": 1}

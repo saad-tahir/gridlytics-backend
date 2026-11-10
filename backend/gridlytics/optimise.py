@@ -1235,6 +1235,8 @@ def solve_with_policy(p: dict, time_limit: float = 10.0) -> dict:
         return first
     short = shorten(p, 96)
     second = solve(short, time_limit=time_limit, relaxed=True)
+    if second["status"] != "not_solved":
+        second = _min_run_repair(short, second, time_limit)
     second["retry_of"] = first.get("message", "")
     second["T"] = short["T"]  # the horizon actually solved: the caller rebuilds its steps on shorten(p, T)
     # a first solve that stopped at its limit without a plan is what put the relaxed 24-hour plan in its place, so the plan says so (HANDOFF
@@ -1247,6 +1249,59 @@ def solve_with_policy(p: dict, time_limit: float = 10.0) -> dict:
     if second["status"] != "not_solved":
         second["notes"] = second.get("notes", []) + ["relaxed_retry"]
     return second
+
+
+def min_run_schedule(p: dict, u) -> np.ndarray | None:
+    """The relaxed retry's genset schedule `u` with the set's minimum up and down times put back (round 7, engine-optimiser-08): a run shorter
+    than UT runs on to UT steps (to the horizon's end at most), and a stop shorter than DT between two runs is run through. A run carried from
+    before the horizon keeps the carried rule (Part 4.3: a grid return or a hold may end it). Only where the plan starts the set (a manual
+    start): a panel or a soc_threshold controller decides its own runs. None where nothing changes."""
+    gen = p.get("genset")
+    if not gen or gen.get("control") != "manual":
+        return None
+    T, UT, DT = int(p["T"]), int(gen["UT"]), int(gen["DT"])
+    on = np.round(np.asarray(u, dtype=float)[:T]) > 0.5
+    out = on.copy()
+    t = 0
+    while t < T:
+        if not out[t]:
+            t += 1
+            continue
+        a = t
+        while t < T and out[t]:
+            t += 1
+        if t - a < UT and not (a == 0 and gen.get("u_prev") == 1):
+            out[a:min(T, a + UT)] = True
+            t = min(T, a + UT)
+    t = 0
+    while t < T:
+        if out[t]:
+            t += 1
+            continue
+        b = t
+        while t < T and not out[t]:
+            t += 1
+        if 0 < b and t < T and t - b < DT:
+            out[b:t] = True
+    return None if bool(np.all(out == on)) else out.astype(float)
+
+
+def _min_run_repair(p: dict, res: dict, time_limit: float) -> dict:
+    """The relaxed retry drops the minimum up and down times (Part 4.5) for solve time, so its plan could run a set for a quarter hour, and the
+    genset requests asked a manual-start operator for that (round 7, engine-optimiser-08). Its schedule is held to them (`min_run_schedule`)
+    and the problem solved once more with the genset fixed to it, close to a linear programme; where that finds no plan the relaxed plan stands,
+    noted. Clipped to the problem's own bounds, so a hold or a grid return still ends a run."""
+    fixed = min_run_schedule(p, res["sol"]["u"])
+    if fixed is None:
+        return res
+    rep = solve(p, time_limit=time_limit, relaxed=True, fix_u=fixed)
+    if rep["status"] == "not_solved":
+        res["notes"] = list(res.get("notes", [])) + ["min_run_repair_failed"]
+        return res
+    rep["solve_seconds"] = round(float(res.get("solve_seconds") or 0.0) + float(rep.get("solve_seconds") or 0.0), 3)
+    rep["time_limited"] = bool(res.get("time_limited") or rep.get("time_limited"))
+    rep["notes"] = list(rep.get("notes", [])) + ["min_run_repair"]
+    return rep
 
 
 def manual_floor(p: dict, T: int) -> np.ndarray:

@@ -610,6 +610,46 @@ def _ask_anchor(site: dict, p: dict, t0: int) -> None:
         bat["anchor_by"] = int(by)
 
 
+#: a solve that stopped at its wall-clock limit with a gap to the solver's bound above KEEP_GAP, or an unknown gap (a relaxed retry after a first
+#: solve that found no plan in time), does not replace a plan in force made at most KEEP_MAX_AGE_S before, solved within KEEP_GAP, on the same
+#: observed outage and overrides: it is kept for reading, held with TIME_LIMIT_HELD, and that plan stays in force (round 7, engine-optimiser-08).
+#: The limits are wall-clock time (HANDOFF 8.A.3), so a loaded machine otherwise put a 30 % plan, and the table and genset requests that follow
+#: it, in place of an optimal one made 15 minutes before
+KEEP_GAP = 0.05
+KEEP_MAX_AGE_S = 2 * 3600
+TIME_LIMIT_HELD = "time_limited_gap"
+
+
+def _kept_by_time_limit(site_id: str, res: dict, t0: int, summary: dict) -> dict | None:
+    """`{plan_id, mip_gap, gap_limit}` of the plan in force that a time-limited solve far from its bound leaves in force (see KEEP_GAP), else
+    None: the solve finished or came within KEEP_GAP, nothing is in force, the plan in force is older or itself no closer, or the outage
+    observed or the overrides changed since it was made (it did not plan for them)."""
+    limited = bool(res.get("time_limited", res.get("status") == "feasible")) or bool(res.get("first_time_limited"))
+    gap = None if res.get("first_time_limited") else res.get("mip_gap")
+    if not limited or (gap is not None and float(gap) <= KEEP_GAP):
+        return None
+    prev = current(site_id)
+    if prev is None:
+        return None
+    made, until = _ts(prev.get("belief_time")), _ts(prev.get("valid_until"))
+    if made is None or not 0 <= t0 - made <= KEEP_MAX_AGE_S or until is None or until <= t0:
+        return None
+    ps = prev.get("summary") or {}
+    psv = ps.get("solver") or {}
+    if _plan_time_limited(ps) and (psv.get("first_time_limited") or psv.get("mip_gap") is None or float(psv["mip_gap"]) > KEEP_GAP):
+        return None
+
+    def observed(o):
+        return bool(o), (o or {}).get("since")
+
+    def same(a, b) -> bool:
+        return json.dumps(a or [], sort_keys=True, default=str) == json.dumps(b or [], sort_keys=True, default=str)
+
+    if observed(ps.get("outage_now")) != observed(summary.get("outage_now")) or not same(ps.get("overrides"), summary.get("overrides")):
+        return None
+    return {"plan_id": prev["id"], "mip_gap": gap, "gap_limit": KEEP_GAP}
+
+
 def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = True, time_limit: float = 10.0) -> dict:
     site = sites.full(site_id)
     if site is None:
@@ -661,6 +701,12 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                           "retry_of": res.get("retry_of"), "first_time_limited": res.get("first_time_limited"),
                           "first_solve_seconds": res.get("first_solve_seconds")},
                "horizon_steps": p["T"], "control_release": release}
+    # how many of the plans made in the 24 hours to this one, this one included, stopped at their time limit (round 7, engine-plans-live-19:
+    # time_limited_recent counted them and nothing read it), for the plan page; a failed solve counts as a plan, never as time-limited
+    recent = time_limited_recent(site_id, 24.0, now)
+    solved = res["status"] not in ("not_solved", "refused")
+    summary["time_limits_24h"] = {"hours": 24.0, "plans": recent["plans"] + 1,
+                                  "time_limited": recent["time_limited"] + int(solved and _plan_time_limited(summary))}
     if res["status"] in ("not_solved", "refused"):
         reason = res.get("message", "not solved")
         if save:
@@ -694,9 +740,13 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                     # the next billing month's cap where the horizon crosses into it (its days' slots carry it), else null
                     "mdi_cap_next_kw": round(Ms[1], 1) if len(Ms) > 1 else None,
                     "v_end": round(res.get("v_end", 0.0), 2), "guard": guard})
+    # a time-limited solve far from its bound leaves a recent, closer plan in force (_kept_by_time_limit; round 7, engine-optimiser-08)
+    kept = None if (release or guard) else _kept_by_time_limit(site_id, res, t0, summary)
+    if kept:
+        summary["time_limit_kept"] = kept
     # a pause or a release to native means no plan is in force: the plan is kept for reading, held, and the previous one stops being active
     # (so nothing stale is served or keyed in when the pause ends; the next tick publishes a fresh plan)
-    reason = release["reason"] if release else guard
+    reason = release["reason"] if release else (guard or (TIME_LIMIT_HELD if kept else None))
     status = "held" if reason else "active"
     plan_id = store.new_id()
     if save:
