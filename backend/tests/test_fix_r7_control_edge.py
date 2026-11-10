@@ -1623,3 +1623,38 @@ def test_a_fallback_test_the_edge_does_not_follow_fails_and_says_why():
     assert plans.fallback_test_status(rel, until + 1800)["cause"] == "not_restored"
     assert step({**t, "released_at": None}, "released", until + 301) is None            # a native report long after the release ends is no release
     assert plans.fallback_test_status({**rel, "restored_at": "2026-11-10T14:20:00+00:00"}, until + 9999)["status"] == "passed"
+
+
+# ------------------------------------------------------------------------------------------------ batch 6: security-roles-11
+
+def _key_rows(sid: str) -> list[dict]:
+    with store.connect() as con:
+        return [dict(r) for r in con.execute("SELECT * FROM site_keys WHERE site_id = ? ORDER BY created, key_id", (sid,))]
+
+
+def test_a_new_signing_key_is_made_owner_only_and_a_failed_chmod_cannot_leave_it_open(company, monkeypatch):
+    import os
+    import stat
+    sid = _site(genset=False)
+    opened = []
+    real_open = os.open
+
+    def spy_open(path, flags, mode=0o777, *a, **k):
+        opened.append((str(path), flags, mode))
+        return real_open(path, flags, mode, *a, **k)
+
+    def no_chmod(*a, **k):
+        raise OSError("chmod refused")
+
+    monkeypatch.setattr(delivery.os, "open", spy_open)
+    monkeypatch.setattr(delivery.os, "chmod", no_chmod)
+    old = os.umask(0o022)
+    try:
+        kid = delivery.public_key(sid)["key_id"]
+    finally:
+        os.umask(old)
+    path = delivery._key_dir() / f"{sid}-{kid}.pem"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600              # owner-only from the first byte: never written open and narrowed after
+    made = [o for o in opened if o[0] == str(path)]
+    assert made and made[0][1] & os.O_EXCL and made[0][1] & os.O_CREAT and made[0][2] == 0o600, opened
+    assert stat.S_IMODE(delivery._key_dir().stat().st_mode) & 0o077 == 0     # and the keys folder is the owner's alone

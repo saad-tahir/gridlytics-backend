@@ -244,9 +244,30 @@ def mode_b(steps: list[dict]) -> dict:
 # ------------------------------------------------------------------------------------------------ signing (Ed25519, one key per site)
 
 def _key_dir() -> Path:
-    d = platformdb.data_dir() / "keys" / store.db_path().stem
-    d.mkdir(parents=True, exist_ok=True)
+    """The company's keys folder, <data folder>/keys/<its file's stem>: the owner's alone (0700), as each key in it is (0600; plan Part 2.8)."""
+    root = platformdb.data_dir() / "keys"
+    d = root / store.db_path().stem
+    for folder in (root, d):
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name != "nt" and folder.stat().st_mode & 0o077:
+            try:
+                os.chmod(folder, 0o700)          # a folder made open before round 7
+            except OSError:
+                pass
     return d
+
+
+def _write_key(path: Path, key: Ed25519PrivateKey) -> None:
+    """The private key written owner-only from its first byte (plan Part 2.8: private keys in 0600 files; audit security-roles-11): the file is made
+    with its mode (os.open, O_EXCL: never over a file there), never written open and narrowed after, where a refused chmod would leave it readable."""
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(pem)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
 
 
 def _site_key(site_id: str) -> tuple[str, Ed25519PrivateKey]:
@@ -258,11 +279,7 @@ def _site_key(site_id: str) -> tuple[str, Ed25519PrivateKey]:
     key = Ed25519PrivateKey.generate()
     kid = store.new_id(8)
     path = _key_dir() / f"{site_id}-{kid}.pem"
-    path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    _write_key(path, key)
     pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     with store.connect() as con:
         con.execute("INSERT INTO site_keys (site_id, key_id, public_key, private_path, created) VALUES (?,?,?,?,?)",
