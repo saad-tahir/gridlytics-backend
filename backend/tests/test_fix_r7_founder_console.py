@@ -3,6 +3,7 @@ listed, copied, pruned and restored as one set (workspace, telemetry and signing
 the finding's id is in each test's docstring."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -22,6 +23,8 @@ from fastapi.testclient import TestClient
 import identities
 from gridlytics import backups, delivery, founder, identity, sites, store, store_members, telemetry
 from gridlytics import platform as platformdb
+import test_companies as tc
+from test_companies import data, supa  # noqa: F401  (fixtures: supabase mode with a stand-in rpc/get_my_context)
 from test_founder import (OWNER, PASSWORD, SESSION_SECRET, _audit, _client, _code, _company, _console, _ok, _sentence, clock, fdb)  # noqa: F401  (fixtures)
 
 REPO = Path(__file__).resolve().parents[2]
@@ -578,3 +581,61 @@ def test_the_console_has_no_commercial_plan_and_counts_the_dispatch_plans_of_the
     assert view["activity"]["sites"] == 1 and view["activity"]["plans_30"] == 1
     month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     assert view["activity"]["plans_month"] == int(now - timedelta(minutes=5) >= month)
+
+
+# ================================================================== batch 4 (late): membership states, the owner-applied Supabase mode
+
+
+def test_a_suspended_or_pending_membership_is_told_its_state_and_who_can_change_it(fdb):
+    """parity-supabase-auth-09: a membership the founder suspended, or left pending, was told 'You are not a member of that company in Gridlytics', and a
+    person with only that company 'Your account is not set up for Gridlytics'. The refusal now names the state and who changes it; its code stays, so the
+    page reads the person's companies again as before."""
+    c = _console()
+    nid = _company(c, "Northwind Solar")["company"]["id"]
+    sid = _company(c, "Southwind Energy", owner={"email": "olga@south.test", "name": "Olga Shah", "password": "olga first password"})["company"]["id"]
+    maaz = _person(c, "maaz@meow.test", "Maaz Ali", nid)
+    _ok(c.post(f"/api/founder/users/{maaz['id']}/memberships", json={"company_id": sid, "company_role": "member"}), 201)
+    me = _as(maaz)
+    assert _ok(me.get("/api/platform/org", headers={"X-Gridlytics-Company": sid}))["company"]["id"] == sid
+    for status, said in (("suspended", "is suspended: its owner can ask us to make it active again"),
+                         ("pending", "is not active yet: its owner can ask us to make it active")):
+        _ok(c.patch(f"/api/founder/users/{maaz['id']}/memberships/{sid}", json={"status": status}))
+        r = me.get("/api/platform/org", headers={"X-Gridlytics-Company": sid})
+        assert (r.status_code, r.json()["code"]) == (403, "not_a_member"), r.text
+        assert r.json()["detail"] == f"Your membership of Southwind Energy {said}"
+        # with no company asked for, the one membership still active opens
+        assert _ok(me.get("/api/platform/org"))["company"]["id"] == nid
+    # a company that is not theirs at all is still 'not a member'
+    r = me.get("/api/platform/org", headers={"X-Gridlytics-Company": str(uuid.uuid4())})
+    assert r.json()["detail"] == "You are not a member of that company in Gridlytics; choose one of yours"
+    # with no membership active, the person is told their memberships' states, not that their account is not set up
+    _ok(c.patch(f"/api/founder/users/{maaz['id']}/memberships/{nid}", json={"status": "suspended"}))
+    r = me.get("/api/platform/org")
+    assert (r.status_code, r.json()["code"]) == (403, "no_company"), r.text
+    assert r.json()["detail"] == ("Your membership of Northwind Solar is suspended and your membership of Southwind Energy is not active yet: their owners "
+                                  "can ask us to make them active")
+    _ok(c.patch(f"/api/founder/users/{maaz['id']}/memberships/{sid}", json={"status": "suspended"}))
+    assert me.get("/api/platform/org").json()["detail"] == ("Your memberships of Northwind Solar and Southwind Energy are suspended: their owners can ask us "
+                                                           "to make them active again")
+    # removed, a membership is gone: then the account is not set up
+    for cid in (nid, sid):
+        _ok(c.delete(f"/api/founder/users/{maaz['id']}/memberships/{cid}"))
+    assert me.get("/api/platform/org").json()["detail"] == "Your account is not set up for Gridlytics. Ask us to add you"
+
+
+def test_supabase_mode_names_a_pending_or_suspended_membership_too(supa):
+    """parity-supabase-auth-09, supabase mode: get_my_context gives every membership with its status, so the same sentences are said from the project's
+    context; a company the project has not verified is still 'not a member'."""
+    token = tc._supa_token()
+    assert tc._refused(403, "not_a_member", token, tc.PENDING).detail == ("Your membership of Pending Panels is not active yet: its owner can ask us to make "
+                                                                           "it active")
+    assert tc._refused(403, "not_a_member", token, tc.SUSPENDED).detail == ("Your membership of Suspended Systems is suspended: its owner can ask us to make "
+                                                                             "it active again")
+    assert tc._refused(403, "not_a_member", token, tc.UNVERIFIED).detail == tc.companies.NOT_A_MEMBER
+    # the project's context without a company name: the registry's name is said
+    ctx = copy.deepcopy(tc.FIXTURE)
+    ctx["memberships"] = [{**tc._membership(tc.SUSPENDED, "", status="suspended")}]
+    supa.rpc.answer = ctx
+    supa.clock[0] += 120
+    assert tc._refused(403, "no_company", tc._supa_token()).detail == ("Your membership of Suspended Systems is suspended: its owner can ask us to make it "
+                                                                        "active again")
