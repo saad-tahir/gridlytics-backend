@@ -96,11 +96,11 @@ def switchback_paint(site_id: str, inp: dict = Body(...)):
         raise Refusal(422, "A monitor-tier site only recommends the plan, so no switchback can run there: its saving is the counterfactual's alone",
                       "monitor_tier")
     if req.block_days not in allowed:
-        raise Refusal(422, f"At the {TIER_WORDS.get(tier, tier)} tier each block is {' or '.join(str(n) for n in allowed)} days: the installer changes "
-                           "the table once per switch", "invalid")
+        raise Refusal(422, f"At the {TIER_WORDS.get(tier, tier)} tier each block must be {' or '.join(str(n) for n in allowed)} days long: the "
+                           "installer changes the table once per switch", "invalid")
     start = date.fromisoformat(req.start)
     if start <= today():
-        raise Refusal(422, "The calendar starts after today: no arm is drawn for a day that has begun", "invalid")
+        raise Refusal(422, "The calendar must start after today: no arm is drawn for a day that has begun", "invalid")
     return verify.plan_switchback(site_id, start, req.fortnights, req.block_days, auth.actor())
 
 

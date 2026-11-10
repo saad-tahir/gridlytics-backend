@@ -83,7 +83,7 @@ def _iso_day(v: str | None, what: str) -> str | None:
             raise ValueError
         _date.fromisoformat(v)
     except ValueError:
-        raise ValueError(f"{what} is a date written YYYY-MM-DD") from None
+        raise ValueError(f"{what} must be a real date written YYYY-MM-DD") from None
     return v
 
 
@@ -115,9 +115,9 @@ class PilotClosure(Strict):
     def _span(self):
         n = (_date.fromisoformat(self.end) - _date.fromisoformat(self.start)).days
         if n < 0:
-            raise ValueError("A closure's last day is on or after its first day")
+            raise ValueError("A closure's last day must be on or after its first day")
         if n >= 60:
-            raise ValueError("A closure is at most 60 days")
+            raise ValueError("A closure must be at most 60 days long")
         return self
 
 
@@ -164,5 +164,5 @@ class SwitchbackPaint(Strict):
     @classmethod
     def _length(cls, v):
         if v not in (3, 7):
-            raise ValueError("A block is 3 or 7 days long")
+            raise ValueError("A block must be 3 or 7 days long")
         return v

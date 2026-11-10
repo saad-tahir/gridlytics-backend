@@ -1681,3 +1681,31 @@ def test_the_calendars_enough_check_is_the_rule_the_switchback_result_applies_an
     bad = [{"block_start": "2026-10-01", "block_end": "2026-10-05", "arm": "plan"}, {"block_start": "2026-10-06", "block_end": "2026-10-10", "arm": "native"}]
     length = next(c for c in verify.calendar_checks(bad, "closed_loop", None, date(2026, 8, 1), [], False) if c["id"] == "length")
     assert length == {"id": "length", "ok": False, "lengths": [5], "options": [3, 7]}
+
+
+# ------------------------------------------------------------------------------------------------ review of the package: a refusal says the rule it
+# ------------------------------------------------------------------------------------------------ applies, never a statement the request has just broken
+
+def test_the_pilot_and_calendar_refusals_say_the_rule_and_never_a_false_fact(world):
+    # role-operator-18's wording rule, for the set-up's own refusals: "A closure's last day is on or after its first day" answered a closure whose
+    # last day was before its first, and "The calendar starts after today" a calendar that started today
+    sid, admin, operator = world.site, world.c["admin"], world.c["operator"]
+    today = _pkt_today()
+    day = lambda n: (today + timedelta(days=n)).isoformat()  # noqa: E731
+
+    def refused(r, *words):
+        assert r.status_code == 422, r.text
+        detail = r.json()["detail"]
+        assert all(w in detail for w in words), detail
+        assert " is on or after" not in detail and " starts after today" not in detail and "A block is " not in detail, detail
+
+    refused(admin.put(f"/api/sites/{sid}/pilot", json={"closures": [{"start": day(5), "end": day(3), "label": "Eid"}]}),
+            "must be on or after its first day")
+    refused(admin.put(f"/api/sites/{sid}/pilot", json={"closures": [{"start": day(1), "end": day(61), "label": "Shutdown"}]}),
+            "must be at most 60 days long")
+    refused(admin.put(f"/api/sites/{sid}/pilot", json={"baseline_start": "2026-02-30"}), "must be a real date written YYYY-MM-DD")
+    _tier(world, sid, "advisory_writes")
+    paint = lambda **kw: operator.put(f"/api/sites/{sid}/switchback", json={"start": day(1), "fortnights": 2, "block_days": 7, **kw})  # noqa: E731
+    refused(paint(start=today.isoformat()), "The calendar must start after today")
+    refused(paint(block_days=5), "A block must be 3 or 7 days long")
+    refused(paint(block_days=3), "each block must be 7 days long")
