@@ -106,9 +106,10 @@ def _mtd_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple[f
 
 
 #: The control states in which a plan is in force at the inverter (R8 2.1's "sites on a plan"), and those that hand the inverter back to its native
-#: settings (a release or a pause: "sites on native mode")
-ON_PLAN = ("following", "hold")
-HANDED_BACK = ("native", "paused")
+#: settings (a release or a pause: "sites on native mode"). control_state is control-edge's: its round-7 keys are named here already, a forced charge
+#: (the plan in force, with the charge in it) and a native block of the switchback calendar (handed back for the day)
+ON_PLAN = ("following", "hold", "force_charge")
+HANDED_BACK = ("native", "paused", "native_block")
 
 
 def fleet_row(s: dict, now: int, counts: dict) -> dict:
@@ -136,7 +137,9 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
             # R8 2.1's summary and filters (audit pages-A-17): a plan in force at the inverter (following it or holding; not a monitor site's
             # recommendation, a table not confirmed today, a release, a pause or an offline edge), and a genset on site. control_state names a hold
             # before the tier, so the tier is read here too: a hold at the monitor tier reaches no inverter
-            "on_plan": plan is not None and control["key"] in ON_PLAN and s["tier"] != "monitor", "has_genset": has_genset}
+            "on_plan": plan is not None and control["key"] in ON_PLAN and s["tier"] != "monitor", "has_genset": has_genset,
+            # handed back to the native settings: the row says so, so the web app counts a fleet's real sites by the summary's own rule (review)
+            "on_native": control["key"] in HANDED_BACK}
 
 
 @router.get("/api/fleet")
@@ -154,7 +157,7 @@ def fleet():
                             "mtd_saving_rs_computed": max(stamps) if stamps else None,
                             "in_outage": sum(1 for r in rows if r["now"] and r["now"]["grid_present"] == 0 and r["category"] != "Off-grid"),
                             "mtd_peak_kwh_avoided": total("mtd_peak_kwh_avoided"), "mtd_litres_saved": total("mtd_litres_saved"),
-                            "on_plan": sum(1 for r in rows if r["on_plan"]), "on_native": sum(1 for r in rows if r["control"]["key"] in HANDED_BACK)},
+                            "on_plan": sum(1 for r in rows if r["on_plan"]), "on_native": sum(1 for r in rows if r["on_native"])},
                 "sites": rows})
 
 

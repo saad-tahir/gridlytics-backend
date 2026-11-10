@@ -226,12 +226,14 @@ def test_the_fleet_counts_the_sites_on_a_plan_and_on_native_settings_and_names_t
         sites.set_tier_capable(sid, "closed_loop")
         sites.set_tier_allowed(sid, "closed_loop", "test")
     fleet = a.get("/api/fleet").json()
-    assert _row(fleet, sid)["on_plan"] is True and fleet["summary"]["on_plan"] == 1
-    # released to its native settings: no longer on a plan, and counted as handed back
+    assert _row(fleet, sid)["on_plan"] is True and fleet["summary"]["on_plan"] == 1 and _row(fleet, sid)["on_native"] is False
+    # released to its native settings: no longer on a plan, and counted as handed back (the row says so, so the web app's count of the real sites
+    # is the summary's own rule, review)
     until = datetime.fromtimestamp(_now() + 7200, PKT).isoformat()
     assert a.post(f"/api/sites/{sid}/overrides", json={"kind": "force_native", "until": until}).status_code == 200
     fleet = a.get("/api/fleet").json()
     assert _row(fleet, sid)["on_plan"] is False and fleet["summary"]["on_plan"] == 0 and fleet["summary"]["on_native"] == 1
+    assert _row(fleet, sid)["on_native"] is True and _row(fleet, world.other)["on_native"] is False
     # the same for a viewer: none of it is money
     seen = world.c["viewer"].get("/api/fleet").json()
     assert seen["summary"]["on_native"] == 1 and _row(seen, sid)["has_genset"] is True
