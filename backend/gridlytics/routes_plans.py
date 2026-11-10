@@ -103,29 +103,67 @@ def plan_apply(site_id: str, inp: dict = Body(...)):
         raise bad(exc) from None
 
 
+#: R8 2.9: the compare drawer needs the native-settings capture and a day of data
+COMPARE_MIN_DATA_S = 86400
+
+
+def _short_price(s: dict, t0: int) -> tuple[float, str]:
+    """The price of a kWh of critical load the battery is short of when an outage starts, as the plan prices its reserve (plans.build_problem's
+    c_short): the genset's all-in cost at three-quarters load where a genset starts at the site ("genset"), else the site's value of lost load
+    ("lost_load")."""
+    from . import optimise, tariffs
+    d = s.get("data") or {}
+    g = (s.get("assets") or {}).get("genset")
+    if g and d.get("genset_start_control", "none") != "none":
+        fuel, _src = tariffs.fuel_price(g.get("fuel_kind", "hsd"), datetime.fromtimestamp(int(t0), twin.PKT).date())
+        c_om = g["c_om_rs_per_kwh"] + (plans.SELFGEN_DUTY_RS_PER_KWH if g["rated_kw"] > 400 and d.get("lat", 31) > 28 else 0.0)
+        return optimise._gen_marginal({"S": g["rated_kw"], "a": g["a"], "b": g["b"], "c_fuel": fuel, "c_om": c_om, "c_runhr": g["c_runhr_rs"]}), "genset"
+    return float(d.get("voll_rs_per_kwh", 500)), "lost_load"
+
+
 @router.get("/api/sites/{site_id}/plan/compare")
 def plan_compare(site_id: str):
-    """The active plan against the inverter's native settings, both replayed through the twin on the plan's own forecast for its horizon."""
+    """The active plan against the inverter's native settings, both replayed through the twin on the plan's own forecast for its horizon.
+
+    `{compare: null, reason}` until it can be made (round 7): no_plan, no_battery, no_capture (the native arm replays the captured settings, never
+    an assumed self-use table) or too_little_data (under a day of readings; R8 2.9: "Needs the native-settings capture and 1 day of data"). `native`
+    names the capture replayed. The replay runs on the plan's grid series, where an outage is only a chance, so each arm also carries what the outage
+    reserve is worth, as the plan prices it: `reserve_short_kwh`, the critical load the battery would be short of the reserve the plan keeps at
+    each quarter an outage may start, weighted by that chance, and `reserve_short_rs` at `short_rs_per_kwh` (`short_basis`: genset or lost_load)."""
+    from . import telemetry
     s = full_or_404(site_id)
     p = plans.current(site_id)
     if p is None or not (s.get("assets") or {}).get("battery"):
-        return {"compare": None}
+        return {"compare": None, "reason": "no_plan" if p is None else "no_battery"}
+    if not s.get("native"):
+        return {"compare": None, "reason": "no_capture"}
+    first = telemetry.first_ts(site_id)
+    if first is None or now_ts() - int(first) < COMPARE_MIN_DATA_S:
+        return {"compare": None, "reason": "too_little_data"}
     steps = p["steps"]
     ts = np.repeat([st["t"] for st in steps], 15) + np.tile(np.arange(15) * 60, len(steps))
     rep = lambda k: np.repeat([st[k] for st in steps], 15).astype(float)
     series = {"ts": ts, "pv": rep("pv_forecast_kw"), "load": rep("load_kw"), "crit": rep("critical_kw"), "grid": rep("grid_present"), "temp": np.full(len(ts), 30.0)}
     plant = twin.plant_of(s)
     soc0 = (steps[0]["soc_start_pct"] or 50) / 100
+    # where an outage may start at a step's end: the chance, and the reserve the plan keeps for it (its floor, per cent)
+    risk = np.array([float(st.get("p_start") or 0.0) if st.get("grid_present", 1.0) >= 0.5 else 0.0 for st in steps])
+    risk = np.where(risk >= 0.01, risk, 0.0)
+    reserve = np.array([float(st.get("reserve_pct") or 0.0) for st in steps])
+    price, basis = _short_price(s, steps[0]["t"])
     arms = {}
     for name, pol in (("native", twin.native_policy(s, ts)), ("plan", twin.slots_policy([x for d in p["slots"]["days"] for x in d["slots"]], ts))):
         sim = twin.simulate(series, pol, plant, soc0)
         c_imp = rep("c_imp")
         c_exp = rep("c_exp")
+        short = float(np.sum(risk * np.maximum(0.0, reserve - sim["soc"][14::15] * 100.0)) / 100.0 * plant.e_nom)
         arms[name] = {"import_kwh": round(float(sim["imp"].sum() / 60), 1), "peak_import_kwh": round(float(sim["imp"][rep("peak") > 0.5].sum() / 60), 1),
                       "energy_rs": round(float((c_imp * sim["imp"] - c_exp * sim["exp"]).sum() / 60), 0), "litres": round(float(sim["fuel"].sum()), 1),
                       "unserved_kwh": round(float(sim["unserved"].sum() / 60), 1), "min_soc_pct": round(float(sim["soc"].min() * 100), 1),
+                      "reserve_short_kwh": round(short, 1), "reserve_short_rs": round(short * price, 0),
                       "soc": [round(float(x) * 100, 1) for x in sim["soc"][::15]]}
-    return out({"compare": arms, "t": [st["t"] for st in steps]})
+    return out({"compare": arms, "t": [st["t"] for st in steps], "native": {"version": s["native"]["version"], "captured_at": s["native"]["captured_at"]},
+                "short_rs_per_kwh": round(price, 1), "short_basis": basis})
 
 
 # ------------------------------------------------------------------------------------------------ control (UI-15)
@@ -140,9 +178,12 @@ def control(site_id: str, day: int = 0):
     from . import telemetry
     with store.connect() as con:
         writes_today = con.execute("SELECT COUNT(*) FROM plan_messages WHERE site_id = ? AND substr(sent_at,1,10) = ?", (site_id, today().isoformat())).fetchone()[0]
+    # per day, the table in the vendor's layout: its rows, the compiled slots each row keys, the values keyed once, and what the brand cannot hold
+    tables = [delivery.vendor_table(comp, i) for i in range(len((comp or {}).get("days", [])))]
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "tier_capable", "tier_allowed")}, "control": control_state(s, telemetry.latest(site_id), now_ts()),
                 "brand": brand, "grammar": delivery.BRANDS.get(brand, delivery.BRANDS["other"]), "compiled": comp,
-                "vendor_view": [delivery.vendor_view(comp, i) for i in range(len((comp or {}).get("days", [])))] if comp else [],
+                "vendor_view": [t["rows"] for t in tables], "vendor_slots": [t["slots"] for t in tables],
+                "vendor_settings": [t["settings"] for t in tables], "vendor_notes": [t["notes"] for t in tables],
                 "plan_id": (p or {}).get("id"), "applied": plans.applied_rows(site_id), "overrides": sites.overrides(site_id),
                 "budget": {"table_writes_per_day": delivery.BRANDS.get(brand, delivery.BRANDS["other"])["table_writes_per_day"], "used_today": writes_today},
                 "native": sites.native_latest(site_id), "fallback": (comp or {}).get("fallback")})

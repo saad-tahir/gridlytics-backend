@@ -194,8 +194,9 @@ def truth(site: dict, day: date) -> dict:
 def native_policy(site: dict, ts: np.ndarray) -> dict:
     """The inverter's own table from the native capture (self-use with a backup floor when nothing was captured).
 
-    * Slots apply whenever the capture has them (a Deye-style TOU program is captured under the default work mode too), each with its floor, target and
-      grid-charge flag; the twin charges from the grid towards the slot's target where the flag is set.
+    * Slots apply whenever the capture has them (a Deye-style TOU program is captured under the default work mode too), each with its floor, target,
+      grid-charge flag and charge power (`max_charge_kw`, the battery's own where none was captured); the twin charges from the grid towards the
+      slot's target where the flag is set.
     * `backup` holds the battery while the grid is present (no discharge), charges it from the grid to the backup state of charge when grid charging is
       allowed, and discharges only in outages. Surplus PV still charges it to its maximum, as a backup-mode inverter does: the backup level is the
       grid-charge level (`grid_target`), not a ceiling.
@@ -209,6 +210,7 @@ def native_policy(site: dict, ts: np.ndarray) -> dict:
     mode = np.full(n, MODE_CODE["self_use"])
     floor = np.full(n, backup)
     target = np.full(n, 1.0)
+    max_ch = np.full(n, np.inf)
     grid_target = None
     gch = np.zeros(n, dtype=bool)
     export_first = np.full(n, work == "feed_in_first")
@@ -227,19 +229,30 @@ def native_policy(site: dict, ts: np.ndarray) -> dict:
             floor[i] = s["soc_floor_pct"] / 100.0
             target[i] = s["soc_target_pct"] / 100.0
             gch[i] = bool(s.get("grid_charge", False))
-    return {"mode": mode, "floor": floor, "target": target, "max_dis": np.full(n, np.inf), "max_ch": np.full(n, np.inf), "grid_charge": gch,
+            if s.get("max_charge_kw") is not None:  # the slot's captured charge power (round 7: the replay charged at the battery's own)
+                max_ch[i] = float(s["max_charge_kw"])
+    return {"mode": mode, "floor": floor, "target": target, "max_dis": np.full(n, np.inf), "max_ch": max_ch, "grid_charge": gch,
             "genset": np.full(n, -1), "export_first": export_first, "grid_target": target.copy() if grid_target is None else grid_target}
 
 
 def slots_policy(slots: list[dict], ts: np.ndarray) -> dict:
-    """A per-minute policy from compiled slots (each with start_ts and end_ts in epoch seconds); minutes outside every slot run self-use."""
+    """A per-minute policy from compiled slots (each with start_ts and end_ts in epoch seconds); minutes outside every slot run self-use. The genset
+    command follows each slot's `genset_runs` (the plan's own runs), so every replay of a plan's slots (the wrong-plan guard, the compare drawer, the
+    demo, the fidelity check) runs the set when the plan does.
+
+    Round 7: a slot's `as_keyed` (delivery.as_keyed, TWN-02) replaces the plan's fields with what the brand runs in their place where a person keys
+    the table: a global floor or cut-off, the brand's own mode where it has no window for the slot, `pv_full` (surplus PV charges the battery above
+    the slot's target) and `charge_end_ts` None where the table cannot stop a charge early. A charge slot whose charging ends before the slot does
+    (`charge_end_ts`, kept where the table or an edge holds it) holds what it charged from then to its end: no grid charge, no discharge."""
     n = len(ts)
     pol = {"mode": np.full(n, MODE_CODE["self_use"]), "floor": np.full(n, 0.2), "target": np.full(n, 1.0), "max_dis": np.full(n, np.inf),
-           "max_ch": np.full(n, np.inf), "grid_charge": np.zeros(n, dtype=bool), "genset": np.full(n, -1), "grid_cap": np.full(n, np.inf)}
-    for s in slots:
-        m = (ts >= s["start_ts"]) & (ts < s["end_ts"])
+           "max_ch": np.full(n, np.inf), "grid_charge": np.zeros(n, dtype=bool), "genset": np.full(n, -1), "grid_cap": np.full(n, np.inf),
+           "pv_full": np.zeros(n, dtype=bool)}
+    for s0 in slots:
+        m = (ts >= s0["start_ts"]) & (ts < s0["end_ts"])
         if not m.any():
             continue
+        s = {**s0, **(s0.get("as_keyed") or {})}
         pol["mode"][m] = MODE_CODE.get(s["mode"], 0)
         pol["floor"][m] = s["soc_floor_pct"] / 100.0
         pol["target"][m] = s["soc_target_pct"] / 100.0
@@ -248,11 +261,106 @@ def slots_policy(slots: list[dict], ts: np.ndarray) -> dict:
         if s.get("max_charge_w") is not None:
             pol["max_ch"][m] = s["max_charge_w"] / 1000.0
         pol["grid_charge"][m] = bool(s.get("grid_charge"))
+        pol["pv_full"][m] = bool(s.get("pv_full"))
         if s.get("grid_cap_w"):
             pol["grid_cap"][m] = s["grid_cap_w"] / 1000.0
-        if s.get("genset") is not None:
+        ce = s.get("charge_end_ts")
+        if ce and str(s["mode"]).startswith("charge") and int(s0["start_ts"]) < int(ce) < int(s0["end_ts"]):
+            tail = m & (ts >= int(ce))
+            pol["mode"][tail] = MODE_CODE["hold"]
+            pol["grid_charge"][tail] = False
+            pol["floor"][tail] = np.maximum(pol["floor"][tail], pol["target"][tail])  # what it charged is held, also against a grid cap
+        if s.get("genset_runs") is not None:
+            # the plan's own runs (round 7): 1 in a run, 0 elsewhere in the slot ("no planned run", under which the operator still rescues a
+            # site about to go dark), as the demo has always set it per step; a slot stored before carries only `genset`, for the whole slot
+            pol["genset"][m] = 0
+            for a, b in s["genset_runs"]:
+                pol["genset"][m & (ts >= a) & (ts < b)] = 1
+        elif s.get("genset") is not None:
             pol["genset"][m] = 1 if s["genset"] else 0
     return pol
+
+
+def repeated_slots(slots: list[dict], t_from: int, t_to: int) -> list[dict]:
+    """One day's compiled slots repeated by clock time over [t_from, t_to), as a keyed table runs with no new plan (Part 7.1 step 6): the same
+    slots every day, and the clock minutes a part-day table leaves uncovered run its last slot, as a ring's last program wraps round. A keyed
+    table holds no genset runs, so the operator's own rule runs the set."""
+    keep = {"genset": None, "genset_runs": None}
+    shift = lambda s, k: {"charge_end_ts": int(s["charge_end_ts"]) + k * 86400} if s.get("charge_end_ts") else {}
+    out = [{**slots[-1], **keep, "start_ts": int(t_from), "end_ts": int(t_to), "charge_end_ts": None}]
+    first = int(slots[0]["start_ts"])
+    for k in range((int(t_from) - first) // 86400 - 1, (int(t_to) - first) // 86400 + 2):
+        out += [{**s, **keep, "start_ts": int(s["start_ts"]) + k * 86400, "end_ts": int(s["end_ts"]) + k * 86400, **shift(s, k)} for s in slots]
+    return out
+
+
+#: what a site runs, minute by minute, when a plan's messages stop (fallback_policy): the plan; the cached plan while an edge has lost its link
+#: (the site is flagged unattended); the inverter's native settings (a plan expired at an edge, or Mode B's setpoints reverted); a keyed table
+#: repeating its day with no new plan
+FALLBACK_STATES = ("plan", "unattended", "native", "repeat")
+
+
+def _merged(a: dict, b: dict, use_b: np.ndarray) -> dict:
+    """Policy `b` where `use_b`, else `a`, over the keys of both (a key one side lacks takes its neutral value)."""
+    n = len(use_b)
+    neutral = {"grid_cap": np.full(n, np.inf), "export_first": np.zeros(n, dtype=bool), "export_cap": np.full(n, np.inf),
+               "pv_full": np.zeros(n, dtype=bool)}
+    pick = lambda pol, k: pol.get(k, pol["target"] if k == "grid_target" else neutral.get(k))
+    return {k: np.where(use_b, pick(b, k), pick(a, k)) for k in set(a) | set(b) if pick(a, k) is not None and pick(b, k) is not None}
+
+
+def _whole_day(days: list[dict]) -> dict:
+    """The last day table that covers a whole local day (a keyed table's day), else the last one."""
+    for d in reversed(days):
+        t0 = day_start_utc(date.fromisoformat(d["date"]))
+        if d["slots"] and int(d["slots"][0]["start_ts"]) == t0 and int(d["slots"][-1]["end_ts"]) == t0 + 86400:
+            return d
+    return days[-1]
+
+
+def fallback_policy(site: dict, compiled: dict, ts: np.ndarray, *, valid_until: int, executor: str = "edge", mode: str = "a",
+                    link_lost_at: int | None = None, revert_after_s: int = 1800, keyed_day: int | None = None) -> tuple[dict, np.ndarray]:
+    """The per-minute policy a site runs when a plan's messages stop, and its state (an index into FALLBACK_STATES), so the twin can replay an
+    expiry or a lost link (plan Part 7.1 step 6 and 7.2, U3 3.3 and 3.4, R6 I2, I3, I5 and I6; tracker DLV-04):
+
+    * An edge with a Mode A plan (`executor` "edge"): `fallback.on_link_loss_after_s` after the link drops it flags the site unattended and keeps
+      executing the cached plan to `valid_until`; from then on it runs `fallback.on_expiry`, the inverter's native settings, with the block's
+      `min_soc_floor_pct` as the floor everywhere and `max_export_w_floor` as the export cap (`export_cap`, kW).
+    * Mode B (`mode` "b"): the volatile setpoints revert `revert_after_s` (mode_b's refresh) after the link drops, to the same native fallback,
+      or at `valid_until` if that comes first. The minutes before run the compiled slots (the twin has no Mode B executor yet).
+    * A table a person keyed (`executor` "keyed", the advisory tier): no edge, so nothing expires; from `valid_until` the keyed day's table
+      (`keyed_day`, by default the last whole day) repeats by clock time, the case delivery.table_safety checks."""
+    fb = compiled.get("fallback") or {}
+    days = [d for d in compiled.get("days") or [] if d.get("slots")]
+    n = len(ts)
+    pol = slots_policy([s for d in days for s in d["slots"]], ts)
+    state = np.zeros(n, dtype=int)
+    if executor == "keyed":
+        rep = ts >= int(valid_until)
+        if rep.any() and days:
+            day = days[keyed_day] if keyed_day is not None else _whole_day(days)
+            pol = _merged(pol, slots_policy(repeated_slots(day["slots"], int(valid_until), int(ts[-1]) + 60), ts), rep)
+            state[rep] = FALLBACK_STATES.index("repeat")
+        return pol, state
+    end = int(valid_until)
+    if link_lost_at is not None:
+        if mode == "b":
+            end = min(end, int(link_lost_at) + int(revert_after_s))
+        state[(ts >= int(link_lost_at) + int(fb.get("on_link_loss_after_s", 300))) & (ts < end)] = FALLBACK_STATES.index("unattended")
+    native = ts >= end
+    if native.any():
+        nat = native_policy(site, ts)
+        nat["floor"] = np.maximum(nat["floor"], float(fb.get("min_soc_floor_pct") or 0.0) / 100.0)
+        cap = fb.get("max_export_w_floor")
+        nat["export_cap"] = np.full(n, np.inf if cap is None else float(cap) / 1000.0)
+        pol = _merged(pol, nat, native)
+        state[native] = FALLBACK_STATES.index("native")
+    return pol, state
+
+
+def state_changes(ts: np.ndarray, state: np.ndarray) -> list[dict]:
+    """The minutes a fallback_policy state begins, as {t, state}: the fallback events a replay counts."""
+    return [{"t": int(ts[i]), "state": FALLBACK_STATES[int(state[i])]} for i in range(len(state)) if i == 0 or state[i] != state[i - 1]]
 
 
 def table_policy(table: list[dict], ts: np.ndarray) -> dict:
@@ -332,9 +440,13 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
         grid_target = target
     max_dis, max_ch, gch, gcmd = policy["max_dis"], policy["max_ch"], policy["grid_charge"], policy["genset"]
     gcap = policy.get("grid_cap", np.full(n, np.inf))
+    xcap = policy.get("export_cap", np.full(n, np.inf))  # a fallback block's export floor (R6 I3), where a policy carries one
     export_first = policy.get("export_first")
     if export_first is None:
         export_first = np.zeros(n, dtype=bool)
+    pv_full = policy.get("pv_full")  # surplus PV charges the battery above the slot's target (a brand profile, twin.slots_policy)
+    if pv_full is None:
+        pv_full = np.zeros(n, dtype=bool)
     has_bat = plant.e_nom > 0
     for i in range(n):
         g = grid[i] > 0.5
@@ -371,9 +483,14 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
             if m == 3 or (grid_ch and ch_room_g > 1e-9):  # charge_grid, never above the slot's grid import cap (the peak-shaving setting)
                 bat = -max(0.0, min(pch, ch_room if m == 3 else ch_room_g, gcap[i] - net if net > 0 else gcap[i] + (-net)))
                 if m != 3 and net < 0:  # surplus PV beyond the grid-charge level still charges, up to the target
-                    bat = -max(-bat, min(-net, pch, ch_room))
-            elif m == 5:  # export: discharge at the cap
-                bat = min(pdis, dis_room)
+                    bat = -max(-bat, min(-net, pch, ch_room_abs if pv_full[i] else ch_room))
+                elif pv_full[i] and net < 0:
+                    bat = -max(-bat, min(-net, pch, ch_room_abs))
+            elif m == 5:
+                # export: discharge at the slot's power, but no more than the load and the export cap take (round 7: an inverter does not discharge
+                # into curtailment); surplus PV beyond the cap charges the battery instead
+                room = net + min(plant.x_max, xcap[i])
+                bat = min(pdis, dis_room, room) if room > 0 else -min(-room, pch, ch_room_abs)
             elif net > 0:
                 if m in (0, 1):
                     bat = min(net, pdis, dis_room_m)
@@ -381,10 +498,12 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                 rest = max(0.0, -net - plant.x_max)
                 bat = -min(rest, pch, ch_room_abs if m in (0, 1) else ch_room)
             else:
-                bat = -min(-net, pch, ch_room_abs if m in (0, 1) else ch_room)
+                bat = -min(-net, pch, ch_room_abs if m in (0, 1) or pv_full[i] else ch_room)
             flow = served - pv - bat
-            if flow > gcap[i] and has_bat:  # peak shaving to the plan's MDI cap, down to the battery's own floor
-                extra = max(0.0, min(flow - gcap[i], plant.p_dis - max(bat, 0.0), dis_room_abs - max(bat, 0.0)))
+            if flow > gcap[i] and has_bat:
+                # peak shaving to the slot's grid cap (the plan's MDI cap where something on site holds it), never below the slot's floor (round 7:
+                # the BMS floor before, so a load above the forecast drained the level a hold keeps for an outage): the floor wins
+                extra = max(0.0, min(flow - gcap[i], plant.p_dis - max(bat, 0.0), dis_room_m - max(bat, 0.0)))
                 bat += extra
                 flow -= extra
             if gen_on:
@@ -395,9 +514,13 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                 unserved = flow - imp
                 out["imp"][i] = imp
             else:
-                exp = min(-flow, plant.x_max)
+                exp = min(-flow, plant.x_max, xcap[i])
                 curtail = -flow - exp
                 out["exp"][i] = exp
+                if curtail > pv and bat > 0:  # battery output nobody takes is never discharged, and never booked as PV curtailment
+                    back = min(curtail - pv, bat)
+                    bat -= back
+                    curtail -= back
                 if curtail > pv and gen > 0:  # genset output nobody takes is not PV curtailment: the genset runs below its minimum load instead
                     over = min(curtail - pv, gen)
                     gen -= over
