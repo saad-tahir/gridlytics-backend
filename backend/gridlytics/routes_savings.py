@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Body
 from fastapi.responses import PlainTextResponse
@@ -291,17 +291,43 @@ def pilot_start(site_id: str, inp: dict = Body(default={})):
     return pilot_get(site_id)
 
 
+def _ics_text(value: str) -> str:
+    """An iCalendar TEXT value (RFC 5545 3.3.11): backslash, semicolon and comma escaped, a line break written as \\n, other control characters
+    dropped, so typed text such as a site's name cannot start a property or an event of its own (round 7, audit security-roles-14)."""
+    v = value.replace("\r\n", "\n").replace("\r", "\n")
+    v = "".join(ch for ch in v if ch == "\n" or ch == "\t" or not (ord(ch) < 32 or ord(ch) == 127))
+    return v.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+
+
+def _ics_fold(line: str) -> list[str]:
+    """A content line folded at 75 octets (RFC 5545 3.1): each continuation starts with a space, and no UTF-8 character is split."""
+    out, cur, size, limit = [], "", 0, 75
+    for ch in line:
+        n = len(ch.encode("utf-8"))
+        if size + n > limit:
+            out.append(cur)
+            cur, size, limit = " ", 1, 75
+        cur += ch
+        size += n
+    return out + [cur]
+
+
 @router.get("/api/sites/{site_id}/pilot/calendar.ics")
 def pilot_ics(site_id: str):
+    """The calendar for a calendar app (tab C). Round 7 (audit security-roles-14, flow-savings-pilot-bill-26): the site's name is escaped as
+    TEXT, each event carries DTSTAMP (when the file was made, UTC), long lines are folded, and the file comes with its name."""
     s = site_or_404(site_id)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Gridlytics//Switchback//EN"]
     for b in verify.switchback_blocks(site_id):
         d0 = date.fromisoformat(b["block_start"])
         d1 = date.fromisoformat(b["block_end"]) + timedelta(days=1)
-        lines += ["BEGIN:VEVENT", f"UID:{site_id}-{b['block_start']}@gridlytics", f"DTSTART;VALUE=DATE:{d0:%Y%m%d}", f"DTEND;VALUE=DATE:{d1:%Y%m%d}",
-                  f"SUMMARY:{s['name']}: {'plan' if b['arm'] == 'plan' else 'native settings'} block", "END:VEVENT"]
+        summary = _ics_text(f"{s['name']}: {'plan' if b['arm'] == 'plan' else 'native settings'} block")
+        lines += ["BEGIN:VEVENT", f"UID:{site_id}-{b['block_start']}@gridlytics", f"DTSTAMP:{stamp}", f"DTSTART;VALUE=DATE:{d0:%Y%m%d}",
+                  f"DTEND;VALUE=DATE:{d1:%Y%m%d}", f"SUMMARY:{summary}", "END:VEVENT"]
     lines.append("END:VCALENDAR")
-    return PlainTextResponse("\r\n".join(lines) + "\r\n", media_type="text/calendar")
+    body = "\r\n".join(part for line in lines for part in _ics_fold(line)) + "\r\n"
+    return PlainTextResponse(body, media_type="text/calendar", headers={"Content-Disposition": f'attachment; filename="{site_id}-switchback.ics"'})
 
 
 @router.get("/api/fleet/savings")

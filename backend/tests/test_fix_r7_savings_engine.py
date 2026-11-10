@@ -1300,3 +1300,37 @@ def test_holiday_closures_are_declared_in_the_pilot_typed_and_amended_with_a_rea
     assert r.status_code == 200
     (am,) = r.json()["pilot"]["amendments"]
     assert am["values"] == [{"field": "closures", "before": [{**xmas, "label": ""}, eid], "after": [xmas, eid]}]
+
+
+# ------------------------------------------------------------------------------------------------ security-roles-14 (flow-savings-pilot-bill-26): the
+# ------------------------------------------------------------------------------------------------ calendar file escapes text, stamps events, names itself
+
+def test_the_calendar_file_escapes_the_site_name_stamps_each_event_folds_long_lines_and_names_itself(world):
+    import re
+    sid = world.site
+    name = "Mill\r\nBEGIN:VALARM\r\nACTION:DISPLAY; call, now\\END:VALARM\x07"
+    with world.use():
+        verify.plan_switchback(sid, _pkt_today() + timedelta(days=30), 1, 7, "t", seed=1)
+        with store.connect() as con:
+            con.execute("UPDATE sites SET name = ? WHERE id = ?", (name, sid))
+    r = world.c["viewer"].get(f"/api/sites/{sid}/pilot/calendar.ics")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/calendar")
+    assert r.headers["content-disposition"] == f'attachment; filename="{sid}-switchback.ics"'
+    raw = r.content.decode("utf-8")
+    assert raw.endswith("\r\n") and "\r" not in raw.replace("\r\n", "") and "\n" not in raw.replace("\r\n", "")  # CRLF lines alone
+    assert all(len(line.encode()) <= 75 for line in raw.split("\r\n"))
+    lines = raw.replace("\r\n ", "").split("\r\n")[:-1]  # unfolded
+    assert not any(line.startswith(("BEGIN:VALARM", "ACTION:", "END:VALARM")) for line in lines)
+    assert lines.count("BEGIN:VEVENT") == 2 and lines.count("END:VEVENT") == 2
+    summaries = [line for line in lines if line.startswith("SUMMARY:")]
+    assert summaries[0] in ("SUMMARY:Mill\\nBEGIN:VALARM\\nACTION:DISPLAY\\; call\\, now\\\\END:VALARM: plan block",
+                            "SUMMARY:Mill\\nBEGIN:VALARM\\nACTION:DISPLAY\\; call\\, now\\\\END:VALARM: native settings block")
+    stamps = [line for line in lines if line.startswith("DTSTAMP:")]
+    assert len(stamps) == 2 and all(re.fullmatch(r"DTSTAMP:\d{8}T\d{6}Z", s) for s in stamps)
+    # a long name in Urdu folds at whole characters
+    long = "ملک " * 30
+    with world.use(), store.connect() as con:
+        con.execute("UPDATE sites SET name = ? WHERE id = ?", (long.strip(), sid))
+    raw = world.c["viewer"].get(f"/api/sites/{sid}/pilot/calendar.ics").content.decode("utf-8")
+    assert all(len(line.encode()) <= 75 for line in raw.split("\r\n"))
+    assert any(line == f"SUMMARY:{long.strip()}: plan block" for line in raw.replace("\r\n ", "").split("\r\n"))
