@@ -455,6 +455,238 @@ def _zone_warning(records: list[dict], spans: list[int]) -> str | None:
             f"the file may be in another zone than the one chosen (UTC or Karachi time)")
 
 
+# ------------------------------------------------------------------------------------------------ the CSV column mapping
+
+#: the units a mapped column may be written in, per key, with the factor to the stored unit (the first is the stored unit); a key not listed has no unit
+#: (a time, an on/off signal, a mode). The column mapping of plan Part 7.5 and UI-06 (flow-telemetry-plan-control-12): column to key, unit and sign.
+_POWER_UNITS = {"W": 1.0, "kW": 1000.0, "MW": 1e6}
+_ENERGY_UNITS = {"Wh": 1.0, "kWh": 1000.0, "MWh": 1e6}
+UNITS: dict[str, dict[str, float]] = {
+    **{k: _POWER_UNITS for k in ("grid_power_w", "pv_power_w", "load_power_w", "battery_power_w", "genset_power_w")},
+    "grid_import_wh": _ENERGY_UNITS, "grid_export_wh": _ENERGY_UNITS, "grid_voltage_v": {"V": 1.0, "kV": 1000.0}, "battery_voltage_v": {"V": 1.0},
+    "battery_current_a": {"A": 1.0}, "battery_temp_c": {"°C": 1.0}, "battery_soc_bms_pct": {"%": 1.0, "fraction": 100.0}, "genset_fuel_l": {"L": 1.0},
+}
+#: the keys whose sign a mapping may reverse: the product's battery discharge and grid import are positive (OpenEMS signs)
+SIGNED = ("grid_power_w", "battery_power_w", "battery_current_a")
+#: what a file must carry: a time, and the grid signal (grid_present, or grid_voltage_v to derive it)
+REQUIRED = ("ts", "grid_present")
+TIER1_NOTE = "No inverter_mode_active column: this source supports monitor (tier 1) only, because the counterfactual needs the inverter's mode"
+
+#: a header's words for each key, as common loggers and inverter clouds write them (the unit, in brackets or as a kW/kWh suffix, is read apart); the
+#: first pattern that matches the whole of a header's words wins, so the more particular come first
+_ALIASES = (
+    ("ts", r"ts|time ?stamp|date ?time|date and time|date time|time|date|local time|time utc|collection time|updated time|record time"),
+    ("grid_present", r"grid present|grid (status|state|on|available|availability|connected)|(utility|mains|wapda)( status| present| available)?"),
+    ("grid_voltage_v", r"(grid|utility|mains|wapda|ac input) (voltage|volt|v)( l1| r| phase a)?"),
+    ("grid_import_wh", r"grid import( energy)?|(energy )?(imported|purchased|bought)( energy)?|import energy|buy energy|energy from grid|grid buy"),
+    ("grid_export_wh", r"grid export( energy)?|(energy )?(exported|sold|fed in)( energy)?|export energy|sell energy|feed ?in energy|energy to grid"
+                       r"|grid sell"),
+    ("grid_power_w", r"grid( active)? power|grid|meter( active)? power|(utility|mains|wapda) power|total grid power"),
+    ("pv_power_w", r"pv|solar|(pv|solar|dc)( input| output| total| active)? power|total (pv|solar|dc) power|(pv|solar) production|production( power)?"),
+    ("load_power_w", r"load|(total |house |home |ac )?load( active)? power|(total )?consumption( power)?|total load|load consumption|house load"
+                     r"|home load"),
+    ("battery_soc_bms_pct", r"soc|(battery|bat|bms) soc|(battery )?state of charge|battery (level|capacity)"),
+    ("battery_voltage_v", r"(battery|bat) (voltage|volt|v)"),
+    ("battery_current_a", r"(battery|bat) (current|i)"),
+    ("battery_temp_c", r"(battery|bat|bms) (temperature|temp)"),
+    ("battery_power_w", r"battery|bat|(battery|bat)( active| charge discharge| charging discharging)? power"),
+    ("genset_running", r"(genset|generator|gen|dg) (running|status|state|on)"),
+    ("genset_fuel_l", r"((genset|generator|gen|dg) )?(fuel|diesel)( used| consumption| consumed| litres| liters)?"),
+    ("genset_power_w", r"genset|generator|(genset|generator|gen|dg|diesel generator)( active)? power"),
+    ("inverter_mode_active", r"inverter mode( active)?|(work|working|operating) mode"),
+    ("quality_flags", r"quality( flags)?"),
+)
+_ALIAS_RE = tuple((k, re.compile(p)) for k, p in _ALIASES)
+_SIGNAL_OF = {"grid_power_w": "grid_present", "genset_power_w": "genset_running"}
+_UNIT_WORDS = {"w": "W", "kw": "kW", "mw": "MW", "wh": "Wh", "kwh": "kWh", "mwh": "MWh", "%": "%", "pct": "%", "percent": "%", "v": "V", "kv": "kV",
+               "a": "A", "°c": "°C", "c": "°C", "degc": "°C", "deg c": "°C", "l": "L", "litre": "L", "litres": "L", "liter": "L", "liters": "L",
+               "ltr": "L"}
+#: the units a header may end in without brackets (load_kw, Energy kWh); one letter alone (grid v) is a word, not a unit
+_UNIT_SUFFIX = ("kw", "mw", "kwh", "mwh", "kv")
+_BRACKETED = re.compile(r"[\(\[]\s*([^\)\]]*?)\s*[\)\]]")
+_DECIMAL_COMMA = re.compile(r"^-?[\d.]*\d,\d+$")
+
+
+def _dialect(text: str) -> tuple[str, str]:
+    """A file's cell separator (",", ";" or a tab: whichever its header line has most of, "," on a tie) and decimal mark ("," when cells are separated
+    by ";" or a tab and numbers are written 12,5, as European loggers export them)."""
+    lines = text.splitlines()
+    head = next((line for line in lines if line.strip()), "")
+    delim = max((",", ";", "\t"), key=lambda d: (head.count(d), d == ","))
+    if delim != ",":
+        for row in csv.reader(lines[1:51], delimiter=delim):
+            if any(_DECIMAL_COMMA.match(c.strip()) for c in row):
+                return delim, ","
+    return delim, "."
+
+
+def mapping_of(mapping: dict | None) -> dict:
+    """A column mapping as {"columns": {file column: {"key", "unit", "reverse"}}, "ts_format"}; also takes the short form {file column: key}. A key of
+    None ignores the column; a column the mapping does not name is read by its own name. Raises ValueError, in one sentence, for a key that is not one
+    of CSV_COLUMNS, a unit the key is not written in (UNITS), a reversed key without a sign (SIGNED) or a time format not in TS_FORMATS."""
+    if not mapping:
+        return {"columns": {}, "ts_format": "auto"}
+    full = isinstance(mapping.get("columns"), dict)
+    cols, fmt = (mapping["columns"], mapping.get("ts_format") or "auto") if full else (mapping, "auto")
+    out = {}
+    for name, c in cols.items():
+        c = c if isinstance(c, dict) else {"key": c}
+        key, unit, reverse = c.get("key"), c.get("unit"), bool(c.get("reverse"))
+        if key is not None and key not in CSV_COLUMNS:
+            raise ValueError(f"Column {name} is mapped to {key}, which is not a key a CSV may carry ({', '.join(CSV_COLUMNS)})")
+        if unit is not None and unit not in UNITS.get(key, {}):
+            units = UNITS.get(key)
+            raise ValueError(f"Column {name} cannot be read in {unit}: "
+                             + (f"the units of {key} are {', '.join(units)}" if units else f"{key} has no unit"))
+        if reverse and key not in SIGNED:
+            raise ValueError(f"Column {name}'s sign cannot be reversed: only {', '.join(SIGNED)} have a sign")
+        out[str(name)] = {"key": key, "unit": unit, "reverse": reverse}
+    if fmt not in TS_FORMATS:
+        raise ValueError(f"The time format is one of {', '.join(TS_FORMATS)}")
+    return {"columns": out, "ts_format": fmt}
+
+
+def _column_names(fields: list[str], m: dict) -> dict:
+    """Each of a file's columns as the key it is read as (None: ignored), by the mapping, else by its own name; two columns read as one key are refused."""
+    names = {f: (m["columns"][f]["key"] if f in m["columns"] else f) for f in fields}
+    twice = Counter(n for n in names.values() if n in CSV_COLUMNS)
+    for key, n in twice.items():
+        if n > 1:
+            cols = [f for f, k in names.items() if k == key]
+            raise ValueError(f"Columns {' and '.join(cols[:3])} are both read as {key}: map one of them to another key, or to none")
+    return names
+
+
+def _found(fields: list[str]) -> str:
+    shown = [f for f in fields if f.strip()][:12]
+    more = len([f for f in fields if f.strip()]) - len(shown)
+    return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
+
+
+def _header_words(name: str) -> tuple[str, str | None]:
+    """A header as (its words in lower case without its unit, the unit it names, if any)."""
+    unit = None
+    m = _BRACKETED.search(name)
+    if m:
+        unit = _UNIT_WORDS.get(m.group(1).strip().lower())
+        name = _BRACKETED.sub(" ", name)
+    if "%" in name:
+        unit, name = unit or "%", name.replace("%", " ")
+    words = re.sub(r"[^0-9a-z°]+", " ", name.lower()).split()
+    if len(words) > 1 and words[-1] in _UNIT_SUFFIX:
+        unit, words = unit or _UNIT_WORDS[words[-1]], words[:-1]
+    return " ".join(words), unit
+
+
+def _ts_format_of(cells: list[str]) -> tuple[str, bool]:
+    """The date order a file's times are written in, and whether it is a guess: day first when a first number is over 12, month first when a second
+    one is; when none is, day first (as Pakistan writes dates), flagged as ambiguous."""
+    slashed = [m for c in cells if (m := _SLASHED.match(c.strip()))]
+    if not slashed:
+        return "auto", False
+    if any(int(m.group(1)) > 12 for m in slashed):
+        return "dmy", False
+    if any(int(m.group(2)) > 12 for m in slashed):
+        return "mdy", False
+    return "dmy", True
+
+
+def guess_mapping(head: str, saved: dict | None = None) -> dict:
+    """The mapping step's first answer for a file's head (its first lines): the cell separator and decimal mark, each column with the key, unit and sign
+    it is read as and where that came from ("saved": the site's saved mapping names the column; "name": it is a documented key; "guess": its header
+    reads as one, see _ALIASES; None: not read), its first cells, the date order of its times (with `ts_ambiguous` when only a guess), the keys still
+    missing (ts, grid_present) and notes (no inverter_mode_active: tier 1 only). One column per key: a later column a key is guessed for again is left
+    unread. Nothing is stored."""
+    text = head.lstrip("\ufeff")
+    delim, decimal = _dialect(text)
+    rows = list(csv.reader(io.StringIO(text), delimiter=delim))
+    header = rows[0] if rows else []
+    body = [r for r in rows[1:52] if any(c.strip() for c in r)]
+    if len(body) > 1 and len(body[-1]) < len(header):
+        body = body[:-1]  # the head was cut in the middle of its last line
+    saved_cols = mapping_of(saved)["columns"] if saved else {}
+    cols, used = [], set()
+    for i, name in enumerate(header):
+        cells = [r[i].strip() for r in body if i < len(r)]
+        if name in saved_cols:
+            c, src = dict(saved_cols[name]), "saved"
+        elif name.strip() in CSV_COLUMNS:
+            c, src = {"key": name.strip(), "unit": None, "reverse": False}, "name"
+        else:
+            words, unit = _header_words(name)
+            key = next((k for k, rx in _ALIAS_RE if words and rx.fullmatch(words)), None)
+            if unit not in UNITS.get(key, {}):
+                unit = None
+            if key == "battery_soc_bms_pct" and unit is None:
+                vals = [x for c in cells if (x := _num(c.replace(",", ".") if decimal == "," else c)[0]) is not None]
+                unit = "fraction" if vals and 0 < max(vals) <= 1 else None
+            # a "Grid" or "Generator" column whose cells are on and off (or 1 and 0) is the signal, not the power
+            if key in _SIGNAL_OF and cells and all(c.strip().lower() in FLAG_WORDS or c.strip() in ("0", "1") for c in cells if c.strip()) \
+                    and any(c.strip() for c in cells):
+                key, unit = _SIGNAL_OF[key], None
+            c, src = {"key": key, "unit": unit, "reverse": False}, ("guess" if key else None)
+        if c["key"] in used:
+            c, src = {"key": None, "unit": None, "reverse": False}, None
+        if c["key"]:
+            used.add(c["key"])
+        cols.append({"name": name, **c, "from": src, "sample": cells[:5]})
+    ts_cells = next(([r[i] for r in body if i < len(r)] for i, c in enumerate(cols) if c["key"] == "ts"), [])
+    fmt, ambiguous = _ts_format_of(ts_cells)
+    saved_fmt = mapping_of(saved)["ts_format"] if saved else "auto"
+    if ambiguous and saved_fmt != "auto" and any(c["from"] == "saved" for c in cols):
+        fmt = saved_fmt  # the date order the site's saved mapping chose, where the file's own dates cannot tell
+    missing = [k for k in ("ts",) if k not in used] + ([] if used & {"grid_present", "grid_voltage_v"} else ["grid_present"])
+    return {"delimiter": delim, "decimal": decimal, "ts_format": fmt, "ts_ambiguous": ambiguous, "columns": cols, "missing": missing,
+            "notes": [] if "inverter_mode_active" in used else [TIER1_NOTE], "saved": any(c["from"] == "saved" for c in cols)}
+
+
+def ts_column(fields: list[str], mapping: dict | None) -> str | None:
+    """The file column read as ts, by the mapping or by its name."""
+    cols = mapping_of(mapping)["columns"]
+    return next((f for f in fields if (cols[f]["key"] if f in cols else f) == "ts"), None)
+
+
+def saved_mapping(site_id: str) -> dict | None:
+    """The site's saved CSV column mapping (its CSV source's data_sources row): {mapping, updated, by}, or None."""
+    with store.connect() as con:
+        r = con.execute("SELECT data FROM data_sources WHERE site_id = ? AND kind = 'csv' ORDER BY created LIMIT 1", (site_id,)).fetchone()
+    try:
+        data = json.loads(r["data"]) if r else {}
+        if not isinstance(data, dict) or not isinstance(data.get("mapping"), dict):
+            return None
+        return {"mapping": mapping_of(data["mapping"]), "updated": data.get("updated"), "by": data.get("by")}
+    except ValueError:  # not JSON, or a mapping this version no longer reads: as if none were saved
+        return None
+
+
+def save_mapping(site_id: str, mapping: dict, by: str) -> dict:
+    """Saves the site's CSV column mapping (checked by mapping_of), replacing the one saved before: {mapping, updated, by}."""
+    data = {"mapping": mapping_of(mapping), "updated": store._now(), "by": by}
+    with store.connect() as con:
+        r = con.execute("SELECT id FROM data_sources WHERE site_id = ? AND kind = 'csv' ORDER BY created LIMIT 1", (site_id,)).fetchone()
+        if r:
+            con.execute("UPDATE data_sources SET data = ? WHERE id = ?", (json.dumps(data), r["id"]))
+        else:
+            con.execute("INSERT INTO data_sources (id, site_id, kind, data, created) VALUES (?,?,?,?,?)",
+                        (store.new_id(), site_id, "csv", json.dumps(data), store._now()))
+    return data
+
+
+def _mapping_words(m: dict) -> str | None:
+    """The import note of a mapping's effect: the columns it renames, their units and signs, and the date order."""
+    parts = []
+    for f, c in m["columns"].items():
+        if c["key"] is None or (c["key"] == f and not c["unit"] and not c["reverse"]):
+            continue
+        parts.append(f"{f} as {c['key']}" + (f" in {c['unit']}" if c["unit"] and c["unit"] != next(iter(UNITS.get(c["key"], {"": 0}))) else "")
+                     + (" with its sign reversed" if c["reverse"] else ""))
+    order = {"dmy": "; dates read day first", "mdy": "; dates read month first"}.get(m["ts_format"], "")
+    if not parts and not order:
+        return None
+    shown = ", ".join(parts[:12]) + (f" and {len(parts) - 12} more" if len(parts) > 12 else "")
+    return f"Read with the column mapping: {shown or 'the columns by their names'}{order}"
+
+
 def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
                file_name: str | None = None, ts_format: str = "auto") -> dict:
     """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
@@ -467,24 +699,46 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
     nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
     rows are aggregated. Times are read by csv_time in `ts_format` (ISO 8601 or epoch seconds by default); a file in which none can be read is refused
-    with the formats read, and a file over UPLOAD_MAX_BYTES with TOO_LARGE. The imports row keeps the uploaded range (`from_ts`, `to_ts`) and the file's name when given (`file_name`, see _file_name)."""
+    with the formats read, and a file over UPLOAD_MAX_BYTES with TOO_LARGE. The imports row keeps the uploaded range (`from_ts`, `to_ts`) and the
+    file's name when given (`file_name`, see _file_name).
+
+    `mapping` (see mapping_of; flow-telemetry-plan-control-12) reads a vendor's columns as the product's keys, in their units and signs, and its
+    `ts_format` (day-first or month-first dates) when `ts_format` is left "auto". Cells separated by ";" or tabs, with decimal commas, are read
+    (_dialect). A file without a ts column, or without a grid signal, is refused with the columns it has."""
     if len(content) > UPLOAD_MAX_BYTES:
         raise ValueError(TOO_LARGE)
+    m = mapping_of(mapping)
+    if ts_format == "auto":
+        ts_format = m["ts_format"]
     if ts_format not in TS_FORMATS:
         raise ValueError(f"The time format is one of {', '.join(TS_FORMATS)}")
     text = content.decode("utf-8-sig", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames or "ts" not in [(mapping or {}).get(f, f) for f in reader.fieldnames]:
+    delim, decimal = _dialect(text)
+    reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+    if not reader.fieldnames:
         raise ValueError("The file needs a header row with a ts column (UTC, or set the timezone)")
+    names = _column_names(reader.fieldnames, m)
+    if "ts" not in names.values():
+        raise ValueError(f"The file has no ts column (its columns are {_found(reader.fieldnames)}): choose the column that holds the time in the column "
+                         f"mapping, or name the columns as the keys a file may carry: {', '.join(CSV_COLUMNS)}")
     log, records = [], []
-    names = {f: (mapping or {}).get(f, f) for f in reader.fieldnames}
+    if delim != ",":
+        log.append(f"Cells are separated by {'semicolons' if delim == ';' else 'tabs'}" + (" and decimals by commas (12,5)" if decimal == "," else ""))
+    mapped = _mapping_words(m)
+    if mapped:
+        log.append(mapped)
     ignored = [f for f, n in names.items() if n not in CSV_COLUMNS]
     if ignored:
         log.append(f"Ignored columns: {', '.join(ignored[:10])}")
     if "inverter_mode_active" not in names.values():
-        log.append("No inverter_mode_active column: this source supports monitor (tier 1) only, because the counterfactual needs the inverter's mode")
+        log.append(TIER1_NOTE)
     if "grid_present" not in names.values() and "grid_voltage_v" not in names.values():
-        raise ValueError("The file needs a grid_present column (or grid_voltage_v to derive it): the product cannot see outages without it")
+        raise ValueError(f"The file needs a grid_present column (or grid_voltage_v to derive it): the product cannot see outages without it. Its "
+                         f"columns are {_found(reader.fieldnames)}: choose the one that holds the grid's state in the column mapping")
+    # a mapped column's unit and sign: its readings scaled to the stored unit and the product's sign (discharge and import positive)
+    scale = {c["key"]: UNITS.get(c["key"], {}).get(c["unit"] or "", 1.0) * (-1.0 if c["reverse"] else 1.0)
+             for f, c in m["columns"].items() if f in names and c["key"] and (c["unit"] or c["reverse"])}
+    scale = {k: x for k, x in scale.items() if x != 1.0}
     if "grid_import_wh" not in names.values() and "grid_export_wh" not in names.values():
         log.append("No grid_import_wh or grid_export_wh column: import and export are read from grid_power_w (positive is import)"
                    if "grid_power_w" in names.values() else
@@ -492,6 +746,13 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     bad_ts, first_bad = 0, None
     for line in reader:
         rec = {names[k]: v for k, v in line.items() if k in names and names[k] in CSV_COLUMNS}
+        if decimal == ",":
+            rec = {k: (v.strip().replace(".", "").replace(",", ".") if k != "ts" and isinstance(v, str) and _DECIMAL_COMMA.match(v.strip()) else v)
+                   for k, v in rec.items()}
+        for k, x in scale.items():
+            v = _num(rec.get(k))[0]
+            if v is not None:
+                rec[k] = v * x
         ts = rec.get("ts") or ""  # a short row leaves its missing trailing cells as None
         try:
             t = csv_time(ts, tz_offset_h, ts_format)

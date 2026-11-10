@@ -13,7 +13,9 @@ measured points and refit (pages-C-16).
 
 Batch 3, CSV mapping, refusals, data quality and series: today's completeness is counted over the minutes elapsed so far, not the whole day
 (role-viewer-07, and its duplicate role-analyst-09); a file's times may be epoch seconds or milliseconds, a refusal of unreadable times names the
-formats read, and a file over the upload cap is told the importer's sentence however it arrives (flow-telemetry-plan-control-25).
+formats read, and a file over the upload cap is told the importer's sentence however it arrives (flow-telemetry-plan-control-25); a vendor export is read through a
+column mapping (column to key, unit, sign, date order) saved per site, guessed from the file's head, and a file without the keys is refused with the
+columns it has and the ones expected; a semicolon file with decimal commas is read (flow-telemetry-plan-control-12).
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -679,3 +681,150 @@ def test_a_file_over_the_upload_cap_is_told_the_importer_s_sentence(world):
     assert r.status_code == 413 and r.json()["detail"] == telemetry.TOO_LARGE, r.text
     other = c.put(f"/api/sites/{sid}/outages/schedule", content=b"{" + b" " * api.MAX_BODY + b"}", headers={"content-type": "application/json"})
     assert other.status_code == 413 and other.json()["detail"] == "The request is too large"
+
+
+# ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-12: the column mapping
+
+VENDOR_HEAD = ("Timestamp", "Grid Status", "Load (kW)", "PV (kW)", "SOC (%)", "Battery Power (kW)")
+
+
+def _vendor(t: int, n: int = 60, stamp=None) -> bytes:
+    """C1_wrong_headers.csv: a vendor export in kW, grid status as On/Off, battery power with charge positive (the product's discharge is positive)."""
+    stamp = stamp or _local
+    return _file(VENDOR_HEAD, [(stamp(t + 60 * i), "On" if i % 10 else "Off", 22.5, 15.0, 70, 4.0) for i in range(n)])
+
+
+def test_a_vendor_export_without_a_mapping_is_refused_with_its_columns_and_the_keys_expected(company):
+    sid = _site("Vendor")
+    with pytest.raises(ValueError) as e:
+        telemetry.import_csv(sid, _vendor(T0 + 9 * 3600), 5, now=NOW)
+    msg = str(e.value)
+    assert "Timestamp, Grid Status, Load (kW)" in msg and "ts" in msg and "grid_present" in msg and "column mapping" in msg, msg
+    with pytest.raises(ValueError) as e:  # a ts column but no grid signal: the columns found are named too
+        telemetry.import_csv(sid, _file(("ts", "Grid Status", "load_power_w"), [(_local(T0), "On", 1000)]), 5, now=NOW)
+    assert "Grid Status" in str(e.value) and "column mapping" in str(e.value), str(e.value)
+
+
+def test_the_guess_reads_a_vendor_export_and_its_mapping_imports_the_units_and_signs(company):
+    """The mapping step's guess names each column's key and unit from its header (with the first cells); confirmed, with the battery's sign reversed,
+    it imports the vendor file in watts with the product's signs, On/Off read as the grid signal."""
+    sid = _site("Vendor mapped")
+    t = T0 + 9 * 3600
+    body = _vendor(t)
+    g = telemetry.guess_mapping(body.decode()[:4000])
+    cols = {c["name"]: c for c in g["columns"]}
+    assert {n: (c["key"], c["unit"]) for n, c in cols.items()} == {
+        "Timestamp": ("ts", None), "Grid Status": ("grid_present", None), "Load (kW)": ("load_power_w", "kW"), "PV (kW)": ("pv_power_w", "kW"),
+        "SOC (%)": ("battery_soc_bms_pct", "%"), "Battery Power (kW)": ("battery_power_w", "kW")}
+    assert cols["Load (kW)"]["sample"][:1] == ["22.5"] and g["missing"] == [] and g["delimiter"] == "," and g["ts_format"] == "auto"
+    assert any("inverter_mode_active" in n for n in g["notes"])
+    mapping = {"columns": {c["name"]: {"key": c["key"], "unit": c["unit"], "reverse": c["name"].startswith("Battery")} for c in g["columns"]},
+               "ts_format": g["ts_format"]}
+    res = telemetry.import_csv(sid, body, 5, mapping=mapping, now=NOW)
+    assert res["rows"] == 60 and res["status"] == "done", res
+    d = telemetry.raw(sid, t, t + 3600, ("load_power_w", "pv_power_w", "battery_power_w", "battery_soc_bms_pct", "grid_present"))
+    assert np.all(d["load_power_w"] == 22500) and np.all(d["pv_power_w"] == 15000) and np.all(d["battery_power_w"] == -4000)
+    assert np.all(d["battery_soc_bms_pct"] == 70) and d["grid_present"][0] == 0 and d["grid_present"][1] == 1
+    assert any("column mapping" in line for line in res["log"]), res["log"]
+
+
+def test_a_state_of_charge_as_a_fraction_is_read_as_percent_through_the_mapping(company):
+    sid = _site("Fraction")
+    t = T0 + 9 * 3600
+    body = _file(("ts", "grid_present", "soc"), [(_local(t + 60 * i), 1, 0.65) for i in range(60)])
+    g = telemetry.guess_mapping(body.decode())
+    assert {c["name"]: (c["key"], c["unit"]) for c in g["columns"]}["soc"] == ("battery_soc_bms_pct", "fraction")
+    telemetry.import_csv(sid, body, 5, mapping={"columns": {"soc": {"key": "battery_soc_bms_pct", "unit": "fraction"}}}, now=NOW)
+    assert np.all(telemetry.raw(sid, t, t + 3600, ("battery_soc_bms_pct",))["battery_soc_bms_pct"] == 65)
+
+
+@pytest.mark.parametrize("fmt", ["dmy", "mdy"])
+def test_day_first_and_month_first_dates_are_read_in_the_order_the_mapping_chooses(company, fmt):
+    sid = _site(f"Dates {fmt}")
+    t = T0 + 9 * 3600  # 5 Nov 2026, 09:00 Karachi time
+
+    def stamp(ts: int) -> str:
+        x = datetime.fromtimestamp(ts, PKT)
+        return x.strftime("%d/%m/%Y %H:%M" if fmt == "dmy" else "%m/%d/%Y %I:%M %p")
+    body = _file(("Time", "Grid", "Load"), [(stamp(t + 60 * i), 1, 40000) for i in range(30)])
+    g = telemetry.guess_mapping(body.decode())
+    assert g["ts_format"] == "dmy"  # 05/11 and 11/05 cannot be told apart: day first, as Pakistan writes dates, and said so
+    assert g["ts_ambiguous"] is True
+    res = telemetry.import_csv(sid, body, 5, mapping={"columns": {"Time": {"key": "ts"}, "Grid": {"key": "grid_present"}, "Load": {"key": "load_power_w"}},
+                                                       "ts_format": fmt}, now=NOW)
+    assert (res["rows"], res["from_ts"], res["to_ts"]) == (30, t, t + 29 * 60)
+    assert {c["name"]: c["key"] for c in g["columns"]} == {"Time": "ts", "Grid": "grid_present", "Load": "load_power_w"}  # 1s: the signal
+    if fmt == "dmy":
+        later = _file(("Time", "Grid"), [("13/11/2026 09:00", 1)])
+        assert (telemetry.guess_mapping(later.decode())["ts_format"], telemetry.guess_mapping(later.decode())["ts_ambiguous"]) == ("dmy", False)
+
+
+def test_a_semicolon_file_with_decimal_commas_is_read(company):
+    """C8_semicolon.csv: a European logger's export, ';' between cells and ',' before the decimals; refused before as having no ts column."""
+    sid = _site("Semicolon")
+    t = T0 + 9 * 3600
+    body = "\n".join(["ts;grid_present;load_power_w;pv_power_w"] + [f"{_local(t + 60 * i)};1;40000,5;1500,25" for i in range(30)]).encode()
+    res = telemetry.import_csv(sid, body, 5, now=NOW)
+    assert res["rows"] == 30
+    d = telemetry.raw(sid, t, t + 1800, ("load_power_w", "pv_power_w"))
+    assert np.all(d["load_power_w"] == 40000.5) and np.all(d["pv_power_w"] == 1500.25)
+    g = telemetry.guess_mapping(body.decode())
+    assert (g["delimiter"], g["decimal"]) == (";", ",")
+    # the upload's window check splits the header the same way: a semicolon file dated 1971 is refused there
+    from gridlytics import routes_telemetry
+    with pytest.raises(ValueError, match="before 2015"):
+        routes_telemetry._upload_window(b"ts;grid_present\n1971-01-02T00:00:00;1\n", 5)
+
+
+def test_two_columns_read_as_one_key_are_refused(company):
+    sid = _site("Twice")
+    body = _file(("load_power_w", "Load (kW)", "ts", "grid_present"), [(1000, 1, _local(T0), 1)])
+    with pytest.raises(ValueError, match="load_power_w"):
+        telemetry.import_csv(sid, body, 5, mapping={"columns": {"Load (kW)": {"key": "load_power_w", "unit": "kW"}}}, now=NOW)
+    with pytest.raises(ValueError, match="unit"):
+        telemetry.import_csv(sid, _vendor(T0), 5, mapping={"columns": {"Load (kW)": {"key": "load_power_w", "unit": "%"}}}, now=NOW)
+
+
+def test_the_mapping_is_saved_per_site_and_an_upload_reads_with_it(world):
+    """GET, guess and PUT /telemetry/mapping, and POST /telemetry/upload?mapping=saved: the operator saves the vendor file's mapping once and uploads
+    with it; a viewer reads the mapping but cannot save one; a mapping naming an unknown key is one sentence; another site has none."""
+    c = world.owner
+    op, viewer = world.role("operator"), world.role("viewer")
+    sid = c.post("/api/sites", json={"name": "Mapped"}).json()["id"]
+    other = c.post("/api/sites", json={"name": "Unmapped"}).json()["id"]
+    start = (int(datetime.now(timezone.utc).timestamp()) // 86400 - 2) * 86400
+    body = _vendor(start, stamp=lambda ts: datetime.fromtimestamp(ts, timezone.utc).strftime("%d/%m/%Y %H:%M"))
+    first = c.get(f"/api/sites/{sid}/telemetry/mapping")
+    assert first.status_code == 200 and first.json()["mapping"] is None
+    keys = {k["key"]: k for k in first.json()["keys"]}
+    assert keys["load_power_w"]["units"] == ["W", "kW", "MW"] and keys["battery_power_w"]["signed"] and keys["ts"]["required"]
+    up = op.post(f"/api/sites/{sid}/telemetry/upload", params={"tz_offset_h": 0}, content=body, headers={"content-type": "text/csv"})
+    assert up.status_code == 422 and "Timestamp" in up.json()["detail"], up.text
+    g = op.post(f"/api/sites/{sid}/telemetry/mapping/guess", json={"head": body.decode()[:2000]})
+    assert g.status_code == 200, g.text
+    guess = g.json()
+    assert guess["ts_format"] == "dmy" and guess["saved"] is False
+    mapping = {"columns": {x["name"]: {"key": x["key"], "unit": x["unit"], "reverse": x["name"].startswith("Battery")} for x in guess["columns"]},
+               "ts_format": guess["ts_format"]}
+    assert viewer.put(f"/api/sites/{sid}/telemetry/mapping", json=mapping).status_code == 403
+    assert viewer.post(f"/api/sites/{sid}/telemetry/mapping/guess", json={"head": "ts"}).status_code == 403
+    bad = op.put(f"/api/sites/{sid}/telemetry/mapping", json={"columns": {"Load": {"key": "load_kw"}}})
+    assert bad.status_code == 422 and "load_kw" in bad.json()["detail"], bad.text
+    assert op.put(f"/api/sites/{sid}/telemetry/mapping", json={"columns": {"A": {"key": "ts"}}, "extra": 1}).status_code == 422
+    saved = op.put(f"/api/sites/{sid}/telemetry/mapping", json=mapping)
+    assert saved.status_code == 200 and saved.json()["mapping"]["columns"]["Load (kW)"] == {"key": "load_power_w", "unit": "kW", "reverse": False}
+    assert viewer.get(f"/api/sites/{sid}/telemetry/mapping").json()["mapping"] == saved.json()["mapping"]
+    again = op.post(f"/api/sites/{sid}/telemetry/mapping/guess", json={"head": body.decode()[:2000]}).json()
+    assert again["saved"] is True and {x["name"]: x["from"] for x in again["columns"]}["Battery Power (kW)"] == "saved"
+    assert {x["name"]: x["reverse"] for x in again["columns"]}["Battery Power (kW)"] is True
+    up = op.post(f"/api/sites/{sid}/telemetry/upload", params={"tz_offset_h": 0, "mapping": "saved"}, content=body,
+                 headers={"content-type": "text/csv"})
+    assert up.status_code == 200, up.text
+    assert (up.json()["rows"], up.json()["from_ts"]) == (60, start)
+    with world.use():
+        d = telemetry.raw(sid, start, start + 3600, ("load_power_w", "battery_power_w"))
+    assert np.all(d["load_power_w"] == 22500) and np.all(d["battery_power_w"] == -4000)
+    none = op.post(f"/api/sites/{other}/telemetry/upload", params={"mapping": "saved"}, content=body, headers={"content-type": "text/csv"})
+    assert none.status_code == 422 and "mapping" in none.json()["detail"], none.text
+    assert op.post(f"/api/sites/{sid}/telemetry/upload", params={"mapping": "mine"}, content=body,
+                   headers={"content-type": "text/csv"}).status_code == 422

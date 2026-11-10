@@ -6,11 +6,12 @@ import json
 import math
 import re
 from datetime import datetime, timedelta, timezone
+from typing import Annotated, Literal
 
 import numpy as np
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import PlainTextResponse
-from pydantic import Field
+from pydantic import Field, StringConstraints
 from starlette.concurrency import run_in_threadpool
 
 from . import alerts, auth, battery, forecast, plans, sites, store, telemetry
@@ -65,7 +66,7 @@ UPLOAD_EARLIEST = datetime(2015, 1, 1, tzinfo=timezone.utc)
 UPLOAD_MAX_DAYS = 400
 
 
-def _upload_window(content: bytes, tz_offset_h: float, ts_format: str = "auto") -> None:
+def _upload_window(content: bytes, tz_offset_h: float, ts_format: str = "auto", mapping: dict | None = None) -> None:
     """Refuses (ValueError, in words) a file whose header names a column twice, a file with a row before 2015, a row more than a day ahead, or rows
     spanning more than UPLOAD_MAX_DAYS. Reads only the ts column, as the import reads it; rows whose ts does not parse are left to the import, which skips
     them. The import reads rows by column name and keeps the last of two columns with one name, so a repeated name is refused outright: this check and
@@ -73,14 +74,16 @@ def _upload_window(content: bytes, tz_offset_h: float, ts_format: str = "auto") 
     import csv
     import io
     text = content.decode("utf-8-sig", errors="replace")
-    reader = csv.reader(io.StringIO(text))
+    # the file's own separator and the column the mapping reads as ts, as the import reads them (flow-telemetry-plan-control-12)
+    reader = csv.reader(io.StringIO(text), delimiter=telemetry._dialect(text)[0])
     head = next(reader, None) or []
     twice = sorted({h for h in head if h.strip() and head.count(h) > 1})
     if twice:
         raise ValueError(f"The header names {', '.join(twice[:5])} more than once: give each column once and upload again")
-    if "ts" not in head:
+    ts_name = telemetry.ts_column(head, mapping)
+    if ts_name is None:
         return
-    col = head.index("ts")
+    col = head.index(ts_name)
     try:
         timezone(timedelta(hours=tz_offset_h))
     except (ValueError, OverflowError):
@@ -122,13 +125,15 @@ def _takes_file_name() -> bool:
         return False
 
 
-def _import(site_id: str, body: bytes, tz_offset_h: float, file_name: str | None = None) -> dict:
-    _upload_window(body, tz_offset_h)
+def _import(site_id: str, body: bytes, tz_offset_h: float, file_name: str | None = None, mapping: dict | None = None) -> dict:
+    m = telemetry.mapping_of(mapping) if mapping else None
+    _upload_window(body, tz_offset_h, m["ts_format"] if m else "auto", m)
+    extra = {"mapping": m} if m else {}
     try:
         # the uploaded file's name goes with the import (the quality page's imports rows) where telemetry.import_csv takes it
         if file_name and _takes_file_name():
-            return telemetry.import_csv(site_id, body, tz_offset_h, file_name=file_name)
-        return telemetry.import_csv(site_id, body, tz_offset_h)
+            return telemetry.import_csv(site_id, body, tz_offset_h, file_name=file_name, **extra)
+        return telemetry.import_csv(site_id, body, tz_offset_h, **extra)
     except (OverflowError, OSError) as exc:
         raise ValueError(f"A row's time cannot be read: {exc}") from None
 
@@ -145,10 +150,18 @@ def _clean_file_name(name) -> str | None:
 
 
 @router.post("/api/sites/{site_id}/telemetry/upload")
-async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0, file_name: str | None = None):
-    """A CSV upload: the file as the request body (its name in `file_name`), or as the file part of a multipart form (its name from the part)."""
+async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0, file_name: str | None = None, mapping: str | None = None):
+    """A CSV upload: the file as the request body (its name in `file_name`), or as the file part of a multipart form (its name from the part). With
+    `mapping=saved` the file is read through the site's saved column mapping (PUT /telemetry/mapping; flow-telemetry-plan-control-12)."""
     auth.need("upload_data", "Uploading data")
     await run_in_threadpool(site_or_404, site_id)
+    saved = None
+    if mapping is not None:
+        if mapping != "saved":
+            raise Refusal(422, "The mapping is 'saved' (the site's saved column mapping) or left out", "invalid")
+        saved = await run_in_threadpool(telemetry.saved_mapping, site_id)
+        if saved is None:
+            raise Refusal(422, "No column mapping is saved for this site yet: save one first, then upload with it", "invalid")
     body = await request.body()
     ctype = request.headers.get("content-type", "")
     if ctype.startswith("multipart/form-data"):
@@ -164,11 +177,73 @@ async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0, file_
     file_name = _clean_file_name(file_name)
     try:
         # parsed and aggregated on a worker thread, never on the event loop that answers every company's requests
-        res = await run_in_threadpool(_import, site_id, body, tz_offset_h, file_name)
+        res = await run_in_threadpool(_import, site_id, body, tz_offset_h, file_name, saved["mapping"] if saved else None)
     except ValueError as exc:
         raise bad(exc) from None
-    await run_in_threadpool(store.audit, auth.actor(), "uploaded telemetry", site_id, {"rows": res["rows"], "gaps": res["gaps"], "file_name": file_name})
+    await run_in_threadpool(store.audit, auth.actor(), "uploaded telemetry", site_id,
+                            {"rows": res["rows"], "gaps": res["gaps"], "file_name": file_name, "mapping": saved is not None})
     return res
+
+
+# ------------------------------------------------------------------------------------------------ the CSV column mapping (plan Part 7.5, UI-06)
+
+class MappedColumn(Strict):
+    #: the key the column is read as (telemetry.CSV_COLUMNS); none: the column is not read
+    key: str | None = Field(None, max_length=40)
+    #: the unit the column is written in (telemetry.UNITS); none: the key's stored unit
+    unit: str | None = Field(None, max_length=12)
+    #: the file's sign is the opposite of the product's (battery discharge and grid import positive)
+    reverse: bool = False
+
+
+class MappingIn(Strict):
+    columns: dict[Annotated[str, StringConstraints(min_length=1, max_length=120)], MappedColumn] = Field(..., max_length=80)
+    ts_format: Literal["auto", "dmy", "mdy"] = "auto"
+
+
+class GuessIn(Strict):
+    #: the file's first lines (the web app sends its first 64 KB)
+    head: str = Field(..., min_length=1, max_length=65536)
+
+
+def _mapping_answer(site_id: str, saved: dict | None) -> dict:
+    keys = [{"key": k, "units": list(telemetry.UNITS.get(k, {})), "signed": k in telemetry.SIGNED, "required": k in telemetry.REQUIRED}
+            for k in telemetry.CSV_COLUMNS]
+    return {"mapping": saved["mapping"] if saved else None, "updated": saved["updated"] if saved else None, "by": saved["by"] if saved else None,
+            "keys": keys, "ts_formats": list(telemetry.TS_FORMATS)}
+
+
+@router.get("/api/sites/{site_id}/telemetry/mapping")
+def mapping_get(site_id: str):
+    """The site's saved CSV column mapping ({columns: {file column: {key, unit, reverse}}, ts_format}, or null), when and by whom it was saved, and the
+    vocabulary the mapping step offers: each key a file may carry with its units, whether its sign may be reversed and whether it is required."""
+    site_or_404(site_id)
+    return _mapping_answer(site_id, telemetry.saved_mapping(site_id))
+
+
+@router.put("/api/sites/{site_id}/telemetry/mapping")
+def mapping_put(site_id: str, inp: dict = Body(...)):
+    """Saves the site's CSV column mapping (upload_data), replacing the one saved before; an upload reads with it when sent with mapping=saved."""
+    auth.need("upload_data", "Saving the CSV column mapping")
+    site_or_404(site_id)
+    body = check(MappingIn, inp)
+    try:
+        saved = telemetry.save_mapping(site_id, body.model_dump(), auth.actor())
+    except ValueError as exc:
+        raise bad(exc) from None
+    store.audit(auth.actor(), "saved the CSV column mapping", site_id, {"columns": len(saved["mapping"]["columns"])})
+    return _mapping_answer(site_id, saved)
+
+
+@router.post("/api/sites/{site_id}/telemetry/mapping/guess")
+def mapping_guess(site_id: str, inp: dict = Body(...)):
+    """The mapping step's first answer for a file's head (telemetry.guess_mapping): its separator, each column's key, unit and sign (from the saved
+    mapping, its name or its header's words) with its first cells, the date order, the keys missing and notes. Nothing is stored."""
+    auth.need("upload_data", "Reading a file's columns")
+    site_or_404(site_id)
+    body = check(GuessIn, inp)
+    saved = telemetry.saved_mapping(site_id)
+    return telemetry.guess_mapping(body.head, saved["mapping"] if saved else None)
 
 
 @router.get("/api/sites/{site_id}/telemetry/export.csv")
