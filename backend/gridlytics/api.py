@@ -445,10 +445,21 @@ def _member_out(m: dict) -> dict:
             "seen": seen, "grants": m["grants"]}
 
 
-def _not_seen() -> list[dict]:
+def _not_seen(request: Request | None = None) -> list[dict]:
+    """The people the company has who may sign in (an active membership) and have no member row here yet, as the users list says a member, with the role
+    their first sign-in would give them (companies._first_sight): the owner an administrator, pinned; else an unused preset's role; else a viewer. Local mode:
+    platform.db's memberships. Supabase mode (lifted from solarlytics-backend c853130, api.py `_not_seen`; audit parity-supabase-auth-05): the project's
+    rpc/company_list_members, which answers only the company's owner or an admin, asked with the caller's own token; for anyone else nobody, as while the
+    project does not answer: the people seen are listed then."""
     company_id = auth.company.get()["id"]
-    people = [{"id": m["user_id"], "email": m["email"], "name": m["name"], "company_role": m["role"]}
-              for m in platformdb.company_members(company_id) if m["status"] == "active" and not m["disabled"]]
+    if identity.MODE == "local":
+        people = [{"id": m["user_id"], "email": m["email"], "name": m["name"], "company_role": m["role"]}
+                  for m in platformdb.company_members(company_id) if m["status"] == "active" and not m["disabled"]]
+    elif request is not None and (auth.current.get() or {}).get("company_role") in ("owner", "admin"):
+        bearer = request.headers.get("authorization") or ""
+        people = _project_members(bearer[7:].strip(), company_id)
+    else:
+        people = []
     known = {m["user_id"] for m in store_members.members()}
     out = []
     for p in people:
@@ -459,6 +470,49 @@ def _not_seen() -> list[dict]:
         role, source = ("admin", "owner") if owner else (preset["role"], "set") if preset else (companies.MEMBER_ROLE, "default")
         out.append({"id": p["id"], "email": p["email"], "name": p["name"], "role": role, "role_source": source, "company_role": p["company_role"],
                     "disabled": False, "disabled_reason": "", "first_seen": None, "last_seen": None, "seen": False, "grants": []})
+    return out
+
+
+#: The most the project's list of a company's members may weigh: some hundreds of bytes a person
+MAX_MEMBERS_BYTES = 1024 * 1024
+
+
+def _project_members(token: str, company_id: str) -> list[dict]:
+    """The company's active memberships from the Supabase project's rpc/company_list_members (Solarlytics' supabase/ migration, which founder-console ports),
+    asked with the person's own token and the project's public anon key, never the service-role key, which is the founder console's: each {id, email, name,
+    company_role}. Nobody when the project refuses (the caller is not the company's owner or an admin there), cannot be reached, or answers something that is
+    not the list (lifted from solarlytics-backend c853130, api.py `_project_members`)."""
+    import http.client
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(f"{identity.SUPABASE_URL}/rest/v1/rpc/company_list_members", data=json.dumps({"p_company_id": company_id}).encode(),
+                                     method="POST", headers={"apikey": identity.SUPABASE_ANON_KEY, "Authorization": f"Bearer {token}",
+                                                             "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with companies._urlopen(request, companies.FETCH_TIMEOUT) as res:
+            body = res.read(MAX_MEMBERS_BYTES + 1)
+        rows = json.loads(body.decode("utf-8")) if len(body) <= MAX_MEMBERS_BYTES else None
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        log.warning("the members of company %s could not be read from %s: it answered %s", company_id, identity.SUPABASE_URL, exc.code)
+        return []
+    # as companies._fetch_context: an address that cannot be reached, a broken answer or one that is not JSON lists the people seen, never a 500
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        log.warning("the members of company %s could not be read from %s: %s", company_id, identity.SUPABASE_URL, str(exc) or type(exc).__name__)
+        return []
+    if not isinstance(rows, list):
+        log.warning("the members of company %s could not be read from %s: the answer is not a list", company_id, identity.SUPABASE_URL)
+        return []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict) or r.get("status") != "active" or r.get("role") not in platformdb.COMPANY_ROLES:
+            continue
+        user_id, email = companies._uuid(r.get("user_id")), r.get("email")
+        if user_id is None or not isinstance(email, str) or not email.strip():
+            continue
+        email = email.strip().lower()
+        name = " ".join(n.strip() for n in (r.get("first_name"), r.get("last_name")) if isinstance(n, str) and n.strip())[:80]
+        out.append({"id": user_id, "email": email, "name": name or email, "company_role": r["role"]})
     return out
 
 
@@ -484,7 +538,7 @@ def _not_in_company(m: dict, places: dict[str, dict] | None) -> None:
 
 
 @app.get("/api/users")
-def users_list():
+def users_list(request: Request):
     """The company's people: its members, then the people it has who have not signed in yet. In local mode a person the founder removed from the company is
     not listed (audit flow-reports-alerts-members-keys-07); one whose place is suspended is, switched off. People are added and removed by OnyxLeaf, never
     here (accounts are preassigned)."""
@@ -492,7 +546,7 @@ def users_list():
     if auth.company.get() is None:
         return []
     places = _registry_places()
-    return [*(_member_out(m) for m in store_members.members() if places is None or m["user_id"] in places), *_not_seen()]
+    return [*(_member_out(m) for m in store_members.members() if places is None or m["user_id"] in places), *_not_seen(request)]
 
 
 def _account(inp) -> dict:
@@ -535,7 +589,7 @@ def users_edit(user_id: str, request: Request = None, inp: dict = Body(...)):
     if (held_row := store_members.member(user_id)) is not None:
         _not_in_company(held_row, _registry_places())
     else:
-        person = next((p for p in _not_seen() if p["id"] == user_id), None)
+        person = next((p for p in _not_seen(request) if p["id"] == user_id), None)
         if person is None:
             raise HTTPException(status_code=404, detail="No such user")
     by = auth.actor()

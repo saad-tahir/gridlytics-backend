@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from gridlytics import sites
 
 from test_fix_api import world  # noqa: F401  (world is a fixture)
@@ -716,3 +718,145 @@ def test_the_api_writes_its_log_in_the_data_folder_in_use(tmp_path):
     run = subprocess.run([sys.executable, "-c", said], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120)
     assert run.returncode == 0, run.stderr
     assert (default / "logs" / "gridlytics.log").exists()
+
+
+# ------------------------------------------------------------------------------------------------ parity-supabase-auth-05 (Solarlytics' supabase branch of the users list)
+
+#: Made up for the tests: never real secrets or keys; the project's address is under .invalid, which no resolver answers, and nothing is fetched from it
+_PROJECT_SECRET = "test-only-project-secret-0123456789abcdefgh"
+_ANON = "anon-key-made-up-for-the-tests"
+_URL = "https://gridlytics-test.invalid"
+_NORTH = "6f1c1a52-3d0c-4b8e-9d2a-7c1f5e2b9a10"
+
+
+class _Answer:
+    def __init__(self, body: bytes):
+        import io
+        self.stream = io.BytesIO(body)
+
+    def read(self, n=-1):
+        return self.stream.read(n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.stream.close()
+
+
+
+@pytest.fixture
+def supa(tmp_path, monkeypatch):
+    """Supabase mode (lifted from solarlytics-backend c853130, tests/test_members_b4b.py's `supa`): the project's HS256 secret, a stand-in for
+    rpc/get_my_context (each person's context from `roles`, their company role in Northwind), and one for the HTTP call of rpc/company_list_members
+    (`requests` and the `rows` it answers, bytes to answer as they are, or an exception to raise)."""
+    import jwt
+    import types
+    from gridlytics import companies, identity, store
+    from gridlytics import platform as platformdb
+    monkeypatch.delenv("GRIDLYTICS_DATA_DIR", raising=False)
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "gridlytics.db")
+    monkeypatch.setattr(identity, "MODE", "supabase")
+    monkeypatch.setattr(identity, "SUPABASE_URL", _URL)
+    monkeypatch.setattr(identity, "SUPABASE_ANON_KEY", _ANON)
+    monkeypatch.setattr(identity, "SUPABASE_JWT_SECRET", _PROJECT_SECRET)
+    monkeypatch.setattr(identity, "AUDIENCE", "authenticated")
+    identity.clear_cache()
+    companies.clear_cache()
+    state = types.SimpleNamespace(roles={}, names={}, requests=[], rows=[])
+
+    def context(token):
+        sub = jwt.decode(token, options={"verify_signature": False})["sub"]
+        if sub not in state.roles:
+            return None
+        return {"profile": {"id": sub, "email": state.names[sub][0], "name": state.names[sub][1]},
+                "memberships": [{"role": state.roles[sub], "status": "active", "company": {"id": _NORTH, "name": "Northwind", "verified": True}}]}
+
+    def urlopen(request, timeout):
+        state.requests.append((request, timeout))
+        if isinstance(state.rows, BaseException):
+            raise state.rows
+        return _Answer(state.rows if isinstance(state.rows, bytes) else json.dumps(state.rows).encode())
+
+    monkeypatch.setattr(companies, "_fetch_context", context)
+    monkeypatch.setattr(companies, "_urlopen", urlopen)
+    platformdb.create_company("Northwind", enabled=True, seats=100, db_file=tmp_path / "northwind.db", company_id=_NORTH)
+    yield state
+    identity.clear_cache()
+    companies.clear_cache()
+
+
+def _supa_client(state, email: str, name: str, company_role: str):
+    import time
+    import uuid
+    import jwt
+    from fastapi.testclient import TestClient
+    from gridlytics import api
+    sub = str(uuid.uuid4())
+    state.roles[sub], state.names[sub] = company_role, (email, name)
+    now = int(time.time())
+    claims = {"iss": f"{_URL}/auth/v1", "aud": "authenticated", "sub": sub, "email": email, "phone": "", "role": "authenticated", "iat": now,
+              "exp": now + 3600, "aal": "aal1", "amr": [{"method": "password", "timestamp": now}], "session_id": str(uuid.uuid4()), "is_anonymous": False,
+              "app_metadata": {"provider": "email", "providers": ["email"]}, "user_metadata": {}}
+    token = jwt.encode(claims, _PROJECT_SECRET, algorithm="HS256")
+    return TestClient(api.app, headers={"Authorization": f"Bearer {token}", "X-Gridlytics-Company": _NORTH}), sub, token
+
+
+def _project_row(sub: str, email: str, first, last, role: str = "member", status: str = "active") -> dict:
+    import uuid
+    return {"membership_id": str(uuid.uuid4()), "user_id": sub, "email": email, "first_name": first, "last_name": last, "avatar_url": None, "role": role,
+            "status": status, "created_at": "2026-10-24T10:00:00+00:00", "activated_at": "2026-10-24T10:00:00+00:00"}
+
+
+def _people(c) -> dict:
+    r = c.get("/api/users")
+    assert r.status_code == 200, r.text
+    return {u["email"]: u for u in r.json()}
+
+
+def test_supabase_mode_lists_the_people_not_seen_yet_from_the_project_for_its_owner_or_admin(supa):
+    """In supabase mode platform.db holds no memberships (the project does), so nobody who had not signed in was listed and a role could not be set ahead
+    (404). The users list asks the project's rpc/company_list_members with the caller's own token, for the company's owner or an admin only."""
+    import uuid
+    from gridlytics import companies
+    owner, owner_sub, owner_token = _supa_client(supa, "saad@example.test", "Saad Khan", "owner")
+    new, waiting = str(uuid.uuid4()), str(uuid.uuid4())
+    supa.rows = [_project_row(owner_sub, "saad@example.test", "Saad", "Khan", "owner"), _project_row(new, "new@example.test", "Nadia", "New"),
+                 _project_row(waiting, "waiting@example.test", "Wait", None, status="pending"),
+                 _project_row(str(uuid.uuid4()), "off@example.test", "Off", "", status="suspended")]
+    people = _people(owner)
+    assert set(people) == {"saad@example.test", "new@example.test"}
+    assert (people["saad@example.test"]["seen"], people["saad@example.test"]["role_source"]) == (True, "owner")
+    assert {k: people["new@example.test"][k] for k in ("id", "name", "role", "role_source", "company_role", "seen")} == \
+        {"id": new, "name": "Nadia New", "role": "viewer", "role_source": "default", "company_role": "member", "seen": False}
+    # the call: the project's rpc, with the caller's own token and the public key, for this company; never the service-role key
+    (request, timeout), = supa.requests
+    assert (request.full_url, request.get_method(), json.loads(request.data), timeout) == \
+        (f"{_URL}/rest/v1/rpc/company_list_members", "POST", {"p_company_id": _NORTH}, companies.FETCH_TIMEOUT)
+    headers = {k.lower(): v for k, v in request.header_items()}
+    assert (headers["apikey"], headers["authorization"]) == (_ANON, f"Bearer {owner_token}")
+    # a role set ahead of the first sign-in, in supabase mode too
+    r = owner.put(f"/api/users/{new}", json={"role": "operator"})
+    assert r.status_code == 200 and (r.json()["role"], r.json()["seen"], r.json()["email"]) == ("operator", False, "new@example.test"), r.text
+    # a company member made a Gridlytics administrator: the people seen only, and the project is not asked (it answers an owner or an admin)
+    admin, _, admin_token = _supa_client(supa, "maaz@example.test", "Maaz Ali", "member")
+    import identities
+    identities.set_role(admin_token, _NORTH, "admin")
+    supa.requests.clear()
+    assert set(_people(admin)) == {"saad@example.test", "new@example.test", "maaz@example.test"} and supa.requests == []
+
+
+@pytest.mark.parametrize("trouble", ["refused", "down", "garbled", "not rows", "too long"])
+def test_supabase_mode_lists_the_people_seen_when_the_project_does_not_answer_with_its_members(supa, trouble, monkeypatch):
+    import io
+    import urllib.error
+    import uuid
+    from gridlytics import api
+    owner, owner_sub, _ = _supa_client(supa, "saad@example.test", "Saad Khan", "owner")
+    rows = [_project_row(owner_sub, "saad@example.test", "Saad", "Khan", "owner"), _project_row(str(uuid.uuid4()), "new@example.test", "Nadia", "New")]
+    supa.rows = {"refused": urllib.error.HTTPError(_URL, 403, "Forbidden", {}, io.BytesIO(b'{"code":"42501"}')),
+                 "down": urllib.error.URLError("no route"), "garbled": b"not json", "not rows": b'{"rows": 1}', "too long": rows}[trouble]
+    if trouble == "too long":
+        monkeypatch.setattr(api, "MAX_MEMBERS_BYTES", len(json.dumps(rows)) - 1)
+    assert set(_people(owner)) == {"saad@example.test"}
+    assert owner.put(f"/api/users/{uuid.uuid4()}", json={"role": "operator"}).status_code == 404
