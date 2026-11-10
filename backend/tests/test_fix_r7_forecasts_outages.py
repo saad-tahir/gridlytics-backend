@@ -1062,6 +1062,10 @@ def test_the_conformal_table_bins_the_errors_by_the_sky_at_the_issue_time(compan
     assert np.median(clear) == pytest.approx(0.35, abs=0.03) and np.median(over) == pytest.approx(-0.35, abs=0.03)
     assert min(every) == pytest.approx(-0.35, abs=0.03) and max(every) == pytest.approx(0.35, abs=0.03)
     assert tab["days"] >= 14
+    # the issue at midnight follows an overcast day: its first hours read the overcast errors, and the issue says which classes did
+    f = forecast.pv(site, day0)
+    assert f["bands"]["sky"] == "overcast" and "0-2h" in f["bands"]["sky_classes"], f["bands"]
+    assert set(f["bands"]["sky_classes"]) <= set(f["bands"]["classes"])
 
 
 def test_load_bands_turn_conformal_after_a_week_of_stage_1_issues(company):

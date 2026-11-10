@@ -160,7 +160,7 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
             for name in QS:
                 q[name] = np.minimum(cap, q[name] * (1 - w) + cs * scale * k_now * w * (q[name] / np.maximum(q50_0, 1e-6)))
     # stage 1: conformal bands from the stored issues' errors where a class has enough of them (plan Part 5.1), around the median above
-    bands = {"method": "empirical" if stage == 1 else "prior", "sky": None, "classes": {}}
+    bands = {"method": "empirical" if stage == 1 else "prior", "sky": None, "classes": {}, "sky_classes": []}
     if stage == 1:
         day = slice(max(0, len(g["ts"]) - 1440), len(g["ts"]))  # the sky reads at most the last 24 hours
         csd = solar.pv_power(g["ts"][day], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"][day]))
@@ -298,15 +298,19 @@ def _conformal(site: dict, kind: str, day0: int) -> dict:
 def _apply_conformal(q: dict, table: dict, sky: str | None, scale: np.ndarray, cap: np.ndarray | None = None, kind: str = "pv") -> dict:
     """Set the bands of every step whose horizon class has enough errors (see above) to the median plus scale times the errors' conformal quantiles,
     in place, each band kept on its side of the median and within [0, cap]. Returns the issue's `bands`: `method` conformal (some class), empirical (a
-    stage-1 issue without) or prior (stage 0), the issue's `sky` class (PV) and `classes`, the error count of each conformal horizon class."""
-    out = {"method": "empirical", "sky": sky, "classes": {}}
+    stage-1 issue without) or prior (stage 0), the issue's `sky` class (PV), `classes`, the error count of each conformal horizon class, and
+    `sky_classes`, those of them read from the errors under the issue's own sky (the others from every sky)."""
+    out = {"method": "empirical", "sky": sky, "classes": {}, "sky_classes": []}
     if table["days"] < CONFORMAL_MIN_DAYS[kind]:
         return out
     n = len(q["q50"])
     for name, a, b in HORIZON_CLASSES:
-        r = next((table["by"][c] for c in ((name, sky), (name, None)) if len(table["by"].get(c, ())) >= CONFORMAL_MIN_PAIRS), None)
-        if r is None or a * 4 >= n:
+        c = next((c for c in ((name, sky), (name, None)) if len(table["by"].get(c, ())) >= CONFORMAL_MIN_PAIRS), None)
+        if c is None or a * 4 >= n:
             continue
+        r = table["by"][c]
+        if c[1] is not None:
+            out["sky_classes"].append(name)
         sl = slice(a * 4, min(b * 4, n))
         rq = _conformal_q(r)
         med = q["q50"][sl]
@@ -511,8 +515,8 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     if have_days < 3:
         q = {name: tmpl * (1 + 0.25 * (v - 0.5) / 0.45) for name, v in zip(QS, QV)}
         q["q50"] = tmpl
-        return {"stage": 0, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days, "bands": {"method": "prior", "sky": None, "classes": {}},
-                **crit_info}
+        return {"stage": 0, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days,
+                "bands": {"method": "prior", "sky": None, "classes": {}, "sky_classes": []}, **crit_info}
     # equivalent-day persistence: per target step, the same slot on the last same-day-type days (up to 7); a type with fewer than 2 such days reads
     # the next type of its fallback (DAY_FALLBACK: Eid and a holiday from the off days, a Ramadan or half day from the working days), then the template
     lo15 = np.nanmean(lo[: len(lo) // 15 * 15].reshape(-1, 15), axis=1)
