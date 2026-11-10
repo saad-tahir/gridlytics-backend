@@ -640,12 +640,13 @@ def _flat_series(ts, load: float, pv: float = 0.0, grid: float = 1.0) -> dict:
 
 def test_a_held_mdi_cap_is_shaved_only_down_to_the_slots_floor_never_into_the_reserve_it_holds():
     """twin.simulate shaved to a slot's grid_cap_w in any mode, hold and charge included, down to the BMS floor: a load above the forecast in the
-    hold before the evening peak (Huawei holds the cap with its capacity control) drained the battery the plan held at 90 % to about 43 %. The floor
-    wins: the cap is held only with the energy above the slot's floor."""
+    hold before the evening peak drained the battery the plan held at 90 % to about 43 %. The floor wins: the cap is held only with the energy above
+    the slot's floor. (An edge holds the cap here and runs the slots as compiled; a keyed Huawei, whose capacity control holds it too, discharges
+    at the battery's own power in a discharge period: as_keyed.)"""
     import numpy as np
 
     from gridlytics import twin
-    comp = delivery.compile_mode_a(_peak_day(), "huawei", BAT, 20.0, 10.0, 300.0, site=_mdi_site())
+    comp = delivery.compile_mode_a(_peak_day(), "huawei", BAT, 20.0, 10.0, 300.0, site=_mdi_site("closed_loop"))
     slots = [s for d in comp["days"] for s in d["slots"]]
     hold, dis = slots[0], next(s for s in slots if s["mode"] == "discharge")
     assert hold["mode"] == "hold" and hold["soc_floor_pct"] == 90.0 and hold["grid_cap_w"] == 400_000
@@ -776,3 +777,142 @@ def test_compare_with_native_shows_what_the_outage_reserve_is_worth_in_both_arms
     viewer = world.c["viewer"].get(f"/api/sites/{world.site}/plan/compare").json()
     assert viewer["compare"]["native"]["reserve_short_kwh"] == nat["reserve_short_kwh"]   # energy for every role, never its rupees
     assert "_rs" not in str(viewer) and "short_rs_per_kwh" not in viewer
+
+
+# ------------------------------------------------------------------------------------------------ batch 3: a charge slot's end (engine-delivery-19)
+
+def _late_charge_day() -> list[dict]:
+    """A grid charge 00:00-05:00 at 100 kW from 30 %, a hold to 18:00, the evening discharge (1 MWh battery, 400 kW load): Sungrow's two slots fold
+    the hold into the charge, which then ends its charging at 05:00 (`charge_end`) and holds to 18:00."""
+    return _day_of([("charge_from_grid", 20, 100.0, 0.0), ("hold_for_outage", 52, 0.0, 0.0), ("discharge_peak_window", 24, 0.0, 120.0)], soc0=30.0)
+
+
+def _late_replay(comp: dict, soc0: float = 0.2):
+    """The day replayed from 20 % instead of the planned 30 %: at its planned rate the charge has not reached its target by 05:00."""
+    import numpy as np
+
+    from gridlytics import twin
+    ts = np.arange(T0, T0 + 86400, 60)
+    slots = [s for d in comp["days"] for s in d["slots"]]
+    return ts, twin.simulate(_flat_series(ts, 400.0), twin.slots_policy(slots, ts), twin.plant_of(_grid_site()), soc0)
+
+
+def test_a_charge_slot_stops_charging_at_its_charge_end_where_the_table_or_an_edge_holds_it():
+    """charge_end_ts was informational: the twin kept a charge slot charging to its target past the charge end, into the hours the plan kept free
+    before the peak. An edge stops the charge there, so a replay of its table does too."""
+    comp = delivery.compile_mode_a(_late_charge_day(), "sungrow", {**SMALL, "E0": 300.0}, 20.0, 10.0, None, site=_grid_site("closed_loop"))
+    charge = comp["days"][0]["slots"][0]
+    assert (charge["mode"], charge["end"], charge["charge_end"]) == ("charge_grid", "18:00", "05:00") and "as_keyed" not in charge
+    ts, sim = _late_replay(comp)
+    tail = (ts >= charge["charge_end_ts"]) & (ts < charge["end_ts"])
+    assert float(sim["bat"][tail].min()) >= -1e-9 and float(sim["imp"][tail].max()) == pytest.approx(400.0)   # charged to 18:00's target before
+    assert float(sim["soc"][tail].max() - sim["soc"][tail].min()) < 1e-9                                       # it holds what it charged
+
+
+def test_a_keyed_table_that_cannot_stop_a_charge_early_is_replayed_charging_on_and_says_so():
+    """Sungrow's forced-charge window is the whole slot: a person keys 00:00 to 18:00, and the inverter charges on to the target if it is not there
+    by 05:00. The replay follows the device, and the table says it; the slot carries `as_keyed.charge_end_ts` None."""
+    comp = delivery.compile_mode_a(_late_charge_day(), "sungrow", {**SMALL, "E0": 300.0}, 20.0, 10.0, None, site=_grid_site())
+    charge = comp["days"][0]["slots"][0]
+    assert charge["as_keyed"]["charge_end_ts"] is None
+    ts, sim = _late_replay(comp)
+    tail = (ts >= charge["charge_end_ts"]) & (ts < charge["end_ts"])
+    assert float(sim["bat"][tail].min()) < -50.0                                         # still charging after 05:00, as the device does
+    notes = delivery.vendor_table(comp, 0)["notes"]
+    assert any("planned to end at 05:00" in n and "keeps charging" in n and f"{charge['soc_target_pct']:.0f} %" in n for n in notes), notes
+
+
+def _ce_slots(n_holds: int = 0) -> list[dict]:
+    """A day keyed by hand: a grid charge 00:00-09:00 whose charging ends at 05:00, then the evening discharge from 09:00; `n_holds` more holds
+    split off the discharge's end to fill a brand's slots."""
+    t = lambda h: T0 + int(h * 3600)
+    slots = [{**_slot("00:00", "09:00", "charge_grid", 30, 80, ch=50000), "start_ts": t(0), "end_ts": t(9), "charge_end_ts": t(5), "charge_end": "05:00"}]
+    ends = [9 + 3 * i for i in range(n_holds + 2)][: n_holds + 1] + [24]
+    for i in range(n_holds + 1):
+        a, b = ends[i], ends[i + 1]
+        mode = "discharge" if i == 0 else "hold"
+        slots.append({**_slot(f"{a:02d}:00", "00:00" if b == 24 else f"{b:02d}:00", mode, 25, 80, dis=100000 if mode == "discharge" else None),
+                      "start_ts": t(a), "end_ts": t(b)})
+    return slots
+
+
+def test_the_vendor_tables_key_the_charge_end_where_the_brand_has_a_place_for_it():
+    """Huawei's charge period ends at the charge end (a gap holds after it); a Deye ring with programs to spare keys a hold program there; Voltronic
+    changes its charger priority to solar only there. Where the brand has no place (Sungrow, Growatt, Solis, a full Deye ring), a sentence says the
+    charge runs on."""
+    slots = _ce_slots()
+    hu = _table("huawei", slots)
+    assert hu["rows"][0]["end"] == "05:00" and any("05:00 to 09:00" in n for n in hu["notes"]), hu
+    deye = _table("deye", slots, limits=LIMITS)
+    at5 = next(r for r in deye["rows"] if r["time"] == "05:00")
+    assert (at5["power_w"], at5["soc_pct"], at5["grid_charge"]) == (0, 80, False) and len(deye["rows"]) == 6
+    full = _table("deye", _ce_slots(4), limits=LIMITS)
+    assert not any(r["time"] == "05:00" for r in full["rows"]) and any("planned to end at 05:00" in n for n in full["notes"])
+    volt = _table("voltronic", slots)
+    assert any(r["at"] == "05:00" and (r["output_priority"], r["charger_priority"]) == ("SUB", "OSO") for r in volt["rows"]), volt["rows"]
+    for brand in ("sungrow", "growatt", "solis"):
+        assert any("planned to end at 05:00" in n for n in _table(brand, slots)["notes"]), brand
+    keyed = {b: delivery.as_keyed(b, slots, _compiled(b, slots, limits=LIMITS)) for b in delivery.BRANDS}
+    assert all(keyed[b][0].get("charge_end_ts", "held") == "held" for b in ("huawei", "deye", "voltronic"))
+    assert all(keyed[b][0]["charge_end_ts"] is None for b in ("sungrow", "growatt", "solis"))
+    assert delivery.as_keyed("deye", _ce_slots(4), _compiled("deye", _ce_slots(4), limits=LIMITS))[0]["charge_end_ts"] is None
+
+
+# ------------------------------------------------------------------------------------------------ batch 3: brand profiles in the twin (engine-delivery-21)
+
+def test_a_keyed_table_is_replayed_as_each_brand_runs_it():
+    """TWN-02: native and table replays used one generic inverter for every brand. A table a person keys now carries, per slot, what the brand
+    does in its place (`as_keyed`), from the same facts the vendor table's notes give in words (R6 3.1 to 3.4)."""
+    k = lambda brand: delivery.as_keyed(brand, BUSY, _compiled(brand, limits=LIMITS))
+    # Sungrow: outside its forced-charge windows it is self-consumption down to its one Min SoC (the lowest discharging floor, 25 %)
+    # (and no per-slot discharge power: the battery serves the load at its own)
+    assert k("sungrow") == [{}, {"mode": "self_use", "soc_floor_pct": 25.0}, {"mode": "self_use", "soc_floor_pct": 25.0},
+                            {"soc_floor_pct": 25.0}, {"mode": "self_use", "max_discharge_w": None}, {}]
+    # Huawei: one grid-charge cut-off (80 %) and one discharge cut-off (25 %); outside its periods it does not discharge and surplus PV charges it
+    assert k("huawei") == [{}, {"pv_full": True}, {"mode": "hold", "pv_full": True}, {"soc_floor_pct": 25.0}, {"max_discharge_w": None},
+                           {"soc_target_pct": 80.0}]
+    # Growatt: Battery First windows charge from the grid (the day's flag is on) to one stop SoC; Load First serves the load to one floor
+    assert k("growatt") == [{"soc_target_pct": 95.0}, {"mode": "charge_grid", "grid_charge": True, "soc_target_pct": 95.0},
+                            {"mode": "charge_grid", "grid_charge": True}, {"soc_floor_pct": 25.0},
+                            {"mode": "self_use", "max_discharge_w": None}, {"soc_target_pct": 95.0}]
+    assert k("voltronic")[3] == {"soc_floor_pct": 25.0} and k("solis")[1] == {"mode": "self_use", "soc_floor_pct": 25.0}
+    # Deye: surplus PV charges the battery above a program's capacity
+    assert [x.get("pv_full") for x in k("deye")] == [True, True, True, None, None, True]
+    assert k("other") == [{}] * 6
+
+
+def _solis_site(tier: str) -> dict:
+    return {**_grid_site(tier), "connections": [{"data": {"regime": "net_billing", "sanctioned_load_kw": 800, "export_cap_kw": 0}}]}
+
+
+def test_the_compiled_table_carries_the_brand_profile_only_where_a_person_keys_it_and_every_replay_follows_it():
+    """A hold before the peak on a Solis table keyed by a person runs self-use (Solis cannot hold outside its slots): the replay now drains it, as
+    the device does, where it held at the planned level before. An edge holds it, so a closed-loop table carries no profile."""
+    import numpy as np
+
+    from gridlytics import twin
+    steps = _day_of([("charge_from_grid", 20, 100.0, 0.0), ("hold_for_outage", 52, 0.0, 0.0), ("discharge_peak_window", 24, 0.0, 120.0)], soc0=30.0)
+    keyed = delivery.compile_mode_a(steps, "solis", {**SMALL, "E0": 300.0}, 20.0, 10.0, None, site=_solis_site("advisory_writes"))
+    edge = delivery.compile_mode_a(steps, "solis", {**SMALL, "E0": 300.0}, 20.0, 10.0, None, site=_solis_site("closed_loop"))
+    hold = next(s for s in keyed["days"][0]["slots"] if s["mode"] == "hold")
+    assert hold["as_keyed"]["mode"] == "self_use" and all("as_keyed" not in s for d in edge["days"] for s in d["slots"])
+    ts = np.arange(T0, T0 + 86400, 60)
+    in_hold = (ts >= hold["start_ts"]) & (ts < hold["end_ts"])
+    run = lambda comp: twin.simulate(_flat_series(ts, 400.0), twin.slots_policy([s for d in comp["days"] for s in d["slots"]], ts),
+                                     twin.plant_of(_grid_site()), 0.3)["soc"][in_hold]
+    assert float(run(edge).min()) == pytest.approx(float(run(edge).max()))               # the edge holds
+    assert float(run(keyed).min()) < float(run(edge).min()) - 0.2                         # the keyed Solis serves the load from it
+
+
+def test_a_keyed_deye_stores_surplus_pv_above_a_hold_programs_capacity_instead_of_curtailing_it():
+    import numpy as np
+
+    from gridlytics import twin
+    t = lambda h: T0 + int(h * 3600)
+    hold = {**_slot("00:00", "00:00", "hold", 50, 50), "start_ts": t(0), "end_ts": t(24)}
+    ts = np.arange(T0, T0 + 4 * 3600, 60)
+    series = _flat_series(ts, 50.0, pv=150.0)                                             # 100 kW of surplus at a zero-export site
+    plant = twin.plant_of(_grid_site())
+    plain = twin.simulate(series, twin.slots_policy([hold], ts), plant, 0.5)
+    deye = twin.simulate(series, twin.slots_policy([{**hold, "as_keyed": delivery.as_keyed("deye", [hold], {})[0]}], ts), plant, 0.5)
+    assert float(plain["curtail"].sum()) > 0 and float(deye["curtail"].sum()) == 0.0 and float(deye["soc"][-1]) > 0.8
