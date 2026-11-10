@@ -74,6 +74,10 @@ class SiteFields(Strict):
     #: a site without any grid connection (plan Part 9.3), stored for activation and settings
     off_grid: bool = False
     data_source: DataSource | None = None
+    #: the site's weekly off days and half days (plan Part 5.2's day types for the load forecast; Pakistan's public holidays, Eid and Ramadan come from
+    #: pk_calendar): three-letter weekdays, Sunday off by default
+    off_days: list[Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]] = Field(default_factory=lambda: ["sun"], max_length=7)
+    half_days: list[Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]] = Field(default_factory=list, max_length=7)
 
 
 def _stamp_source(data: dict, before: dict | None, by: str) -> None:

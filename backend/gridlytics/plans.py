@@ -406,9 +406,11 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     if res.get("sol") is not None and len(res["sol"]["G"]) != p["T"]:
         p = optimise.shorten(p, len(res["sol"]["G"]))  # the relaxed retry solved a shorter horizon: steps, slots and the guard follow it
     brand = ((site.get("assets") or {}).get("inverter") or {}).get("brand", "deye")
-    stage = min(bundle["pv"]["stage"], bundle["load"]["stage"])
+    # a kind that does not apply to the site (no PV, an off-grid site's outages) has no stage and is left out (forecast.not_applicable)
+    stages = {k: bundle[k]["stage"] for k in ("pv", "load", "outage") if bundle[k].get("stage") is not None}
+    stage = min(v for k, v in stages.items() if k in ("pv", "load"))
     tier = site.get("tier", "monitor")
-    summary = {"stage": stage, "stages": {"pv": bundle["pv"]["stage"], "load": bundle["load"]["stage"], "outage": bundle["outage"]["stage"]},
+    summary = {"stage": stage, "stages": stages,
                "tier": tier, "recommendation": tier == "monitor", "brand": brand, "notes": res.get("notes", []),
                "outage_now": bundle["outage"].get("observed"), "adherence": bundle["outage"].get("adherence"),
                "icp": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in (p.get("icp") or {}).items()},

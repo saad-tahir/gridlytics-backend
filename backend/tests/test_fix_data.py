@@ -98,9 +98,11 @@ def test_minute_grid_and_the_forecast_page_take_a_bound_inside_a_minute(company)
     now = int(datetime.now(timezone.utc).timestamp())
     bt = forecast.align(now)
     telemetry.ingest(sid, [{"ts": m, "grid_present": 0, "load_power_w": 2000, "pv_power_w": 0} for m in range(bt, now // 60 * 60 + 60, 60)], "edge")
+    # a grid-connected site with PV: every kind applies (a site without PV, or off grid, has no PV or outage page since round 7, pages-C-12)
+    site = {"id": sid, "assets": {"pv": {"kwp_dc": 10.0, "kw_ac": 10.0}}, "connections": [{"id": "c1", "data": {"regime": "none"}}]}
     for kind in ("load", "outage", "pv"):
         telemetry.save_forecast(sid, kind, bt, 1, "v1.0", {"q50": [1.0] * 192, "p_down": [0.1] * 192})
-        out = forecast.page({"id": sid}, kind)
+        out = forecast.page(site, kind)
         assert out["belief_time"] == bt and isinstance(out["actual"], list)
 
 
