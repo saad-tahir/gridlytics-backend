@@ -11,6 +11,7 @@ reason to refuse the batch. The deviations from U3 are listed in contracts/ems-e
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
@@ -287,6 +288,138 @@ class Capabilities(Envelope):
     @property
     def control_tier(self) -> str:
         return self.tier or (self.edge.control_tier if self.edge else None) or "monitor"
+
+
+# ------------------------------------------------------------------------------------------------ canonical JSON (RFC 8785, the signed bytes)
+
+def _number(x) -> str:
+    """A JSON number as RFC 8785 3.2.2.3 writes it: the IEEE 754 double's shortest form by ECMAScript's Number.prototype.toString (20.0 is "20",
+    1e-05 is "0.00001", 1e21 is "1e+21"). An integer outside a double's exact range is that double, as a JavaScript or Go edge reads it."""
+    if isinstance(x, int) and -(2 ** 53) <= x <= 2 ** 53:
+        return str(x)
+    try:
+        x = float(x)
+    except OverflowError:
+        raise ValueError("canonical JSON: a number past a double's range") from None
+    if not math.isfinite(x):
+        raise ValueError("canonical JSON: NaN and Infinity are not JSON")
+    if x == 0:
+        return "0"
+    if x < 0:
+        return "-" + _number(-x)
+    mantissa, _, exp = repr(x).partition("e")              # Python's repr is the shortest form that reads back as the same double
+    whole, _, frac = mantissa.partition(".")
+    digits = (whole + frac).lstrip("0")
+    trimmed = digits.rstrip("0")
+    k = len(trimmed)
+    n = k + int(exp or 0) - len(frac) + (len(digits) - k)  # x = trimmed * 10 ** (n - k)
+    if k <= n <= 21:
+        return trimmed + "0" * (n - k)
+    if 0 < n <= 21:
+        return trimmed[:n] + "." + trimmed[n:]
+    if -6 < n <= 0:
+        return "0." + "0" * -n + trimmed
+    e = n - 1
+    return (trimmed[0] + ("." + trimmed[1:] if k > 1 else "")) + "e" + ("+" if e >= 0 else "-") + str(abs(e))
+
+
+def _canon(v, out: list[str]) -> None:
+    if v is None or v is True or v is False:
+        out.append("null" if v is None else "true" if v else "false")
+    elif isinstance(v, str):
+        # RFC 8785 3.2.2.2: ECMAScript's JSON.stringify of a string: the quote, the backslash and the controls escaped (\b \f \n \r \t, the others
+        # as \u00xx in lower case), every other character as itself in UTF-8
+        out.append(json.dumps(v, ensure_ascii=False))
+    elif isinstance(v, (int, float)):
+        out.append(_number(v))
+    elif isinstance(v, dict):
+        if any(not isinstance(k, str) for k in v):
+            raise ValueError("canonical JSON: a member name must be a string")
+        out.append("{")
+        # RFC 8785 3.2.3: members sorted by their names' UTF-16 code units
+        for i, k in enumerate(sorted(v, key=lambda name: name.encode("utf-16-be", "surrogatepass"))):
+            out.append("," if i else "")
+            _canon(k, out)
+            out.append(":")
+            _canon(v[k], out)
+        out.append("}")
+    elif isinstance(v, (list, tuple)):
+        out.append("[")
+        for i, item in enumerate(v):
+            out.append("," if i else "")
+            _canon(item, out)
+        out.append("]")
+    else:
+        raise ValueError(f"canonical JSON: a {type(v).__name__} is not JSON")
+
+
+def canonical_json(value) -> bytes:
+    """The RFC 8785 JSON Canonicalization Scheme (JCS) bytes of a JSON value: no whitespace, members sorted by their names' UTF-16 code units, strings
+    and numbers written as ECMAScript writes them, UTF-8. The plan message's signature covers these bytes of the message without `signature`, so an
+    edge in any language that parses the message and writes it again by RFC 8785 gets the same bytes (audit engine-delivery-22: Python's own
+    json.dumps writes 20.0 and 1e-05 where JavaScript writes 20 and 0.00001)."""
+    out: list[str] = []
+    _canon(value, out)
+    return "".join(out).encode("utf-8")
+
+
+#: The signing vectors' key: RFC 8032 7.1's TEST 1 key, published in the RFC and never a site's key, so an edge team checks its verifier against
+#: a known signature
+_VECTOR_SEED = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+#: Canonical JSON cases, each a message as sent and the bytes signed; the first five are RFC 8785's own (3.2.2, 3.2.3 and Appendix B)
+_CANONICAL_CASES = [
+    ("RFC 8785 3.2.2: numbers, escapes and literals",
+     '{"numbers": [333333333.33333329, 1E30, 4.50, 2e-3, 0.000000000000000000000000001], '
+     '"string": "\\u20ac$\\u000F\\u000aA\'\\u0042\\u0022\\u005c\\\\\\"\\/", "literals": [null, true, false]}'),
+    ("RFC 8785 3.2.3: members sorted by UTF-16 code units",
+     '{"\\u20ac": "Euro Sign", "\\r": "Carriage Return", "\\ufb33": "Hebrew Letter Dalet With Dagesh", "1": "One", '
+     '"\\ud83d\\ude00": "Emoji: Grinning Face", "\\u0080": "Control", "\\u00f6": "Latin Small Letter O With Diaeresis"}'),
+    ("RFC 8785 Appendix B: the shortest form, the exponent past 1e21 and under 1e-6",
+     '[0, -0, 5e-324, 1.7976931348623157e+308, 9007199254740992, 295147905179352830000, 1e+23, 999999999999999700000, 1e21, '
+     '9.999999999999997e-7, 0.000001, 333333333.33333325, -0.0000033333333333333333, 1424953923781206.2]'),
+    ("Whole-number floats are written as integers, as JavaScript writes them",
+     '{"soc_floor_pct": 20.0, "min_soc_floor_pct": 20.0, "max_discharge_w": 50000.0, "soc_target_pct": 100.0}'),
+    ("Small and inexact numbers",
+     '{"a": 1e-05, "b": 0.1, "c": 0.30000000000000004, "d": -2.5e-07, "e": 1.5e+300}'),
+    ("Nesting, Unicode as itself, an empty object and array",
+     '{"z": {"y": [], "x": {}}, "a": [{"b": "Lahore \\u2013 Multan", "c": "\\u0627\\u0631\\u062f\\u0648"}], '
+     '"slots": [{"end": "19:00", "start": "17:00"}]}'),
+]
+
+
+def vector_files() -> dict[str, str]:
+    """contracts/ems-edge/1.0/signing-vectors.json: how a plan message is canonicalised and signed, with cases an edge's canonicaliser must
+    reproduce byte for byte and one signed message to verify (written by scripts/export_contract.py; a test fails when the file drifts)."""
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    cases = [{"name": name, "json": text, "canonical": canonical_json(json.loads(text)).decode("utf-8")} for name, text in _CANONICAL_CASES]
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(_VECTOR_SEED))
+    public = base64.b64encode(key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+    body = {"contract": CONTRACT, "msg_type": "plan", "msg_id": "8a6d3f0e-2b1c-4e5f-9a7b-0c1d2e3f4a5b", "type": "plan", "plan_id": "plan-example",
+            "site_id": "example-site", "seq": 7, "sent_at": "2026-11-10T12:00:05+00:00", "issued_at": "2026-11-10T12:00:00+00:00",
+            "valid_from": "2026-11-10T12:00:00+00:00", "valid_until": "2026-11-11T12:00:00+00:00", "timezone": "Asia/Karachi", "mode": "a",
+            "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": 20.0, "revert_after_hours": 3},
+            "mode_a": {"days": [{"date": "2026-11-10", "slots": [
+                {"start": "17:00", "end": "21:00", "start_ts": 1794312000, "end_ts": 1794326400, "mode": "discharge", "soc_floor_pct": 20.0,
+                 "soc_target_pct": 20.0, "max_discharge_w": 50000.0, "max_charge_w": 0.0, "grid_charge": False, "export_allowed": False}]}]},
+            "notes": {"reason": "Following"}}
+    signed = canonical_json(body)
+    message = {**body, "signature": {"alg": "Ed25519", "key_id": "example-key", "value": base64.b64encode(key.sign(signed)).decode()}}
+    doc = {"contract": CONTRACT,
+           "canonicalization": "RFC 8785 (JSON Canonicalization Scheme): no whitespace, members sorted by their names' UTF-16 code units, strings and "
+                               "numbers as ECMAScript's JSON.stringify writes them, UTF-8",
+           "signed_bytes": "The plan message without its `signature` member, canonicalised; `signature.value` is the base64 Ed25519 signature of "
+                           "those bytes by the site's key `signature.key_id`. Parse the message as sent, remove `signature`, canonicalise the "
+                           "rest and verify.",
+           "canonical": cases,
+           "signature": {"note": "RFC 8032 7.1 TEST 1's key, published in the RFC: never a site's key", "alg": "Ed25519", "key_id": "example-key",
+                         "public_key": public, "message_json": json.dumps(message, indent=2, ensure_ascii=False),
+                         "signed_text": signed.decode("utf-8")}}
+    # ASCII on disk (a control character such as U+0080 is escaped): the values read back are the same
+    return {"signing-vectors.json": json.dumps(doc, indent=2) + "\n"}
 
 
 # ------------------------------------------------------------------------------------------------ the plan message (cloud to edge, signed)

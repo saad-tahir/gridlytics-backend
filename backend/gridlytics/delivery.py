@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 
 from . import platform as platformdb
 from . import store
+from .contract import canonical_json as _jcs
 
 PKT = timezone(timedelta(hours=5))
 CONTRACT = "ems-edge/1.0"
@@ -368,21 +369,45 @@ def replace_key(site_id: str, by: str, reason: str) -> tuple[dict, list[str]]:
 
 
 def canonical(body: dict) -> bytes:
+    """The bytes a plan message's signature covers: the RFC 8785 canonical JSON of the message without `signature` (contract.canonical_json), which
+    an edge in any language reproduces from the message as it parses it (audit engine-delivery-22)."""
+    return _jcs(body)
+
+
+def _legacy_canonical(body: dict) -> bytes:
+    """What a plan message was signed over before round 7 (Python's json.dumps, which only a Python edge reproduces): read only by `verify`, so a
+    message stored before still verifies for a dispute."""
     return json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()
 
 
+def _plain(v):
+    """A value as the JSON the API sends of it: a numpy scalar is its number, a datetime or other object its text (as signed before)."""
+    return v.item() if isinstance(v, np.generic) else str(v)
+
+
 def sign(site_id: str, body: dict) -> dict:
+    """The message signed with the site's key in force. The body is first made the plain JSON it is sent as (a numpy number its number, a tuple a
+    list), so the message returned, stored and sent is the very value whose canonical bytes were signed."""
     kid, key = _site_key(site_id)
-    return {**body, "signature": {"alg": "Ed25519", "key_id": kid, "value": base64.b64encode(key.sign(canonical(body))).decode()}}
+    plain = json.loads(json.dumps(body, default=_plain, allow_nan=False))
+    return {**plain, "signature": {"alg": "Ed25519", "key_id": kid, "value": base64.b64encode(key.sign(canonical(plain))).decode()}}
 
 
 def verify(message: dict, public_b64: str) -> bool:
+    """Whether the message's signature is the key's over its canonical bytes (or, for a message signed before round 7, over Python's json.dumps)."""
     body = {k: v for k, v in message.items() if k != "signature"}
     try:
-        Ed25519PublicKey.from_public_bytes(base64.b64decode(public_b64)).verify(base64.b64decode(message["signature"]["value"]), canonical(body))
-        return True
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(public_b64))
+        sig = base64.b64decode(message["signature"]["value"])
     except Exception:
         return False
+    for form in (canonical, _legacy_canonical):
+        try:
+            pub.verify(sig, form(body))
+            return True
+        except Exception:
+            continue
+    return False
 
 
 # ------------------------------------------------------------------------------------------------ ems-edge/1.0 messages (strict; the one validator)

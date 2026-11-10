@@ -9,6 +9,9 @@ what the cloud accepts and sends today.
   `test_the_published_schema_files_are_the_contract_models` fail when a file differs from the models.
 - `examples/`: the examples of U3 section 5 (and a heartbeat with its envelope). Each validates against its model (backend test
   `test_every_u3_section_5_example_validates`).
+- `signing-vectors.json`: how a plan message is canonicalised and signed, cases an edge's RFC 8785 canonicaliser must reproduce byte for byte, and
+  one signed plan message to verify with its public key (RFC 8032's published test key, never a site's). Written by the same script; the backend
+  test `test_the_published_signing_vectors_are_the_code_and_verify` fails when it drifts.
 
 ## Transport
 
@@ -59,6 +62,11 @@ the edge pulls its plan with GET `/api/sites/{site_id}/plans/current/message` (`
 
 ## The signing key
 
+- The signature covers the RFC 8785 (JSON Canonicalization Scheme) bytes of the message without `signature`: no whitespace, members sorted by
+  their names' UTF-16 code units, strings and numbers as ECMAScript writes them (`20.0` is `20`, `1e-05` is `0.00001`), UTF-8. An edge parses the
+  message as sent, removes `signature`, canonicalises the rest with any RFC 8785 library and verifies the Ed25519 signature (`signature.value`,
+  base64) with the site's public key. A message stored before round 7 was signed over Python's `json.dumps` with sorted keys; the cloud still
+  verifies those for a dispute, and sends only the canonical form.
 - Each site has one Ed25519 key in force; the edge is given its public key (`key_id` and the raw 32-byte key in base64) at enrolment, and every plan
   message names the `key_id` that signed it. The private key never leaves the cloud's keys folder.
 - A key is never replaced on its own. While the site's private key is missing from the keys folder (a data folder moved or restored without it), the

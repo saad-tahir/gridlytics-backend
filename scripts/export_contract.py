@@ -1,5 +1,6 @@
 """Writes the ems-edge/1.0 JSON Schema files (contracts/ems-edge/1.0/<message>.schema.json) from the contract's pydantic models (backend/gridlytics/
-contract.py), so an edge team builds against a published schema (plan DAT-02, U3 5.8). With --check it writes nothing and exits 1 when a file differs
+contract.py), so an edge team builds against a published schema (plan DAT-02, U3 5.8), and the signing vectors (signing-vectors.json: the RFC 8785
+canonical bytes of sample messages and one signed plan message, from contract.vector_files). With --check it writes nothing and exits 1 when a file differs
 from the models (the test backend/tests/test_fix_r7_control_edge.py does the same). Run from anywhere: python scripts/export_contract.py [--check]
 [--out FOLDER]."""
 from __future__ import annotations
@@ -22,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=FOLDER, help="the folder of the schema files")
     args = ap.parse_args(argv)
     drift = []
-    for name, text in contract.schema_files().items():
+    for name, text in {**contract.schema_files(), **contract.vector_files()}.items():
         path = args.out / name
         if path.exists() and path.read_text(encoding="utf-8") == text:
             continue

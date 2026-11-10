@@ -1800,3 +1800,85 @@ def test_a_restored_keys_folder_signs_again_and_closes_the_alert(world):
     with world.use(), store.connect() as con:
         assert [r["state"] for r in con.execute("SELECT state FROM alerts WHERE site_id = ? AND rule = 'signing_key_missing'", (sid,))] == ["resolved"]
         assert con.execute("SELECT count(*) FROM site_keys WHERE site_id = ?", (sid,)).fetchone()[0] == 1
+
+# ------------------------------------------------------------------------------------------------ batch 6: engine-delivery-22
+
+#: RFC 8785 Appendix B: IEEE 754 doubles (as their bits) and the text JCS (ECMAScript's Number serialisation) writes for each
+_RFC8785_NUMBERS = [("0000000000000000", "0"), ("8000000000000000", "0"), ("0000000000000001", "5e-324"), ("8000000000000001", "-5e-324"),
+                    ("7fefffffffffffff", "1.7976931348623157e+308"), ("ffefffffffffffff", "-1.7976931348623157e+308"),
+                    ("4340000000000000", "9007199254740992"), ("c340000000000000", "-9007199254740992"),
+                    ("4430000000000000", "295147905179352830000"), ("44b52d02c7e14af5", "9.999999999999997e+22"), ("44b52d02c7e14af6", "1e+23"),
+                    ("44b52d02c7e14af7", "1.0000000000000001e+23"), ("444b1ae4d6e2ef4e", "999999999999999700000"),
+                    ("444b1ae4d6e2ef4f", "999999999999999900000"), ("444b1ae4d6e2ef50", "1e+21"), ("3eb0c6f7a0b5ed8c", "9.999999999999997e-7"),
+                    ("3eb0c6f7a0b5ed8d", "0.000001"), ("41b3de4355555553", "333333333.3333332"), ("41b3de4355555554", "333333333.33333325"),
+                    ("41b3de4355555555", "333333333.3333333"), ("41b3de4355555556", "333333333.3333334"), ("41b3de4355555557", "333333333.33333343"),
+                    ("becbf647612f3696", "-0.0000033333333333333333"), ("43143ff3c1cb0959", "1424953923781206.2")]
+
+
+def test_the_canonical_json_is_rfc_8785():
+    import struct
+    for bits, text in _RFC8785_NUMBERS:
+        x = struct.unpack(">d", bytes.fromhex(bits))[0]
+        assert delivery.canonical({"n": x}) == ('{"n":%s}' % text).encode(), bits
+    # RFC 8785 3.2.2's example: numbers, a string with escapes and literals
+    raw = '{"numbers": [333333333.33333329, 1E30, 4.50, 2e-3, 0.000000000000000000000000001], "string": "\\u20ac$\\u000F\\u000aA\'\\u0042\\u0022\\u005c\\\\\\"\\/", "literals": [null, true, false]}'
+    assert delivery.canonical(json.loads(raw)).decode() == \
+        '{"literals":[null,true,false],"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"string":"€$\\u000f\\nA\'B\\"\\\\\\\\\\"/"}'
+    # RFC 8785 3.2.3: members sorted by their names' UTF-16 code units (a name above U+FFFF sorts before U+FB33)
+    names = {"\u20ac": "Euro Sign", "\r": "Carriage Return", "\ufb33": "Hebrew Letter Dalet With Dagesh", "1": "One", "\U0001F600": "Emoji: Grinning Face",
+             "\u0080": "Control", "\u00f6": "Latin Small Letter O With Diaeresis"}
+    assert [k for k in json.loads(delivery.canonical(names))] == ["\r", "1", "\u0080", "\u00f6", "\u20ac", "\U0001F600", "\ufb33"]
+    # a whole-number float is a number like any other: 20.0 and 20 are the same bytes, as a JavaScript or Go edge writes them
+    assert delivery.canonical({"a": 20.0, "b": 1e-05, "c": 0.1 + 0.2, "d": -0.0}) == b'{"a":20,"b":0.00001,"c":0.30000000000000004,"d":0}'
+    assert delivery.canonical({"a": 20}) == delivery.canonical({"a": 20.0})
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            delivery.canonical({"x": bad})
+
+
+def _js_parse(text: str):
+    """The message as a JavaScript edge reads it: every number one IEEE double (20.0 and 20 are the same value)."""
+    return json.loads(text, parse_int=float, parse_float=float)
+
+
+def test_a_signed_plan_verifies_after_a_non_python_edge_parses_and_rebuilds_it(company):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    import base64
+    sid = _site(genset=False)
+    _closed_loop(sid)
+    assert plans.tick(sid)["status"] == "active"
+    msg = plans.signed_message(sid)
+    text = json.dumps(msg)                                                   # what the API sends: Python writes 20.0 and 1e-05
+    assert ".0," in text or ".0}" in text                                    # the plan carries whole-number floats (soc_floor_pct 20.0)
+    got = _js_parse(text)
+    sig = base64.b64decode(got.pop("signature")["value"])
+    pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(delivery.public_key(sid)["public_key"]))
+    pub.verify(sig, delivery.canonical(got))                                 # raises when the edge's rebuild is not the signed bytes
+    assert msg["signature"]["alg"] == "Ed25519"
+    # a message stored before round 7 (signed over Python's own json.dumps) still verifies for a dispute
+    kid, key = delivery._site_key(sid)
+    body = {"plan_id": "p0", "floor": 20.0}
+    legacy = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()
+    old = {**body, "signature": {"alg": "Ed25519", "key_id": kid, "value": base64.b64encode(key.sign(legacy)).decode()}}
+    assert delivery.verify(old, delivery.public_key(sid)["public_key"])
+    assert not delivery.verify({**old, "floor": 21.0}, delivery.public_key(sid)["public_key"])
+
+
+def test_the_published_signing_vectors_are_the_code_and_verify():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    import base64
+    from gridlytics import contract
+    files = contract.vector_files()
+    assert list(files) == ["signing-vectors.json"]
+    assert (CONTRACTS / "signing-vectors.json").read_text(encoding="utf-8") == files["signing-vectors.json"], \
+        "signing-vectors.json drifted: run python scripts/export_contract.py"
+    v = json.loads(files["signing-vectors.json"])
+    assert v["canonicalization"].startswith("RFC 8785")
+    assert len(v["canonical"]) >= 5
+    for case in v["canonical"]:
+        assert delivery.canonical(_js_parse(case["json"])).decode() == case["canonical"], case["name"]
+    s = v["signature"]
+    sent = _js_parse(s["message_json"])
+    sig = sent.pop("signature")
+    assert sig["key_id"] == s["key_id"] and delivery.canonical(sent).decode() == s["signed_text"]
+    Ed25519PublicKey.from_public_bytes(base64.b64decode(s["public_key"])).verify(base64.b64decode(sig["value"]), s["signed_text"].encode())
