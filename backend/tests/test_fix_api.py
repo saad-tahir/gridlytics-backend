@@ -351,7 +351,8 @@ def test_acting_on_an_alert_outside_the_inbox_first_rows_answers_it(world):
         info = next(a for a in alerts.listing("active", world.site))
     r = world.c["operator"].post(f"/api/alerts/{info['id']}/acknowledge", json={})
     assert r.status_code == 200 and r.json()["state"] == "acknowledged" and r.json()["site_name"] == "Mill One", r.text
-    assert world.c["operator"].post(f"/api/alerts/{info['id']}/assign", json={"assignee": "Ali"}).json()["assigned"] == "Ali"
+    # an alert is assigned to a member who acts on alerts (round 7, role-operator-31), not to any typed name
+    assert world.c["operator"].post(f"/api/alerts/{info['id']}/assign", json={"assignee": "Operator"}).json()["assigned"] == "Operator"
 
 
 # ------------------------------------------------------------------------------------------------ data-genset-request-every-tick

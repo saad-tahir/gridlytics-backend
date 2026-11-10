@@ -17,7 +17,7 @@ from pydantic import Field, ValidationError
 
 from . import auth
 from . import battery as battery_service
-from . import plans, sites, store, tariffs, telemetry
+from . import plans, sites, store, store_members, tariffs, telemetry
 from .schemas import Refusal, Strict, message
 
 PKT = timezone(timedelta(hours=5))
@@ -721,7 +721,41 @@ def counts() -> dict:
     return {"total": sum(out.values()), "by_severity": out, "by_site": {r["site_id"]: r["n"] for r in by_site}, "categories": list(cats)}
 
 
-def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "") -> dict:
+ASSIGNEE_WORDS = "Assign the alert to a member who acts on alerts (an administrator or an operator), picked from the list"
+
+
+def assignees() -> list[dict]:
+    """The members an alert may be assigned to (audit role-operator-31): the company's members, not switched off, whose role acts on alerts
+    (`ack_alerts`: an administrator or an operator), as {id, name, role}, by name. A person appears once they have signed in (their member row is
+    made at their first sight)."""
+    if auth.company.get() is None:
+        return []
+    roles = auth.PERMISSIONS["ack_alerts"]
+    people = [{"id": m["user_id"], "name": m["name"] or m["email"], "role": m["role"]} for m in store_members.members()
+              if not m["disabled"] and m["role"] in roles]
+    return sorted(people, key=lambda m: m["name"].lower())
+
+
+def _assignee(member_id: str, name: str) -> tuple[str, str]:
+    """The (id, name) of who an alert is assigned to: the member by id, else the one member whose name or address is `name` (an older page sends the
+    name); ("", "") when neither is given. Anyone else, a member who does not act on alerts or one switched off, is refused (ValueError)."""
+    member_id, name = (member_id or "").strip(), (name or "").strip()
+    if not member_id and not name:
+        return "", ""
+    people = assignees()
+    if member_id:
+        hit = [m for m in people if m["id"] == member_id]
+    else:
+        mails = {m["user_id"]: (m["email"] or "").lower() for m in store_members.members()}
+        hit = [m for m in people if name.lower() in (m["name"].lower(), mails.get(m["id"], ""))]
+    if len(hit) > 1:
+        raise ValueError("Two or more members are called that: pick one from the list")
+    if not hit:
+        raise ValueError(ASSIGNEE_WORDS)
+    return hit[0]["id"], hit[0]["name"]
+
+
+def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "", member_id: str = "") -> dict:
     with store.connect() as con:
         r = con.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
         if r is None or r["category"] not in reader_categories():
@@ -732,7 +766,10 @@ def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "")
             con.execute(f"UPDATE alerts SET state = 'acknowledged', note = CASE WHEN ? = '' THEN note ELSE ? END, {_HISTORY} WHERE id = ?",
                         (note, note, _event("acknowledged", by, note), alert_id))
         elif action == "assign":
-            con.execute(f"UPDATE alerts SET assigned = ?, {_HISTORY} WHERE id = ?", (assignee[:120], _event("assigned", by, assignee=assignee[:120]), alert_id))
+            # a member who acts on alerts, kept by id with their name (audit role-operator-31: any text was stored); empty takes the alert back
+            who_id, who = _assignee(member_id, assignee)
+            con.execute(f"UPDATE alerts SET assigned = ?, assigned_id = ?, {_HISTORY} WHERE id = ?",
+                        (who, who_id, _event("assigned", by, assignee=who), alert_id))
         elif action == "close":
             con.execute(f"UPDATE alerts SET state = 'closed', closed_at = ?, note = CASE WHEN ? = '' THEN note ELSE ? END, {_HISTORY} WHERE id = ?",
                         (store._now(), note, note, _event("closed", by, note), alert_id))

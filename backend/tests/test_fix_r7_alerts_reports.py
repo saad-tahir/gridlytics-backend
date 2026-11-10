@@ -1312,3 +1312,40 @@ def test_an_alerts_title_names_its_day_not_today_or_the_last_day(world, monkeypa
     assert got["data_gap"]["title"] == "The data stopped for 2.5 hours, from 9 Nov 16:00 to 9 Nov 18:30", got["data_gap"]["title"]
     for a in got.values():
         assert not re.search(r"\b(today|yesterday|tomorrow|last day|last hour)\b", a["title"], re.I), a["title"]
+
+
+# ------------------------------------------------------------------------------------------------ role-operator-31 (and flow-reports-alerts-members-keys-26)
+
+def test_an_alert_is_assigned_to_a_member_who_acts_on_alerts_not_to_any_text(world):
+    """role-operator-31: an operator typed the assignee as free text and the API stored any string ('Nobody Real <script>', 200)."""
+    sid = world.site
+    for role in ROLES:
+        assert world.c[role].get("/api/alerts").status_code == 200         # each person's first sight makes their member row
+    with world.use():
+        alerts._open(sid, "data_stale", "Data", "warning", "No data for 40 minutes", {})
+        aid = alerts.listing("active", sid)[0]["id"]
+        from gridlytics import store_members
+        ids = {m["role"]: m["user_id"] for m in store_members.members()}
+    op = world.c["operator"]
+    people = op.get("/api/alerts/assignees")
+    assert people.status_code == 200, people.text
+    assert sorted((p["name"], p["role"]) for p in people.json()) == [("Admin", "admin"), ("Operator", "operator")], people.json()
+    assert {p["id"] for p in people.json()} == {ids["admin"], ids["operator"]} and set(people.json()[0]) == {"id", "name", "role"}
+    assert world.c["viewer"].get("/api/alerts/assignees").status_code == 403
+    assert world.c["analyst"].get("/api/alerts/assignees").status_code == 403
+    r = op.post(f"/api/alerts/{aid}/assign", json={"member_id": ids["admin"]})
+    assert r.status_code == 200 and (r.json()["assigned"], r.json()["assigned_id"]) == ("Admin", ids["admin"]), r.text
+    assert r.json()["history"][-1] == {**r.json()["history"][-1], "action": "assigned", "by": "Operator", "assignee": "Admin"}
+    for bad in ({"assignee": "Nobody Real <script>"}, {"member_id": "no-such-member"}, {"member_id": ids["analyst"]}, {"assignee": "Viewer"}):
+        refused = op.post(f"/api/alerts/{aid}/assign", json=bad)
+        assert refused.status_code == 422 and "administrator or an operator" in refused.json()["detail"], (bad, refused.text)
+    # a name as the team knows it still works when it is one such member's (an older page sends the name)
+    r = op.post(f"/api/alerts/{aid}/assign", json={"assignee": "operator"})
+    assert r.status_code == 200 and (r.json()["assigned"], r.json()["assigned_id"]) == ("Operator", ids["operator"]), r.text
+    # a member who is switched off cannot be given an alert; an empty assignee takes it back
+    with world.use():
+        store_members.update_member(ids["admin"], disabled=True)
+    assert op.post(f"/api/alerts/{aid}/assign", json={"member_id": ids["admin"]}).status_code == 422
+    assert [p["name"] for p in op.get("/api/alerts/assignees").json()] == ["Operator"]
+    r = op.post(f"/api/alerts/{aid}/assign", json={})
+    assert r.status_code == 200 and (r.json()["assigned"], r.json()["assigned_id"]) == ("", ""), r.text

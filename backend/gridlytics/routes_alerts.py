@@ -59,13 +59,23 @@ def site_rules_put(site_id: str, inp: dict = Body(...)):
         raise bad(exc) from None
 
 
+@router.get("/api/alerts/assignees")
+def assignees():
+    """Who an alert may be assigned to: the members who act on alerts, {id, name, role} (audit role-operator-31)."""
+    auth.need("ack_alerts", "Assigning an alert")
+    return alerts.assignees()
+
+
 @router.post("/api/alerts/{alert_id}/{action}")
 def act(alert_id: str, action: str, inp: dict = Body(default={})):
+    """acknowledge and close take {note}; assign takes {member_id} (from GET /api/alerts/assignees), or {assignee} as one such member's name, or
+    neither to take the alert back."""
     auth.need("ack_alerts", "Acting on an alert")
     if action not in ("acknowledge", "assign", "close"):
         raise Refusal(404, "The actions are acknowledge, assign and close", "not_found")
     try:
-        return out(alerts.act(alert_id, action, auth.actor(), str(inp.get("note", ""))[:300], str(inp.get("assignee", ""))))
+        return out(alerts.act(alert_id, action, auth.actor(), str(inp.get("note") or "")[:300], str(inp.get("assignee") or ""),
+                              str(inp.get("member_id") or "")))
     except KeyError:
         raise Refusal(404, "No such alert", "not_found") from None
     except ValueError as exc:
