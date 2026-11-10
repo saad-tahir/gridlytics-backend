@@ -51,7 +51,9 @@ def tariffs_index(on: str | None = None):
             "prosumer": {k: (tariffs.resolve("prosumer", k, d) or {}).get("body") for k in ("net_billing", "net_metering_legacy")},
             # pending counts the versions an administrator can approve: a placeholder awaiting its notification is not one (approving it is a 422)
             "versions": tariffs.provenance(), "pending": sum(1 for v in tariffs.versions() if v["status"] == "pending"),
-            "agreements": _agreements(d)}
+            "agreements": _agreements(d),
+            # a version awaiting its notification whose start has passed by the day (engine-tariffs-06): priced with the one still in force
+            "notices": tariffs.awaiting_notices(d)}
 
 
 @router.get("/api/tariffs/versions")

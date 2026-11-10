@@ -20,7 +20,9 @@ Batch 2, bill rebuild and bill comparison:
 - flow-savings-pilot-bill-23: an overlapping bill is refused, a bill can be corrected or deleted, and the fixed charge shows its proration.
 
 Batch 3 (the hand-worked goldens of engine-tariffs-07 are test_r7_tariffs_golden.py):
-- role-owner-25: every version in the library has a readable name, never a raw key.
+- role-owner-25: every version in the library has a readable name, never a raw key;
+- engine-tariffs-06: a version awaiting its notification whose start has passed (the CY2027 schedule from 1 Jan 2027) is flagged in the price
+  vector, the price page, a plan, a rebuilt bill and the tariff library, naming the version still in use.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -758,3 +760,50 @@ def test_every_version_in_the_library_has_a_readable_name(company):
     assert not set(names.values()) & {"national", "xwdisco", "ke", "net_billing", "net_metering_legacy"}
     tariffs.propose("adder", "fca_late", "2026-12-01", {"rate": 0.5, "billing_months": ["2026-12"]}, SRC, "t")
     assert next(v["name"] for v in tariffs.provenance() if v["key"] == "fca_late") == "FCA late"
+
+
+# ------------------------------------------------------------------------------------------------ engine-tariffs-06: a passed placeholder is flagged
+
+JAN27 = date(2027, 1, 4)
+AWAITING = ("The uniform schedule due from 1 Jan 2027 is awaiting its notification: prices from that day still use Uniform schedule CY2026 "
+            "(SRO 279(I)/2026) until an administrator approves the notified version.")
+
+
+def test_a_schedule_awaiting_its_notification_is_flagged_once_its_start_has_passed(company):
+    """From 1 Jan 2027 the engine kept pricing with the CY2026 schedule and nothing said so (the shipped CY2027 version is a placeholder): the price
+    vector and a rebuilt bill whose days reach the placeholder's start now carry a notice naming the version still in use, until the notified
+    schedule is approved."""
+    assert tariffs.awaiting_notices(date(2026, 12, 31)) == []
+    [n] = tariffs.awaiting_notices(JAN27)
+    assert (n["kind"], n["key"], n["effective_from"]) == ("schedule", "national", "2027-01-01")
+    assert n["in_use"]["name"] == "Uniform schedule CY2026 (SRO 279(I)/2026)" and n["in_use"]["effective_from"] == "2026-02-12"
+    assert n["message"] == AWAITING
+    conn = _conn("B-2(b)")
+    assert _vec(conn, date(2026, 12, 30))["tariff_notices"] == []
+    assert [x["key"] for x in _vec(conn, date(2026, 12, 31), steps=192)["tariff_notices"]] == ["national"]  # a horizon that reaches 1 Jan
+    assert _vec(conn, JAN27)["tariff_notices"] == [n]
+    assert _vec(_conn("B-2(b)", "off_grid"), JAN27)["tariff_notices"] == []  # no grid, nothing priced
+    ts, imp, exp = _month_series(date(2026, 12, 1), 31)
+    assert tariffs.rebuild(ts, imp, exp, conn, date(2026, 12, 1), date(2026, 12, 31))["tariff_notices"] == []
+    ts, imp, exp = _month_series(date(2027, 1, 1), 31)
+    assert tariffs.rebuild(ts, imp, exp, conn, date(2027, 1, 1), date(2027, 1, 31))["tariff_notices"] == [n]
+    # the notified schedule approved: the placeholder is superseded and nothing is flagged
+    v = tariffs.propose("schedule", "national", "2027-01-01", {"name": "Uniform schedule CY2027 (test)", "cards": tariff_data.CARDS_279}, SRC, "t")
+    tariffs.approve(v["id"], "t")
+    assert tariffs.awaiting_notices(JAN27) == [] and _vec(conn, JAN27)["tariff_notices"] == []
+
+
+def test_the_plan_the_price_page_and_the_library_say_when_the_schedule_awaits_its_notification(world):
+    from gridlytics import plans
+    a = world.c["admin"]
+    jan = a.get("/api/tariffs", params={"on": JAN27.isoformat()}).json()
+    assert [x["message"] for x in jan["notices"]] == [AWAITING]
+    assert a.get("/api/tariffs", params={"on": "2026-11-09"}).json()["notices"] == []
+    r = a.get(f"/api/sites/{world.site}/prices", params={"day": JAN27.isoformat()})
+    assert r.status_code == 200, r.text
+    assert [x["message"] for x in r.json()["tariff_notices"]] == [AWAITING]
+    assert a.get(f"/api/sites/{world.site}/prices", params={"day": "2026-11-09"}).json()["tariff_notices"] == []
+    with world.use():
+        t0 = int(datetime(2027, 1, 4, 6, tzinfo=PKT).timestamp())
+        out = plans.tick(world.site, at=t0, steps=96, save=False)
+    assert [x["message"] for x in out["summary"]["tariff_notices"]] == [AWAITING]

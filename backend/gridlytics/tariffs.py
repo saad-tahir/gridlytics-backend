@@ -165,6 +165,43 @@ def version_name(v: dict) -> str:
     return words
 
 
+#: A placeholder's kind as a notice names it
+_KIND_WORDS = {"schedule": "uniform schedule", "tou": "time-of-use calendar", "adder": "adder", "tax": "tax rules",
+               "icp": "incremental consumption package", "prosumer": "prosumer regime"}
+
+
+def _day_words(d: date) -> str:
+    """A day as people read it: "1 Jan 2027"."""
+    return f"{d.day} {d:%b} {d.year}"
+
+
+def awaiting_notices(on) -> list[dict]:
+    """The versions awaiting their notification whose start has passed by `on` (plan 6.1 and 6.2, TAR-09; R9 section 10): the shipped CY2027 schedule
+    from 1 Jan 2027, until the notified one is drafted and approved (which supersedes the placeholder). The engine keeps pricing with the active
+    version in force, so the price vector, a plan, a rebuilt bill and the tariff library carry these to say their rupees rest on a version that the
+    notification may change. Each names the version still in use (`in_use`, None when none is in force). Words and dates only, no rate or rupee:
+    every role may read it. The alert for it is the alert rules'."""
+    ensure_shipped()
+    day = on.isoformat() if isinstance(on, date) else str(on)[:10]
+    with store.connect() as con:
+        rows = con.execute("SELECT * FROM tariff_versions WHERE status = 'awaiting_notification' AND effective_from <= ? "
+                           "ORDER BY kind, key, effective_from", (day,)).fetchall()
+    out = []
+    for r in rows:
+        v = _ver(r)
+        used = resolve(v["kind"], v["key"], day)
+        start = _day_words(date.fromisoformat(v["effective_from"]))
+        what = _KIND_WORDS.get(v["kind"], v["kind"])
+        if used is not None:
+            then = f"prices from that day still use {version_name(used)} until an administrator approves the notified version."
+        else:
+            then = "nothing is in force from that day until an administrator approves the notified version."
+        out.append({"kind": v["kind"], "key": v["key"], "version_id": v["id"], "effective_from": v["effective_from"], "name": version_name(v),
+                    "in_use": {"id": used["id"], "name": version_name(used), "effective_from": used["effective_from"]} if used else None,
+                    "message": f"The {what} due from {start} is awaiting its notification: {then}"})
+    return out
+
+
 # The keys the engine resolves for each kind (an adder's key is free: qta, fca, dss, nj, ...)
 _KEYS = {"schedule": ("national",), "tou": ("xwdisco", "ke"), "tax": ("national",), "icp": ("national",), "prosumer": ("net_billing", "net_metering_legacy")}
 _BASES = ("per_kw_month", "sanctioned_kw_month", "per_consumer_month")
@@ -858,7 +895,8 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     the bill before carried (`credit_carried_rs` of its result).
 
     `ts_utc` holds epoch seconds of each minute's start (UTC); `import_kw` and `export_kw` the mean power of that minute. Returns the line items, the totals
-    (as billed, and as the company bears them), the aggregates verification reads, and every version's hash with the series' (plan 6.3 step 13)."""
+    (as billed, and as the company bears them), the aggregates verification reads, and every version's hash with the series' (plan 6.3 step 13);
+    `tariff_notices` names a version awaiting its notification whose start the period reaches (`awaiting_notices`)."""
     data = conn["data"]
     if period_start_exclusive:
         period_start = period_start + timedelta(days=1)
@@ -1114,7 +1152,9 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
            "first_day": period_start.isoformat(), "last_day": period_end.isoformat(),
            "versions": [{"kind": v["kind"], "key": v["key"], "id": v["id"], "hash": v["hash"], "effective_from": v["effective_from"]}
                         for v in sorted(versions.values(), key=lambda v: (v["kind"], v["key"], v["effective_from"]))] + adder_versions,
-           "series_hash": series_hash, "unpriced": unpriced}
+           "series_hash": series_hash, "unpriced": unpriced,
+           # a version awaiting its notification whose start the period reaches: the bill is priced with the one still in force (engine-tariffs-06)
+           "tariff_notices": awaiting_notices(period_end)}
     if _num(power_factor_pct):
         out["power_factor_pct"] = float(power_factor_pct)
     if multi:
@@ -1151,11 +1191,14 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     Each day is priced under the regime it is billed under (`regime_on`): an export earns nothing before an agreement starts, after a net-billing
     agreement ends or with a date that cannot be read (as on a connection without a regime), and earns the NAEPP after a legacy agreement ends (the
     site moves to net billing). Legacy netting (the surplus credit and the ICP case on net imports) applies only while the legacy agreement is in
-    force on the first step's day."""
+    force on the first step's day.
+
+    `tariff_notices` lists the versions awaiting their notification whose start the horizon reaches (`awaiting_notices`): the steps from then on
+    are priced with the version still in force."""
     h = 0.25
     out = {"c_imp": np.zeros(steps), "c_exp": np.zeros(steps), "peak": np.zeros(steps, dtype=bool), "month": np.zeros(steps, dtype=int),
            "local_hour": np.zeros(steps), "grid": np.ones(steps), "icp": {}, "mdi": None, "billing_month": [], "billing_month_end_step": steps,
-           "export_tie_break": np.zeros(steps)}
+           "export_tie_break": np.zeros(steps), "tariff_notices": []}
     times = [t0_utc + timedelta(minutes=15 * i) for i in range(steps)]
     locs = [t.astimezone(PKT) for t in times]
     for i, loc in enumerate(locs):
@@ -1172,6 +1215,8 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
         return out
     data = conn["data"]
     on = t0_utc.astimezone(PKT).date()
+    # a version awaiting its notification whose start the horizon reaches: priced with the version still in force, and said so (engine-tariffs-06)
+    out["tariff_notices"] = awaiting_notices(max(bm_by_day))
     # each day priced with the versions in force that day, as the bill engine prices it (day_versions): a horizon across a new schedule changes card
     # at midnight; the per-unit duty is a rupee figure on every imported kWh
     run_of: dict[date, dict] = {}

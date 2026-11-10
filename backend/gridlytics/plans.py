@@ -206,7 +206,7 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
          "p_start": p_start, "dur_steps": dur, "c_imp": vec["c_imp"], "c_exp": vec["c_exp"], "peak": vec["peak"], "in_month": in_month,
          "G_max": G_max, "X_max": X_max, "off_grid": off_grid, "load_mode": int(d.get("outage_load_mode", 0)),
          "voll": float(d.get("voll_rs_per_kwh", 500)), "reserve_threshold": float((d.get("reserve_policy") or {}).get("p_threshold", 0.2)),
-         "icp": vec["icp"], "regime": regime}
+         "icp": vec["icp"], "regime": regime, "tariff_notices": vec.get("tariff_notices", [])}
     if vec["mdi"] and mtd:
         month_end = int(vec["billing_month_end_step"]) if "billing_month_end_step" in vec else (int(np.argmin(in_month)) if not in_month.all() else steps)
         p["mdi"] = {"rate": vec["mdi"]["rate_rs_per_kw"], "M0": mtd["M0"], "floor": vec["mdi"]["floor_kw"], "n_mdi": vec["mdi"]["interval_steps"],
@@ -429,7 +429,9 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                           # time-limited too); null where no retry ran
                           "retry_of": res.get("retry_of"), "first_time_limited": res.get("first_time_limited"),
                           "first_solve_seconds": res.get("first_solve_seconds")},
-               "horizon_steps": p["T"], "control_release": release}
+               "horizon_steps": p["T"], "control_release": release,
+               # a tariff version awaiting its notification the horizon reaches: the plan is priced with the one still in force (engine-tariffs-06)
+               "tariff_notices": p.get("tariff_notices", [])}
     if res["status"] in ("not_solved", "refused"):
         reason = res.get("message", "not solved")
         if save:

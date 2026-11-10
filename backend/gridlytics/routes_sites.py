@@ -566,4 +566,5 @@ def site_prices(site_id: str, day: str | None = None, connection: str | None = N
             "icp": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in val.items()} for k, val in v["icp"].items()},
             "energy_factor": round(tariffs.energy_factor(conn, d), 4) if conn else None,
             "month_import_kwh": {k: round(float(x), 1) for k, x in month_q.items()} if month_q is not None else None,
-            "month_export_kwh": {k: round(float(x), 1) for k, x in month_x.items()} if month_x is not None else None}
+            "month_export_kwh": {k: round(float(x), 1) for k, x in month_x.items()} if month_x is not None else None,
+            "tariff_notices": v.get("tariff_notices", [])}  # a version awaiting its notification the day reaches (tariffs, engine-tariffs-06)
