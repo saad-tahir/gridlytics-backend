@@ -681,10 +681,15 @@ def client_address(request) -> str:
 
 
 def record(event: str, email: str, address: str = "", account_id: str = "", detail: dict | None = None) -> None:
-    """One line of the record of sign-ins: a refusal the lockout counts, a sign-in that clears the count, or an account's own change."""
+    """One line of the record of sign-ins: a refusal the lockout counts, a sign-in that clears the count, or an account's own change. A refusal for an email
+    with no account (audit parity-supabase-auth-08) is kept only while the lockout counts it (LOCK_MINUTES): the record never fills with made-up emails."""
+    now = _clock()
     with _write() as con:
+        if event == REFUSED and not account_id:
+            con.execute("DELETE FROM account_events WHERE event = ? AND account_id = '' AND email LIKE '%@%' AND at < ?",
+                        (REFUSED, now - auth.LOCK_MINUTES * 60))
         con.execute("INSERT INTO account_events (at, email, address, event, account_id, detail) VALUES (?,?,?,?,?,?)",
-                    (_clock(), (email or "").strip().lower(), address or "", event, account_id or "", json.dumps(detail or {})))
+                    (now, (email or "").strip().lower(), address or "", event, account_id or "", json.dumps(detail or {})))
 
 
 def events(email: str, limit: int = 200) -> list[dict]:

@@ -860,3 +860,38 @@ def test_supabase_mode_lists_the_people_seen_when_the_project_does_not_answer_wi
         monkeypatch.setattr(api, "MAX_MEMBERS_BYTES", len(json.dumps(rows)) - 1)
     assert set(_people(owner)) == {"saad@example.test"}
     assert owner.put(f"/api/users/{uuid.uuid4()}", json={"role": "operator"}).status_code == 404
+
+
+# ------------------------------------------------------------------------------------------------ parity-supabase-auth-08
+
+def test_sign_in_requests_from_one_address_are_limited_as_supabase_auth_limits_them(world):
+    """One address could send 1,200 sign-ins a minute (the public rate), each a PBKDF2 hash, whatever the email. Now SIGN_IN_RATE of them in 5 minutes,
+    Supabase Auth's default for its sign-in endpoints (30 per 5 minutes per address), then 429 with Retry-After; other addresses are not stopped."""
+    import uuid
+    import identities
+    from gridlytics import auth
+    assert auth.RATE_LIMITS["sign_in"] == 30 and auth.RATE_WINDOWS["sign_in"] == 300
+    codes = [_sign_in(f"{uuid.uuid4().hex[:12]}@nowhere.test", "a wrong password 1", "203.0.113.50").status_code for _ in range(30)]
+    assert codes == [401] * 30
+    r = _sign_in("viewer@fix.test", identities.PASSWORD, "203.0.113.50")
+    assert r.status_code == 429 and 0 < int(r.headers["retry-after"]) <= 300 and "Too many sign-in attempts from here" in r.json()["detail"], r.text
+    assert _sign_in("viewer@fix.test", identities.PASSWORD, "203.0.113.51").status_code == 200
+
+
+def test_an_email_with_no_account_is_locked_out_as_an_account_is(world, monkeypatch):
+    """Tries for an email with no account were not recorded, so they were never stopped, while an account's were after five: the lockout told which
+    emails have an account. They are counted now, and answered as an account's are; the record keeps them only while they count."""
+    from gridlytics import auth
+    from gridlytics import platform as platformdb
+    for email in ("nobody@fix.test", "viewer@fix.test"):
+        codes = [_sign_in(email, "a wrong password 1", "198.51.100.77").status_code for _ in range(auth.MAX_TRIES + 1)]
+        assert codes == [401] * auth.MAX_TRIES + [429], (email, codes)
+    nobody, viewer = (_sign_in(e, "a wrong password 1", "198.51.100.77") for e in ("nobody@fix.test", "viewer@fix.test"))
+    assert (nobody.status_code, nobody.json()["detail"]) == (viewer.status_code, viewer.json()["detail"])
+    assert len([e for e in platformdb.events("nobody@fix.test") if e["event"] == platformdb.REFUSED]) == auth.MAX_TRIES
+    # once they no longer count, they go
+    later = platformdb._clock() + auth.LOCK_MINUTES * 60 + 1
+    monkeypatch.setattr(platformdb, "_clock", lambda: later)
+    platformdb.record(platformdb.REFUSED, "someone-else@nowhere.test", "198.51.100.78")
+    assert platformdb.events("nobody@fix.test") == []
+    assert any(e["event"] == platformdb.REFUSED for e in platformdb.events("viewer@fix.test"))   # an account's record stays

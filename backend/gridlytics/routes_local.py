@@ -49,6 +49,15 @@ def _session(account: dict, refresh_token: str) -> dict:
             "user": {k: account[k] for k in ("id", "email", "name", "created")}}
 
 
+def _too_many_sign_ins(address: str) -> None:
+    """auth.RATE_LIMITS["sign_in"] sign-ins from one address in 5 minutes, whatever the email (audit parity-supabase-auth-08): each is a PBKDF2 hash."""
+    wait = auth.rate_wait("sign_in", address)
+    if wait:
+        minutes = math.ceil(wait / 60)
+        raise HTTPException(status_code=429, detail=f"Too many sign-in attempts from here; wait {minutes} minute{'s' if minutes != 1 else ''}",
+                            headers={"Retry-After": str(wait)})
+
+
 def _locked(email: str, address: str) -> None:
     """Five wrong passwords for one account from one address stop that address for 15 minutes from the fifth (auth.MAX_TRIES, auth.LOCK_MINUTES); twenty
     from every address together stop the account for as long, but for an address it signed in from lately (auth.ACCOUNT_TRIES, audit security-roles-10)."""
@@ -93,8 +102,9 @@ def _refresh_token(inp: dict, needed: bool) -> str | None:
 
 @router.post("/api/local/session")
 def local_session(request: Request, inp: dict = Body(...)):
-    """Sign in with an email and a password. A wrong password, an email with no account and a disabled account get one answer, and take as long. Tries for
-    an email with no account are not recorded; five refused for one account from one address stop that address."""
+    """Sign in with an email and a password. A wrong password, an email with no account and a disabled account get one answer, and take as long. Five
+    refused for one email from one address stop that address, whether the email has an account or not (a lockout told before which ones had one: audit
+    parity-supabase-auth-08); and thirty sign-ins from one address in five minutes stop it, whatever the emails."""
     global _dummy_hash
     email, password = inp.get("email"), inp.get("password")
     # A body without the two texts is refused before any account is looked at, so its answer and its time are the same for every email
@@ -102,13 +112,14 @@ def local_session(request: Request, inp: dict = Body(...)):
         _api._fail("Give your email address and your password")
     email = email.strip().lower()
     address = platformdb.client_address(request)
+    _too_many_sign_ins(address)
     _locked(email, address)
     found = platformdb.account_by_email(email) if email else None
     account = platformdb.check_sign_in(email, password) if found else None
     if account is None:
-        if found:
-            platformdb.record(platformdb.REFUSED, email, address, found["id"])
-        else:
+        if email:
+            platformdb.record(platformdb.REFUSED, email, address, found["id"] if found else "")
+        if not found:
             # The same PBKDF2 work as a real check, so that the time of the answer does not say whether the email has an account
             _dummy_hash = _dummy_hash or auth.hash_password(secrets.token_urlsafe(16))
             auth.check_password(password, _dummy_hash)

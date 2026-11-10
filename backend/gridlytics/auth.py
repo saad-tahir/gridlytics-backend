@@ -93,8 +93,14 @@ def _env_int(name: str, default: int) -> int:
 #: person working, a page polling a job and the tests never meet them: they stop a script. GRIDLYTICS_RATE_USER, GRIDLYTICS_RATE_ADDRESS and
 #: GRIDLYTICS_RATE_PUBLIC change them; 0 turns one off.
 RATE_WINDOW = 60
+#: Besides them, the sign-ins (POST /api/local/session) from one address, whatever the email, in 5 minutes (audit parity-supabase-auth-08): each costs
+#: a PBKDF2 hash, and the public rate let one address buy 1,200 a minute. Supabase Auth's default for its sign-in endpoints, 30 per 5 minutes per
+#: address (config.toml `sign_in_sign_ups`) [recalled; verify], so either sign-in mode stops a script alike. GRIDLYTICS_RATE_SIGN_IN changes it; 0 turns
+#: it off.
 RATE_LIMITS = {"user": _env_int("GRIDLYTICS_RATE_USER", 6000), "address": _env_int("GRIDLYTICS_RATE_ADDRESS", 20000),
-               "public": _env_int("GRIDLYTICS_RATE_PUBLIC", 1200)}
+               "public": _env_int("GRIDLYTICS_RATE_PUBLIC", 1200), "sign_in": _env_int("GRIDLYTICS_RATE_SIGN_IN", 30)}
+#: A limit's window in seconds when it is not RATE_WINDOW
+RATE_WINDOWS = {"sign_in": 300}
 _limiter = None
 
 
@@ -110,7 +116,7 @@ def limiter():
 def rate_wait(kind: str, key: str) -> int:
     """Seconds to wait before this request may go on (0 when it may), counting it."""
     limit = RATE_LIMITS.get(kind, 0)
-    return limiter().hit(("api", kind, key), limit, RATE_WINDOW) if limit and key else 0
+    return limiter().hit(("api", kind, key), limit, RATE_WINDOWS.get(kind, RATE_WINDOW)) if limit and key else 0
 
 
 def new_link() -> tuple[str, str]:

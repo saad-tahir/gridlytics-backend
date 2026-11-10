@@ -291,7 +291,8 @@ def test_a_wrong_password_an_unknown_email_and_a_disabled_account_get_one_refusa
     plat.set_account_disabled(account["id"], True)
     disabled = _sign_in(client)
     assert disabled.status_code == 401 and disabled.json()["detail"] == wrong.json()["detail"]
-    assert plat.events("nobody@example.pk") == []                                # tries for an address with no account are not recorded
+    # tries for an address with no account are recorded too, naming no account, so they are locked out as an account's are (audit parity-supabase-auth-08)
+    assert [(e["event"], e["account_id"]) for e in plat.events("nobody@example.pk")] == [("sign-in refused", "")]
     assert [e["event"] for e in plat.events("saad@example.pk")] == ["sign-in refused", "sign-in refused"]
 
 
