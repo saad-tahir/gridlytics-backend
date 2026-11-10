@@ -1201,3 +1201,54 @@ def test_a_genset_request_is_answered_once_and_a_withdrawn_one_not_at_all(world)
         assert (note["state"], note["note"]) == ("resolved", "Condition cleared"), dict(note)     # the withdrawn request's alert is left as it was
         with pytest.raises(alerts.RequestClosed):
             alerts.answer_request(sid, "n1", "done", "operator@r7.test")
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-28
+
+def test_acknowledging_and_closing_keep_each_actor_time_and_note_in_the_alerts_history(world):
+    """pages-D-28: `note or f'Acknowledged by {by}'` kept either the note or the person, never both, and a close overwrote both."""
+    sid = world.site
+    with world.use():
+        for rule in ("data_stale", "data_gap", "unserved"):
+            alerts._open(sid, rule, "Data" if rule != "unserved" else "Reserve", "warning", f"The {rule} alert", {})
+        ids = {a["rule"]: a["id"] for a in alerts.listing("active", sid)}
+    op, admin = world.c["operator"], world.c["admin"]
+    r = op.post(f"/api/alerts/{ids['data_stale']}/acknowledge", json={"note": "Checking the logger"})
+    assert r.status_code == 200, r.text
+    got = r.json()
+    assert got["state"] == "acknowledged" and got["note"] == "Checking the logger", got
+    assert [(h["action"], h["by"], h["note"]) for h in got["history"]] == [("acknowledged", "Operator", "Checking the logger")], got["history"]
+    assert datetime.fromisoformat(got["history"][0]["at"]).tzinfo is not None
+    assert admin.post(f"/api/alerts/{ids['data_stale']}/close", json={}).status_code == 200
+    closed = next(a for a in admin.get(f"/api/alerts?state=closed&site_id={sid}").json() if a["id"] == ids["data_stale"])
+    assert [(h["action"], h["by"], h["note"]) for h in closed["history"]] == [("acknowledged", "Operator", "Checking the logger"), ("closed", "Admin", "")]
+    assert closed["note"] == "Checking the logger", closed          # a close without a note keeps the last note
+    # an acknowledgement without a note still says who, in the history, and leaves no made-up note
+    got = op.post(f"/api/alerts/{ids['data_gap']}/acknowledge", json={}).json()
+    assert got["note"] == "" and [(h["action"], h["by"]) for h in got["history"]] == [("acknowledged", "Operator")], got
+    # the product's own resolution is in the history too, after the person's acknowledgement
+    with world.use():
+        alerts._clear(sid, "data_gap")
+        row = next(a for a in alerts.listing("resolved", sid) if a["id"] == ids["data_gap"])
+    assert [(h["action"], h["by"], h["note"]) for h in row["history"]] == [("acknowledged", "Operator", ""), ("resolved", "", "Condition cleared")]
+    assert next(a for a in op.get(f"/api/alerts?site_id={sid}").json() if a["id"] == ids["unserved"])["history"] == []
+
+
+def test_a_workspace_file_of_schema_2_gains_the_alerts_history(tmp_path, monkeypatch):
+    import sqlite3
+    from contextlib import closing
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(tmp_path))
+    path = tmp_path / "old.db"
+    with closing(sqlite3.connect(path)) as con, con:
+        for sql in store._V1:
+            con.execute(sql)
+        con.execute("ALTER TABLE reports ADD COLUMN preliminary INTEGER")
+        con.execute("INSERT INTO alerts (id, site_id, rule, category, severity, title, state, opened_at, note) VALUES "
+                    "('a1','s','data_stale','Data','warning','No data','acknowledged','2026-11-02T10:00:00+00:00','Acknowledged by Ali')")
+        con.execute("PRAGMA user_version = 2")
+    with store.use_company(path):
+        rows = alerts.listing("active")
+        alerts.act("a1", "close", "Ali", "Logger replaced")
+        after = alerts.listing("closed")
+    assert rows[0]["history"] == [] and rows[0]["note"] == "Acknowledged by Ali", rows                 # not recorded before
+    assert [(h["action"], h["by"], h["note"]) for h in after[0]["history"]] == [("closed", "Ali", "Logger replaced")], after

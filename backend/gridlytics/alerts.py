@@ -40,6 +40,22 @@ def reader_categories() -> tuple[str, ...]:
     return tuple(c for c in CATEGORIES if c not in CATEGORY_NEEDS or auth.can(CATEGORY_NEEDS[c]))
 
 
+#: The SQL that adds one event (`_event`) at the end of an alert's history (audit pages-D-28)
+_HISTORY = "history = json_insert(history, '$[#]', json(?))"
+
+
+def _event(action: str, by: str = "", note: str = "", **more) -> str:
+    """One event of an alert's history (audit pages-D-28), as JSON for `_HISTORY`: what was done (acknowledged, assigned, closed, answered, or resolved
+    when the product closed it), who did it ("" for the product itself), when (UTC) and the note, so an acknowledgement keeps its person and its note
+    and a later close or clear overwrites neither."""
+    return json.dumps({"at": store._now(), "action": action, "by": by, "note": note, **more})
+
+
+def _row(r, site_name: str) -> dict:
+    """An alert as the API answers it: its detail and history read, with its site's name."""
+    return {**dict(r), "detail": json.loads(r["detail"] or "{}"), "history": json.loads(r["history"] or "[]"), "site_name": site_name}
+
+
 def _open(site_id: str, rule: str, category: str, severity: str, title: str, detail: dict | None = None) -> None:
     with store.connect() as con:
         r = con.execute("SELECT id FROM alerts WHERE site_id = ? AND rule = ? AND state IN ('open','acknowledged')", (site_id, rule)).fetchone()
@@ -52,8 +68,8 @@ def _open(site_id: str, rule: str, category: str, severity: str, title: str, det
 
 def _clear(site_id: str, rule: str) -> None:
     with store.connect() as con:
-        con.execute("UPDATE alerts SET state = 'resolved', closed_at = ?, note = 'Condition cleared' WHERE site_id = ? AND rule = ? AND state IN ('open','acknowledged')",
-                    (store._now(), site_id, rule))
+        con.execute(f"UPDATE alerts SET state = 'resolved', closed_at = ?, note = 'Condition cleared', {_HISTORY} WHERE site_id = ? AND rule = ? "
+                    "AND state IN ('open','acknowledged')", (store._now(), _event("resolved", note="Condition cleared"), site_id, rule))
 
 
 def _set(cond: bool, site_id: str, rule: str, category: str, severity: str, title: str, detail: dict | None = None) -> None:
@@ -529,7 +545,8 @@ def _withdraw_requests(site_id: str, spans: list[tuple[int, int]], running: bool
                 note, withdraw = unplanned, True
             else:
                 continue
-            con.execute("UPDATE alerts SET state = 'resolved', closed_at = ?, note = ? WHERE id = ?", (store._now(), note, r["id"]))
+            con.execute(f"UPDATE alerts SET state = 'resolved', closed_at = ?, note = ?, {_HISTORY} WHERE id = ?",
+                        (store._now(), note, _event("resolved", note=note), r["id"]))
             if withdraw:
                 con.execute("UPDATE notifications SET status = 'withdrawn' WHERE site_id = ? AND kind = 'genset_request' AND status = 'pending' AND payload LIKE ?",
                             (site_id, f'%"genset_request:{start}"%'))
@@ -587,8 +604,8 @@ def genset_requests(site: dict, plan: dict | None, now: int) -> None:
                     old_key = p.get("key") or f"genset_request:{old}"
                     con.execute("UPDATE notifications SET status = 'withdrawn' WHERE site_id = ? AND kind = 'genset_request' AND status = 'pending' "
                                 "AND payload LIKE ?", (sid, f'%"{old_key}"%'))
-                    con.execute("UPDATE alerts SET state = 'resolved', closed_at = ?, note = ? WHERE site_id = ? AND rule = ? AND state IN ('open','acknowledged')",
-                                (store._now(), note, sid, f"genset_request_{old}"))
+                    con.execute(f"UPDATE alerts SET state = 'resolved', closed_at = ?, note = ?, {_HISTORY} WHERE site_id = ? AND rule = ? "
+                                "AND state IN ('open','acknowledged')", (store._now(), note, _event("resolved", note=note), sid, f"genset_request_{old}"))
             held = [("withdrawn", p) if any(p is q for q in later) else (status, p) for status, p in held]
         payload = {"key": key, "start": start, "end": end, "kw": s["genset_kw"], "reason": s["reason"], "detail": s["detail"], "plan_id": plan["id"]}
         with store.connect() as con:
@@ -634,8 +651,9 @@ def answer_request(site_id: str, nid: str, outcome: str, by: str) -> dict:
                                                    (outcome, store._now(), nid)).rowcount != 1:
             raise RequestClosed(con.execute("SELECT status, outcome FROM notifications WHERE id = ?", (nid,)).fetchone())
         payload = json.loads(r["payload"])
-        con.execute("UPDATE alerts SET state = 'closed', closed_at = ?, note = ? WHERE site_id = ? AND rule = ? AND state != 'closed'",
-                    (store._now(), f"Answered {outcome} by {by}", site_id, f"genset_request_{payload['start']}"))
+        said = OUTCOME_WORDS[outcome]
+        con.execute(f"UPDATE alerts SET state = 'closed', closed_at = ?, note = ?, {_HISTORY} WHERE site_id = ? AND rule = ? AND state != 'closed'",
+                    (store._now(), f"Answered: {said}, by {by}", _event("answered", by, said), site_id, f"genset_request_{payload['start']}"))
     store.audit(by, f"answered a genset request: {outcome}", site_id, {"notification": nid})
     return {"id": nid, "outcome": outcome}
 
@@ -666,7 +684,7 @@ def listing(state: str | None = None, site_id: str | None = None, category: str 
     with store.connect() as con:
         rows = con.execute(q, args).fetchall()
     names = {s["id"]: s["name"] for s in sites.listing()}
-    return [{**dict(r), "detail": json.loads(r["detail"]), "site_name": names.get(r["site_id"], "")} for r in rows]
+    return [_row(r, names.get(r["site_id"], "")) for r in rows]
 
 
 def counts() -> dict:
@@ -685,12 +703,16 @@ def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "")
         r = con.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
         if r is None or r["category"] not in reader_categories():
             raise KeyError(alert_id)               # an alert of a category the reader does not receive is not there for them
+        # each action is an event of the alert's history, with who and when (audit pages-D-28); `note` is the latest note written, which an action
+        # without one leaves as it was
         if action == "acknowledge":
-            con.execute("UPDATE alerts SET state = 'acknowledged', note = ? WHERE id = ?", (note or f"Acknowledged by {by}", alert_id))
+            con.execute(f"UPDATE alerts SET state = 'acknowledged', note = CASE WHEN ? = '' THEN note ELSE ? END, {_HISTORY} WHERE id = ?",
+                        (note, note, _event("acknowledged", by, note), alert_id))
         elif action == "assign":
-            con.execute("UPDATE alerts SET assigned = ? WHERE id = ?", (assignee[:120], alert_id))
+            con.execute(f"UPDATE alerts SET assigned = ?, {_HISTORY} WHERE id = ?", (assignee[:120], _event("assigned", by, assignee=assignee[:120]), alert_id))
         elif action == "close":
-            con.execute("UPDATE alerts SET state = 'closed', closed_at = ?, note = ? WHERE id = ?", (store._now(), note or f"Closed by {by}", alert_id))
+            con.execute(f"UPDATE alerts SET state = 'closed', closed_at = ?, note = CASE WHEN ? = '' THEN note ELSE ? END, {_HISTORY} WHERE id = ?",
+                        (store._now(), note, note, _event("closed", by, note), alert_id))
         else:
             raise ValueError("The action is acknowledge, assign or close")
     store.audit(by, f"{action}d an alert" if action != "assign" else "assigned an alert", r["site_id"], {"alert": alert_id})
@@ -699,7 +721,7 @@ def act(alert_id: str, action: str, by: str, note: str = "", assignee: str = "")
     # the alert itself, read by its id (the inbox listing is capped, so an alert outside its first rows would not be found there)
     with store.connect() as con:
         r2 = con.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
-    return {**dict(r2), "detail": json.loads(r2["detail"] or "{}"), "site_name": (sites.get(r2["site_id"]) or {}).get("name", "")}
+    return _row(r2, (sites.get(r2["site_id"]) or {}).get("name", ""))
 
 
 # ------------------------------------------------------------------------------------------------ the rules (R8 2.16: per company, with site overrides)
