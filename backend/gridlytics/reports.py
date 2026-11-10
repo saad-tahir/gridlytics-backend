@@ -282,18 +282,33 @@ def coverage_sentence(tdays: list[dict], p0: date, p1: date, today: date) -> str
     return ""
 
 
+def _grid(site: dict) -> str:
+    """The site's grid in a word: "connected" (a connection saved), "off_grid" (a connection of regime off_grid, or none at a site whose settings
+    say off-grid or that is a farm, as Site settings' tab C reads it), or "unsaved" (a grid site whose connection is not saved yet; audit
+    flow-reports-alerts-members-keys-16: it was called off-grid)."""
+    conn = (site.get("connections") or [None])[0]
+    if conn:
+        return "off_grid" if conn["data"].get("regime") == "off_grid" else "connected"
+    data = site.get("data") or {}
+    return "off_grid" if data.get("off_grid") or data.get("site_type") == "farm" else "unsaved"
+
+
 def _connection_words(site: dict) -> str:
+    """The header's connection: the DISCO, the category and the regime in words; "Off-grid."; or that the grid connection is not saved yet."""
+    grid, disco = _grid(site), str((site.get("data") or {}).get("disco") or "").strip()
+    if grid == "unsaved":
+        return f"{disco} grid connection, not saved yet." if disco else "Grid connection not saved yet."
     conn = (site.get("connections") or [None])[0]
     if not conn:
         return "Off-grid."
     data = conn["data"]
     regime = REGIME_WORDS.get(data.get("regime"), str(data.get("regime")).replace("_", " "))
-    return f"{site['data'].get('disco') or ''} {data.get('tariff_category') or ''}, {regime}.".strip()
+    return f"{disco} {data.get('tariff_category') or ''}, {regime}.".strip()
 
 
 def _on_grid(site: dict) -> bool:
-    conn = (site.get("connections") or [None])[0]
-    return bool(conn) and conn["data"].get("regime") != "off_grid"
+    """Whether the site has a grid, its connection saved or not: its outages and its import are read; an off-grid site has neither."""
+    return _grid(site) != "off_grid"
 
 
 # ------------------------------------------------------------------------------------------------ the key figures (plan 8.3, the report's KPI grid)
@@ -513,6 +528,9 @@ def _bills(doc: _Doc, site: dict, d0: date, d1: date) -> None:
     """Plan 8.5: the bill comparison, the DISCO bills entered for the period against the bill engine's rebuild (verify.bills)."""
     if not _on_grid(site):
         doc.p("No grid connection: there is no DISCO bill to compare.")
+        return
+    if _grid(site) == "unsaved":
+        doc.p("The grid connection is not saved yet: there is no DISCO bill to compare until it is (Site settings, Grid connection).")
         return
     rows = [b for b in verify.bills(site["id"]) if str(b.get("period_start")) <= d1.isoformat() and str(b.get("period_end")) >= d0.isoformat()]
     if not rows:

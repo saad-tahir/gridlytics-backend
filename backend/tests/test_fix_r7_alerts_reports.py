@@ -1613,3 +1613,37 @@ def test_a_report_period_is_a_whole_month_of_the_sites_data_and_never_in_the_fut
     r = a.post("/api/reports", json={"kind": "daily_operations", "site_id": fresh, "period": (first - timedelta(days=1)).isoformat()})
     assert r.status_code == 422 and f"no data before {first:%A} {first.day} {first:%B %Y}" in r.json()["detail"], r.text
     assert a.post("/api/reports", json={"kind": "company_rollup", "period": last}).status_code == 200
+
+
+# ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-16
+
+def test_a_grid_site_with_no_connection_saved_is_not_called_off_grid_and_an_empty_period_is_said(world, monkeypatch):
+    """flow-reports-alerts-members-keys-16: a MEPCO grid site with no connection saved yet read 'Off-grid.' in every report's header and 'No grid
+    connection' in its outage and bill lines; a connected site printed its regime raw ('none'); a month with no data and a sheet with no plan said
+    nothing. The header now says the connection is not saved, a regime in words, and the empty month and the missing plan in a sentence."""
+    from gridlytics import reports
+    month, today = _past_month(), datetime.now(PKT).date()
+    built = _story(monkeypatch)
+    with world.use():
+        unsaved = sites.create({"name": "Multan Unit", "disco": "MEPCO"}, "test")["id"]
+        farm = sites.create({"name": "Pump Farm", "disco": "MEPCO", "off_grid": True}, "test")["id"]
+        for kind in ("monthly_savings", "energy_only"):
+            reports.generate(kind, unsaved, month, "test")
+            text = built[-1]
+            assert text.splitlines()[1].startswith(f"01 {month_name(month)} to "), text.splitlines()[1]
+            assert "MEPCO grid connection, not saved yet." in text.splitlines()[1] and "Off-grid" not in text, (kind, text)
+            assert "No grid connection" not in text and "No outages in the period." in text, (kind, text)
+            assert f"No data was received for {month_name(month)}: this report has no measured figures." in text, (kind, text)
+        bill = "The grid connection is not saved yet: there is no DISCO bill to compare until it is (Site settings, Grid connection)."
+        assert bill in built[0], built[0]
+        reports.generate("daily_operations", unsaved, today.isoformat(), "test")
+        assert "MEPCO grid connection, not saved yet." in built[-1].splitlines()[1] and "No plan was in force now" in built[-1], built[-1]
+        reports.generate("energy_only", farm, month, "test")
+        assert "Off-grid." in built[-1].splitlines()[1] and "No grid connection: there are no grid outages to carry." in built[-1], built[-1]
+        reports.generate("energy_only", world.site, month, "test")
+        head = built[-1].splitlines()[1]
+        assert "FESCO B-2(b), no export (no net metering)." in head and "none." not in head, head
+
+
+def month_name(month: str) -> str:
+    return f"{datetime.strptime(month, '%Y-%m'):%B %Y}"
