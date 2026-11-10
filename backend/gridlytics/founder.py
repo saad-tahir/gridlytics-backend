@@ -14,7 +14,18 @@ console answers 503.
 The session is an 8-hour token in the exact format of Boxlytics' `founder-auth.ts` (`boxlytics@c429bef`, supabase/functions/_shared/founder-auth.ts,
 ported): base64url of the JSON {"sub":"founder","iat":..,"exp":..} (JSON.stringify's order, no spaces), a dot, and base64url of HMAC-SHA256 over that first
 part with the session secret (trimmed), all without padding. It is checked as `verifySessionToken` checks it: the signature compared in constant time, `sub`
-"founder", `iat` and `exp` finite numbers, and `exp` after now. Nothing is kept of a session on the server, so signing out is forgetting the token.
+"founder", `iat` and `exp` finite numbers, and `exp` after now. The session secret is at least SESSION_SECRET_CHARS long: a shorter one is refused at
+start-up (`check_startup`) and by every route (503), since one token would let it be guessed offline (audit security-roles-12).
+
+A session ends on the server, not only in the browser (audit founder-console-09; Boxlytics kept nothing, so signing out was forgetting the token):
+
+* signing out (`sign_out`) records the hash of that token (`token_id`), never the token, and it is refused from then on;
+* signing out everywhere ends every founder session made so far: sessions hold only when made from a given second on (`store_founder.sessions_from`);
+* a new founder password ends every session too: the second is moved on the first time the server sees a password hash other than the one it last saw,
+  before any new session is made, so the first session of the new password holds. A change of the session secret is seen the same way (its sessions no
+  longer verify anyway).
+
+A refusal of an ended session is 401 `founder_session_ended`, which the console takes as it takes an expired one.
 
 The sign-in is two steps, and the password is sent once (addendum item 13):
 
@@ -42,10 +53,11 @@ import logging
 import math
 import os
 import re
+import secrets
 import sys
 import time
 
-from . import auth, mfa
+from . import auth, identity, mfa
 from . import platform as platformdb
 
 log = logging.getLogger("gridlytics")
@@ -68,6 +80,13 @@ SIGNED_IN = platformdb.SIGNED_IN
 REFUSED = platformdb.REFUSED
 #: A session token is far shorter than this; anything longer is not one
 MAX_TOKEN = 2048
+#: The least length of the session secret: as GRIDLYTICS_LOCAL_JWT_SECRET's (identity.SECRET_CHARS, 256 bits as text); one token would let a shorter one be
+#: guessed offline, and with it every company (audit security-roles-12)
+SESSION_SECRET_CHARS = identity.SECRET_CHARS
+#: Why a session that is still well signed and inside its 8 hours is refused (401 founder_session_ended)
+SIGNED_OUT_WORDS = "This founder session was signed out; sign in again"
+ALL_ENDED_WORDS = "Every founder session was ended; sign in again"
+PASSWORD_CHANGED_WORDS = "The founder's password was changed, which ended every founder session; sign in again"
 _WRONG = "The username or the password is wrong"
 #: The forms GRIDLYTICS_FOUNDER_PASSWORD_HASH takes: auth.hash_password's PBKDF2, and Boxlytics' sha256 in hex (either case)
 _HASH_FORMS = re.compile(r"pbkdf2_sha256\$[1-9]\d{0,7}\$(?:[0-9a-f]{2})+\$[0-9a-f]{64}|[0-9a-fA-F]{64}")
@@ -95,9 +114,16 @@ def missing() -> list[str]:
     return [name for name in SETTINGS if not _setting(name)]
 
 
+def _short_secret() -> bool:
+    """The session secret is set but shorter than SESSION_SECRET_CHARS (security-roles-12)."""
+    secret = _setting("GRIDLYTICS_FOUNDER_SESSION_SECRET")
+    return bool(secret) and len(secret) < SESSION_SECRET_CHARS
+
+
 def malformed() -> list[str]:
     """The settings that are set but cannot work: a code secret that is not Base32, or a password hash in neither form (auth.py's PBKDF2, or 64 hex digits).
-    Either would refuse every sign-in, and lock the founder out, without saying why."""
+    Either would refuse every sign-in, and lock the founder out, without saying why. And a session secret shorter than SESSION_SECRET_CHARS, which would let
+    one token be guessed back to it offline."""
     out = []
     try:
         mfa.secret_bytes(_setting("GRIDLYTICS_FOUNDER_TOTP_SECRET"))
@@ -105,7 +131,14 @@ def malformed() -> list[str]:
         out.append("GRIDLYTICS_FOUNDER_TOTP_SECRET")
     if not _HASH_FORMS.fullmatch(_setting("GRIDLYTICS_FOUNDER_PASSWORD_HASH")):
         out.append("GRIDLYTICS_FOUNDER_PASSWORD_HASH")
+    if _short_secret():
+        out.append("GRIDLYTICS_FOUNDER_SESSION_SECRET")
     return out
+
+
+def _short_words() -> str:
+    return (f"GRIDLYTICS_FOUNDER_SESSION_SECRET is shorter than {SESSION_SECRET_CHARS} characters: make one with "
+            "`python -m gridlytics.founder session-secret`")
 
 
 def need_set_up() -> None:
@@ -115,8 +148,18 @@ def need_set_up() -> None:
         raise Refused(503, "unavailable", f"The founder console is not set up on this server: set {', '.join(gone)}")
     bad = malformed()
     if bad:
-        raise Refused(503, "unavailable", f"The founder console is not set up on this server: {' and '.join(bad)} {'is' if len(bad) == 1 else 'are'} "
-                                          "not in the form `python -m gridlytics.founder` makes")
+        form = [name for name in bad if name != "GRIDLYTICS_FOUNDER_SESSION_SECRET"]
+        said = ([f"{' and '.join(form)} {'is' if len(form) == 1 else 'are'} not in the form `python -m gridlytics.founder` makes"] if form else []) + \
+               ([_short_words()] if len(form) < len(bad) else [])
+        raise Refused(503, "unavailable", f"The founder console is not set up on this server: {'; '.join(said)}")
+
+
+def check_startup() -> None:
+    """Refuses (RuntimeError) a session secret that is set but shorter than SESSION_SECRET_CHARS, before the API answers anyone, as identity.check_startup
+    refuses a short GRIDLYTICS_LOCAL_JWT_SECRET (security-roles-12). routes_founder calls it when the API loads it. With no secret at all the console is off
+    (503) and the API starts."""
+    if _short_secret():
+        raise RuntimeError(_short_words())
 
 
 # ------------------------------------------------------------------------------------------------ the password's hash
@@ -154,9 +197,30 @@ def _sign(payload_b64: str, secret: str) -> str:
     return _b64(hmac.new(secret.encode("utf-8"), payload_b64.encode("ascii"), hashlib.sha256).digest())
 
 
+def token_id(token: str) -> str:
+    """What the server keeps of a session it ended: the sha256 of its token, in hex; never the token. Two sessions never share one: each is made by a code
+    of a later time step than the last (mfa), so their `iat` differ."""
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def _password_mark() -> str:
+    """What tells the server that the founder's password changed: an HMAC of the password hash under the session secret, so that the record says nothing of
+    the hash. A new session secret changes it too."""
+    key = _setting("GRIDLYTICS_FOUNDER_SESSION_SECRET").encode("utf-8")
+    return hmac.new(key, b"password:" + _setting("GRIDLYTICS_FOUNDER_PASSWORD_HASH").encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def _sessions_from() -> dict:
+    """The second from which a founder session must be made to hold, and why the earlier ones ended ({from, why}); a new password is seen here."""
+    from . import store_founder
+    return store_founder.sessions_from(_password_mark(), math.floor(_clock()))
+
+
 def new_token() -> tuple[str, int]:
-    """A session token of the founder and the moment it ends (unix seconds): createSessionToken's."""
+    """A session token of the founder and the moment it ends (unix seconds): createSessionToken's. A new password is seen first, so its first session is
+    not ended with the old ones."""
     need_set_up()
+    _sessions_from()
     now = math.floor(_clock())
     exp = now + SESSION_SECONDS
     payload_b64 = _b64(json.dumps({"sub": "founder", "iat": now, "exp": exp}, separators=(",", ":")).encode("utf-8"))
@@ -199,7 +263,27 @@ def verify(token) -> int:
         raise invalid
     if not payload["exp"] > math.floor(_clock()):
         raise Refused(401, "founder_session_expired", "The founder session has ended; sign in again")
+    # ended on the server (founder-console-09): every session made before a second, or this one signed out
+    from . import store_founder
+    held = _sessions_from()
+    if payload["iat"] < held["from"]:
+        raise Refused(401, "founder_session_ended", PASSWORD_CHANGED_WORDS if held["why"] == "password" else ALL_ENDED_WORDS)
+    if store_founder.signed_out(token_id(token)):
+        raise Refused(401, "founder_session_ended", SIGNED_OUT_WORDS)
     return int(payload["exp"])
+
+
+def sign_out(token, everywhere: bool, address: str) -> None:
+    """End the session of this token on the server, or with `everywhere` every founder session made so far (this one too); the founder's audit says which.
+    The token is verified first: a session that does not hold is refused as at every route."""
+    from . import store_founder
+    ends = verify(token)
+    if everywhere:
+        store_founder.end_sessions(_password_mark(), math.floor(_clock()) + 1)
+        platformdb.founder_audit("ended every founder session", "", {"address": address, "why": "signed out everywhere"})
+    else:
+        store_founder.sign_out(token_id(token), ends, address)
+        platformdb.founder_audit("signed out", "", {"address": address})
 
 
 # ------------------------------------------------------------------------------------------------ the sign-in: the lockout, the password, the code
@@ -273,13 +357,13 @@ def code(challenge, code, address: str) -> dict:
 # ------------------------------------------------------------------------------------------------ the command line
 
 def main(argv: list[str] | None = None, stdin=None, stdout=None, stderr=None) -> int:
-    """`python -m gridlytics.founder hash | totp-secret | code`: the password's hash for GRIDLYTICS_FOUNDER_PASSWORD_HASH (the password asked twice, or
-    read from the standard input when it is not a terminal), a new code secret for GRIDLYTICS_FOUNDER_TOTP_SECRET with its otpauth:// link, and the
-    current code of GRIDLYTICS_FOUNDER_TOTP_SECRET. Nothing is printed but what was asked for; no secret is taken as an argument, which a shell's
-    history would keep."""
+    """`python -m gridlytics.founder hash | totp-secret | code | session-secret`: the password's hash for GRIDLYTICS_FOUNDER_PASSWORD_HASH (the password
+    asked twice, or read from the standard input when it is not a terminal), a new code secret for GRIDLYTICS_FOUNDER_TOTP_SECRET with its otpauth://
+    link, the current code of GRIDLYTICS_FOUNDER_TOTP_SECRET, and a new GRIDLYTICS_FOUNDER_SESSION_SECRET (64 characters). Nothing is printed but what
+    was asked for; no secret is taken as an argument, which a shell's history would keep."""
     stdin, stdout, stderr = stdin or sys.stdin, stdout or sys.stdout, stderr or sys.stderr
     parser = argparse.ArgumentParser(prog="python -m gridlytics.founder", description="The founder console's settings")
-    parser.add_argument("what", choices=("hash", "totp-secret", "code"))
+    parser.add_argument("what", choices=("hash", "totp-secret", "code", "session-secret"))
     try:
         args = parser.parse_args(argv)
     except SystemExit as stop:
@@ -297,6 +381,9 @@ def main(argv: list[str] | None = None, stdin=None, stdout=None, stderr=None) ->
             print(problem, file=stderr)
             return 1
         print(hash_password(password), file=stdout)
+        return 0
+    if args.what == "session-secret":
+        print(secrets.token_urlsafe(48), file=stdout)
         return 0
     if args.what == "totp-secret":
         secret = mfa.new_secret()

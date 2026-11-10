@@ -4,20 +4,23 @@
     POST  /api/founder/login                         {username, password}  -> {challenge, expires_in, tries}
     POST  /api/founder/login/code                    {challenge, code}     -> {token, expires_at}
     GET   /api/founder/session                                             -> {authenticated, expires_at}
+    POST  /api/founder/logout                        {everywhere?}         -> {ended: true, everywhere}
     GET   /api/founder/overview                                            -> the registry's and the files' figures
     GET   /api/founder/companies                                           -> {companies}
     POST  /api/founder/companies                     {name, seats, enabled, owner}  -> 201 {company, owner, membership}
     PATCH /api/founder/companies/{id}                {name?, seats?}       -> {company}
     POST  /api/founder/companies/{id}/access         {enabled, reason?}    -> {company}
+    POST  /api/founder/companies/{id}/archive        {archived}            -> {company, made}
     GET   /api/founder/companies/{id}/members                              -> {members}
     GET   /api/founder/companies/{id}/backups                              -> {backups}
     POST  /api/founder/companies/{id}/backups        {}                    -> {made, backups}
     GET   /api/founder/users                                               -> {users}
     POST  /api/founder/users                         {email, name, password, company_id?, company_role?}  -> 201 {user}
     POST  /api/founder/users/{id}/password           {password}            -> {user}
-    PATCH /api/founder/users/{id}                    {disabled?, name?}    -> {user}
+    PATCH /api/founder/users/{id}                    {disabled?, name?, leave_without_owner?}  -> {user}
+    POST  /api/founder/users/{id}/archive            {archived, leave_without_owner?}  -> {user}
     POST  /api/founder/users/{id}/memberships        {company_id, company_role}  -> 201 {membership}
-    PATCH /api/founder/users/{id}/memberships/{cid}  {company_role?, status?}    -> {membership}
+    PATCH /api/founder/users/{id}/memberships/{cid}  {company_role?, status?}    -> {membership}  (with gridlytics_role and last_seen there now)
     DELETE /api/founder/users/{id}/memberships/{cid}                       -> {removed: true}
     GET   /api/founder/audit?offset=                                       -> {entries}
 
@@ -42,6 +45,8 @@ from . import platform as platformdb
 
 router = APIRouter()
 log = logging.getLogger("gridlytics")
+# A session secret too short to keep the founder's tokens from being forged stops the API as it loads this module, before it answers anyone (security-roles-12)
+founder.check_startup()
 
 #: The founder's audit, a page at a time (the console's AUDIT_PAGE)
 AUDIT_PAGE = 300
@@ -175,6 +180,19 @@ def founder_session(ends: int = Depends(_session)):
     return {"authenticated": True, "expires_at": ends}
 
 
+@router.post("/api/founder/logout", dependencies=[Depends(_session)])
+def founder_logout(request: Request, inp: dict | None = Body(None)):
+    """Sign out: the session of this token ends on the server, and is refused from now on (401 founder_session_ended); with everywhere, every founder
+    session made so far ends, this one too (audit founder-console-09)."""
+    _object(inp or {}, {"everywhere"}, "Signing out")
+    everywhere = _yes_no((inp or {}).get("everywhere", False), "Say whether every founder session ends: everywhere, true or false")
+    try:
+        founder.sign_out(request.headers.get("x-founder-session"), everywhere, platformdb.client_address(request))
+    except founder.Refused as refused:
+        raise _refusal(refused) from None
+    return {"ended": True, "everywhere": everywhere}
+
+
 # ------------------------------------------------------------------------------------------------ the overview and the companies
 
 @router.get("/api/founder/overview", dependencies=[Depends(_session)])
@@ -250,12 +268,30 @@ def founder_company_access(company_id: str, inp: dict = Body(...)):
     reason = inp.get("reason", "")
     if not isinstance(reason, str) or len(reason) > 200:
         _api._fail("The reason is text of at most 200 characters")
-    if platformdb.company(company_id) is None:
+    held = platformdb.company(company_id)
+    if held is None:
         _missing("company")
+    if enabled and company_id in store_founder.archived("company"):
+        raise schemas.Refusal(409, f"{held['name']} is archived: bring it back from the archive first")
     row = platformdb.update_company(company_id, enabled=enabled, disabled_reason="" if enabled else reason)
     platformdb.founder_audit(f"switched Gridlytics {'on' if enabled else 'off'}", row["name"], {} if enabled else {"reason": row["disabled_reason"]})
     with _said():
         return {"company": store_founder.company_view(company_id)}
+
+
+@router.post("/api/founder/companies/{company_id}/archive", dependencies=[Depends(_session)])
+def founder_company_archive(company_id: str, inp: dict = Body(...)):
+    """Archive a company, or bring it back (audit founder-console-13): archived, Gridlytics is switched off for it and a last copy of its files is made
+    (`made`, its name; null when it had no file or was archived already); nothing is deleted. It cannot be switched on while archived; brought back, it
+    stays off until switched on."""
+    company_id = _id(company_id, "company")
+    _object(inp, {"archived"}, "Archiving a company")
+    on = _yes_no(inp.get("archived"), "Say whether the company is archived: archived, true or false")
+    with _said():
+        row, detail = store_founder.archive_company(company_id, on)
+        if detail is not None:
+            platformdb.founder_audit("archived a company" if on else "brought a company back from the archive", row["name"], detail)
+        return {"company": store_founder.company_view(company_id), "made": (detail or {}).get("copy")}
 
 
 @router.get("/api/founder/companies/{company_id}/members", dependencies=[Depends(_session)])
@@ -329,18 +365,38 @@ def founder_user_password(user_id: str, inp: dict = Body(...)):
 @router.patch("/api/founder/users/{user_id}", dependencies=[Depends(_session)])
 def founder_user_change(user_id: str, inp: dict = Body(...)):
     """Disable an account (its sessions end at once, and a token made before is refused at its next request; in supabase mode a ban) or enable it; rename
-    it."""
+    it. Disabling a company's only owner who can sign in is refused (409) unless leave_without_owner is true (audit founder-console-10)."""
     user_id = _id(user_id, "account")
-    _object(inp, {"disabled", "name"}, "A change of an account")
-    if not inp:
+    _object(inp, {"disabled", "name", "leave_without_owner"}, "A change of an account")
+    if not set(inp) - {"leave_without_owner"}:
         _api._fail("Send whether the account is disabled, or its new name")
     disabled = _yes_no(inp["disabled"], "Say whether the account is disabled: true or false") if "disabled" in inp else None
     name = _text(inp["name"], "Give the person's name, 1 to 80 characters") if "name" in inp else None
+    alone = _yes_no(inp.get("leave_without_owner", False), "Say whether a company may be left without an owner who can sign in: true or false")
     with _said():
-        before, after = store_founder.update_account(user_id, disabled, name)
+        before, after, left = store_founder.update_account(user_id, disabled, name, alone)
         changes = {k: {"from": before[k], "to": after[k]} for k in ("disabled", "name") if before[k] != after[k]}
+        if left:
+            changes["left_without_owner"] = left
         if changes:
             platformdb.founder_audit("changed an account", after["email"], changes)
+        return {"user": store_founder.user(user_id)}
+
+
+@router.post("/api/founder/users/{user_id}/archive", dependencies=[Depends(_session)])
+def founder_user_archive(user_id: str, inp: dict = Body(...)):
+    """Archive an account, or bring it back (audit founder-console-13): archived, it is disabled (its sessions end) and its seats are freed; a company's
+    only owner who can sign in is refused (409) unless leave_without_owner is true, as for disabling. It cannot be enabled while archived; brought back,
+    it stays disabled until enabled."""
+    user_id = _id(user_id, "account")
+    _object(inp, {"archived", "leave_without_owner"}, "Archiving an account")
+    on = _yes_no(inp.get("archived"), "Say whether the account is archived: archived, true or false")
+    alone = _yes_no(inp.get("leave_without_owner", False), "Say whether a company may be left without an owner who can sign in: true or false")
+    with _said():
+        before, detail = store_founder.archive_account(user_id, on, alone)
+        if detail is not None:
+            platformdb.founder_audit("archived an account" if on else "brought an account back from the archive", before["email"], detail)
+            store_founder.follow_archive(user_id, on)
         return {"user": store_founder.user(user_id)}
 
 
@@ -368,6 +424,7 @@ def founder_membership_new(user_id: str, inp: dict = Body(...)):
         account = store_founder.add_membership(user_id, company_id, role)
         platformdb.founder_audit("added a membership", account["email"], {"company": platformdb.company(company_id)["name"], "company_role": role})
         store_founder.follow_membership(company_id, user_id, "active")
+        store_founder.follow_roles(company_id)
         return {"membership": store_founder.membership_view(user_id, company_id)}
 
 
@@ -388,6 +445,9 @@ def founder_membership_change(user_id: str, company_id: str, inp: dict = Body(..
         if status is not None:
             # also when the status was already this one: a member row a failed follow-up left behind is set right by sending the status again
             store_founder.follow_membership(company_id, user_id, status)
+        if role is not None:
+            # the Gridlytics role the company role gives, now, not at the person's next request (audit founder-console-16)
+            store_founder.follow_roles(company_id)
         return {"membership": store_founder.membership_view(user_id, company_id)}
 
 

@@ -219,7 +219,7 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
 
 def backup(tag: str) -> Path | None:
     """A copy of the current workspace file and its telemetry file in `backup/` beside them (SQLite's own backup, consistent while another connection
-    writes); None when there is no file yet."""
+    writes), and of the company's signing keys and reports (backups.copy_folders); None when there is no file yet."""
     path = db_path()
     if not path.exists() or path.stat().st_size == 0:
         return None
@@ -231,6 +231,8 @@ def backup(tag: str) -> Path | None:
         if src_path.exists() and src_path.stat().st_size > 0:
             with closing(sqlite3.connect(src_path)) as src, closing(sqlite3.connect(dst_path)) as dst:
                 src.backup(dst)
+    from . import backups               # the company's signing keys and reports go with its two files (audit founder-console-01, parity-architecture-11)
+    backups.copy_folders(path, folder, f"{stamp}-{tag}")    # imported here: backups imports store
     return target
 
 

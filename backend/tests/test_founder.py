@@ -191,9 +191,11 @@ def test_every_founder_route_but_the_login_needs_the_session_whatever_else_the_r
     sign_in_required, and a member's token or a company header does not stand in for the founder's session."""
     member = identities.token("member@acme.test", "admin", company_role="owner")
     routes = _founder_routes()
-    assert {("POST", "/api/founder/login"), ("POST", "/api/founder/login/code"), ("GET", "/api/founder/session"), ("GET", "/api/founder/overview"),
+    assert {("POST", "/api/founder/login"), ("POST", "/api/founder/login/code"), ("GET", "/api/founder/session"), ("POST", "/api/founder/logout"),
+            ("GET", "/api/founder/overview"),
             ("GET", "/api/founder/companies"), ("POST", "/api/founder/companies"), ("PATCH", "/api/founder/companies/{company_id}"),
             ("POST", "/api/founder/companies/{company_id}/access"), ("GET", "/api/founder/companies/{company_id}/members"),
+            ("POST", "/api/founder/companies/{company_id}/archive"), ("POST", "/api/founder/users/{user_id}/archive"),
             ("GET", "/api/founder/companies/{company_id}/backups"), ("POST", "/api/founder/companies/{company_id}/backups"),
             ("GET", "/api/founder/users"), ("POST", "/api/founder/users"), ("POST", "/api/founder/users/{user_id}/password"),
             ("PATCH", "/api/founder/users/{user_id}"), ("POST", "/api/founder/users/{user_id}/memberships"),
@@ -457,7 +459,7 @@ def test_a_company_is_made_with_its_owner_together_or_not_at_all(fdb):
     assert set(made) == {"company", "owner", "membership"}
     company, owner = made["company"], made["owner"]
     assert company["name"] == "Boxlytics Internal" and company["enabled"] is True and company["seats"] == 5 and "db_file" not in company
-    assert company["owner"] == {"id": owner["id"], "email": OWNER["email"], "name": OWNER["name"]} and company["members"] == 1
+    assert company["owner"] == {"id": owner["id"], "email": OWNER["email"], "name": OWNER["name"], "disabled": False} and company["members"] == 1
     assert made["membership"]["company_role"] == "owner" and made["membership"]["status"] == "active"
     assert platformdb.check_sign_in(OWNER["email"], OWNER["password"])["id"] == owner["id"]
     assert platformdb.company_file(company["id"]) == platformdb.companies_dir() / f"{company['id']}.db"
@@ -536,7 +538,7 @@ def test_the_companies_list_carries_the_files_figures_and_the_plan(fdb):
     assert not platformdb.company_file(quiet["company"]["id"]).exists()          # the list made no file
     members = _ok(c.get(f"/api/founder/companies/{cid}/members"))["members"]
     assert members == [{"user_id": owner["id"], "email": OWNER["email"], "name": OWNER["name"], "company_role": "owner", "status": "active",
-                        "disabled": False, "gridlytics_role": "admin", "solarlytics_role": "admin", "seated": True,
+                        "disabled": False, "gridlytics_role": "admin", "seated": True,
                         "last_seen": members[0]["last_seen"]}] and members[0]["last_seen"]
     assert _ok(c.get(f"/api/founder/companies/{quiet['company']['id']}/members"))["members"][0]["gridlytics_role"] is None
     assert c.get(f"/api/founder/companies/{uuid.uuid4()}/members").status_code == 404
@@ -585,7 +587,7 @@ def test_an_account_is_made_with_a_first_password_reset_disabled_and_enabled(fdb
     cid = _company(c)["company"]["id"]
     made = _ok(c.post("/api/founder/users", json={"email": "Sunia@Meow.test", "name": "Sunia Ahmed", "password": "sunia first password",
                                                    "company_id": cid, "company_role": "member"}), 201)["user"]
-    assert made["email"] == "sunia@meow.test" and made["disabled"] is False and set(made) == {"id", "email", "name", "disabled", "created", "memberships"}
+    assert made["email"] == "sunia@meow.test" and made["disabled"] is False and set(made) == {"id", "email", "name", "disabled", "created", "archived", "memberships"}
     assert made["memberships"] == [{"company_id": cid, "company_name": "Boxlytics Internal", "company_role": "member", "status": "active"}]
     for body, words in (({"email": "sunia@meow.test", "name": "Sunia", "password": "another password 1"}, "account"),
                         ({"email": "x@meow.test", "name": "X", "password": "x first password", "company_id": str(uuid.uuid4())}, "company"),
@@ -723,7 +725,9 @@ def test_backups_are_per_company_and_reachable_only_by_the_founder(fdb):
     first = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))
     assert first["made"] and first["made"].startswith(cid) and [b["name"] for b in first["backups"]] == [first["made"]]
     backup = first["backups"][0]
-    assert set(backup) == {"name", "kind", "modified", "bytes"} and backup["kind"] == "manual" and backup["bytes"] > 0
+    # a copy is the workspace, its telemetry, its signing keys and its reports (round 7, audit founder-console-12, parity-architecture-11)
+    assert set(backup) == {"name", "kind", "modified", "bytes", "workspace_bytes", "telemetry", "telemetry_bytes", "keys", "reports", "reports_bytes"}
+    assert backup["kind"] == "manual" and backup["bytes"] > 0
     assert datetime.fromisoformat(backup["modified"]).utcoffset().total_seconds() == 0
     for _ in range(backups.KEEP_MANUAL + 1):
         made_now = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))
@@ -752,7 +756,7 @@ def test_the_audit_lists_every_action_newest_first_a_page_at_a_time(fdb):
     assert c.get("/api/founder/audit?offset=-1").status_code == 422
 
 
-def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_wrong_shape_in_a_sentence(fdb):
+def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_wrong_shape_in_a_sentence(fdb, clock):
     """The role walk does not reach the founder's routes (walk_cases/founder.py): this is their walk. Each answers its good request with the founder's
     session, and each field of a good body sent as a list, null, a number or a long text, and each body sent empty or not an object, is refused in a
     sentence or answered, never a server error."""
@@ -766,14 +770,19 @@ def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_
              ("POST", "/api/founder/companies"): {"name": "Walk", "seats": 5, "enabled": True, "owner": {"user_id": uid}},
              ("PATCH", "/api/founder/companies/{company_id}"): {"name": "Walked", "seats": 4},
              ("POST", "/api/founder/companies/{company_id}/access"): {"enabled": True, "reason": ""},
+             ("POST", "/api/founder/companies/{company_id}/archive"): {"archived": False},
+             ("POST", "/api/founder/users/{user_id}/archive"): {"archived": False, "leave_without_owner": False},
              ("POST", "/api/founder/companies/{company_id}/backups"): {},
              ("POST", "/api/founder/users"): {"email": "walk@meow.test", "name": "Walk", "password": "walk first password"},
              ("POST", "/api/founder/users/{user_id}/password"): {"password": "a walk password 1"},
              ("PATCH", "/api/founder/users/{user_id}"): {"disabled": False, "name": "Walk"},
              ("POST", "/api/founder/users/{user_id}/memberships"): {"company_id": cid, "company_role": "member"},
-             ("PATCH", "/api/founder/users/{user_id}/memberships/{company_id}"): {"status": "active"}}
+             ("PATCH", "/api/founder/users/{user_id}/memberships/{company_id}"): {"status": "active"},
+             ("POST", "/api/founder/logout"): {"everywhere": False}}
     problems = []
-    for method, path in _founder_routes():
+    logout = ("POST", "/api/founder/logout")
+    # signing out ends the walk's session (round 7, audit founder-console-09): it is walked last, each body with a session of its own
+    for method, path in sorted(_founder_routes(), key=lambda route: route == logout):
         url = path.replace("{company_id}", cid).replace("{user_id}", other)
         good = goods.get((method, path))
         if method == "GET" or good is None:
@@ -783,6 +792,9 @@ def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_
             continue
         bodies = [[], "text", 5, {}] + [{**good, k: v} for k in good for v in ([], None, 5, "x" * 500)] + [{**good, "unknown": 1}]
         for body in bodies:
+            if (method, path) == logout:
+                clock.step()
+                c.headers.update(_session())
             r = c.request(method, url, json=body)
             if r.status_code >= 500 or (r.status_code >= 400 and not (_sentence(r) or r.json().get("code") == "invalid_body")):
                 problems.append(f"{method} {path} with {json.dumps(body)[:80]}: answered {r.status_code}: {r.text[:160]}")
@@ -913,8 +925,8 @@ def test_supabase_mode_makes_accounts_through_the_admin_api_and_the_company_with
     assert [(u["email"], u["name"], u["disabled"]) for u in users] == [(OWNER["email"], OWNER["name"], False)]
     assert users[0]["memberships"][0]["company_role"] == "owner"
     assert _ok(c.get("/api/founder/companies"))["companies"][0]["owner"]["email"] == OWNER["email"]
-    # disable is a ban; enable lifts it; a reset sets the password; a rename follows the profile
-    _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": True}))
+    # disable is a ban; enable lifts it; a reset sets the password; a rename follows the profile (the company's only owner: said knowingly, round 7)
+    _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": True, "leave_without_owner": True}))
     assert project.users[owner["id"]]["banned_until"] and _ok(c.get("/api/founder/users"))["users"][0]["disabled"] is True
     _ok(c.patch(f"/api/founder/users/{owner['id']}", json={"disabled": False, "name": "Saad K. Khan"}))
     assert project.users[owner["id"]]["banned_until"] is None and project.profiles[owner["id"]] == {"id": owner["id"], "first_name": "Saad",

@@ -4,6 +4,9 @@
 
 - `saad-tahir/solarlytics-backend` at `c853130`: the sign-in, tenancy and founder-console modules listed in `docs/DESIGN_LOG.md`, and their tests. Same
   owner; no licence obligation.
+- The same repository at the same commit: `supabase/` (`sql/solar_000_preflight.sql`, `migrations/solar_001_accounts_and_companies.sql`,
+  `migrations/solar_001_rollback.sql`, `README.md`) as `supabase/` here, renamed `grid_*`, and `backend/tests/test_supabase_sql.py` (audit
+  parity-supabase-auth-03). The SQL adapts Boxlytics at `boxlytics@c429bef`, naming each piece's source in the file.
 
 ## Constructions followed clean-room (no code copied)
 
