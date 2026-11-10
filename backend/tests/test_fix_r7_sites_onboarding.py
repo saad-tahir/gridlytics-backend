@@ -44,6 +44,10 @@ power factor (0.8 to start with): its kW is the kVA times the power factor, and 
 
 flow-onboarding-11: a site's genset start method had no threshold, so a set started by a controller at a battery level was planned at the reserve floor
 plus 5 points whatever the controller did. A site now records the state of charge its controller starts the genset at, and the plan and the twin use it.
+
+flow-onboarding-09 and flow-onboarding-17: equipment that disagreed with the inverter (a 5 kW inverter with a 5,000 kW battery, PV 900 kW AC from 10 kWp
+DC, an export cap above the sanctioned load) and a blank feeder code were saved with no word. Every site answer now carries `setup_warnings`: sentences
+that say so, without refusing the save (a site may really have PV on inverters of its own).
 """
 from __future__ import annotations
 
@@ -576,3 +580,46 @@ def test_a_soc_threshold_genset_starts_at_the_battery_level_the_site_records(wor
     for bad in (0, 101):
         r = op.put(f"/api/sites/{sid}", json={"genset_start_soc_pct": bad})
         assert r.status_code == 422, (bad, r.text)
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-09 and flow-onboarding-17
+
+def test_the_site_answer_says_where_the_equipment_disagrees_and_when_no_feeder_is_given(world):
+    a, sid = world.c["admin"], world.site
+    cid = _site(a, sid)["connections"][0]["id"]
+    assert a.put(f"/api/sites/{sid}/assets/inverter", json={"brand": "deye", "kw_ac": 50}).status_code == 200
+    assert a.put(f"/api/sites/{sid}/assets/pv", json={"kwp_dc": 300, "kw_ac": 250}).status_code == 200
+    assert a.put(f"/api/sites/{sid}/assets/battery", json={"nameplate_kwh": 215, "p_ch_kw": 400, "p_dis_kw": 400}).status_code == 200
+    r = a.put(f"/api/sites/{sid}/connection", json={"id": cid, "tariff_category": "B-2(b)", "sanctioned_load_kw": 100, "export_cap_kw": 5000,
+                                                    "regime": "net_billing"})
+    assert r.status_code == 200, r.text
+    r = a.put(f"/api/sites/{sid}", json={"critical_load_kw": [500.0] * 24, "load_peak_kw": 300})
+    assert r.status_code == 200, r.text
+    # saves are not refused: each answer says what disagrees (a site may have PV on inverters of its own, or a battery rated above its inverter)
+    for answer in (r.json(), _site(a, sid), a.put(f"/api/sites/{sid}/assets/genset", json={"rated_kw": 150}).json(),
+                   a.put(f"/api/sites/{sid}/connection", json={"id": cid, "tariff_category": "B-2(b)", "sanctioned_load_kw": 100, "export_cap_kw": 5000,
+                                                               "regime": "net_billing"}).json()):
+        assert answer["setup_warnings"] == [
+            "The PV's AC size (250 kW) is above the inverter's (50 kW): the plan passes no more than 50 kW of PV and battery power through it",
+            "The battery's charge power (400 kW) is above the inverter's AC size (50 kW): the plan keeps it within 50 kW",
+            "The battery's discharge power (400 kW) is above the inverter's AC size (50 kW): the plan keeps it within 50 kW",
+            "The export cap (5,000 kW) is above the inverter's AC size (50 kW): the site cannot export more than the inverter passes",
+            "The export cap (5,000 kW) is above the sanctioned load (100 kW): a net-metering or net-billing agreement allows no more than the sanctioned load",
+            "The critical load (500 kW at most) is more than the battery can give through the inverter (50 kW): it cannot carry it alone in an outage",
+            "The critical load (500 kW at most) is above the typical peak load (300 kW): check both",
+            "No feeder or transformer code is given: the outage forecast learns from this site's own outages only, not from the company's other sites on "
+            "its feeder",
+        ], answer["setup_warnings"]
+    # PV far above its DC size is a typing slip worth a word too
+    r = a.put(f"/api/sites/{sid}/assets/pv", json={"kwp_dc": 10, "kw_ac": 40})
+    assert "The PV's AC size (40 kW) is more than one and a half times its DC size (10 kWp): check both" in r.json()["setup_warnings"], r.text
+    # equipment that agrees, and a feeder code, leave nothing to say
+    assert a.put(f"/api/sites/{sid}/assets/inverter", json={"brand": "deye", "kw_ac": 600}).status_code == 200
+    assert a.put(f"/api/sites/{sid}/assets/pv", json={"kwp_dc": 300, "kw_ac": 250}).status_code == 200
+    a.put(f"/api/sites/{sid}/connection", json={"id": cid, "tariff_category": "B-2(b)", "sanctioned_load_kw": 400, "export_cap_kw": 100,
+                                                "regime": "net_billing"})
+    r = a.put(f"/api/sites/{sid}", json={"critical_load_kw": [200.0] * 24, "outage_unit": {"kind": "feeder", "code": "411205", "name": "Jhang Road"}})
+    assert r.status_code == 200 and r.json()["setup_warnings"] == [], r.text
+    # an off-grid site has no feeder to pool
+    other = world.other
+    assert a.put(f"/api/sites/{other}", json={"off_grid": True}).json()["setup_warnings"] == []

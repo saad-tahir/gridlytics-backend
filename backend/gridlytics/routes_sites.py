@@ -255,7 +255,7 @@ def site_activate(site_id: str):
         raise Refusal(422, "Add " + " and ".join(missing) + " before activating", "incomplete")
     sites.set_status(site_id, "active")
     store.audit(auth.actor(), "activated a site", site_id)
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 #: A new connection's save is idempotent (a retried first save never inserts a second row): by the client's key when it sends one (the Idempotency-Key
@@ -311,7 +311,7 @@ def connection_put(site_id: str, inp: dict = Body(...), idempotency_key: str | N
         raise _changed(exc) from None
     except ValueError as exc:
         raise bad(exc) from None
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 @router.delete("/api/sites/{site_id}/connection/{conn_id}")
@@ -330,7 +330,7 @@ def connection_delete(site_id: str, conn_id: str):
         con.execute("DELETE FROM connections WHERE id = ? AND site_id = ?", (conn_id, site_id))
         con.execute("DELETE FROM settings WHERE key LIKE ? AND value = ?", (_idem_setting(site_id, "%"), json.dumps(conn_id)))
     store.audit(auth.actor(), "removed a connection", site_id, {"connection_id": conn_id})
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 @router.put("/api/sites/{site_id}/assets/{role}")
@@ -357,7 +357,7 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
         raise _changed(exc) from None
     except ValueError as exc:
         raise bad(exc) from None
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 def _money_set(role: str, cur: dict | None) -> bool:
@@ -378,7 +378,7 @@ def asset_delete(site_id: str, role: str):
     if _money_set(role, sites.assets(site_id).get(role)):
         auth.need("edit_money_settings", "Removing equipment whose money settings (prices and wear) an administrator set")
     sites.remove_asset(site_id, role, auth.actor())
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 def _has_inverter_mode(site_id: str) -> bool:
@@ -429,9 +429,12 @@ def _tier_signoff(site_id: str, state: dict | None) -> dict | None:
 
 
 def _site_answer(site_id: str) -> dict:
+    """Every answer that is the site: what GET gives, with `tier_signoff` and `setup_warnings` (sites.setup_warnings: what the equipment, connections
+    and critical load say against each other, and a missing feeder code; audit flow-onboarding-09 and -17)."""
     s = full_or_404(site_id)
     s.pop("photo", None)
     s["tier_signoff"] = _tier_signoff(site_id, s.get("state"))
+    s["setup_warnings"] = sites.setup_warnings(s)
     return out(s)
 
 

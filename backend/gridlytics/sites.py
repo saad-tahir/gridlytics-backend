@@ -641,6 +641,55 @@ def full(site_id: str) -> dict | None:
     return {**site, "connections": connections(site_id), "assets": assets(site_id), "state": state(site_id), "native": native_latest(site_id)}
 
 
+# ------------------------------------------------------------------------------------------------ what the setup says against itself
+
+#: A PV AC size above this many times its DC size is a typing slip worth a word: the array never gives the AC side more than its DC
+PV_AC_DC_MAX = 1.5
+
+
+def setup_warnings(site: dict) -> list[str]:
+    """Sentences on what the site's equipment, connections and critical load say against each other, and on a missing feeder code, for every site
+    answer (audit flow-onboarding-09: a 5 kW inverter took a 5,000 kW battery, PV 900 kW AC from 10 kWp DC and an export cap far above the sanctioned
+    load with no word; flow-onboarding-17: a blank feeder code was saved with no word). They do not refuse a save: a site may have PV on inverters of
+    its own, or a battery rated above its inverter, and the plan keeps PV and battery power within the inverter's kW AC whatever is typed. `site` is
+    full() of a site."""
+    out: list[str] = []
+    kw = lambda x: f"{_num(float(x))} kW"  # noqa: E731
+    a, d = site.get("assets") or {}, site.get("data") or {}
+    pv, bat = a.get("pv") or {}, a.get("battery") or {}
+    inv = float((a.get("inverter") or {}).get("kw_ac") or 0) or None
+    if inv and pv.get("kw_ac", 0) > inv:
+        out.append(f"The PV's AC size ({kw(pv['kw_ac'])}) is above the inverter's ({kw(inv)}): the plan passes no more than {kw(inv)} of PV and battery "
+                   "power through it")
+    if pv.get("kwp_dc") and pv.get("kw_ac", 0) > PV_AC_DC_MAX * pv["kwp_dc"]:
+        out.append(f"The PV's AC size ({kw(pv['kw_ac'])}) is more than one and a half times its DC size ({_num(pv['kwp_dc'])} kWp): check both")
+    for key, name in (("p_ch_kw", "charge power"), ("p_dis_kw", "discharge power")):
+        if inv and bat.get(key, 0) > inv:
+            out.append(f"The battery's {name} ({kw(bat[key])}) is above the inverter's AC size ({kw(inv)}): the plan keeps it within {kw(inv)}")
+    conns = [c.get("data") or {} for c in site.get("connections") or []]
+    for c in conns:
+        cap = float(c.get("export_cap_kw") or 0)
+        if inv and cap > inv:
+            out.append(f"The export cap ({kw(cap)}) is above the inverter's AC size ({kw(inv)}): the site cannot export more than the inverter passes")
+        if c.get("sanctioned_load_kw") and cap > c["sanctioned_load_kw"]:
+            out.append(f"The export cap ({kw(cap)}) is above the sanctioned load ({kw(c['sanctioned_load_kw'])}): a net-metering or net-billing agreement "
+                       "allows no more than the sanctioned load")
+    crit = max([float(x) for x in d.get("critical_load_kw") or [] if isinstance(x, (int, float))] or [0.0])
+    if crit > 0 and bat.get("p_dis_kw"):
+        by_inverter = bool(inv) and inv < bat["p_dis_kw"]
+        if crit > (inv if by_inverter else bat["p_dis_kw"]):
+            what = f"the battery can give through the inverter ({kw(inv)})" if by_inverter else f"the battery's discharge power ({kw(bat['p_dis_kw'])})"
+            out.append(f"The critical load ({kw(crit)} at most) is more than {what}: it cannot carry it alone in an outage")
+    if crit > 0 and d.get("load_peak_kw") and crit > d["load_peak_kw"]:
+        out.append(f"The critical load ({kw(crit)} at most) is above the typical peak load ({kw(d['load_peak_kw'])}): check both")
+    # the outage model pools the company's sites on one feeder or transformer code (forecast: sites.outage_unit, "the key the outage model pools on")
+    on_grid = not d.get("off_grid") and (any(c.get("regime") != "off_grid" for c in conns) if conns else bool(d.get("disco")))
+    if on_grid and not str((d.get("outage_unit") or {}).get("code") or "").strip():
+        out.append("No feeder or transformer code is given: the outage forecast learns from this site's own outages only, not from the company's other "
+                   "sites on its feeder")
+    return list(dict.fromkeys(out))
+
+
 # ------------------------------------------------------------------------------------------------ carried state (plan Part 4.8)
 
 def state(site_id: str) -> dict:
