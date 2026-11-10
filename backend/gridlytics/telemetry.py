@@ -986,12 +986,28 @@ def filled(g: dict) -> dict:
 SERIES_KIND = {"grid_import_wh": "sum", "grid_export_wh": "sum", "genset_fuel_l": "sum", "grid_present": "min"}
 
 
-def series(site_id: str, t0: int, t1: int, names: list[str], res: str = "auto") -> dict:
-    """Chart series at a resolution: 1m, 15m, 1h or 1d (auto picks so a request never returns more than about 3,000 points)."""
-    span = t1 - t0
-    if res == "auto":
-        res = "1m" if span <= 2 * 86400 else "15m" if span <= 31 * 86400 else "1h" if span <= 120 * 86400 else "1d"
-    step = {"1m": 60, "15m": 900, "1h": 3600, "1d": 86400}[res]
+#: a chart series answers at most this many buckets (plan Part 9 and the telemetry.py row of Part 11: about 2,000 points per series; R7 section 8)
+SERIES_MAX_POINTS = 2000
+#: the resolutions a series is read at, finest first, with their bucket in seconds (R8's steps; 1d buckets are Karachi days)
+RESOLUTIONS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
+
+
+def _buckets(t0: int, t1: int, step: int, off: int) -> int:
+    """The buckets of `step` seconds (shifted back by `off`) that [t0, t1) touches: a range starting part-way through a bucket touches one more."""
+    return 0 if t1 <= t0 else (int(t1) - 1 + off) // step - (int(t0) + off) // step + 1
+
+
+def series(site_id: str, t0: int, t1: int, names: list[str], res: str = "auto", max_points: int = SERIES_MAX_POINTS) -> dict:
+    """Chart series at a resolution of RESOLUTIONS. "auto" is the finest whose buckets over [t0, t1) stay within max_points; an explicit resolution
+    that would answer more is coarsened to that one, whoever asks (audit R7 tests-and-perf-05: 400 days at 1 minute built some 576,000 buckets of
+    every series; performance-live-13: 2 days at 1 minute gave 2,880), and 1d is never coarsened. The answer gives the resolution used, the one asked
+    (`requested_resolution`) and the cap (`max_points`)."""
+    if res != "auto" and res not in RESOLUTIONS:
+        raise ValueError(f"The resolution is auto or one of {', '.join(RESOLUTIONS)}")
+    asked = res
+    finest = 0 if res == "auto" else list(RESOLUTIONS).index(res)
+    res = next((r for r in list(RESOLUTIONS)[finest:] if _buckets(t0, t1, RESOLUTIONS[r], 5 * 3600 if r == "1d" else 0) <= max_points), "1d")
+    step = RESOLUTIONS[res]
     names = [n for n in names if n in NUMERIC] or ["pv_power_w", "load_power_w", "grid_power_w", "battery_power_w", "battery_soc_est_pct"]
     off = 5 * 3600 if res == "1d" else 0
     parts = []
@@ -1003,7 +1019,7 @@ def series(site_id: str, t0: int, t1: int, names: list[str], res: str = "auto") 
            f"GROUP BY b ORDER BY b")
     with reading() as con:
         rows = con.execute(sql, (site_id, int(t0), int(t1))).fetchall()
-    return {"resolution": res, "ts": [r[0] for r in rows],
+    return {"resolution": res, "requested_resolution": asked, "max_points": int(max_points), "ts": [r[0] for r in rows],
             "series": {n: [None if r[i + 1] is None or not math.isfinite(float(r[i + 1])) else round(float(r[i + 1]), 3) for r in rows]
                        for i, n in enumerate(names)}}
 

@@ -22,7 +22,9 @@ health named as entered (pages-C-13); the daily rate divided by the days with re
 named by its source, the estimate or the BMS, and the outages for the chart (pages-C-14).
 
 Batch 5, the telemetry file's cost: a read takes a deferred (read) transaction, never the write lock, so readers neither wait for a writer nor make one
-wait, and the export formats its CSV outside any transaction (performance-live-03, and its duplicate tests-and-perf-04).
+wait, and the export formats its CSV outside any transaction (performance-live-03, and its duplicate tests-and-perf-04); a chart series never answers
+more than SERIES_MAX_POINTS (2,000) points, an explicit resolution that would is coarsened for every role, and the automatic one is the finest within the
+cap (tests-and-perf-05, and its duplicate performance-live-13).
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
@@ -1024,3 +1026,47 @@ def test_the_export_formats_its_csv_outside_any_transaction(company, monkeypatch
     text = telemetry.export_csv(sid, T0, T0 + 3600)
     assert text.count("\n") == 11 and "1009.0" in text
     assert open_while_formatting and not any(open_while_formatting)
+
+
+# ------------------------------------------------------------------------------------------------ tests-and-perf-05: at most about 2,000 points
+
+def test_a_series_answers_at_most_2000_points_at_the_finest_resolution_within_them(company):
+    """performance-live-13: 2 days at 1 minute answered 2,880 points and 30 days at 15 minutes 2,881. Each range now gets the finest of 1m, 5m, 15m, 1h
+    and 1d that keeps its buckets within SERIES_MAX_POINTS, counting a range that starts part-way through a bucket."""
+    assert telemetry.SERIES_MAX_POINTS == 2000
+    sid = _site("Dense")
+    _write(sid, T0, 2 * 1440, load_power_w=1000.0)
+    _write(sid, T0 + 2 * 86400, 28 * 96, step=900, load_power_w=2000.0)
+    cases = {  # (span from T0 + 30 s, so every range starts part-way through a minute) -> the resolution
+        86400: "1m", 2 * 86400: "5m", 7 * 86400: "15m", 14 * 86400: "15m", 30 * 86400: "1h", 90 * 86400: "1d", 400 * 86400: "1d"}
+    for span, res in cases.items():
+        s = telemetry.series(sid, T0 + 30, T0 + 30 + span, ["load_power_w"])
+        assert s["resolution"] == res, (span // 86400, s["resolution"])
+        assert len(s["ts"]) <= 2000, (span // 86400, len(s["ts"]))
+    two = telemetry.series(sid, T0, T0 + 2 * 86400, ["load_power_w"])
+    assert (two["resolution"], len(two["ts"]), two["ts"][1] - two["ts"][0]) == ("5m", 576, 300)
+    assert set(two["series"]["load_power_w"]) == {1000.0}
+    month = telemetry.series(sid, T0, T0 + 30 * 86400, ["load_power_w"])
+    assert (month["resolution"], len(month["ts"])) == ("1h", 720)
+    # an explicit resolution within the cap is kept
+    assert telemetry.series(sid, T0, T0 + 86400, ["load_power_w"], "15m")["resolution"] == "15m"
+
+
+def test_an_explicit_resolution_past_the_cap_is_coarsened_for_every_role(world):
+    """tests-and-perf-05: a viewer asked for 400 days at 1 minute (about 576,000 buckets of every series, built in Python). The route answers the finest
+    resolution within the cap, says which was asked and the cap, and refuses only a resolution it does not know."""
+    c = world.owner
+    sid = c.post("/api/sites", json={"name": "Capped"}).json()["id"]
+    end = int(datetime.now(timezone.utc).timestamp())
+    with world.use():
+        _write(sid, end - 3 * 86400, 3 * 1440, load_power_w=1000.0, pv_power_w=500.0)
+    viewer = world.role("viewer")
+    for res, start, given in (("1m", end - 400 * 86400, "1d"), ("1m", end - 2 * 86400, "5m"), ("15m", end - 30 * 86400, "1h"), ("1m", end - 86400, "1m"),
+                              ("auto", end - 3 * 86400, "5m")):
+        r = viewer.get(f"/api/sites/{sid}/telemetry", params={"start": start, "end": end, "res": res, "names": "load_power_w,pv_power_w"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert (body["resolution"], body["requested_resolution"], body["max_points"]) == (given, res, 2000), (res, start)
+        assert len(body["ts"]) <= 2000
+    r = viewer.get(f"/api/sites/{sid}/telemetry", params={"res": "10s"})
+    assert r.status_code == 422 and "5m" in r.json()["detail"]

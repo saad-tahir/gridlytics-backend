@@ -29,8 +29,9 @@ def series(site_id: str, start: str | None = None, end: str | None = None, names
     t0 = parse_ts(start, t1 - 86400)
     if t1 <= t0 or t1 - t0 > 400 * 86400:
         raise Refusal(422, "The range runs forwards and is at most 400 days", "invalid")
-    if res not in ("auto", "1m", "15m", "1h", "1d"):
-        raise Refusal(422, "The resolution is auto, 1m, 15m, 1h or 1d", "invalid")
+    if res != "auto" and res not in telemetry.RESOLUTIONS:
+        raise Refusal(422, "The resolution is auto, 1m, 5m, 15m, 1h or 1d", "invalid")
+    # at most telemetry.SERIES_MAX_POINTS buckets for every role: an explicit resolution past them is coarsened, and the answer says so (tests-and-perf-05)
     return telemetry.series(site_id, t0, t1, [n for n in names.split(",") if n], res)
 
 
