@@ -850,16 +850,61 @@ def sheet_day(period: str | None, today: date) -> date:
 
 
 def period_bounds(kind: str, period: str, today: date) -> tuple[date, date]:
-    """The first and last day a report of this kind covers: the day of a daily operations sheet, else the month ("YYYY-MM"). Raises ValueError."""
+    """The first and last day a report of this kind covers: the day of a daily operations sheet, else the month, exactly "YYYY-MM", this month or one
+    before it (audit flow-reports-alerts-members-keys-13: '2026-11-05', '2026-1' and a future '2027-03' were read by their first characters, kept
+    and listed). Raises ValueError."""
     if kind not in KINDS:
         raise ValueError(f"A report is one of {', '.join(KINDS)}")
     if kind == "daily_operations":
         day = sheet_day(period, today)
         return day, day
     try:
-        return _period(period)
+        if not re.fullmatch(r"\d{4}-\d{2}", str(period or "")):
+            raise ValueError(period)
+        p0, p1 = _period(str(period))
     except (ValueError, IndexError):
         raise ValueError("The period is a month as YYYY-MM") from None
+    if p0 > today:
+        raise ValueError("The period is this month or a month before it")
+    return p0, p1
+
+
+def _pkt_day(stamp) -> date | None:
+    try:
+        return datetime.fromisoformat(str(stamp)).astimezone(PKT).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def data_since(site_id: str | None) -> date | None:
+    """The first day a report may cover, in Pakistan time: a site's is the earlier of the day it was added and its first day of data (a history
+    imported after the site was added starts before it), the company's (no site) the earliest of its sites'; None for a company with no sites."""
+    ids = [site_id] if site_id else [s["id"] for s in sites.listing()]
+    days: list[date] = []
+    with store.connect() as con:
+        for sid in ids:
+            added = con.execute("SELECT created FROM sites WHERE id = ?", (sid,)).fetchone()
+            first = con.execute("SELECT MIN(day_local) FROM telemetry_days WHERE site_id = ?", (sid,)).fetchone()[0]
+            days += [d for d in (_pkt_day(added["created"]) if added else None, _pkt_day(first) if first else None) if d is not None]
+    for sid in ids:
+        ts = telemetry.first_ts(sid)
+        if ts is not None:
+            days.append(datetime.fromtimestamp(int(ts), PKT).date())
+    return min(days) if days else None
+
+
+def check_period(kind: str, site_id: str | None, period: str, today: date) -> tuple[date, date]:
+    """What POST /api/reports accepts: period_bounds, and a period that does not end before the site's data starts (data_since; the company's for a
+    company kind, this month for a company with no sites), so '1999-01' is refused, not kept as an empty report. Raises ValueError with the sentence."""
+    p0, p1 = period_bounds(kind, period, today)
+    site = sites.get(site_id) if site_id else None
+    since = min(data_since(site_id or None) or today, today)
+    if p1 < since:
+        who = site["name"] if site else "The company"
+        if kind == "daily_operations":
+            raise ValueError(f"{who} has no data before {day_words(since)}: choose that day or a later one")
+        raise ValueError(f"{who} has no data before {since:%B %Y}: choose that month or a later one")
+    return p0, p1
 
 
 def _slot_table(doc: _Doc, day: dict | None, heading: str) -> None:

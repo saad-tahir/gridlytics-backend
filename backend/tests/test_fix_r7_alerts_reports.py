@@ -38,6 +38,11 @@ def world(tmp_path, monkeypatch):
         sites.put_asset(one, "inverter", {"brand": "deye", "kw_ac": 100}, "test")
         sites.put_asset(one, "battery", {"nameplate_kwh": 200, "p_ch_kw": 100, "p_dis_kw": 100}, "test")
         sites.put_asset(one, "genset", {"rated_kw": 150}, "test")
+        # the site's data starts a year back, so the reports of past months may be generated (a period before a site's data is refused since
+        # flow-reports-alerts-members-keys-13)
+        with store.connect() as con:
+            con.execute("INSERT INTO telemetry_days (site_id, day_local, data) VALUES (?,?,?)",
+                        (one, (datetime.now(PKT).date() - timedelta(days=400)).isoformat(), json.dumps({"pv_kwh": 0.0})))
     clients = {}
     for role in ROLES:
         owner = role == "admin"
@@ -1559,3 +1564,52 @@ def test_report_files_are_kept_inside_the_data_folder_and_still_served_after_it_
             assert reports.file_path(new["id"], "pdf") is None, bad
             r = a.get(f"/api/reports/{new['id']}/pdf")
             assert r.status_code == 404 and "missing" in r.json()["detail"], (bad, r.status_code)
+
+
+# ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-13
+
+def _month_words(d) -> str:
+    return f"{d:%B %Y}"
+
+
+def test_a_report_period_is_a_whole_month_of_the_sites_data_and_never_in_the_future(world):
+    """flow-reports-alerts-members-keys-13: '2026-11-05', '2026-1', '1999-01' and a future '2027-03' were accepted and listed ('January 1999
+    Preliminary', 'March 2027 Preliminary'); only '2026-13' was refused. A month is now exactly YYYY-MM (the daily sheet's day YYYY-MM-DD), not after
+    this month, and not before the site's data starts: the earlier of the day it was added and its first day of data, so a history imported after the
+    site was added still reports."""
+    a = world.c["analyst"]
+    today = datetime.now(PKT).date()
+    this, last = today.strftime("%Y-%m"), _past_month()
+    nxt = (today.replace(day=28) + timedelta(days=5)).strftime("%Y-%m")
+    with world.use():
+        fresh = sites.create({"name": "Mill Two", "disco": "MEPCO"}, "test")["id"]      # added today, no data yet
+    refused = [
+        ("energy_only", fresh, f"{this}-05", "The period is a month as YYYY-MM"),
+        ("energy_only", fresh, f"{this[:4]}-1", "The period is a month as YYYY-MM"),
+        ("energy_only", fresh, f"{this}x", "The period is a month as YYYY-MM"),
+        ("energy_only", fresh, f"{this[:4]}-13", "The period is a month as YYYY-MM"),
+        ("monthly_savings", fresh, nxt, "The period is this month or a month before it"),
+        ("monthly_savings", world.site, nxt, "The period is this month or a month before it"),
+        ("energy_only", fresh, "1999-01", f"Mill Two has no data before {_month_words(today)}: choose that month or a later one"),
+        ("energy_only", fresh, last, f"Mill Two has no data before {_month_words(today)}: choose that month or a later one"),
+        ("pilot", fresh, last, f"Mill Two has no data before {_month_words(today)}"),
+        ("daily_operations", fresh, (today - timedelta(days=40)).isoformat(),
+         f"Mill Two has no data before {today:%A} {today.day} {today:%B %Y}: choose that day or a later one"),
+        ("company_rollup", None, "1999-01", "The company has no data before"),
+        ("company_rollup", None, nxt, "The period is this month or a month before it"),
+    ]
+    for kind, sid, period, said in refused:
+        r = a.post("/api/reports", json={"kind": kind, "period": period, **({"site_id": sid} if sid else {})})
+        assert r.status_code == 422 and said in r.json()["detail"], (kind, period, r.status_code, r.text)
+    assert a.get("/api/reports").json() == []                                             # nothing refused is kept or listed
+    for kind, sid, period in (("energy_only", fresh, this), ("daily_operations", fresh, today.isoformat()), ("energy_only", world.site, last)):
+        r = a.post("/api/reports", json={"kind": kind, "site_id": sid, "period": period})
+        assert r.status_code == 200, (kind, period, r.text)
+    # a history imported after the site was added: its first day of data is the start
+    first = (today.replace(day=1) - timedelta(days=1)).replace(day=3)
+    with world.use(), store.connect() as con:
+        con.execute("INSERT INTO telemetry_days (site_id, day_local, data) VALUES (?,?,?)", (fresh, first.isoformat(), json.dumps({"pv_kwh": 10.0})))
+    assert a.post("/api/reports", json={"kind": "energy_only", "site_id": fresh, "period": last}).status_code == 200
+    r = a.post("/api/reports", json={"kind": "daily_operations", "site_id": fresh, "period": (first - timedelta(days=1)).isoformat()})
+    assert r.status_code == 422 and f"no data before {first:%A} {first.day} {first:%B %Y}" in r.json()["detail"], r.text
+    assert a.post("/api/reports", json={"kind": "company_rollup", "period": last}).status_code == 200
