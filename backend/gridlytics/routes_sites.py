@@ -454,9 +454,9 @@ def _off_grid(site: dict, conn: dict | None) -> bool:
 
 def _today_kpis(site: dict, td: dict | None, bs: dict | None, now: int, day: date) -> dict:
     """The Overview's KPI tiles of the plan (R8 2.4) for today in Pakistan time: the share of the solar made that was used on site (not exported), the
-    battery's equivalent full cycles (its discharge over the usable pack, as the battery page counts them) and the outages with how many of them the
-    site rode through with no critical load unserved. A figure without its data (no reading today, no solar yet, no battery, an off-grid site's
-    outages) is None, never a zero (audit pages-A-09)."""
+    battery's equivalent full cycles (its discharge over the pack's capacity at its present health, nameplate times state of health, as the battery
+    page counts them) and the outages with how many of them the site rode through with no critical load unserved. A figure without its data (no
+    reading today, no solar yet, no battery, an off-grid site's outages) is None, never a zero (audit pages-A-09)."""
     td = td or {}
     pv, exp, dis = td.get("pv_kwh"), td.get("export_kwh"), td.get("discharge_kwh")
     self_pct = round(100 * min(1.0, max(0.0, (pv - (exp or 0)) / pv)), 1) if pv else None
