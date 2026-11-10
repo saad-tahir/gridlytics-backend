@@ -46,6 +46,15 @@ Batch 5, the control page:
 - the fallback test releases for 15 minutes and checks from the heartbeats that the edge handed the inverter back and took the plan again (audit
   flow-telemetry-plan-control-19).
 
+Batch 6, edge message hardening and the signing keys:
+- a new signing key is made owner-only from its first byte, in a keys folder that is the owner's alone (audit security-roles-11);
+- a key is kept by its name in the keys folder, so a moved data folder signs with the same key; a missing key is an error, never silently
+  replaced (the edge is refused, an alert is raised, a restored folder signs again); two first signings make one key; an administrator replaces a
+  key with a reason (audit engine-delivery-13);
+- the signature covers the RFC 8785 canonical JSON, which an edge in another language reproduces, with published test vectors (audit
+  engine-delivery-22);
+- an edge message is at most 1 MiB however it is sent, and its free-form parts are bounded (audit engine-delivery-23).
+
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
