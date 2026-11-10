@@ -706,6 +706,8 @@ MODE_B_WITHOUT_EDGE = ("Mode B (set-points written by the edge device) needs an 
 SOURCE_POINTS = ("grid_present", "grid_voltage_v", "grid_power_w", "pv_power_w", "load_power_w", "battery_power_w", "battery_soc_bms_pct",
                  "genset_running", "inverter_mode_active")
 GRID_POINTS = ("grid_present", "grid_voltage_v")
+#: The grid points in the sentence's words (the points themselves are listed in `points`)
+GRID_POINT_WORDS = {"grid_present": "the grid-present signal", "grid_voltage_v": "the grid voltage"}
 #: How far back from the last minute received the test reads: a day of minutes
 SOURCE_TEST_S = 86400
 SOURCE_NO_DATA = "No data has arrived from this site yet: test the source again once its first readings are in"
@@ -736,7 +738,8 @@ def source_test(site_id: str) -> dict:
     grid = [p for p in GRID_POINTS if p in points]
     return {"kind": kind, "grid_signal": "found" if grid else "missing", "rows": len(ts), "first_at": _iso(ts[0]), "last_at": _iso(ts[-1]),
             "points": points,
-            "sentence": f"Grid presence is in the data received ({', '.join(grid)}), so outages can be seen" if grid else SOURCE_NO_GRID}
+            "sentence": f"Grid presence is in the data received ({' and '.join(GRID_POINT_WORDS[p] for p in grid)}), so outages can be seen" if grid
+            else SOURCE_NO_GRID}
 
 
 def grid_connected(site: dict) -> bool:

@@ -663,7 +663,8 @@ def test_a_source_test_says_what_the_data_carries_and_a_source_without_grid_pres
     t = op.post(f"/api/sites/{sid}/source/test").json()
     assert (t["grid_signal"], t["rows"]) == ("found", 31), t
     assert t["points"] == ["grid_present", "grid_voltage_v", "pv_power_w", "load_power_w"]
-    assert t["sentence"] == "Grid presence is in the data received (grid_present, grid_voltage_v), so outages can be seen"
+    # in words, not the points' keys (the web app prints the sentence; the keys are in `points`)
+    assert t["sentence"] == "Grid presence is in the data received (the grid-present signal and the grid voltage), so outages can be seen"
     r = a.post(f"/api/sites/{sid}/activate")
     assert r.status_code == 200 and r.json()["status"] == "active", r.text
 
@@ -712,3 +713,4 @@ def test_a_capture_a_person_sends_cannot_claim_the_edge_read_it_back(world):
     # the edge's own read-back (the demo's captures are made so) is recorded as such
     with world.use():
         assert sites.capture_native(sid, {"source": "read_back", "work_mode": "self_use"}, "edge")["body"]["source"] == "read_back"
+
