@@ -751,3 +751,28 @@ def test_the_compare_drawer_needs_the_native_capture_and_a_day_of_data(world, mo
     assert r["compare"]["native"]["import_kwh"] > 0 and r["native"]["version"] == 1 and r["native"]["captured_at"]
     assert "energy_rs" not in str(world.c["viewer"].get(url).json())
 
+
+def test_compare_with_native_shows_what_the_outage_reserve_is_worth_in_both_arms(world, monkeypatch):
+    """The replay ran both arms on the plan's grid series (all up: an outage is only a chance), so the reserve a plan holds for a likely outage
+    showed only as more import and a higher energy cost, and a reserve-holding plan always looked worse than native. Each arm now carries the
+    critical load it would be short of the reserve at each quarter an outage may start, weighted by that chance, and its price as the plan prices
+    it (the genset's all-in cost at this site, whose genset starts)."""
+    from gridlytics import optimise, plans, tariffs
+    steps, comp = _reserve_plan()
+    monkeypatch.setattr(plans, "current", lambda site_id, *x, **k: {"id": "p1", "slots": comp, "steps": steps, "summary": {}})
+    _compare_ready(world)
+    r = world.c["admin"].get(f"/api/sites/{world.site}/plan/compare").json()
+    nat, plan = r["compare"]["native"], r["compare"]["plan"]
+    assert plan["reserve_short_kwh"] == 0.0 and nat["min_soc_pct"] < 25.0
+    # native is down at its 20 % backup through the second hour: 40 points of a 200 kWh battery short, at a 30 % chance in each of four quarters
+    assert nat["reserve_short_kwh"] == pytest.approx(0.3 * 4 * 0.4 * 200, abs=1.0)
+    with world.use():
+        price = optimise._gen_marginal({"S": 150.0, "a": 0.273, "b": 0.033, "c_fuel": tariffs.fuel_price("hsd", __import__("datetime").date.today())[0],
+                                        "c_om": 8.0, "c_runhr": 400.0})
+    assert r["short_basis"] == "genset" and r["short_rs_per_kwh"] == pytest.approx(price, abs=0.1)
+    assert nat["reserve_short_rs"] == pytest.approx(nat["reserve_short_kwh"] * price, rel=0.01)
+    assert plan["energy_rs"] > nat["energy_rs"]                                            # all the drawer showed before
+    assert plan["energy_rs"] + plan["reserve_short_rs"] < nat["energy_rs"] + nat["reserve_short_rs"]
+    viewer = world.c["viewer"].get(f"/api/sites/{world.site}/plan/compare").json()
+    assert viewer["compare"]["native"]["reserve_short_kwh"] == nat["reserve_short_kwh"]   # energy for every role, never its rupees
+    assert "_rs" not in str(viewer) and "short_rs_per_kwh" not in viewer
