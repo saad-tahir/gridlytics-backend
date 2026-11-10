@@ -59,6 +59,18 @@ class HoldFields(TimedFields):
                                                           "present level)")
 
 
+class ForceChargeFields(TimedFields):
+    """POST /control/force_charge: also the state of charge to charge to, a percent from 1 to 100; left out, a full battery (the force_charge
+    override's own default, plans.build_problem)."""
+    soc_pct: float | None = None
+
+    @field_validator("soc_pct", mode="before")
+    @classmethod
+    def _soc(cls, v):
+        return None if v is None else _number(v, 1, 100, "The state of charge to charge to must be a percent from 1 to 100 (leave it out to charge "
+                                                          "to full)")
+
+
 class ResumeFields(Strict):
     """POST /control/resume reads no field."""
 
@@ -76,7 +88,17 @@ class ApplyFields(Strict):
 #: too while a pause is in force: as clearing an override needs the permission of its kind (sites.OVERRIDE_PERMISSION), an operator may end a hold
 #: or a release, and a pause is an administrator's (plan Part 10.5)
 CONTROL_ACTIONS = {"hold": ("hold_release", "Holding the battery", HoldFields), "release": ("hold_release", "Releasing to native", TimedFields),
-                   "pause": ("resume_control", "Pausing control", TimedFields), "resume": (None, "Resuming control", ResumeFields)}
+                   "pause": ("resume_control", "Pausing control", TimedFields), "resume": (None, "Resuming control", ResumeFields),
+                   # round 7 (audit flow-telemetry-plan-control-17): the overrides the solver bounds (plan Part 4.8) but no page placed, each behind
+                   # the permission its kind needs (sites.OVERRIDE_PERMISSION: a forced charge is an administrator's)
+                   "genset_hold": ("hold_release", "Holding the genset off", TimedFields),
+                   "charge_block": ("hold_release", "Blocking battery charging", TimedFields),
+                   "force_charge": ("pin_genset", "Forcing a charge", ForceChargeFields)}
+#: The actions that place an override of their own name: the asset the site needs for it, the reason when none is given, and the refusal without
+#: the asset (409 no_equipment)
+OVERRIDE_ACTIONS = {"genset_hold": ("genset", "Genset held off", "The site has no genset to hold off"),
+                    "charge_block": ("battery", "Charging blocked", "The site has no battery to block charging of"),
+                    "force_charge": ("battery", "Forced charge", "The site has no battery to charge")}
 #: the overrides a resume clears
 RESUMED_KINDS = ("pause_control", "force_native", "reserve")
 
@@ -239,18 +261,21 @@ def control(site_id: str, day: int = 0):
                 "plan_id": (p or {}).get("id"), "applied": plans.applied_rows(site_id), "overrides": sites.overrides(site_id),
                 "budget": {"table_writes_per_day": plans.table_budget(s), "used_today": plans.writes_used(site_id, today(), s)},
                 "native": sites.native_latest(site_id), "fallback": (comp or {}).get("fallback"),
-                "issued": issued, "reissue": plans.reissue_held(site_id, (p or {}).get("id"), today()) if issued is not None else None})
+                "issued": issued, "reissue": plans.reissue_held(site_id, (p or {}).get("id"), today()) if issued is not None else None,
+                # the overrides the site has the equipment for (a genset hold needs a genset, a charging block and a forced charge a battery)
+                "placeable": [k for k, (asset, _, _) in OVERRIDE_ACTIONS.items() if (s.get("assets") or {}).get(asset)]})
 
 
 @router.post("/api/sites/{site_id}/control/{action}")
 def control_action(site_id: str, action: str, inp: dict = Body(default={})):
-    """Hold, release, pause and resume. The action, then the permission, then the body are checked (a 404, a 403, then a 422 in one sentence)
-    before anything is written. Each takes effect at once: the plan is re-solved now (a resume only when it cleared something), so a hold is in the
+    """Hold, release, pause and resume, and the genset hold, the charging block and the forced charge. The action, then the permission, then the body
+    are checked (a 404, a 403, then a 422 in one sentence), then that the site has the equipment the override bounds (a 409), before anything is
+    written. Each takes effect at once: the plan is re-solved now (a resume only when it cleared something), so a hold is in the
     plan and in the edge's signed message straight away, and under a pause or a release the tick holds its plan and the plan of before stops being
     active. The answer is the control answer with `resolve`, how that re-solve went; a failed one is said, the action stands."""
     site_or_404(site_id)
     if action not in CONTROL_ACTIONS:
-        raise Refusal(404, "The control actions are hold, release, pause and resume", "not_found")
+        raise Refusal(404, "The control actions are hold, release, pause, resume, genset_hold, charge_block and force_charge", "not_found")
     perm, doing, model = CONTROL_ACTIONS[action]
     if action == "resume":
         kinds = {o["kind"] for o in sites.overrides(site_id) if o["kind"] in RESUMED_KINDS}
@@ -260,6 +285,8 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
     else:
         auth.need(perm, doing)
     f = check(model, inp)
+    if action in OVERRIDE_ACTIONS and not (sites.assets(site_id) or {}).get(OVERRIDE_ACTIONS[action][0]):
+        raise Refusal(409, OVERRIDE_ACTIONS[action][2], "no_equipment")
     who = auth.actor()
     if action == "resume":
         cleared = 0
@@ -277,6 +304,10 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
             fields = {"kind": "reserve", "value": float(f.soc_pct or st.get("soc_pct") or 50), "until": until, "reason": f.reason or "Operator hold"}
         elif action == "release":
             fields = {"kind": "force_native", "until": until, "reason": f.reason or "Released to native"}
+        elif action in OVERRIDE_ACTIONS:
+            fields = {"kind": action, "until": until, "reason": f.reason or OVERRIDE_ACTIONS[action][1]}
+            if action == "force_charge":
+                fields["value"] = float(f.soc_pct or 100)
         else:
             fields = {"kind": "pause_control", "until": until, "reason": f.reason or "Paused"}
         try:
@@ -290,7 +321,8 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
 
 
 #: what a failed re-solve names as its cause
-_AFTER = {"hold": "the hold", "release": "the release", "pause": "the pause", "resume": "resuming"}
+_AFTER = {"hold": "the hold", "release": "the release", "pause": "the pause", "resume": "resuming", "genset_hold": "the genset hold",
+          "charge_block": "the charging block", "force_charge": "the forced charge"}
 
 
 def _resolve_now(site_id: str, action: str) -> dict:
@@ -307,7 +339,8 @@ def _resolve_now(site_id: str, action: str) -> dict:
         return {"status": "failed", "plan_id": None,
                 "reason": f"The re-solve after {_AFTER[action]} failed ({type(exc).__name__}); the next scheduled tick tries again"}
     store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"], "after": action})
-    _issue(site_id, force=action if action in ("hold", "resume") else None)
+    # a hold of any kind (the battery's, the genset's, a charging block, a forced charge) and a resume issue today's table at once
+    _issue(site_id, force="hold" if action == "hold" or action in OVERRIDE_ACTIONS else "resume" if action == "resume" else None)
     return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": r.get("reason")}
 
 

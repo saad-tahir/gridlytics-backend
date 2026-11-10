@@ -43,7 +43,8 @@ def until_words(iso: str, now: int) -> str:
 
 
 def control_state(site: dict, last: dict | None, now: int) -> dict:
-    """The control chip: `key`, `label` (in words, an end with its day when it is not today) and, for a pause, a release or a hold, `until`."""
+    """The control chip: `key`, `label` (in words, an end with its day when it is not today) and, for a pause, a release, a forced charge or a hold,
+    `until`."""
     ovs = sites.overrides(site["id"])
     kinds = {o["kind"]: o for o in ovs}
     tier = site.get("tier", "monitor")
@@ -58,6 +59,11 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
     if block:
         # a native block of the switchback calendar: the inverter runs its own settings all day, so no table is keyed in or followed
         return {"key": "native_block", "label": "Switchback: native settings today", "until": block["until"]}
+    if "force_charge" in kinds:
+        # a forced charge says so (round 7, audit flow-telemetry-plan-control-17: the chip read "Recommendation only"); it outranks a hold's floor
+        o = kinds["force_charge"]
+        target = 100.0 if o["value"] is None else float(o["value"])
+        return {"key": "force_charge", "label": f"Forced charge to {target:.0f} % until {until_words(o['until_ts'], now)}", "until": o["until_ts"]}
     if "reserve" in kinds:
         until = kinds["reserve"]["until_ts"]
         return {"key": "hold", "label": f"Hold until {until_words(until, now)}", "until": until}

@@ -1364,3 +1364,89 @@ def test_marking_todays_table_says_when_the_card_comes_and_the_tick_runs_the_che
     monkeypatch.setattr(plans, "early_check", lambda site_id: calls.append("early"))
     scheduler._after_tick(sid)
     assert calls == ["issue", "early"]                                         # a failed issue does not stop the check
+
+
+# ------------------------------------------------------------------------------------------------ batch 5: flow-telemetry-plan-control-17 (role-operator-08, tracker-and-docs-10)
+
+def test_a_genset_hold_a_charging_block_and_a_forced_charge_are_placed_as_control_actions(world, monkeypatch):
+    """The genset hold, the charging block and the forced charge had solver bounds but no page placed them: they are control actions now, each behind
+    the permission its override kind needs (a forced charge an administrator's), read through a strict body, refused where the site has not the
+    equipment, and solved in at once as a hold is; a forced charge says so in the control chip (it read "Recommendation only")."""
+    ticks = _no_ticks(monkeypatch)
+    sid, admin, op, viewer = world.site, world.c["admin"], world.c["operator"], world.c["viewer"]
+    r = op.post(f"/api/sites/{sid}/control/genset_hold", json={"hours": 3, "reason": "Fuel delivery late"})
+    assert r.status_code == 200 and r.json()["resolve"]["status"] == "active", r.text
+    r = op.post(f"/api/sites/{sid}/control/charge_block", json={"hours": 2})
+    assert r.status_code == 200, r.text
+    r = op.post(f"/api/sites/{sid}/control/force_charge", json={"hours": 2, "soc_pct": 90})
+    assert r.status_code == 403 and r.json()["detail"] == "Forcing a charge is for an administrator", r.text
+    assert viewer.post(f"/api/sites/{sid}/control/genset_hold", json={"hours": "x"}).status_code == 403
+    r = admin.post(f"/api/sites/{sid}/control/force_charge", json={"hours": 2, "soc_pct": 90})
+    assert r.status_code == 200, r.text
+    c = r.json()["control"]
+    assert c["key"] == "force_charge" and c["label"].startswith("Forced charge to 90 % until "), c
+    assert ticks == [sid] * 3
+    with world.use():
+        ovs = {o["kind"]: o for o in sites.overrides(sid)}
+    assert set(ovs) == {"genset_hold", "charge_block", "force_charge"}
+    assert ovs["genset_hold"]["reason"] == "Fuel delivery late" and ovs["charge_block"]["reason"] == "Charging blocked"
+    assert ovs["force_charge"]["value"] == 90.0 and ovs["genset_hold"]["value"] is None
+    assert 3 * 3600 - 60 <= plans._ts(ovs["genset_hold"]["until_ts"]) - _now() <= 3 * 3600
+    # left out, a forced charge charges to full; a hold placed after it does not hide it from the chip
+    admin.delete(f"/api/sites/{sid}/overrides/{ovs['force_charge']['id']}")
+    r = admin.post(f"/api/sites/{sid}/control/force_charge", json={})
+    assert r.status_code == 200 and r.json()["control"]["label"].startswith("Forced charge to 100 % until "), r.text
+    assert admin.post(f"/api/sites/{sid}/control/hold", json={"hours": 1}).json()["control"]["key"] == "force_charge"
+
+
+@pytest.mark.parametrize("action,body,said", [
+    ("force_charge", {"soc_pct": 0}, "The state of charge to charge to must be a percent from 1 to 100"),
+    ("force_charge", {"soc_pct": "full"}, "The state of charge to charge to must be a percent from 1 to 100"),
+    ("genset_hold", {"hours": 100}, HOURS),
+    ("genset_hold", {"soc_pct": 50}, "Unknown field 'soc_pct'"),
+    ("charge_block", {"hours": "two"}, HOURS),
+])
+def test_an_override_action_with_a_bad_field_is_one_sentence_and_does_nothing(world, monkeypatch, action, body, said):
+    ticks = _no_ticks(monkeypatch)
+    r = world.c["admin"].post(f"/api/sites/{world.site}/control/{action}", json=body)
+    assert r.status_code == 422 and r.json()["detail"].startswith(said), r.text
+    with world.use():
+        assert sites.overrides(world.site) == []
+    assert ticks == []
+
+
+def test_an_override_the_site_has_no_equipment_for_is_refused(world, monkeypatch):
+    ticks = _no_ticks(monkeypatch)
+    other, admin = world.other, world.c["admin"]                     # no battery and no genset
+    for action, said in (("genset_hold", "The site has no genset to hold off"), ("charge_block", "The site has no battery to block charging of"),
+                         ("force_charge", "The site has no battery to charge")):
+        r = admin.post(f"/api/sites/{other}/control/{action}", json={"hours": 1})
+        assert r.status_code == 409 and r.json()["detail"] == said and r.json()["code"] == "no_equipment", r.text
+    with world.use():
+        assert sites.overrides(other) == []
+    assert ticks == []
+    # the control answer names the overrides the site has the equipment for, so the page offers only those
+    assert world.c["operator"].get(f"/api/sites/{world.site}/control").json()["placeable"] == ["genset_hold", "charge_block", "force_charge"]
+    assert world.c["operator"].get(f"/api/sites/{other}/control").json()["placeable"] == []
+
+
+def test_a_forced_charge_and_a_genset_hold_reach_the_plan_at_once(world):
+    """The re-solve at once takes the new override: the forced charge's floor is in the plan in force, as is the genset hold."""
+    sid, admin = world.site, world.c["admin"]
+    with world.use():
+        plans.tick(sid)
+    r = admin.post(f"/api/sites/{sid}/control/force_charge", json={"hours": 3, "soc_pct": 80})
+    assert r.status_code == 200 and r.json()["resolve"]["status"] == "active", r.text
+    with world.use():
+        (o,) = sites.overrides(sid)
+        plan = plans.current(sid)
+    assert plan["id"] == r.json()["resolve"]["plan_id"] and o["kind"] == "force_charge"
+    assert [(x["kind"], x["value"]) for x in plan["summary"]["overrides"]] == [("force_charge", 80.0)], plan["summary"]["overrides"]
+    until = plans._ts(o["until_ts"])
+    assert any(s["reserve_pct"] >= 80 for s in plan["steps"] if s["t"] < until), [(s["local"], s["reserve_pct"]) for s in plan["steps"][:12]]
+    # a genset hold keeps the genset off in its window
+    r = admin.post(f"/api/sites/{sid}/control/genset_hold", json={"hours": 2})
+    assert r.status_code == 200 and r.json()["resolve"]["status"] == "active", r.text
+    with world.use():
+        plan = plans.current(sid)
+    assert "genset_hold" in [x["kind"] for x in plan["summary"]["overrides"]]
