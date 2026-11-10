@@ -1615,6 +1615,31 @@ def test_a_report_period_is_a_whole_month_of_the_sites_data_and_never_in_the_fut
     assert a.post("/api/reports", json={"kind": "company_rollup", "period": last}).status_code == 200
 
 
+@pytest.mark.skipif(not hasattr(__import__("time"), "tzset"), reason="the process's time zone is set with time.tzset, which Windows lacks")
+def test_a_sites_first_day_of_data_is_that_day_whatever_the_servers_time_zone(world):
+    """Review of flow-reports-alerts-members-keys-13: telemetry_days keeps Pakistan days ("YYYY-MM-DD"), which reports.data_since read as a time of the
+    server's own zone and then moved to Karachi time, so on a server east of Pakistan (Tokyo) a site's data started a day early."""
+    import os
+    import time
+    from gridlytics import reports
+    first = datetime.now(PKT).date() - timedelta(days=10)
+    with world.use():
+        sid = sites.create({"name": "Mill Three", "disco": "LESCO"}, "test")["id"]
+        with store.connect() as con:
+            con.execute("INSERT INTO telemetry_days (site_id, day_local, data) VALUES (?,?,?)", (sid, first.isoformat(), json.dumps({"pv_kwh": 1.0})))
+        was = os.environ.get("TZ")
+        os.environ["TZ"] = "Asia/Tokyo"
+        time.tzset()
+        try:
+            assert reports.data_since(sid) == first
+        finally:
+            if was is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = was
+            time.tzset()
+
+
 # ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-16
 
 def test_a_grid_site_with_no_connection_saved_is_not_called_off_grid_and_an_empty_period_is_said(world, monkeypatch):

@@ -888,8 +888,14 @@ def period_bounds(kind: str, period: str, today: date) -> tuple[date, date]:
 
 
 def _pkt_day(stamp) -> date | None:
+    """The Pakistan day of a stored time ("2026-11-10T14:27:27+00:00"), or a stored day ("2026-11-10", already Pakistan's) as it is: a day read as
+    a time would be one of the server's own zone, a day early east of Pakistan."""
+    text = str(stamp or "")
     try:
-        return datetime.fromisoformat(str(stamp)).astimezone(PKT).date()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return date.fromisoformat(text)
+        t = datetime.fromisoformat(text)
+        return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(PKT).date()
     except (TypeError, ValueError):
         return None
 
