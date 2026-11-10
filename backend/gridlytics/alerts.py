@@ -309,6 +309,35 @@ def _connection_words(data: dict) -> str:
     return str(data.get("meter_ref") or "").strip() or f"{data.get('tariff_category') or 'Grid connection'}, {_regime(data.get('regime'))}"
 
 
+def _connection_label(c: dict, i: int, conns: list[dict]) -> str:
+    """Which of a site's connections, for a title that must tell two apart: its meter reference, else its place and tariff ("connection 2 (B-3)")."""
+    ref = str(c["data"].get("meter_ref") or "").strip()
+    return f"meter {ref}" if ref else f"connection {i + 1} ({c['data'].get('tariff_category') or 'no tariff'})"
+
+
+def _agreements(site: dict, now: int, rules_: dict) -> None:
+    """Tariff: a connection's agreement ending within the rules' days (60 by default), a warning that says the day it ends; once that day has passed
+    (audit pages-D-16) a critical alert that says it ended and what to do, since the site is then priced on an agreement that no longer holds. With more
+    than one connection the title names which (flow-reports-alerts-members-keys-25)."""
+    conns = site.get("connections") or []
+    today = datetime.fromtimestamp(now, PKT).date()
+    for i, c in enumerate(conns):
+        end = c["data"].get("agreement_end")
+        left = None
+        if end:
+            try:
+                left = (date.fromisoformat(end) - today).days
+            except ValueError:
+                left = None
+        ended = left is not None and left < 0
+        which = f" of {_connection_label(c, i, conns)}" if len(conns) > 1 else ""
+        regime = _regime(c["data"].get("regime"))
+        title = (f"The {regime} agreement{which} ended on {_long_day(end)}: enter the agreement that follows it in the site's settings" if ended
+                 else f"The {regime} agreement{which} ends on {_long_day(end)}")
+        _set(left is not None and left <= _th(rules_, "Tariff", "agreement_days"), site["id"], f"regime_expiring_{c['id']}", "Tariff",
+             "critical" if ended else "warning", title, {"connection": _connection_words(c["data"]), "agreement_end": end, "ended": ended})
+
+
 def tariff_staleness(site: dict, now: int, rules_: dict) -> None:
     """Tariff (brief-vs-build-18): the stored tariff library has gone stale, read from its versions and fuel prices (nothing is fetched from
     NEPRA, OGRA or a DISCO: a new notification is still drafted and approved by a person, plan Part 6.2):
@@ -491,17 +520,7 @@ def evaluate(site_id: str, now: int | None = None) -> None:
         unconfirmed = True
     _set(ready and unconfirmed, site_id, "apply_unconfirmed", "Control", "warning",
          "Today's slot table is not marked as applied: tier 2 has no read-back, so the saving is not claimed until it is")
-    # tariff: a regime ending within the rules' days (60 by default)
-    for c in site.get("connections") or []:
-        end = c["data"].get("agreement_end")
-        soon = False
-        if end:
-            try:
-                soon = (date.fromisoformat(end) - datetime.fromtimestamp(now, PKT).date()).days <= _th(rules_, "Tariff", "agreement_days")
-            except ValueError:
-                soon = False
-        _set(soon, site_id, f"regime_expiring_{c['id']}", "Tariff", "warning", f"The {_regime(c['data'].get('regime'))} agreement ends on {_long_day(end)}",
-             {"connection": _connection_words(c["data"]), "agreement_end": end})
+    _agreements(site, now, rules_)
     _bill_residual(site_id, float(_th(rules_, "Tariff", "bill_difference_pct")))
     tariff_staleness(site, now, rules_)
     _forecast_stages(site_id, now)

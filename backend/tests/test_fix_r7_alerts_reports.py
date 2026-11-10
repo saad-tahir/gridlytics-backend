@@ -1252,3 +1252,38 @@ def test_a_workspace_file_of_schema_2_gains_the_alerts_history(tmp_path, monkeyp
         after = alerts.listing("closed")
     assert rows[0]["history"] == [] and rows[0]["note"] == "Acknowledged by Ali", rows                 # not recorded before
     assert [(h["action"], h["by"], h["note"]) for h in after[0]["history"]] == [("closed", "Ali", "Logger replaced")], after
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-16 (and flow-reports-alerts-members-keys-25)
+
+def test_an_agreement_that_has_ended_says_it_ended_and_two_connections_are_told_apart(world):
+    """pages-D-16: `(end - today).days <= 60` held for any past date, so an agreement that ended in 2020 still read 'ends on' forever; and two
+    connections of one site gave two identical titles (flow-reports-alerts-members-keys-25)."""
+    sid, now = world.site, _now()
+    today = datetime.fromtimestamp(now, PKT).date()
+    ended, soon = today - timedelta(days=100), today + timedelta(days=30)
+    with world.use():
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "regime": "net_billing", "agreement_end": ended.isoformat()}, "test", conn_id=conn["id"])
+        alerts.evaluate(sid, now)
+        got = next(a for a in alerts.listing("active", sid) if a["rule"].startswith("regime_expiring_"))
+    assert got["title"] == (f"The net billing agreement ended on {ended.day} {ended:%B %Y}: enter the agreement that follows it in the "
+                            "site's settings"), got["title"]
+    assert got["severity"] == "critical" and got["detail"]["ended"] is True and got["detail"]["agreement_end"] == ended.isoformat(), got
+    # the day it ends it still "ends"; the day after, it has ended
+    with world.use():
+        sites.put_connection(sid, {**conn["data"], "regime": "net_billing", "agreement_end": today.isoformat()}, "test", conn_id=conn["id"])
+        alerts.evaluate(sid, now)
+        got = next(a for a in alerts.listing("active", sid) if a["rule"].startswith("regime_expiring_"))
+    assert " ends on " in got["title"] and got["severity"] == "warning" and got["detail"]["ended"] is False, got
+    # a second connection: each title names its connection (the meter reference, else its place and tariff), never its id
+    with world.use():
+        sites.put_connection(sid, {**conn["data"], "regime": "net_billing", "agreement_end": ended.isoformat(), "meter_ref": "FS-24-11-0042"},
+                             "test", conn_id=conn["id"])
+        two = sites.put_connection(sid, {"tariff_category": "B-3", "sanctioned_load_kw": 900, "regime": "net_billing",
+                                         "agreement_end": soon.isoformat()}, "test")
+        alerts.evaluate(sid, now)
+        titles = {a["rule"]: a["title"] for a in alerts.listing("active", sid) if a["rule"].startswith("regime_expiring_")}
+    assert titles[f"regime_expiring_{conn['id']}"].startswith(f"The net billing agreement of meter FS-24-11-0042 ended on {ended.day}"), titles
+    assert titles[f"regime_expiring_{two['id']}"] == f"The net billing agreement of connection 2 (B-3) ends on {soon.day} {soon:%B %Y}", titles
+    assert not any(conn["id"] in t or two["id"] in t for t in titles.values())
