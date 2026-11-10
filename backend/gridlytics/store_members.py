@@ -10,7 +10,6 @@ what is decided in companies.py; this module only keeps the rows.
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta
 
 from . import auth
@@ -23,7 +22,7 @@ OWNED: tuple = ()
 #: A member's last sight is written at most this often, so a page's requests do not each write
 SEEN_EVERY = timedelta(minutes=5)
 #: What a change may set (the key, the first sight and the time of the change are the store's)
-_FIELDS = ("email", "name", "role", "role_source", "company_role", "licence", "seal", "disabled", "disabled_reason", "legacy_user_id", "by", "grants")
+_FIELDS = ("email", "name", "role", "role_source", "company_role", "licence", "seal", "disabled", "disabled_reason", "legacy_user_id", "by")
 
 
 def _member(r) -> dict | None:
@@ -31,23 +30,7 @@ def _member(r) -> dict | None:
     if r is None:
         return None
     row = dict(r)
-    return {**{k: v for k, v in row.items() if k != "seal"}, "disabled": bool(row["disabled"]), "has_seal": bool(row["seal"]),
-            "grants": _grants_read(row.get("grants"))}
-
-
-def _grants_read(text) -> list[str]:
-    """A member's grants as a sorted list of permissions (auth.GRANTS); a value that is not one reads as none."""
-    try:
-        held = json.loads(text or "[]")
-    except (TypeError, ValueError):
-        return []
-    return sorted({g for g in held if g in auth.GRANTS}) if isinstance(held, list) else []
-
-
-def _grants(grants) -> str:
-    if not isinstance(grants, (list, tuple, set, frozenset)) or any(g not in auth.GRANTS for g in grants):
-        raise ValueError(f"A member can be granted only {', '.join(auth.GRANTS)}")
-    return json.dumps(sorted(set(grants)))
+    return {**{k: v for k, v in row.items() if k != "seal"}, "disabled": bool(row["disabled"]), "has_seal": bool(row["seal"])}
 
 
 def _role(role) -> str:
@@ -71,8 +54,6 @@ def _values(fields: dict) -> dict:
             value = int(bool(value))
         elif key == "legacy_user_id":
             value = value or None
-        elif key == "grants":
-            value = _grants(value)
         elif key == "email":
             value = (value or "").strip().lower()
         else:
@@ -82,12 +63,12 @@ def _values(fields: dict) -> dict:
 
 
 def add_member(user_id: str, *, email: str, name: str, role: str, role_source: str = "default", company_role: str = "", licence: str = "",
-               seal: str = "", disabled: bool = False, disabled_reason: str = "", legacy_user_id: str | None = None, by: str = "", grants=()) -> dict:
+               seal: str = "", disabled: bool = False, disabled_reason: str = "", legacy_user_id: str | None = None, by: str = "") -> dict:
     """The member of a first sight, or the row already there: two first requests of one person may race, and the first row made is the one both read."""
     if not isinstance(user_id, str) or not user_id.strip():
         raise ValueError("A member is kept by the sign-in's id")
     values = _values({"email": email, "name": name, "role": role, "role_source": role_source, "company_role": company_role, "licence": licence, "seal": seal,
-                      "disabled": disabled, "disabled_reason": disabled_reason, "legacy_user_id": legacy_user_id, "by": by, "grants": grants})
+                      "disabled": disabled, "disabled_reason": disabled_reason, "legacy_user_id": legacy_user_id, "by": by})
     now = _now()
     columns = ("org_id", "user_id", *values, "first_seen", "updated")
     with _connect() as con:
@@ -114,12 +95,7 @@ def members() -> list[dict]:
 
 
 def update_member(user_id: str, **fields) -> dict | None:
-    """Change a member's fields (of `_FIELDS`); the member as it is now, or None when there is no such member. A grant is for one role (auth.GRANTS): a
-    change of role that does not set the grants too ends every grant the new role is not given them for (audit security-roles-16)."""
-    if "role" in fields and "grants" not in fields:
-        held = member(user_id)
-        if held is not None and held["role"] != fields["role"]:
-            fields = {**fields, "grants": [g for g in held["grants"] if auth.GRANTS[g] == fields["role"]]}
+    """Change a member's fields (of `_FIELDS`); the member as it is now, or None when there is no such member."""
     values = _values(fields)
     if values:
         with _connect() as con:
@@ -158,10 +134,9 @@ def seal(user_id: str) -> str:
 
 def as_user(m: dict) -> dict:
     """A member as the signed-in user `auth.current` holds: today's shape of a user (so `auth.can`, `auth.actor` and every `need` work unchanged), with the
-    company role, the id of the user of before it was linked to and the grants an administrator gave the person (`auth.can` reads them)."""
+    company role and the id of the user of before it was linked to."""
     return {"id": m["user_id"], "email": m["email"], "name": m["name"], "role": m["role"], "created": m["first_seen"], "disabled": bool(m["disabled"]),
-            "licence": m["licence"], "has_seal": m["has_seal"], "mfa": False, "company_role": m["company_role"], "legacy_id": m["legacy_user_id"],
-            "grants": m["grants"]}
+            "licence": m["licence"], "has_seal": m["has_seal"], "mfa": False, "company_role": m["company_role"], "legacy_id": m["legacy_user_id"]}
 
 
 # ------------------------------------------------------------------ the users of before (a workspace linked to its company, design F.4)

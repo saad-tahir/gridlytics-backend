@@ -442,7 +442,7 @@ def _member_out(m: dict) -> dict:
     seen = m["last_seen"] is not None
     return {"id": m["user_id"], "email": m["email"], "name": m["name"], "role": m["role"], "role_source": m["role_source"], "company_role": m["company_role"],
             "disabled": m["disabled"], "disabled_reason": m["disabled_reason"], "first_seen": m["first_seen"] if seen else None, "last_seen": m["last_seen"],
-            "seen": seen, "grants": m["grants"]}
+            "seen": seen}
 
 
 def _not_seen(request: Request | None = None) -> list[dict]:
@@ -469,7 +469,7 @@ def _not_seen(request: Request | None = None) -> list[dict]:
         preset = None if owner else store_members.preset(p["email"])
         role, source = ("admin", "owner") if owner else (preset["role"], "set") if preset else (companies.MEMBER_ROLE, "default")
         out.append({"id": p["id"], "email": p["email"], "name": p["name"], "role": role, "role_source": source, "company_role": p["company_role"],
-                    "disabled": False, "disabled_reason": "", "first_seen": None, "last_seen": None, "seen": False, "grants": []})
+                    "disabled": False, "disabled_reason": "", "first_seen": None, "last_seen": None, "seen": False})
     return out
 
 
@@ -561,14 +561,9 @@ def _account(inp) -> dict:
         if not isinstance(inp["disabled"], bool):
             _fail("Disabled must be yes or no")
         out["disabled"] = 1 if inp["disabled"] else 0
-    if "grants" in inp:
-        # what an administrator grants a named member beyond the role (plan Part 10.5; audit security-roles-16): the costs, to a viewer
-        grants = inp["grants"]
-        if not isinstance(grants, list) or any(not isinstance(g, str) or g not in auth.GRANTS for g in grants):
-            _fail(f"A member can be granted only the right to {' and '.join(auth.GRANT_WORDS.values())}: grants is a list holding "
-                  f"{' or '.join(repr(g) for g in auth.GRANTS)}, or nothing")
-        out["grants"] = sorted(set(grants))
-    extra = sorted(set(inp) - {"role", "disabled", "grants"})
+    # no member is granted a permission beyond the role, the costs least of all: a viewer never sees money (the owner's rule; review of audit
+    # security-roles-16), so "grants" is an unknown field like any other
+    extra = sorted(set(inp) - {"role", "disabled"})
     if extra:
         _fail(f"Unknown field '{extra[0]}': a member's role and access can be changed here")
     return out
@@ -597,12 +592,6 @@ def users_edit(user_id: str, request: Request = None, inp: dict = Body(...)):
         found = store_members.member(user_id)
         before = _member_out(found) if found is not None else person
         role, disabled = fields.get("role", before["role"]), bool(fields.get("disabled", before["disabled"]))
-        refused = [g for g in fields.get("grants", ()) if auth.GRANTS[g] != role]
-        if refused:
-            g = refused[0]
-            holders = [f"{'an' if n[0] in 'aeiou' else 'a'} {n}" for n in (auth.ROLES[r].lower() for r in auth.ROLES if r in auth.PERMISSIONS[g])]
-            _fail(f"A grant to {auth.GRANT_WORDS[g]} is for a {auth.ROLES[auth.GRANTS[g]].lower()}: {', '.join(holders[:-1])} and {holders[-1]} "
-                  f"{auth.GRANT_WORDS[g]} already")
         owner = before["role_source"] == "owner" or before["company_role"] == "owner"
         if owner and (role != "admin" or disabled):
             _fail("The company's owner is its administrator in Gridlytics, and stays one")
@@ -619,17 +608,16 @@ def users_edit(user_id: str, request: Request = None, inp: dict = Body(...)):
             made = store_members.add_member(user_id, email=person["email"], name=person["name"], role=role,
                                             role_source="set" if "role" in fields and not owner else person["role_source"],
                                             company_role=person["company_role"], disabled=disabled or no_seat,
-                                            disabled_reason=companies.NO_SEAT if no_seat else "", by=by, grants=fields.get("grants", ()))
+                                            disabled_reason=companies.NO_SEAT if no_seat else "", by=by)
             store_members.use_preset(person["email"])
         else:
-            changes = {k: fields[k] for k in ("role", "grants") if k in fields}
+            changes = {k: fields[k] for k in ("role",) if k in fields}
             if "role" in fields and not owner:
                 changes["role_source"] = "set"
             if "disabled" in fields:
                 changes.update(disabled=disabled, disabled_reason="")
             made = store_members.update_member(user_id, **changes, by=by) if changes else found
-    store.audit(by, "changed a user", before["email"], {**fields, **({"role_before": before["role"]} if "role" in fields else {}),
-                                                        **({"grants_before": before["grants"]} if "grants" in fields else {})})
+    store.audit(by, "changed a user", before["email"], {**fields, **({"role_before": before["role"]} if "role" in fields else {})})
     return _member_out(made)
 
 

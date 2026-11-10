@@ -35,8 +35,7 @@ PASSWORD = "a long enough password"
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "get_my_context.json").read_text(encoding="utf-8"))
 USER = FIXTURE["profile"]["id"]
 NORTH, PENDING, SOUTH, SUSPENDED, UNVERIFIED = (m["company"]["id"] for m in FIXTURE["memberships"])
-#: the grants an administrator gave the person beyond the role since round 7 (audit security-roles-16)
-USER_KEYS = {"id", "email", "name", "role", "created", "disabled", "licence", "has_seal", "mfa", "company_role", "legacy_id", "grants"}
+USER_KEYS = {"id", "email", "name", "role", "created", "disabled", "licence", "has_seal", "mfa", "company_role", "legacy_id"}
 
 
 @pytest.fixture
