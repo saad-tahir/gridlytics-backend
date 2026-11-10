@@ -1471,3 +1471,42 @@ def test_a_closed_alert_comes_back_once_its_condition_cleared_changed_or_became_
         alerts._open(sid, "data_stale", "Data", "warning", "No data for 40 minutes", {"last_ts": None, "source": None})
         assert [r["state"] for r in _rows(sid, "data_stale")] == ["closed", "open"]
 
+
+# ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-10
+
+def test_every_bad_rule_is_refused_in_a_sentence_and_nothing_is_stored(world):
+    """flow-reports-alerts-members-keys-10: {'channels': 5} was a 500; 'banana' quiet hours, an escalation of -7 or 'soon' and a 5,000-character
+    object were stored; an unknown channel was dropped silently; and {'Data': null} was refused as 'Unknown alert category: Data'."""
+    admin, sid = world.c["admin"], world.site
+    before = admin.get("/api/alerts/rules").json()
+    site_before = admin.get(f"/api/alerts/rules/sites/{sid}").json()
+    cases = [
+        ({"Data": {"channels": 5}}, ["The channels must be a list"]),
+        ({"Data": {"channels": ["email"], "quiet_hours": "banana", "escalate_after_min": -7}}, ["Quiet hours are two times", "escalation must be at least 1"]),
+        ({"Data": {"channels": ["in_app"], "quiet_hours": {"x": "y" * 5000}, "escalate_after_min": "soon"}},
+         ["Quiet hours are two times", "escalation must be a whole number"]),
+        ({"Data": {"channels": ["pager"]}}, ["The channels must be one of"]),
+        ({"Data": None}, ["Data alerts: the rule must be a set of named values"]),
+        ({"Data": {"escalate_after_min": 10081}}, ["escalation must be at most 10080"]),
+        ({"Data": {"escalate_after_min": True}}, ["escalation must be a whole number"]),
+        ({"Data": {"channels": "email"}}, ["The channels must be a list"]),
+        ({"Data": {"thresholds": [1]}}, ["thresholds must be a set of named values"]),
+        ({"Data": {"thresholds": {"gap_hours": "two"}}}, ["gap hours must be a number"]),
+        ([], ["The alert rules are a set of categories"]),
+        ("Data", ["The alert rules are a set of categories"]),
+    ]
+    for body, said in cases:
+        for url in ("/api/alerts/rules", f"/api/alerts/rules/sites/{sid}"):
+            r = admin.put(url, json=body)
+            assert r.status_code == 422, (url, body if len(str(body)) < 200 else "long", r.text[:300])
+            detail = r.json()["detail"]
+            assert isinstance(detail, str) and len(detail) < 300 and "y" * 50 not in detail, (url, detail[:300])
+            for words in said:
+                assert words in detail, (url, words, detail)
+            if isinstance(body, dict):
+                assert detail.startswith("Data alerts: "), (url, detail)
+    assert admin.get("/api/alerts/rules").json() == before
+    assert admin.get(f"/api/alerts/rules/sites/{sid}").json() == site_before
+    # the editor's own body still saves, every known category included
+    r = admin.put("/api/alerts/rules", json={c: {**v, "channels": ["in_app", "sms"]} for c, v in before.items()})
+    assert r.status_code == 200 and set(r.json()) == set(alerts.CATEGORIES) and r.json()["Data"]["channels"] == ["in_app", "sms"], r.text

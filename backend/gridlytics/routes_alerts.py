@@ -1,6 +1,8 @@
 """Alerts (UI-16): the inbox, counts, actions and the rule editor."""
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Body
 
 from . import alerts, auth
@@ -34,7 +36,9 @@ def rules_get():
 
 
 @router.put("/api/alerts/rules")
-def rules_put(inp: dict = Body(...)):
+def rules_put(inp: Any = Body(...)):
+    """The company's rules, {category: rule}: each rule is checked as alerts.RuleIn and a bad value is a 422 of one sentence (audit
+    flow-reports-alerts-members-keys-10); the body is any JSON so that a list or a text is refused in those words too."""
     auth.need("edit_workspace", "Changing the alert rules")
     try:
         return alerts.set_rules(inp, auth.actor())
@@ -50,7 +54,7 @@ def site_rules_get(site_id: str):
 
 
 @router.put("/api/alerts/rules/sites/{site_id}")
-def site_rules_put(site_id: str, inp: dict = Body(...)):
+def site_rules_put(site_id: str, inp: Any = Body(...)):
     auth.need("edit_workspace", "Changing a site's alert rules")
     site_or_404(site_id)
     try:

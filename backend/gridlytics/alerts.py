@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
 import numpy as np
-from pydantic import Field, ValidationError
+from pydantic import Field, StrictInt, ValidationError, field_validator
 
 from . import auth
 from . import battery as battery_service
@@ -897,11 +897,18 @@ def in_quiet_hours(rule: dict, ts: int) -> bool:
 
 
 class RuleIn(Strict):
-    """A category's rule as the editor sends it."""
+    """A category's rule as the editor sends it (the request model of PUT /api/alerts/rules and of a site's rules: audit
+    flow-reports-alerts-members-keys-10). Every field is checked together, so one sentence names each bad value: the channels a list of known ones,
+    quiet hours two times of day, escalation a whole number of minutes from 1 to 10,080 (a week) and thresholds numbers by name."""
     channels: list[Literal[CHANNELS]] = Field(default_factory=lambda: ["in_app"], max_length=4)
-    quiet_hours: str | int | float | None = None
-    escalate_after_min: int | None = Field(None, ge=1, le=10080)
+    quiet_hours: str | None = None
+    escalate_after_min: StrictInt | None = Field(None, ge=1, le=10080)
     thresholds: dict[str, float | None] = Field(default_factory=dict)
+
+    @field_validator("quiet_hours", mode="before")
+    @classmethod
+    def _quiet(cls, v):
+        return quiet_hours(v)
 
 
 def _threshold_values(cat: str, given: dict | None, strict: bool) -> dict:
@@ -938,11 +945,7 @@ def _rule(cat: str, v: dict | None, strict: bool) -> dict:
         except ValidationError as exc:
             words = message(exc).replace("The escalate after min", "The escalation").replace("The thresholds's ", "The threshold ")
             raise ValueError(f"{cat} alerts: {words}") from None
-        try:
-            quiet = quiet_hours(r.quiet_hours)
-        except ValueError as exc:
-            raise ValueError(f"{cat} alerts: {exc}") from None
-        channels, escalate = r.channels, r.escalate_after_min
+        channels, quiet, escalate = r.channels, r.quiet_hours, r.escalate_after_min
     else:
         try:
             quiet = quiet_hours(v.get("quiet_hours"))
@@ -962,11 +965,15 @@ def rules() -> dict:
 
 
 def _check_body(body) -> dict:
+    """The body of a rules edit: known categories, each a rule (a set of named values). A category given as null is refused in words rather than read
+    as unknown (audit flow-reports-alerts-members-keys-10: {"Data": null} read "Unknown alert category: Data"); left out, it takes its defaults."""
     if not isinstance(body, dict):
         raise ValueError("The alert rules are a set of categories, each with its rule")
-    for cat in body:
+    for cat, v in body.items():
         if cat not in CATEGORIES:
-            raise ValueError(f"Unknown alert category: {cat}")
+            raise ValueError(f"Unknown alert category: {str(cat)[:40]}")
+        if not isinstance(v, dict):
+            raise ValueError(f"{cat} alerts: the rule must be a set of named values")
     return body
 
 
@@ -1020,8 +1027,6 @@ def set_site_rules(site_id: str, body: dict, by: str) -> dict:
     company = rules()
     over = {}
     for c, v in body.items():
-        if not isinstance(v, dict):
-            raise ValueError(f"{c} alerts: the rule must be a set of named values")
         th = v.get("thresholds") or {}
         if not isinstance(th, dict):
             raise ValueError(f"{c} alerts: the thresholds must be a set of named values")
