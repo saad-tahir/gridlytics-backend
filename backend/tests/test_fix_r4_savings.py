@@ -9,7 +9,7 @@ from test_fix_r2_savings import GRID_COLS, NIGHT_CHARGER, D, P
 from test_fix_r3_savings import BAT, GEN, SHIFTING, SOC, _score
 from test_fix_savings import company, make_site, twin_day  # noqa: F401 (company is a fixture)
 
-from gridlytics import sites, telemetry, twin, verify
+from gridlytics import sites, tariffs, telemetry, twin, verify
 
 
 def _tou_site(name, native_slots, table):
@@ -114,6 +114,9 @@ def _site_day(name, native_slots, table, outage=None, gen_run=None, genset=None)
     `outage` and the plan asks the genset to run over `gen_run` (minute ranges)."""
     sid = make_site(name=name, tier="closed_loop", native={"source": "entered", "work_mode": "tou", "backup_soc_pct": 20, "slots": native_slots},
                     genset=genset)
+    # the scored days are before the first shipped HSD price (30 Oct 2026), which claims nothing (audit engine-money-live-15): the price they were
+    # priced with until then, entered for them
+    tariffs.add_fuel_price("hsd", "2026-10-01", 400.67, "t")
     site = sites.full(sid)
     plant = twin.plant_of(site)
     out, soc0 = [], 0.5

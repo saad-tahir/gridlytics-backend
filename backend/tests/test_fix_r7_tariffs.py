@@ -24,6 +24,10 @@ Batch 3 (the hand-worked goldens of engine-tariffs-07 are test_r7_tariffs_golden
 - engine-tariffs-06: a version awaiting its notification whose start has passed (the CY2027 schedule from 1 Jan 2027) is flagged in the price
   vector, the price page, a plan, a rebuilt bill and the tariff library, naming the version still in use.
 
+Batch 4 (late findings; the golden of the dated diesel price is test_r7_tariffs_golden.py):
+- engine-money-live-15: a genset day before the first entered fuel price has no fuel price: the first price stands in only with a flag that says so,
+  and a day whose fuel (or whose carry-over, off grid) rests on it claims nothing (claim_withheld "no_fuel_price") until a price is entered for it.
+
 Each test fails on the code before its fix."""
 from __future__ import annotations
 
@@ -33,7 +37,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 import pytest
 from test_fix_api import world  # noqa: F401  (world is a fixture)
-from test_fix_savings import _days, _put_rows, _row, make_site
+from test_fix_savings import _days, _put_rows, _row, make_site, twin_day
 from test_fix_tariffs import OFF, PEAK_NOV, SRC, _bump, _conn, _flat_day, _minutes, _t0, company  # noqa: F401  (company is a fixture)
 
 from gridlytics import sites, store, tariff_data, tariffs, verify
@@ -807,3 +811,37 @@ def test_the_plan_the_price_page_and_the_library_say_when_the_schedule_awaits_it
         t0 = int(datetime(2027, 1, 4, 6, tzinfo=PKT).timestamp())
         out = plans.tick(world.site, at=t0, steps=96, save=False)
     assert [x["message"] for x in out["summary"]["tariff_notices"]] == [AWAITING]
+
+
+# ------------------------------------------------------------------------------------------------ batch 4, engine-money-live-15: no fuel price that day
+
+EARLY = date(2026, 10, 28)  # a Wednesday before the first shipped HSD price (30 Oct 2026)
+
+
+def _genset_day(name: str, windows: list) -> tuple[str, dict]:
+    sid = make_site(name=name, control="auto_on_grid_loss", twin_extra={"windows": windows, "adherence": 1.0, "trips_per_day": 0.0})
+    _, prev, _ = twin_day(sid, EARLY - timedelta(days=1), 0.9, seed=1)
+    _, sim, _ = twin_day(sid, EARLY, float(prev["soc"][-1]), seed=2)
+    return sid, sim
+
+
+def test_a_genset_day_before_the_first_fuel_price_says_so_and_claims_nothing(company):
+    sid, sim = _genset_day("Early fuel", [["14:00", "16:00"]])
+    assert sim["fuel"].sum() > 10  # the set ran in the outage
+    rows = verify.compute_day(sid, EARLY, with_bound=False)
+    for base in ("native", "tuned"):  # before: priced and claimed at 30 Oct's Rs 400.67, with nothing to say so
+        assert rows[base]["claim_withheld"] == "no_fuel_price" and rows[base]["claimed_rs"] == 0.0, base
+        assert rows[base]["baseline"]["genset_rs"] > 0  # the estimate stays, on the flagged stand-in
+    assert verify.summary(sid, EARLY.isoformat(), EARLY.isoformat())["days"][0]["claim_withheld"] == "no_fuel_price"
+    tariffs.add_fuel_price("hsd", "2026-10-01", 380.10, "t")  # the price in force then, entered: the day is priced with it and claims
+    n = verify.compute_day(sid, EARLY, with_bound=False)["native"]
+    assert n["claim_withheld"] is None and n["claimed_rs"] == n["saving_rs"]
+
+
+def test_a_day_before_the_first_fuel_price_whose_genset_did_not_run_claims_as_before(company):
+    sid, sim = _genset_day("Idle set", [])
+    assert sim["fuel"].sum() == 0
+    rows = verify.compute_day(sid, EARLY, with_bound=False)
+    assert rows["native"]["actual"]["litres"] == 0 and rows["native"]["baseline"]["litres"] == 0
+    assert rows["native"]["claim_withheld"] is None
+

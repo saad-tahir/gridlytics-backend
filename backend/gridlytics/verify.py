@@ -897,6 +897,11 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
             fidelity_score = conf["fidelity"] if conf else None
     else:
         fidelity = "recommendation_only"
+    # a genset day before the first entered fuel price has no fuel price (tariffs.fuel_price: the first one stands in, flagged): where an arm burned
+    # fuel, or the carry-over off the grid is valued at the set's fuel, the saving rests on a price the day did not have, so the day says so and
+    # claims nothing until a price is entered for it (audit engine-money-live-15)
+    no_fuel_price = (bool(gen_asset) and bool(tariffs.fuel_price(gen_asset.get("fuel_kind", "hsd"), day)[1].get("stands_in"))
+                     and (any(arm["litres"] > 0 for arm in arms.values()) or (bool(b) and not on_grid)))
     rows = {}
     for base in ("native", "tuned"):
         a, n = arms["actual"], arms[base]
@@ -915,7 +920,8 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
         # a day whose import or whose actual battery flow is unknown claims nothing: withholding only its wear lever would credit the baseline's whole
         # wear when the actual cycled more (the "never over-claim" rule of plan 8.4); likewise a day whose genset may have run unseen, whose energy
         # the grid levers or the carry-over would credit without its fuel
-        withheld = ("import_unknown" if imp_unknown else "battery_flow_unknown" if wear_unknown else "genset_unknown" if gen_unseen else None)
+        withheld = ("import_unknown" if imp_unknown else "battery_flow_unknown" if wear_unknown else "genset_unknown" if gen_unseen
+                    else "no_fuel_price" if no_fuel_price else None)
         claim = saving if fidelity in CLAIMING and not withheld else 0.0
         rows[base] = {"saving_rs": saving, "claimed_rs": claim, "levers": levers, "actual": a, "baseline": n, "fidelity": fidelity,
                       "fidelity_score": fidelity_score, "litres_saved": None if g_unknown else round(n["litres"] - a["litres"], 2),

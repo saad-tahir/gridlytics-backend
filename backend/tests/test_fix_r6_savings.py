@@ -32,6 +32,9 @@ def _farm(name: str) -> str:
     sites.set_tier_capable(sid, "closed_loop")
     sites.set_tier_allowed(sid, spec["tier"], "t", "demo")
     sites.capture_native(sid, spec["native"], "t")
+    # the scored days are before the first shipped HSD price (30 Oct 2026), which claims nothing (audit engine-money-live-15): the price they were
+    # priced with until then, entered for them
+    tariffs.add_fuel_price("hsd", "2026-10-01", 400.67, "t")
     return sid
 
 

@@ -438,13 +438,22 @@ def approve(version_id: str, by: str) -> dict:
 
 
 def fuel_price(kind: str, on: date | str) -> tuple[float, dict]:
+    """The fuel price in force on a day and its source: the latest entered on or before it (R9 section 9.1: OGRA prices diesel daily, and a day
+    with no entry of its own keeps the one before). A day before the first entry has no fuel price (audit engine-money-live-15): the first price
+    stands in, so that a plan never runs on free fuel, and its source says so (`stands_in`, `first_from` and a `note` in words); the savings ledger
+    then claims nothing on fuel priced with it (verify.compute_day, claim_withheld "no_fuel_price")."""
     ensure_shipped()
     day = on.isoformat() if isinstance(on, date) else str(on)[:10]
     with store.connect() as con:
         r = con.execute("SELECT price, source FROM fuel_prices WHERE kind = ? AND valid_from <= ? ORDER BY valid_from DESC LIMIT 1", (kind, day)).fetchone()
-        if r is None:
-            r = con.execute("SELECT price, source FROM fuel_prices WHERE kind = ? ORDER BY valid_from LIMIT 1", (kind,)).fetchone()
-    return (float(r["price"]), json.loads(r["source"])) if r else (0.0, {})
+        if r is not None:
+            return float(r["price"]), json.loads(r["source"])
+        r = con.execute("SELECT price, source, valid_from FROM fuel_prices WHERE kind = ? ORDER BY valid_from LIMIT 1", (kind,)).fetchone()
+    if r is None:
+        return 0.0, {"stands_in": True, "first_from": None, "note": "No fuel price has been entered for this fuel"}
+    first = date.fromisoformat(r["valid_from"])
+    return float(r["price"]), {**json.loads(r["source"]), "stands_in": True, "first_from": r["valid_from"],
+                               "note": f"No fuel price for this day: the first entered price, from {_day_words(first)}, stands in"}
 
 
 def add_fuel_price(kind: str, valid_from: str, price: float, by: str) -> None:

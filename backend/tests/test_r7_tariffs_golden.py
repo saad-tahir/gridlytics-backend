@@ -15,6 +15,7 @@ engine's bill line by line. The cases:
 - TAR-01, peak membership at every season boundary of both calendars and in a window that crosses midnight;
 - TAR-04 and TAR-05: fixed 30-minute MDI blocks, the floor, the PF penalty and the gross-up; the surcharge and tax stack line by line (DSS, the
   Neelum-Jhelum line, provincial duty, Punjab's per-unit duty, GST, income tax, further and extra tax, PTV and MUCT).
+- engine-money-live-15: the dated diesel price of each day (R9 section 9.1), none before the first entry, and a genset day's cost priced with it.
 
 R9 section 7's order of a bill: (1) energy by period, (2) fixed charges, (3) FPA, QTA and surcharges on the units, (4) electricity duty, (5) GST,
 (6) income tax s.235, (7) further and extra tax, (8) flat fees, (9) adjustments (here the export credit and a credit carried between bills).
@@ -445,3 +446,45 @@ def test_golden_a_peak_window_across_midnight_follows_the_month_of_each_minute(c
             assert tariffs.is_peak_local(cal, datetime(day.year, day.month, day.day, m // 60, m % 60, tzinfo=PKT)) == peak, (day, m)
         minutes = sorted(expected)
         assert _one_day_peak_kwh(conn, day, minutes) == pytest.approx(sum(2 ** i for i, m in enumerate(minutes) if expected[m])), day
+
+
+# ------------------------------------------------------------------------------------------------ engine-money-live-15: the dated diesel price
+
+#: R9 section 9.1's daily HSD prices (OGRA notifications, Rs per litre), each in force from its day until the next entry
+HSD_BY_DAY = {date(2026, 10, 30): 400.67, date(2026, 10, 31): 402.96, date(2026, 11, 1): 402.96, date(2026, 11, 2): 402.96,
+              date(2026, 11, 3): 395.20, date(2026, 11, 4): 391.52, date(2026, 11, 5): 387.81, date(2026, 11, 6): 382.25, date(2026, 11, 9): 382.25}
+
+
+def test_golden_the_diesel_price_of_each_day_and_none_before_the_first(company):
+    """R9 section 9.1: HSD Rs 400.67 from 30 Oct 2026, 402.96 from 31 Oct, 395.20 from 3 Nov, 391.52 from 4 Nov, 387.81 from 5 Nov and 382.25 from
+    6 Nov. A day takes the latest price on or before it: 1 and 2 Nov have no entry of their own and keep 31 Oct's 402.96, 9 Nov keeps 6 Nov's 382.25.
+    29 Oct is before the first entry: it has no fuel price. The first one (400.67, from 30 Oct) stands in, so that a plan never runs on free fuel,
+    and only with a flag that says so (before: the same 400.67, silently)."""
+    for day, price in HSD_BY_DAY.items():
+        p, src = tariffs.fuel_price("hsd", day)
+        assert p == price and not src.get("stands_in"), day
+        assert src["kind"] == "ogra", day
+    p, src = tariffs.fuel_price("hsd", date(2026, 10, 29))
+    assert p == 400.67
+    assert src["stands_in"] is True and src["first_from"] == "2026-10-30"
+    assert src["note"] == "No fuel price for this day: the first entered price, from 30 Oct 2026, stands in"
+    tariffs.add_fuel_price("hsd", "2026-10-01", 380.10, "t")  # a price entered for October: the day now has its own
+    p, src = tariffs.fuel_price("hsd", date(2026, 10, 29))
+    assert p == 380.10 and not src.get("stands_in")
+
+
+def test_golden_a_genset_day_is_priced_with_that_days_diesel(company):
+    """One run of 2 hours (one start) at 150 kW burning 0.5 L a minute: 60 L and 300 kWh. Start Rs 500, Rs 200 a run hour, O&M Rs 2 a kWh:
+    1 x 500 + 2 x 200 + 300 x 2 = Rs 1,500.00 besides the fuel.
+    - 3 Nov 2026: 60 x 395.20 = 23,712.00, total Rs 25,212.00;
+    - 2 Nov 2026 (no entry that day, 31 Oct's 402.96): 60 x 402.96 = 24,177.60, total Rs 25,677.60;
+    - 29 Oct 2026 (no fuel price; 30 Oct's 400.67 stands in, flagged): 60 x 400.67 = 24,040.20, total Rs 25,540.20, an estimate the day does not
+      claim on (test_fix_r7_tariffs)."""
+    site = {"assets": {"genset": {"fuel_kind": "hsd", "c_start_rs": 500.0, "c_runhr_rs": 200.0, "c_om_rs_per_kwh": 2.0}}}
+    on = np.zeros(1440, dtype=bool)
+    on[600:720] = True
+    sim = {"gen_on": on, "fuel": np.where(on, 0.5, 0.0), "gen": np.where(on, 150.0, 0.0)}
+    for day, total in ((date(2026, 11, 3), 25212.00), (date(2026, 11, 2), 25677.60), (date(2026, 10, 29), 25540.20)):
+        cost, litres = verify._genset_cost(site, sim, day)
+        assert litres == pytest.approx(60.0)
+        assert round(cost, 2) == total, day
