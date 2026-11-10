@@ -106,7 +106,6 @@ def test_an_overlapping_upload_keeps_every_column_the_file_does_not_carry(compan
     head = ("ts", "grid_present", "grid_power_w", "pv_power_w", "load_power_w", "battery_power_w", "battery_soc_bms_pct")
     full = _file(head, [(_local(t + 60 * i), 1, 114600, 150000, 224600, -40000, 70) for i in range(60)])
     first = telemetry.import_csv(sid, full, 5, now=NOW)
-    assert first["overlap"] == 0 and first["minutes"] == 60
     # an edge batch on the same minutes carries the estimate a CSV never does: it merges too, and keeps the file's PV
     telemetry.ingest(sid, [{"ts": t + 60 * i, "grid_present": 1, "battery_soc_est_pct": 71.0} for i in range(60)], "edge", now=NOW)
     before = telemetry.aggregate_day(sid, date.fromisoformat(DAY))  # an edge batch does not aggregate the day itself
@@ -122,6 +121,8 @@ def test_an_overlapping_upload_keeps_every_column_the_file_does_not_carry(compan
     for k in ("pv_kwh", "import_kwh", "import_completeness", "completeness", "min_soc", "max_soc"):
         assert after[k] == before[k], k
     assert after["load_kwh"] > before["load_kwh"]
+    # the answer's fields come after the behaviour, so the test fails on the erased columns without the fix, not only on a missing field
+    assert first["overlap"] == 0 and first["minutes"] == 60
     assert res["overlap"] == 60 and res["rows"] == 60
     assert any("60 minutes were already stored" in line for line in res["log"]), res["log"]
 
@@ -162,8 +163,6 @@ def test_a_coarse_file_is_stored_as_the_intervals_its_rows_cover(company, step):
         up = not (14 * 60 <= i * step < 15 * 60)
         rows.append((_local(ts), 1 if up else 0, 200000 if up else 0, 200000, 200000 * step / 60 if up else 0))
     res = telemetry.import_csv(sid, _file(("ts", "grid_present", "grid_power_w", "load_power_w", "grid_import_wh"), rows), 5, now=NOW)
-    assert (res["rows"], res["step_min"], res["minutes"], res["gaps"]) == (n, step, 1440, 0)
-    assert any(f"Rows are {step} minutes apart" in line for line in res["log"]), res["log"]
     day = _day(sid)
     assert day["load_kwh"] == pytest.approx(4800.0)
     assert day["import_kwh"] == pytest.approx(200 * 23)
@@ -172,14 +171,16 @@ def test_a_coarse_file_is_stored_as_the_intervals_its_rows_cover(company, step):
     assert day["completeness"] == 1.0
     out = telemetry.outages(sid, T0, T0 + 86400)
     assert [(o["start"], o["minutes"]) for o in out] == [(T0 + 14 * 3600, 60)]
+    assert (res["rows"], res["step_min"], res["minutes"], res["gaps"]) == (n, step, 1440, 0)
+    assert any(f"Rows are {step} minutes apart" in line for line in res["log"]), res["log"]
 
 
 def test_a_missing_row_in_a_coarse_file_is_a_gap_and_its_minutes_stay_missing(company):
     sid = _site("Coarse gap")
     rows = [(_local(T0 + i * 900), 1, 100000) for i in range(96) if i != 40]
     res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), rows), 5, now=NOW)
-    assert (res["rows"], res["step_min"], res["minutes"], res["gaps"]) == (95, 15, 1425, 1)
     assert _day(sid)["completeness"] == pytest.approx(1425 / 1440, abs=1e-4)
+    assert (res["rows"], res["step_min"], res["minutes"], res["gaps"]) == (95, 15, 1425, 1)
     # a 1-minute file keeps its rows as single minutes
     one = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), [(_local(T0 + 86400 + 60 * i), 1, 1) for i in range(30)]), 5, now=NOW)
     assert (one["step_min"], one["minutes"]) == (1, 30)
@@ -260,10 +261,6 @@ def test_impossible_values_are_stored_as_missing_and_reported(company):
         pv = -2000 if i == 20 else -20
         rows.append((_local(t + 60 * i), 1, load, soc, pv))
     res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w", "battery_soc_bms_pct", "pv_power_w"), rows), 5, now=NOW)
-    w = " | ".join(res["warnings"])
-    assert "5 load_power_w cells were below -500 W" in w, w
-    assert "1 pv_power_w cell was below -500 W" in w, w
-    assert "2 battery_soc_bms_pct cells were outside 0 to 100 %" in w, w
     d = telemetry.raw(sid, t, t + 3600, ("load_power_w", "battery_soc_bms_pct", "pv_power_w"))
     assert np.all(np.isnan(d["load_power_w"][:5])) and np.all(d["load_power_w"][5:] == 80000)
     assert np.isnan(d["battery_soc_bms_pct"][10]) and np.isnan(d["battery_soc_bms_pct"][11]) and d["battery_soc_bms_pct"][12] == 60
@@ -271,6 +268,10 @@ def test_impossible_values_are_stored_as_missing_and_reported(company):
     day = _day(sid)
     assert day["max_soc"] == 60.0 and day["min_soc"] == 60.0
     assert day["load_kwh"] == pytest.approx(80 * 55 / 60, abs=0.01)
+    w = " | ".join(res["warnings"])
+    assert "5 load_power_w cells were below -500 W" in w, w
+    assert "1 pv_power_w cell was below -500 W" in w, w
+    assert "2 battery_soc_bms_pct cells were outside 0 to 100 %" in w, w
 
 
 def test_a_state_of_charge_given_as_a_fraction_is_reported(company):
@@ -472,6 +473,8 @@ def test_the_genset_page_names_its_litres_and_prices_each_run_at_its_own_day_s_p
         _one_run(sid, _pk_ts(d2, 10))
     page = c.get(f"/api/sites/{sid}/genset").json()
     k = page["kpis"]
+    # the behaviour first: 31 L from the curve for the unmetered run (it was 0 L), and Rs 21,400 at each day's price (not every litre at Rs 400)
+    assert (k["litres"], k["fuel_cost_rs"]) == (61.0, 21400.0)
     assert (k["litres"], k["litres_metered"], k["litres_curve"], k["litres_source"], k["estimated"]) == (61.0, 30.0, 31.0, "curve", True)
     runs = sorted(page["runs"], key=lambda r: r["start"])
     assert [(r["litres"], r["litres_source"], r["price_per_l"], r["fuel_cost_rs"]) for r in runs] == [(30.0, "meter", 300.0, 9000.0),
@@ -493,8 +496,9 @@ def test_no_run_signal_is_unknown_and_a_live_signal_with_no_runs_is_zero(world):
     with world.use():
         _write(sid, t, 60, grid_present=1, load_power_w=50000)
     page = c.get(f"/api/sites/{sid}/genset").json()
-    assert page["signal"] == {"present": False, "last_seen": None, "running": None}
     k = page["kpis"]
+    assert (k["hours"], k["starts"], k["litres"], k["estimated"]) == (None, None, None, False)  # unknown, not 0 h, 0 starts and 0 L
+    assert page["signal"] == {"present": False, "last_seen": None, "running": None}
     assert (k["hours"], k["starts"], k["litres"], k["kwh"], k["litres_source"], k["estimated"]) == (None, None, None, None, None, False)
     assert k["fuel_cost_rs"] is None and page["runs"] == [] and all(d["hours"] is None and d["litres"] is None for d in page["daily"])
     with world.use():
@@ -642,7 +646,8 @@ def test_the_quality_route_counts_today_so_far(world, monkeypatch):
     q = c.get(f"/api/sites/{sid}/telemetry/quality", params={"days": 14})
     assert q.status_code == 200, q.text
     last = q.json()["days"][-1]
-    assert (last["day"], last["completeness"], last["in_progress"]) == (DAY, 1.0, True)
+    assert (last["day"], last["completeness"]) == (DAY, 1.0)  # it was the share of all 1,440 minutes, 52 %
+    assert last["in_progress"] is True
     viewer = world.role("viewer").get(f"/api/sites/{sid}/telemetry/quality")
     assert viewer.status_code == 200 and viewer.json()["days"][-1]["completeness"] == 1.0
 
@@ -1036,7 +1041,6 @@ def test_the_export_formats_its_csv_outside_any_transaction(company, monkeypatch
 def test_a_series_answers_at_most_2000_points_at_the_finest_resolution_within_them(company):
     """performance-live-13: 2 days at 1 minute answered 2,880 points and 30 days at 15 minutes 2,881. Each range now gets the finest of 1m, 5m, 15m, 1h
     and 1d that keeps its buckets within SERIES_MAX_POINTS, counting a range that starts part-way through a bucket."""
-    assert telemetry.SERIES_MAX_POINTS == 2000
     sid = _site("Dense")
     _write(sid, T0, 2 * 1440, load_power_w=1000.0)
     _write(sid, T0 + 2 * 86400, 28 * 96, step=900, load_power_w=2000.0)
@@ -1053,6 +1057,7 @@ def test_a_series_answers_at_most_2000_points_at_the_finest_resolution_within_th
     assert (month["resolution"], len(month["ts"])) == ("1h", 720)
     # an explicit resolution within the cap is kept
     assert telemetry.series(sid, T0, T0 + 86400, ["load_power_w"], "15m")["resolution"] == "15m"
+    assert telemetry.SERIES_MAX_POINTS == 2000
 
 
 def test_an_explicit_resolution_past_the_cap_is_coarsened_for_every_role(world):
@@ -1069,8 +1074,8 @@ def test_an_explicit_resolution_past_the_cap_is_coarsened_for_every_role(world):
         r = viewer.get(f"/api/sites/{sid}/telemetry", params={"start": start, "end": end, "res": res, "names": "load_power_w,pv_power_w"})
         assert r.status_code == 200, r.text
         body = r.json()
+        assert len(body["ts"]) <= 2000 and body["resolution"] == given, (res, start, body["resolution"], len(body["ts"]))
         assert (body["resolution"], body["requested_resolution"], body["max_points"]) == (given, res, 2000), (res, start)
-        assert len(body["ts"]) <= 2000
     r = viewer.get(f"/api/sites/{sid}/telemetry", params={"res": "10s"})
     assert r.status_code == 422 and "5m" in r.json()["detail"]
 
@@ -1136,8 +1141,8 @@ def test_an_upload_s_memory_is_a_small_multiple_of_the_file(company):
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
-    assert res["rows"] == 20000 and res["minutes"] == 20000 and res["status"] == "done", res["warnings"]
     assert peak < 6 * len(body), f"peak {peak / 1e6:.1f} MB for a {len(body) / 1e6:.1f} MB file ({peak / len(body):.1f} times)"
+    assert res["rows"] == 20000 and res["minutes"] == 20000 and res["status"] == "done", res["warnings"]
     d = telemetry.raw(sid, T0, T0 + 3600, ("load_power_w", "grid_import_wh", "inverter_mode_active"))
     assert np.all(d["load_power_w"] == 40000.5) and np.all(d["grid_import_wh"] == 20.6) and d["inverter_mode_active"][0] == "self_use"
 
@@ -1148,10 +1153,10 @@ def test_an_upload_is_written_one_karachi_day_per_transaction(company, monkeypat
     sid = _site("Days")
     seen = _traced(monkeypatch)
     res = telemetry.import_csv(sid, _logger_file(T0 + 12 * 3600, 2 * 1440), 5, now=NOW)  # noon on 5 Nov to noon on 7 Nov: three Karachi days
-    assert res["minutes"] == 2 * 1440
-    writes = [sum(1 for x in run if x.startswith("INSERT INTO minute")) for _, run in seen if any(x.startswith("BEGIN IMMEDIATE") for x in run)]
+    writes = [sum(1 for x in run if x.startswith("INSERT")) for _, run in seen if any(x.startswith("BEGIN IMMEDIATE") for x in run)]
     writes = [n for n in writes if n]
     assert writes == [720, 1440, 720], writes
+    assert res["minutes"] == 2 * 1440
     for day, n in (("2026-11-05", 720), ("2026-11-06", 1440), ("2026-11-07", 720)):
         assert _day(sid, day)["completeness"] == round(n / 1440, 4), day
 
@@ -1159,8 +1164,12 @@ def test_an_upload_is_written_one_karachi_day_per_transaction(company, monkeypat
 # ------------------------------------------------------------------------------------------------ performance-live-06: forecast issues' retention
 
 def _issue_rows(sid: str, kind: str = "pv") -> list[int]:
-    with telemetry.reading() as con:
+    # a plain read of the file (telemetry._open, as old as the table), so the test fails without the fix on what it keeps, not on a missing helper
+    con = telemetry._open()
+    try:
         return [r[0] for r in con.execute("SELECT belief_time FROM forecast_issues WHERE site_id = ? AND kind = ? ORDER BY belief_time", (sid, kind))]
+    finally:
+        con.close()
 
 
 def test_forecast_issues_are_kept_hourly_for_35_days_then_only_each_day_s_day_ahead_issue(company):
@@ -1168,7 +1177,6 @@ def test_forecast_issues_are_kept_hourly_for_35_days_then_only_each_day_s_day_ah
     days (the stage-1 bands read 16 days, the night's scoring 3), then only each Karachi day's day-ahead issue, the latest within 6 hours before its
     midnight, which is what the day's scoring reads; a day without one keeps nothing. Another site's and another kind's issues are untouched."""
     sid, other = "retained", "other"
-    assert (telemetry.ISSUE_ALL_DAYS, telemetry.ISSUE_HOURLY_DAYS) == (3, 35)
     newest = T0 + 45 * 86400  # a Karachi midnight
     first = T0
     quarters = list(range(first, newest, 900))
@@ -1196,3 +1204,4 @@ def test_forecast_issues_are_kept_hourly_for_35_days_then_only_each_day_s_day_ah
     assert len(kept) < len(quarters) / 3
     # another kind and another site are pruned by their own saves, not this one
     assert len(_issue_rows(sid, "load")) == len(_issue_rows(other, "pv")) == len(quarters) - 1 - 25
+    assert (telemetry.ISSUE_ALL_DAYS, telemetry.ISSUE_HOURLY_DAYS) == (3, 35)
