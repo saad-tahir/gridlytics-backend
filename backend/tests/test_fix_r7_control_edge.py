@@ -39,6 +39,13 @@ Batch 4, the advisory tier:
   meter counts table writes, never pulls (audit pages-B-02, engine-delivery-09, brief-vs-build-06, flow-telemetry-plan-control-16);
 - the "it took" card on today's keyed table, 30 minutes after its first discharge slot in the peak (audit pages-B-08).
 
+Batch 5, the control page:
+- a genset hold, a charging block and a forced charge are control actions: strict bodies, the permission of their kind, refused without the
+  equipment, re-solved at once; a forced charge shows in the chip (audit flow-telemetry-plan-control-17, role-operator-08, tracker-and-docs-10);
+- a closed-loop site whose edge never reported says so, and its read-back and write log are served (audit role-operator-11, role-analyst-12);
+- the fallback test releases for 15 minutes and checks from the heartbeats that the edge handed the inverter back and took the plan again (audit
+  flow-telemetry-plan-control-19).
+
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
