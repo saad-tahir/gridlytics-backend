@@ -208,6 +208,31 @@ def _grid_signal(site_id: str, now: int) -> dict:
         return {"grid_present": None, "last_seen": None}
     return {"grid_present": bool(r["grid_present"] >= 0.5), "last_seen": int(r["ts"])}
 
+
+def _outage_calendar(site_id: str, log: list[dict], now: int, days: int) -> dict:
+    """The outage heatmap by date and hour (R8 2.7: date on y, hour on x, cells coloured by minutes without grid; round 7, pages-C-10): the last `days`
+    local dates to today's, oldest first, as {dates: ["YYYY-MM-DD", ...], by_date: [[24 minutes per local hour], ...]}. The minutes are the log's, counted
+    as the weekday profile counts them. An hour with no grid-present reading and no outage minute (a logger that was off says nothing) and an hour still to
+    come are null, not an hour with the grid up."""
+    last = datetime.fromtimestamp(now, PKT).date()
+    first = last - timedelta(days=days - 1)
+    d0 = int(datetime(first.year, first.month, first.day, tzinfo=PKT).timestamp())
+    n = days * 24
+    mins = np.zeros(n, dtype=np.int64)
+    for o in log:
+        h = (np.arange(max(int(o["start"]), d0), int(o["end"]), 60, dtype=np.int64) - d0) // 3600
+        np.add.at(mins, h[h < n], 1)
+    known = np.zeros(n, dtype=bool)
+    with telemetry.connect() as con:
+        for h, c in con.execute("SELECT (ts - ?) / 3600 AS h, COUNT(grid_present) FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? GROUP BY h",
+                                (d0, site_id, d0, now)).fetchall():
+            if 0 <= int(h) < n and c:
+                known[int(h)] = True
+    begun = d0 + 3600 * np.arange(n) <= now
+    cells = [int(m) if b and (k or m) else None for m, k, b in zip(mins, known, begun)]
+    return {"dates": [(first + timedelta(days=i)).isoformat() for i in range(days)], "by_date": [cells[i * 24:(i + 1) * 24] for i in range(days)]}
+
+
 @router.get("/api/sites/{site_id}/outages")
 def outages(site_id: str, days: int = 30):
     s = full_or_404(site_id)
@@ -248,7 +273,9 @@ def outages(site_id: str, days: int = 30):
             "battery_hours": round(sum(o["battery_minutes"] for o in log) / 60, 1) if reserve.has_battery(s) else None,
             "reserve_outages": rk["outages"], "reserve_met": rk["met"], "reserve_adequacy_pct": rk["pct"]}
     off_grid = not s.get("connections") or s["connections"][0]["data"].get("regime") == "off_grid"
-    return {"off_grid": off_grid, "signal": _grid_signal(site_id, now), "kpis": kpis, "log": list(reversed(log)), "heatmap": {"days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "minutes": heat},
+    # the weekday profile (the schedule's shape) and the calendar by date (a day's outage, a bad week, a change of schedule; pages-C-10)
+    heatmap = {"days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "minutes": heat, **_outage_calendar(site_id, log, now, days)}
+    return {"off_grid": off_grid, "signal": _grid_signal(site_id, now), "kpis": kpis, "log": list(reversed(log)), "heatmap": heatmap,
             "schedule": sch, "forecast": fc, "reserve": [{"t": st["t"], "reserve_pct": st["reserve_pct"], "soc_pct": st["soc_pct"], "p_down": st["p_down"]}
                                                         for st in (plan or {}).get("steps", [])], "feeder": s["data"].get("outage_unit")}
 

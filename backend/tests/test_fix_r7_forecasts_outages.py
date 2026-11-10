@@ -952,6 +952,39 @@ def test_the_outages_page_gives_the_reserve_at_each_outage_s_start_and_the_reser
     assert all(o["reserve_pct"] is None and o["reserve_met"] is None and o["battery_minutes"] is None for o in page["log"])
 
 
+# ------------------------------------------------------------------------------------------------ pages-C-10
+
+def test_the_outages_page_answers_a_calendar_heatmap_by_date_and_hour(api_world, monkeypatch):
+    """R8 2.7: 'an outage heatmap (date on y, hour on x, cells coloured by minutes without grid; the single most useful chart for a load-shedding
+    feeder)'. v1 folded every day onto 7 weekday rows (heat[weekday][hour]), so a day's outage, a bad week or a change of schedule could not be read and a
+    90-day cell summed about 13 days. The answer now also gives the last `days` local dates to today, oldest first, with each local hour's outage
+    minutes; an hour with no grid reading (a logger that was off) and an hour still to come are unknown (null), not an hour with the grid up."""
+    w = api_world
+    downs = [((11, 5, 14, 30), (11, 5, 16, 10)),   # Thursday afternoon: 30, 60 and 10 minutes
+             ((11, 6, 23, 30), (11, 7, 0, 45))]    # across midnight: 30 minutes on the 6th, 45 on the 7th
+    gap = (_pkt(11, 8, 2, 0), _pkt(11, 8, 5, 0))   # no rows at all on the 8th from 02:00 to 05:00
+    with w.use():
+        ts = np.arange(PAGE_NOW - 10 * 86400, PAGE_NOW, 60, dtype=np.int64)
+        g = np.ones(len(ts))
+        for a, b in downs:
+            g[(ts >= _pkt(*a)) & (ts < _pkt(*b))] = 0.0
+        g[(ts >= gap[0]) & (ts < gap[1])] = np.nan
+        _write_grid(w.site, ts, g)
+    heat = _page(w, monkeypatch, 7)["heatmap"]
+    # the weekday profile stays (it is what the schedule is read from)
+    assert heat["days"] == ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] and len(heat["minutes"]) == 7
+    assert heat["dates"] == [f"2026-11-0{d}" for d in range(3, 10)]
+    cal = dict(zip(heat["dates"], heat["by_date"]))
+    assert all(len(row) == 24 for row in heat["by_date"])
+    assert cal["2026-11-05"][13:17] == [0, 30, 60, 10]
+    assert cal["2026-11-06"][23] == 30 and cal["2026-11-07"][0] == 45 and cal["2026-11-07"][1] == 0
+    assert cal["2026-11-08"][1] == 0 and cal["2026-11-08"][2:5] == [None, None, None] and cal["2026-11-08"][5] == 0
+    assert cal["2026-11-09"][17] == 0 and cal["2026-11-09"][18:] == [None] * 6  # the page's now is 18:00
+    assert sum(v or 0 for row in heat["by_date"] for v in row) == 175
+    # 90 days: one row per date, not the weekday sums
+    assert len(_page(w, monkeypatch, 90)["heatmap"]["by_date"]) == 90
+
+
 # ------------------------------------------------------------------------------------------------ pages-C-19
 
 def test_the_outage_forecast_page_gives_the_announced_windows_as_blocks(company):
