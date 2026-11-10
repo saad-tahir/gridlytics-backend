@@ -53,6 +53,19 @@ def test_every_answer_is_filtered_for_a_viewer_and_a_count_is_not_money(world):
     sid = world.site
     assert world.c["viewer"].get(f"/api/sites/{sid}/native").status_code == 200
     assert world.anon.get(f"/api/sites/{sid}/overrides", headers=world.key(["sites:read"])).status_code == 200
+    # a route that forgets out() altogether (review: the checks above pass without the guard's filter; this one does not)
+    from gridlytics import api
+    api.app.add_api_route("/api/sites/{site_id}/plan/r7-forgetful", lambda site_id: {"litres": 12.5, "cost_rs": 9876.5, "detail": {"fee_ratio": 0.3}},
+                          methods=["GET"])
+    added = api.app.router.routes[-1]
+    try:
+        url = f"/api/sites/{sid}/plan/r7-forgetful"
+        assert world.c["admin"].get(url).json()["cost_rs"] == 9876.5
+        assert world.c["viewer"].get(url).json() == {"litres": 12.5, "detail": {}}
+        assert world.c["operator"].get(url).json() == {"litres": 12.5, "cost_rs": 9876.5, "detail": {}}
+        assert world.anon.get(url, headers=world.key(["plans:read"])).json() == {"litres": 12.5, "detail": {}}
+    finally:
+        api.app.router.routes.remove(added)
 
 
 # ------------------------------------------------------------------------------------------------ role-operator-06 (pages-C-20)
