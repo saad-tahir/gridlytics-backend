@@ -58,35 +58,50 @@ def billing_period(conn: dict | None, t0: int) -> tuple[int, int]:
 
 def month_to_date(site_id: str, conn: dict | None, t0: int) -> dict:
     """Billing-month-to-date imports (and exports) per period, the MDI peak so far, the open block's elapsed mean, and the recent import (and export)
-    per day per period. The month is the bill's: it starts the day after the previous meter reading (calendar month without a reading_day)."""
+    per day per period. The month is the bill's: it starts the day after the previous meter reading (calendar month without a reading_day).
+
+    A missing minute is unknown, not zero import (round 7, engine-optimiser-13): the month's imports and exports per period are the known
+    minutes' energy scaled to all the period's minutes so far (as verify.month_totals scales a scored month's), an MDI block counts only with
+    80 % of its minutes known, at the mean of those, and the open block's elapsed mean is that of its known minutes."""
     ms, me = billing_period(conn, t0)
     g = telemetry.minute_grid(site_id, min(ms, t0 - 7 * 86400), t0)
+    k_imp, k_exp = ~np.isnan(g["imp"]), ~np.isnan(g["exp"])
     imp = np.nan_to_num(g["imp"])
     exp = np.nan_to_num(g["exp"])
     pk = peak_mask(conn, g["ts"])
     in_month = g["ts"] >= ms
-    mtd = {"peak": float(imp[in_month & pk].sum() / 60), "off_peak": float(imp[in_month & ~pk].sum() / 60)}
-    mtd_exp = {"peak": float(exp[in_month & pk].sum() / 60), "off_peak": float(exp[in_month & ~pk].sum() / 60)}
+
+    def to_date(a: np.ndarray, known: np.ndarray) -> dict:
+        out = {}
+        for per, sel in (("peak", in_month & pk), ("off_peak", in_month & ~pk)):
+            n = int(np.sum(known & sel))
+            out[per] = float(a[known & sel].sum() / 60) * float(np.sum(sel)) / n if n else 0.0
+        return out
+
+    mtd, mtd_exp = to_date(imp, k_imp), to_date(exp, k_exp)
     week = g["ts"] >= t0 - 7 * 86400
     # the per-day rate divides by the days the telemetry actually covers (a new site, an upload gap), not by the window's seven
     days_w = max(1.0, float(np.sum(~np.isnan(g["imp"][week]))) / 1440)
     per_day = {"peak": float(imp[week & pk].sum() / 60 / days_w), "off_peak": float(imp[week & ~pk].sum() / 60 / days_w)}
     per_day_exp = {"peak": float(exp[week & pk].sum() / 60 / days_w), "off_peak": float(exp[week & ~pk].sum() / 60 / days_w)}
     interval = int((conn or {"data": {}})["data"].get("mdi_interval_min", 30))
-    m0 = 0.0
-    mi = imp[in_month]
-    mts = g["ts"][in_month]
-    if len(mi):
-        blk = (mts // (interval * 60))
-        uniq, inv = np.unique(blk, return_inverse=True)
-        sums = np.bincount(inv, weights=mi)
-        full = np.bincount(inv) >= interval * 0.8
-        if full.any():
-            m0 = float((sums[full] / interval).max())
+
+    def block_means(sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The MDI blocks over the selected minutes with 80 % of their minutes known (their start, epoch seconds) and their mean import."""
+        if not sel.any():
+            return np.zeros(0, dtype=np.int64), np.zeros(0)
+        uniq, inv = np.unique(g["ts"][sel] // (interval * 60), return_inverse=True)
+        n_known = np.bincount(inv, weights=k_imp[sel].astype(float), minlength=len(uniq))
+        sums = np.bincount(inv, weights=imp[sel], minlength=len(uniq))
+        full = n_known >= interval * 0.8
+        return uniq[full] * interval * 60, sums[full] / np.maximum(n_known[full], 1.0)
+
+    _, means = block_means(in_month)
+    m0 = float(means.max()) if len(means) else 0.0
     blk_start = t0 // (interval * 60) * (interval * 60)
-    el = imp[g["ts"] >= blk_start]
+    el_known = k_imp & (g["ts"] >= blk_start)
     n_el_steps = (t0 - blk_start) // 900
-    g_el = float(el.mean()) if len(el) else 0.0
+    g_el = float(imp[el_known].mean()) if el_known.any() else 0.0
     return {"mtd": mtd, "per_day": per_day, "M0": m0, "G_elapsed": g_el, "n_elapsed": int(n_el_steps), "mtd_export": mtd_exp,
             "per_day_export": per_day_exp, "period_start": ms, "period_end": me}
 

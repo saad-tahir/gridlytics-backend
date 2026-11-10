@@ -431,7 +431,9 @@ def test_month_to_date_follows_the_reading_day(company):
     assert m["period_start"] == twin.day_start_utc(date(2026, 11, 16)) and m["period_end"] == twin.day_start_utc(date(2026, 12, 16))
     assert m["mtd"]["peak"] + m["mtd"]["off_peak"] == pytest.approx(4 * 2400.0, rel=0.01)  # 16 to 19 November, not from the 1st
     calendar = plans.month_to_date(sid, {**conn, "data": {**conn["data"], "reading_day": None}}, t0)
-    assert calendar["mtd"]["peak"] + calendar["mtd"]["off_peak"] == pytest.approx(10 * 2400.0, rel=0.01)
+    # from the 1st: the 10 days read (10 to 19 November) scaled to the 19 days of the month so far, since the 1st to the 9th are unknown, not
+    # zero import (round 7, engine-optimiser-13: this read 10 days, the missing ones as nothing imported)
+    assert calendar["mtd"]["peak"] + calendar["mtd"]["off_peak"] == pytest.approx(19 * 2400.0, rel=0.01)
 
 
 def test_the_problem_takes_its_billing_month_from_the_reading_day(company, monkeypatch):
@@ -469,7 +471,8 @@ def test_legacy_net_metering_passes_the_months_exports(company, monkeypatch):
 
     monkeypatch.setattr(tariffs, "vectors", spy)
     plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 96)
-    assert sum(seen["mtd_export"].values()) == pytest.approx(7 * 24 * 50.0, rel=0.01)
+    # the 7 days read, scaled to the 19 days of the month so far: the 1st to the 12th are unknown, not zero export (round 7, engine-optimiser-13)
+    assert sum(seen["mtd_export"].values()) == pytest.approx(19 * 24 * 50.0, rel=0.01)
     rest_days = (twin.day_start_utc(date(2026, 12, 1)) - (t0 + 96 * 900)) / 86400
     assert sum(seen["rest_net_export"].values()) == pytest.approx(24 * 50.0 * rest_days, rel=0.01)
 

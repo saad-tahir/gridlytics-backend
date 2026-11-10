@@ -1118,3 +1118,47 @@ def test_a_pack_that_charges_to_its_top_each_day_is_used_in_the_peak_and_the_pla
     # before: sigma at 15 points, and the mill's plan cost about Rs 900 more than native over the 48 hours (it bought energy to hold above the band)
     assert arms["plan"]["energy_rs"] <= arms["native"]["energy_rs"]
     assert arms["plan"]["unserved_kwh"] <= arms["native"]["unserved_kwh"]
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-13
+
+IMP_COLS = ("site_id", "ts", "source_id", "grid_present", "grid_import_wh")
+
+
+def _import_minutes(sid, t_from, t_to, kw, skip=()):
+    """One row a minute of `kw` grid import (a float, or a function of the minute's epoch seconds) over [t_from, t_to), none in `skip`'s spans."""
+    rows = []
+    for t in range(int(t_from), int(t_to), 60):
+        if any(a <= t < b for a, b in skip):
+            continue
+        k = kw(t) if callable(kw) else kw
+        rows.append((sid, t, "test", 1.0, k * 1000 / 60))
+    telemetry.write_rows(rows, IMP_COLS)
+
+
+def test_month_to_date_reads_missing_minutes_as_unknown_not_zero(company):
+    """month_to_date filled missing minutes with zero import: a block with 5 of its 30 minutes missing read 5/6 of its mean, a block with 15
+    missing still counted as complete (the 80 % rule counted grid minutes, not known ones), and a day without data took a day off the month's
+    imports. A block now counts only with 80 % of its minutes known, at the mean of those; the month's imports per period are scaled from the
+    known minutes to all of them (as verify.month_totals does), and the open block's elapsed mean is that of its known minutes."""
+    sid = _site()
+    conn = sites.full(sid)["connections"][0]
+    ms = twin.day_start_utc(date(2026, 11, 1))
+    t0 = twin.day_start_utc(date(2026, 11, 20)) + 10 * 3600 + 15 * 60     # 10:15 on the 20th: the open block has 15 minutes
+    a = twin.day_start_utc(date(2026, 11, 10)) + 10 * 3600               # 10:00-10:30 on the 10th: 300 kW, its last 5 minutes missing
+    b = twin.day_start_utc(date(2026, 11, 12)) + 10 * 3600               # 10:00-10:30 on the 12th: 900 kW for 15 minutes, then nothing
+    day15 = twin.day_start_utc(date(2026, 11, 15))                       # the 15th: no data at all
+
+    def kw(t):
+        return 300.0 if a <= t < a + 1800 else 900.0 if b <= t < b + 1800 else 100.0
+
+    _import_minutes(sid, ms, t0, kw, skip=[(a + 1500, a + 1800), (b + 900, b + 1800), (day15, day15 + 86400), (t0 - 300, t0)])
+    m = plans.month_to_date(sid, conn, t0)
+    assert m["M0"] == pytest.approx(300.0)                              # before: 450 (block b at 900 x 15/30); block a read 250
+    # the month's imports: every minute so far at 100 kW, and blocks a and b's known minutes above it (the known minutes' energy per period,
+    # scaled to all of them)
+    total = m["mtd"]["peak"] + m["mtd"]["off_peak"]
+    extra = (25 * 200.0 + 15 * 800.0) / 60
+    assert total == pytest.approx((t0 - ms) / 3600 * 100.0 + extra, rel=0.002)  # before: a whole day (2,400 kWh) and the gaps short
+    # the open block (10:00-10:15, its last 5 minutes missing): the mean of the 10 minutes known, not 2/3 of it
+    assert m["n_elapsed"] == 1 and m["G_elapsed"] == pytest.approx(100.0)
