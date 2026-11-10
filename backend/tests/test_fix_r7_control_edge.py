@@ -1552,3 +1552,67 @@ def test_the_write_log_lists_the_days_writes_who_why_and_the_result(world, monke
     assert r.status_code == 422 and r.json()["detail"] == "The day is a date written YYYY-MM-DD", r.text
     # no money in the log: a table issue's rupee gain stays on the control answer, for a role that sees money
     assert "_rs" not in json.dumps(rows)
+
+
+# ------------------------------------------------------------------------------------------------ batch 5: flow-telemetry-plan-control-19
+
+def test_the_fallback_test_releases_and_checks_the_edge_hands_back_and_takes_the_plan_again(world, monkeypatch):
+    """UI-15's "Test fallback" (an administrator's, closed loop only): it releases the inverter to its native settings for 15 minutes and watches
+    the edge's heartbeats: the test passes when the edge reports the native settings during the release and the plan again after it, and fails when
+    it does neither in time."""
+    ticks = _no_ticks(monkeypatch)
+    sid, admin, op, kh = world.site, world.c["admin"], world.c["operator"], world.key(["telemetry:write"])
+    beat = lambda n, state: world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json=_env(n, uptime_s=60, control_state=state))  # noqa: E731
+    # below closed loop there is nothing to test; an operator may not; an edge not heard from cannot be tested
+    r = admin.post(f"/api/sites/{sid}/control/test_fallback", json={})
+    assert r.status_code == 409 and r.json()["code"] == "not_closed_loop", r.text
+    with world.use():
+        _closed_loop(sid)
+    assert op.post(f"/api/sites/{sid}/control/test_fallback", json={}).json()["detail"] == "Testing the fallback is for an administrator"
+    assert admin.post(f"/api/sites/{sid}/control/test_fallback", json={"minutes": 5}).status_code == 422
+    r = admin.post(f"/api/sites/{sid}/control/test_fallback", json={})
+    assert r.status_code == 409 and r.json()["code"] == "edge_offline", r.text
+    assert ticks == []
+    beat(1, "executing")
+    r = admin.post(f"/api/sites/{sid}/control/test_fallback", json={})
+    assert r.status_code == 200 and r.json()["resolve"]["status"] == "active", r.text            # the release goes to the edge at once
+    t = r.json()["fallback_test"]
+    assert t["status"] == "running" and t["by"] == "Admin" and plans._ts(t["until"]) - plans._ts(t["started_at"]) == 15 * 60, t
+    assert r.json()["control"]["label"].startswith("Fallback test: released to native until "), r.json()["control"]
+    with world.use():
+        (o,) = sites.overrides(sid)
+        message = plans.signed_message(sid, record=False)
+    assert o["kind"] == "force_native" and o["reason"] == "Fallback test" and message["type"] == "release"
+    assert admin.post(f"/api/sites/{sid}/control/test_fallback", json={}).json()["code"] == "test_running"
+    # the edge hands the inverter to its native settings, then (after the release) takes the plan again
+    beat(2, "released")
+    t = world.c["viewer"].get(f"/api/sites/{sid}/control").json()["fallback_test"]
+    assert t["status"] == "released" and t["released_at"], t
+    beat(3, "executing")                                                    # still inside the release: not yet a restore
+    with world.use():
+        assert plans.fallback_test(sid)["status"] == "released"
+        later = plans._ts(t["until"]) + 60
+        assert plans.fallback_test(sid, later)["status"] == "restoring"
+        plans.fallback_test_observe(sid, "following_plan", later)
+        done = plans.fallback_test(sid, later)
+    assert done["status"] == "passed" and done["restored_at"], done
+    with world.use():
+        acts = [a["action"] for a in store.list_audit()]
+    assert "started a fallback test" in acts and "passed a fallback test" in acts
+
+
+def test_a_fallback_test_the_edge_does_not_follow_fails_and_says_why():
+    t = {"started_at": "2026-11-10T14:00:00+00:00", "until": "2026-11-10T14:15:00+00:00", "released_at": None, "restored_at": None, "by": "Admin"}
+    t0, until = plans._ts(t["started_at"]), plans._ts(t["until"])
+    step = plans.fallback_test_step
+    assert step(t, "executing", t0 + 60) is None                                       # still running the plan: nothing to record
+    assert step(t, "native", t0 - 60) is None                                          # a report from before the test says nothing
+    assert plans.fallback_test_status(t, until + 299)["status"] == "running"
+    assert plans.fallback_test_status(t, until + 300) == {**t, "status": "failed", "cause": "not_released"}
+    rel = {**t, **step(t, "fallback", t0 + 120)}
+    assert rel["released_at"] == "2026-11-10T14:02:00+00:00"
+    assert step(rel, "executing", until - 1) is None                                    # back to the plan inside the release is no restore
+    assert step(rel, "native", until + 5 * 60 + 1) is None
+    assert plans.fallback_test_status(rel, until + 1800)["cause"] == "not_restored"
+    assert step({**t, "released_at": None}, "released", until + 301) is None            # a native report long after the release ends is no release
+    assert plans.fallback_test_status({**rel, "restored_at": "2026-11-10T14:20:00+00:00"}, until + 9999)["status"] == "passed"

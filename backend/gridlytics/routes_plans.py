@@ -75,6 +75,10 @@ class ResumeFields(Strict):
     """POST /control/resume reads no field."""
 
 
+class FallbackTestFields(Strict):
+    """POST /control/test_fallback reads no field: the test's release lasts plans.FALLBACK_TEST_MIN."""
+
+
 class ApplyFields(Strict):
     """POST /plan/apply: the plan, the day (Karachi's today when left out; plans.mark_applied checks it is a date of the plan's table), the method
     and an optional photograph."""
@@ -93,7 +97,9 @@ CONTROL_ACTIONS = {"hold": ("hold_release", "Holding the battery", HoldFields), 
                    # the permission its kind needs (sites.OVERRIDE_PERMISSION: a forced charge is an administrator's)
                    "genset_hold": ("hold_release", "Holding the genset off", TimedFields),
                    "charge_block": ("hold_release", "Blocking battery charging", TimedFields),
-                   "force_charge": ("pin_genset", "Forcing a charge", ForceChargeFields)}
+                   "force_charge": ("pin_genset", "Forcing a charge", ForceChargeFields),
+                   # UI-15's "Test fallback": an administrator's, closed loop only (plan Part 9.3 and 10.5; audit flow-telemetry-plan-control-19)
+                   "test_fallback": ("resume_control", "Testing the fallback", FallbackTestFields)}
 #: The actions that place an override of their own name: the asset the site needs for it, the reason when none is given, and the refusal without
 #: the asset (409 no_equipment)
 OVERRIDE_ACTIONS = {"genset_hold": ("genset", "Genset held off", "The site has no genset to hold off"),
@@ -263,7 +269,9 @@ def control(site_id: str, day: int = 0):
                 "native": sites.native_latest(site_id), "fallback": (comp or {}).get("fallback"),
                 "issued": issued, "reissue": plans.reissue_held(site_id, (p or {}).get("id"), today()) if issued is not None else None,
                 # the overrides the site has the equipment for (a genset hold needs a genset, a charging block and a forced charge a battery)
-                "placeable": [k for k, (asset, _, _) in OVERRIDE_ACTIONS.items() if (s.get("assets") or {}).get(asset)]})
+                "placeable": [k for k, (asset, _, _) in OVERRIDE_ACTIONS.items() if (s.get("assets") or {}).get(asset)],
+                # the last fallback test with its status (closed loop; audit flow-telemetry-plan-control-19), else null
+                "fallback_test": plans.fallback_test(site_id)})
 
 
 @router.get("/api/sites/{site_id}/control/readback")
@@ -298,7 +306,8 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
     active. The answer is the control answer with `resolve`, how that re-solve went; a failed one is said, the action stands."""
     site_or_404(site_id)
     if action not in CONTROL_ACTIONS:
-        raise Refusal(404, "The control actions are hold, release, pause, resume, genset_hold, charge_block and force_charge", "not_found")
+        raise Refusal(404, "The control actions are hold, release, pause, resume, genset_hold, charge_block, force_charge and test_fallback",
+                      "not_found")
     perm, doing, model = CONTROL_ACTIONS[action]
     if action == "resume":
         kinds = {o["kind"] for o in sites.overrides(site_id) if o["kind"] in RESUMED_KINDS}
@@ -311,6 +320,8 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
     if action in OVERRIDE_ACTIONS and not (sites.assets(site_id) or {}).get(OVERRIDE_ACTIONS[action][0]):
         raise Refusal(409, OVERRIDE_ACTIONS[action][2], "no_equipment")
     who = auth.actor()
+    if action == "test_fallback":
+        return _test_fallback(site_id, who)
     if action == "resume":
         cleared = 0
         for o in sites.overrides(site_id):
@@ -343,9 +354,32 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
     return res
 
 
+def _test_fallback(site_id: str, who: str) -> dict:
+    """POST /control/test_fallback (plan Part 9.3 UI-15: it releases and verifies the restore; audit flow-telemetry-plan-control-19): at a closed-loop
+    site whose edge was heard from in the last 5 minutes, with no test running and no release in force (each a 409 in one sentence), a release to
+    native for plans.FALLBACK_TEST_MIN, re-solved at once so the edge is sent it; the edge's heartbeats then say whether it handed the inverter to its
+    own settings and took the plan again after (plans.fallback_test, GET /control's `fallback_test`)."""
+    if (sites.get(site_id) or {}).get("tier") != "closed_loop":
+        raise Refusal(409, "The fallback is tested at a closed-loop site: below it no edge writes to the inverter", "not_closed_loop")
+    seen = sites.state(site_id).get("edge_last_seen")
+    if not seen or now_ts() - int(seen) >= plans.HEARTBEAT_FRESH_S:
+        raise Refusal(409, "The edge has not been heard from in the last 5 minutes, so the fallback cannot be tested", "edge_offline")
+    held = plans.fallback_test(site_id)
+    if held and held["status"] in ("running", "released", "restoring"):
+        raise Refusal(409, "A fallback test is already running", "test_running")
+    if plans.control_release(site_id) is not None:
+        raise Refusal(409, "The inverter already runs its own settings (a pause, a release or a native block), so there is nothing to test",
+                      "already_native")
+    plans.start_fallback_test(site_id, who)
+    resolve = _resolve_now(site_id, "test_fallback")
+    res = control(site_id)
+    res["resolve"] = resolve
+    return res
+
+
 #: what a failed re-solve names as its cause
 _AFTER = {"hold": "the hold", "release": "the release", "pause": "the pause", "resume": "resuming", "genset_hold": "the genset hold",
-          "charge_block": "the charging block", "force_charge": "the forced charge"}
+          "charge_block": "the charging block", "force_charge": "the forced charge", "test_fallback": "the fallback test"}
 
 
 def _resolve_now(site_id: str, action: str) -> dict:

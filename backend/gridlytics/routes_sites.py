@@ -54,7 +54,9 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
         return {"key": "paused", "label": f"Control paused until {until_words(until, now)}", "until": until}
     if "force_native" in kinds:
         until = kinds["force_native"]["until_ts"]
-        return {"key": "native", "label": f"Released to native until {until_words(until, now)}", "until": until}
+        # a fallback test is a release that says what it is for (round 7, audit flow-telemetry-plan-control-19)
+        what = "Fallback test: released to native" if kinds["force_native"].get("reason") == plans.FALLBACK_TEST_REASON else "Released to native"
+        return {"key": "native", "label": f"{what} until {until_words(until, now)}", "until": until}
     block = plans.switchback_release(site["id"], now)
     if block:
         # a native block of the switchback calendar: the inverter runs its own settings all day, so no table is keyed in or followed

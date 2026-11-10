@@ -1565,3 +1565,84 @@ def write_log(site_id: str, day: date, primitive: str | None = None) -> list[dic
     if primitive:
         rows = [r for r in rows if r["primitive"] == primitive]
     return sorted(rows, key=lambda r: (_ts(r["at"]) or 0, r["kind"] == "write"), reverse=True)
+
+
+# ------------------------------------------------------------------------------------------------ round 7 (audit): the fallback test (UI-15)
+
+#: Plan Part 9.3 UI-15: "Test fallback" (an administrator's, closed loop) releases the inverter and verifies the restore (audit
+#: flow-telemetry-plan-control-19). The release lasts FALLBACK_TEST_MIN; the edge must report the inverter's own settings during it (or within
+#: FALLBACK_GRACE_S after: it beats once a minute) and the plan again within FALLBACK_RESTORE_S of its end (the next tick publishes a fresh plan within
+#: 15 minutes and the edge pulls it).
+FALLBACK_TEST_MIN, FALLBACK_GRACE_S, FALLBACK_RESTORE_S = 15, 300, 1800
+FALLBACK_TEST_REASON = "Fallback test"
+#: The heartbeat states in which the inverter runs its own settings
+NATIVE_STATES = ("native", "released", "fallback")
+
+
+def start_fallback_test(site_id: str, by: str, now: int | None = None) -> dict:
+    """Starts a fallback test: a release to native (force_native, reason FALLBACK_TEST_REASON) for FALLBACK_TEST_MIN, and the test kept in the site's
+    state (`fallback_test`: {id, override_id, by, started_at, until, released_at, restored_at}). The caller checks the tier, the edge and that no
+    release is in force, and re-solves at once so the edge is sent the release."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    until = _iso_utc(now + FALLBACK_TEST_MIN * 60)
+    o = sites.add_override(site_id, {"kind": "force_native", "until": until, "reason": FALLBACK_TEST_REASON}, by)
+    test = {"id": store.new_id(), "override_id": o["id"], "by": by, "started_at": _iso_utc(now), "until": until, "released_at": None,
+            "restored_at": None}
+    sites.put_state(site_id, fallback_test=test)
+    store.audit(by, "started a fallback test", site_id, {"until": until})
+    return test
+
+
+def fallback_test_step(test: dict, control_state: str | None, at: int) -> dict | None:
+    """What a heartbeat's control state at `at` adds to a fallback test: `released_at` the first time the edge reports the inverter's own settings
+    from the test's start to FALLBACK_GRACE_S after its end, then `restored_at` the first time it reports the plan again from the end to
+    FALLBACK_RESTORE_S after it; else None."""
+    from . import contract
+
+    if not test or test.get("restored_at"):
+        return None
+    start, until = _ts(test["started_at"]), _ts(test["until"])
+    if not test.get("released_at"):
+        return {"released_at": _iso_utc(at)} if control_state in NATIVE_STATES and start <= at < until + FALLBACK_GRACE_S else None
+    if control_state in contract.FOLLOWING_STATES and until <= at < until + FALLBACK_RESTORE_S:
+        return {"restored_at": _iso_utc(at)}
+    return None
+
+
+def fallback_test_status(test: dict, now: int) -> dict:
+    """The test with its `status`: running (no release reported yet), released (reported, the release still in force), restoring (the release over,
+    the plan not yet reported), passed, or failed with its `cause`: not_released (nothing reported by FALLBACK_GRACE_S after the end) or not_restored
+    (no plan reported by FALLBACK_RESTORE_S after it)."""
+    until = _ts(test["until"])
+    if test.get("restored_at"):
+        status, cause = "passed", None
+    elif not test.get("released_at"):
+        status, cause = ("failed", "not_released") if now >= until + FALLBACK_GRACE_S else ("running", None)
+    elif now >= until + FALLBACK_RESTORE_S:
+        status, cause = "failed", "not_restored"
+    else:
+        status, cause = ("released" if now < until else "restoring"), None
+    return {**test, "status": status, "cause": cause}
+
+
+def fallback_test(site_id: str, now: int | None = None) -> dict | None:
+    """The site's last fallback test with its status (fallback_test_status), else None."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    test = sites.state(site_id).get("fallback_test")
+    return fallback_test_status(test, now) if test else None
+
+
+def fallback_test_observe(site_id: str, control_state: str | None, at: int | None = None) -> dict | None:
+    """A heartbeat's control state applied to the site's fallback test (routes_edge's heartbeat), read and written in one write transaction on the
+    site's state; a restore says so in the audit trail. The test's change, else None."""
+    at = int(at if at is not None else datetime.now(timezone.utc).timestamp())
+    with store.write_transaction() as con:
+        r = con.execute("SELECT data FROM site_state WHERE site_id = ?", (site_id,)).fetchone()
+        cur = json.loads(r["data"]) if r else {}
+        step = fallback_test_step(cur.get("fallback_test") or {}, control_state, at)
+        if step:
+            cur["fallback_test"] = {**cur["fallback_test"], **step}
+            con.execute("UPDATE site_state SET data = ?, updated = ? WHERE site_id = ?", (json.dumps(cur, default=str), store._now(), site_id))
+    if step and step.get("restored_at"):
+        store.audit("edge", "passed a fallback test", site_id, {"released_at": cur["fallback_test"].get("released_at"), "restored_at": step["restored_at"]})
+    return step

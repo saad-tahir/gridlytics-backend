@@ -340,6 +340,11 @@ def edge_heartbeat(site_id: str, inp: dict = Body(...)):
     site_or_404(site_id)
     msg = _check(delivery.Heartbeat, inp, site_id)
     _put_state(site_id, edge_last_seen=now_ts(), edge_heartbeat=msg.model_dump(), edge_heartbeat_at=now_ts())
+    try:
+        # a fallback test in progress reads the edge's state from its heartbeats (round 7, audit flow-telemetry-plan-control-19)
+        plans.fallback_test_observe(site_id, msg.control_state, now_ts())
+    except Exception:
+        log.exception("could not record the fallback test's progress for site %s", site_id)
     level, worst = _clock_update(site_id, msg.clock_offset_s, "edge")
     return {"ack": msg.seq, "warning": _clock_warning(level, worst)}
 
