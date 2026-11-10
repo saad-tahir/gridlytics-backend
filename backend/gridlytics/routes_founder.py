@@ -13,7 +13,7 @@
     GET   /api/founder/companies/{id}/backups                              -> {backups}
     POST  /api/founder/companies/{id}/backups        {}                    -> {made, backups}
     GET   /api/founder/users                                               -> {users}
-    POST  /api/founder/users                         {email, name, password, company_id?, company_role?}  -> 201 {user}
+    POST  /api/founder/users                         {email, name, password, company_id?, company_role?, one_time?}  -> 201 {user}
     POST  /api/founder/users/{id}/password           {password, one_time?}  -> {user}
     PATCH /api/founder/users/{id}                    {disabled?, name?}    -> {user}
     POST  /api/founder/users/{id}/memberships        {company_id, company_role}  -> 201 {membership}
@@ -145,6 +145,16 @@ def _yes_no(value, words: str) -> bool:
     return value
 
 
+def _first_one_time(inp: dict) -> bool:
+    """Whether a first password the founder gives is one-time (plan Part 9.3; audit founder-console-08): yes unless `one_time` is false, in local sign-in;
+    the Supabase sign-in service cannot make one so (409 not_local_mode)."""
+    local = identity.MODE == "local"
+    one_time = _yes_no(inp.get("one_time", local), "Say whether the person replaces the first password at their first sign-in: one_time, true or false")
+    if one_time and not local:
+        raise schemas.Refusal(409, "With this sign-in service a password cannot be made one-time: the person changes it under My account", "not_local_mode")
+    return one_time
+
+
 # ------------------------------------------------------------------------------------------------ the sign-in and the session
 
 @router.post("/api/founder/login", dependencies=[Depends(_set_up)])
@@ -198,10 +208,10 @@ def _owner(owner) -> dict:
         if set(owner) != {"user_id"}:
             _api._fail("The owner is an account that exists (its user_id) or a new one (email, name and first password), not both")
         return {"user_id": _id(owner["user_id"], "account")}
-    _object(owner, {"email", "name", "password"}, "The new owner")
+    _object(owner, {"email", "name", "password", "one_time"}, "The new owner")
     return {"email": _email(owner.get("email"), "Give the owner's email address"),
             "name": _text(owner.get("name"), "Give the owner's name, 1 to 80 characters"),
-            "password": _password(owner.get("password"), "The owner's first password")}
+            "password": _password(owner.get("password"), "The owner's first password"), "one_time": _first_one_time(owner)}
 
 
 @router.post("/api/founder/companies", status_code=201, dependencies=[Depends(_session)])
@@ -215,10 +225,14 @@ def founder_company_new(inp: dict = Body(...)):
     if "owner" not in inp:
         _api._fail(_OWNER_NEEDED)
     owner = _owner(inp["owner"])
+    one_time = owner.pop("one_time", False)
     with _said():
         company, account = store_founder.create_company(name, seats, enabled, owner)
+        if one_time:
+            platformdb.mark_one_time(account["id"])                 # a new owner's first password is one-time (audit founder-console-08)
         platformdb.founder_audit("made a company", company["name"], {"seats": seats, "enabled": enabled, "owner": account["email"],
-                                                                      "new_owner": "user_id" not in owner})
+                                                                      "new_owner": "user_id" not in owner,
+                                                                      **({"one_time": one_time} if "user_id" not in owner else {})})
         return {"company": store_founder.company_view(company["id"]), "owner": store_founder.user(account["id"]),
                 "membership": store_founder.membership_view(account["id"], company["id"])}
 
@@ -295,10 +309,11 @@ def founder_users():
 @router.post("/api/founder/users", status_code=201, dependencies=[Depends(_session)])
 def founder_user_new(inp: dict = Body(...)):
     """An account with a first password; with a company, it joins it at once, active, with the company role (member unless said), or neither is made."""
-    _object(inp, {"email", "name", "password", "company_id", "company_role"}, "A new account")
+    _object(inp, {"email", "name", "password", "company_id", "company_role", "one_time"}, "A new account")
     email = _email(inp.get("email"), "Give the person's email address")
     name = _text(inp.get("name"), "Give the person's name, 1 to 80 characters")
     password = _password(inp.get("password"))
+    one_time = _first_one_time(inp)
     company_id = role = None
     if inp.get("company_id") is not None:
         if not isinstance(inp["company_id"], str):
@@ -309,8 +324,11 @@ def founder_user_new(inp: dict = Body(...)):
         _api._fail("A company role is given with the company it is in (company_id)")
     with _said():
         made = store_founder.create_account(email, name, password, company_id, role)
+        if one_time:
+            platformdb.mark_one_time(made["id"])                    # the first password is one-time (audit founder-console-08)
         platformdb.founder_audit("made an account", made["email"],
-                                 {"company": platformdb.company(company_id)["name"], "company_role": role} if company_id else {})
+                                 {**({"company": platformdb.company(company_id)["name"], "company_role": role} if company_id else {}),
+                                  **({"one_time": one_time} if identity.MODE == "local" else {})})
         return {"user": store_founder.user(made["id"])}
 
 

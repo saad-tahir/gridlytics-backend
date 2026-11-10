@@ -392,6 +392,13 @@ def set_password(account_id: str, password: str, *, one_time: bool = False) -> d
     return account(account_id)
 
 
+def mark_one_time(account_id: str) -> None:
+    """A first password someone else chose (the founder console's new account, or a company's new owner; plan Part 9.3, audit founder-console-08): the
+    person chooses their own at their first sign-in, as after a one-time password (`must_change`). The demo's accounts, made by the store, keep theirs."""
+    with _write() as con:
+        con.execute("UPDATE accounts SET must_change = 1, updated = ? WHERE id = ?", (_now(), account_id))
+
+
 def set_account_disabled(account_id: str, disabled: bool) -> dict | None:
     """Disable an account, which ends its sessions at once, or enable it again (its ended sessions stay ended)."""
     if not isinstance(disabled, bool):

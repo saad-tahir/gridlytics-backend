@@ -317,6 +317,34 @@ def test_a_password_the_founder_sets_is_one_time_unless_said_otherwise(monkeypat
     assert "sunia" not in json.dumps([e["detail"] for e in sets])
 
 
+def test_a_first_password_the_founder_gives_is_one_time_unless_said_otherwise(monkeypatch, tmp_path):
+    """founder-console-08, its first step (left by the batch, done at review): an account the founder makes, and a company's new owner, sign in with the
+    first password and choose their own before anything else opens. one_time false keeps it (an account of OnyxLeaf's own); the demo's accounts are made
+    by the store, not the console, and keep theirs."""
+    import identities
+    import test_founder as tf
+    from gridlytics import platform as platformdb
+    c, sunia = _founder_world(monkeypatch, tmp_path)
+    assert platformdb.account(sunia["id"])["must_change"] is True
+    assert platformdb.account_by_email(tf.OWNER["email"])["must_change"] is True
+    s = _sign_in("sunia@meow.test", "sunia first password")
+    assert s.status_code == 200, s.text
+    r = _app().get("/api/sites", headers=identities.headers(s.json()["access_token"]))
+    assert r.status_code == 403 and r.json()["code"] == "password_change_required", r.text
+    # one_time false, for an account and for a company's new owner; a one_time that is not yes or no is refused
+    kept = c.post("/api/founder/users", json={"email": "ops@onyxleaf.test", "name": "OnyxLeaf Ops", "password": "ops first password", "one_time": False})
+    assert kept.status_code == 201 and platformdb.account(kept.json()["user"]["id"])["must_change"] is False, kept.text
+    owner = {"email": "purr@meow.test", "name": "Purr Owner", "password": "purr first password", "one_time": False}
+    made = c.post("/api/founder/companies", json={"name": "Purr Mills", "seats": 2, "enabled": True, "owner": owner})
+    assert made.status_code == 201 and platformdb.account_by_email("purr@meow.test")["must_change"] is False, made.text
+    for body in ({"email": "x@meow.test", "name": "X", "password": "x first password 1", "one_time": "yes"},):
+        assert c.post("/api/founder/users", json=body).status_code == 422
+    owner = {"email": "y@meow.test", "name": "Y", "password": "y first password 1", "one_time": 1}
+    assert c.post("/api/founder/companies", json={"name": "Y Mills", "owner": owner}).status_code == 422
+    said = {e["target"]: e["detail"].get("one_time") for e in platformdb.list_founder_audit() if e["action"] in ("made an account", "made a company")}
+    assert said["sunia@meow.test"] is True and said["ops@onyxleaf.test"] is False and said["Purr Mills"] is False, said
+
+
 def _app():
     from fastapi.testclient import TestClient
     from gridlytics import api
