@@ -274,6 +274,7 @@ GRANT ALL ON TABLE public.profiles, public.companies, public.company_memberships
 -- From 001 section 7.1, as 011 section 5 last defined it, without token_balance and seat_limit (011, 001). The answer has the shape of local mode's context
 -- (platform.context) key for key, so the backend (companies.py) and the web app read one shape in both modes:
 --   profile      the profile with the account's email and name; is_super_admin, assignment_status and requested_company_name are constants kept for the shape
+--                (so is must_change_password, Gridlytics' own, for local mode's one-time password: Supabase Auth makes none, so it is false)
 --   memberships  every membership, of any status, each with its company {id, name, verified}; the registry adds `enabled` and the seats (decisions 2 and 5)
 --   pending_invites_for_email  always empty: no invitations
 -- An account that is banned (the founder's "disable" in supabase mode) or deleted gets null, as a caller with no token does, and as a disabled account gets
@@ -305,7 +306,8 @@ BEGIN
       'assignment_status',      'none',
       'requested_company_name', NULL,
       'created_at',             COALESCE(p.created_at, u.created_at),
-      'updated_at',             COALESCE(p.updated_at, u.updated_at)
+      'updated_at',             COALESCE(p.updated_at, u.updated_at),
+      'must_change_password',   false
     ),
     'memberships', (
       SELECT COALESCE(jsonb_agg(

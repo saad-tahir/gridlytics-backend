@@ -186,6 +186,8 @@ def test_get_my_context_answers_in_the_shape_the_backend_reads(local_context):
     profile = _object(top["profile"])
     assert set(profile) == set(local_context["profile"])
     assert profile["is_super_admin"] == "false" and profile["assignment_status"] == "'none'" and profile["requested_company_name"] == "NULL"
+    # local mode's one-time password (auth-security): Supabase Auth makes none, so the project's answer says false, and the console refuses one there
+    assert profile["must_change_password"] == "false" and local_context["profile"]["must_change_password"] is False
     membership = _object(top["memberships"])
     assert set(membership) == set(local_context["memberships"][0])
     company = _object(membership["company"])

@@ -46,6 +46,7 @@ What the backend reads, always with the person's own access token:
   name, verified}}], pending_invites_for_email: []}`. That is the shape of local mode's `GET /api/local/context`, key for key; the registry adds each
   company's `enabled` and seats.
   - Every membership comes back, of any status: a membership pending or suspended opens nothing, and the backend tells the person its state.
+  - The profile's `must_change_password` is always false: Supabase Auth makes no one-time password, which only local mode's sign-in has.
   - An account that is banned (the founder's "disable", and an archive, which disables) or deleted gets `null`, as a disabled account does in local mode.
 - **`rpc/company_list_members`** (`p_company_id`). It returns the company's members with their email addresses, owner first, for the company's Users list.
   - Only the company's owner or an admin may call it, as in Boxlytics. The backend also checks the Gridlytics permission `manage_users` before it calls.
