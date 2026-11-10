@@ -3,17 +3,18 @@ supabase/ folder and backend/tests/test_supabase_sql.py, with the product's name
 as text: nothing here connects to any database, and no Supabase project is ever called. The files are checked for what they make and what they leave out,
 the rights they give the browser's roles, the shape `get_my_context` answers in (the shape companies.py reads, which local mode's `platform.context` gives
 too), the undo, the read-only preflight and the owner's steps; and, Gridlytics' own, that every table, column, function and constraint the lifted code
-(companies._fetch_context, store_founder._Project) calls or names is one the migration makes.
+(companies._fetch_context, store_founder._Project, api._project_members) calls or names is one the migration makes.
 
 Where pglast (PostgreSQL's own parser, libpg_query) can be imported, every statement and every function body is also parsed. The app's environment does not
 carry it, so that test is skipped there."""
+import inspect
 import json
 import re
 from pathlib import Path
 
 import pytest
 
-from gridlytics import auth, companies, store, store_founder
+from gridlytics import api, auth, companies, store, store_founder
 from gridlytics import platform as platformdb
 from test_founder import _company, _console, _ok, clock, fdb, project  # noqa: F401  (fixtures: the console, a stand-in project)
 
@@ -548,6 +549,15 @@ def test_every_table_column_and_rpc_the_lifted_code_calls_is_one_the_migration_m
     # the person's context: the rpc companies.py calls, which the browser's role may call
     assert re.findall(r"/rest/v1/rpc/(\w+)", _text(Path(companies.__file__))) == ["get_my_context"]
     assert re.search(r"GRANT EXECUTE ON FUNCTION public\.get_my_context\(\) TO authenticated", code)
+    # the company's Users list in supabase mode (auth-security's api._project_members, audit parity-supabase-auth-05): the rpc it calls with the person's
+    # token, by its argument's name, and the columns it reads are the migration's, and the browser's role may call it
+    source = _text(Path(api.__file__))
+    assert re.findall(r"/rest/v1/rpc/(\w+)", source) == ["company_list_members"] and '{"p_company_id": company_id}' in source
+    args, head, _ = _function(code, "company_list_members")
+    returned = {c.split()[0] for c in re.search(r"RETURNS TABLE \((.*?)\)\s+LANGUAGE", head, re.S).group(1).split(",")}
+    read = {name for pair in re.findall(r'r\.get\("(\w+)"\)|r\["(\w+)"\]', inspect.getsource(api._project_members)) for name in pair if name}
+    assert args == "p_company_id UUID" and read == {"user_id", "email", "first_name", "last_name", "role", "status"} and read <= returned
+    assert re.search(r"GRANT EXECUTE ON FUNCTION public\.company_list_members\(UUID\) TO authenticated", code)
 
 
 def test_the_test_fixture_of_get_my_context_has_the_migrations_shape():
