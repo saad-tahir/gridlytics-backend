@@ -2048,3 +2048,61 @@ def test_the_past_rows_take_1_to_48_hours(world, hours):
     r = world.c["admin"].get(f"/api/sites/{world.site}/plan/past", params={"hours": hours})
     assert r.status_code == 422 and r.json()["detail"] == "The hours are a whole number from 1 to 48"
 
+
+# ------------------------------------------------------------------------------------------------ frontend-states-formats-07
+
+def test_a_held_tick_says_why_and_which_plan_stays_in_force(company, monkeypatch):
+    """The held path returned no reason, so "Re-solve now" said "held back by the guard" with no reason and "the previous plan stays in force"
+    even with none. The tick now answers the reason and the plan in force after it (null: none)."""
+    sid = _site()
+    monkeypatch.setattr(plans, "_guard", lambda *a, **k: "replayed_soc_below_floor")
+    first = plans.tick(sid, at=T_LIM)
+    assert first["status"] == "held" and first["reason"] == "replayed_soc_below_floor" and first["in_force"] is None
+    monkeypatch.setattr(plans, "_guard", lambda *a, **k: None)
+    good = plans.tick(sid, at=T_LIM + 900)
+    assert good["status"] == "active" and good["in_force"] == good["plan_id"]
+    monkeypatch.setattr(plans, "_guard", lambda *a, **k: "import_in_outage")
+    held = plans.tick(sid, at=T_LIM + 1800)
+    assert held["status"] == "held" and held["reason"] == "import_in_outage" and held["in_force"] == good["plan_id"]
+
+
+def test_a_tick_under_a_pause_leaves_no_plan_in_force(company):
+    sid = _site()
+    good = plans.tick(sid)
+    assert good["status"] == "active"
+    sites.add_override(sid, {"kind": "pause_control", "until": _iso_utc(int(time.time()) + 3600), "reason": "r7"}, "t")
+    held = plans.tick(sid)
+    assert held["status"] == "held" and held["reason"] == "control_paused" and held["in_force"] is None
+
+
+def _fails(monkeypatch, **res):
+    base = {"status": "not_solved", "solver_status": 1, "message": "Time limit reached. (HiGHS Status 13: model_status is Reached time limit)",
+            "relaxed": True, "notes": [], "time_limited": True, "solve_seconds": 20.0}
+    monkeypatch.setattr(optimise, "solve_with_policy", lambda p, time_limit=10.0: {**base, **res})
+
+
+@pytest.mark.parametrize("res,code", [({}, "solve_time_limit"), ({"solver_status": 2, "message": "The problem is infeasible."}, "solve_infeasible"),
+                                      ({"solver_status": 3, "message": "The problem is unbounded."}, "solve_unbounded"),
+                                      ({"solver_status": 0, "message": "Re-check failed: balance 1.00e-03"}, "solve_recheck_failed"),
+                                      ({"solver_status": 4, "message": "Something else"}, "solve_failed"),
+                                      ({"status": "refused", "message": "The battery needs a positive capacity and positive power limits"}, "problem_refused")])
+def test_a_failed_solve_is_stored_with_a_code_never_the_solver_s_text(company, monkeypatch, res, code):
+    """A failed tick stored scipy's message as the plan's reason ("Time limit reached. (HiGHS Status 13: ...)"), which the plan page and the
+    re-solve toast showed raw. The reason is now a code the page words; the solver's message stays in the summary."""
+    sid = _site()
+    good = plans.tick(sid, at=T_LIM)
+    _fails(monkeypatch, **res)
+    r = plans.tick(sid, at=T_LIM + 900)
+    assert r["status"] == "failed" and r["reason"] == code and r["in_force"] == good["plan_id"]
+    row = plans.history(sid, 1)[0]
+    assert row["status"] == "failed" and row["reason"] == code
+    assert row["summary"]["solver"]["message"] == res.get("message", "Time limit reached. (HiGHS Status 13: model_status is Reached time limit)")
+
+
+def test_re_solve_answers_the_reason_and_the_plan_in_force(world, monkeypatch):
+    a, sid = world.c["admin"], world.site
+    _past_world(world)
+    monkeypatch.setattr(plans, "_guard", lambda *x, **k: "replayed_soc_below_floor")
+    r = a.post(f"/api/sites/{sid}/plan/solve")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "held" and r.json()["reason"] == "replayed_soc_below_floor" and r.json()["in_force"] is None

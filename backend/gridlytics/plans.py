@@ -713,7 +713,8 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     summary["time_limits_24h"] = {"hours": 24.0, "plans": recent["plans"] + 1,
                                   "time_limited": recent["time_limited"] + int(solved and _plan_time_limited(summary))}
     if res["status"] in ("not_solved", "refused"):
-        reason = res.get("message", "not solved")
+        # a code the web app words, never the solver's own text (round 7, frontend-states-formats-07); the message stays in summary.solver
+        reason = failure_code(res)
         if save:
             with store.connect() as con:
                 if release:
@@ -727,7 +728,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                             (site_id, _iso(t0), started, store._now(), "failed", reason, pid))
             if release:
                 sites.put_state(site_id, active_plan=None, last_tick=_iso(t0))
-        return {"status": "failed", "reason": reason, "control_release": release}
+        return {"status": "failed", "reason": reason, "control_release": release, "in_force": None if release else _in_force_id(site_id)}
     steps_out = _steps_out(p, res, bundle)
     # the slots' floors are max(bms_low + 2, fallback floor): delivered_floor_pct, the floor the plan held on its grid-up steps. A horizon that
     # crosses the billing month's end compiles the new month's days with its own cap, M2 (round 7, engine-optimiser-02: every slot carried M,
@@ -775,8 +776,33 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
         elif by is not None:
             anchor["anchor_by"] = None
         sites.put_state(site_id, active_plan=active, last_tick=_iso(t0), **anchor)
-    return {"status": status, "plan_id": plan_id, "objective_rs": res["objective_rs"], "solve_seconds": res["solve_seconds"], "steps": steps_out,
-            "slots": compiled, "summary": summary}
+    # why a plan was held, and the plan in force after this tick (null: none, as under a pause, a release or before the first plan passes the
+    # guard), so a re-solve says what stays in force (round 7, frontend-states-formats-07)
+    in_force = plan_id if status == "active" else (None if release else _in_force_id(site_id))
+    return {"status": status, "plan_id": plan_id, "reason": reason, "in_force": in_force, "objective_rs": res["objective_rs"],
+            "solve_seconds": res["solve_seconds"], "steps": steps_out, "slots": compiled, "summary": summary}
+
+
+#: a failed solve's reason by the solver's status (scipy.optimize.milp: 1 a time or iteration limit with no plan, 2 infeasible, 3 unbounded)
+FAILURE_CODES = {1: "solve_time_limit", 2: "solve_infeasible", 3: "solve_unbounded"}
+
+
+def failure_code(res: dict) -> str:
+    """Why a solve produced no plan, as a code (round 7, frontend-states-formats-07: the plan's reason was scipy's message, "Time limit reached.
+    (HiGHS Status 13: ...)", and the plan page and the re-solve toast showed it raw): problem_refused when the problem failed validation,
+    solve_recheck_failed when the solution failed the numpy re-check, else by the solver's status, solve_failed for any other."""
+    if res.get("status") == "refused":
+        return "problem_refused"
+    if str(res.get("message") or "").startswith("Re-check failed"):
+        return "solve_recheck_failed"
+    return FAILURE_CODES.get(res.get("solver_status"), "solve_failed")
+
+
+def _in_force_id(site_id: str) -> str | None:
+    """The id of the plan active once a tick has written its row, else None."""
+    with store.connect() as con:
+        r = con.execute("SELECT id FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
+    return r["id"] if r else None
 
 
 def _iso(ts: int) -> str:

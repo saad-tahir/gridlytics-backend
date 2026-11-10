@@ -97,7 +97,8 @@ def plan_solve(site_id: str):
         demo.advance(site_id)
     r = plans.tick(site_id)
     store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"]})
-    return out({"status": r["status"], "plan_id": r.get("plan_id"), "reason": r.get("reason"), "solve_seconds": r.get("solve_seconds")})
+    return out({"status": r["status"], "plan_id": r.get("plan_id"), "reason": r.get("reason"), "solve_seconds": r.get("solve_seconds"),
+                "in_force": r.get("in_force")})
 
 
 @router.post("/api/sites/{site_id}/plan/apply")
