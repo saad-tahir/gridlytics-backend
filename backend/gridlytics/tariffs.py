@@ -474,7 +474,9 @@ def adders_for(billing_month: str) -> list[dict]:
         if not _num(body.get("rate")):
             continue
         best[v["key"]] = v  # ordered by start, so the last one of a key wins
-    return [{"key": v["key"], "id": v["id"], "name": v["key"], "exempt": [], **v["body"], "hash": v["hash"]} for v in best.values()]
+    out = [{"key": v["key"], "id": v["id"], "name": v["key"], "exempt": [], **v["body"], "hash": v["hash"]} for v in best.values()]
+    # in R9 section 7's order of a bill's third group: the FCAs (FPA), the QTA, then the surcharges (DSS, Neelum-Jhelum, ...), each by key
+    return sorted(out, key=lambda a: (0 if is_fca(a) else 1 if str(a["key"]).lower().startswith("qta") else 2, a["key"]))
 
 
 def is_fca(adder: dict) -> bool:
@@ -1028,9 +1030,12 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     taxable = base_total - pre_tax
     gst = sum(tf_run[i]["gst"] * base_run[i] * keep for i in range(len(runs)))
     lines.append({"line": "GST", "rate": tf_end["gst"], "amount_rs": round(gst, 2)})
+    # further and extra tax are on the same base as GST, but a bill prints them after the income tax (R9 section 7's order: GST, s.235, then
+    # further and extra tax), which is levied on the bill amount including them
+    sales_lines: list[dict] = []
     further = sum(tf_run[i]["further"] * base_run[i] * keep for i in range(len(runs)))
     if further:
-        lines.append({"line": "Further tax", "rate": tf_end["further"], "amount_rs": round(further, 2)})
+        sales_lines.append({"line": "Further tax", "rate": tf_end["further"], "amount_rs": round(further, 2)})
     unpriced: list[str] = []
     extra_rates = [_extra_tax_rate(conn, r["tax"], taxable) for r in runs]
     if any(x is None for x in extra_rates):
@@ -1038,8 +1043,8 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
                         "it out")
     extra = sum((extra_rates[i] or 0.0) * base_run[i] * keep for i in range(len(runs)))
     if extra:
-        lines.append({"line": "Extra tax (not on the Active Taxpayer List)", **({"rate": extra_rates[-1]} if len(set(extra_rates)) == 1 else {}),
-                      "amount_rs": round(extra, 2)})
+        sales_lines.append({"line": "Extra tax (not on the Active Taxpayer List)", **({"rate": extra_rates[-1]} if len(set(extra_rates)) == 1 else {}),
+                            "amount_rs": round(extra, 2)})
     # 11. income tax s.235 on the bill amount (the billing month's slabs)
     slab = tax_end.get("s235", {}).get("industrial" if tf_end["class"] == "industrial" else "commercial")
     bill_amount = taxable + gst + further + extra
@@ -1050,6 +1055,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
         elif bill_amount > slab["nil_upto"]:
             s235 = slab["mid_rate"] * bill_amount
     lines.append({"line": "Income tax (s.235)", "amount_rs": round(s235, 2)})
+    lines += sales_lines
     # 12. flat items
     flat = float(tax_end.get("ptv", {}).get(tf_end["class"], 0))
     if data.get("disco_group") == "ke" and tf_end["class"] in ("industrial", "commercial"):
