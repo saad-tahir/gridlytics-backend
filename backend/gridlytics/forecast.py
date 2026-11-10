@@ -457,6 +457,16 @@ def in_announced_window(windows: list, start: int, end: int) -> bool:
     return bool(len(xs) and _window_mask(windows, xs).any())
 
 
+def announced_blocks(windows: list, t0: int, t1: int) -> list[dict]:
+    """Each announced window's occurrences over [t0, t1) as [{from, to}] in epoch seconds, clipped to the span, oldest first: the probability chart draws
+    them as solid blocks (R8 2.7; round 7, pages-C-19). A window across midnight is one block; touching windows are one block."""
+    if not windows or t1 <= t0:
+        return []
+    ts = np.arange(int(t0) // 60 * 60, int(t1), 60, dtype=np.int64)
+    d = np.diff(np.concatenate(([0], _window_mask(windows, ts).astype(np.int8), [0])))
+    return [{"from": max(int(ts[a]), int(t0)), "to": min(int(ts[b - 1]) + 60, int(t1))} for a, b in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1))]
+
+
 #: the schedule adherence's prior, Beta(8, 2) (plan Part 5.3): 8 kept windows in 10
 ADHERENCE_PRIOR = (8.0, 10.0)
 #: a window occurrence is a trial only when its known grid samples cover at least this share of its minutes (a logger that was off says nothing)
@@ -742,7 +752,7 @@ def page(site: dict, kind: str) -> dict:
     """The latest issue of a kind with the actuals so far (15-minute means) for the forecast page, and `past`: the 24 hours before its belief time with
     their actuals and the issue held a day before over them, so the chart shows how the forecast tracked. The tick re-issues every 15 minutes, so the
     latest issue's own actuals are at most one step. `preliminary` follows the design rules (see preliminary()), with `verified_days` and
-    `verified_days_needed` beside it."""
+    `verified_days_needed` beside it. An outage page also carries `announced`: the announced windows over the chart's span (announced_blocks)."""
     na = not_applicable(site, kind)
     if na:
         return {"kind": kind, "issue": None, "not_applicable": na, "stage": None, "preliminary": False}
@@ -754,9 +764,14 @@ def page(site: dict, kind: str) -> dict:
     now = int(datetime.now(timezone.utc).timestamp())
     t1 = max(t0, min(now // 60 * 60, t0 + STEPS * STEP_S))  # whole minutes only
     actual = _actual15(site["id"], kind, t0, t1) if kind in PAST_KEYS else None
-    return {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
-            "issue": {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version")}, "actual": actual,
-            **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None, "not_applicable": None}
+    out = {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
+           "issue": {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version")}, "actual": actual,
+           **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None, "not_applicable": None}
+    if kind == "outage":
+        # the announced windows over the chart's span, the past 24 hours and the issue's 48, from the schedule in force now (pages-C-19)
+        sch = schedule(site["id"])
+        out["announced"] = announced_blocks(sch["windows"] if sch else [], t0 - PAST_STEPS * STEP_S, t0 + STEPS * STEP_S)
+    return out
 
 
 def _outage_baselines(site: dict, t0: int) -> dict:

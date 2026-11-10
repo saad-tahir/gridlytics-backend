@@ -950,3 +950,23 @@ def test_the_outages_page_gives_the_reserve_at_each_outage_s_start_and_the_reser
     page = _page(w, monkeypatch, 10)
     assert page["kpis"]["reserve_adequacy_pct"] is None and page["kpis"]["reserve_outages"] == 0 and page["kpis"]["battery_hours"] is None
     assert all(o["reserve_pct"] is None and o["reserve_met"] is None and o["battery_minutes"] is None for o in page["log"])
+
+
+# ------------------------------------------------------------------------------------------------ pages-C-19
+
+def test_the_outage_forecast_page_gives_the_announced_windows_as_blocks(company):
+    """R8 2.7: the 48-hour probability chart shows 'the announced slots as solid blocks'. v1 answered only the probabilities, so the schedule could be read
+    only from a plateau of P(down). The outage page now carries each announced window's occurrence over the chart's span (the 24 hours before the issue
+    and its 48 hours), clipped to the span, in epoch seconds; a window across midnight is one block, and a weekday window skips Sunday."""
+    sid = "announced"
+    site = _grid_site(sid)
+    b = _pkt(11, 7, 12, 0)  # Saturday noon: the span runs from Friday noon to Monday noon
+    telemetry.save_forecast(sid, "outage", b, 1, forecast.VERSION, {"p_down": [0.1] * 192, "p_start": [0.01] * 192})
+    assert forecast.page(site, "outage")["announced"] == []  # no announced schedule
+    forecast.set_schedule(sid, [["14:00", "16:00", "weekdays"], ["23:30", "00:30", "daily"]], "entered", "test")
+    blocks = forecast.page(site, "outage")["announced"]
+    want = [((11, 6, 14, 0), (11, 6, 16, 0)), ((11, 6, 23, 30), (11, 7, 0, 30)), ((11, 7, 14, 0), (11, 7, 16, 0)),
+            ((11, 7, 23, 30), (11, 8, 0, 30)), ((11, 8, 23, 30), (11, 9, 0, 30))]  # Sunday the 8th has no 14:00 window
+    assert blocks == [{"from": _pkt(*a), "to": _pkt(*z)} for a, z in want]
+    # the PV and load pages carry no windows
+    assert "announced" not in forecast.page(site, "load")
