@@ -10,9 +10,10 @@ touch only that company's copies. The daily check goes through the default file,
 Gridlytics is switched off for is not copied daily (nothing of it changes while it is off), only when the founder asks.
 
 A copy is one set (audit founder-console-01 and -12): the workspace file `<id>-<stamp>-<kind>.db`, the telemetry file taken with it
-`<id>-telemetry-<stamp>-<kind>.db` (store.backup), and the folder of the company's signing keys `<id>-keys-<stamp>-<kind>/` (the backup
-half of engine-delivery-13: a restore onto another machine needs the keys the edges were given). The three are listed, pruned and
-restored together; `scripts/restore_backup.py` restores one from the command line with the server stopped.
+`<id>-telemetry-<stamp>-<kind>.db` (store.backup), the folder of the company's signing keys `<id>-keys-<stamp>-<kind>/` (the backup
+half of engine-delivery-13: a restore onto another machine needs the keys the edges were given) and the folder of the reports it made
+`<id>-reports-<stamp>-<kind>/` (the backup half of parity-architecture-11 and -16: a stored report is downloaded from its file). The four
+are listed, pruned and restored together; `scripts/restore_backup.py` restores one from the command line with the server stopped.
 """
 
 from __future__ import annotations
@@ -51,23 +52,42 @@ def keys_folder(path: Path | None = None) -> Path:
     return platformdb.data_dir() / "keys" / (path or store.db_path()).stem
 
 
-def companions(name: str, path: Path | None = None) -> tuple[str, str]:
-    """The telemetry copy and the keys folder taken with the workspace copy `name` (store.backup names the three by one stamp and kind)."""
+def reports_folder(path: Path | None = None) -> Path:
+    """The reports a company made, as reports.py keeps them: the data folder's `reports/<the file's stem>`."""
+    return platformdb.data_dir() / "reports" / (path or store.db_path()).stem
+
+
+def companions(name: str, path: Path | None = None) -> tuple[str, str, str]:
+    """The telemetry copy, the keys folder and the reports folder taken with the workspace copy `name` (store.backup names the four by one stamp and
+    kind)."""
     stem = (path or store.db_path()).stem
     rest = name[len(stem) + 1:-len(".db")]
-    return f"{stem}-telemetry-{rest}.db", f"{stem}-keys-{rest}"
+    return f"{stem}-telemetry-{rest}.db", f"{stem}-keys-{rest}", f"{stem}-reports-{rest}"
+
+
+def _copy_files(source: Path, target: Path, private: bool = False) -> int:
+    """The files of the folder `source` copied into the folder `target` (made only when there is one), readable by the owner only when `private`; how
+    many."""
+    files = sorted(f for f in source.iterdir() if f.is_file()) if source.is_dir() else []
+    if files:
+        target.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            shutil.copyfile(f, target / f.name)
+            if private:
+                _private(target / f.name)
+    return len(files)
 
 
 def copy_keys(path: Path, target: Path) -> int:
     """The signing keys of the database `path` copied into the folder `target`, readable by the owner only; how many (0, and no folder, when it has none)."""
-    source = keys_folder(path)
-    keys = sorted(f for f in source.iterdir() if f.is_file()) if source.is_dir() else []
-    if keys:
-        target.mkdir(parents=True, exist_ok=True)
-        for key in keys:
-            shutil.copyfile(key, target / key.name)
-            _private(target / key.name)
-    return len(keys)
+    return _copy_files(keys_folder(path), target, private=True)
+
+
+def copy_folders(path: Path, folder: Path, rest: str) -> None:
+    """What a copy of the database `path` takes beside its two files, into the backup folder `folder` under the copy's `<stamp>-<kind>` (`rest`): the
+    signing keys and the reports (store.backup)."""
+    copy_keys(path, folder / f"{path.stem}-keys-{rest}")
+    _copy_files(reports_folder(path), folder / f"{path.stem}-reports-{rest}")
 
 
 def _private(path: Path) -> None:
@@ -84,18 +104,19 @@ def _size(path: Path) -> int | None:
         return None
 
 
-def _count(keys: Path) -> int:
-    """The key files in a copy's keys folder; 0 when it has none, or was pruned while being listed."""
+def _files(folder: Path) -> list[Path]:
+    """The files in a copy's keys or reports folder; none when it has none, or was pruned while being listed."""
     try:
-        return sum(1 for k in keys.iterdir() if k.is_file())
+        return [f for f in folder.iterdir() if f.is_file()]
     except (FileNotFoundError, NotADirectoryError):
-        return 0
+        return []
 
 
 def list_backups() -> list[dict]:
     """The current database's copies, newest first: the workspace copy's name (the one to restore), its kind and when it was made (UTC, with its offset: the
     server's local time with none was read as UTC by the browser, frontend-states-formats-17), the telemetry copy taken with it (None when the company had no
-    telemetry then) and the number of signing keys, and the sizes: `bytes` is the whole copy's, the workspace's and the telemetry's beside it."""
+    telemetry then), the number of signing keys and of report files (`reports`: a report is a PDF and a CSV), and the sizes: `bytes` is the whole copy's,
+    the workspace's, the telemetry's and the reports' beside it."""
     if not folder().exists():
         return []
     out = []
@@ -110,12 +131,13 @@ def list_backups() -> list[dict]:
         tag = m.group(2)
         kind = ("daily" if tag == "daily" else "before a schema change" if tag.startswith("schema-v") else "manual" if tag == "manual"
                 else "before a reset" if tag == "before-reset" else "before archiving" if tag == "before-archive" else "restore point")
-        telemetry_name, keys_name = companions(f.name)
+        telemetry_name, keys_name, reports_name = companions(f.name)
         telemetry_bytes = _size(folder() / telemetry_name)
+        reports = [n for r in _files(folder() / reports_name) if (n := _size(r)) is not None]
         out.append({"name": f.name, "kind": kind, "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="seconds"),
-                    "bytes": st.st_size + (telemetry_bytes or 0), "workspace_bytes": st.st_size,
+                    "bytes": st.st_size + (telemetry_bytes or 0) + sum(reports), "workspace_bytes": st.st_size,
                     "telemetry": telemetry_name if telemetry_bytes is not None else None, "telemetry_bytes": telemetry_bytes or 0,
-                    "keys": _count(folder() / keys_name)})
+                    "keys": len(_files(folder() / keys_name)), "reports": len(reports), "reports_bytes": sum(reports)})
     return out
 
 
@@ -174,11 +196,12 @@ def prune(kind: str, keep: int, path: Path | None = None) -> None:
     they were made."""
     copies = sorted(f for f in folder(path).iterdir() if _ours(kind, path).match(f.name)) if folder(path).exists() else []
     for old in copies[:-keep] if len(copies) > keep else []:
-        telemetry_name, keys_name = companions(old.name, path)
+        telemetry_name, keys_name, reports_name = companions(old.name, path)
         old.unlink()
-        # the telemetry copy and the keys go with it (the telemetry copies were never removed: founder-console-12)
+        # the telemetry copy, the keys and the reports go with it (the telemetry copies were never removed: founder-console-12)
         (folder(path) / telemetry_name).unlink(missing_ok=True)
         shutil.rmtree(folder(path) / keys_name, ignore_errors=True)
+        shutil.rmtree(folder(path) / reports_name, ignore_errors=True)
 
 
 def before_reset() -> Path | None:
@@ -199,15 +222,15 @@ def _is_database(path: Path, table: str) -> bool:
 
 def restore(name: str) -> dict:
     """Put a copy back as the current company's files, as one set (founder-console-01): the workspace file, the telemetry file taken with it (an empty one
-    when it had none, so that no later minute is left beside older plans) and its signing keys (those the keys folder lacks: a key file never changes once
-    made, and a newer one is kept). The files as they are now are copied aside first, as one set too ("restore point"), so a restore can be undone. Only a
-    copy of this database is put back: the companies' copies share one folder. Stop the server first (scripts/restore_backup.py runs it from the command
-    line). The answer names what was put back: {workspace, telemetry (None when empty), keys, restore_point}."""
+    when it had none, so that no later minute is left beside older plans), its signing keys and its reports (those the folder lacks: a key or a report file
+    never changes once made, and a newer one is kept). The files as they are now are copied aside first, as one set too ("restore point"), so a restore can
+    be undone. Only a copy of this database is put back: the companies' copies share one folder. Stop the server first (scripts/restore_backup.py runs it
+    from the command line). The answer names what was put back: {workspace, telemetry (None when empty), keys, reports, restore_point}."""
     source = (folder() / name).resolve()
     if (source.parent != folder().resolve() or not _ours().match(source.name) or not source.is_file() or source.suffix != ".db"
             or source.stat().st_size == 0 or not _is_database(source, "sites")):     # refuses a file that is not a workspace database
         raise FileNotFoundError(name)
-    telemetry_name, keys_name = companions(source.name)
+    telemetry_name, keys_name, reports_name = companions(source.name)
     telemetry_copy = folder() / telemetry_name
     if telemetry_copy.exists() and not _is_database(telemetry_copy, "minute"):
         raise FileNotFoundError(telemetry_name)
@@ -221,17 +244,23 @@ def restore(name: str) -> dict:
         from . import telemetry                         # an emptied file is given its tables again (telemetry imports this module's own imports)
         with telemetry.connect():
             pass
-    keys_copy, keys = folder() / keys_name, 0
-    if keys_copy.is_dir():
-        mine = keys_folder()
-        mine.mkdir(parents=True, exist_ok=True)
-        for key in sorted(k for k in keys_copy.iterdir() if k.is_file()):
-            if not (mine / key.name).exists():
-                shutil.copyfile(key, mine / key.name)
-                _private(mine / key.name)
-            keys += 1
-    return {"workspace": source.name, "telemetry": telemetry_name if telemetry_copy.exists() else None, "keys": keys,
+    keys = _put_back(folder() / keys_name, keys_folder(), private=True)
+    reports = _put_back(folder() / reports_name, reports_folder())
+    return {"workspace": source.name, "telemetry": telemetry_name if telemetry_copy.exists() else None, "keys": keys, "reports": reports,
             "restore_point": aside.name if aside else None}
+
+
+def _put_back(copied: Path, mine: Path, private: bool = False) -> int:
+    """The files of a copy's keys or reports folder `copied` that the company's folder `mine` lacks, put back; how many the copy holds."""
+    files = sorted(_files(copied))
+    if files:
+        mine.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        if not (mine / f.name).exists():
+            shutil.copyfile(f, mine / f.name)
+            if private:
+                _private(mine / f.name)
+    return len(files)
 
 
 def start_daily(interval_s: float = 3600.0, files=None) -> None:

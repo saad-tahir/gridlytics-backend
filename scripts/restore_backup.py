@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Put a company's backup back (audit founder-console-01): its workspace database, the telemetry file copied with it and its sites' signing keys, together,
-so that plans and telemetry stay in step. Stop the server first: this refuses while the launcher (`scripts/start_local.py` in the web app's repository)
-holds the data folder, and holds it itself while the files are put back.
+"""Put a company's backup back (audit founder-console-01): its workspace database, the telemetry file copied with it, its sites' signing keys and the reports
+it made (audit parity-architecture-11 and -16), together, so that plans and telemetry stay in step and a stored report can be downloaded. Stop the server
+first: this refuses while the launcher (`scripts/start_local.py` in the web app's repository) holds the data folder, and holds it itself while the files are
+put back.
 
     python scripts/restore_backup.py                                   # the companies, and how many copies each has
     python scripts/restore_backup.py --company <id or name>            # that company's copies, newest first
@@ -98,16 +99,20 @@ def list_companies(out) -> None:
         print(f"  {row['id']}  {row['name']}  (Gridlytics {'on' if row['enabled'] else 'off'}, {n} cop{'y' if n == 1 else 'ies'})", file=out)
 
 
+def _counted(n: int, what: str) -> str:
+    return f"{n} {what}{'' if n == 1 else 's'}"
+
+
 def list_copies(company: dict, out) -> None:
     copies = _copies(company)
     print(f"Copies of {company['name']} ({company['id']}), newest first, in Pakistan time; put one back with --company {company['id']} <copy>:", file=out)
     if not copies:
         print("  none yet", file=out)
     for b in copies:
-        keys = f"{b['keys']} signing key{'' if b['keys'] == 1 else 's'}"
         telemetry = f"telemetry {_mb(b['telemetry_bytes'])}" if b["telemetry"] else "no telemetry"
-        print(f"  {b['name']}\n      {b['kind']}, {_when(b['modified'])}, {_mb(b['bytes'])} (workspace {_mb(b['workspace_bytes'])}, {telemetry}, {keys})",
-              file=out)
+        reports = f"{_counted(b['reports'], 'report file')} {_mb(b['reports_bytes'])}" if b["reports"] else "no report files"
+        print(f"  {b['name']}\n      {b['kind']}, {_when(b['modified'])}, {_mb(b['bytes'])} (workspace {_mb(b['workspace_bytes'])}, {telemetry}, "
+              f"{_counted(b['keys'], 'signing key')}, {reports})", file=out)
 
 
 def restore(company: dict, name: str, out) -> None:
@@ -122,8 +127,10 @@ def restore(company: dict, name: str, out) -> None:
             raise Stop(f"The copy {name} could not be put back ({e}); the files as they were are kept as a restore point when one was made.") from None
     telemetry = (f"its telemetry file {done['telemetry']}" if done["telemetry"]
                  else "an empty telemetry file (the copy was made before the company had any telemetry)")
-    keys = f"{done['keys']} signing key{'' if done['keys'] == 1 else 's'}" if done["keys"] else "no signing keys (the copy holds none)"
-    print(f"Put back {done['workspace']} as {company['name']}'s workspace ({path}), with {telemetry} and {keys}.", file=out)
+    keys = _counted(done["keys"], "signing key") if done["keys"] else "no signing keys (the copy holds none)"
+    reports = _counted(done["reports"], "report file") if done["reports"] else "no report files (the copy holds none)"
+    print(f"Put back {done['workspace']} as {company['name']}'s workspace ({path}), with {telemetry}, {keys} and {reports}; keys and reports made "
+          "since the copy are kept.", file=out)
     if done["restore_point"]:
         print(f"The files as they were are kept as the restore point {done['restore_point']}; put that back the same way to undo this.", file=out)
     else:
@@ -133,7 +140,8 @@ def restore(company: dict, name: str, out) -> None:
 def main(argv: list[str] | None = None, out=None, err=None) -> int:
     out, err = out or sys.stdout, err or sys.stderr
     parser = argparse.ArgumentParser(prog="python scripts/restore_backup.py",
-                                     description="Put a company's backup back: its workspace, its telemetry and its signing keys together. Stop the server first.")
+                                     description="Put a company's backup back: its workspace, its telemetry, its signing keys and its reports together. "
+                                                 "Stop the server first.")
     parser.add_argument("--company", metavar="ID_OR_NAME", help="the company, by its id or its name")
     parser.add_argument("copy", nargs="?", help="the copy to put back, by the name its list gives")
     args = parser.parse_args(argv)

@@ -639,3 +639,45 @@ def test_supabase_mode_names_a_pending_or_suspended_membership_too(supa):
     supa.clock[0] += 120
     assert tc._refused(403, "no_company", tc._supa_token()).detail == ("Your membership of Suspended Systems is suspended: its owner can ask us to make it "
                                                                         "active again")
+
+
+def _reports(path: Path) -> dict[str, bytes]:
+    folder = platformdb.data_dir() / "reports" / path.stem
+    return {f.name: f.read_bytes() for f in sorted(folder.iterdir())} if folder.exists() else {}
+
+
+def test_a_copy_takes_the_companys_reports_and_a_restore_puts_them_back(fdb):
+    """parity-architecture-11 and -16 (the backup half, the founder console's): the reports a company made (data folder's reports/<company>) were in no
+    copy, so a restore on another machine left every stored report's download broken. A copy now takes them beside the signing keys, the list counts them
+    and their size, the copies beyond those kept go with them, and a restore (and scripts/restore_backup.py) puts back those the folder lacks."""
+    c = _console()
+    cid, path = _company_with_data(c)
+    made = platformdb.data_dir() / "reports" / path.stem
+    made.mkdir(parents=True)
+    (made / "r1.pdf").write_bytes(b"%PDF-1.4 made up")
+    (made / "r1.csv").write_text("day,kwh\n2026-11-01,12\n", encoding="utf-8")
+    listed = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))
+    one = listed["backups"][0]
+    assert one["reports"] == 2 and one["reports_bytes"] == sum(len(b) for b in _reports(path).values())
+    assert one["bytes"] == one["workspace_bytes"] + one["telemetry_bytes"] + one["reports_bytes"]
+    kept = backups.folder(path) / one["name"].replace(f"{cid}-", f"{cid}-reports-", 1)[:-len(".db")]
+    assert sorted(f.name for f in kept.iterdir()) == ["r1.csv", "r1.pdf"]
+    # a report lost after the copy is put back; one made since is kept
+    before = _reports(path)
+    (made / "r1.pdf").unlink()
+    (made / "r2.pdf").write_bytes(b"%PDF-1.4 made later")
+    listing = _script(platformdb.data_dir(), "--company", cid)
+    assert listing.returncode == 0 and "2 report files" in listing.stdout, listing.stdout + listing.stderr
+    done = _script(platformdb.data_dir(), "--company", cid, one["name"])
+    assert done.returncode == 0 and "2 report files" in done.stdout, done.stdout + done.stderr
+    assert _reports(path) == {**before, "r2.pdf": b"%PDF-1.4 made later"}
+    with store.use_company(path):
+        assert backups.restore(one["name"])["reports"] == 2
+    # the copies beyond those kept go with their reports
+    for _ in range(backups.KEEP_MANUAL + 1):
+        _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))
+    assert not kept.exists()
+    with store.use_company(path):
+        held = {backups.companions(b["name"])[2] for b in backups.list_backups() if b["reports"]}
+    assert {f.name for f in backups.folder(path).iterdir() if "-reports-" in f.name} == held and len(held) == backups.KEEP_MANUAL + 2   # 2 restore points
+
