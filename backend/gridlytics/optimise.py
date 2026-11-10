@@ -114,7 +114,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     W, forced, rm_floor = None, np.zeros(T, dtype=bool), {}
     e_gap_idx, e_gap_price = None, 0.0
     anchor_a, anchor_ends, anchor_short = None, [], None
-    dump_ok = forced
+    dump_ok = dump_forced = forced
     thr_t: list[int] = []
     thr_w: dict[int, int] = {}
     thr_z: dict[int, int] = {}
@@ -179,6 +179,13 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         forced = u_lb >= 1
         dump_ok = forced.copy()
         dump_ok[thr_t] = True
+        dump_forced = dump_ok.copy()
+        # and with the grid down a run of the plan's own dumps what the load and the battery cannot take, explicitly (round 7,
+        # engine-plans-live-15): the battery never charges and discharges at once (the discharge_net rows below), which a plan used to burn the
+        # set's minimum-load surplus in the battery's round trip (the farm: 14.4 kW in, 7.8 to 10.9 kW out, at 83 to 95 %), and a minimum up time
+        # can outlast the room a nearly full battery has (on site the set then runs under its minimum, as in the twin). Only while it runs
+        dump_run = (g < 0.5) & (u_ub > 0) & ~dump_ok
+        dump_ok = dump_ok | dump_run
         # with the grid down the set's output follows the load, never under its minimum (twin.simulate's outage branch): its output is capped at
         # max(f_min S, served load - PV), so the battery takes the set's output only up to its minimum-load surplus, never at full power (HANDOFF
         # 8.A.1, round 5). On every grid-down step whatever the charging flag (round 7, engine-optimiser-06: with gen_charge_allowed off the cap
@@ -199,6 +206,8 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         v = m.var("v", T, 0, 1, gen["c_start"], integer=True)
         # a dump costs more than a curtailment at the same step (curtail PV first, then dump: twin.simulate's order; `curtail_cost`)
         W = m.var("W", T, 0, np.where(dump_ok, gen["f_min"] * S, 0.0), k_cost + H * EPS_CURTAIL) if dump_ok.any() else None
+        for t in np.flatnonzero(dump_run):
+            m.row([W[t], u[t]], [1, -gen["f_min"] * S], ub=0, name=f"dump_on[{t}]")
         # at a panel-started site the panel decides u: minimum up and down rows bind only the starts and stops the plan is free to make
         free_start = ~(auto & (u_lb >= 1))
         free_stop = ~(auto & (u_ub <= 0))
@@ -358,6 +367,17 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 served_on = float(L[t] if (off_grid or lmode == 1) else Lc[t])
                 cap_off, cap_on = max(0.0, float(PV[t] - base_served[t])), max(0.0, float(PV[t]) - served_on)
                 m.row([C[t], u[t]], [1, cap_off - cap_on], ub=cap_off, name=f"charge_pv_surplus[{t}]")
+            if g[t] < 0.5:
+                # with the grid down the battery discharges only into the load PV leaves (with the set off), or what PV and the set's minimum load
+                # leave of it (with the set on: the set follows the load first), so it never charges and discharges at once, which an inverter
+                # cannot do and the twin does not (round 7, engine-plans-live-15: a plan burnt the set's surplus in the battery's round trip)
+                cap_off = max(0.0, float(base_served[t] - PV[t]))
+                if gen:
+                    served_on = float(L[t] if (off_grid or lmode == 1) else Lc[t])
+                    cap_on = max(0.0, served_on - float(PV[t]) - gen["f_min"] * gen["S"])
+                    m.row([D[t], u[t]], [1, cap_off - cap_on], ub=cap_off, name=f"discharge_net[{t}]")
+                else:
+                    m.row([D[t]], [1], ub=cap_off, name=f"discharge_net[{t}]")
         # the single recovery to the grid-up floor (see e_lb above): y = 1 once the battery is back at the floor, monotone over the run, one per
         # clock hour (a crossing within the hour waits for its end, a quarter of the binaries); while y = 0 there is no discharge
         rec_last = None                                  # the recovery binary of the horizon's last step, where it ends in such a run
@@ -777,7 +797,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         # one, with `threshold_repair.status` not_solved. A tick stays within three limits: the repair is skipped after a failed re-solve in the
         # relaxed retry, which already spent two
         if dodges and not (resolved and relaxed):
-            rep_u = threshold_replay(p, sol, u_lb, u_ub, thr_t, E_on, dump_ok, relaxed=relaxed)
+            rep_u = threshold_replay(p, sol, u_lb, u_ub, thr_t, E_on, dump_forced, relaxed=relaxed)
             rep = solve(p, time_limit=time_limit, gap=gap, relaxed=relaxed, shed_rule=True, fix_u=rep_u["u"])
             info = {"shed_steps": len(dodges), "shed_kwh": round(float(np.sum(x[U[dodges]])) * H, 2), "first_objective_rs": out["objective_rs"],
                     "first_solve_seconds": out["solve_seconds"], "first_mip_gap": out["mip_gap"], "repair_seconds": rep["solve_seconds"],

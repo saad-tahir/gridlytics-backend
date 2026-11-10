@@ -1430,3 +1430,52 @@ def test_with_genset_charging_the_battery_takes_the_sets_minimum_load_surplus_an
     L, PV = np.asarray(p["L"]), np.asarray(p["PV"])
     assert np.all(s["P"][on] <= np.maximum(14.4, (L - PV)[on]) + 1e-4)
     assert np.allclose(s["C"][:16][on[:16]], 14.4 - 10.0, atol=1e-3)
+
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-15
+
+def _spike_night(UT=10):
+    """The farm's night with a 45 kW minute of load at its start (over the battery's 40 kW, so the set must run), a battery already full and a
+    one-hour minimum run longer than the battery has room for the set's minimum-load surplus. Lost load priced high, so the set runs."""
+    from test_fix_r5_genset import _farm_night
+
+    p = _farm_night(T=48, c_next=150.0)
+    p["voll"] = 50000.0
+    p["L"][:] = 10.0
+    p["L"][0] = 45.0
+    p["Lhi"][:] = p["L"] * 1.1
+    p["Lc"][:] = np.minimum(p["Lc"], p["L"])
+    p["battery"]["E0"] = 0.95 * 120.0
+    p["genset"]["UT"] = UT
+    return p
+
+
+def test_the_battery_never_charges_and_discharges_at_once_with_the_grid_down():
+    """Rahim Yar Khan's plan charged 14.4 kW and discharged 7.8 to 10.9 kW at once for 12 steps, with the set at its minimum load overnight
+    and the battery at 83 to 95 %: the round trip's losses burnt the surplus the full battery could not take. An inverter cannot do that, and the
+    twin does not. The surplus is now stored net, the set is stopped, or it is dumped explicitly (`genset_dump_kw`)."""
+    p = _spike_night()
+    r = optimise.solve(p)
+    assert r["status"] in ("optimal", "feasible")
+    s = r["sol"]
+    both = (s["C"] > 1e-3) & (s["D"] > 1e-3)
+    assert not both.any(), np.flatnonzero(both)                                 # before: steps 0 and 4 to 8
+    assert float(s["U"].sum()) * H < 1e-6                                       # the set still carries the spike...
+    on = s["u"] > 0.5
+    assert on[0]
+    W = np.asarray(s["W"]) if s.get("W") is not None else np.zeros(p["T"])
+    full = np.asarray(s["E"])[1:] >= 0.95 * 120.0 - 1e-3
+    assert float(np.sum(W[on & full])) > 0.0                                    # ...and dumps what the full battery cannot take
+    assert float(np.sum(W[~on])) < 1e-6
+    # the dumped kW are named on the steps
+    steps = plans._steps_out(p, r, {"outage": {"p_down": np.ones(p["T"])}})
+    assert sum(x["genset_dump_kw"] for x in steps) == pytest.approx(float(np.sum(W)), abs=0.05)
+
+
+def test_no_step_of_the_farms_day_charges_and_discharges_at_once():
+    for surplus in (True, False):
+        p = _farm_day(c_next=150.0)
+        p["battery"]["a_gen_surplus"] = surplus
+        p["battery"]["E0"] = 0.9 * 120.0
+        s = optimise.solve(p)["sol"]
+        assert not ((s["C"] > 1e-3) & (s["D"] > 1e-3)).any(), surplus
