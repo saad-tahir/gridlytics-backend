@@ -2299,6 +2299,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
 #: budget, so 3-day blocks too; a monitor site only recommends the plan, so no block of it would ever run the plan (R8 2.13: the calendar is
 #: disabled, and R8 2.12: switchback is unavailable there)
 BLOCK_DAYS_BY_TIER = {"monitor": (), "advisory_writes": (7,), "closed_loop": (3, 7)}
+#: plan 8.2: the block lengths a switchback may have at all (the calendar's "length" check answers them, so the page holds no copy of the rule;
+#: round 7, audit parity-architecture-23)
+BLOCK_DAYS_OPTIONS = (3, 7)
 
 
 def _paint_key(site_id: str) -> str:
@@ -2386,7 +2389,11 @@ def calendar_checks(blocks: list[dict], tier: str, baseline_end: date | None, to
     ("balanced"); one block of each arm per pair, in random order ("paired"; `unit` "fortnight" for 7-day blocks, else "pair"); back to back
     ("joined"); one length of 3 or 7 days ("length") that the control tier runs ("tier-length", BLOCK_DAYS_BY_TIER); enough days on each arm for
     a result ("enough", SWITCHBACK_MIN_DAYS_PER_ARM); with a baseline window, a start after it ends ("after-baseline"); before the start, a first
-    block after today ("future"); with declared holiday closures, no block on one ("closures"). No blocks: no checks."""
+    block after today ("future"); with declared holiday closures, no block on one ("closures"). No blocks: no checks.
+
+    The pilot page shows these checks as they are and only words them (round 7, audit parity-architecture-23: it judged them itself, and its
+    "enough" rule had drifted from switchback_result's), so each carries the numbers its words need: the rule's own (`options`, `allowed`,
+    `min_days`) as well as the calendar's."""
     blocks = sorted(blocks, key=lambda b: b["block_start"])
     if not blocks:
         return []
@@ -2401,7 +2408,7 @@ def calendar_checks(blocks: list[dict], tier: str, baseline_end: date | None, to
     out = [{"id": "balanced", "ok": len(plan) == len(native), "plan_blocks": len(plan), "native_blocks": len(native)},
            {"id": "paired", "ok": paired, "unit": "fortnight" if lengths == [7] else "pair"},
            {"id": "joined", "ok": joined},
-           {"id": "length", "ok": len(lengths) == 1 and lengths[0] in (3, 7), "lengths": lengths},
+           {"id": "length", "ok": len(lengths) == 1 and lengths[0] in BLOCK_DAYS_OPTIONS, "lengths": lengths, "options": list(BLOCK_DAYS_OPTIONS)},
            {"id": "tier-length", "ok": len(lengths) == 1 and lengths[0] in allowed, "lengths": lengths, "allowed": allowed, "tier": tier},
            {"id": "enough", "ok": min(sum(plan), sum(native)) >= SWITCHBACK_MIN_DAYS_PER_ARM, "plan_days": sum(plan), "native_days": sum(native),
             "min_days": SWITCHBACK_MIN_DAYS_PER_ARM}]

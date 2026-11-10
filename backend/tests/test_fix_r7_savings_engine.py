@@ -1649,3 +1649,35 @@ def test_the_calendar_file_escapes_the_site_name_stamps_each_event_folds_long_li
     raw = world.c["viewer"].get(f"/api/sites/{sid}/pilot/calendar.ics").content.decode("utf-8")
     assert all(len(line.encode()) <= 75 for line in raw.split("\r\n"))
     assert any(line == f"SUMMARY:{long.strip()}: plan block" for line in raw.replace("\r\n ", "").split("\r\n"))
+
+
+# ------------------------------------------------------------------------------------------------ parity-architecture-23: the calendar's checks are the
+# ------------------------------------------------------------------------------------------------ server's, and its 'enough' rule is the result's
+
+def test_the_calendars_enough_check_is_the_rule_the_switchback_result_applies_and_every_check_carries_its_facts(company):
+    # The pilot page judged "6 days on each arm" itself while switchback_result needed 6 days in total, so a 3+3 calendar the server would score
+    # read as failing on the page. The server's check and its result now apply one rule, and the page only words the server's checks: each
+    # carries the numbers its words need, the lengths a block may have included (before: the page held "3 or 7" itself)
+    sid = make_site(name="Switchback r7 enough")
+    pair = [("2026-09-01", "2026-09-03", "plan"), ("2026-09-04", "2026-09-06", "native")]
+    _calendar(sid, pair)
+    blocks = verify.switchback_blocks(sid)
+    checks = {c["id"]: c for c in verify.calendar_checks(blocks, "closed_loop", None, date(2026, 8, 1), [], False)}
+    assert checks["enough"] == {"id": "enough", "ok": False, "plan_days": 3, "native_days": 3, "min_days": verify.SWITCHBACK_MIN_DAYS_PER_ARM}
+    assert checks["length"] == {"id": "length", "ok": True, "lengths": [3], "options": [3, 7]}
+    assert checks["tier-length"]["allowed"] == list(verify.BLOCK_DAYS_BY_TIER["closed_loop"])
+    rows = {f"2026-09-{d:02d}": _sb_day(sid, f"2026-09-{d:02d}", 120_000.0 + 3_000 * (d % 3), 500.0, d) for d in range(1, 7)}
+    _put_rows(sid, {d: {"native": r} for d, r in rows.items()})
+    sb = verify.switchback_result(sid)
+    assert sb["result"] is None and sb["result_withheld"] == "too_few_days" and sb["min_days_per_arm"] == checks["enough"]["min_days"]
+    # a second pair: six days on each arm, the check passes and the result gives a figure once the days are scored
+    _calendar(sid, [("2026-09-07", "2026-09-09", "native"), ("2026-09-10", "2026-09-12", "plan")])
+    checks = {c["id"]: c for c in verify.calendar_checks(verify.switchback_blocks(sid), "closed_loop", None, date(2026, 8, 1), [], False)}
+    assert checks["enough"]["ok"] is True and (checks["enough"]["plan_days"], checks["enough"]["native_days"]) == (6, 6)
+    rows.update({f"2026-09-{d:02d}": _sb_day(sid, f"2026-09-{d:02d}", 118_000.0 + 2_000 * (d % 4), 500.0, d) for d in range(7, 13)})
+    _put_rows(sid, {d: {"native": r} for d, r in rows.items()})
+    assert verify.switchback_result(sid)["result"] is not None
+    # a length the rule does not allow fails, with the lengths it allows
+    bad = [{"block_start": "2026-10-01", "block_end": "2026-10-05", "arm": "plan"}, {"block_start": "2026-10-06", "block_end": "2026-10-10", "arm": "native"}]
+    length = next(c for c in verify.calendar_checks(bad, "closed_loop", None, date(2026, 8, 1), [], False) if c["id"] == "length")
+    assert length == {"id": "length", "ok": False, "lengths": [5], "options": [3, 7]}

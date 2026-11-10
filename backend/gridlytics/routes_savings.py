@@ -240,7 +240,8 @@ PAINT_FIELDS = ("painted_at", "painted_on", "by", "draw", "paint_count", "start"
 
 #: a calendar rule check in words, for the start's refusal
 CHECK_WORDS = {"balanced": "both arms equally often", "paired": "one block of each arm in each pair", "joined": "blocks back to back",
-               "length": "one block length of 3 or 7 days", "tier-length": "a block length the control tier runs",
+               "length": f"one block length of {' or '.join(map(str, verify.BLOCK_DAYS_OPTIONS))} days",
+               "tier-length": "a block length the control tier runs",
                "enough": f"at least {verify.SWITCHBACK_MIN_DAYS_PER_ARM} days on each arm", "after-baseline": "a start after the baseline window",
                "future": "a start after today", "closures": "no block on a holiday closure"}
 
