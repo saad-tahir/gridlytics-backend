@@ -2,7 +2,8 @@
 computation date (flow-savings-pilot-bill-02, its duplicates role-owner-01, role-operator-01 and role-analyst-02, and pages-A-08), and off-grid in the
 fleet is the site's own fact, so a grid site whose connection is not saved yet is not labelled Off-grid and its outage counts (pages-A-03,
 role-viewer-09). The Overview carries the plan's KPI tiles (today's solar used on site, battery cycles and outages covered), the peak window of
-its chart's actual steps and the genset start requests waiting for an answer, its quick action (pages-A-09)."""
+its chart's actual steps and the genset start requests waiting for an answer, its quick action (pages-A-09). The Fleet's 7-day bars draw each day's
+claimed saving, as its month column, so a monitor site's replay noise is not a loss (role-analyst-14 and its duplicates)."""
 from __future__ import annotations
 
 import json
@@ -154,3 +155,20 @@ def test_the_fleet_s_month_saving_is_missing_without_a_scored_day_and_a_real_zer
         _put_days(world.site, {today().isoformat(): _day(0.0, 300.0, 300.0, 1500.0)})      # a scored day that saved nothing
     fleet = a.get("/api/fleet").json()
     assert _row(fleet, world.site)["mtd_saving_rs"] == 0 and fleet["summary"]["mtd_saving_rs"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ role-analyst-14, role-owner-13, flow-savings-pilot-bill-21, engine-money-live-14
+
+def test_the_fleet_s_7_day_bars_carry_each_day_s_claimed_saving_so_unclaimed_replay_noise_is_not_a_loss(world):
+    a, sid = world.c["admin"], world.site
+    t = today()
+    y = t - timedelta(days=1)
+    # a recommendation-only day (the Lahore mall's -Rs 0.09): the replay's figure, which nothing claims; and a day that claims its saving
+    noise = {**_day(0.0, 300.0, 300.0, 1500.0), "saving_rs": -0.09, "claimed_rs": 0.0, "fidelity": "recommendation_only"}
+    with world.use():
+        _put_days(sid, {y.isoformat(): noise, t.isoformat(): _day(512.4, 300.0, 300.0, 1500.0)})
+    spark = _row(a.get("/api/fleet").json(), sid)["spark"]
+    assert [(p["day"], p["claimed_rs"]) for p in spark] == [(y.isoformat(), 0.0), (t.isoformat(), 512.4)]    # before: saving_rs only
+    assert spark[0]["saving_rs"] == -0.09                                                  # the replay's own figure stays beside it
+    # money both: a viewer's bars carry the days only
+    assert [set(p) for p in _row(world.c["viewer"].get("/api/fleet").json(), sid)["spark"]] == [{"day"}, {"day"}]

@@ -70,9 +70,9 @@ MTD_SAVING_METHOD = "counterfactual"
 
 def _mtd_saving(site_id: str) -> tuple[float | None, str | None, list]:
     """The month's claimed saving against the native settings, exactly as the Savings page's "This month" reads it (verify.summary from the 1st to
-    today: the claimed days plus the month's MDI lever), when its days were computed, and the last 7 scored days for the sparkline. The figure is None
-    while no day of the month is scored, never a zero (audit flow-savings-pilot-bill-02: the daily claims alone left out the MDI lever, so Fleet and
-    Overview read Rs 1,956 where Savings read Rs 43,594)."""
+    today: the claimed days plus the month's MDI lever), when its days were computed, and the last 7 scored days for the sparkline (each day's claimed
+    saving and the replay's figure). The figure is None while no day of the month is scored, never a zero (audit flow-savings-pilot-bill-02: the
+    daily claims alone left out the MDI lever, so Fleet and Overview read Rs 1,956 where Savings read Rs 43,594)."""
     t = today()
     summ = verify.summary(site_id, t.replace(day=1).isoformat(), t.isoformat())
     scored = any(d.get("saving_native_rs") is not None for d in summ["days"])
@@ -81,7 +81,12 @@ def _mtd_saving(site_id: str) -> tuple[float | None, str | None, list]:
     with store.connect() as con:
         rows = con.execute("SELECT day_local, data FROM savings_days WHERE site_id = ? AND baseline = 'native' AND day_local >= ? ORDER BY day_local",
                            (site_id, (t - timedelta(days=40)).isoformat())).fetchall()
-    spark = [{"day": r["day_local"], "saving_rs": json.loads(r["data"]).get("saving_rs")} for r in rows]
+    # each day's claimed saving beside the replay's own figure: the bars draw the claim, as the month column does, so a recommendation-only day's
+    # replay noise (the Lahore mall's -Rs 0.09) is not drawn as a loss (audit role-analyst-14, flow-savings-pilot-bill-21, engine-money-live-14)
+    spark = []
+    for r in rows:
+        d = json.loads(r["data"])
+        spark.append({"day": r["day_local"], "saving_rs": d.get("saving_rs"), "claimed_rs": d.get("claimed_rs")})
     return mtd, (summ["computed"] or None) if scored else None, spark[-7:]
 
 
