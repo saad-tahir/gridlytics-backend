@@ -916,3 +916,19 @@ def test_a_keyed_deye_stores_surplus_pv_above_a_hold_programs_capacity_instead_o
     plain = twin.simulate(series, twin.slots_policy([hold], ts), plant, 0.5)
     deye = twin.simulate(series, twin.slots_policy([{**hold, "as_keyed": delivery.as_keyed("deye", [hold], {})[0]}], ts), plant, 0.5)
     assert float(plain["curtail"].sum()) > 0 and float(deye["curtail"].sum()) == 0.0 and float(deye["soc"][-1]) > 0.8
+
+
+# ------------------------------------------------------------------------------------------------ review
+
+def test_review_growatts_grammar_is_three_plus_three_windows_and_a_compiled_day_keeps_six_slots():
+    """flow-onboarding-23: the grammar said 'three charge and three discharge windows' with max_slots 3, which the Slots view prints as 'Up to 3
+    slots', and the compiler cut a Growatt day to three slots. Load First takes no window, so a day of three grid charges between discharges keys
+    three Battery First windows and keeps all six slots (the review found the vendor-table test passes with max_slots 3)."""
+    g = delivery.BRANDS["growatt"]
+    assert g["max_slots"] == 6 and "three Battery First and three Grid First windows" in g["layout"]
+    steps = _day_of([("charge_from_grid", 16, 10.0, 0.0), ("discharge_peak_window", 16, 0.0, 10.0)] * 3)
+    comp = delivery.compile_mode_a(steps, "growatt", SMALL, 20.0)
+    assert [s["mode"] for s in comp["days"][0]["slots"]] == ["charge_grid", "discharge"] * 3
+    t = delivery.vendor_table(comp, 0)
+    assert [(r["priority"], r["window"]) for r in t["rows"]] == [("battery_first", 1), ("battery_first", 2), ("battery_first", 3)]
+    assert not any("cannot be keyed" in n for n in t["notes"])
