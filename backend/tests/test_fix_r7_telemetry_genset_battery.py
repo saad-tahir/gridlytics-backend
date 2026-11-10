@@ -25,12 +25,15 @@ Batch 5, the telemetry file's cost: a read takes a deferred (read) transaction, 
 wait, and the export formats its CSV outside any transaction (performance-live-03, and its duplicate tests-and-perf-04); a chart series never answers
 more than SERIES_MAX_POINTS (2,000) points, an explicit resolution that would is coarsened for every role, and the automatic one is the finest within the
 cap (tests-and-perf-05, and its duplicate performance-live-13); a CSV upload is parsed once, in one streamed pass into columns, with memory a small multiple
-of the file, and written one Karachi day per transaction (performance-live-04, and its duplicate tests-and-perf-23).
+of the file, and written one Karachi day per transaction (performance-live-04, and its duplicate tests-and-perf-23); forecast issues are kept whole for
+3 days, hourly for 35 days (the stage-1 bands' 16-day window and the scoring), then only each Karachi day's day-ahead issue, the one scoring reads
+(performance-live-06; the minute rows' 13-month Parquet archive, DAT-07, is planned work).
 
 Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company file of its own."""
 from __future__ import annotations
 
 import io
+import json
 import types
 from datetime import date, datetime, timedelta, timezone
 
@@ -1151,3 +1154,45 @@ def test_an_upload_is_written_one_karachi_day_per_transaction(company, monkeypat
     assert writes == [720, 1440, 720], writes
     for day, n in (("2026-11-05", 720), ("2026-11-06", 1440), ("2026-11-07", 720)):
         assert _day(sid, day)["completeness"] == round(n / 1440, 4), day
+
+
+# ------------------------------------------------------------------------------------------------ performance-live-06: forecast issues' retention
+
+def _issue_rows(sid: str, kind: str = "pv") -> list[int]:
+    with telemetry.reading() as con:
+        return [r[0] for r in con.execute("SELECT belief_time FROM forecast_issues WHERE site_id = ? AND kind = ? ORDER BY belief_time", (sid, kind))]
+
+
+def test_forecast_issues_are_kept_hourly_for_35_days_then_only_each_day_s_day_ahead_issue(company):
+    """Every hourly issue was kept forever, about 240 MB a site-year (four times the minute rows). Now: every issue for 3 days, the hourly ones for 35
+    days (the stage-1 bands read 16 days, the night's scoring 3), then only each Karachi day's day-ahead issue, the latest within 6 hours before its
+    midnight, which is what the day's scoring reads; a day without one keeps nothing. Another site's and another kind's issues are untouched."""
+    sid, other = "retained", "other"
+    assert (telemetry.ISSUE_ALL_DAYS, telemetry.ISSUE_HOURLY_DAYS) == (3, 35)
+    newest = T0 + 45 * 86400  # a Karachi midnight
+    first = T0
+    quarters = list(range(first, newest, 900))
+    body = json.dumps({"q50": [1.0] * 192})
+    gone_midnight = T0 + 2 * 86400  # 7 Nov: its midnight issue never ran, so its day-ahead issue is the one an hour before
+    dark_day = T0 + 4 * 86400  # 9 Nov: no issue in the 6 hours before its midnight
+    with telemetry.connect() as con:
+        con.executemany("INSERT INTO forecast_issues (site_id, kind, belief_time, stage, model_version, body) VALUES (?,?,?,?,?,?)",
+                        [(s_, k, bt, 1, "v", body) for s_ in (sid, other) for k in ("pv", "load") for bt in quarters
+                         if bt != gone_midnight and not dark_day - 6 * 3600 <= bt <= dark_day])
+    telemetry.save_forecast(sid, "pv", newest, 1, "v", {"q50": [1.0] * 192})
+    kept = _issue_rows(sid)
+    recent = [bt for bt in kept if bt >= newest - 3 * 86400]
+    hourly = [bt for bt in kept if newest - 35 * 86400 <= bt < newest - 3 * 86400]
+    old = [bt for bt in kept if bt < newest - 35 * 86400]
+    assert recent == [bt for bt in quarters if bt >= newest - 3 * 86400] + [newest]
+    assert hourly == [bt for bt in quarters if newest - 35 * 86400 <= bt < newest - 3 * 86400 and bt % 3600 == 0]
+    midnights = [d for d in range(T0, newest - 35 * 86400, 86400)]
+    assert old == sorted([d for d in midnights if d not in (gone_midnight, dark_day)] + [gone_midnight - 3600]), [
+        datetime.fromtimestamp(t, PKT).isoformat() for t in old]
+    # the day's scoring finds its day-ahead issue still (forecast.score_day: the latest at or before midnight, at most 6 hours before it)
+    assert telemetry.latest_forecast(sid, "pv", T0 + 86400)["belief_time"] == T0 + 86400
+    assert telemetry.latest_forecast(sid, "pv", gone_midnight)["belief_time"] == gone_midnight - 3600
+    assert dark_day - telemetry.latest_forecast(sid, "pv", dark_day)["belief_time"] > 6 * 3600
+    assert len(kept) < len(quarters) / 3
+    # another kind and another site are pruned by their own saves, not this one
+    assert len(_issue_rows(sid, "load")) == len(_issue_rows(other, "pv")) == len(quarters) - 1 - 25

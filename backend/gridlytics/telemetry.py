@@ -1436,12 +1436,31 @@ def delete_site(site_id: str) -> None:
 
 # ------------------------------------------------------------------------------------------------ forecast issues
 
+#: forecast issues are kept whole for ISSUE_ALL_DAYS, the hourly ones for ISSUE_HOURLY_DAYS (the stage-1 bands read the last 16 days' issues, the night's
+#: scoring the last 3), then only each Karachi day's day-ahead issue: the latest at or before its midnight and at most DAY_AHEAD_S before it, which the
+#: day's scoring reads (forecast.score_day). An issue is about 27 KB a site for its three kinds; kept hourly for ever they came to about 240 MB a
+#: site-year, four times the minute rows (audit R7 performance-live-06); kept so, about 30 MB a site plus 10 MB a site-year.
+ISSUE_ALL_DAYS = 3
+ISSUE_HOURLY_DAYS = 35
+DAY_AHEAD_S = 6 * 3600
+#: the seconds from an issue's belief time to the Karachi midnight at or after it
+_TO_MIDNIGHT = "((86400 - (belief_time + 18000) % 86400) % 86400)"
+
+
 def save_forecast(site_id: str, kind: str, belief_time: int, stage: int, version: str, body: dict) -> None:
+    """Saves an issue and prunes the site's issues of that kind by age from this one's belief time (ISSUE_ALL_DAYS, ISSUE_HOURLY_DAYS; see there)."""
+    bt = int(belief_time)
     with connect() as con:
         con.execute("INSERT OR REPLACE INTO forecast_issues (site_id, kind, belief_time, stage, model_version, body) VALUES (?,?,?,?,?,?)",
-                    (site_id, kind, int(belief_time), stage, version, json.dumps(body)))
+                    (site_id, kind, bt, stage, version, json.dumps(body)))
         con.execute("DELETE FROM forecast_issues WHERE site_id = ? AND kind = ? AND belief_time < ? AND belief_time % 3600 != 0",
-                    (site_id, kind, int(belief_time) - 3 * 86400))
+                    (site_id, kind, bt - ISSUE_ALL_DAYS * 86400))
+        later = (f"SELECT 1 FROM forecast_issues AS later WHERE later.site_id = forecast_issues.site_id AND later.kind = forecast_issues.kind "
+                 f"AND later.belief_time > forecast_issues.belief_time AND later.belief_time <= forecast_issues.belief_time + "
+                 f"{_TO_MIDNIGHT.replace('belief_time', 'forecast_issues.belief_time')}")
+        con.execute(f"DELETE FROM forecast_issues WHERE site_id = ? AND kind = ? AND belief_time < ? "
+                    f"AND NOT ({_TO_MIDNIGHT} <= ? AND NOT EXISTS ({later}))",
+                    (site_id, kind, bt - ISSUE_HOURLY_DAYS * 86400, DAY_AHEAD_S))
 
 
 def latest_forecast(site_id: str, kind: str, at_or_before: int | None = None) -> dict | None:
