@@ -694,13 +694,15 @@ def company_members(company_id: str) -> list[dict]:
 
 def account_view(account: dict, mine: list[dict], names: dict, reads: dict | None = None, gone: set[str] | None = None) -> dict:
     """An account as the console shows it, never with a password or its hash, saying whether it is archived; with `reads` (each company's file, read
-    once), each membership carries the person's Gridlytics role and last sign-in there."""
+    once), each membership carries the person's Gridlytics role there, where it came from (`role_source`) and their last sign-in there."""
     out = []
     for m in mine:
         view = _membership_view(m, names)
         if reads is not None:
             held = (reads.get(m["company_id"]) or {"members": {}})["members"].get(account["id"])
-            view.update(gridlytics_role=held["role"] if held else None, last_seen=held["last_seen"] if held else None)
+            # role_source says where the role came from (owner, default, set or legacy), so the console says what a change of the company role gives
+            view.update(gridlytics_role=held["role"] if held else None, role_source=held["role_source"] if held else None,
+                        last_seen=held["last_seen"] if held else None)
         out.append(view)
     return {**{k: account[k] for k in ("id", "email", "name", "disabled", "created")},
             "archived": account["id"] in (gone if gone is not None else archived("account")),
@@ -739,15 +741,15 @@ def _member_row(company_id: str, user_id: str) -> dict | None:
 
 
 def membership_view(user_id: str, company_id: str) -> dict:
-    """A membership as the membership routes answer it, with the person's Gridlytics role and last sign-in there now (null before the first sign-in), so
-    the console says what a change of the company role gave (audit founder-console-16)."""
+    """A membership as the membership routes answer it, with the person's Gridlytics role there now, where it came from (`role_source`) and their last
+    sign-in there (each null before the first sign-in), so the console says what a change of the company role gave (audit founder-console-16, -03)."""
     held = directory().memberships(company_id=company_id, user_id=user_id)
     if not held:
         raise NotFound("No such membership")
     row = platformdb.company(company_id) or {"name": ""}
     member = _member_row(company_id, user_id)
     return {**_membership_view(held[0], {company_id: row["name"]}), "gridlytics_role": member["role"] if member else None,
-            "last_seen": member["last_seen"] if member else None}
+            "role_source": member["role_source"] if member else None, "last_seen": member["last_seen"] if member else None}
 
 
 # ================================================================================================================ the founder's changes

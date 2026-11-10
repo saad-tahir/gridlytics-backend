@@ -699,3 +699,35 @@ def test_the_daily_copy_leaves_a_default_database_outside_the_data_folder_in_use
     monkeypatch.delenv("GRIDLYTICS_DATA_DIR")
     made = backups.daily_all(lambda: [])
     assert [p.parent for p in made] == [owner / "backup"] and made[0].name.startswith("gridlytics-")
+
+
+# ================================================================== review: where a Gridlytics role came from
+
+def _membership_on_users(c, user_id: str, cid: str) -> dict:
+    user = next(u for u in _ok(c.get("/api/founder/users"))["users"] if u["id"] == user_id)
+    return next(m for m in user["memberships"] if m["company_id"] == cid)
+
+
+def test_the_users_list_and_the_membership_answers_say_where_the_gridlytics_role_came_from(fdb):
+    """founder-console-03 (review): the Change dialog says, before saving, what a change of the company role gives; with only the role to go by, it took a
+    company admin whose administrator role was set in Gridlytics for one the company role gave, and said that making them a member ends it, though a role
+    set in Gridlytics stays (companies.role_follows). The users list and the membership answers now say the role's source as the company's Users list
+    does (role_source: owner, default, set or legacy; null before the first sign-in)."""
+    c = _console()
+    made = _company(c)
+    cid, owner = made["company"]["id"], made["owner"]
+    boss = _as(owner)
+    _ok(boss.get("/api/sites"))
+    assert _membership_on_users(c, owner["id"], cid)["role_source"] == "owner"
+    maaz = _person(c, "maaz@meow.test", "Maaz Ali", cid, "admin")
+    assert _membership_on_users(c, maaz["id"], cid)["role_source"] is None                # no row before the first sign-in
+    _ok(_as(maaz).get("/api/sites"))
+    assert {k: _membership_on_users(c, maaz["id"], cid)[k] for k in ("gridlytics_role", "role_source")} == {"gridlytics_role": "admin",
+                                                                                                             "role_source": "default"}
+    _ok(boss.put(f"/api/users/{maaz['id']}", json={"role": "admin"}))                       # set in Gridlytics: the same role, now the company's own choice
+    assert _membership_on_users(c, maaz["id"], cid)["role_source"] == "set"
+    answer = _ok(c.patch(f"/api/founder/users/{maaz['id']}/memberships/{cid}", json={"company_role": "member"}))["membership"]
+    assert (answer["company_role"], answer["gridlytics_role"], answer["role_source"]) == ("member", "admin", "set")
+    sunia = _person(c, "sunia@meow.test", "Sunia Ahmed", cid)
+    added = _ok(c.patch(f"/api/founder/users/{sunia['id']}/memberships/{cid}", json={"company_role": "admin"}))["membership"]
+    assert added["gridlytics_role"] is None and added["role_source"] is None
