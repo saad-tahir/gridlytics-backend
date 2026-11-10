@@ -190,7 +190,7 @@ def _gap(site_id: str, now: int, gap_hours: float) -> None:
         if hours > gap_hours and (best is None or hours > best[2]):
             best = (a + 60, b, hours)
     _set(best is not None, site_id, "data_gap", "Data", "warning",
-         f"The data stopped for {best[2]:.1f} hours in the last day, from {_when(best[0])} to {_when(best[1])}" if best else "",
+         f"The data stopped for {best[2]:.1f} hours, from {_when(best[0])} to {_when(best[1])}" if best else "",
          {"gap_from": best[0], "gap_to": best[1], "hours": round(best[2], 1)} if best else {})
 
 
@@ -271,7 +271,7 @@ def _forecast_stages(site_id: str, now: int) -> None:
         before = telemetry.latest_forecast(site_id, kind, now - 86400)
         changed = bool(cur and before and cur.get("stage") != before.get("stage"))
         _set(changed, site_id, f"forecast_stage_{kind}", "Forecast", "info",
-             f"The {words} forecast moved from stage {before['stage']} to stage {cur['stage']} in the last day" if changed else "",
+             f"The {words} forecast moved from stage {before['stage']} to stage {cur['stage']} in the day to {_when(now)}" if changed else "",
              {"from_stage": before["stage"], "to_stage": cur["stage"]} if changed else {})
 
 
@@ -448,11 +448,11 @@ def _genset_condition(site: dict, now: int, rules_: dict) -> None:
         unasked += int(not steps_on[q])
     on_unasked = unasked >= _th(rules_, "Genset", "unrequested_minutes")
     _set(on_unasked, sid, "genset_unrequested", "Genset", "warning",
-         f"The genset ran for {unasked} minutes in the last hour that the plan did not ask for" if on_unasked else "", {"minutes": unasked})
+         f"The genset ran for {unasked} minutes in the hour to {_when(now)} that the plan did not ask for" if on_unasked else "", {"minutes": unasked})
     low = int(np.sum(on & ~np.isnan(pw) & (pw < min_kw * 1000)))
     on_low = rated > 0 and low >= _th(rules_, "Genset", "low_load_minutes")
     _set(on_low, sid, "genset_low_load", "Genset", "warning",
-         f"The genset ran below its minimum load of {min_kw:.0f} kW for {low} minutes in the last hour" if on_low else "",
+         f"The genset ran below its minimum load of {min_kw:.0f} kW for {low} minutes in the hour to {_when(now)}" if on_low else "",
          {"minutes": low, "min_kw": round(min_kw, 1)})
     # a request nobody answered and the set did not follow: pending (not answered, not withdrawn), its start past by the window, in the last day
     with store.connect() as con:
@@ -503,7 +503,8 @@ def evaluate(site_id: str, now: int | None = None) -> None:
                 short.append({"start": o["start"], "soc": o["soc_start_pct"], "reserve": st["reserve_pct"]})
     _set(bool(short), site_id, "reserve_short", "Reserve", "warning", "An outage started with the battery below the planned reserve", {"outages": short[:5]})
     unserved = sum(o["unserved_kwh"] for o in outs)
-    _set(unserved > float(_th(rules_, "Reserve", "unserved_kwh")), site_id, "unserved", "Reserve", "critical", f"{unserved:.1f} kWh of critical load went unserved in the last day")
+    _set(unserved > float(_th(rules_, "Reserve", "unserved_kwh")), site_id, "unserved", "Reserve", "critical",
+         f"{unserved:.1f} kWh of critical load went unserved in the day to {_when(now)}")
     # battery
     bs = battery_service.state(site, now)
     held = {a[0] for a in (bs or {}).get("alerts", [])}
@@ -518,8 +519,11 @@ def evaluate(site_id: str, now: int | None = None) -> None:
         unconfirmed = _peak_unconfirmed(site, now, today)
     if site.get("demo_link") and site["data"].get("twin", {}).get("unconfirmed_alert"):
         unconfirmed = True
+    # the title names the day (audit role-operator-31: "Today's slot table" was still read the next day)
+    day = datetime.fromtimestamp(now, PKT).date()
     _set(ready and unconfirmed, site_id, "apply_unconfirmed", "Control", "warning",
-         "Today's slot table is not marked as applied: tier 2 has no read-back, so the saving is not claimed until it is")
+         f"The slot table for {day:%A} {_long(day)} is not marked as applied: tier 2 has no read-back, so the saving is not claimed until it is",
+         {"day": today})
     _agreements(site, now, rules_)
     _bill_residual(site_id, float(_th(rules_, "Tariff", "bill_difference_pct")))
     tariff_staleness(site, now, rules_)

@@ -1287,3 +1287,28 @@ def test_an_agreement_that_has_ended_says_it_ended_and_two_connections_are_told_
     assert titles[f"regime_expiring_{conn['id']}"].startswith(f"The net billing agreement of meter FS-24-11-0042 ended on {ended.day}"), titles
     assert titles[f"regime_expiring_{two['id']}"] == f"The net billing agreement of connection 2 (B-3) ends on {soon.day} {soon:%B %Y}", titles
     assert not any(conn["id"] in t or two["id"] in t for t in titles.values())
+
+
+# ------------------------------------------------------------------------------------------------ role-operator-31 (an alert names its day)
+
+def test_an_alerts_title_names_its_day_not_today_or_the_last_day(world, monkeypatch):
+    """role-operator-31: "Today's slot table is not marked as applied" was read 16 hours after it opened, on the next day; the titles kept "in the
+    last day" and "in the last hour" after the alert cleared."""
+    sid = world.site
+    now = int(datetime(2026, 11, 9, 20, 0, tzinfo=PKT).timestamp())
+    _ready(monkeypatch)
+    plan = {"id": "p1", "steps": [], "summary": {}, "valid_until": _iso(now + 86400).replace("Z", "+00:00")}
+    monkeypatch.setattr(alerts.plans, "current", lambda site_id: plan)
+    monkeypatch.setattr(alerts, "_peak_unconfirmed", lambda site, now, today: True)
+    with world.use():
+        sites.set_tier_capable(sid, "advisory_writes")
+        sites.set_tier_allowed(sid, "advisory_writes", "test")
+        telemetry.ingest(sid, _minutes(now - 6 * 3600, now - 4 * 3600) + _minutes(now - 90 * 60, now), "edge", now=now)
+        alerts.evaluate(sid, now)
+        got = {a["rule"]: a for a in alerts.listing("active", sid)}
+    applied = got["apply_unconfirmed"]
+    assert applied["title"].startswith("The slot table for Monday 9 November 2026 is not marked as applied"), applied["title"]
+    assert "Today" not in applied["title"] and applied["detail"]["day"] == "2026-11-09", applied
+    assert got["data_gap"]["title"] == "The data stopped for 2.5 hours, from 9 Nov 16:00 to 9 Nov 18:30", got["data_gap"]["title"]
+    for a in got.values():
+        assert not re.search(r"\b(today|yesterday|tomorrow|last day|last hour)\b", a["title"], re.I), a["title"]
