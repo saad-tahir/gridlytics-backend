@@ -71,7 +71,7 @@ def check(model: type[BaseModel], body: Any, **context) -> Any:
 
 from datetime import date as _date  # noqa: E402  (this section's own imports, so the shared head of the file stays as it was)
 
-from pydantic import Field, field_validator  # noqa: E402
+from pydantic import Field, field_validator, model_validator  # noqa: E402
 
 
 def _iso_day(v: str | None, what: str) -> str | None:
@@ -98,6 +98,29 @@ class PilotCriteriaEdit(Strict):
     forecast_pv_nrmse_max: float = Field(None, ge=0, le=1)
 
 
+class PilotClosure(Strict):
+    """A declared holiday closure (R8 2.13, tab C: "no arm during a declared holiday closure"): its first and last day, both closed, and a name;
+    at most 60 days (round 7, audit pages-D-19)."""
+
+    start: str
+    end: str
+    label: str = Field("", max_length=80)
+
+    @field_validator("start", "end")
+    @classmethod
+    def _day(cls, v):
+        return _iso_day(v, "A closure's day")
+
+    @model_validator(mode="after")
+    def _span(self):
+        n = (_date.fromisoformat(self.end) - _date.fromisoformat(self.start)).days
+        if n < 0:
+            raise ValueError("A closure's last day is on or after its first day")
+        if n >= 60:
+            raise ValueError("A closure is at most 60 days")
+        return self
+
+
 class PilotEdit(Strict):
     """`PUT /sites/:id/pilot`: the fields of the set-up a person may change. The sign-off is written by the start alone and the amendments by the
     server, so neither is a field here (an unknown field is refused). `reason` is the amendment's, needed once the pilot has started (round 7,
@@ -109,6 +132,7 @@ class PilotEdit(Strict):
     reason: str = Field("", max_length=500)
     #: a started pilot adopts a later native capture by its version, as an amendment (round 7, audit flow-savings-pilot-bill-12)
     capture_version: int = Field(None, ge=1)
+    closures: list[PilotClosure] = Field(None, max_length=20)
 
     @field_validator("baseline_start")
     @classmethod

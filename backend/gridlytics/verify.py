@@ -630,6 +630,56 @@ def native_for_day(site_id: str, day: date) -> dict | None:
     return d
 
 
+#: a baseline day counts as complete when at least this share of its minutes was read: past the 5 % of unread minutes at which a replay withholds
+#: its claim (round 7, audit pr-review-11), a day is no reference (round 7, audit pages-D-19)
+BASELINE_DAY_COMPLETE = 0.95
+
+
+def baseline_quality(site_id: str, start: str | None, days: int, today: date) -> dict | None:
+    """The pilot's tab A check (R8 2.13: "data completeness check for the window so far"; round 7, audit pages-D-19): over the baseline window's
+    days that are over (`through`, at most yesterday), each day's share of minutes read (None: no data), how many have data, how many are complete
+    (BASELINE_DAY_COMPLETE), and the window's completeness so far (a day without data counts as 0). None without a window."""
+    if not start:
+        return None
+    d0 = date.fromisoformat(start)
+    d1 = d0 + timedelta(days=int(days) - 1)
+    through = min(d1, today - timedelta(days=1))
+    rows = {d["day"]: d for d in telemetry.days(site_id, d0.isoformat(), through.isoformat())} if through >= d0 else {}
+    out = []
+    d = d0
+    while d <= through:
+        c = (rows.get(d.isoformat()) or {}).get("completeness")
+        out.append({"day": d.isoformat(), "completeness": None if c is None else round(float(c), 4)})
+        d += timedelta(days=1)
+    n = len(out)
+    return {"from": d0.isoformat(), "to": d1.isoformat(), "through": through.isoformat() if n else None, "days_so_far": n,
+            "days_with_data": sum(1 for x in out if x["completeness"]),
+            "days_complete": sum(1 for x in out if (x["completeness"] or 0) >= BASELINE_DAY_COMPLETE),
+            "completeness": round(sum(x["completeness"] or 0.0 for x in out) / n, 4) if n else None, "day_complete_share": BASELINE_DAY_COMPLETE,
+            "days": out}
+
+
+def pilot_kpis(site_id: str) -> list[str]:
+    """The KPIs the pilot measures from the baseline window on (R8 2.13, tab A: "the list of KPIs that will be computed during it"; round 7, audit
+    pages-D-19): the telemetry day totals the site's connection and assets give, by their keys in telemetry_days (outage_hours from
+    outage_minutes), as the Savings page's energy figures name them."""
+    site = sites.full(site_id) or {}
+    assets = site.get("assets") or {}
+    conns = site.get("connections") or []
+    regime = conns[0]["data"].get("regime") if conns else "off_grid"
+    keys = []
+    if regime != "off_grid":
+        keys += ["import_kwh", "peak_import_kwh", "peak_kw"] + (["export_kwh"] if regime in ("net_billing", "net_metering_legacy") else []) + ["outage_hours"]
+    if assets.get("pv"):
+        keys.append("pv_kwh")
+    keys.append("load_kwh")
+    if assets.get("battery"):
+        keys += ["throughput_kwh", "min_soc"]
+    if assets.get("genset"):
+        keys += ["genset_hours", "litres"]
+    return keys + ["unserved_kwh"]
+
+
 TUNED_VARIANTS = [(fp, hb, gc) for fp in (20, 40) for hb in (False, True) for gc in (0, 80)]
 
 #: HOMER cycle charging's set points (state of charge, %) the tuned fit tries at a genset site with a battery (plan 8.1: "at genset sites additionally
@@ -1403,8 +1453,9 @@ def _price_basis(pr: dict, fuel: float | None) -> str:
 
 def _month_fingerprint(site_id: str, conn: dict | None, p0: date, p1: date) -> str:
     """What a billing month's stored days were priced and replayed on, short of reading its minutes: every tariff version (rates, calendars, taxes,
-    the ICP rule, the adders, such as an FCA approved after the month), the dated fuel prices, the connection's settings, the native captures (and
-    those a started pilot pinned) and the month's telemetry day totals (late data re-aggregates them). While it is unchanged, a settled month needs no re-scoring."""
+    the ICP rule, the adders, such as an FCA approved after the month), the dated fuel prices, the connection's settings, the native captures
+    (and those a started pilot pinned) and the month's telemetry day totals (late data re-aggregates them). While it is unchanged, a settled
+    month needs no re-scoring."""
     with store.connect() as con:
         tv = [list(r) for r in con.execute("SELECT id, status, effective_from, effective_to FROM tariff_versions ORDER BY id")]
         fuel = [list(r) for r in con.execute("SELECT kind, valid_from, price FROM fuel_prices ORDER BY kind, valid_from")]

@@ -131,7 +131,7 @@ def fee_put(site_id: str, inp: dict = Body(...)):
 
 PILOT_DEFAULT = {"baseline_start": None, "baseline_days": 14, "criteria": {"min_saving_pct": 8.0, "max_unserved_kwh": 0.0, "reserve_adequacy_pct": 90.0,
                                                                           "fidelity_pct": 80.0, "fee_multiple": 3.0, "forecast_pv_nrmse_max": 0.35},
-                 "signoff": None, "amendments": []}
+                 "signoff": None, "amendments": [], "closures": []}
 
 
 def _pilot_data(r) -> dict:
@@ -142,6 +142,8 @@ def _pilot_data(r) -> dict:
     got = data.get("criteria") if isinstance(data.get("criteria"), dict) else {}
     data["criteria"] = {k: float(got[k]) if isinstance(got.get(k), (int, float)) and not isinstance(got.get(k), bool) else v
                         for k, v in PILOT_DEFAULT["criteria"].items()}
+    if not isinstance(data.get("closures"), list):
+        data["closures"] = []
     # an amendment recorded before round 7 names the keys sent, with no reason and no values (audit flow-savings-pilot-bill-30, pages-D-17)
     data["amendments"] = [{**a, "reason": a.get("reason"), "changes": list(a.get("changes") or []), "values": list(a.get("values") or [])}
                           for a in (data["amendments"] if isinstance(data.get("amendments"), list) else []) if isinstance(a, dict)]
@@ -173,6 +175,8 @@ def _pilot_values(before: dict, after: dict) -> list[dict]:
         a, b = before["criteria"].get(k), after["criteria"].get(k)
         if a != b:
             out.append({"field": f"criteria.{k}", "before": a, "after": b})
+    if before.get("closures") != after.get("closures"):
+        out.append({"field": "closures", "before": before.get("closures"), "after": after.get("closures")})
     return out
 
 
@@ -209,7 +213,10 @@ def _pilot_answer(site_id: str) -> dict:
         capture = verify.native_for_day(site_id, max(today(), date.fromisoformat(pins[-1]["from"])))
         newer = latest if latest and capture and latest["version"] > capture["version"] else None
     return {"pilot": data, "started": r["started"] if r else None, "capture": capture or latest, "capture_newer": newer,
-            "switchback": verify.switchback_blocks(site_id)}
+            "switchback": verify.switchback_blocks(site_id),
+            # tab A: the window's completeness so far and the KPIs the pilot measures (round 7, audit pages-D-19)
+            "baseline_quality": verify.baseline_quality(site_id, data["baseline_start"], data["baseline_days"], today()),
+            "kpis": verify.pilot_kpis(site_id)}
 
 
 @router.put("/api/sites/{site_id}/pilot")
@@ -221,7 +228,8 @@ def pilot_put(site_id: str, inp: dict = Body(...)):
     pages-D-17)."""
     auth.need("start_pilot", "Editing the pilot")
     site_or_404(site_id)
-    sent = check(PilotEdit, inp).model_dump(exclude_unset=True)
+    edit = check(PilotEdit, inp)
+    sent = edit.model_dump(exclude_unset=True)
     reason = sent.pop("reason", "").strip()
     with store.write_transaction() as con:
         r = con.execute("SELECT * FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
@@ -231,6 +239,8 @@ def pilot_put(site_id: str, inp: dict = Body(...)):
             raise Refusal(422, "A started pilot keeps its baseline window: change its first day instead", "invalid")
         if "criteria" in sent:
             sent["criteria"] = {**data["criteria"], **sent["criteria"]}
+        if "closures" in sent:  # tab C's declared holiday closures, in date order (round 7, audit pages-D-19)
+            sent["closures"] = sorted((c.model_dump() for c in edit.closures), key=lambda c: (c["start"], c["end"]))
         adopt = sent.pop("capture_version", None)
         new = {**data, **sent}
         values = _pilot_values(data, new)

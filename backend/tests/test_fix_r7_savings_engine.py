@@ -1254,3 +1254,49 @@ def test_a_capture_is_adopted_only_by_a_started_pilot_and_a_pilot_started_before
         with store.connect() as con:
             con.execute("DELETE FROM pilots WHERE site_id = ?", (sid,))
         assert verify.native_for_day(sid, date(2026, 10, 25))["version"] == 2
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-19: tab A's completeness check and KPI list,
+# ------------------------------------------------------------------------------------------------ tab C's declared holiday closures
+
+def test_the_pilot_answers_the_baseline_windows_completeness_so_far_and_the_kpis_it_measures(world):
+    sid, admin = world.site, world.c["admin"]
+    assert admin.get(f"/api/sites/{sid}/pilot").json()["baseline_quality"] is None  # no window chosen yet
+    today = _pkt_today()
+    start = today - timedelta(days=4)
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"baseline_start": start.isoformat(), "baseline_days": 14}).status_code == 200
+    with world.use(), store.connect() as con:
+        for i, c in ((0, 1.0), (1, 0.5), (3, 0.97), (4, 0.2)):  # day 2 has no data; day 4 is today, not over yet
+            con.execute("INSERT INTO telemetry_days (site_id, day_local, data) VALUES (?,?,?)",
+                        (sid, (start + timedelta(days=i)).isoformat(), json.dumps({"completeness": c, "import_kwh": 10.0})))
+    p = admin.get(f"/api/sites/{sid}/pilot").json()
+    q = p["baseline_quality"]
+    assert (q["from"], q["to"], q["through"]) == (start.isoformat(), (start + timedelta(days=13)).isoformat(), (today - timedelta(days=1)).isoformat())
+    assert (q["days_so_far"], q["days_with_data"], q["days_complete"], q["day_complete_share"]) == (4, 3, 2, 0.95)
+    assert q["completeness"] == round((1.0 + 0.5 + 0.0 + 0.97) / 4, 4)
+    assert [d["completeness"] for d in q["days"]] == [1.0, 0.5, None, 0.97]
+    # the mill is on the grid with a battery and a genset, and no solar
+    assert p["kpis"] == ["import_kwh", "peak_import_kwh", "peak_kw", "outage_hours", "load_kwh", "throughput_kwh", "min_soc", "genset_hours",
+                         "litres", "unserved_kwh"]
+    assert admin.get(f"/api/sites/{world.other}/pilot").json()["kpis"] == ["load_kwh", "unserved_kwh"]
+    # a window that starts tomorrow has no day so far
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"baseline_start": (today + timedelta(days=1)).isoformat()}).status_code == 200
+    q = admin.get(f"/api/sites/{sid}/pilot").json()["baseline_quality"]
+    assert (q["days_so_far"], q["completeness"], q["through"], q["days"]) == (0, None, None, [])
+
+
+def test_holiday_closures_are_declared_in_the_pilot_typed_and_amended_with_a_reason(world):
+    sid = _pilot_ready(world)
+    admin = world.c["admin"]
+    eid = {"start": "2027-03-20", "end": "2027-03-23", "label": "Eid closure"}
+    xmas = {"start": "2026-12-24", "end": "2026-12-26", "label": "Year-end shutdown"}
+    for bad in ([{"start": "2026-12-26", "end": "2026-12-24"}], [{"start": "2026-12-01", "end": "2027-03-01"}], [{"start": "x", "end": "2026-12-24"}],
+                [{**xmas, "kind": "eid"}], [{**xmas, "label": "y" * 81}], [xmas] * 21, None, "Eid"):
+        assert admin.put(f"/api/sites/{sid}/pilot", json={"closures": bad}).status_code == 422, bad
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"closures": [eid, {"start": "2026-12-24", "end": "2026-12-26"}]})
+    assert r.status_code == 200 and r.json()["pilot"]["closures"] == [{**xmas, "label": ""}, eid]  # kept in date order
+    assert _start(world, sid).status_code == 200
+    r = admin.put(f"/api/sites/{sid}/pilot", json={"closures": [xmas, eid], "reason": "The year-end shutdown was named"})
+    assert r.status_code == 200
+    (am,) = r.json()["pilot"]["amendments"]
+    assert am["values"] == [{"field": "closures", "before": [{**xmas, "label": ""}, eid], "after": [xmas, eid]}]
