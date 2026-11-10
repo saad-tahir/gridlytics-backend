@@ -472,10 +472,18 @@ def _native_slots_fit(site_id: str, inp: dict) -> None:
         raise Refusal(422, f"{whose} table holds at most {gram['max_slots']} slots", "invalid")
 
 
+#: A capture sent by a person (POST /native needs edit_sites, which no API key holds) was typed in or taken from a photograph: only the edge device reads the
+#: settings back (audit flow-savings-pilot-bill-12, the form's half: a typed capture was marked "read back by the edge device", the most trusted source)
+NATIVE_NOT_READ_BACK = ("Only the edge device reads the inverter's settings back: a capture sent here was typed in or taken from a photograph of the screen, "
+                        "so say which")
+
+
 @router.post("/api/sites/{site_id}/native")
 def native_post(site_id: str, inp: dict = Body(...)):
     auth.need("edit_sites", "Capturing the native settings")
     site_or_404(site_id)
+    if isinstance(inp, dict) and inp.get("source") == "read_back":
+        raise Refusal(422, NATIVE_NOT_READ_BACK, "invalid")
     _native_slots_fit(site_id, inp)
     try:
         return sites.capture_native(site_id, inp, auth.actor())

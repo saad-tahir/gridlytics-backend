@@ -691,3 +691,24 @@ def test_mode_b_without_an_edge_device_is_a_setup_warning_and_meta_gives_the_fal
         "setup_warnings"]
     # what every plan falls back to (delivery's fallback block), for tab D to show
     assert a.get("/api/meta").json()["fallback"] == {"on_expiry": "inverter_native", "revert_after_hours": delivery.FALLBACK_HOURS}
+
+
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-12, the capture form's half
+
+def test_a_capture_a_person_sends_cannot_claim_the_edge_read_it_back(world):
+    # POST /native is a person's (edit_sites; no API key holds a role permission): a capture typed in or taken from a photograph said it was "read back
+    # by the edge device", the most trusted source, and the pilot's baseline took it as such
+    a, op, sid = world.c["admin"], world.c["operator"], world.site
+    for who in (a, op):
+        r = _native(who, sid, ["00:00", "17:00"], source="read_back")
+        assert r.status_code == 422 and r.json()["code"] == "invalid", r.text
+        assert r.json()["detail"] == ("Only the edge device reads the inverter's settings back: a capture sent here was typed in or taken from a photograph "
+                                      "of the screen, so say which")
+    with world.use():
+        assert sites.native_versions(sid) == []
+    for source in ("entered", "photo"):
+        r = _native(op, sid, ["00:00", "17:00"], source=source)
+        assert r.status_code == 200 and r.json()["body"]["source"] == source, r.text
+    # the edge's own read-back (the demo's captures are made so) is recorded as such
+    with world.use():
+        assert sites.capture_native(sid, {"source": "read_back", "work_mode": "self_use"}, "edge")["body"]["source"] == "read_back"
