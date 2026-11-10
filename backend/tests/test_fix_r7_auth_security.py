@@ -402,6 +402,24 @@ def test_a_refresh_token_used_again_ends_the_access_tokens_of_its_session(world,
     assert anon.get("/api/sites", headers=h).status_code == 401
 
 
+def test_a_signed_out_session_stays_ended_while_its_last_access_token_lives(world, monkeypatch):
+    """Review of security-roles-09: a sign-in clears the refresh tokens of sessions past their last day, and a session signed out in the hour before its
+    last day lost them with it, so its access token, still in its hour, passed again. They are kept an access token's life past the session's end."""
+    import identities
+    from gridlytics import platform as platformdb
+    anon = world.anon
+    one = _sign_in("operator@fix.test", identities.PASSWORD).json()
+    h = identities.headers(one["access_token"], world.company)
+    assert anon.post("/api/local/logout", json={"refresh_token": one["refresh_token"]}).status_code == 200
+    assert anon.get("/api/sites", headers=h).status_code == 401
+    # the session's last day is over a minute ago, and another person's sign-in clears the tokens of the sessions that ended
+    later = platformdb._clock() + platformdb.SESSION_DAYS * 86400 + 60
+    monkeypatch.setattr(platformdb, "_clock", lambda: later)
+    assert _sign_in("analyst@fix.test", identities.PASSWORD).status_code == 200
+    r = anon.get("/api/sites", headers=h)
+    assert r.status_code == 401 and r.json()["code"] == "session_ended", r.text
+
+
 # ------------------------------------------------------------------------------------------------ security-roles-10
 
 def test_wrong_passwords_from_many_addresses_stop_the_account_but_not_where_it_signs_in(world):

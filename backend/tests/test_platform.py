@@ -356,7 +356,12 @@ def test_the_tokens_of_ended_sessions_are_cleared_at_a_sign_in(plat, monkeypatch
     monkeypatch.setattr(plat, "_clock", lambda: start + plat.SESSION_DAYS * 86400 + 1)
     plat.new_refresh(account["id"])
     with closing(sqlite3.connect(plat.db_path())) as con:
-        assert con.execute("SELECT COUNT(*) FROM refresh_tokens").fetchone()[0] == 2        # its two tokens went; the second session and the new one stay
+        # ended, but kept an access token's life, so a signed-out session's access tokens stay refused until they run out (round 7 review)
+        assert con.execute("SELECT COUNT(*) FROM refresh_tokens").fetchone()[0] == 4
+    monkeypatch.setattr(plat, "_clock", lambda: start + plat.SESSION_DAYS * 86400 + plat.ACCESS_MINUTES * 60 + 1)
+    plat.new_refresh(account["id"])
+    with closing(sqlite3.connect(plat.db_path())) as con:
+        assert con.execute("SELECT COUNT(*) FROM refresh_tokens").fetchone()[0] == 3        # its two tokens went; the second session and the new ones stay
 
 
 def test_a_refresh_token_ends_unused_after_its_hours_and_a_session_after_its_days(client, plat, monkeypatch):

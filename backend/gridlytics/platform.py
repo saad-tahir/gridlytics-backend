@@ -526,7 +526,8 @@ def _add_refresh(con: sqlite3.Connection, user_id: str, family: str, session_end
 
 def new_refresh(user_id: str, address: str = "", agent: str = "", *, checked: dict | None = None) -> str | None:
     """The refresh token of a new session of an account (a sign-in), kept as its hash, with the address and the browser (`agent`, its User-Agent) it was
-    made from. The tokens of sessions past their last day go: nothing can renew them, so the table holds a week of sessions, not every one ever made.
+    made from. The tokens of sessions past their last day by more than an access token's life go: nothing can renew them, so the table holds a week of
+    sessions, not every one ever made.
     `checked` is the account as the sign-in's password check read it: None, and no session, when the account was disabled or its password changed since,
     so a reset landing between the check and this leaves no session behind it (audit parity-supabase-auth-01)."""
     with _write() as con:
@@ -534,7 +535,9 @@ def new_refresh(user_id: str, address: str = "", agent: str = "", *, checked: di
             now = con.execute("SELECT disabled, sessions_from FROM accounts WHERE id = ?", (user_id,)).fetchone()
             if now is None or now["disabled"] or now["sessions_from"] != checked["sessions_from"]:
                 return None
-        con.execute("DELETE FROM refresh_tokens WHERE session_ends < ?", (_clock(),))
+        # kept an access token's life past the session's end: a session signed out in its last hour keeps its access tokens refused until they run out
+        # (session_ended reads these rows; round 7 review of audit security-roles-09)
+        con.execute("DELETE FROM refresh_tokens WHERE session_ends < ?", (_clock() - ACCESS_MINUTES * 60,))
         return _add_refresh(con, user_id, uuid.uuid4().hex, _clock() + SESSION_DAYS * 86400, address=address, agent=agent)
 
 
