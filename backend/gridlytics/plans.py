@@ -207,6 +207,23 @@ def delivered_floor_pct(site: dict) -> float:
     return max(bms_low_pct(site) + 2.0, fallback_floor_pct(site))
 
 
+def terminal_cal_hold(b_cal: np.ndarray, c_imp: np.ndarray, load: np.ndarray, pv: np.ndarray, off_grid: bool) -> float:
+    """The terminal value's c_cal_hold (Part 4.4): the calendar cost of holding a kWh from the horizon's end until the next peak uses it, the
+    sum of the per-step slopes over the steps between (round 7, engine-optimiser-10: it was the mean slope of 32 steps, one 15-minute step's
+    cost, Rs 0.03 to 0.1 against Rs 1 to 6 for the hours the energy waits). The next peak is the day after's dearest step, c_next's own (the
+    horizon's last day stands for the day after, as it does for c_next), and off-grid the first step whose load PV does not cover; the slopes
+    are those of the same hours of the horizon's last day."""
+    n = min(96, len(b_cal))
+    if not n:
+        return 0.0
+    if off_grid:
+        short = np.flatnonzero(np.asarray(load, dtype=float)[-n:] > np.asarray(pv, dtype=float)[-n:] + 1e-9)
+        hold = int(short[0]) if len(short) else n
+    else:
+        hold = int(np.argmax(np.asarray(c_imp, dtype=float)[-n:]))
+    return float(np.sum(np.asarray(b_cal, dtype=float)[-n:][:hold]))
+
+
 def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     conn = (site.get("connections") or [None])[0]
     a = site.get("assets") or {}
@@ -340,8 +357,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         if p.get("inverter_kw_ac"):
             kw_next = np.minimum(kw_next, float(p["inverter_kw_ac"]))
         r_next = float(np.mean(kw_next)) * 2.0 / b_asset["eta_d"] if (off_grid or p_next >= p["reserve_threshold"]) and len(kw_next) else 0.0
-        p["terminal"] = {"c_next": c_next, "H_peak": 4.0, "R_next": r_next, "c_cal_hold": float(np.mean(bat["b_cal"][:32])) if steps else 0.0,
-                         "p_next": p_next}
+        p["terminal"] = {"c_next": c_next, "H_peak": 4.0, "R_next": r_next,
+                         "c_cal_hold": terminal_cal_hold(bat["b_cal"], vec["c_imp"], L, PV, off_grid), "p_next": p_next}
     return p
 
 

@@ -7,7 +7,7 @@ from datetime import date
 import numpy as np
 import pytest
 
-from gridlytics import forecast, optimise, plans, sites, store, telemetry, twin
+from gridlytics import forecast, optimise, plans, sites, solar, store, telemetry, twin
 
 H = 0.25
 
@@ -1307,3 +1307,36 @@ def test_the_cost_lines_add_up_to_the_objective():
     E = np.asarray(r["sol"]["E"])
     assert bd["calendar_rs"] == pytest.approx(0.04 * float(np.sum(E[1:])), abs=0.01)
     assert sum(bd[k] for k in LINES) == pytest.approx(r["objective_rs"], abs=2.0)
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-10
+
+def test_the_terminal_value_takes_the_calendar_cost_of_holding_the_energy_to_the_next_peak(company):
+    """Golden. v_end = eta_d c_next - c_cyc - c_cal_hold, c_cal_hold the calendar cost of holding a kWh until the next peak (Part 4.4). It was
+    the mean of b_cal over 32 steps, one 15-minute step's slope (Rs 0.04), while energy left at a 07:00 horizon end waits 11 hours for the
+    18:00 peak: the sum of the slopes over those 44 steps (the same hours of the horizon's last day stand for the day after, as for c_next)."""
+    sid = _battery_site()
+    full = sites.full(sid)
+    t0 = twin.day_start_utc(date(2026, 11, 10)) + 7 * 3600            # 07:00: the 48 hours end at 07:00 on the 12th
+    p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 192)
+    assert int(np.argmax(np.asarray(p["peak"], dtype=bool)[96:])) == 44  # the peak starts at 18:00, 44 steps after 07:00
+    ts = np.asarray(p["ts"])[96:140] + 86400                           # 07:00 to 17:45 on the day after the horizon
+    temp = solar.air_temp(ts, solar.local_month(ts) - 1) + 7.0          # the enclosure's 7 C above the air (enclosure_temp_offset_c)
+    want = float(np.sum(optimise.calendar_slope(temp, 52000.0)))
+    assert p["terminal"]["c_cal_hold"] == pytest.approx(want, rel=1e-6)
+    assert 1.0 < p["terminal"]["c_cal_hold"] < 3.0                      # before: Rs 0.04
+    # and the plan's v_end deducts it
+    r = optimise.solve(p, time_limit=30.0)
+    assert r["v_end"] == pytest.approx(max(0.0, p["battery"]["eta_d"] * p["terminal"]["c_next"] - p["battery"]["c_cyc"] - want), abs=1e-6)
+
+
+def test_the_holding_time_runs_to_the_dearest_step_or_off_grid_to_the_first_step_pv_does_not_cover():
+    b_cal = np.full(192, 0.05)
+    c_imp = np.full(192, 28.0)
+    c_imp[96 + 40:96 + 56] = 60.0                                       # the last day's peak from its 40th step
+    assert plans.terminal_cal_hold(b_cal, c_imp, np.zeros(192), np.zeros(192), off_grid=False) == pytest.approx(40 * 0.05)
+    L, PV = np.full(192, 30.0), np.zeros(192)
+    PV[96:96 + 30] = 50.0                                               # PV covers the load for the last day's first 30 steps
+    assert plans.terminal_cal_hold(b_cal, np.zeros(192), L, PV, off_grid=True) == pytest.approx(30 * 0.05)
+    # a calendar cost switched off holds nothing
+    assert plans.terminal_cal_hold(np.zeros(192), c_imp, L, PV, off_grid=False) == 0.0
