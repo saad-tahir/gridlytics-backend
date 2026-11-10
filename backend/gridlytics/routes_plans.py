@@ -103,13 +103,27 @@ def plan_apply(site_id: str, inp: dict = Body(...)):
         raise bad(exc) from None
 
 
+#: R8 2.9: the compare drawer needs the native-settings capture and a day of data
+COMPARE_MIN_DATA_S = 86400
+
+
 @router.get("/api/sites/{site_id}/plan/compare")
 def plan_compare(site_id: str):
-    """The active plan against the inverter's native settings, both replayed through the twin on the plan's own forecast for its horizon."""
+    """The active plan against the inverter's native settings, both replayed through the twin on the plan's own forecast for its horizon.
+
+    `{compare: null, reason}` until it can be made (round 7): no_plan, no_battery, no_capture (the native arm replays the captured settings, never
+    an assumed self-use table) or too_little_data (under a day of readings; R8 2.9: "Needs the native-settings capture and 1 day of data"). `native`
+    names the capture replayed."""
+    from . import telemetry
     s = full_or_404(site_id)
     p = plans.current(site_id)
     if p is None or not (s.get("assets") or {}).get("battery"):
-        return {"compare": None}
+        return {"compare": None, "reason": "no_plan" if p is None else "no_battery"}
+    if not s.get("native"):
+        return {"compare": None, "reason": "no_capture"}
+    first = telemetry.first_ts(site_id)
+    if first is None or now_ts() - int(first) < COMPARE_MIN_DATA_S:
+        return {"compare": None, "reason": "too_little_data"}
     steps = p["steps"]
     ts = np.repeat([st["t"] for st in steps], 15) + np.tile(np.arange(15) * 60, len(steps))
     rep = lambda k: np.repeat([st[k] for st in steps], 15).astype(float)
@@ -125,7 +139,7 @@ def plan_compare(site_id: str):
                       "energy_rs": round(float((c_imp * sim["imp"] - c_exp * sim["exp"]).sum() / 60), 0), "litres": round(float(sim["fuel"].sum()), 1),
                       "unserved_kwh": round(float(sim["unserved"].sum() / 60), 1), "min_soc_pct": round(float(sim["soc"].min() * 100), 1),
                       "soc": [round(float(x) * 100, 1) for x in sim["soc"][::15]]}
-    return out({"compare": arms, "t": [st["t"] for st in steps]})
+    return out({"compare": arms, "t": [st["t"] for st in steps], "native": {"version": s["native"]["version"], "captured_at": s["native"]["captured_at"]}})
 
 
 # ------------------------------------------------------------------------------------------------ control (UI-15)

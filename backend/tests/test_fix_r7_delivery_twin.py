@@ -418,6 +418,7 @@ def test_compare_with_native_burns_the_plans_genset_hours_not_the_whole_slots(wo
     steps = _outage_day()
     comp = delivery.compile_mode_a(steps, "voltronic", SMALL, 20.0)
     monkeypatch.setattr(plans, "current", lambda site_id, *a, **k: {"id": "p1", "slots": comp, "steps": steps, "summary": {}})
+    _compare_ready(world)
     arms = world.c["admin"].get(f"/api/sites/{world.site}/plan/compare").json()["compare"]
     assert 28.0 <= arms["plan"]["litres"] <= 36.0, arms["plan"]           # 50 L before: the set ran through the whole outage
 
@@ -700,3 +701,53 @@ def test_an_export_slot_discharges_only_what_the_load_and_the_export_cap_take_an
     # surplus PV beyond the cap in an export slot is stored, not curtailed, while the battery has room
     sunny = twin.simulate(_flat_series(ts, 10.0, pv=60.0), twin.slots_policy(slots, ts), twin.plant_of(site), 0.5)
     assert float(sunny["exp"].max()) == pytest.approx(20.0) and float(sunny["bat"].max()) <= 0.0 and float(sunny["curtail"].sum()) == 0.0
+
+
+# ------------------------------------------------------------------------------------------------ batch 3: the compare with native (pages-B-14, engine-plans-live-10)
+
+def _compare_ready(w, backup_soc: float = 20.0) -> None:
+    """What the compare drawer needs (R8 2.9): the inverter's native settings captured, and a day of data (a reading two days ago)."""
+    from test_fix_api import _now
+
+    from gridlytics import sites, telemetry
+    with w.use():
+        sites.capture_native(w.site, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": backup_soc}, "test")
+        telemetry.ingest(w.site, [{"ts": _now() // 60 * 60 - 2 * 86400, "grid_present": 1}], "edge")
+
+
+def _reserve_plan() -> tuple[list[dict], dict]:
+    """Two hours of an 80 kW load (20 kW critical) with no PV and the grid up, the battery at 60 %; an outage may start in the second hour (a 30 %
+    chance each quarter), for which the plan holds 60 %, so its one slot is a hold at 60 %. Native self-use spends it on the load first."""
+    from test_fix_api import _now
+    t0 = _now() // 900 * 900
+    steps = [{"t": t0 + 900 * i, "local": "", "reason": "hold_for_outage", "detail": "", "pv_forecast_kw": 0.0, "load_kw": 80.0, "critical_kw": 20.0,
+              "grid_present": 1.0, "soc_start_pct": 60.0, "soc_pct": 60.0, "c_imp": 30.0, "c_exp": 0.0, "peak": False, "genset_on": False,
+              "p_start": 0.3 if i >= 4 else 0.0, "reserve_pct": 60.0 if i >= 4 else 10.0} for i in range(8)]
+    slot = {"start": "", "end": "", "start_ts": t0, "end_ts": t0 + 7200, "mode": "hold", "soc_floor_pct": 60.0, "soc_target_pct": 60.0,
+            "max_discharge_w": None, "max_charge_w": None, "grid_charge": False, "grid_cap_w": None, "genset": None, "genset_runs": []}
+    return steps, {"days": [{"date": "x", "slots": [slot]}], "fallback": None}
+
+
+def test_the_compare_drawer_needs_the_native_capture_and_a_day_of_data(world, monkeypatch):
+    """R8 2.9: the drawer is 'disabled with "Needs the native-settings capture and 1 day of data"'. With no capture the native arm was
+    twin.native_policy's assumed self-use table at a 20 % backup, which the page called 'the captured native settings', in rupees."""
+    from gridlytics import plans
+    steps, comp = _reserve_plan()
+    url, a = f"/api/sites/{world.site}/plan/compare", world.c["admin"]
+    monkeypatch.setattr(plans, "current", lambda site_id, *x, **k: None)
+    assert a.get(url).json() == {"compare": None, "reason": "no_plan"}
+    monkeypatch.setattr(plans, "current", lambda site_id, *x, **k: {"id": "p1", "slots": comp, "steps": steps, "summary": {}})
+    assert a.get(url).json() == {"compare": None, "reason": "no_capture"}            # figures against an assumed table before
+    from gridlytics import sites
+    with world.use():
+        sites.capture_native(world.site, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 20.0}, "test")
+    assert a.get(url).json() == {"compare": None, "reason": "too_little_data"}
+    from test_fix_api import _now
+
+    from gridlytics import telemetry
+    with world.use():
+        telemetry.ingest(world.site, [{"ts": _now() // 60 * 60 - 2 * 86400, "grid_present": 1}], "edge")
+    r = a.get(url).json()
+    assert r["compare"]["native"]["import_kwh"] > 0 and r["native"]["version"] == 1 and r["native"]["captured_at"]
+    assert "energy_rs" not in str(world.c["viewer"].get(url).json())
+
