@@ -35,7 +35,9 @@ from .schemas import Refusal
 log = logging.getLogger("gridlytics")
 if not log.handlers and os.environ.get("GRIDLYTICS_LOGS", "1") == "1":
     try:
-        _logs = store.DB_PATH.parent / "logs"
+        # the data folder in use (GRIDLYTICS_DATA_DIR, else the default database's folder): a scratch run's log is the scratch folder's, never the
+        # owner's data/ (audit parity-architecture-05)
+        _logs = platformdb.data_dir() / "logs"
         _logs.mkdir(parents=True, exist_ok=True)
         _handler = RotatingFileHandler(_logs / "gridlytics.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8")
         _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))

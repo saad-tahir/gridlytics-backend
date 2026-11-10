@@ -692,3 +692,27 @@ def test_a_person_the_founder_removed_leaves_members_and_cannot_be_switched_on_o
     store_founder.follow_membership(cid, viewer, "active")
     assert viewer in {u["id"] for u in a.get("/api/users").json()}
     assert a.put(f"/api/users/{viewer}", json={"role": "analyst"}).status_code == 200
+
+
+# ------------------------------------------------------------------------------------------------ parity-architecture-05 (performance-live-07, the log half)
+
+def test_the_api_writes_its_log_in_the_data_folder_in_use(tmp_path):
+    """The API logged beside GRIDLYTICS_DB's default (the backend's data/, the owner's folder) whatever GRIDLYTICS_DATA_DIR said, so every scratch run
+    wrote its log there. The log is in <the data folder in use>/logs. Run in a Python of its own: the log is set up when the API is imported."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    default, scratch = tmp_path / "default", tmp_path / "scratch"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GRIDLYTICS_")}
+    env.update(GRIDLYTICS_DB=str(default / "gridlytics.db"), GRIDLYTICS_DATA_DIR=str(scratch), PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    said = "import logging, gridlytics.api; logging.getLogger('gridlytics').warning('a scratch run says this')"
+    run = subprocess.run([sys.executable, "-c", said], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert "a scratch run says this" in (scratch / "logs" / "gridlytics.log").read_text(encoding="utf-8")
+    assert not (default / "logs").exists()
+    # with no data folder named, the log is beside the database, as before
+    env.pop("GRIDLYTICS_DATA_DIR")
+    run = subprocess.run([sys.executable, "-c", said], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert (default / "logs" / "gridlytics.log").exists()
