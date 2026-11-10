@@ -1205,3 +1205,18 @@ def test_forecast_issues_are_kept_hourly_for_35_days_then_only_each_day_s_day_ah
     # another kind and another site are pruned by their own saves, not this one
     assert len(_issue_rows(sid, "load")) == len(_issue_rows(other, "pv")) == len(quarters) - 1 - 25
     assert (telemetry.ISSUE_ALL_DAYS, telemetry.ISSUE_HOURLY_DAYS) == (3, 35)
+
+
+# ================================================================================================ review
+
+def test_a_month_at_the_calendar_s_edge_is_refused_in_one_sentence_not_a_server_error(world):
+    """Review of pages-C-15: GET /genset?month=9999-12 built the month's end as year 10000, and 0001-01 the month before it as year 0, both a 500. A month
+    before 2015 (the first a telemetry row may carry) or past 9998 is refused in one sentence; 2015-01 is answered, its month before read as stored."""
+    c = world.owner
+    sid = _route_site(c, "Edges")
+    for month in ("9999-12", "0000-01", "0001-01", "2014-12"):
+        r = c.get(f"/api/sites/{sid}/genset", params={"month": month})
+        assert r.status_code == 422 and r.json()["detail"].endswith("."), (month, r.status_code, r.text)
+    r = c.get(f"/api/sites/{sid}/genset", params={"month": "2015-01"})
+    assert r.status_code == 200, r.text
+    assert r.json()["previous"]["month"] == "2014-12" and r.json()["kpis"]["hours"] is None

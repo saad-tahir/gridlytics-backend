@@ -395,13 +395,25 @@ REFIT_MIN_POINTS = 3
 REFIT_MIN_SPREAD = 0.1
 
 
+#: the first year a genset month may be: a telemetry row is dated 2015 or later (telemetry.EARLIEST_TS); the last keeps the month after it a calendar date
+MONTH_FIRST_YEAR = datetime.fromtimestamp(telemetry.EARLIEST_TS, timezone.utc).year
+MONTH_LAST_YEAR = 9998
+
+
+def _month_bounds(month: str) -> tuple[int, int]:
+    """[start, end) of a "YYYY-MM" Karachi month, unchecked (the caller's month, or the one before a checked month)."""
+    y, mo = int(month[:4]), int(month[5:7])
+    return int(datetime(y, mo, 1, tzinfo=PKT).timestamp()), int(datetime(y + mo // 12, mo % 12 + 1, 1, tzinfo=PKT).timestamp())
+
+
 def _month_window(month: str, now: int) -> tuple[int, int]:
     m = re.fullmatch(r"(\d{4})-(\d{2})", (month or "").strip())
     if not m or not 1 <= int(m.group(2)) <= 12:
         raise bad(ValueError("The month must be written as year and month, for example 2026-11."))
-    y, mo = int(m.group(1)), int(m.group(2))
-    t0 = int(datetime(y, mo, 1, tzinfo=PKT).timestamp())
-    t1 = int(datetime(y + mo // 12, mo % 12 + 1, 1, tzinfo=PKT).timestamp())
+    if not MONTH_FIRST_YEAR <= int(m.group(1)) <= MONTH_LAST_YEAR:
+        # 9999-12 ended in the year 10000 and 0001-01's month before began in the year 0: both were a server error (review r7 pages-C-15)
+        raise bad(ValueError(f"The month must be from {MONTH_FIRST_YEAR} on, the first year telemetry is kept for."))
+    t0, t1 = _month_bounds(m.group(0))
     if t0 >= now:
         raise bad(ValueError("That month has not started yet."))
     return t0, min(t1, now)
@@ -505,7 +517,8 @@ def genset_page(site_id: str, days: int = 14, month: str | None = None):
               "policy": "Gridlytics never starts or stops the genset itself: it asks, with a reason, and records whether the advice was followed."}
     if period["kind"] == "month":
         pm = _previous_month(period["month"])
-        p0, p1 = _month_window(pm, now)
+        p0, p1 = _month_bounds(pm)  # the month before a checked month: 2015-01's is 2014-12, read as stored (nothing), never refused
+        p1 = min(p1, now)
         prev = _run_kpis(telemetry.genset_runs(site_id, p0, p1, g))
         answer["previous"] = {"month": pm, **{k: prev[k] for k in ("hours", "starts", "litres", "kwh")}}
     return out(answer)
