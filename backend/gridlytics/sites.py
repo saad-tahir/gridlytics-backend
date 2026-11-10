@@ -314,11 +314,24 @@ GENSET_UPPER = {"c_start_rs": (1_000_000, "The cost per start is at most Rs 1,00
                 "tank_l": (1_000_000, "The tank holds at most 1,000,000 L")}
 
 
+#: Each fuel's typical curve and tank, taken where a save leaves them out (audit flow-onboarding-10: a captive gas engine kept the diesel curve, 0.273 litres
+#: a kWh read as MMBtu, so its fuel cost came out about 35 times too high and the plan never ran it). Diesel is in litres; captive gas and RLNG are in
+#: MMBtu, the unit their price is set in (tariff_data's fuel prices), with the demo's gas engine's curve (0.0085 MMBtu a kWh, about 40 % efficient, and
+#: 0.0010 MMBtu an hour per rated kW at no load). Both gases are piped: no tank, which the plan reads as no fuel limit.
+FUEL_CURVES = {"hsd": {"a": 0.273, "b": 0.033, "tank_l": 2000.0},
+               "gas_captive": {"a": 0.0085, "b": 0.0010, "tank_l": 0.0},
+               "lng_captive": {"a": 0.0085, "b": 0.0010, "tank_l": 0.0}}
+GAS_FUELS = ("gas_captive", "lng_captive")
+#: A curve in the other fuel's unit: a diesel slope under 0.1 L a kWh would burn under one kWh of diesel for a kWh out, and a gas slope over 0.05 MMBtu
+#: a kWh (under 7 % efficient) or a no-load term over 0.01 MMBtu an hour per rated kW is a diesel curve in litres
+HSD_A_MIN, GAS_A_MAX, GAS_B_MAX = 0.1, 0.05, 0.01
+
+
 class GensetFields(Strict):
     rated_kw: float = Field(gt=0, le=50000)
     f_min: float = Field(0.3, ge=0.0, le=1.0)
     fuel_kind: Literal["hsd", "gas_captive", "lng_captive"] = "hsd"
-    #: HOMER's convention: fuel units per hour = b * rated_kw * on + a * output_kw (litres, or m3 / MMBtu for gas)
+    #: HOMER's convention: fuel units per hour = b * rated_kw * on + a * output_kw (litres of diesel, or MMBtu of captive gas or RLNG: FUEL_CURVES)
     a: float = Field(0.273, gt=0, le=5)
     b: float = Field(0.033, ge=0, le=1)
     c_start_rs: float = Field(1500.0, ge=0)
@@ -339,6 +352,28 @@ class GensetFields(Strict):
         if v > hi:
             raise ValueError(words)
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fuel_defaults(cls, v):
+        """The fuel's own curve and tank where the save leaves them out (FUEL_CURVES), not diesel's whatever the fuel."""
+        if isinstance(v, dict) and v.get("fuel_kind") in FUEL_CURVES:
+            v = {**{k: x for k, x in FUEL_CURVES[v["fuel_kind"]].items() if k not in v}, **v}
+        return v
+
+    @model_validator(mode="after")
+    def _fuel_units(self):
+        """A curve in the fuel's own unit, and no tank on piped gas."""
+        if self.fuel_kind in GAS_FUELS:
+            if self.a > GAS_A_MAX:
+                raise ValueError(f"A gas genset's fuel curve is in MMBtu: its slope (a) is at most {GAS_A_MAX} MMBtu per kWh")
+            if self.b > GAS_B_MAX:
+                raise ValueError(f"A gas genset's fuel at no load (b) is at most {GAS_B_MAX} MMBtu an hour per rated kW")
+            if self.tank_l > 0:
+                raise ValueError("A genset on piped gas has no tank: its tank is 0 L")
+        elif self.a < HSD_A_MIN:
+            raise ValueError(f"A diesel genset's fuel curve is in litres: its slope (a) is at least {HSD_A_MIN} L per kWh")
+        return self
 
 
 ASSET_MODELS = {"pv": PvFields, "inverter": InverterFields, "battery": BatteryFields, "genset": GensetFields}

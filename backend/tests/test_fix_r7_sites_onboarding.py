@@ -34,6 +34,10 @@ engine-tariffs-05 (and flow-onboarding-13, engine-money-live-10): {strn: false} 
 out; the ICP baseline took any key and figure; Tariff F's season took any numbers. A connection without an STRN now bears its GST (saying it recovers it
 is refused), the baseline is by calendar month in kWh from 0, the season is six distinct months at least on an industrial connection, and GET /api/meta
 names the categories the ICP applies to.
+
+flow-onboarding-10: a captive gas or RLNG genset kept the diesel fuel curve (0.273 litres a kWh read as MMBtu), so its fuel cost came out about 35 times
+too high and the plan never ran it. A gas genset now takes the gas curve in MMBtu and no tank where they are left out, and a curve in the other fuel's
+unit, or a tank on piped gas, is refused.
 """
 from __future__ import annotations
 
@@ -484,3 +488,34 @@ def test_tax_flags_the_icp_baseline_and_tariff_f_are_checked_and_no_strn_bears_t
     # GET /meta names the categories the ICP applies to, for the web app's tab C
     meta = a.get("/api/meta").json()
     assert "B-2(b)" in meta["icp_categories"] and "A-2(c)" not in meta["icp_categories"]
+
+
+# ------------------------------------------------------------------------------------------------ flow-onboarding-10
+
+def test_a_gas_genset_takes_the_gas_curve_in_mmbtu_and_no_tank(world):
+    a, sid = world.c["admin"], world.site
+    put = lambda **body: a.put(f"/api/sites/{sid}/assets/genset", json={"rated_kw": 800, **body})  # noqa: E731
+    # the fuel's typical curve where the save leaves it out: diesel in litres with a tank, captive gas and RLNG in MMBtu (their price's unit), piped
+    for kind, curve in (("hsd", (0.273, 0.033, 2000.0)), ("gas_captive", (0.0085, 0.0010, 0.0)), ("lng_captive", (0.0085, 0.0010, 0.0))):
+        r = put(fuel_kind=kind)
+        assert r.status_code == 200, r.text
+        g = r.json()["assets"]["genset"]
+        assert (g["a"], g["b"], g["tank_l"]) == curve, (kind, g)
+    # a full-load kWh of an 800 kW RLNG engine costs about Rs 46 at the placeholder Rs 4,800 an MMBtu, not about Rs 1,469 on the diesel curve
+    with world.use():
+        from datetime import date
+        from gridlytics import tariffs
+        price, _ = tariffs.fuel_price("lng_captive", date(2026, 11, 2))
+        g = sites.assets(sid)["genset"]
+    assert price == 4800.0
+    assert (g["a"] * 800 + g["b"] * 800) * price / 800 == pytest.approx(45.6)
+    # the other fuel's curve, or a tank on piped gas, is refused in a sentence
+    for body, sentence in (({"fuel_kind": "gas_captive", "a": 0.273, "b": 0.001},
+                            "A gas genset's fuel curve is in MMBtu: its slope (a) is at most 0.05 MMBtu per kWh"),
+                           ({"fuel_kind": "gas_captive", "b": 0.033}, "A gas genset's fuel at no load (b) is at most 0.01 MMBtu an hour per rated kW"),
+                           ({"fuel_kind": "lng_captive", "tank_l": 2000}, "A genset on piped gas has no tank: its tank is 0 L"),
+                           ({"fuel_kind": "hsd", "a": 0.0085, "b": 0.001},
+                            "A diesel genset's fuel curve is in litres: its slope (a) is at least 0.1 L per kWh")):
+        r = put(**body)
+        assert r.status_code == 422 and r.json()["detail"] == sentence, (body, r.text)
+    assert sites.GensetFields.model_validate({"rated_kw": 1000, "fuel_kind": "gas_captive", "a": 0.0085, "b": 0.0010, "tank_l": 0}).a == 0.0085
