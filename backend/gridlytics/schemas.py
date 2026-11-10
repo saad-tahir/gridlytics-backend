@@ -144,3 +144,24 @@ class PilotStart(Strict):
     """`POST /sites/:id/pilot/start`: the full name of who signs the pilot off (round 7, audit flow-savings-pilot-bill-09)."""
 
     name: str = Field(min_length=1, max_length=120)
+
+
+class SwitchbackPaint(Strict):
+    """`PUT /sites/:id/switchback`: the calendar's first day, its pairs of blocks (`fortnights`: a fortnight of 7-day blocks, six days of 3-day
+    ones) and the block length (round 7, audit security-roles-06). The route refuses a first day before tomorrow."""
+
+    start: str
+    fortnights: int = Field(4, ge=1, le=26, strict=True)
+    block_days: int = Field(7, strict=True)
+
+    @field_validator("start")
+    @classmethod
+    def _first(cls, v):
+        return _iso_day(v, "The calendar's first day")
+
+    @field_validator("block_days")
+    @classmethod
+    def _length(cls, v):
+        if v not in (3, 7):
+            raise ValueError("A block is 3 or 7 days long")
+        return v

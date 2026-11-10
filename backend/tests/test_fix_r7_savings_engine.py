@@ -1081,6 +1081,13 @@ def _pilot_ready(w) -> str:
     return w.site
 
 
+def _tier(w, sid: str, tier: str) -> None:
+    """The site's effective control tier: what its source can do and what an administrator allows, both set to `tier`."""
+    with w.use():
+        sites.set_tier_capable(sid, tier)
+        sites.set_tier_allowed(sid, tier, "t")
+
+
 def _start(w, sid: str, name: str = "Plant manager"):
     return w.c["admin"].post(f"/api/sites/{sid}/pilot/start", json={"name": name})
 
@@ -1300,6 +1307,80 @@ def test_holiday_closures_are_declared_in_the_pilot_typed_and_amended_with_a_rea
     assert r.status_code == 200
     (am,) = r.json()["pilot"]["amendments"]
     assert am["values"] == [{"field": "closures", "before": [{**xmas, "label": ""}, eid], "after": [xmas, eid]}]
+
+
+# ------------------------------------------------------------------------------------------------ security-roles-06: the draw, the start after today,
+# ------------------------------------------------------------------------------------------------ and only blocks painted before they began count
+
+def test_the_calendar_is_drawn_from_os_entropy_after_today_stored_audited_and_only_blocks_painted_ahead_count(world, monkeypatch):
+    sid, admin, operator = world.site, world.c["admin"], world.c["operator"]
+    _tier(world, sid, "advisory_writes")
+    today = _pkt_today()
+    for start in (today.isoformat(), (today - timedelta(days=30)).isoformat(), "2026-02-30", None, 20261120):
+        r = operator.put(f"/api/sites/{sid}/switchback", json={"start": start, "fortnights": 4, "block_days": 7})
+        assert r.status_code == 422 and r.json()["code"] == "invalid", (start, r.text)
+    with world.use():
+        assert verify.switchback_blocks(sid) == []
+    # the arms come from the operating system's entropy, never a generator seeded by the clock
+    bits = iter([1, 0, 0, 1, 0, 0, 0, 0])
+    monkeypatch.setattr(verify.secrets, "randbits", lambda k: next(bits))
+    monkeypatch.setattr(verify.np.random, "default_rng", lambda *a, **k: pytest.fail("a seeded generator drew the arms"))
+    tomorrow = today + timedelta(days=1)
+    r = operator.put(f"/api/sites/{sid}/switchback", json={"start": tomorrow.isoformat(), "fortnights": 4, "block_days": 7})
+    assert r.status_code == 200, r.text
+    arms = ["plan", "native", "native", "plan", "native", "plan", "plan", "native"]
+    assert [b["arm"] for b in r.json()] == arms
+    cal = admin.get(f"/api/sites/{sid}/pilot").json()["calendar"]
+    assert (cal["draw"], cal["painted_on"], cal["paint_count"], cal["pairs"], cal["block_days"]) == ("os_entropy", today.isoformat(), 1, 4, 7)
+    assert cal["by"] and cal["painted_at"]
+    (line,) = _audit_lines(world, "painted the switchback calendar")
+    assert line["detail"]["arms"] == arms and line["detail"]["draw"] == "os_entropy" and line["detail"]["start"] == tomorrow.isoformat()
+    # a repaint before the start is counted and audited with its own arms
+    r = operator.put(f"/api/sites/{sid}/switchback", json={"start": tomorrow.isoformat(), "fortnights": 2, "block_days": 7})
+    assert [b["arm"] for b in r.json()] == ["native", "plan", "native", "plan"]
+    assert admin.get(f"/api/sites/{sid}/pilot").json()["calendar"]["paint_count"] == 2
+    assert [a["detail"]["arms"] for a in _audit_lines(world, "painted the switchback calendar")] in ([arms, ["native", "plan", "native", "plan"]],
+                                                                                                   [["native", "plan", "native", "plan"], arms])
+    monkeypatch.undo()
+    with world.use():
+        assert all(b["painted_before_start"] for b in verify.switchback_blocks(sid))
+        # eight weeks painted after they began (backdated): none counts toward the eight weeks, so nothing loses its Preliminary for them
+        verify.plan_switchback(sid, today - timedelta(days=70), 4, 7, "t", seed=3)
+        blocks = verify.switchback_blocks(sid)
+        assert len(blocks) == 8 and not any(b["painted_before_start"] for b in blocks)
+        assert verify._switchback_weeks(blocks, today) == 0 and verify.switchback_result(sid)["switchback_weeks"] == 0
+        assert verify.paint_record(sid)["draw"] == "seeded"
+        # the same eight weeks painted the day before they began count (before: any block that had ended counted, painted when it may)
+        verify.plan_switchback(sid, today - timedelta(days=70), 4, 7, "t", seed=3, painted_on=today - timedelta(days=71))
+        assert verify._switchback_weeks(verify.switchback_blocks(sid), today) == 8
+        # a block the recorded paint did not draw (written some other way) counts for nothing
+        with store.connect() as con:
+            con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,0)",
+                        (sid, (today - timedelta(days=14)).isoformat(), (today - timedelta(days=8)).isoformat(), "plan"))
+        blocks = verify.switchback_blocks(sid)
+        assert [b["painted_before_start"] for b in blocks][-1] is False and verify._switchback_weeks(blocks, today) == 8
+
+
+def test_a_calendar_locked_before_the_paint_record_counts_the_blocks_that_began_after_the_pilots_start(world):
+    """A real pilot started before round 7 has no paint record: the blocks its start locked that began after the start's day were painted before
+    they began (the paint precedes the lock), so they keep counting towards the 8 weeks; the rest, and any unlocked block, count for nothing."""
+    sid, today = world.site, _pkt_today()
+    began = today - timedelta(days=60)
+    with world.use(), store.connect() as con:
+        for k in range(8):  # the first block began the week before the start, the second on the start's day (the start came after its midnight)
+            a = began - timedelta(days=7) + timedelta(days=7 * k)
+            con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,1)",
+                        (sid, a.isoformat(), (a + timedelta(days=6)).isoformat(), "plan" if k % 2 else "native"))
+        con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?)",
+                    (sid, "{}", f"{began.isoformat()}T05:00:00+00:00", f"{began.isoformat()}T05:00:00+00:00"))
+    with world.use():
+        assert verify.paint_record(sid) is None
+        blocks = verify.switchback_blocks(sid)
+        assert [b["painted_before_start"] for b in blocks] == [False, False] + [True] * 6
+        assert verify._switchback_weeks(blocks, today) == 6
+        with store.connect() as con:
+            con.execute("UPDATE switchback SET locked = 0 WHERE site_id = ?", (sid,))
+        assert not any(b["painted_before_start"] for b in verify.switchback_blocks(sid))
 
 
 # ------------------------------------------------------------------------------------------------ security-roles-14 (flow-savings-pilot-bill-26): the

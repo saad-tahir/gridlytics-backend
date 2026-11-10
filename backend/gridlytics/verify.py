@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
@@ -2259,31 +2260,83 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
 
 # ------------------------------------------------------------------------------------------------ switchback (Part 8.2)
 
-def plan_switchback(site_id: str, start: date, fortnights: int, block_days: int, by: str, seed: int | None = None) -> list[dict]:
-    """Paint the calendar: a coin flip per fortnight. Refused once the pilot has locked it (a repaint would re-roll or overlap the signed-off blocks)."""
-    rng = np.random.default_rng(seed if seed is not None else int(datetime.now().timestamp()))
+def _paint_key(site_id: str) -> str:
+    return f"switchback:{site_id}"
+
+
+def paint_record(site_id: str) -> dict | None:
+    """The calendar's paint as stored with it (round 7, audit security-roles-06): when (`painted_at`, and `painted_on`, the Pakistan day it stands
+    for), by whom, how the arms were drawn (`draw`: "os_entropy", or "seeded" for the demo and tests), the pairs, the block length, the blocks it
+    drew and how many times the calendar has been painted. None for a calendar painted before the record existed."""
+    rec = store.get_setting(_paint_key(site_id))
+    return rec if isinstance(rec, dict) else None
+
+
+def plan_switchback(site_id: str, start: date, fortnights: int, block_days: int, by: str, seed: int | None = None,
+                    painted_on: date | None = None) -> list[dict]:
+    """Paint the calendar: a coin flip per pair of blocks (a fortnight of 7-day blocks, six days of 3-day ones). Round 7 (audit security-roles-06):
+    the flips come from the operating system's entropy (`secrets`), so nobody can work the arms out in advance (before: a generator seeded by the
+    clock's second); a `seed` (the demo, tests) draws reproducibly and is recorded as "seeded". The paint is stored with the calendar
+    (paint_record), written with the blocks in one transaction and audited with its arms. `painted_on` is the Pakistan day of the paint (today;
+    the demo's history paints on the day it starts), so only blocks painted before they began count towards the 8 weeks (_switchback_weeks).
+    Whether the start may lie in the past is the caller's rule (the API refuses a start before tomorrow). Refused once the pilot has locked the
+    calendar (a repaint would re-roll or overlap the signed-off blocks)."""
+    if seed is None:
+        flips = [secrets.randbits(1) == 1 for _ in range(fortnights)]
+    else:
+        rng = np.random.default_rng(seed)
+        flips = [bool(rng.random() < 0.5) for _ in range(fortnights)]
+    now = store._now()
+    on = painted_on or local_day(now)
     rows = []
-    with store.connect() as con:
+    with store.write_transaction() as con:
         if con.execute("SELECT 1 FROM switchback WHERE site_id = ? AND locked = 1 LIMIT 1", (site_id,)).fetchone():
             raise CalendarLocked()
+        old = con.execute("SELECT value FROM settings WHERE key = ?", (_paint_key(site_id),)).fetchone()
+        try:
+            count = int(json.loads(old["value"]).get("paint_count") or 0) if old else 0
+        except (ValueError, TypeError, AttributeError):
+            count = 0
         con.execute("DELETE FROM switchback WHERE site_id = ? AND locked = 0", (site_id,))
         d = start
-        for _ in range(fortnights):
-            first = "plan" if rng.random() < 0.5 else "native"
-            for arm in (first, "native" if first == "plan" else "plan"):
+        for plan_first in flips:
+            for arm in (("plan", "native") if plan_first else ("native", "plan")):
                 end = d + timedelta(days=block_days - 1)
                 con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,0)",
                             (site_id, d.isoformat(), end.isoformat(), arm))
                 rows.append({"block_start": d.isoformat(), "block_end": end.isoformat(), "arm": arm})
                 d = end + timedelta(days=1)
-    store.audit(by, "painted the switchback calendar", site_id, {"start": start.isoformat(), "fortnights": fortnights, "block_days": block_days})
+        rec = {"painted_at": now, "painted_on": on.isoformat(), "by": by, "draw": "os_entropy" if seed is None else "seeded", "start": start.isoformat(),
+               "pairs": fortnights, "block_days": block_days, "blocks": rows, "paint_count": count + 1}
+        con.execute("INSERT INTO settings (key, value, updated) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                    "updated = excluded.updated", (_paint_key(site_id), json.dumps(rec), now))
+        store.audit(by, "painted the switchback calendar", site_id,
+                    {"start": start.isoformat(), "fortnights": fortnights, "block_days": block_days, "draw": rec["draw"], "painted_on": rec["painted_on"],
+                     "paint_count": rec["paint_count"], "arms": [r["arm"] for r in rows]}, con=con)
     return rows
 
 
 def switchback_blocks(site_id: str) -> list[dict]:
+    """The calendar's blocks in date order. Each says whether the stored paint drew it before it began (`painted_before_start`; round 7, audit
+    security-roles-06): a block written any other way, or painted on or after its first day, does not count towards the 8 weeks. A calendar with no
+    paint record (painted before the record existed) that a started pilot locked: a locked block that begins after the start's day was painted
+    before it began (the paint precedes the lock), so it counts."""
     with store.connect() as con:
         rows = con.execute("SELECT * FROM switchback WHERE site_id = ? ORDER BY block_start", (site_id,)).fetchall()
-    return [dict(r) for r in rows]
+        p = con.execute("SELECT started FROM pilots WHERE site_id = ?", (site_id,)).fetchone() if rows else None
+    rec = paint_record(site_id) if rows else None
+    drawn = {(b.get("block_start"), b.get("block_end"), b.get("arm")) for b in (rec or {}).get("blocks") or [] if isinstance(b, dict)}
+    on = str((rec or {}).get("painted_on") or "")
+    locked_on = local_day(p["started"]).isoformat() if rec is None and p is not None and p["started"] else ""
+    out = []
+    for r in rows:
+        b = dict(r)
+        if rec is None:
+            b["painted_before_start"] = bool(locked_on) and bool(b.get("locked")) and b["block_start"] > locked_on
+        else:
+            b["painted_before_start"] = bool(on) and (b["block_start"], b["block_end"], b["arm"]) in drawn and b["block_start"] > on
+        out.append(b)
+    return out
 
 
 def arm_on(site_id: str, day: date) -> str | None:
@@ -2356,9 +2409,11 @@ AGREEMENT_FLOOR_RS_PER_DAY = 300.0
 
 
 def _switchback_weeks(blocks: list[dict], today: date) -> float:
-    """Weeks of switchback run: the days of the blocks that have ended (plan 8.5's "Preliminary until 8 weeks of switchback have run")."""
+    """Weeks of switchback run: the days of the blocks that have ended (plan 8.5's "Preliminary until 8 weeks of switchback have run"), each painted
+    before it began (round 7, audit security-roles-06: a calendar painted over days already run, its arms chosen after their costs were seen,
+    clears nothing)."""
     days = sum((date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in blocks
-               if date.fromisoformat(b["block_end"]) < today)
+               if date.fromisoformat(b["block_end"]) < today and b.get("painted_before_start"))
     return days / 7
 
 

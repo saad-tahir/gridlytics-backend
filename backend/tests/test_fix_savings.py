@@ -523,11 +523,10 @@ def test_preliminary_holds_until_eight_switchback_weeks_and_the_fca_is_billed(co
     s = verify.summary(sid, "2026-10-01", "2026-10-31")
     assert s["baselines"]["native"]["verified_days"] >= 28
     assert s["preliminary"] is True and s["final_conditions"]["switchback_weeks"] == 0  # before: final at 28 verified days
+    # eight weeks of blocks painted the day before they began (round 7, audit security-roles-06: only blocks painted ahead count), then locked
+    verify.plan_switchback(sid, date(2026, 8, 1), 4, 7, "t", seed=1, painted_on=date(2026, 7, 31))
     with store.connect() as con:
-        for k in range(8):
-            a = date(2026, 8, 1) + timedelta(days=7 * k)
-            con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,1)",
-                        (sid, a.isoformat(), (a + timedelta(days=6)).isoformat(), "plan" if k % 2 else "native"))
+        con.execute("UPDATE switchback SET locked = 1 WHERE site_id = ?", (sid,))
     s = verify.summary(sid, "2026-10-01", "2026-10-31")
     assert s["final_conditions"]["fca_billed"] is True and s["preliminary"] is False
     _put_rows(sid, {d.isoformat(): {"native": _row(100.0, 100.0), "tuned": _row(100.0, 100.0)} for d in _days(date(2026, 11, 1), date(2026, 11, 28))})

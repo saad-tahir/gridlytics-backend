@@ -265,7 +265,8 @@ def build_history(site_id: str, days: int, progress=None) -> None:
     start = today - timedelta(days=days)
     spec = next((s for s in DEMO_SITES if s["site"]["name"] == site["name"]), {})
     if spec.get("switchback"):
-        verify.plan_switchback(site_id, start + timedelta(days=OBSERVE_DAYS + 4), 4, 7, "demo", seed=7)
+        # painted on the history's first day, before its blocks begin, so its weeks count as a real calendar's do (round 7, audit security-roles-06)
+        verify.plan_switchback(site_id, start + timedelta(days=OBSERVE_DAYS + 4), 4, 7, "demo", seed=7, painted_on=start)
     every = _replan_seconds()
     for i in range(days):
         day = start + timedelta(days=i)

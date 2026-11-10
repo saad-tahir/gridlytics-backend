@@ -10,7 +10,7 @@ from fastapi.responses import PlainTextResponse
 
 from . import auth, sites, store, telemetry, verify
 from .routes_common import bad, full_or_404, out, parse_day, site_or_404, today
-from .schemas import PilotEdit, PilotStart, Refusal, check
+from .schemas import PilotEdit, PilotStart, Refusal, SwitchbackPaint, check
 
 router = APIRouter()
 
@@ -80,19 +80,15 @@ def switchback(site_id: str):
 
 @router.put("/api/sites/{site_id}/switchback")
 def switchback_paint(site_id: str, inp: dict = Body(...)):
+    """Tab C: paint the calendar (edit_sites), with a strict model (schemas.SwitchbackPaint). Round 7: the first day is after today, so no arm is
+    drawn over days already run (audit security-roles-06)."""
     auth.need("edit_sites", "Painting the switchback calendar")
     site_or_404(site_id)
-    try:
-        start = date.fromisoformat(str(inp.get("start")))
-        fortnights = int(inp.get("fortnights", 4))
-        block = int(inp.get("block_days", 7))
-        if not (1 <= fortnights <= 26) or block not in (3, 7):
-            raise ValueError("Use 1 to 26 fortnights of 3- or 7-day blocks")
-    except (ValueError, TypeError) as exc:
-        raise bad(exc) from None
-    if fortnights * 2 * block > 26 * 14:
-        raise Refusal(422, "The calendar is longer than a year", "invalid")
-    return verify.plan_switchback(site_id, start, fortnights, block, auth.actor())
+    req = check(SwitchbackPaint, inp)
+    start = date.fromisoformat(req.start)
+    if start <= today():
+        raise Refusal(422, "The calendar starts after today: no arm is drawn for a day that has begun", "invalid")
+    return verify.plan_switchback(site_id, start, req.fortnights, req.block_days, auth.actor())
 
 
 @router.get("/api/sites/{site_id}/bills")
@@ -212,11 +208,18 @@ def _pilot_answer(site_id: str) -> dict:
         data["capture_pins"] = pins
         capture = verify.native_for_day(site_id, max(today(), date.fromisoformat(pins[-1]["from"])))
         newer = latest if latest and capture and latest["version"] > capture["version"] else None
+    rec = verify.paint_record(site_id)
     return {"pilot": data, "started": r["started"] if r else None, "capture": capture or latest, "capture_newer": newer,
             "switchback": verify.switchback_blocks(site_id),
             # tab A: the window's completeness so far and the KPIs the pilot measures (round 7, audit pages-D-19)
             "baseline_quality": verify.baseline_quality(site_id, data["baseline_start"], data["baseline_days"], today()),
-            "kpis": verify.pilot_kpis(site_id)}
+            "kpis": verify.pilot_kpis(site_id),
+            # the calendar's paint as stored (round 7, audit security-roles-06)
+            "calendar": {k: rec.get(k) for k in PAINT_FIELDS} if rec else None}
+
+
+#: the paint record's fields the pilot answers (the blocks it drew are the calendar's own)
+PAINT_FIELDS = ("painted_at", "painted_on", "by", "draw", "paint_count", "start", "pairs", "block_days")
 
 
 @router.put("/api/sites/{site_id}/pilot")
