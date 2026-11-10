@@ -10,7 +10,7 @@ from fastapi.responses import PlainTextResponse
 
 from . import auth, sites, store, telemetry, verify
 from .routes_common import bad, full_or_404, out, parse_day, site_or_404, today
-from .schemas import PilotEdit, Refusal, check
+from .schemas import PilotEdit, PilotStart, Refusal, check
 
 router = APIRouter()
 
@@ -227,19 +227,25 @@ def pilot_put(site_id: str, inp: dict = Body(...)):
 
 @router.post("/api/sites/{site_id}/pilot/start")
 def pilot_start(site_id: str, inp: dict = Body(default={})):
+    """Sign off and start the pilot, once: the start time and the sign-off are the pre-registration, so a second start is refused rather than
+    written over them (round 7, audit flow-savings-pilot-bill-09); a later change is an amendment (PUT)."""
     auth.need("start_pilot", "Starting the pilot")
     site_or_404(site_id)
+    name = check(PilotStart, inp).name
     if not sites.native_latest(site_id):
         raise Refusal(422, "Capture the inverter's native settings first (tab B)", "no_capture")
     if not verify.switchback_blocks(site_id):
         raise Refusal(422, "Paint the switchback calendar first (tab C)", "no_calendar")
-    cur = pilot_get(site_id)
-    data = {**cur["pilot"], "signoff": {"by": auth.actor(), "at": store._now(), "name": str(inp.get("name", ""))[:120]}}
-    with store.connect() as con:
+    with store.write_transaction() as con:
+        r = con.execute("SELECT * FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
+        if r is not None and r["started"]:
+            raise Refusal(409, "The pilot has already started: its start and sign-off stand, and a change is an amendment", "already_started")
+        now = store._now()
+        data = {**_pilot_data(r), "signoff": {"by": auth.actor(), "at": now, "name": name}}
         con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?) ON CONFLICT(site_id) DO UPDATE SET data = excluded.data, "
-                    "started = excluded.started, updated = excluded.updated", (site_id, json.dumps(data), store._now(), store._now()))
+                    "started = excluded.started, updated = excluded.updated", (site_id, json.dumps(data), now, now))
         con.execute("UPDATE switchback SET locked = 1 WHERE site_id = ?", (site_id,))
-    store.audit(auth.actor(), "started the pilot", site_id)
+        store.audit(auth.actor(), "started the pilot", site_id, {"name": name}, con=con)
     return pilot_get(site_id)
 
 

@@ -1170,3 +1170,19 @@ def test_a_role_without_the_fee_reads_no_fee_multiple_in_the_pilot_nor_in_its_am
         (am,) = p["amendments"]
         assert am["values"] == [] and am["changes"] == [] and am["reason"] == "Fee renegotiated", role
     assert world.c["analyst"].get(f"/api/sites/{sid}/pilot").json()["pilot"]["amendments"][0]["values"][0]["after"] == 2.5
+
+
+# ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-09: one start
+
+def test_a_second_start_is_refused_and_the_start_and_sign_off_stand(world):
+    sid = _pilot_ready(world)
+    admin = world.c["admin"]
+    assert admin.post(f"/api/sites/{sid}/pilot/start", json={}).status_code == 422  # the sign-off names someone
+    assert admin.post(f"/api/sites/{sid}/pilot/start", json={"name": "X", "by": "someone"}).status_code == 422
+    first = _start(world, sid, "AUDIT Owner").json()
+    assert first["started"] and first["pilot"]["signoff"]["name"] == "AUDIT Owner"
+    r = _start(world, sid, "Someone Else")
+    assert r.status_code == 409 and r.json()["code"] == "already_started"
+    now = admin.get(f"/api/sites/{sid}/pilot").json()
+    assert now["started"] == first["started"] and now["pilot"]["signoff"] == first["pilot"]["signoff"]
+    assert len(_audit_lines(world, "started the pilot")) == 1

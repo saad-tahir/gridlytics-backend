@@ -112,3 +112,9 @@ class PilotEdit(Strict):
     @classmethod
     def _start(cls, v):
         return _iso_day(v, "The baseline window's first day")
+
+
+class PilotStart(Strict):
+    """`POST /sites/:id/pilot/start`: the full name of who signs the pilot off (round 7, audit flow-savings-pilot-bill-09)."""
+
+    name: str = Field(min_length=1, max_length=120)
