@@ -67,7 +67,8 @@ def _person(request: Request) -> dict:
     identity = getattr(request.state, "identity", None)
     iat = (getattr(identity, "claims", None) or {}).get("iat")
     # A token without its issue time could never be told from one made before a password change: refused
-    found = platformdb.signed_in(getattr(identity, "user_id", None), iat, one_time_ok=True) if identity is not None and iat is not None else None
+    found = (platformdb.signed_in(getattr(identity, "user_id", None), iat, session=identity.claims.get("session_id"), one_time_ok=True)
+             if identity is not None and iat is not None else None)
     if found is None:
         raise HTTPException(status_code=401, detail="Sign in first")
     return found
@@ -112,8 +113,12 @@ def local_session(request: Request, inp: dict = Body(...)):
             _dummy_hash = _dummy_hash or auth.hash_password(secrets.token_urlsafe(16))
             auth.check_password(password, _dummy_hash)
         raise schemas.Refusal(401, _WRONG, "invalid_credentials")
+    refresh_token = platformdb.new_refresh(account["id"], address, _agent(request), checked=account)
+    if refresh_token is None:
+        # the password was changed, or the account disabled, while this sign-in was checked: no session (audit parity-supabase-auth-01)
+        raise schemas.Refusal(401, _WRONG, "invalid_credentials")
     platformdb.record(platformdb.SIGNED_IN, email, address, account["id"])
-    return _session(account, platformdb.new_refresh(account["id"], address, _agent(request)))
+    return _session(account, refresh_token)
 
 
 @router.post("/api/local/refresh")
@@ -171,7 +176,10 @@ def local_password(request: Request, inp: dict = Body(...)):
         _api._fail("The new password must be different from the current one")
     account = platformdb.set_password(me["id"], new)
     platformdb.record("changed their password", me["email"], address, me["id"])
-    return {"changed": True, **_session(account, platformdb.new_refresh(me["id"], address, _agent(request)))}
+    refresh_token = platformdb.new_refresh(me["id"], address, _agent(request), checked=account)
+    if refresh_token is None:                      # disabled, or the password set again, a moment after this change
+        raise schemas.Refusal(401, _ENDED, "session_ended")
+    return {"changed": True, **_session(account, refresh_token)}
 
 
 # ------------------------------------------------------------------------------------------------ the person's sessions (UI-18 My account; audit role-analyst-32)

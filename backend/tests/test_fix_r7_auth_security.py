@@ -593,3 +593,65 @@ def test_a_partner_key_never_acts_as_the_sites_controller(world):
         assert r.status_code == 200, (what, r.text)
     with world.use():
         assert sites.get(sid)["tier_capable"] == "closed_loop"
+
+
+# ------------------------------------------------------------------------------------------------ parity-supabase-auth-01
+
+def test_a_sign_in_whose_password_was_reset_while_it_was_checked_gets_no_session(world, monkeypatch):
+    """A sign-in checks the password, then makes the session: a reset (or a disable) landing between the two left a session and an access token of the same
+    second as the reset, which `iat < sessions_from` (whole seconds) let through, for an hour, and again after a re-enable. The session is made only while
+    the account is as the password check found it."""
+    import identities
+    from gridlytics import platform as platformdb
+    viewer = _member(world, "viewer@fix.test")["id"]
+    checked = platformdb.check_sign_in
+
+    def then(change):
+        def check(email, password):
+            found = checked(email, password)
+            change()                                         # lands after the password was checked, before the session is made
+            return found
+        return check
+
+    monkeypatch.setattr(platformdb, "check_sign_in", then(lambda: platformdb.set_password(viewer, "the founder's new password", one_time=True)))
+    r = _sign_in("viewer@fix.test", identities.PASSWORD)
+    assert r.status_code == 401 and r.json()["code"] == "invalid_credentials", r.text
+    assert platformdb.open_sessions(viewer) == []
+    monkeypatch.setattr(platformdb, "check_sign_in", checked)
+    platformdb.set_password(viewer, identities.PASSWORD)
+    monkeypatch.setattr(platformdb, "check_sign_in", then(lambda: platformdb.set_account_disabled(viewer, True)))
+    assert _sign_in("viewer@fix.test", identities.PASSWORD).status_code == 401
+    platformdb.set_account_disabled(viewer, False)
+    assert platformdb.open_sessions(viewer) == []                                  # nothing comes back with the re-enable
+
+
+def test_a_token_of_the_same_second_as_a_reset_or_a_disable_is_refused(world, monkeypatch):
+    """sessions_from was the reset's whole second, so a token issued in that second passed. It is the reset's time to the millisecond now: a token whose
+    session started before it is refused, and a token naming no session (its issue time in whole seconds) is refused when it may be older."""
+    import identities
+    import jwt
+    from gridlytics import platform as platformdb
+    op = _member(world, "operator@fix.test")["id"]
+    real, second = platformdb._clock, 1_900_000_000
+    monkeypatch.setattr(platformdb, "_clock", lambda: second + 0.25)
+    platformdb.set_password(op, "the founder's new password")
+    assert platformdb.account(op)["sessions_from"] == second + 0.25
+    assert platformdb.signed_in(op, second) is None                                # issued in the reset's second: it may be older
+    assert platformdb.signed_in(op, second - 1) is None and platformdb.signed_in(op, second + 1)
+    monkeypatch.setattr(platformdb, "_clock", lambda: second + 10.5)
+    platformdb.set_account_disabled(op, True)
+    platformdb.set_account_disabled(op, False)
+    assert platformdb.signed_in(op, second + 10) is None and platformdb.signed_in(op, second + 11)
+    # a session's tokens are told by when the session started, to the millisecond: one started just after a reset passes in the reset's own second
+    monkeypatch.setattr(platformdb, "_clock", real)
+    before = _sign_in("operator@fix.test", "the founder's new password").json()
+    platformdb.set_password(op, "the operator's own password")
+    after = _sign_in("operator@fix.test", "the operator's own password").json()
+    old, new = (identities.headers(s["access_token"], world.company) for s in (before, after))
+    assert world.anon.get("/api/sites", headers=old).status_code == 401
+    assert world.anon.get("/api/sites", headers=new).status_code == 200
+    claims = jwt.decode(after["access_token"], options={"verify_signature": False})
+    sessions_from = platformdb.account(op)["sessions_from"]
+    assert platformdb.signed_in(op, claims["iat"], session=claims["session_id"])
+    assert platformdb.signed_in(op, claims["iat"], session=jwt.decode(before["access_token"], options={"verify_signature": False})["session_id"]) is None
+    assert sessions_from != int(sessions_from) or claims["iat"] >= sessions_from   # whole seconds no longer

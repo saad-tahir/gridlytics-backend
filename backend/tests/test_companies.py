@@ -213,7 +213,9 @@ def test_revocation_in_local_mode_is_at_once_for_a_token_made_before_the_change(
     assert companies.resolve(before, None)
     platformdb.set_password(sunia["id"], "another long password")
     assert _refused(401, "session_ended", before).detail == identity.ENDED
-    fresh = _token(sunia)
+    # a token naming no session, made in the second of the change, may be older than it: refused (audit parity-supabase-auth-01); one of the next second is not
+    _refused(401, "session_ended", _token(sunia))
+    fresh = _aged(_token(sunia), -1)
     assert companies.resolve(fresh, None)
     later = time.time() + 5
     monkeypatch.setattr(platformdb, "_clock", lambda: later)

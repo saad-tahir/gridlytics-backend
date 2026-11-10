@@ -541,7 +541,9 @@ def test_a_person_changes_their_own_password_and_their_other_sessions_end(client
     assert _sign_in(client).status_code == 401 and _sign_in(client, password=new).status_code == 200
     # an access token minted before the change is no longer taken (stage B3 asks the same with signed_in)
     assert plat.account(account["id"])["sessions_from"] >= started
-    assert plat.signed_in(account["id"], iat=started - 1) is None and plat.signed_in(account["id"], iat=_claims(out["access_token"])["iat"])
+    # the new session's token is told by when its session started, which is after the change, though in the change's second (audit parity-supabase-auth-01)
+    mine = _claims(out["access_token"])
+    assert plat.signed_in(account["id"], iat=started - 1) is None and plat.signed_in(account["id"], iat=mine["iat"], session=mine["session_id"])
     events = [e["event"] for e in plat.events("saad@example.pk")]
     assert "changed their password" in events
     refused = [e for e in plat.events("saad@example.pk") if e["event"] == "sign-in refused"]

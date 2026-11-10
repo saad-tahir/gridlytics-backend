@@ -354,16 +354,23 @@ def check_sign_in(email: str, password: str) -> dict | None:
     return _account(r)
 
 
-def signed_in(account_id: str, iat: int | None = None, *, one_time_ok: bool = False) -> dict | None:
-    """The account an access token names, while it may act: it exists, it is not disabled, and the token (`iat`, its issue time in unix seconds) is not
-    older than the account's last password change or disabling. Local revocation is immediate (addendum item 17): stage B3 asks this on every request.
+def signed_in(account_id: str, iat: int | None = None, *, session: str | None = None, one_time_ok: bool = False) -> dict | None:
+    """The account an access token names, while it may act: it exists, it is not disabled, and the token is not older than the account's last password
+    change or disabling (`sessions_from`, to a fraction of a second). Local revocation is immediate (addendum item 17): stage B3 asks this on every request.
+    A token of a known session (`session`, its `session_id`) is as old as the session, which started when its sign-in was made (to a fraction of a second); one
+    naming no session is told by `iat`, its issue time in whole seconds, and is refused when it falls in the second of the change, as it may be older (a
+    token of the same second passed before: audit parity-supabase-auth-01).
     An account signed in with a one-time password (`must_change`, plan Part 9.3) is refused 403 `password_change_required` (identity.Refused) unless
     `one_time_ok`: only the sign-in's own paths (the context, the password change) take it."""
     found = account(account_id) if isinstance(account_id, str) else None
     if found is None or found["disabled"]:
         return None
-    if iat is not None and (not isinstance(iat, (int, float)) or iat < found["sessions_from"]):
-        return None
+    if iat is not None:
+        if not isinstance(iat, (int, float)) or isinstance(iat, bool):
+            return None
+        started = _session_started(found["id"], session)
+        if (started if started is not None else iat) < found["sessions_from"]:
+            return None
     if found["must_change"] and not one_time_ok:
         raise identity.Refused(403, "password_change_required", ONE_TIME)
     return found
@@ -378,8 +385,9 @@ def set_password(account_id: str, password: str, *, one_time: bool = False) -> d
     if not isinstance(one_time, bool):
         raise ValueError("One-time must be yes or no")
     with _write() as con:
+        # to a fraction of a second: a token of the same second is told from one made after (audit parity-supabase-auth-01)
         con.execute("UPDATE accounts SET password = ?, updated = ?, sessions_from = ?, must_change = ? WHERE id = ?",
-                    (auth.hash_password(password), _now(), int(_clock()), int(one_time), account_id))
+                    (auth.hash_password(password), _now(), _clock(), int(one_time), account_id))
         con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?", (account_id,))
     return account(account_id)
 
@@ -390,7 +398,7 @@ def set_account_disabled(account_id: str, disabled: bool) -> dict | None:
         raise ValueError("Disabled must be yes or no")
     with _write() as con:
         if disabled:
-            con.execute("UPDATE accounts SET disabled = 1, updated = ?, sessions_from = ? WHERE id = ?", (_now(), int(_clock()), account_id))
+            con.execute("UPDATE accounts SET disabled = 1, updated = ?, sessions_from = ? WHERE id = ?", (_now(), _clock(), account_id))
             con.execute("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?", (account_id,))
         else:
             con.execute("UPDATE accounts SET disabled = 0, updated = ? WHERE id = ?", (_now(), account_id))
@@ -516,10 +524,16 @@ def _add_refresh(con: sqlite3.Connection, user_id: str, family: str, session_end
     return token
 
 
-def new_refresh(user_id: str, address: str = "", agent: str = "") -> str:
+def new_refresh(user_id: str, address: str = "", agent: str = "", *, checked: dict | None = None) -> str | None:
     """The refresh token of a new session of an account (a sign-in), kept as its hash, with the address and the browser (`agent`, its User-Agent) it was
-    made from. The tokens of sessions past their last day go: nothing can renew them, so the table holds a week of sessions, not every one ever made."""
+    made from. The tokens of sessions past their last day go: nothing can renew them, so the table holds a week of sessions, not every one ever made.
+    `checked` is the account as the sign-in's password check read it: None, and no session, when the account was disabled or its password changed since,
+    so a reset landing between the check and this leaves no session behind it (audit parity-supabase-auth-01)."""
     with _write() as con:
+        if checked is not None:
+            now = con.execute("SELECT disabled, sessions_from FROM accounts WHERE id = ?", (user_id,)).fetchone()
+            if now is None or now["disabled"] or now["sessions_from"] != checked["sessions_from"]:
+                return None
         con.execute("DELETE FROM refresh_tokens WHERE session_ends < ?", (_clock(),))
         return _add_refresh(con, user_id, uuid.uuid4().hex, _clock() + SESSION_DAYS * 86400, address=address, agent=agent)
 
@@ -581,6 +595,16 @@ def session_id(refresh_token: str) -> str | None:
     with _read() as con:
         r = con.execute("SELECT family FROM refresh_tokens WHERE token_hash = ?", (auth.token_hash(refresh_token),)).fetchone()
     return str(uuid.UUID(r["family"])) if r and _family(r["family"]) else None
+
+
+def _session_started(user_id: str, session: str | None) -> float | None:
+    """When the account's session `session` started (its sign-in, in unix seconds with their fraction); None when it names no session of the account."""
+    family = _family(session)
+    if family is None:
+        return None
+    with _read() as con:
+        r = con.execute("SELECT MIN(COALESCE(started, created)) AS started FROM refresh_tokens WHERE family = ? AND user_id = ?", (family, user_id)).fetchone()
+    return r["started"] if r is not None else None
 
 
 def session_ended(session: str | None) -> bool:
