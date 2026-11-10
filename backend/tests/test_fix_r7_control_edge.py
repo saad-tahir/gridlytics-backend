@@ -963,10 +963,18 @@ def test_marking_a_plan_applied_takes_only_a_date_of_its_table(world):
 
 # ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-15, flow-telemetry-plan-control-21
 
+def _charged(sid: str, soc: float = 0.9) -> None:
+    """The site's battery at `soc` (it has no readings, so the solve starts from the carried state): a hold at 80 % is then reachable without a charge
+    at any hour. From 50 %, a hold at 80 % in the evening peak can be kept only by shedding load with the grid up, which the wrong-plan guard refuses
+    (the re-solve is held and the plan of before stays in force), so a test of the hold's own effect read the time of day (review)."""
+    sites.put_state(sid, soc=soc)
+
+
 def test_a_hold_re_solves_at_once_so_the_plan_and_the_edge_take_it(world):
     sid, op = world.site, world.c["operator"]
     with world.use():
         _closed_loop(sid)
+        _charged(sid)
         before = plans.tick(sid)
     assert before["status"] == "active"
     r = op.post(f"/api/sites/{sid}/control/hold", json={"hours": 2, "soc_pct": 80})
@@ -984,6 +992,24 @@ def test_a_hold_re_solves_at_once_so_the_plan_and_the_edge_take_it(world):
     assert any(s["reserve_pct"] < 80 for s in plan["steps"] if s["t"] >= until)
 
 
+def test_a_hold_whose_re_solve_the_guard_holds_says_why_and_the_plan_of_before_stays(world, monkeypatch):
+    """A hold the site cannot keep but by a plan the wrong-plan guard refuses (say, shedding load with the grid up to charge to it in the peak): the
+    hold is placed, the re-solve is answered held with the guard's reason (it read None), and the plan of before stays in force (review)."""
+    sid, op = world.site, world.c["operator"]
+    with world.use():
+        _closed_loop(sid)
+        before = plans.tick(sid)
+    assert before["status"] == "active"
+    monkeypatch.setattr(plans, "_guard", lambda *a, **k: "sheds_load_with_grid_up")
+    r = op.post(f"/api/sites/{sid}/control/hold", json={"hours": 2, "soc_pct": 80})
+    assert r.status_code == 200, r.text
+    resolve = r.json()["resolve"]
+    assert resolve["status"] == "held" and resolve["reason"] == "sheds_load_with_grid_up" and resolve["plan_id"] != before["plan_id"], resolve
+    assert r.json()["control"]["key"] == "hold"                                  # the hold stands
+    with world.use():
+        assert plans.current(sid)["id"] == before["plan_id"]                      # the plan of before is in force
+
+
 def test_a_pause_or_release_re_solves_at_once_so_the_versions_list_holds_the_plan(world):
     sid, admin, op = world.site, world.c["admin"], world.c["operator"]
     for client, action, reason in ((admin, "pause", "control_paused"), (op, "release", "released_to_native")):
@@ -992,6 +1018,7 @@ def test_a_pause_or_release_re_solves_at_once_so_the_versions_list_holds_the_pla
         assert first["status"] == "active"
         r = client.post(f"/api/sites/{sid}/control/{action}", json={"hours": 1})
         assert r.status_code == 200 and r.json()["resolve"]["status"] == "held", r.text
+        assert r.json()["resolve"]["reason"] == reason, r.json()["resolve"]          # why it is held is said (review: it read None)
         rows = world.c["viewer"].get(f"/api/sites/{sid}/plans").json()
         # the plan of before is no longer badged active under "No plan in force": it is superseded, and the newest is held for the pause
         assert [x["status"] for x in rows[:2]] == ["held", "superseded"] and rows[0]["reason"] == reason, rows[:2]
@@ -1232,6 +1259,7 @@ def test_a_hold_issues_the_table_at_once_and_nothing_is_issued_under_a_release_o
     day = datetime.now(PKT).date().isoformat()
     with world.use():
         _tier(sid, "advisory_writes")
+        _charged(sid)                                                              # a hold at 80 % the site keeps at any hour
         first = plans.tick(sid)
         assert plans.issue_tables(sid)["reason"] == "first"
     r = op.post(f"/api/sites/{sid}/control/hold", json={"hours": 2, "soc_pct": 80})

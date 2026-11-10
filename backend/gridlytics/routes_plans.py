@@ -398,7 +398,13 @@ def _resolve_now(site_id: str, action: str) -> dict:
     store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"], "after": action})
     # a hold of any kind (the battery's, the genset's, a charging block, a forced charge) and a resume issue today's table at once
     _issue(site_id, force="hold" if action == "hold" or action in OVERRIDE_ACTIONS else "resume" if action == "resume" else None)
-    return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": r.get("reason")}
+    reason = r.get("reason")
+    if r["status"] == "held" and not reason:
+        # why the tick held its plan (it answers that only in the plan's row): the pause or release in force, else the wrong-plan guard's rule, and
+        # then the plan of before stays in force (a hold the site can keep only by shedding load with the grid up, say)
+        rel = plans.control_release(site_id)
+        reason = rel["reason"] if rel else (r.get("summary") or {}).get("guard")
+    return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": reason}
 
 
 _ = verify
