@@ -1003,3 +1003,122 @@ def test_the_outage_forecast_page_gives_the_announced_windows_as_blocks(company)
     assert blocks == [{"from": _pkt(*a), "to": _pkt(*z)} for a, z in want]
     # the PV and load pages carry no windows
     assert "announced" not in forecast.page(site, "load")
+
+
+# ------------------------------------------------------------------------------------------------ engine-forecast-16
+
+def _pv_issues(sid: str, day0: int, q50_of, days: int = 16, pr: float = 1.0, every_h: int = 3) -> None:
+    """Stage-1 PV issues every `every_h` local hours over the `days` days before day0, each with the clear sky and the median q50_of(cs, t)."""
+    for b in range(day0 - days * 86400, day0, every_h * 3600):
+        t = forecast.step_times(b)
+        cs = forecast._mean15(_clear, t)
+        q50 = q50_of(cs, t)
+        body = {"cs": [round(float(x), 3) for x in cs], "pr": pr, **{q: [round(float(x), 3) for x in q50] for q in forecast.QS}}
+        telemetry.save_forecast(sid, "pv", b, 1, forecast.VERSION, body)
+
+
+def test_pv_bands_are_conformal_from_the_stored_issues_errors_by_horizon_class(company):
+    """Plan Part 5.1 (stage 1, from day 3): 'conformal residual bands by horizon class and sky class ... conformal from the last 14 to 28 days'. Every
+    day is the same: whole local hours alternate between clear sky and half of it, so each day's clearness is the same and v1's fan, the quantiles of
+    14 daily ratios applied to every step, had no width at all, while every 15-minute step missed its median by a quarter of the clear sky. The stored
+    stage-1 issues of the last 14 days (at the model's median, 0.75 of clear sky) now set the bands: their errors span -0.25 to +0.25 of clear sky,
+    so the 5 % and 95 % bands sit at 0.5 and 1.0 of clear sky, at every horizon class. Without stored issues the empirical fan stays."""
+    sid = "pv-conformal"
+    site = _pv_site(sid)
+    day0 = _midnight(date(2026, 11, 9))
+    ts = np.arange(day0 - 16 * 86400, day0, 60, dtype=np.int64)
+    _write_pv(sid, ts, _clear(ts) * np.where(_local_hour(ts) % 2 == 0, 1.0, 0.5))
+    before = forecast.pv(site, day0)
+    noon = 12 * 4
+    cs = float(before["cs"][noon])
+    assert before["stage"] == 1 and before["bands"]["method"] == "empirical"
+    assert float(before["q"]["q95"][noon] - before["q"]["q05"][noon]) < 0.05 * cs  # v1's fan: no width
+    _pv_issues(sid, day0, lambda cs_, t: 0.75 * cs_)
+    f = forecast.pv(site, day0)
+    assert f["bands"]["method"] == "conformal", f["bands"]
+    assert set(f["bands"]["classes"]) == {"0-2h", "2-6h", "6-24h", "24-48h"}, f["bands"]
+    for i in (noon, noon + 96, 10 * 4 + 96):  # noon today (6-24h), noon and 10:00 tomorrow (24-48h)
+        c = float(f["cs"][i])
+        q = {k: float(f["q"][k][i]) / c for k in forecast.QS}
+        assert q["q05"] == pytest.approx(q["q50"] - 0.25, abs=0.03) and q["q25"] == pytest.approx(q["q50"] - 0.25, abs=0.03), (i, q)
+        assert q["q95"] == pytest.approx(min(q["q50"] + 0.25, 1.0), abs=0.03) and q["q75"] == pytest.approx(min(q["q50"] + 0.25, 1.0), abs=0.03), (i, q)
+    # the bands are saved with the issue, so the page can say where they come from
+    forecast.issue(site, day0)
+    assert forecast.page(site, "pv")["issue"]["bands"]["method"] == "conformal"
+
+
+def test_the_conformal_table_bins_the_errors_by_the_sky_at_the_issue_time(company):
+    """The sky class is the clearness of the last daylight hour before the issue (plan R5 4.1 item 7: clear, intermediate, overcast). Clear and overcast
+    days alternate (all clear sky, or 0.3 of it) and the stored issues forecast 0.65 of clear sky: an issue made under a clear sky missed low over its
+    next hours, one made under an overcast sky missed high, and the 0-2 hour class keeps the two apart; the class over every sky holds both."""
+    sid = "pv-sky"
+    site = _pv_site(sid)
+    day0 = _midnight(date(2026, 11, 9))
+    ts = np.arange(day0 - 16 * 86400, day0, 60, dtype=np.int64)
+    _write_pv(sid, ts, _clear(ts) * np.where(((ts - day0) // 86400) % 2 == 0, 1.0, 0.3))
+    _pv_issues(sid, day0, lambda cs_, t: 0.65 * cs_)
+    tab = forecast._conformal(site, "pv", day0)
+    clear, over, every = tab["by"][("0-2h", "clear")], tab["by"][("0-2h", "overcast")], tab["by"][("0-2h", None)]
+    assert np.median(clear) == pytest.approx(0.35, abs=0.03) and np.median(over) == pytest.approx(-0.35, abs=0.03)
+    assert min(every) == pytest.approx(-0.35, abs=0.03) and max(every) == pytest.approx(0.35, abs=0.03)
+    assert tab["days"] >= 14
+
+
+def test_load_bands_turn_conformal_after_a_week_of_stage_1_issues(company):
+    """Plan Part 5.2: load quantiles from 'the empirical spread across the k days plus conformal residuals after week 2'. Days alternate between 80 and
+    120 kW, so the spread across the same-type days is about 20 kW and v1's 5 to 95 % band was the median plus or minus 1.645 times it (about 65 kW
+    wide). The stored stage-1 issues at 100 kW missed by 20 % either way, so the conformal band is the median plus or minus 20 % of it; with fewer than
+    7 days of issues the empirical band stays."""
+    sid = "load-conformal"
+    site = _load_site(sid, battery=False)
+    day0 = _midnight(date(2026, 11, 4))
+    ts = np.arange(day0 - 21 * 86400, day0, 60, dtype=np.int64)
+    _write_load(sid, ts, np.where(((ts - day0) // 86400) % 2 == 0, 120.0, 80.0), grid=np.ones(len(ts)))
+
+    def issues(days: int) -> None:
+        for b in range(day0 - days * 86400, day0, 3 * 3600):
+            telemetry.save_forecast(sid, "load", b, 1, forecast.VERSION, {q: [100.0] * 192 for q in forecast.QS})
+
+    issues(5)
+    few = forecast.load(site, day0)
+    assert few["bands"]["method"] == "empirical", few["bands"]
+    issues(16)
+    f = forecast.load(site, day0)
+    assert f["bands"]["method"] == "conformal", f["bands"]
+    i = 12 * 4  # noon: the last two hours' ratio has faded
+    m = float(f["q"]["q50"][i])
+    assert float(f["q"]["q05"][i]) == pytest.approx(0.8 * m, rel=0.02) and float(f["q"]["q95"][i]) == pytest.approx(1.2 * m, rel=0.02)
+    assert float(few["q"]["q95"][i] - few["q"]["q05"][i]) > 60.0  # v1's empirical band: 1.645 times the spread either side
+
+
+def test_the_day_s_band_coverage_and_pinball_loss_are_scored(company):
+    """Plan Part 5.5 (both PV and load): 'pinball loss, ... q10 to q90 coverage 80 percent plus or minus 5, q05 to q95 coverage 90 percent'. v1 scored
+    the median only, so the bands the optimiser reads (PV q25, load q75) were never checked. The day runs at 0.8 of clear sky against a midnight issue
+    whose 10 to 90 % band tops out at 0.6 and whose 5 to 95 % band reaches 1.2: none of the daytime slots falls in the first, all in the second. The
+    nRMSE row stays the PV headline alerts.nightly reads, and the accuracy summary gives the coverage beside its target."""
+    sid = "pv-cover"
+    site = _pv_site(sid)
+    day = datetime.now(PKT).date() - timedelta(days=1)  # within the summary's last 7 days
+    t0 = _midnight(day)
+    ts = np.arange(t0 - 2 * 86400, t0 + 86400, 60, dtype=np.int64)
+    _write_pv(sid, ts, _clear(ts) * 0.8)
+    cs = forecast._mean15(_clear, forecast.step_times(t0))
+    ks = dict(zip(forecast.QS, (0.3, 0.4, 0.5, 0.55, 0.58, 0.6, 1.2)))
+    telemetry.save_forecast(sid, "pv", t0, 1, forecast.VERSION, {"cs": [round(float(x), 3) for x in cs],
+                                                                **{q: [round(float(x) * k, 3) for x in cs] for q, k in ks.items()}})
+    rows = [r for r in forecast.score_day(site, day) if r["kind"] == "pv"]
+    assert rows[0]["metric"] == "nrmse" and rows[0]["horizon_class"] == "day_ahead"
+    by = {r["metric"]: r for r in rows if r["horizon_class"] == "day_ahead"}
+    assert by["coverage_80"]["value"] == 0.0 and by["coverage_90"]["value"] == 1.0, by
+    # the pinball loss over the seven quantiles, by the AC rating, over the daytime slots scored
+    act = forecast._q15(_clear(np.arange(t0, t0 + 86400, 60, dtype=np.int64)) * 0.8)
+    zen, _ = solar.sun_position(forecast.step_times(t0, 96) + 450, LAT, LON)
+    ok = zen < 85.0
+    want = np.mean([np.mean(np.maximum(v * (act[ok] - k * cs[:96][ok]), (v - 1) * (act[ok] - k * cs[:96][ok]))) for v, k in zip(forecast.QV, ks.values())])
+    assert by["pinball"]["value"] == pytest.approx(want / 100.0, rel=0.02), (by["pinball"], want / 100.0)
+    s = forecast.scores(sid, 30)
+    assert {r["metric"] for r in s["days"].get("pv", [])} <= {"nrmse"}  # the day table keeps the headline metric
+    cal = s["summary"]["pv"]["calibration"]
+    assert cal["coverage_80"]["last30"] == 0.0 and cal["coverage_80"]["target"] == 0.8 and cal["coverage_80"]["tolerance"] == 0.05
+    assert cal["coverage_90"]["last30"] == 1.0 and cal["coverage_90"]["target"] == 0.9 and cal["pinball"]["n"] == 1
+

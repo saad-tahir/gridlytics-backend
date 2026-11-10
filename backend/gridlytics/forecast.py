@@ -2,8 +2,9 @@
 
 Every issue covers 192 steps of 15 minutes from its belief time, carries seven quantiles (q05 to q95) and its stage, and reads only telemetry before the
 belief time, so a replayed day sees exactly what was known then. Stage 2 models (xgboost) and NWP feeds are later items; until then the PV chain runs on
-the clear-sky model with a climatological clearness distribution (stage 0) and a per-site capacity and clearness fit (stage 1), and every screen marks
-it Preliminary until the site has 28 verified days and the forecast is stage 1 (preliminary()).
+the clear-sky model with a climatological clearness distribution (stage 0) and a per-site capacity and clearness fit (stage 1); PV and load at stage
+1 take conformal bands from the stored issues' own errors once there are enough of them (_conformal); and every screen marks it Preliminary until
+the site has 28 verified days and the forecast is stage 1 (preliminary()).
 """
 from __future__ import annotations
 
@@ -158,10 +159,168 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
             q50_0 = q["q50"].copy()  # every quantile keeps its ratio to the unblended median, so the fan moves as one
             for name in QS:
                 q[name] = np.minimum(cap, q[name] * (1 - w) + cs * scale * k_now * w * (q[name] / np.maximum(q50_0, 1e-6)))
+    # stage 1: conformal bands from the stored issues' errors where a class has enough of them (plan Part 5.1), around the median above
+    bands = {"method": "empirical" if stage == 1 else "prior", "sky": None, "classes": {}}
+    if stage == 1:
+        day = slice(max(0, len(g["ts"]) - 1440), len(g["ts"]))  # the sky reads at most the last 24 hours
+        csd = solar.pv_power(g["ts"][day], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"][day]))
+        sky = _sky_class(_sky_index(available_pv(g)[day], csd, len(csd), float(pv_asset["kw_ac"]), pr, iv))
+        bands = _apply_conformal(q, _conformal(site, "pv", _local_midnight(t0)), sky, cs, cap)
     # quantiles sorted per step (plan Part 5.1)
     qa = np.maximum.accumulate(np.vstack([q[name] for name in QS]), axis=0)
     q = {name: qa[i] for i, name in enumerate(QS)}
-    return {"stage": stage, "cs": cs, "q": q, "pr": pr, "days": days_ok}
+    return {"stage": stage, "cs": cs, "q": q, "pr": pr, "days": days_ok, "bands": bands}
+
+
+# ------------------------------------------------------------------------------------------------ conformal bands
+
+#: conformal residual bands (plan Part 5.1, PV stage 1 "from day 3": "conformal residual bands by horizon class and sky class ... conformal from the
+#: last 14 to 28 days"; Part 5.2, load: "empirical spread ... plus conformal residuals after week 2", here once 7 days of errors are scored, so in the
+#: site's second week at the earliest, as stage 1 starts on day 3; R5 4.1 item 7). The errors are the stored stage-1 issues' against
+#: what happened over the CONFORMAL_DAYS local days before the issue's own day (every third local hour's issue; quarter issues are pruned after 3 days):
+#: the actual minus the issue's median per 15-minute step, divided by the step's clear sky for PV (an error of clearness, so a band widens at noon and
+#: closes at dusk; daylight steps only) or by the issue's median for load (floored at a tenth of its mean, so a night slot near zero does not blow up).
+#: Load errors read the unshed minutes only, as the scores do. They are binned by plan Part 5.5's horizon class (HORIZON_CLASSES) and, for PV, by the
+#: sky at the issue time (the clearness of the last daylight hour before it, the persisted index a forecast without a weather feed knows: SKY_CLASSES).
+#: A class with CONFORMAL_MIN_PAIRS errors from CONFORMAL_MIN_DAYS days sets the bands of its steps as the median plus the errors' split-conformal
+#: quantiles (the median is the model's own); a sky class too thin falls back to the horizon class over every sky, and a horizon class too thin keeps
+#: the empirical bands. The table reads data before the issue's day only, so it is built once per site, kind and local day (_CONFORMAL), like the
+#: plan's nightly stage1_refit; a stored issue more or less rebuilds it. The xgboost models of stage 2 (FOR-05, FOR-07) wait on the weather feed.
+CONFORMAL_DAYS = 14
+CONFORMAL_EVERY_H = 3
+CONFORMAL_MIN_PAIRS = 48
+CONFORMAL_MIN_DAYS = {"pv": 3, "load": 7}
+SKY_CLASSES = (("overcast", 0.4), ("intermediate", 0.8), ("clear", float("inf")))
+_CONFORMAL: dict = {}
+
+
+def _sky_index(av: np.ndarray, csm: np.ndarray, end: int, kw_ac: float, pr: float | None, iv: int = 1) -> float | None:
+    """The clearness of the last daylight hour before minute `end` of a minute grid (at most 24 hours back): available PV over the clear sky times
+    the plant's ratio, over the last 60 daylight minutes (clear sky above a tenth of the inverter's rating); None with under 20 minutes of data."""
+    lo = max(0, end - 1440)
+    day = np.flatnonzero(csm[lo:end] > 0.1 * kw_ac)[-60:] + lo
+    m = day[~np.isnan(av[day])]
+    if len(m) * iv < 20:
+        return None
+    return float(np.sum(av[m]) / max(1e-9, np.sum(csm[m])) / max(1e-6, pr or 1.0))
+
+
+def _sky_class(k: float | None) -> str | None:
+    return None if k is None else next(name for name, top in SKY_CLASSES if k < top)
+
+
+def _conformal_q(r: np.ndarray) -> np.ndarray:
+    """The split-conformal quantiles of errors at QV: below the median the floor((n + 1) v)-th smallest, above it the ceil((n + 1) v)-th, so each band
+    holds at least its share of a new error exchangeable with these (the extreme error past the sample); 0 at the median, which stays the model's."""
+    r = np.sort(np.asarray(r, dtype=float))
+    n = len(r)
+    out = np.zeros(len(QV))
+    for j, v in enumerate(QV):
+        if v != 0.5:
+            i = int(np.floor((n + 1) * v)) if v < 0.5 else int(np.ceil((n + 1) * v))
+            out[j] = r[min(max(i, 1), n) - 1]
+    return out
+
+
+def _conformal(site: dict, kind: str, day0: int) -> dict:
+    """The conformal table of a site's PV or load for the local day from day0: `by` {(horizon class, sky class or None): the errors}, `pairs`
+    {(class, sky): count}, `days` (the local days with an error). Cached per telemetry file, site, kind and day, rebuilt when the issues change."""
+    sid, w0 = site["id"], int(day0) - CONFORMAL_DAYS * 86400
+    every = CONFORMAL_EVERY_H * 3600
+    sql = ("FROM forecast_issues WHERE site_id = ? AND kind = ? AND stage = 1 AND belief_time >= ? AND belief_time < ? "
+           "AND (belief_time + 18000) % ? = 0")
+    args = (sid, kind, w0 - 2 * 86400, int(day0), every)
+    with telemetry.connect() as con:
+        n, last = con.execute(f"SELECT COUNT(*), MAX(belief_time) {sql}", args).fetchone()
+    key = (str(store.telemetry_path()), sid, kind, int(day0))
+    hit = _CONFORMAL.get(key)
+    if hit is not None and hit[0] == (n, last):
+        return hit[1]
+    table: dict = {"by": {}, "pairs": {}, "days": 0}
+    if n:
+        with telemetry.connect() as con:
+            rows = con.execute(f"SELECT belief_time, body {sql} ORDER BY belief_time", args).fetchall()
+        g = telemetry.minute_grid(sid, w0 - 3 * 86400, int(day0))  # the oldest issue's sky reads the day before it
+        g0 = int(g["ts"][0])
+        iv = sample_minutes(g["present"])
+        if kind == "pv":
+            pv_asset = site["assets"]["pv"]
+            lat, lon = site["data"].get("lat", 31.5), site["data"].get("lon", 74.3)
+            kw_ac = float(pv_asset["kw_ac"])
+            av = available_pv(g)
+            csm = solar.pv_power(g["ts"], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"]))
+            act = _q15(av)
+        else:
+            act = _q15(np.where(censored_minutes(site, g), np.nan, g["load"]))
+        k = np.arange(STEPS)
+        hc = np.searchsorted([4 * b for _, _, b in HORIZON_CLASSES], k, side="right")
+        errs: dict = {}
+        days: set = set()
+        for r in rows:
+            body = json.loads(r["body"])
+            bt = int(r["belief_time"])
+            q50 = np.array([np.nan if x is None else float(x) for x in body.get("q50") or []], dtype=float)
+            if len(q50) != STEPS:
+                continue
+            tgt = bt + STEP_S * k
+            sel = (tgt >= w0) & (tgt < day0)
+            if not sel.any():
+                continue
+            j = (tgt[sel] - g0) // STEP_S
+            a, m = act[j], q50[sel]
+            if kind == "pv":
+                cs = np.array([np.nan if x is None else float(x) for x in body.get("cs") or []], dtype=float)
+                if len(cs) != STEPS:
+                    continue
+                s = cs[sel]
+                ok = ~np.isnan(a) & ~np.isnan(m) & (s > 0.05 * kw_ac)
+                sky = _sky_class(_sky_index(av, csm, (bt - g0) // 60, kw_ac, body.get("pr"), iv))
+            else:
+                s = np.maximum(m, 0.1 * max(1e-6, float(np.nanmean(q50))))
+                ok = ~np.isnan(a) & ~np.isnan(m)
+                sky = None
+            if not ok.any():
+                continue
+            e = (a[ok] - m[ok]) / s[ok]
+            for c in np.unique(hc[sel][ok]):
+                v = e[hc[sel][ok] == c]
+                for sk in {None, sky}:
+                    errs.setdefault((HORIZON_CLASSES[c][0], sk), []).append(v)
+            days.update(((tgt[sel][ok] + 5 * 3600) // 86400).tolist())
+        table = {"by": {c: np.sort(np.concatenate(v)) for c, v in errs.items()}, "days": len(days)}
+        table["pairs"] = {c: len(v) for c, v in table["by"].items()}
+    if len(_CONFORMAL) >= 256:
+        _CONFORMAL.clear()
+    _CONFORMAL[key] = ((n, last), table)
+    return table
+
+
+def _apply_conformal(q: dict, table: dict, sky: str | None, scale: np.ndarray, cap: np.ndarray | None = None, kind: str = "pv") -> dict:
+    """Set the bands of every step whose horizon class has enough errors (see above) to the median plus scale times the errors' conformal quantiles,
+    in place, each band kept on its side of the median and within [0, cap]. Returns the issue's `bands`: `method` conformal (some class), empirical (a
+    stage-1 issue without) or prior (stage 0), the issue's `sky` class (PV) and `classes`, the error count of each conformal horizon class."""
+    out = {"method": "empirical", "sky": sky, "classes": {}}
+    if table["days"] < CONFORMAL_MIN_DAYS[kind]:
+        return out
+    n = len(q["q50"])
+    for name, a, b in HORIZON_CLASSES:
+        r = next((table["by"][c] for c in ((name, sky), (name, None)) if len(table["by"].get(c, ())) >= CONFORMAL_MIN_PAIRS), None)
+        if r is None or a * 4 >= n:
+            continue
+        sl = slice(a * 4, min(b * 4, n))
+        rq = _conformal_q(r)
+        med = q["q50"][sl]
+        for j, qn in enumerate(QS):
+            if qn == "q50":
+                continue
+            v = med + scale[sl] * rq[j]
+            v = np.minimum(v, med) if QV[j] < 0.5 else np.maximum(v, med)
+            q[qn] = q[qn].copy()
+            q[qn][sl] = np.clip(v, 0.0, None if cap is None else cap[sl])
+        out["classes"][name] = int(len(r))
+    if out["classes"]:
+        out["method"] = "conformal"
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ load
@@ -352,7 +511,8 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     if have_days < 3:
         q = {name: tmpl * (1 + 0.25 * (v - 0.5) / 0.45) for name, v in zip(QS, QV)}
         q["q50"] = tmpl
-        return {"stage": 0, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days, **crit_info}
+        return {"stage": 0, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days, "bands": {"method": "prior", "sky": None, "classes": {}},
+                **crit_info}
     # equivalent-day persistence: per target step, the same slot on the last same-day-type days (up to 7); a type with fewer than 2 such days reads
     # the next type of its fallback (DAY_FALLBACK: Eid and a holiday from the off days, a Ramadan or half day from the working days), then the template
     lo15 = np.nanmean(lo[: len(lo) // 15 * 15].reshape(-1, 15), axis=1)
@@ -397,7 +557,10 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
             w = np.exp(-np.arange(steps) / 8.0)
             qarr = qarr * (1 + (ratio - 1) * w)
     q = {name: qarr[j] for j, name in enumerate(QS)}
-    return {"stage": 1, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days, **crit_info}
+    # conformal bands from the stored issues' errors once a week of them is scored (plan Part 5.2), around the median above
+    scale = np.maximum(q["q50"], 0.1 * max(1e-6, float(np.mean(q["q50"]))))
+    bands = _apply_conformal(q, _conformal(site, "load", _local_midnight(t0)), None, scale, kind="load")
+    return {"stage": 1, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days, "bands": bands, **crit_info}
 
 
 # ------------------------------------------------------------------------------------------------ outages
@@ -674,10 +837,11 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
     p, l, o = pv(site, t0), load(site, t0), outage(site, t0, now=now)
     if save:
         if p["stage"] is not None:  # a site without PV has no PV issue
-            telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION, {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr")})
+            telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION, {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr"),
+                                                                             "bands": p.get("bands")})
         telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION, {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"]),
                                                                            "crit_learned_hours": l.get("crit_learned_hours"), "crit_zero": l.get("crit_zero"),
-                                                                           "calendar": l.get("calendar")})
+                                                                           "calendar": l.get("calendar"), "bands": l.get("bands")})
         # an off-grid site's issue (always down, no stage) is still saved: the plan's same-quarter protection reads it
         telemetry.save_forecast(site["id"], "outage", t0, o["stage"] or 0, VERSION,
                                 {"p_down": _r(o["p_down"]), "p_start": _r(o["p_start"]), "dur_steps": [int(x) for x in o["dur_steps"]], "g": _r(o["g"], 0),
@@ -906,11 +1070,15 @@ def _power_scores(site: dict, kind: str, t0: int, g: dict) -> list[dict]:
         row = {"kind": kind, "metric": "nrmse", "value": round(_nrmse(pred[ok], act[ok], denom), 4), "horizon_class": "day_ahead"}
         base = baseline(None, f["belief_time"])
         okp = ok & ~np.isnan(base)
+        sl = ok
         if okp.sum() >= MIN_SLOTS:
             # the model and its baseline over the same slots, so the skill compares like with like
             row["value"] = round(_nrmse(pred[okp], act[okp], denom), 4)
             row["baseline_value"] = round(_nrmse(base[okp], act[okp], denom), 4)
+            sl = okp
         rows.append(row)
+        cal = _calibration(f, off, act, sl, denom)
+        rows += [{"kind": kind, "metric": m, "value": v, "horizon_class": "day_ahead"} for m, v in cal.items()]
     issues = _issues(sid, kind, t0 - 48 * 3600, t0 + 86400, "q50")
     for cls, a, b in HORIZON_CLASSES:
         P, A, B = [], [], []
@@ -938,11 +1106,35 @@ def _power_scores(site: dict, kind: str, t0: int, g: dict) -> list[dict]:
     return rows
 
 
+#: the bands' calibration (plan Part 5.5, PV and load: "pinball loss, ... q10 to q90 coverage 80 percent plus or minus 5, q05 to q95 coverage 90
+#: percent"), scored on the day-ahead issue over the slots of its nRMSE: the share of slots inside each band, and the pinball loss averaged over the
+#: seven quantiles, by the same denominator as the nRMSE (AC rating, mean load). The day rows keep these apart from the headline metric (scores()).
+CALIBRATION = {"coverage_80": {"target": 0.8, "tolerance": 0.05}, "coverage_90": {"target": 0.9}, "pinball": {}}
+
+
+def _calibration(f: dict, off: int, act: np.ndarray, ok: np.ndarray, denom: float) -> dict:
+    """{coverage_80, coverage_90, pinball} of an issue over the day's slots `ok` (see CALIBRATION); empty when the issue lacks a quantile or the slots
+    are too few."""
+    qs = {}
+    for name in QS:
+        v = f.get(name)
+        if not isinstance(v, list) or len(v) < off + len(act):
+            return {}
+        qs[name] = np.array([np.nan if x is None else float(x) for x in v[off:off + len(act)]], dtype=float)
+    m = ok & ~np.any(np.isnan(np.vstack(list(qs.values()))), axis=0)
+    if m.sum() < MIN_SLOTS:
+        return {}
+    y = act[m]
+    inside = lambda lo, hi: round(float(np.mean((y >= qs[lo][m]) & (y <= qs[hi][m]))), 4)
+    pin = np.mean([np.mean(np.maximum(v * (y - qs[n][m]), (v - 1) * (y - qs[n][m]))) for n, v in zip(QS, QV)])
+    return {"coverage_80": inside("q10", "q90"), "coverage_90": inside("q05", "q95"), "pinball": round(float(pin / denom), 5)}
+
+
 def score_day(site: dict, day) -> list[dict]:
     """Yesterday's scores (plan Part 5.5): for PV and load the day-ahead issue's (the first issue at or before local midnight) nRMSE and one row per
-    horizon class, each against its baseline (_power_scores); the outage Brier over the slots with a known grid state against the schedule-only
-    baseline (the pre-registered gate; the climatology Brier is returned beside it). A kind's day-ahead row comes first: alerts.nightly reads the
-    first PV row as the day's headline."""
+    horizon class, each against its baseline, then the day-ahead bands' coverage and pinball loss (_power_scores, CALIBRATION); the outage Brier
+    over the slots with a known grid state against the schedule-only baseline (the pre-registered gate; the climatology Brier is returned beside it).
+    A kind's day-ahead row comes first: alerts.nightly reads the first PV row as the day's headline."""
     t0 = twin.day_start_utc(day)
     g = telemetry.minute_grid(site["id"], t0, t0 + 86400)
     if g["completeness"] < 0.5:
@@ -1000,6 +1192,7 @@ def scores(site_id: str, days: int = 30, site: dict | None = None) -> dict:
     """The scored days of the last `days` calendar days (Pakistan time) and their summary. `days` holds each kind's day-ahead rows (one per day and
     metric) with their skill; `summary` gives per kind the mean over the last 7 and the last `days` calendar days (`last7`, `last30`; `n7` and `n` days
     scored in each), the baseline's means and the skill against it, and the same per horizon class (`horizons`, plan Part 5.5's classes in order).
+    PV and load also get `calibration`: per CALIBRATION metric its window means and counts with its target (the bands' rows stay out of `days`).
     With the site, the kinds that do not apply to it (not_applicable) are left out, rows stored before included."""
     today = datetime.now(PKT).date()
     since = (today - timedelta(days=days)).isoformat()
@@ -1008,13 +1201,16 @@ def scores(site_id: str, days: int = 30, site: dict | None = None) -> dict:
         rows = con.execute("SELECT * FROM forecast_scores WHERE site_id = ? AND day_local >= ? ORDER BY day_local", (site_id, since)).fetchall()
     head: dict = {}
     by_class: dict = {}
+    cal: dict = {}
     skip = {k for k in ("pv", "load", "outage") if site is not None and not_applicable(site, k)}
     for r in rows:
         if r["kind"] in skip:
             continue
         x = {"day": r["day_local"], "metric": r["metric"], "value": r["value"], "baseline": r["baseline_value"], "horizon_class": r["horizon_class"],
              "skill": _skill(r["value"], r["baseline_value"])}
-        if r["horizon_class"] == "day_ahead":
+        if r["metric"] in CALIBRATION:
+            cal.setdefault(r["kind"], {}).setdefault(r["metric"], []).append(x)
+        elif r["horizon_class"] == "day_ahead":
             head.setdefault(r["kind"], []).append(x)
         else:
             by_class.setdefault(r["kind"], {}).setdefault(r["horizon_class"], []).append(x)
@@ -1031,4 +1227,7 @@ def scores(site_id: str, days: int = 30, site: dict | None = None) -> dict:
         horizons = [{"horizon_class": c, "from_h": a, "to_h": b, **window(classes[c])} for c, a, b in HORIZON_CLASSES if classes.get(c)]
         metric = v[0]["metric"] if v else next(iter(classes.values()))[0]["metric"]
         summary[k] = {"metric": metric, **window(v), "baseline_kind": BASELINES.get(k), "horizons": horizons}
+        if cal.get(k):
+            summary[k]["calibration"] = {m: {**{x: w[x] for x in ("last7", "last30", "n", "n7")}, **CALIBRATION[m]}
+                                         for m, rs in cal[k].items() for w in [window(rs)]}
     return {"days": head, "summary": summary, "from": since, "from7": since7}
