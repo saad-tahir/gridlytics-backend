@@ -408,6 +408,34 @@ def test_sites_on_the_same_feeder_pool_their_outage_history(company):
     assert issue["pooled"] == {"sites": 1, "days": 28.0} and issue["days_known"] == 0.0
 
 
+def test_the_feeder_pool_leaves_out_demo_sites_and_off_grid_sites(company):
+    """Review of brief-vs-build-09: a demo site's grid history is the twin's, made up, and an off-grid site's grid always reads 0, so neither is a sensor
+    of a real feeder, even with the same DISCO and feeder code (the demo seeds FESCO feeder 411205). A real site pools only real sites on the grid, and a
+    demo site only demo sites. Before the review every site of the company with the code was pooled: the real site below read the demo's and the
+    off-grid site's 56 days, the off-grid site's always-down grid as windows kept."""
+    from gridlytics import sites
+    unit = {"kind": "feeder", "code": "411205", "name": "Jhang Road Industrial"}
+    real = _feeder_site("Real mill", "411205")
+    demo_ids = []
+    for name in ("Demo mill", "Demo weaving"):
+        sid = sites.create({"name": name, "disco": "FESCO", "outage_unit": unit}, "test", demo_link="demo")["id"]
+        sites.put_connection(sid, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400}, "test")
+        demo_ids.append(sid)
+    island = sites.create({"name": "Island mill", "disco": "FESCO", "off_grid": True, "outage_unit": unit}, "test")["id"]
+    t0 = int(datetime(2026, 11, 9, tzinfo=PKT).timestamp())
+    ts = np.arange(t0 - 28 * 86400, t0, 60, dtype=np.int64)
+    _, minute = _local(ts)
+    _write_grid(demo_ids[0], ts, np.where((minute >= 18 * 60) & (minute < 19 * 60 + 30), 0.0, 1.0))
+    _write_grid(island, ts, np.zeros(len(ts)))
+    forecast.set_schedule(real["id"], [["14:00", "16:00", "daily"]], "manual", "t")
+    o = forecast.outage(real, t0)
+    assert o["pooled"] == {"sites": 0, "days": 0.0} and o["stage"] == 0
+    assert o["adherence_windows"] == 0 and o["lam_day"] == pytest.approx(0.7, abs=0.01)
+    # a demo site pools the other demo site on its feeder, not the real or the off-grid one
+    o = forecast.outage(sites.full(demo_ids[1]), t0)
+    assert o["pooled"] == {"sites": 1, "days": 28.0}
+
+
 # ------------------------------------------------------------------------------------------------ engine-forecast-12
 
 def test_a_rural_feeder_without_a_schedule_starts_from_about_ten_hours_a_day_without_grid_flagged_as_a_prior(company):

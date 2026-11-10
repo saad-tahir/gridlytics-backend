@@ -687,12 +687,16 @@ def _pool_key(site: dict) -> tuple | None:
 
 
 def _feeder_peers(site: dict) -> list[str]:
-    """The ids of the other sites of the company on the site's feeder or transformer (same DISCO, kind and code), at most POOL_MAX_SITES."""
+    """The ids of the other sites of the company on the site's feeder or transformer (same DISCO, kind and code), at most POOL_MAX_SITES. An off-grid
+    site (its grid always reads 0) is no sensor of a feeder, and a demo site's history is the twin's: a real site pools real sites only, a demo site
+    demo sites only."""
     key = _pool_key(site)
     if key is None:
         return []
     from . import sites as sites_mod
-    return sorted(r["id"] for r in sites_mod.listing() if r["id"] != site["id"] and _pool_key(r) == key)[:POOL_MAX_SITES]
+    demo = bool(site.get("demo_link"))
+    peers = [r for r in sites_mod.listing() if r["id"] != site["id"] and _pool_key(r) == key and bool(r.get("demo_link")) == demo]
+    return sorted(r["id"] for r in peers if not off_grid({**r, "connections": sites_mod.connections(r["id"])}))[:POOL_MAX_SITES]
 
 
 def _outage_events(grid: np.ndarray, ts: np.ndarray, windows: list) -> dict:
