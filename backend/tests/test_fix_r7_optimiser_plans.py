@@ -1479,3 +1479,39 @@ def test_no_step_of_the_farms_day_charges_and_discharges_at_once():
         p["battery"]["E0"] = 0.9 * 120.0
         s = optimise.solve(p)["sol"]
         assert not ((s["C"] > 1e-3) & (s["D"] > 1e-3)).any(), surplus
+
+
+# ------------------------------------------------------------------------------------------------ engine-optimiser-11
+
+def _gen_site():
+    sid = _site(genset_start_control="manual")
+    sites.put_asset(sid, "genset", {"rated_kw": 200, "fuel_kind": "hsd", "tank_l": 1500}, "t")
+    return sid
+
+
+def test_the_grid_tied_terminal_value_takes_the_gensets_cost_where_an_outage_is_likely_the_day_after(company):
+    """Part 4.4: c_next is the dearest import price of the day after the horizon, or the genset's marginal cost where that day's outage
+    probability reaches the site's threshold. It was always the import price, so at an outage-heavy feeder (the set about Rs 130 a kWh against a
+    Rs 50 peak) the plan ran the battery down towards the horizon's end before a likely outage."""
+    sid = _gen_site()
+    full = sites.full(sid)
+    t0 = twin.day_start_utc(date(2026, 11, 10)) + 7 * 3600
+    b = forecast.issue(full, t0, save=False)
+    b["outage"]["p_start"] = np.zeros(192)
+    quiet = plans.build_problem(full, t0, b, 192)
+    peak = float(np.max(np.asarray(quiet["c_imp"])[-96:]))
+    assert quiet["terminal"]["c_next"] == pytest.approx(peak)
+    assert quiet["c_short"] > peak
+    b["outage"]["p_start"] = np.zeros(192)
+    b["outage"]["p_start"][-96:] = 0.01                                          # 62 % that an outage starts on the last day: over the 20 %
+    likely = plans.build_problem(full, t0, b, 192)
+    assert likely["terminal"]["p_next"] >= likely["reserve_threshold"]
+    assert likely["terminal"]["c_next"] == pytest.approx(likely["c_short"])     # before: the import peak
+    assert likely["terminal"]["c_next_basis"] == "genset"
+    # under the site's threshold, and without a genset, the import price stays
+    sites.update(sid, {"reserve_policy": {"p_threshold": 0.9, "min_soc_pct": 20.0}}, "t")
+    assert plans.build_problem(sites.full(sid), t0, b, 192)["terminal"]["c_next"] == pytest.approx(peak)
+    assert plans.build_problem(sites.full(_site()), t0, b, 192)["terminal"]["c_next"] == pytest.approx(peak)
+    # nor behind an auto-start panel: the set takes the outage within a minute and follows the load, so a stored kWh spares it nothing
+    sites.update(sid, {"reserve_policy": {"p_threshold": 0.2, "min_soc_pct": 20.0}, "genset_start_control": "auto_on_grid_loss"}, "t")
+    assert plans.build_problem(sites.full(sid), t0, b, 192)["terminal"]["c_next"] == pytest.approx(peak)

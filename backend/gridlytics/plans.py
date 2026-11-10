@@ -353,11 +353,21 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         # 0.5 outages a day decided it, and the site's setting did nothing). Two hours of the critical load, never above what the battery and the
         # inverter can deliver (engine-plans-live-06)
         p_next = 1.0 - float(np.prod(1.0 - np.clip(p_start[-96:], 0.0, 1.0))) if len(p_start) else 0.0
+        # Part 4.4: at a grid-connected site c_next is the dearest import price of the day after, or the genset's marginal cost where that day's
+        # outage chance reaches the site's threshold (round 7, engine-optimiser-11: always the import price, so at an outage-heavy feeder a kWh
+        # left at the horizon's end, which a likely outage would take from the set at about Rs 130, was valued at a Rs 50 peak, and the plan
+        # ran the battery down towards hour 48). The dearer of the two: the kWh serves whichever use comes. Not behind an auto-start panel: there
+        # the set starts within a minute of the grid's loss and follows the load (twin.simulate), so a stored kWh spares it nothing beyond the
+        # start delay the reserve already covers (engine-plans-live-03), and Lahore's plan held its battery for an outage it never used
+        c_next_basis = "genset" if off_grid and gen else ("lost_load" if off_grid else "import")
+        if (not off_grid and gen and gen["control"] != "auto_on_grid_loss" and p_next >= p["reserve_threshold"]
+                and p["c_short"] > c_next):
+            c_next, c_next_basis = float(p["c_short"]), "genset"
         kw_next = np.minimum(Lc[-96:], float(b_asset["p_dis_kw"]))
         if p.get("inverter_kw_ac"):
             kw_next = np.minimum(kw_next, float(p["inverter_kw_ac"]))
         r_next = float(np.mean(kw_next)) * 2.0 / b_asset["eta_d"] if (off_grid or p_next >= p["reserve_threshold"]) and len(kw_next) else 0.0
-        p["terminal"] = {"c_next": c_next, "H_peak": 4.0, "R_next": r_next,
+        p["terminal"] = {"c_next": c_next, "c_next_basis": c_next_basis, "H_peak": 4.0, "R_next": r_next,
                          "c_cal_hold": terminal_cal_hold(bat["b_cal"], vec["c_imp"], L, PV, off_grid), "p_next": p_next}
     return p
 
