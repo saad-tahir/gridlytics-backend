@@ -1253,3 +1253,57 @@ def test_slots_in_the_next_billing_month_carry_its_own_cap(company, monkeypatch)
         for s in d["slots"]:
             if s["mode"].startswith("charge"):
                 assert s["grid_cap_w"] == round(cap2 * 1000)
+
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-08, engine-optimiser-12
+
+LINES = ("energy_rs", "genset_rs", "wear_rs", "mdi_rise_rs", "mdi_month_rs", "calendar_rs", "unserved_rs", "expected_shortfall_rs",
+         "terminal_credit_rs")
+
+
+def test_at_a_months_start_the_month_charge_is_its_own_line_and_no_rise():
+    """Golden. Karachi's first plans of November showed 'MDI rise' Rs 527,841: M0 is near nothing at a month's start, and the rise was measured
+    from max(M0, floor), so the whole month's demand charge above the 25 % floor read as a rise the plan caused. The rise is now measured from
+    the peak's lower bound (the expected month peak here), and the charge at that bound is its own line, `mdi_month_rs`."""
+    p = _problem()
+    p["mdi"] = {"rate": 1250.0, "M0": 0.0, "floor": 50.0, "n_mdi": 2, "G_elapsed": 0.0, "n_elapsed": 0, "month_end_step": 96, "M_exp": 120.0}
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    bd = r["breakdown"]
+    assert bd["mdi_rise_rs"] == pytest.approx(0.0, abs=0.01)           # before: 1,250 x (120 - 50) = Rs 87,500
+    assert bd["mdi_month_rs"] == pytest.approx(1250.0 * 120.0, abs=0.01)  # Rs 150,000: 120 kW at Rs 1,250 per kW
+
+
+def test_the_next_months_rise_and_charge_are_itemised():
+    """Golden. M2, the next month's peak, was in the objective and in no line of the breakdown: the cost terms did not explain the objective
+    across a month's end. A 300 kW half hour on the new month's first morning raises M2 above its 50 kW floor; the rise and the charge at the
+    floors are itemised."""
+    p = _month_end(_problem(), end=48, M0=100.0, floor=50.0)
+    p["L"] = p["L"].copy()
+    p["L"][56:58] = 300.0
+    p["Lhi"] = np.maximum(p["Lhi"], p["L"])
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    M, M2 = r["M"]
+    assert M2 > 150.0
+    bd = r["breakdown"]
+    assert bd["mdi_rise_rs"] == pytest.approx(1250.0 * ((M - 100.0) + (M2 - 50.0)), abs=0.05)
+    assert bd["mdi_month_rs"] == pytest.approx(1250.0 * (100.0 + 50.0), abs=0.01)
+
+
+def test_the_cost_lines_add_up_to_the_objective():
+    """The plan page showed 'Not itemised (mainly the month's demand charge)' Rs 577,290 of a Rs 1,007,127 objective. With the month's charge,
+    the next month's and the calendar ageing itemised, the lines add up to the objective but for the solver's tie-breaks (a fraction of a paisa
+    per kWh)."""
+    p = _month_end(_problem(), end=48, M0=100.0, floor=50.0, M_exp=95.0)
+    p["L"] = p["L"].copy()
+    p["L"][56:58] = 300.0
+    p["Lhi"] = np.maximum(p["Lhi"], p["L"])
+    p["battery"]["b_cal"] = np.full(96, 0.04)
+    p["terminal"]["c_cal_hold"] = 0.4
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    bd = r["breakdown"]
+    E = np.asarray(r["sol"]["E"])
+    assert bd["calendar_rs"] == pytest.approx(0.04 * float(np.sum(E[1:])), abs=0.01)
+    assert sum(bd[k] for k in LINES) == pytest.approx(r["objective_rs"], abs=2.0)

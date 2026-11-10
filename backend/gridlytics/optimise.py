@@ -924,9 +924,22 @@ def _breakdown(p: dict, s: dict, out: dict) -> dict:
     if gen:
         genset = float(np.sum(gen["c_fuel"] * s["F"] + gen["c_start"] * s["v"] + H * gen["c_runhr"] * s["u"] + H * gen["c_om"] * s["P"]))
     wear = float(np.sum(H * bat["c_cyc"] * s["D"])) if bat else 0.0
-    mdi = 0.0
+    # the demand charge (round 7, engine-plans-live-08, engine-optimiser-12): the objective pays rate x M, and rate x M2 where the horizon
+    # crosses into the next billing month. `mdi_month_rs` is the charge at each peak's lower bound (the month so far, the floor and the expected
+    # month peak: mdi_floors), which no plan changes; `mdi_rise_rs` what the plan adds above it, M's and M2's. Before, the rise was measured from
+    # max(M0, floor) alone, so at a month's start (M0 near nothing) the whole month's charge read as a rise, M2 was in no line, and the rest of the
+    # charge was left unitemised
+    mdi_rise = mdi_month = 0.0
     if p.get("mdi") and out.get("M"):
-        mdi = float(p["mdi"]["rate"] * (out["M"][0] - max(p["mdi"]["M0"], p["mdi"]["floor"])))
+        rate = float(p["mdi"]["rate"])
+        lbs = list(out.get("M_lb") or mdi_floors(p["mdi"]))[:len(out["M"])]
+        mdi_month = rate * float(sum(lbs))
+        mdi_rise = rate * float(sum(max(0.0, M - lb) for M, lb in zip(out["M"], lbs)))
+    # the calendar ageing the objective prices on the energy held after each step (b_cal, Rs per kWh per step)
+    calendar = 0.0
+    if bat:
+        b_cal = np.asarray(bat.get("b_cal", np.zeros(len(s["G"]))), dtype=float)[:len(s["G"])]
+        calendar = float(np.dot(b_cal, np.asarray(s["E"], dtype=float)[1:len(b_cal) + 1]))
     unserved = float(np.sum(H * p["voll"] * s["U"]))
     # each reserve row's slack at its own price (p c_short; behind an AMF panel the start delay's and the failed start's, round 7)
     prices = out.get("r_price") or {}
@@ -937,8 +950,8 @@ def _breakdown(p: dict, s: dict, out: dict) -> dict:
     terminal = -float(out.get("v_end", 0.0) * out.get("E_use", 0.0)) if bat else 0.0
     # and a start under the cut-off that ends under it pays for the kWh short of it (round 7, engine-optimiser-03)
     terminal += float(out.get("E_gap_price", 0.0) * out.get("E_gap", 0.0)) if bat else 0.0
-    return {"energy_rs": round(energy, 2), "genset_rs": round(genset, 2), "wear_rs": round(wear, 2), "mdi_rise_rs": round(mdi, 2),
-            "unserved_rs": round(unserved, 2), "expected_shortfall_rs": round(reserve, 2), "terminal_credit_rs": round(terminal, 2),
+    return {"energy_rs": round(energy, 2), "genset_rs": round(genset, 2), "wear_rs": round(wear, 2), "mdi_rise_rs": round(mdi_rise, 2),
+            "mdi_month_rs": round(mdi_month, 2), "calendar_rs": round(calendar, 2), "unserved_rs": round(unserved, 2), "expected_shortfall_rs": round(reserve, 2), "terminal_credit_rs": round(terminal, 2),
             "litres": round(float(np.sum(s["F"])), 2), "import_kwh": round(float(np.sum(s["G"]) * H), 2), "export_kwh": round(float(np.sum(s["X"]) * H), 2),
             "discharge_kwh": round(float(np.sum(s["D"]) * H), 2), "genset_kwh": round(float(np.sum(s["P"]) * H), 2),
             "peak_import_kwh": round(float(np.sum(s["G"][np.asarray(p["peak"], dtype=bool)]) * H), 2)}
