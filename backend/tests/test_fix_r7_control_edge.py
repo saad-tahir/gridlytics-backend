@@ -1882,3 +1882,66 @@ def test_the_published_signing_vectors_are_the_code_and_verify():
     sig = sent.pop("signature")
     assert sig["key_id"] == s["key_id"] and delivery.canonical(sent).decode() == s["signed_text"]
     Ed25519PublicKey.from_public_bytes(base64.b64decode(s["public_key"])).verify(base64.b64decode(sig["value"]), s["signed_text"].encode())
+
+
+# ------------------------------------------------------------------------------------------------ batch 6: engine-delivery-23
+
+def _env6(seq: int, **extra) -> dict:
+    return {"contract": "ems-edge/1.0", "seq": seq, "sent_at": "2026-11-06T10:00:00Z", **extra}
+
+
+def _stored_events(sid: str) -> int:
+    with store.connect() as con:
+        return con.execute("SELECT count(*) FROM events WHERE site_id = ? AND source LIKE 'edge%'", (sid,)).fetchone()[0]
+
+
+def test_an_edge_message_over_1_mib_is_refused_with_413_and_nothing_is_stored(world):
+    sid = world.site
+    kh = {**world.key(["telemetry:write"]), "Content-Type": "application/json"}
+    # 300 events of 3.5 kB each: every field within its bound, 1.05 MB in all
+    events = [{"ts": "2026-11-06T10:00:00Z", "type": "data_gap", "detail": {"note": "x" * 3500}} for _ in range(300)]
+    body = json.dumps(_env6(1, events=events))
+    assert len(body.encode()) > 1_048_576
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, content=body)
+    assert r.status_code == 413 and r.json()["code"] == "too_large" and "1 MiB" in r.json()["detail"], r.text[:300]
+    # sent in chunks with no length named, it is counted as it arrives
+    chunks = (body[i:i + 65536].encode() for i in range(0, len(body), 65536))
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, content=chunks)
+    assert r.status_code == 413, r.text[:300]
+    # a heartbeat padded past 1 MiB with spaces is refused before it is read whole
+    beat = json.dumps(_env6(1, uptime_s=5)) + " " * 1_048_576
+    r = world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, content=beat)
+    assert r.status_code == 413, r.text[:300]
+    with world.use():
+        assert _stored_events(sid) == 0 and not sites.state(sid).get("edge_heartbeat")
+    # under the cap the same events are stored
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_env6(1, events=events[:200]))
+    assert r.status_code == 200 and r.json()["stored"] == 200, r.text[:300]
+    # a body that is not JSON is one sentence, as before
+    r = world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, content="{not json")
+    assert r.status_code == 422 and r.json()["detail"], r.text
+
+
+@pytest.mark.parametrize("path,body,said", [
+    ("events", _env6(2, events=[{"ts": "2026-11-06T10:00:00Z", "type": "data_gap", "detail": {"note": "x" * 5000}}]), "events.0.detail"),
+    ("events", _env6(2, events=[{"ts": "2026-11-06T10:00:00Z", "type": "data_gap", "detail": {f"k{i}": i for i in range(80)}}]), "events.0.detail"),
+    ("telemetry", _env6(2, columns=["ts", "grid_present"], rows=[[1794000000, 1]], quality={"flags": ["x" * 100] * 50}), "quality"),
+    ("ack", _env6(2, plan_id="p1", status="partial", per_device=[{"device_id": "inv1", "status": "partial",
+                                                                   "applied": [{"primitive": "slot_table", "written": {"prog": ["x" * 5000]}}]}]),
+     "per_device.0.applied.0.written"),
+    ("ack", _env6(2, plan_id="p1", status="applied", items=[{"device": "inv1", "primitive": "soc", "written": "x" * 200, "status": "ok"}]),
+     "items.0.written"),
+    ("capabilities", _env6(2, edge_version="1.0", devices=[{"device_id": "inv1", "role": "hybrid_inverter", "estimator": {"blob": "x" * 5000}}]),
+     "devices.0.estimator"),
+    ("heartbeat", _env6(2, uptime_s=5, active_plan="p" * 5000), "active_plan"),
+])
+def test_free_form_fields_of_an_edge_message_are_bounded(world, path, body, said):
+    sid = world.site
+    kh = world.key(["telemetry:write"])
+    r = world.anon.post(f"/api/edge/{sid}/{path}", headers=kh, json=body)
+    assert r.status_code == 422 and r.json()["code"] == "SCHEMA" and r.json()["detail"].startswith(said), (path, r.status_code, r.text[:300])
+    with world.use():
+        assert _stored_events(sid) == 0 and not sites.state(sid).get("edge_heartbeat")
+        with store.connect() as con:
+            assert con.execute("SELECT count(*) FROM acks WHERE site_id = ?", (sid,)).fetchone()[0] == 0
+            assert con.execute("SELECT count(*) FROM capabilities WHERE site_id = ?", (sid,)).fetchone()[0] == 0

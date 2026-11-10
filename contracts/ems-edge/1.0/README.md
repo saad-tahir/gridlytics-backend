@@ -17,7 +17,10 @@ what the cloud accepts and sends today.
 
 HTTPS POST of the JSON message to `/api/edge/{site_id}/{telemetry|heartbeat|events|ack|capabilities}` with the site's API key (`telemetry:write`);
 the edge pulls its plan with GET `/api/sites/{site_id}/plans/current/message` (`plans:read`). MQTT is not served yet. A refused message is answered
-422 with `code` `SCHEMA` and the first error in words; the same message is refused the same way every time it is sent.
+422 with `code` `SCHEMA` and the first error in words; the same message is refused the same way every time it is sent. A message is at most 1 MiB
+(1,048,576 bytes), however it is sent: a larger one is answered 413 `too_large` and nothing in it is stored, so a long backlog goes in smaller
+batches. A free-form part (an event's `detail`, telemetry's `quality`, a device's `estimator`, an ack's `requested`, `written` and `readback`) is
+at most 4096 bytes of compact JSON with at most 64 members, and a value an ack item reports as text at most 120 characters.
 
 ## Rules the cloud keeps
 

@@ -5,6 +5,8 @@
       "properties": {
         "detail": {
           "additionalProperties": true,
+          "description": "Free-form: at most 4096 bytes of compact JSON",
+          "maxProperties": 64,
           "title": "Detail",
           "type": "object"
         },

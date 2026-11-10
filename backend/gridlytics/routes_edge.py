@@ -7,6 +7,7 @@ and msg_id aside) was stored before (`edge_seen`). A batch below the last sequen
 stored, and so is a counter that restarted (a replaced box, a reboot that lost it). A message counts as received only once it is stored, so a batch
 that fails is never later acknowledged as a duplicate; an events batch is marked in the transaction that stores it. A malformed batch (an unknown or repeated column, a
 ts outside 2015 to a day from now) is refused with 422 every time it is sent. An outage event re-solves the plan once telemetry shows it (OPT-15).
+A message is at most 1 MiB however it is sent (413 too_large, DAT-03), and its free-form parts are bounded by the contract's models.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
-from fastapi import APIRouter, BackgroundTasks, Body, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request
 from pydantic import Field, ValidationError
 
 from . import alerts, auth, contract, delivery, forecast, money, plans, sites, store, telemetry
@@ -68,6 +69,39 @@ OBSERVED_LAG_MIN = int(getattr(forecast, "OBSERVED_LAG_MIN", 2))
 SHOWN_WINDOW_S = 3600
 _last_event_solve: dict[str, float] = {}
 _solve_lock = threading.Lock()
+
+
+#: The largest edge message (plan DAT-03, R7 4: 413 above 1 MiB), however it is sent: one site key cannot fill the workspace file or the site's
+#: carried state, which every tick and page reads (audit engine-delivery-23; the API's own cap for every other path is api.MAX_BODY)
+EDGE_MAX_BODY = 1_048_576
+TOO_LARGE = "An edge message is at most 1 MiB: send the rows or events in smaller batches"
+#: The edge routes' body in the API description (they read it themselves, `_edge_body`)
+_JSON_BODY = {"requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object"}}}}}
+
+
+async def _edge_body(request: Request) -> dict:
+    """The edge message's JSON object, read up to EDGE_MAX_BODY: a Content-Length over it is refused before a byte is read, and a body sent in chunks
+    is counted as it arrives and refused once over, never read whole or parsed (413 too_large). A body that is not a JSON object is a 422 in one
+    sentence, as a message that breaks the contract is."""
+    try:
+        announced = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        announced = 0
+    if announced > EDGE_MAX_BODY:
+        raise Refusal(413, TOO_LARGE, "too_large")
+    chunks, seen = [], 0
+    async for chunk in request.stream():
+        seen += len(chunk)
+        if seen > EDGE_MAX_BODY:
+            raise Refusal(413, TOO_LARGE, "too_large")
+        chunks.append(chunk)
+    try:
+        body = json.loads(b"".join(chunks))
+    except (ValueError, RecursionError):
+        raise Refusal(422, "The message is not JSON", "SCHEMA") from None
+    if not isinstance(body, dict):
+        raise Refusal(422, "The message must be a JSON object", "SCHEMA")
+    return body
 
 
 def _check(model, body, site_id: str | None = None):
@@ -287,8 +321,8 @@ def _resolve_pending(site_id: str, state: dict | None, background: BackgroundTas
     return "waiting_for_telemetry"
 
 
-@router.post("/api/edge/{site_id}/telemetry")
-def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(...)):
+@router.post("/api/edge/{site_id}/telemetry", openapi_extra=_JSON_BODY)
+def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Depends(_edge_body)):
     _key_only()
     site = site_or_404(site_id)
     msg = _check(delivery.TelemetryBatch, inp, site_id)
@@ -334,8 +368,8 @@ def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Body(.
     return answer
 
 
-@router.post("/api/edge/{site_id}/heartbeat")
-def edge_heartbeat(site_id: str, inp: dict = Body(...)):
+@router.post("/api/edge/{site_id}/heartbeat", openapi_extra=_JSON_BODY)
+def edge_heartbeat(site_id: str, inp: dict = Depends(_edge_body)):
     _key_only()
     site_or_404(site_id)
     msg = _check(delivery.Heartbeat, inp, site_id)
@@ -390,8 +424,8 @@ def _pause_in(con, site_id: str) -> None:
     store.audit("edge", "set an override", site_id, {"kind": "pause_control", "value": None, "until": until}, con=con)
 
 
-@router.post("/api/edge/{site_id}/events")
-def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Body(...)):
+@router.post("/api/edge/{site_id}/events", openapi_extra=_JSON_BODY)
+def edge_events(site_id: str, background: BackgroundTasks, inp: dict = Depends(_edge_body)):
     """An event batch, stored once. The message is marked stored (`edge_seen`) in the same workspace-file transaction (BEGIN IMMEDIATE) that stores
     the events and any pause they call for, so two identical batches sent at once, or a retry after a failure, never store the events or the pause
     twice; a batch that fails stores nothing and is stored when sent again. An outage starting or ending re-solves the plan (OPT-15)."""
@@ -468,8 +502,8 @@ def _merge_pending(held, cands: list[tuple[int, int, str]], now: int) -> dict:
     return {"minute": minute, "event": event, "since": min(int(held.get("since", now)), now) if same else now}
 
 
-@router.post("/api/edge/{site_id}/ack")
-def edge_ack(site_id: str, inp: dict = Body(...)):
+@router.post("/api/edge/{site_id}/ack", openapi_extra=_JSON_BODY)
+def edge_ack(site_id: str, inp: dict = Depends(_edge_body)):
     _key_only()
     site_or_404(site_id)
     msg = _check(delivery.Ack, inp, site_id)
@@ -484,8 +518,8 @@ def edge_ack(site_id: str, inp: dict = Body(...)):
     return {"ack": msg.seq}
 
 
-@router.post("/api/edge/{site_id}/capabilities")
-def edge_caps(site_id: str, inp: dict = Body(...)):
+@router.post("/api/edge/{site_id}/capabilities", openapi_extra=_JSON_BODY)
+def edge_caps(site_id: str, inp: dict = Depends(_edge_body)):
     _key_only()
     site_or_404(site_id)
     msg = _check(delivery.Capabilities, inp, site_id)

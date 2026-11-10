@@ -10,6 +10,7 @@
         },
         "readback": {
           "default": null,
+          "description": "Free-form: at most 4096 bytes of compact JSON",
           "title": "Readback"
         },
         "readback_ok": {
@@ -26,6 +27,7 @@
         },
         "requested": {
           "default": null,
+          "description": "Free-form: at most 4096 bytes of compact JSON",
           "title": "Requested"
         },
         "requested_hash": {
@@ -43,6 +45,7 @@
         },
         "written": {
           "default": null,
+          "description": "Free-form: at most 4096 bytes of compact JSON",
           "title": "Written"
         }
       },
@@ -135,6 +138,7 @@
               "type": "number"
             },
             {
+              "maxLength": 120,
               "type": "string"
             },
             {
@@ -159,6 +163,7 @@
               "type": "number"
             },
             {
+              "maxLength": 120,
               "type": "string"
             },
             {

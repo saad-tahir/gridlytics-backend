@@ -15,7 +15,7 @@ import math
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 CONTRACT = "ems-edge/1.0"
 #: The largest sequence number taken: a JSON number above 2**53 is no longer exact everywhere
@@ -68,6 +68,36 @@ Name = Annotated[str, Field(min_length=1, max_length=64)]
 Time = Annotated[str, Field(max_length=40)]
 Cell = bool | int | float | Annotated[str, Field(max_length=64)] | None
 
+#: A free-form part of an edge message (an event's detail, a batch's quality, an estimator's notes, a value an ack reports) is at most this much
+#: compact JSON, and an object in it names at most FREE_MEMBERS members (plan DAT-03; audit engine-delivery-23): the edge's notes are kept, never a
+#: store, so one site key cannot bloat the workspace file
+FREE_BYTES = 4096
+FREE_MEMBERS = 64
+#: A value an ack item reports (written, read back) as text is at most this long
+SCALAR_CHARS = 120
+
+
+def _small_json(v):
+    size = len(json.dumps(v, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8"))
+    if size > FREE_BYTES:
+        raise ValueError(f"at most {FREE_BYTES} bytes of JSON, not {size}")
+    return v
+
+
+def _short_scalar(v):
+    if isinstance(v, str) and len(v) > SCALAR_CHARS:
+        raise ValueError(f"at most {SCALAR_CHARS} characters, not {len(v)}")
+    return v
+
+
+_FREE_WORDS = f"Free-form: at most {FREE_BYTES} bytes of compact JSON"
+#: A free-form object of an edge message
+Free = Annotated[dict, Field(max_length=FREE_MEMBERS, description=_FREE_WORDS), AfterValidator(_small_json)]
+#: A free-form value of an edge message
+FreeValue = Annotated[Any, Field(description=_FREE_WORDS), AfterValidator(_small_json)]
+#: A number or a short text an ack reports
+Scalar = Annotated[float | Annotated[str, Field(max_length=SCALAR_CHARS)] | None, BeforeValidator(_short_scalar)]
+
 
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -87,13 +117,13 @@ class TelemetryBatch(Envelope):
     """One-minute rows (U3 5.2). Either `rows` with a ts column, or U3's `data` with ts_start and interval_s (and `rows` as its count)."""
     msg_type: Literal["telemetry"] | None = None
     columns: list[Annotated[str, Field(max_length=60)]] = Field(min_length=1, max_length=64)
-    rows: Annotated[list[list[Cell]], Field(max_length=1440)] | Annotated[int, Field(ge=0, le=1440)] | None = None
-    data: Annotated[list[list[Cell]], Field(max_length=1440)] | None = None
+    rows: Annotated[list[Annotated[list[Cell], Field(max_length=64)]], Field(max_length=1440)] | Annotated[int, Field(ge=0, le=1440)] | None = None
+    data: Annotated[list[Annotated[list[Cell], Field(max_length=64)]], Field(max_length=1440)] | None = None
     ts_start: Time | None = None
     interval_s: int | None = Field(None, ge=1, le=86400)
     aggregation: dict[Annotated[str, Field(max_length=60)], Annotated[str, Field(max_length=20)]] | None = Field(None, max_length=64)
     sample_period_s: float | None = Field(None, gt=0, le=3600)
-    quality: dict = Field(default_factory=dict)
+    quality: Free = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _shape(self):
@@ -137,7 +167,7 @@ class Event(_Strict):
     type: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$", json_schema_extra={"examples": list(KNOWN_EVENTS)},
                       description="One of the known event types (examples); an unknown one is stored and named in the answer")
     source: Name | None = None
-    detail: dict = Field(default_factory=dict)
+    detail: Free = Field(default_factory=dict)
 
 
 class EventBatch(Envelope):
@@ -151,18 +181,18 @@ class EventBatch(Envelope):
 class AckItem(_Strict):
     device: Annotated[str, Field(max_length=60)]
     primitive: Annotated[str, Field(max_length=60)]
-    written: float | str | None = None
-    read_back: float | str | None = None
+    written: Scalar = None
+    read_back: Scalar = None
     status: Literal["ok", "clamped", "failed"]
     codes: list[Annotated[str, Field(max_length=40)]] = Field(default_factory=list, max_length=10)
 
 
 class AckApplied(_Strict):
     primitive: Annotated[str, Field(max_length=60)]
-    requested: Any = None
+    requested: FreeValue = None
     requested_hash: Annotated[str, Field(max_length=100)] | None = None
-    written: Any = None
-    readback: Any = None
+    written: FreeValue = None
+    readback: FreeValue = None
     readback_ok: bool | None = None
 
 
@@ -250,7 +280,7 @@ class Device(_Strict):
     mode_b: ModeB | None = None
     native_settings_ref: Annotated[str, Field(max_length=80)] | None = None
     shunt_fitted: bool | None = None
-    estimator: dict | None = None
+    estimator: Free | None = None
     control: Annotated[str, Field(max_length=40)] | None = None
 
 

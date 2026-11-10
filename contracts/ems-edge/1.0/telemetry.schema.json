@@ -64,6 +64,7 @@
                 }
               ]
             },
+            "maxItems": 64,
             "type": "array"
           },
           "maxItems": 1440,
@@ -133,6 +134,8 @@
     },
     "quality": {
       "additionalProperties": true,
+      "description": "Free-form: at most 4096 bytes of compact JSON",
+      "maxProperties": 64,
       "title": "Quality",
       "type": "object"
     },
@@ -160,6 +163,7 @@
                 }
               ]
             },
+            "maxItems": 64,
             "type": "array"
           },
           "maxItems": 1440,
