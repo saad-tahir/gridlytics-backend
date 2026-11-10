@@ -1625,3 +1625,78 @@ def test_the_demo_refills_a_tank_under_half_full(company):
     sites.put_state(sid, fuel_l=180.0, fuel_ts=T_FUEL)
     demo._top_up(sid, T_FUEL + 900 + 120)                                       # logged at the quarter, so the tick at that quarter counts it
     assert plans.fuel_level(sites.full(sid), T_FUEL + 900)["litres"] == pytest.approx(400.0)
+
+
+# ------------------------------------------------------------------------------------------------ brief-vs-build-04
+
+def _two_days(cap=None, done=0.0):
+    """Two days of a Rs 28 / Rs 60 spread, a four-hour peak each evening: with nothing but the wear price to stop it the plan empties the
+    200 kWh pack into each peak (about 160 kWh a day). `cap` cycles a day (the site's cycle_cap_per_day), with `done` kWh discharged today."""
+    p = _problem(T=192)
+    pk = np.zeros(192, dtype=bool)
+    pk[72:88] = True
+    pk[168:184] = True
+    p.update({"peak": pk, "c_imp": np.where(pk, 60.0, 28.0)})
+    p["battery"]["day_index"] = np.repeat([0, 1], 96)
+    if cap is not None:
+        p["battery"]["cycle_cap_kwh"] = cap * 200.0
+        p["battery"]["discharged_today_kwh"] = done
+    return p
+
+
+def test_the_daily_cycle_cap_limits_the_plans_discharge_each_day():
+    """cycle_cap_per_day was a site setting the battery page showed beside the measured cycles, and nothing read it: the plan could cycle the
+    pack any number of times a day. Each local day's discharge (kWh out of the battery over its E_nom) now stays under the cap, less what the
+    battery has discharged since midnight on the first day."""
+    free = optimise.solve(_two_days())
+    assert free["status"] == "optimal"
+    day = [np.arange(96), np.arange(96, 192)]
+    assert all(float(free["sol"]["D"][d].sum()) * H > 150.0 for d in day)      # the price alone: nearly a cycle a day
+    r = optimise.solve(_two_days(cap=0.5, done=30.0))
+    assert r["status"] == "optimal"
+    used = [float(r["sol"]["D"][d].sum()) * H for d in day]
+    assert used[0] <= 100.0 - 30.0 + 1e-6 and used[0] > 69.0                   # the first day's cap less the 30 kWh already discharged
+    assert used[1] <= 100.0 + 1e-6 and used[1] > 99.0
+    # a peak step the cap keeps from discharging says so, with the cap in cycles and kWh
+    capped = [x for t, x in enumerate(r["reasons"]) if x["reason"] == "cycle_cap"]
+    assert capped and all(x["detail"] == {"cycles": 0.5, "kwh": 100.0} for x in capped)
+    assert any(r["reasons"][t]["reason"] == "cycle_cap" for t in range(72, 88))
+    assert all(x["reason"] != "cycle_cap" for x in free["reasons"])
+
+
+def test_the_cycle_cap_never_keeps_the_battery_from_carrying_an_outage():
+    """In an outage the battery-inverter carries the load whatever the plan says: the cap binds the discharge the plan chooses with the grid up,
+    never the outage's, so it never sheds load to save a cycle."""
+    p = _problem(outage=(40, 48))
+    p["battery"].update({"E0": 150.0, "day_index": np.zeros(96, dtype=int), "cycle_cap_kwh": 20.0, "discharged_today_kwh": 0.0})
+    r = optimise.solve(p)
+    assert r["status"] == "optimal"
+    s, up = r["sol"], np.asarray(p["g"]) > 0.5
+    assert float(s["U"].sum()) * H < 1e-6                                       # the outage's 60 kWh of critical load is carried
+    assert float(s["D"][40:48].sum()) * H == pytest.approx(60.0, abs=1e-3)
+    assert float(s["D"][up].sum()) * H <= 20.0 + 1e-6
+
+
+def _discharged(sid, start, minutes, kw=40.0, soc=60.0):
+    rows = [(sid, start + 60 * i, "edge", 1.0, soc, soc, kw * 1000.0) for i in range(minutes)]
+    telemetry.write_rows(rows, SOC_COLS)
+
+
+def test_a_tick_takes_the_sites_cycle_cap_and_counts_the_days_discharge_so_far(company):
+    from gridlytics import battery
+    sid = _battery_site(cycle_cap_per_day=0.5)
+    midnight = twin.day_start_utc(date(2026, 11, 3))
+    _discharged(sid, midnight - 3600, 60)                                       # yesterday's last hour: not today's
+    _discharged(sid, midnight + 6 * 3600, 60)                                   # 40 kWh this morning
+    now = midnight + 9 * 3600
+    st = battery.state(sites.full(sid), now)
+    assert st["discharged_today_kwh"] == pytest.approx(40.0, abs=0.1)
+    t0 = now // 900 * 900
+    p = plans.build_problem(sites.full(sid), t0, forecast.issue(sites.full(sid), t0, save=False), 192)
+    b = p["battery"]
+    assert b["cycle_cap_kwh"] == pytest.approx(100.0) and b["discharged_today_kwh"] == pytest.approx(40.0, abs=0.1)
+    day = np.asarray(b["day_index"])
+    assert day[0] == 0 and day[(midnight + 86400 - t0) // 900] == 1 and day[(midnight + 86400 - t0) // 900 - 1] == 0
+    out = plans.tick(sid, at=now, save=False)
+    first = [s for s in out["steps"] if s["date"] == "2026-11-03" and s["grid_present"] > 0.5]
+    assert sum(s["discharge_kw"] for s in first) * H <= 60.0 + 0.05

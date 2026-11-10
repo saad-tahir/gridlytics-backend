@@ -380,6 +380,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     p["override_mask"] = mask["genset_hold"] | mask["charge_block"] | mask["reserve"] | mask["force_charge"]
     p["overrides"] = [{"kind": o["kind"], "value": o["value"], "until": o["until_ts"], "author": o["author"]} for o in ovs]
     gen = None
+    # each step's local (Pakistan) day from t0's: the genset's run-hour cap and the battery's cycle cap are per day
+    local_days = np.array([(_local(int(x)).date() - _local(t0).date()).days for x in ts])
     if g_asset and d.get("genset_start_control", "none") != "none":
         # the fuel the tank holds (fuel_level; round 7, engine-optimiser-05): piped gas and a tank of no size are not rationed
         fuel = fuel_level(site, t0)
@@ -390,7 +392,6 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         control = d.get("genset_start_control", "manual")
         if carried["unknown"] and control == "auto_on_grid_loss" and len(g) and g[0] < 0.5:
             carried = {**carried, "u_prev": 1, "elapsed": 99}  # in an outage the panel has already started the set; this fixes nothing
-        local_days = np.array([(_local(int(x)).date() - _local(t0).date()).days for x in ts])
         c_om = g_asset["c_om_rs_per_kwh"] + (SELFGEN_DUTY_RS_PER_KWH if g_asset["rated_kw"] > 400 and (d.get("lat", 31) > 28) else 0.0)
         gen = {"S": g_asset["rated_kw"], "f_min": g_asset["f_min"], "a": g_asset["a"], "b": g_asset["b"], "c_fuel": price, "c_start": g_asset["c_start_rs"],
                "c_runhr": g_asset["c_runhr_rs"], "c_om": c_om, "UT": max(1, int(math.ceil(g_asset["min_up_h"] * 4))),
@@ -418,7 +419,11 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                "b_cal": optimise.calendar_slope(temp, b_asset["replacement_cost_per_kwh"]) if d.get("calendar_cost_on", True) else np.zeros(steps),
                "charge_block": mask["charge_block"],
                # the floor the delivered table and the fallback hold with the grid up (round 7, engine-delivery-02); never above soc_max
-               "soc_floor_grid": min(float(b_asset["soc_max"]), delivered_floor_pct(site) / 100.0)}
+               "soc_floor_grid": min(float(b_asset["soc_max"]), delivered_floor_pct(site) / 100.0),
+               # the site's daily cycle cap (round 7, brief-vs-build-04): kWh discharged per local day, at most cycle_cap_per_day times E_nom (a
+               # cycle as the battery page counts it), less what the battery discharged since midnight on t0's day
+               "cycle_cap_kwh": float(d.get("cycle_cap_per_day", 1.5)) * e_nom,
+               "discharged_today_kwh": float(bs.get("discharged_today_kwh") or 0.0), "day_index": local_days}
         p["battery"] = bat
         # what the plan starts from, for the plan's summary (round 7, engine-optimiser-07): the state service's estimate, its uncertainty and the
         # age of the reading it read; a reading older than one control period, or none (the plan then starts from an assumed state), is stale

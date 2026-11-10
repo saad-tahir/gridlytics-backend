@@ -33,7 +33,7 @@ AMF_FAILED_START_STEPS = 2
 SURPLUS_ROWS = True    # solve's grid-down rows on the set's surplus and the battery; a switch only for the tests that check they cut no plan off
 REASONS = ("hold_for_outage", "charge_from_pv", "charge_from_grid", "discharge_peak_window", "mdi_cap", "genset_on", "genset_off", "icp_flat_price",
            "terminal_value", "export_capped", "wear_margin_too_small", "forecast_guard", "operator_hold", "carry_outage", "self_consumption", "idle",
-           "unserved", "charge_for_reserve", "save_for_later", "carry_load")
+           "unserved", "charge_for_reserve", "save_for_later", "carry_load", "cycle_cap")
 
 
 class Model:
@@ -114,6 +114,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     W, forced, rm_floor = None, np.zeros(T, dtype=bool), {}
     e_gap_idx, e_gap_price = None, 0.0
     anchor_a, anchor_ends, anchor_short = None, [], None
+    cycle_left: dict[int, float] = {}                # the cycle cap's kWh per local day where its row is written (brief-vs-build-04)
     dump_ok = dump_forced = forced
     thr_t: list[int] = []
     thr_w: dict[int, int] = {}
@@ -311,7 +312,8 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         # there, and the off-grid threshold solves are timed to the second)
         ramp = np.where(g > 0.5, np.arange(T) / max(T, 1), 0.0)
         C = m.var("C", T, 0, ch_ub, H * (EPS_CHARGE + EPS_ORDER * np.where(g > 0.5, 1.0 - ramp, 0.0)))
-        D = m.var("D", T, 0, bat["P_dis"], H * (c_cyc + EPS_ORDER * ramp))
+        d_ub = np.full(T, float(bat["P_dis"]))
+        D = m.var("D", T, 0, d_ub, H * (c_cyc + EPS_ORDER * ramp))
         e_lb = np.full(T + 1, min(Emin, E0))
         e_ub = np.full(T + 1, max(Emax, E0))
         e_lb[0] = e_ub[0] = E0
@@ -431,6 +433,20 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             for j, t in enumerate(anchor_ends):
                 lb_ = float(e_lb[t + 1])
                 m.row([E[t + 1], int(anchor_a[j]), anchor_short], [1, -(A - lb_), 1], lb=lb_, name=f"anchor[{t}]")
+        # the site's daily cycle cap (R8 tab D; the deep review's "cap daily cycles"; round 7, brief-vs-build-04): each local day's discharge
+        # with the grid up stays under cycle_cap_kwh (cycles a day times E_nom, as the battery page counts a cycle), the first day's less what
+        # the battery discharged since midnight. The discharge in an outage is the battery-inverter's, which carries the load whatever the plan
+        # says, so the cap never makes the plan shed load to save a cycle; at a site without a grid every step is so and no row is written.
+        # A hard row: no grid-up step needs the battery (the grid carries the load), so it never makes a plan infeasible
+        if bat.get("cycle_cap_kwh") is not None and not off_grid:
+            days = np.asarray(bat.get("day_index", np.zeros(T, dtype=int)))[:T]
+            for dd in np.unique(days):
+                ks = [int(k) for k in np.flatnonzero(days == dd) if g[k] > 0.5]
+                left = max(0.0, float(bat["cycle_cap_kwh"]) - (float(bat.get("discharged_today_kwh") or 0.0) if dd == 0 else 0.0))
+                if not ks or left >= H * float(np.sum(d_ub[ks])) - 1e-9:
+                    continue  # it cannot bind
+                m.row([D[k] for k in ks], [H] * len(ks), ub=left, name=f"cycle_cap[{int(dd)}]")
+                cycle_left[int(dd)] = left
         # reserve (soft, expected value): rows only where the grid is up and an outage may start next, and none where the next step is itself a
         # modelled outage (g = 0): its balance rows already price that outage's shortfall (genset fuel or lost load), which is never charged
         # twice (Part 4.3; round 7, engine-optimiser-09: the step before a scheduled window paid about 0.9 c_short on top)
@@ -758,6 +774,14 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         j = int(np.argmax(x[anchor_a]))
         out["anchor"] = {"step": int(anchor_ends[j]), "t": int(np.asarray(p["ts"])[anchor_ends[j]]) + 900, "short_kwh": round(float(x[anchor_short]), 3)}
     out["E_floor_grid"] = Elo if bat else 0.0
+    # the cycle cap's kWh per local day where its row binds the plan (each day's grid-up discharge reaches it), for explain
+    out["cycle_cap"] = {}
+    if bat and cycle_left:
+        days = np.asarray(bat.get("day_index", np.zeros(T, dtype=int)))[:T]
+        for dd, left in cycle_left.items():
+            used = H * float(np.sum(x[D][(days == dd) & (g > 0.5)]))
+            if used >= left - 1e-3 * max(1.0, float(bat["E_nom"])):
+                out["cycle_cap"][dd] = left
     out["breakdown"] = _breakdown(p, sol, out)
     out["reasons"] = explain(p, sol, out)
     if off_grid and thr_t and not shed_rule and fix_u is None:
@@ -1067,6 +1091,8 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
         return next((k for k in range(t + 1, T) if Ds[k] > 0.1), None)
 
     uses: dict[int, int] = {}                       # a step saved for later and the step its energy is used at (its reason is filled in after)
+    capped = out.get("cycle_cap") or {}             # the local days whose grid-up discharge reached the cycle cap (brief-vs-build-04)
+    cap_days = np.asarray((bat or {}).get("day_index", np.zeros(T, dtype=int)))[:T] if capped else np.zeros(T, dtype=int)
 
     def held(t: int, E1: float) -> tuple[str, dict] | None:
         """Why a grid-up step with energy above the floor neither charges nor discharges, from the numbers (round 7, flow-telemetry-plan-control-08):
@@ -1104,6 +1130,10 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
             return "terminal_value", {}
         if nc is not None and 0.01 < gap < c_cyc + 1e-6:
             return "wear_margin_too_small", {"gap_rs_per_kwh": round(gap, 2), "wear_rs_per_kwh": round(c_cyc, 2)}
+        if g[t] > 0.5 and int(cap_days[t]) in capped and gap > c_cyc:
+            # discharging now would gain more than its wear, and the day's discharge has reached the cycle cap (brief-vs-build-04)
+            cap_kwh = float(bat["cycle_cap_kwh"])
+            return "cycle_cap", {"cycles": round(cap_kwh / En, 2), "kwh": round(cap_kwh, 1)}
         return None
 
     reasons = []
@@ -1332,7 +1362,7 @@ def shorten(p: dict, T: int) -> dict:
             q[k] = np.asarray(q[k])[:T]
     if q.get("battery"):
         b = dict(q["battery"])
-        for k in ("b_cal", "charge_block"):
+        for k in ("b_cal", "charge_block", "day_index"):
             if k in b:
                 b[k] = np.asarray(b[k])[:T]
         q["battery"] = b

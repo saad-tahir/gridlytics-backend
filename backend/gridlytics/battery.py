@@ -19,6 +19,12 @@ UPPER_KNEE = 0.95
 #: a reading older than one control period (the tick's 15 minutes; R6 5.9: the optimiser's soc_est and sigma are never older than that) is
 #: stale: from then on sigma grows by R6 5.3's gap term, 1 point per 10 minutes, as well as by the hours since the anchor
 STALE_MINUTES = 15.0
+PKT_OFFSET_S = 5 * 3600
+
+
+def _local_midnight(ts: int) -> int:
+    """The start (epoch seconds) of the Pakistan-time day that holds `ts` (UTC+5, no daylight saving)."""
+    return (int(ts) + PKT_OFFSET_S) // 86400 * 86400 - PKT_OFFSET_S
 
 
 def full_charge_level(b: dict) -> float:
@@ -48,8 +54,12 @@ def state(site: dict, now: int | None = None) -> dict | None:
     e_nom = b["nameplate_kwh"] * b.get("soh", 1.0)
     est = np.where(np.isnan(g["soc"]), g["soc_bms"], g["soc"])
     known = ~np.isnan(est)
+    # the kWh discharged since local midnight (Pakistan time), which the day's cycle cap counts first (round 7, brief-vs-build-04)
+    today = g["ts"] >= _local_midnight(now)
+    done = float(np.nansum(np.maximum(g["bat"][today], 0.0)) / 60.0)
     out = {"e_nom_kwh": round(e_nom, 1), "c_cyc": round(optimise.wear_cost(b), 2), "soh_pct": round(b.get("soh", 1.0) * 100, 1),
-           "p_ch_kw": b["p_ch_kw"], "p_dis_kw": b["p_dis_kw"], "soc_min_pct": b["soc_min"] * 100, "soc_max_pct": b["soc_max"] * 100}
+           "p_ch_kw": b["p_ch_kw"], "p_dis_kw": b["p_dis_kw"], "soc_min_pct": b["soc_min"] * 100, "soc_max_pct": b["soc_max"] * 100,
+           "discharged_today_kwh": round(done, 2)}
     if not known.any():
         return {**out, "soc_pct": None, "sigma_pct": 25.0, "trust": None, "trust_basis": None, "usable_kwh": None, "anchor": None, "alerts": [],
                 "waiting_for_anchor": True, "reading_age_min": None, "stale": True, "anchor_due": False, "anchor_soc_pct": None}
