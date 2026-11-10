@@ -729,8 +729,8 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
     t = step_times(t0, steps)
     if off_grid(site):
         one = np.ones(steps)
-        return {"stage": None, "not_applicable": "off_grid", "p_down": one, "p_start": np.zeros(steps), "dur_steps": np.full(steps, 4), "g": np.zeros(steps), "observed": None,
-                "adherence": None, "adherence_windows": None, "off_grid": True, "shed_prior": None}
+        return {"stage": None, "not_applicable": "off_grid", "p_down": one, "p_start": np.zeros(steps), "dur_steps": np.full(steps, 4),
+                "g": np.zeros(steps), "observed": None, "adherence": None, "adherence_windows": None, "off_grid": True, "shed_prior": None}
     sched = schedule(site["id"])
     windows = sched["windows"] if sched else []
     h0 = t0 - 28 * 86400
@@ -845,11 +845,11 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
     p, l, o = pv(site, t0), load(site, t0), outage(site, t0, now=now)
     if save:
         if p["stage"] is not None:  # a site without PV has no PV issue
-            telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION, {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr"),
-                                                                             "bands": p.get("bands")})
-        telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION, {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"]),
-                                                                           "crit_learned_hours": l.get("crit_learned_hours"), "crit_zero": l.get("crit_zero"),
-                                                                           "calendar": l.get("calendar"), "bands": l.get("bands")})
+            telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION,
+                                    {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr"), "bands": p.get("bands")})
+        telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION,
+                                {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"]), "crit_learned_hours": l.get("crit_learned_hours"),
+                                 "crit_zero": l.get("crit_zero"), "calendar": l.get("calendar"), "bands": l.get("bands")})
         # an off-grid site's issue (always down, no stage) is still saved: the plan's same-quarter protection reads it
         telemetry.save_forecast(site["id"], "outage", t0, o["stage"] or 0, VERSION,
                                 {"p_down": _r(o["p_down"]), "p_start": _r(o["p_start"]), "dur_steps": [int(x) for x in o["dur_steps"]], "g": _r(o["g"], 0),
