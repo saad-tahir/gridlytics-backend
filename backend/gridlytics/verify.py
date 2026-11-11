@@ -2123,8 +2123,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         info = mdi_info[bill_month(day)]
         return info["by_base"][base]["lever"] / info["days_in_month"]
 
-    #: per baseline and month: (claimed rupees of the days, their MDI shares included; days whose saving is known), for the fee check
-    per_month: dict[str, dict[str, tuple[float, int]]] = {}
+    #: per baseline and month: (claimed rupees of the days, their MDI shares included; days whose saving is known; days that claim), for the fee
+    #: check
+    per_month: dict[str, dict[str, tuple[float, int, int]]] = {}
     #: per baseline and day: the provisional carry-over left out of the claim, and the hand-over to days the plan did not run
     prov_by_day: dict[str, dict[str, float]] = {}
     ho_by_day: dict[str, dict[str, dict | None]] = {}
@@ -2202,7 +2203,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             mdi_prov += share if claims and not closed else 0.0
             unserved_a += d["unserved_kwh_actual"]
             unserved_b += d["unserved_kwh_baseline"]
-        per_month[base] = {k: (v[0], v[1]) for k, v in months.items()}
+        per_month[base] = {k: (v[0], v[1], v[2]) for k, v in months.items()}
         levers["mdi"] = round(mdi, 2)
         levers_claimed = {k: levers_claimed.get(k, 0.0) for k in levers if k != "mdi"} | {k: v for k, v in levers_claimed.items() if k not in levers}
         levers_claimed["mdi"] = round(mdi_claimed, 2)
@@ -2289,18 +2290,31 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         fee = float(store.get_setting(f"fee:{site_id}", 0) or 0)
         # each month's claimed rate, the days' MDI shares included, scaled to the whole billing month (a part month is not a month; a month whose
         # every day claims scales to its whole MDI lever); the smaller of the two baselines (plan 8.1: claims must beat the tuned baseline); the
-        # months averaged
-        monthly = []
+        # months averaged. Round 7 (audit pages-D-01): each month says which baseline it took and the claim and days its rate rests on, so the
+        # fee card names them; a month scaled from part of it is a projection, so the figure is preliminary until whole months are scored and the
+        # period's own conditions (28 verified days, the capture, the switchback weeks, the FCA billed) are met
+        monthly, used = [], []
         for mk in sorted({bill_month(d) for d in days}):
             dim = mdi_info[mk]["days_in_month"]
-            cands = [c / n * dim for (c, n) in (per_month.get(base, {}).get(mk, (0.0, 0)) for base in ("native", "tuned")) if n]
+            cands = [(c / n * dim, base, c, n, k) for base in ("native", "tuned")
+                     for (c, n, k) in [per_month.get(base, {}).get(mk, (0.0, 0, 0))] if n]
             if cands:
-                monthly.append(min(cands))
+                rate, base, c, n, k = min(cands, key=lambda x: x[0])
+                monthly.append(rate)
+                used.append({"month": mk, "baseline": base, "claimed_rs": round(c, 2), "scored_days": n, "claiming_days": k, "days_in_month": dim,
+                             "rs_per_month": round(rate, 0)})
         saving_pm = sum(monthly) / len(monthly) if monthly else 0.0
+        bases = {m["baseline"] for m in used}
+        scaled = any(m["scored_days"] < m["days_in_month"] for m in used)
         out["fee"] = {"fee_rs_per_month": fee, "verified_saving_rs_per_month": round(saving_pm, 0),
                       "within_one_third": fee <= saving_pm / 3 if fee else None,
-                      "basis": ("claimed saving per scored day, each day's share of its month's MDI lever included, x days in the month; the smaller "
-                                "of the native and tuned baselines")}
+                      "basis": ("each billing month's claim (the claiming days, each day's share of its month's MDI lever included) per day whose "
+                                "saving is known, x days in the month; the smaller of the native and tuned baselines, month by month; the months "
+                                "averaged"),
+                      "baseline": (next(iter(bases)) if len(bases) == 1 else "both") if bases else None,
+                      "claimed_rs": round(sum(m["claimed_rs"] for m in used), 2), "scored_days": sum(m["scored_days"] for m in used),
+                      "claiming_days": sum(m["claiming_days"] for m in used), "scaled": scaled,
+                      "preliminary": bool(out["preliminary"] or scaled or not used), "months": used}
     return out
 
 

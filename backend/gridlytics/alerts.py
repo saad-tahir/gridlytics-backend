@@ -1172,12 +1172,15 @@ def _savings_day(site_id: str, day: date, ready: bool) -> None:
 
 
 def _fee_check(site_id: str, day: date, ready: bool) -> None:
-    """Product (R8 2.16, fee notices for the owner): the month's verified saving is under three times the fee (plan 8.1: the fee at most a third of
-    the verified saving), from verify.summary's fee check of the month to `day`."""
-    on = False
+    """Product (R8 2.16, fee notices for the owner): the month's saving is under three times the fee (plan 8.1: the fee at most a third of the
+    verified saving), from verify.summary's fee check of the month to `day`; called verified only when the check is not preliminary."""
+    on, fee = False, {}
     if ready and float(store.get_setting(f"fee:{site_id}", 0) or 0) > 0:
         from . import verify
         fee = (verify.summary(site_id, day.replace(day=1).isoformat(), day.isoformat(), see_fee=True) or {}).get("fee") or {}
         on = fee.get("within_one_third") is False
-    _set(on, site_id, "fee_above_third", "Product", "warning",
-         f"The verified saving of {day:%B %Y} so far is under three times the fee" if on else "", {"month": day.strftime("%Y-%m")} if on else {})
+    # round 7 (audit pages-D-01): a month scored in part is scaled to the whole month, and the figure is verified only once the fee check says it is
+    # not preliminary; until then the notice does not call it verified
+    title = (f"The verified saving of {day:%B %Y} is under three times the fee" if fee.get("preliminary") is False else
+             f"The saving of {day:%B %Y} so far, scaled to the whole month, is under three times the fee (preliminary)")
+    _set(on, site_id, "fee_above_third", "Product", "warning", title if on else "", {"month": day.strftime("%Y-%m")} if on else {})
