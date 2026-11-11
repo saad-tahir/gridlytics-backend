@@ -21,10 +21,19 @@ from scipy.sparse import coo_matrix
 H = 0.25
 EPS_CURTAIL = 0.05     # Rs/kWh: keep PV unless export is capped and the battery is full
 EPS_CHARGE = 0.001     # Rs/kWh: a tie-break against charging and discharging at once
+EPS_ORDER = 0.002      # Rs/kWh across the horizon: of two steps alike, discharge the earlier and charge the later (round 7: ties split by turns
+                       # read as 0 / full / 0 / full runs, "Peak discharge" and "Wear > saving" alternating at one price)
+PKT_OFFSET_S = 5 * 3600  # Pakistan time (UTC+5, no daylight saving): a step's local day for the curtailment's price (`curtail_cost`)
+#: Behind an auto-start (AMF) panel the battery bridges only the panel's start delay (mains-fail confirmation, crank, warm-up and transfer: a minute at
+#: most) and, when the set fails to start, the critical load until someone starts it by hand (two steps, the cover the reserve kept before). One
+#: start in twenty fails (a set exercised weekly fails 1 to 5 % of its starts; the pessimistic end). Round 7, engine-plans-live-03
+AMF_START_DELAY_S = 60
+AMF_FAIL_TO_START = 0.05
+AMF_FAILED_START_STEPS = 2
 SURPLUS_ROWS = True    # solve's grid-down rows on the set's surplus and the battery; a switch only for the tests that check they cut no plan off
 REASONS = ("hold_for_outage", "charge_from_pv", "charge_from_grid", "discharge_peak_window", "mdi_cap", "genset_on", "genset_off", "icp_flat_price",
            "terminal_value", "export_capped", "wear_margin_too_small", "forecast_guard", "operator_hold", "carry_outage", "self_consumption", "idle",
-           "unserved")
+           "unserved", "charge_for_reserve", "save_for_later", "carry_load", "cycle_cap")
 
 
 class Model:
@@ -98,11 +107,15 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     m = Model()
     G = m.var("G", T, 0, g * p["G_max"], H * c_imp)
     X = m.var("X", T, 0, g * p["X_max"], -H * c_exp)
-    K = m.var("K", T, 0, PV, H * EPS_CURTAIL)
     bat, gen = p.get("battery"), p.get("genset")
+    k_cost = curtail_cost(p)
+    K = m.var("K", T, 0, PV, k_cost)
     lmode = int(p.get("load_mode", 0))
     W, forced, rm_floor = None, np.zeros(T, dtype=bool), {}
-    dump_ok = forced
+    e_gap_idx, e_gap_price = None, 0.0
+    anchor_a, anchor_ends, anchor_short = None, [], None
+    cycle_left: dict[int, float] = {}                # the cycle cap's kWh per local day where its row is written (brief-vs-build-04)
+    dump_ok = dump_forced = forced
     thr_t: list[int] = []
     thr_w: dict[int, int] = {}
     thr_z: dict[int, int] = {}
@@ -167,10 +180,21 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         forced = u_lb >= 1
         dump_ok = forced.copy()
         dump_ok[thr_t] = True
-        # with the grid down the set's output follows the load, never under its minimum (twin.simulate's outage branch): where the battery may take
-        # the minimum-load surplus (`genset_surplus_steps`), the output is capped at max(f_min S, served load - PV), so the battery takes the set's
-        # output only up to that surplus, never at full power (HANDOFF 8.A.1, round 5)
-        P_on = np.where(gen_surplus, genset_follow_cap(p), S)
+        dump_forced = dump_ok.copy()
+        # and with the grid down a run of the plan's own dumps what the load and the battery cannot take, explicitly (round 7,
+        # engine-plans-live-15): the battery never charges and discharges at once (the discharge_net rows below), which a plan used to burn the
+        # set's minimum-load surplus in the battery's round trip (the farm: 14.4 kW in, 7.8 to 10.9 kW out, at 83 to 95 %), and a minimum up time
+        # can outlast the room a nearly full battery has (on site the set then runs under its minimum, as in the twin). Only while it runs
+        dump_run = (g < 0.5) & (u_ub > 0) & ~dump_ok
+        dump_ok = dump_ok | dump_run
+        # with the grid down the set's output follows the load, never under its minimum (twin.simulate's outage branch): its output is capped at
+        # max(f_min S, served load - PV), so the battery takes the set's output only up to its minimum-load surplus, never at full power (HANDOFF
+        # 8.A.1, round 5). On every grid-down step whatever the charging flag (round 7, engine-optimiser-06: with gen_charge_allowed off the cap
+        # was off too, and the plan ran the set at the whole load while PV charged the battery, genset charging in net terms the site's inverter
+        # never does); only a brand that can be told to charge from the set at full power (a_gen) runs it uncapped. Whether that surplus may
+        # reach the battery is the flag's (`genset_surplus_steps`, and the charge_pv_surplus rows below)
+        follow = (g < 0.5) & (not (bat and bat.get("a_gen")))
+        P_on = np.where(follow, genset_follow_cap(p), S)
         Pg = m.var("P", T, 0, P_on, H * gen["c_om"])
         F = m.var("F", T, 0, np.inf, gen["c_fuel"])
         if fix_u is not None:
@@ -181,7 +205,10 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         else:
             u = m.var("u", T, u_lb, u_ub, H * gen["c_runhr"], integer=True)
         v = m.var("v", T, 0, 1, gen["c_start"], integer=True)
-        W = m.var("W", T, 0, np.where(dump_ok, gen["f_min"] * S, 0.0), H * 2 * EPS_CURTAIL) if dump_ok.any() else None
+        # a dump costs more than a curtailment at the same step (curtail PV first, then dump: twin.simulate's order; `curtail_cost`)
+        W = m.var("W", T, 0, np.where(dump_ok, gen["f_min"] * S, 0.0), k_cost + H * EPS_CURTAIL) if dump_ok.any() else None
+        for t in np.flatnonzero(dump_run):
+            m.row([W[t], u[t]], [1, -gen["f_min"] * S], ub=0, name=f"dump_on[{t}]")
         # at a panel-started site the panel decides u: minimum up and down rows bind only the starts and stops the plan is free to make
         free_start = ~(auto & (u_lb >= 1))
         free_stop = ~(auto & (u_ub <= 0))
@@ -262,6 +289,13 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     base_served = np.where(g > 0.5, L, served_g0)
     u_dep = (g < 0.5) & (lmode == 1) & bool(gen) & (not off_grid)
     U_ub = np.where(u_dep, L, base_served)
+    # With the grid up a site cannot shed load on command (no Mode A or Mode B primitive does it; the meter simply imports), so a grid-up step
+    # may leave unserved only the load beyond what the connection and PV can carry: never load shed to hold the MDI or dodge a price, which a VoLL
+    # under the cost of the alternative made cheap (round 7, engine-optimiser-01: Rs 250 per kW-block against Rs 1,250 per kW of MDI)
+    # (PV reaches the AC side only through the inverter: never more than its kW AC, round 7)
+    inv_ac = float(p["inverter_kw_ac"]) if p.get("inverter_kw_ac") else None
+    pv_ac = np.minimum(PV, inv_ac) if inv_ac is not None else PV
+    U_ub = np.where(g > 0.5, np.maximum(0.0, L - float(p["G_max"]) - pv_ac), U_ub)
     # in the threshold repair (the genset fixed, off-grid) a shortfall the tank leaves costs the same VoLL whenever it is shed, so a tie-break
     # (a ten-thousandth of VoLL, falling over the horizon) sheds it as late as it can be: after the battery has carried what it can, as the
     # battery-inverter does on site, not earlier with the battery above its cut-off
@@ -272,13 +306,39 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         En, E0 = bat["E_nom"], bat["E0"]
         Emin, Emax = bat["soc_min"] * En, bat["soc_max"] * En
         c_cyc = bat["c_cyc"]
-        ch_ub = np.full(T, bat["P_ch"])
+        ch_ub, d_ub = power_caps(bat, T)
         ch_ub[np.asarray(bat.get("charge_block", np.zeros(T, dtype=bool)), dtype=bool)] = 0
-        C = m.var("C", T, 0, ch_ub, H * EPS_CHARGE)
-        D = m.var("D", T, 0, bat["P_dis"], H * c_cyc)
+        # the order tie-break only where the grid is up: grid-down and off-grid steps keep their costs (the battery-inverter follows the load
+        # there, and the off-grid threshold solves are timed to the second)
+        ramp = np.where(g > 0.5, np.arange(T) / max(T, 1), 0.0)
+        C = m.var("C", T, 0, ch_ub, H * (EPS_CHARGE + EPS_ORDER * np.where(g > 0.5, 1.0 - ramp, 0.0)))
+        D = m.var("D", T, 0, d_ub, H * (c_cyc + EPS_ORDER * ramp))
         e_lb = np.full(T + 1, min(Emin, E0))
         e_ub = np.full(T + 1, max(Emax, E0))
         e_lb[0] = e_ub[0] = E0
+        # the floor the delivered table and the fallback hold with the grid up (round 7, engine-delivery-02): every Mode A slot's floor is at
+        # least max(BMS low + 2, fallback floor) and the edge enforces the fallback floor whatever the slots say, so with the grid up the plan
+        # never counts on the energy under it. In an outage the battery-inverter carries the load to its own cut-off (soc_min). A grid-up run
+        # that starts above the floor (the horizon's first, from E0) holds it as a bound; one that may start under it (after an outage, or E0
+        # under the floor) recovers once, as EMHASS's single-recovery rows do (R2 3.5): until the battery is back at the floor it does not
+        # discharge, as the device holds a battery under its slot floor, and from then on the floor binds. `floor_runs` lists those runs
+        Elo = Emin
+        if bat.get("soc_floor_grid") is not None and not off_grid:
+            Elo = min(Emax, max(Emin, float(bat["soc_floor_grid"]) * En))
+        floor_runs: list[tuple[int, int]] = []
+        if Elo > Emin + 1e-9:
+            t = 0
+            while t < T:
+                if g[t] < 0.5:
+                    t += 1
+                    continue
+                a_ = t
+                while t < T and g[t] > 0.5:
+                    t += 1
+                if a_ == 0 and E0 >= Elo - 1e-9:
+                    e_lb[a_ + 1:t + 1] = np.maximum(e_lb[a_ + 1:t + 1], Elo)
+                else:
+                    floor_runs.append((a_, t))
         cal = np.concatenate([[0.0], np.asarray(bat.get("b_cal", np.zeros(T)), dtype=float)])
         E = m.var("E", T + 1, e_lb, e_ub, cal)
         for t in range(T):
@@ -301,19 +361,134 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                     cols.append(Pg[t])
                     vals.append(-1)
                 m.row(cols, vals, ub=max(0.0, float(PV[t] - L[t])), name=f"charge_surplus[{t}]")
-        # reserve (soft, expected value): rows only where the grid is up and an outage may start next
+            if gen and g[t] < 0.5 and not (bat["a_gen"] or gen_surplus[t]):
+                # no genset charging, with the grid down: the load takes PV first (the set follows what it leaves), so the battery charges only
+                # from the PV beyond the load, never from the set's minimum-load surplus (round 7, engine-optimiser-06). The load served is the
+                # critical load with the set off at a grid-connected site, the whole load where the set carries it (load_mode 1) or off-grid
+                served_on = float(L[t] if (off_grid or lmode == 1) else Lc[t])
+                cap_off, cap_on = max(0.0, float(PV[t] - base_served[t])), max(0.0, float(PV[t]) - served_on)
+                m.row([C[t], u[t]], [1, cap_off - cap_on], ub=cap_off, name=f"charge_pv_surplus[{t}]")
+            if g[t] < 0.5:
+                # with the grid down the battery discharges only into the load PV leaves (with the set off), or what PV and the set's minimum load
+                # leave of it (with the set on: the set follows the load first), so it never charges and discharges at once, which an inverter
+                # cannot do and the twin does not (round 7, engine-plans-live-15: a plan burnt the set's surplus in the battery's round trip)
+                cap_off = max(0.0, float(base_served[t] - PV[t]))
+                if gen:
+                    served_on = float(L[t] if (off_grid or lmode == 1) else Lc[t])
+                    cap_on = max(0.0, served_on - float(PV[t]) - gen["f_min"] * gen["S"])
+                    m.row([D[t], u[t]], [1, cap_off - cap_on], ub=cap_off, name=f"discharge_net[{t}]")
+                else:
+                    m.row([D[t]], [1], ub=cap_off, name=f"discharge_net[{t}]")
+        # the single recovery to the grid-up floor (see e_lb above): y = 1 once the battery is back at the floor, monotone over the run, one per
+        # clock hour (a crossing within the hour waits for its end, a quarter of the binaries); while y = 0 there is no discharge
+        rec_last = None                                  # the recovery binary of the horizon's last step, where it ends in such a run
+        if floor_runs:
+            hour = np.asarray(p["ts"], dtype=np.int64)[:T] // 3600
+            for a_, b_ in floor_runs:
+                keys = list(dict.fromkeys(int(h) for h in hour[a_:b_]))
+                yv = m.var(f"floor_rec[{a_}]", len(keys), 0, 1, 0.0, integer=True)
+                y_of = {k: int(yv[j]) for j, k in enumerate(keys)}
+                for j in range(1, len(keys)):
+                    m.row([yv[j], yv[j - 1]], [1, -1], lb=0, name=f"floor_rec_order[{a_},{j}]")
+                for t in range(a_, b_):
+                    y = y_of[int(hour[t])]
+                    m.row([D[t], y], [1, -float(bat["P_dis"])], ub=0, name=f"floor_rec_dis[{t}]")
+                    lb_ = float(e_lb[t + 1])
+                    m.row([E[t + 1], y], [1, -(Elo - lb_)], lb=lb_, name=f"floor_rec_e[{t}]")
+                if b_ == T:
+                    rec_last = y_of[int(hour[T - 1])]
+        # a start under the cut-off itself (E0 < soc_min, after native operation or an outage) recovers once too, as EMHASS's single-recovery rows
+        # do (R2 3.5; round 7, engine-optimiser-04): z = 1 once the battery is back at soc_min, monotone over the whole horizon (grid up or down:
+        # the BMS keeps a battery under its cut-off from discharging), one per clock hour; while z = 0 there is no discharge, so the state of
+        # charge only moves towards the band, and from then on soc_min binds. Before, min(soc_min, E0) bounded every step, so a plan starting
+        # at 5 % could discharge to 5 % again in the evening peak, and Mode B was told it may
+        if E0 < Emin - 1e-9:
+            hour = np.asarray(p["ts"], dtype=np.int64)[:T] // 3600
+            keys = list(dict.fromkeys(int(h) for h in hour))
+            zv = m.var("cut_rec", len(keys), 0, 1, 0.0, integer=True)
+            z_of = {k: int(zv[j]) for j, k in enumerate(keys)}
+            for j in range(1, len(keys)):
+                m.row([zv[j], zv[j - 1]], [1, -1], lb=0, name=f"cut_rec_order[{j}]")
+            for t in range(T):
+                z = z_of[int(hour[t])]
+                m.row([D[t], z], [1, -float(bat["P_dis"])], ub=0, name=f"cut_rec_dis[{t}]")
+                m.row([E[t + 1], z], [1, -(Emin - E0)], lb=E0, name=f"cut_rec_e[{t}]")
+        # the anchor the battery service asks for (round 7, engine-optimiser-15; R6 5.7, Part 4.6): with sigma over 15 points, or no anchor in
+        # the 30 days it read, one charge to the pack's top of charge, held at the end of one clock hour the solver picks (a = 1 there), so a
+        # reading there re-anchors the estimate. The kWh short of it at that hour are priced a rupee above the dearest kWh the horizon could
+        # store, as a start under the cut-off is, so the cheapest charge meets it (a sunny day's PV first) and nothing makes it infeasible
+        if bat.get("anchor_soc") and T:
+            A = min(Emax, float(bat["anchor_soc"]) * En)
+            hour = np.asarray(p["ts"], dtype=np.int64)[:T] // 3600
+            anchor_ends = [t for t in range(T) if t == T - 1 or hour[t + 1] != hour[t]]
+            if bat.get("anchor_by"):
+                # by the time an earlier plan fixed for it (plans._ask_anchor), or the first hour's end where none is that soon
+                ts_end = np.asarray(p["ts"], dtype=np.int64)[:T] + 900
+                anchor_ends = [t for t in anchor_ends if ts_end[t] <= int(bat["anchor_by"])] or anchor_ends[:1]
+            anchor_a = m.var("anchor", len(anchor_ends), 0, 1, 0.0, integer=True)
+            m.row([int(a) for a in anchor_a], [1.0] * len(anchor_ends), lb=1, ub=1, name="anchor_one")
+            dear = float(np.max(np.asarray(p["c_imp"])[:T])) if not off_grid else float(p.get("c_short", voll))
+            anchor_short = m.var("anchor_short", 1, 0, A, dear / bat["eta_c"] + 1.0)[0]
+            for j, t in enumerate(anchor_ends):
+                lb_ = float(e_lb[t + 1])
+                m.row([E[t + 1], int(anchor_a[j]), anchor_short], [1, -(A - lb_), 1], lb=lb_, name=f"anchor[{t}]")
+        # the site's daily cycle cap (R8 tab D; the deep review's "cap daily cycles"; round 7, brief-vs-build-04): each local day's discharge
+        # with the grid up stays under cycle_cap_kwh (cycles a day times E_nom, as the battery page counts a cycle), the first day's less what
+        # the battery discharged since midnight. The discharge in an outage is the battery-inverter's, which carries the load whatever the plan
+        # says, so the cap never makes the plan shed load to save a cycle; at a site without a grid every step is so and no row is written.
+        # A hard row: no grid-up step needs the battery (the grid carries the load), so it never makes a plan infeasible
+        if bat.get("cycle_cap_kwh") is not None and not off_grid:
+            days = np.asarray(bat.get("day_index", np.zeros(T, dtype=int)))[:T]
+            for dd in np.unique(days):
+                ks = [int(k) for k in np.flatnonzero(days == dd) if g[k] > 0.5]
+                left = max(0.0, float(bat["cycle_cap_kwh"]) - (float(bat.get("discharged_today_kwh") or 0.0) if dd == 0 else 0.0))
+                if not ks or left >= H * float(np.sum(d_ub[ks])) - 1e-9:
+                    continue  # it cannot bind
+                m.row([D[k] for k in ks], [H] * len(ks), ub=left, name=f"cycle_cap[{int(dd)}]")
+                cycle_left[int(dd)] = left
+        # reserve (soft, expected value): rows only where the grid is up and an outage may start next, and none where the next step is itself a
+        # modelled outage (g = 0): its balance rows already price that outage's shortfall (genset fuel or lost load), which is never charged
+        # twice (Part 4.3; round 7, engine-optimiser-09: the step before a scheduled window paid about 0.9 c_short on top)
         sig = bat.get("sigma0", 0.0)
+        band = (bat["soc_max"] - bat["soc_min"]) * En
         R = np.zeros(T)
-        r_idx = {}
+        R_gap = np.zeros(T)                              # behind an AMF panel: the start delay's reserve (R is then the failed start's)
+        R_steps = np.zeros(T, dtype=int)  # the steps of outage each reserve covers (two at most behind an AMF panel), for explain's detail
+        r_idx, r_gap_idx, r_price, r_gap_price = {}, {}, {}, {}
         c_short = p["c_short"]
-        deficit = np.maximum(0.0, Lc - PVlo) * H / bat["eta_d"]
+        amf = bool(gen and gen["control"] == "auto_on_grid_loss")
+        # what the battery can deliver in a step of an outage: the critical load less PV, never above its discharge power, nor above what the
+        # inverter's kW AC leaves after PV (round 7, engine-plans-live-06: Lahore held 115 kWh for a 180 kW load on a 50 kW battery, of which
+        # it could deliver 25 kWh in the 30 minutes the reserve covered)
+        out_kw = np.minimum(np.maximum(0.0, Lc - PVlo), d_ub)   # under a temperature derating, the derated power (brief-vs-build-05)
+        if inv_ac is not None:
+            out_kw = np.minimum(out_kw, np.maximum(0.0, inv_ac - np.minimum(PVlo, Lc)))
+        deficit = out_kw * H / bat["eta_d"]
         for t in range(T):
-            d_ = int(dur[t]) if not (gen and gen["control"] == "auto_on_grid_loss") else min(int(dur[t]), 2)
-            R[t] = min((bat["soc_max"] - bat["soc_min"]) * En, float(deficit[t + 1:t + 1 + d_].sum())) + 2 * sig * En
+            d_ = min(int(dur[t]), AMF_FAILED_START_STEPS) if amf else int(dur[t])
+            R_steps[t] = d_
+            R[t] = min(band, float(deficit[t + 1:t + 1 + d_].sum())) + 2 * sig * En
+            if amf and t + 1 < T:
+                R_gap[t] = min(band, float(out_kw[t + 1]) * AMF_START_DELAY_S / 3600 / bat["eta_d"]) + 2 * sig * En
         for t in range(T):
-            if g[t] > 0.5 and p_start[t] >= 0.01 and R[t] > 0:
-                r = m.var(f"r{t}", 1, 0, np.inf, p_start[t] * c_short)[0]
+            if not (g[t] > 0.5 and p_start[t] >= 0.01 and (t + 1 >= T or g[t + 1] > 0.5)):
+                continue
+            if amf:
+                # behind an AMF panel a shortfall is lost load, in the start delay of every start and over a failed start's 30 minutes:
+                # the delay's reserve at p (1 - p_fail) VoLL and the failed start's at p p_fail VoLL, so each kWh short is priced once at
+                # its expected cost (round 7, engine-plans-live-03: before, 30 minutes of the whole critical load at the set's diesel cost)
+                if R_gap[t] > 0:
+                    r_gap_price[t] = float(p_start[t]) * (1.0 - AMF_FAIL_TO_START) * voll
+                    rg = m.var(f"r_gap{t}", 1, 0, np.inf, r_gap_price[t])[0]
+                    r_gap_idx[t] = rg
+                    m.row([E[t + 1], rg], [1, 1], lb=Emin + R_gap[t], name=f"reserve_gap[{t}]")
+                price = float(p_start[t]) * AMF_FAIL_TO_START * voll
+            else:
+                price = float(p_start[t]) * c_short
+            if R[t] > 0:
+                r = m.var(f"r{t}", 1, 0, np.inf, price)[0]
                 r_idx[t] = r
+                r_price[t] = price
                 m.row([E[t + 1], r], [1, 1], lb=Emin + R[t], name=f"reserve[{t}]")
         # A battery-inverter sheds load only once the battery is at its cut-off, so where a row on E stands for an operator's floor during an
         # outage, load shed in that outage counts as if the battery had carried it (`shed_kwh`): shedding never keeps a floor, which it would
@@ -378,7 +553,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 # adds no variables; on the farm's full tank (seven start hours, 10 s) every plan shed nothing, at objectives within 3 % of the
                 # first solve's. On a tank that runs dry it slows the solve past the limit, hence only in this re-solve
                 for k in shed_steps:
-                    cut = max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"])
+                    cut = max(0.0, float(base_served[k] - PV[k]) - d_ub[k])
                     if U_ub[k] <= cut:
                         continue
                     cols, vals = [U[k], u[k], u[k + 1]], [1, -(U_ub[k] - cut), -(U_ub[k] - cut)]
@@ -391,7 +566,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 # a guard only: every shed the rule allows is reachable without it, and at ten times VoLL it is never the cheap way round it
                 sv = m.var("thr_shed", len(shed_k), 0, np.inf, H * 10 * voll)
                 for i, k in enumerate(shed_k):
-                    cut = max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"])
+                    cut = max(0.0, float(base_served[k] - PV[k]) - d_ub[k])
                     cols, vals = [U[k], u[k], yv[i], sv[i]], [1, -U_ub[k], -U_ub[k], -1]
                     if k in thr_z:
                         cols.append(thr_z[k])
@@ -404,7 +579,27 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         term = p.get("terminal") or {}
         v_end = max(0.0, bat["eta_d"] * term.get("c_next", 0.0) - c_cyc - term.get("c_cal_hold", 0.0))
         E_use = m.var("E_use", 1, 0, bat["P_dis"] * term.get("H_peak", 4.0) + term.get("R_next", 0.0), -v_end)[0]
-        m.row([E_use, E[T]], [1, -1], ub=-Emin, name="terminal")
+        # the terminal value values stored energy, it imposes no floor (round 7, engine-optimiser-03): E_use >= 0 made E[T] >= soc_min a hard
+        # row, so a battery that started under its cut-off with nothing to recharge it (grid charging off and no PV surplus, or a charge block
+        # to the horizon's end) made the tick infeasible, and the relaxed retry too. Such a start ends under the cut-off only by `E_gap`, priced
+        # a rupee above the dearest kWh the horizon could store (EMHASS's soft terminal condition, R2 3.5), so it recovers whenever anything
+        # can recharge it, and with nothing to it holds what it has, with no credit
+        tail = []
+        if E0 < Emin - 1e-9:
+            dear = float(np.max(np.asarray(p["c_imp"])[:T])) if (T and not off_grid) else float(p.get("c_short", voll))
+            e_gap_price = dear / bat["eta_c"] + 1.0
+            e_gap_idx = m.var("E_gap", 1, 0, Emin - E0, e_gap_price)[0]
+            tail = [e_gap_idx]
+        # the next peak uses only the energy above the floor the table holds with the grid up (round 7, engine-delivery-02); a horizon that
+        # ends in an outage keeps the cut-off, and one that ends in a run still under the floor counts above the floor once it is recovered
+        if T and g[T - 1] > 0.5 and Elo > Emin + 1e-9:
+            if rec_last is None:
+                m.row([E_use, E[T]] + tail, [1, -1] + [-1] * len(tail), ub=-Elo, name="terminal")
+            else:
+                m.row([E_use, E[T], rec_last] + tail, [1, -1, Elo - Emin] + [-1] * len(tail), ub=-Emin, name="terminal")
+                m.row([E_use, rec_last], [1, -float(m.ub[E_use])], ub=0, name="terminal_recovered")
+        else:
+            m.row([E_use, E[T]] + tail, [1, -1] + [-1] * len(tail), ub=-Emin, name="terminal")
     # ---------------------------------------------------------------- the set's surplus and the battery, with the grid down
     if gen and bat and SURPLUS_ROWS and gen_surplus.any() and not thr_t:
         # Two rows the balance implies on a grid-down step (no import, no export) once the set's state is 0 or 1, written out because the
@@ -446,19 +641,35 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
                 vals.append(-(L[t] - Lc[t]))
                 m.row([U[t], u[t]], [1, -(L[t] - Lc[t])], ub=Lc[t], name=f"unserved_cap[{t}]")
         m.row(cols, vals, rhs, rhs, f"balance[{t}]")
+    # ---------------------------------------------------------------- the inverter's AC rating
+    if inv_ac is not None:
+        # PV reaches the AC side and the battery discharges through the same inverter, and grid or genset charging comes back through it: the
+        # net flow (PV - K) + D - C stays within its kW AC both ways (round 7, flow-onboarding-09's engine half: a 50 kW inverter passed PV 163 kW
+        # and a 76 kW charge)
+        for t in range(T):
+            cols, vals = [K[t]], [-1.0]
+            if bat:
+                cols += [D[t], C[t]]
+                vals += [1.0, -1.0]
+            m.row(cols, vals, lb=-inv_ac - float(PV[t]), ub=inv_ac - float(PV[t]), name=f"inverter_ac[{t}]")
     # ---------------------------------------------------------------- MDI
     mdi = p.get("mdi")
-    M_idx = []
+    M_idx, M_lb = [], []
     if mdi and not off_grid and g.sum() > 0:
         n_blk = mdi["n_mdi"]
-        Mv = m.var("M", 1, max(mdi["M0"], mdi["floor"]), np.inf, mdi["rate"])[0]
+        # never under the month's expected peak (mdi_floors; round 7, engine-optimiser-02): at a month's start M0 is near nothing, and M2 was
+        # bounded by the floor alone, so every kW above the floor was priced as a whole month's demand charge
+        lb_M, lb_M2 = mdi_floors(mdi)
+        Mv = m.var("M", 1, lb_M, np.inf, mdi["rate"])[0]
         M_idx.append(Mv)
+        M_lb.append(lb_M)
         M2 = None
         blocks = (np.asarray(p["ts"]) // (n_blk * 900)).astype(np.int64)
         month_end = mdi.get("month_end_step", T)
         if month_end < T:
-            M2 = m.var("M2", 1, mdi["floor"], np.inf, mdi["rate"])[0]
+            M2 = m.var("M2", 1, lb_M2, np.inf, mdi["rate"])[0]
             M_idx.append(M2)
+            M_lb.append(lb_M2)
         extra = np.where(g > 0.5, np.maximum(0.0, Lhi - L), 0.0)
         for bid in np.unique(blocks):
             steps = np.where(blocks == bid)[0]
@@ -468,6 +679,12 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             elapsed = mdi["G_elapsed"] * mdi["n_elapsed"] if steps[0] == 0 and mdi.get("n_elapsed") else 0.0
             m.row(list(G[steps]) + [target], [1.0] * len(steps) + [-n_blk], ub=-elapsed, name=f"mdi[{bid}]")
             m.row(list(G[steps]) + [target], [1.0] * len(steps) + [-n_blk], ub=-elapsed - float(extra[steps].sum()), name=f"mdi_hi[{bid}]")
+            # and step by step: every Mode A slot carries grid_cap_w = M and the device shaves each instant above it, so a step that imports above
+            # the cap while its block's mean stays under it (0 / full / 0 / full charging, or one step of each block discharging for both) is a
+            # plan the device throttles. Under the upper load quantile as the block rows are (round 7, engine-plans-live-17)
+            for t in steps:
+                if g[t] > 0.5:
+                    m.row([G[t], target], [1.0, -1.0], ub=-float(extra[t]), name=f"mdi_step[{t}]")
     # ---------------------------------------------------------------- ICP, the uncertain middle case
     icp = p.get("icp") or {}
     # legacy net metering nets each period's exports against its imports before the ICP case is decided (tariffs.vectors decides it on the net), so
@@ -534,10 +751,36 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     out["sol"] = sol
     out["T"] = T
     out["R"] = R if bat else np.zeros(T)
+    out["R_steps"] = R_steps if bat else np.zeros(T, dtype=int)
     out["r"] = {t: float(x[i]) for t, i in r_idx.items()} if bat else {}
+    # behind an AMF panel: the start delay's reserve and slack (R and r are then the failed start's), and each row's price per kWh short
+    out["R_gap"] = R_gap if bat else np.zeros(T)
+    out["r_gap"] = {t: float(x[i]) for t, i in r_gap_idx.items()} if bat else {}
+    out["r_price"] = dict(r_price) if bat else {}
+    out["r_gap_price"] = dict(r_gap_price) if bat else {}
     out["manual_floor"] = dict(rm_floor)
     out["M"] = [float(x[i]) for i in M_idx]
+    out["M_lb"] = list(M_lb)  # each peak's lower bound: the month so far, the floor and the expected month peak (mdi_floors)
     out["v_end"] = v_end if bat else 0.0
+    # the energy the terminal value credits (the next peak's use, above the grid-up floor and under its cap), and that floor in kWh
+    out["E_use"] = float(x[E_use]) if bat else 0.0
+    # a start under the cut-off that ends under it: the kWh short of soc_min at the horizon's end and their price (engine-optimiser-03)
+    out["E_gap"] = float(x[e_gap_idx]) if e_gap_idx is not None else 0.0
+    out["E_gap_price"] = e_gap_price
+    # the hour end the anchor charge was planned for (the step, and its end as epoch seconds) and the kWh it stays short of it (engine-optimiser-15)
+    out["anchor"] = None
+    if anchor_a is not None:
+        j = int(np.argmax(x[anchor_a]))
+        out["anchor"] = {"step": int(anchor_ends[j]), "t": int(np.asarray(p["ts"])[anchor_ends[j]]) + 900, "short_kwh": round(float(x[anchor_short]), 3)}
+    out["E_floor_grid"] = Elo if bat else 0.0
+    # the cycle cap's kWh per local day where its row binds the plan (each day's grid-up discharge reaches it), for explain
+    out["cycle_cap"] = {}
+    if bat and cycle_left:
+        days = np.asarray(bat.get("day_index", np.zeros(T, dtype=int)))[:T]
+        for dd, left in cycle_left.items():
+            used = H * float(np.sum(x[D][(days == dd) & (g > 0.5)]))
+            if used >= left - 1e-3 * max(1.0, float(bat["E_nom"])):
+                out["cycle_cap"][dd] = left
     out["breakdown"] = _breakdown(p, sol, out)
     out["reasons"] = explain(p, sol, out)
     if off_grid and thr_t and not shed_rule and fix_u is None:
@@ -553,7 +796,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         tank_need = max(0.0, float(gen["fuel_available"]) - min_burn)
         burnt = np.concatenate([[0.0], np.cumsum(x[F])])
         dodges = [k for k in shed_steps
-                  if x[U[k]] > max(0.0, float(base_served[k] - PV[k]) - bat["P_dis"]) + 1e-3 and x[u[k]] < 0.5 and x[u[k + 1]] < 0.5
+                  if x[U[k]] > max(0.0, float(base_served[k] - PV[k]) - d_ub[k]) + 1e-3 and x[u[k]] < 0.5 and x[u[k + 1]] < 0.5
                   and not (k in thr_z and burnt[k] >= tank_need - 1e-6)]
         left = float(gen["fuel_available"]) - float(np.sum(x[F]))
         resolved, resolve_limited = False, False
@@ -577,7 +820,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         # one, with `threshold_repair.status` not_solved. A tick stays within three limits: the repair is skipped after a failed re-solve in the
         # relaxed retry, which already spent two
         if dodges and not (resolved and relaxed):
-            rep_u = threshold_replay(p, sol, u_lb, u_ub, thr_t, E_on, dump_ok, relaxed=relaxed)
+            rep_u = threshold_replay(p, sol, u_lb, u_ub, thr_t, E_on, dump_forced, relaxed=relaxed)
             rep = solve(p, time_limit=time_limit, gap=gap, relaxed=relaxed, shed_rule=True, fix_u=rep_u["u"])
             info = {"shed_steps": len(dodges), "shed_kwh": round(float(np.sum(x[U[dodges]])) * H, 2), "first_objective_rs": out["objective_rs"],
                     "first_solve_seconds": out["solve_seconds"], "first_mip_gap": out["mip_gap"], "repair_seconds": rep["solve_seconds"],
@@ -641,10 +884,10 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
     - where a day's run-hour cap binds, the hours the threshold does not force count against it (as in the run_cap rows), and once it is used
       a run above the threshold stops, unless it is the plan's own start inside its minimum up time.
     A run the plan did not make follows the load (at least its minimum load). What the load leaves of PV and the set's output charges the
-    battery (from PV only, unless the genset may charge it: at full power, or its minimum-load surplus with the grid down), the rest is
-    curtailed, then dumped; with the set off the battery carries the load, and load is shed only for what its power or its energy above the
-    cut-off cannot carry. The last of the tank is burnt at the output it can still cover. A hold and a carried minimum up or down time are kept
-    (`u_lb`, `u_ub`). Returns the schedule `u` and the replayed `E`, `U`, `F` and `P`: a feasible point of the problem with the shed rule and
+    battery (from the PV beyond the load only, unless the genset may charge it: at full power, or its minimum-load surplus with the grid down),
+    the rest is curtailed, then dumped; with the set off the battery carries the load, and load is shed only for what its power or its energy
+    above the cut-off cannot carry. The last of the tank is burnt at the output it can still cover. A hold and a carried minimum up or down time
+    are kept (`u_lb`, `u_ub`). Returns the schedule `u` and the replayed `E`, `U`, `F` and `P`: a feasible point of the problem with the shed rule and
     that schedule."""
     T = int(p["T"])
     bat, gen = p["battery"], p["genset"]
@@ -653,7 +896,7 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
     En = float(bat["E_nom"])
     Emin, Emax = bat["soc_min"] * En, bat["soc_max"] * En
     eta_c, eta_d = float(bat["eta_c"]), float(bat["eta_d"])
-    ch_ub = np.full(T, float(bat["P_ch"]))
+    ch_ub, d_ub = power_caps(bat, T)
     ch_ub[np.asarray(bat.get("charge_block", np.zeros(T, dtype=bool)), dtype=bool)[:T]] = 0.0
     S, f_min, a, b = float(gen["S"]), float(gen["f_min"]), float(gen["a"]), float(gen["b"])
     UT = 1 if relaxed else int(gen["UT"])
@@ -708,7 +951,7 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
                 # never more than the load PV leaves plus what the battery can take (the PV the set frees for it, or the set's own output
                 # where the genset may charge it), and at least the minimum load: no fuel is burnt only to be dumped above that minimum
                 room_c = max(0.0, Emax - E) / (H * eta_c)
-                useful = net + min(ch_ub[t], room_c, np.inf if gen_ch[t] else float(PV[t]))
+                useful = net + min(ch_ub[t], room_c, np.inf if gen_ch[t] else max(0.0, -net))
                 P = min(S, max(f_min * S, min(float(P_plan[t]) if plan_on else net, useful)))
             burn = H * (a * P + b * S)
             if burn > fuel:
@@ -717,10 +960,11 @@ def threshold_replay(p: dict, sol: dict, u_lb: np.ndarray, u_ub: np.ndarray, thr
         rest = net - P
         C = D = 0.0
         if rest > 0:
-            D = min(float(bat["P_dis"]), max(0.0, E - Emin) * eta_d / H, rest)
+            D = min(float(d_ub[t]), max(0.0, E - Emin) * eta_d / H, rest)
             Us[t] = rest - D
         else:
-            src = -rest if gen_ch[t] else min(-rest, float(PV[t]))
+            # without genset charging the battery takes only the PV beyond the load (round 7, engine-optimiser-06), never the set's surplus
+            src = -rest if gen_ch[t] else min(-rest, max(0.0, -net))
             C = min(ch_ub[t], max(0.0, Emax - E) / (H * eta_c), src)
         E += H * (eta_c * C - D / eta_d)
         fuel -= burn
@@ -738,14 +982,34 @@ def _breakdown(p: dict, s: dict, out: dict) -> dict:
     if gen:
         genset = float(np.sum(gen["c_fuel"] * s["F"] + gen["c_start"] * s["v"] + H * gen["c_runhr"] * s["u"] + H * gen["c_om"] * s["P"]))
     wear = float(np.sum(H * bat["c_cyc"] * s["D"])) if bat else 0.0
-    mdi = 0.0
+    # the demand charge (round 7, engine-plans-live-08, engine-optimiser-12): the objective pays rate x M, and rate x M2 where the horizon
+    # crosses into the next billing month. `mdi_month_rs` is the charge at each peak's lower bound (the month so far, the floor and the expected
+    # month peak: mdi_floors), which no plan changes; `mdi_rise_rs` what the plan adds above it, M's and M2's. Before, the rise was measured from
+    # max(M0, floor) alone, so at a month's start (M0 near nothing) the whole month's charge read as a rise, M2 was in no line, and the rest of the
+    # charge was left unitemised
+    mdi_rise = mdi_month = 0.0
     if p.get("mdi") and out.get("M"):
-        mdi = float(p["mdi"]["rate"] * (out["M"][0] - max(p["mdi"]["M0"], p["mdi"]["floor"])))
+        rate = float(p["mdi"]["rate"])
+        lbs = list(out.get("M_lb") or mdi_floors(p["mdi"]))[:len(out["M"])]
+        mdi_month = rate * float(sum(lbs))
+        mdi_rise = rate * float(sum(max(0.0, M - lb) for M, lb in zip(out["M"], lbs)))
+    # the calendar ageing the objective prices on the energy held after each step (b_cal, Rs per kWh per step)
+    calendar = 0.0
+    if bat:
+        b_cal = np.asarray(bat.get("b_cal", np.zeros(len(s["G"]))), dtype=float)[:len(s["G"])]
+        calendar = float(np.dot(b_cal, np.asarray(s["E"], dtype=float)[1:len(b_cal) + 1]))
     unserved = float(np.sum(H * p["voll"] * s["U"]))
-    reserve = float(sum(np.asarray(p["p_start"])[t] * p["c_short"] * r for t, r in out.get("r", {}).items()))
-    terminal = -float(out.get("v_end", 0.0) * max(0.0, s["E"][-1] - (bat["soc_min"] * bat["E_nom"] if bat else 0.0))) if bat else 0.0
-    return {"energy_rs": round(energy, 2), "genset_rs": round(genset, 2), "wear_rs": round(wear, 2), "mdi_rise_rs": round(mdi, 2),
-            "unserved_rs": round(unserved, 2), "expected_shortfall_rs": round(reserve, 2), "terminal_credit_rs": round(terminal, 2),
+    # each reserve row's slack at its own price (p c_short; behind an AMF panel the start delay's and the failed start's, round 7)
+    prices = out.get("r_price") or {}
+    reserve = float(sum(prices.get(t, np.asarray(p["p_start"])[t] * p["c_short"]) * r for t, r in out.get("r", {}).items()))
+    reserve += float(sum((out.get("r_gap_price") or {}).get(t, 0.0) * r for t, r in (out.get("r_gap") or {}).items()))
+    # the credit the objective takes: v_end times E_use, the energy above the floor the next peak can use and never above its cap (round 7,
+    # engine-delivery-02; before, every kWh above the cut-off was credited, past the cap)
+    terminal = -float(out.get("v_end", 0.0) * out.get("E_use", 0.0)) if bat else 0.0
+    # and a start under the cut-off that ends under it pays for the kWh short of it (round 7, engine-optimiser-03)
+    terminal += float(out.get("E_gap_price", 0.0) * out.get("E_gap", 0.0)) if bat else 0.0
+    return {"energy_rs": round(energy, 2), "genset_rs": round(genset, 2), "wear_rs": round(wear, 2), "mdi_rise_rs": round(mdi_rise, 2),
+            "mdi_month_rs": round(mdi_month, 2), "calendar_rs": round(calendar, 2), "unserved_rs": round(unserved, 2), "expected_shortfall_rs": round(reserve, 2), "terminal_credit_rs": round(terminal, 2),
             "litres": round(float(np.sum(s["F"])), 2), "import_kwh": round(float(np.sum(s["G"]) * H), 2), "export_kwh": round(float(np.sum(s["X"]) * H), 2),
             "discharge_kwh": round(float(np.sum(s["D"]) * H), 2), "genset_kwh": round(float(np.sum(s["P"]) * H), 2),
             "peak_import_kwh": round(float(np.sum(s["G"][np.asarray(p["peak"], dtype=bool)]) * H), 2)}
@@ -760,9 +1024,117 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
     hold = np.asarray(p.get("override_mask", np.zeros(T, dtype=bool)), dtype=bool)
     En = bat["E_nom"] if bat else 1.0
     Emin = bat["soc_min"] * En if bat else 0.0
+    Efl = max(Emin, float(out.get("E_floor_grid", Emin)))  # the grid-up floor: a battery at it has nothing to hold (round 7, engine-delivery-02)
     R = out.get("R", np.zeros(T))
+    R_steps = np.asarray(out.get("R_steps", np.asarray(p["dur_steps"])[:T]), dtype=int)
     icp = p.get("icp") or {}
-    thr = p.get("reserve_threshold", 0.2)
+    c_imp, p_start, ts = np.asarray(p["c_imp"], dtype=float), np.asarray(p["p_start"], dtype=float), np.asarray(p["ts"], dtype=np.int64)
+    Cs, Ds, Es = np.asarray(s["C"], dtype=float), np.asarray(s["D"], dtype=float), np.asarray(s["E"], dtype=float)
+    # the steps that carry a reserve row (p_start >= 0.01 with the grid up); behind an AMF panel also the start delay's rows (R_gap)
+    rows = set(out.get("r") or {}) | set(out.get("r_gap") or {})
+    R_gap = np.asarray(out.get("R_gap", np.zeros(T)), dtype=float)
+    R_top = np.maximum(np.asarray(R, dtype=float), R_gap)
+    amf = bool(gen and gen.get("control") == "auto_on_grid_loss")
+    margin = 2 * float(bat.get("sigma0", 0.0)) * En if bat else 0.0   # every reserve row's widening for the SoC estimate (Part 4.3)
+    tol = 0.02 * En
+    Ms = out.get("M") or []
+    month_end = int((p.get("mdi") or {}).get("month_end_step", T))
+
+    def cap_at(t: int) -> float | None:
+        """The MDI cap step t is held under: the billing month's peak M, or M2 in the next month (round 7, engine-optimiser-02)."""
+        if not Ms:
+            return None
+        return float(Ms[1] if (t >= month_end and len(Ms) > 1) else Ms[0])
+
+    def binds(k: int) -> bool:
+        """The reserve row of step k holds the battery: its energy after the step is at or under the reserve it asks for."""
+        return k in rows and float(Es[k + 1]) <= Emin + float(R_top[k]) + tol
+
+    def reserve_window(t: int, stop_at_charge: bool) -> int | None:
+        """The last step whose reserve row binds the energy the battery holds after step t: from t on, while the grid is up and until the
+        battery next discharges (or, for a step that holds, next charges, which refills what a discharge now would take). None where no row in
+        that stretch binds: the reserve is not what keeps the energy."""
+        last = None
+        for k in range(t, T):
+            if g[k] < 0.5 or (k > t and Ds[k] > 0.1) or (stop_at_charge and k > t and Cs[k] > 0.1):
+                break
+            if binds(k):
+                last = k
+        return last
+
+    def reserve_detail(t: int, last: int) -> dict:
+        """The figures a reserve reason can be checked against: the chance that an outage starts while the energy is held for it (every step of
+        the window, not one step's), how long that is, how long an outage the reserve covers (two steps behind an AMF panel), and the reserve
+        the rows ask for, never above the battery's usable band."""
+        k0 = next(k for k in range(t, last + 1) if binds(k))
+        chance = 1.0 - float(np.prod(1.0 - np.clip(p_start[t:last + 1], 0.0, 1.0)))
+        band = (bat["soc_max"] - bat["soc_min"]) * En
+        if amf:
+            # behind an AMF panel (round 7, engine-plans-live-03): the energy up to the start delay's reserve is held for the delay of every
+            # start; above it, for a failed start (one start in AMF_FAIL_TO_START)
+            if k0 in (out.get("r_gap") or {}) and float(Es[t + 1]) <= Emin + float(R_gap[k0]) + tol:
+                d = {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "cover": "start_delay", "seconds": AMF_START_DELAY_S,
+                     "hours": round(AMF_START_DELAY_S / 3600, 3), "kwh": round(min(float(R_gap[k0]), band), 1)}
+            else:
+                d = {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "cover": "failed_start", "p_fail": AMF_FAIL_TO_START,
+                     "hours": round(int(R_steps[k0]) * H, 2), "kwh": round(min(float(R[k0]), band), 1)}
+        else:
+            d = {"p": round(chance, 2), "within_h": round((last + 1 - t) * H, 2), "hours": round(int(R_steps[k0]) * H, 2),
+                 "kwh": round(min(float(R[k0]), band), 1)}
+        # the part of it that is the state of charge's uncertainty (2 sigma E_nom, Part 4.3), never above the reserve named: behind an AMF panel
+        # it is nearly all of the start delay's reserve, which read as hundreds of kW for a minute (round 7, engine-plans-live-03)
+        d["margin_kwh"] = round(min(margin, d["kwh"]), 1)
+        return d
+
+    def next_discharge(t: int) -> int | None:
+        return next((k for k in range(t + 1, T) if Ds[k] > 0.1), None)
+
+    uses: dict[int, int] = {}                       # a step saved for later and the step its energy is used at (its reason is filled in after)
+    capped = out.get("cycle_cap") or {}             # the local days whose grid-up discharge reached the cycle cap (brief-vs-build-04)
+    cap_days = np.asarray((bat or {}).get("day_index", np.zeros(T, dtype=int)))[:T] if capped else np.zeros(T, dtype=int)
+
+    def held(t: int, E1: float) -> tuple[str, dict] | None:
+        """Why a grid-up step with energy above the floor neither charges nor discharges, from the numbers (round 7, flow-telemetry-plan-control-08):
+        - the reserve: a reserve row binds from this step on, before the battery next charges or discharges, so a kWh discharged now is a kWh
+          short for the outage those rows hold it for (also on a step whose own p_start has no row);
+        - later use: the battery discharges later before it next charges, so the energy is kept for that step;
+        - wear: discharging now and putting the kWh back at the next charge (its grid price, or the export its PV forgoes, over the round trip)
+          gains a positive gap smaller than the wear cost;
+        - the terminal value: nothing refills or uses the energy in the horizon, and it is worth more kept for the day after.
+        None where none holds (nothing to gain)."""
+        last = reserve_window(t, stop_at_charge=True)
+        if last is not None:
+            det = reserve_detail(t, last)
+            det["kwh"] = round(min(float(det["kwh"]), E1 - Emin), 1)  # the reserve the battery holds, never above what it holds
+            det["margin_kwh"] = round(min(float(det["margin_kwh"]), det["kwh"]), 1)
+            return "hold_for_outage", det
+        nc = next((k for k in range(t + 1, T) if Cs[k] > 0.1), None)
+        use = next_discharge(t)
+        if use is not None and (nc is None or use < nc):
+            uses[t] = use
+            det = {"use_t": int(ts[use])}
+            if g[use] > 0.5:
+                det["use_rs_per_kwh"] = round(float(c_imp[use]), 2)
+            return "save_for_later", det
+        rt = bat["eta_c"] * bat["eta_d"]
+        if nc is None:
+            refill = float(out.get("v_end", 0.0)) / bat["eta_d"]
+        else:
+            Gn, Kn, Pn = float(s["G"][nc]), float(s["K"][nc]), float(s["P"][nc]) if gen else 0.0
+            from_grid = Cs[nc] - max(0.0, PV[nc] - Kn + Pn - L[nc]) > 0.1 and Gn > 0.1
+            refill = float(c_imp[nc] if from_grid else np.asarray(p["c_exp"], dtype=float)[nc]) / rt
+        gap = float(c_imp[t]) - refill
+        c_cyc = float(bat["c_cyc"])
+        if nc is None and gap < c_cyc + 1e-6:
+            return "terminal_value", {}
+        if nc is not None and 0.01 < gap < c_cyc + 1e-6:
+            return "wear_margin_too_small", {"gap_rs_per_kwh": round(gap, 2), "wear_rs_per_kwh": round(c_cyc, 2)}
+        if g[t] > 0.5 and int(cap_days[t]) in capped and gap > c_cyc:
+            # discharging now would gain more than its wear, and the day's discharge has reached the cycle cap (brief-vs-build-04)
+            cap_kwh = float(bat["cycle_cap_kwh"])
+            return "cycle_cap", {"cycles": round(cap_kwh / En, 2), "kwh": round(cap_kwh, 1)}
+        return None
+
     reasons = []
     for t in range(T):
         G, X, K, U, C, D, P = (float(s[k][t]) for k in ("G", "X", "K", "U", "C", "D", "P"))
@@ -770,15 +1142,17 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
         d = {}
         if hold[t]:
             r = "operator_hold"
+        elif U > 0.1:
+            # load the plan cannot serve: in an outage, at a site without a grid, or (the grid up) beyond the connection and PV
+            r = "unserved"
+            d = {"kw": round(U, 1), "grid": "up" if g[t] >= 0.5 else ("none" if p.get("off_grid") else "down")}
         elif g[t] < 0.5:
-            if U > 0.1:
-                r = "unserved"
-                d = {"kw": round(U, 1)}
-            elif P > 0.1:
+            if P > 0.1:
                 r = "genset_on"
                 d = {"kw": round(P, 1), "rs_per_kwh": round(_gen_marginal(gen), 1) if gen else None}
             elif D > 0.1:
-                r = "carry_outage"
+                # a site without a grid has no outage: its battery simply carries the load (round 7, engine-plans-live-14)
+                r = "carry_load" if p.get("off_grid") else "carry_outage"
                 d = {"kw": round(D, 1)}
             elif C > 0.1:
                 r = "charge_from_pv"
@@ -794,17 +1168,32 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
                 d = {"rs_per_kwh": round(float(p["c_imp"][t]), 2)}
             elif icp.get(per, {}).get("case") == "above":
                 r = "icp_flat_price"
-            elif p.get("mdi") and G > 0.8 * (out["M"][0] if out.get("M") else 1e9):
+            elif p.get("mdi") and G > 0.8 * (cap_at(t) or 1e9):
                 r = "mdi_cap"
-                d = {"kw": round(out["M"][0], 1)}
+                d = {"kw": round(cap_at(t), 1)}
             else:
                 r = "self_consumption"
         elif C > 0.1:
             # what PV and the genset leave over after the load, as delivery.grid_charging reads it; a site without grid charging never names it
             surplus = max(0.0, PV[t] - K + (P if gen else 0.0) - L[t])
             if C - surplus > 0.1 and G > 0.1 and (not bat or bat.get("a_grid", True)):
-                r = "charge_from_grid"
-                d = {"rs_per_kwh": round(float(p["c_imp"][t]), 2)}
+                # grid charging is "cheaper" only against a dearer step the energy is used at; where it is not (the peak window, or a later use
+                # at the same price) and the reserve rows bind the energy, the step is named for the reserve it refills (round 7,
+                # flow-telemetry-plan-control-02): never "while energy is cheaper" at the day's highest price
+                use = next_discharge(t)
+                use_price = float(c_imp[use]) if use is not None and g[use] > 0.5 else None
+                cheaper = use_price is not None and use_price > float(c_imp[t]) + 1e-6
+                last = reserve_window(t, stop_at_charge=False) if bat else None
+                d = {"rs_per_kwh": round(float(c_imp[t]), 2)}
+                if last is not None and not cheaper:
+                    r = "charge_for_reserve"
+                    d.update(reserve_detail(t, last))
+                else:
+                    r = "charge_from_grid"
+                    if use is not None:
+                        d["use_t"] = int(ts[use])
+                        if use_price is not None:
+                            d["use_rs_per_kwh"] = round(use_price, 2)
             elif gen and P > 0.1:
                 r = "genset_on"
             else:
@@ -813,18 +1202,17 @@ def explain(p: dict, s: dict, out: dict) -> list[dict]:
             # a set running with the grid up (parallel) is named for what it does, never "genset_off" (Part 4.7)
             r = "genset_on"
             d = {"kw": round(P, 1), "rs_per_kwh": round(_gen_marginal(gen), 1)}
-        elif bat and R[t] > 0 and float(p["p_start"][t]) >= 0.01 and E1 <= Emin + R[t] + 0.02 * En and (peak[t] or float(p["p_start"][t]) >= thr):
-            r = "hold_for_outage"
-            d = {"p": round(float(p["p_start"][t]), 2), "hours": round(int(p["dur_steps"][t]) * H, 2), "kwh": round(float(R[t]), 1)}
-        elif bat and peak[t] and E1 > Emin + 0.02 * En:
-            r = "wear_margin_too_small"
-        elif bat and t >= T - 24 and E1 > Emin + 0.05 * En:
-            r = "terminal_value"
-        elif gen and g[t] > 0.5 and float(p["p_start"][t]) > 0.2:
+        elif bat and E1 > (Efl if g[t] > 0.5 else Emin) + tol and (why := held(t, E1)) is not None:
+            r, d = why
+        elif gen and g[t] > 0.5 and float(p["p_start"][t]) >= float(p.get("reserve_threshold", 0.2)) > 0.0:
+            # an outage at least as likely as the site's reserve threshold (round 7, engine-plans-live-12), with its chance
             r = "genset_off"
+            d = {"p": round(float(p["p_start"][t]), 2)}
         else:
             r = "idle"
         reasons.append({"reason": r, "detail": d})
+    for t, k in uses.items():
+        reasons[t]["detail"]["use_reason"] = reasons[k]["reason"]
     return reasons
 
 
@@ -847,6 +1235,8 @@ def solve_with_policy(p: dict, time_limit: float = 10.0) -> dict:
         return first
     short = shorten(p, 96)
     second = solve(short, time_limit=time_limit, relaxed=True)
+    if second["status"] != "not_solved":
+        second = _min_run_repair(short, second, time_limit)
     second["retry_of"] = first.get("message", "")
     second["T"] = short["T"]  # the horizon actually solved: the caller rebuilds its steps on shorten(p, T)
     # a first solve that stopped at its limit without a plan is what put the relaxed 24-hour plan in its place, so the plan says so (HANDOFF
@@ -859,6 +1249,59 @@ def solve_with_policy(p: dict, time_limit: float = 10.0) -> dict:
     if second["status"] != "not_solved":
         second["notes"] = second.get("notes", []) + ["relaxed_retry"]
     return second
+
+
+def min_run_schedule(p: dict, u) -> np.ndarray | None:
+    """The relaxed retry's genset schedule `u` with the set's minimum up and down times put back (round 7, engine-optimiser-08): a run shorter
+    than UT runs on to UT steps (to the horizon's end at most), and a stop shorter than DT between two runs is run through. A run carried from
+    before the horizon keeps the carried rule (Part 4.3: a grid return or a hold may end it). Only where the plan starts the set (a manual
+    start): a panel or a soc_threshold controller decides its own runs. None where nothing changes."""
+    gen = p.get("genset")
+    if not gen or gen.get("control") != "manual":
+        return None
+    T, UT, DT = int(p["T"]), int(gen["UT"]), int(gen["DT"])
+    on = np.round(np.asarray(u, dtype=float)[:T]) > 0.5
+    out = on.copy()
+    t = 0
+    while t < T:
+        if not out[t]:
+            t += 1
+            continue
+        a = t
+        while t < T and out[t]:
+            t += 1
+        if t - a < UT and not (a == 0 and gen.get("u_prev") == 1):
+            out[a:min(T, a + UT)] = True
+            t = min(T, a + UT)
+    t = 0
+    while t < T:
+        if out[t]:
+            t += 1
+            continue
+        b = t
+        while t < T and not out[t]:
+            t += 1
+        if 0 < b and t < T and t - b < DT:
+            out[b:t] = True
+    return None if bool(np.all(out == on)) else out.astype(float)
+
+
+def _min_run_repair(p: dict, res: dict, time_limit: float) -> dict:
+    """The relaxed retry drops the minimum up and down times (Part 4.5) for solve time, so its plan could run a set for a quarter hour, and the
+    genset requests asked a manual-start operator for that (round 7, engine-optimiser-08). Its schedule is held to them (`min_run_schedule`)
+    and the problem solved once more with the genset fixed to it, close to a linear programme; where that finds no plan the relaxed plan stands,
+    noted. Clipped to the problem's own bounds, so a hold or a grid return still ends a run."""
+    fixed = min_run_schedule(p, res["sol"]["u"])
+    if fixed is None:
+        return res
+    rep = solve(p, time_limit=time_limit, relaxed=True, fix_u=fixed)
+    if rep["status"] == "not_solved":
+        res["notes"] = list(res.get("notes", [])) + ["min_run_repair_failed"]
+        return res
+    rep["solve_seconds"] = round(float(res.get("solve_seconds") or 0.0) + float(rep.get("solve_seconds") or 0.0), 3)
+    rep["time_limited"] = bool(res.get("time_limited") or rep.get("time_limited"))
+    rep["notes"] = list(rep.get("notes", [])) + ["min_run_repair"]
+    return rep
 
 
 def manual_floor(p: dict, T: int) -> np.ndarray:
@@ -925,6 +1368,32 @@ def genset_surplus_steps(p: dict) -> np.ndarray:
     return np.asarray(p["g"], dtype=float)[:T] < 0.5
 
 
+def curtail_cost(p: dict) -> np.ndarray:
+    """The objective's coefficient on curtailed PV (K, kW) per step: a tie-break that keeps PV unless it cannot be used, priced so that PV is
+    never curtailed while the battery has room to store it (round 7, engine-plans-live-16). Storing a kWh at a step costs the calendar ageing of
+    holding it (b_cal on E), so where PV would fill the battery later the same day, curtailing now and charging later saved those slopes (and
+    the order tie-break preferred the later charge): Faisalabad curtailed 54 to 67 kW from 12:00 with the battery at 78 % and charged inside
+    the afternoon's load-shedding window, on the median forecast's word that the afternoon would fill it. A kW curtailed therefore pays the
+    calendar cost of holding its charge to the end of its local day, and a tie-break falling over the horizon at twice the order's slope, so
+    charging now always costs less than curtailing now to charge later that day, as the inverter does on site (PV beyond the load charges a
+    battery with room). The genset's dump costs more still (`solve`: curtail PV first, then dump, twin.simulate's order)."""
+    T = int(p["T"])
+    cost = np.full(T, H * EPS_CURTAIL)
+    bat = p.get("battery")
+    if not bat or not T:
+        return cost
+    b_cal = np.asarray(bat.get("b_cal", np.zeros(T)), dtype=float)[:T]
+    b_cal = np.pad(b_cal, (0, T - len(b_cal)))
+    day = (np.asarray(p["ts"], dtype=np.int64)[:T] + PKT_OFFSET_S) // 86400
+    hold, acc = np.zeros(T), 0.0
+    for t in range(T - 1, -1, -1):
+        if t == T - 1 or day[t + 1] != day[t]:
+            acc = 0.0
+        acc += max(0.0, float(b_cal[t]))
+        hold[t] = acc
+    return cost + H * (2 * EPS_ORDER * (1.0 - np.arange(T) / T) + float(bat["eta_c"]) * hold)
+
+
 def genset_follow_cap(p: dict) -> np.ndarray:
     """The genset's output per step where it follows the load with the grid down: the load it serves less PV, never under its minimum load nor
     over its rating (twin.simulate: gen = min(S, max(f_min S, served - PV))). The load served is the forecast load off-grid or where the set
@@ -947,7 +1416,7 @@ def shorten(p: dict, T: int) -> dict:
             q[k] = np.asarray(q[k])[:T]
     if q.get("battery"):
         b = dict(q["battery"])
-        for k in ("b_cal", "charge_block"):
+        for k in ("b_cal", "charge_block", "day_index", "P_ch_t", "P_dis_t"):
             if k in b:
                 b[k] = np.asarray(b[k])[:T]
         q["battery"] = b
@@ -963,6 +1432,27 @@ def shorten(p: dict, T: int) -> dict:
         md["month_end_step"] = min(md.get("month_end_step", T), T)
         q["mdi"] = md
     return q
+
+
+def power_caps(bat: dict, T: int) -> tuple[np.ndarray, np.ndarray]:
+    """The battery's charge and discharge limits per step (kW): its rated P_ch and P_dis, under the temperature derating where the problem
+    carries one (`P_ch_t`, `P_dis_t`; round 7, brief-vs-build-05)."""
+    caps = []
+    for rated, key in ((bat["P_ch"], "P_ch_t"), (bat["P_dis"], "P_dis_t")):
+        a = np.full(T, float(rated))
+        if bat.get(key) is not None:
+            v = np.asarray(bat[key], dtype=float)[:T]
+            a[:len(v)] = np.minimum(a[:len(v)], v)
+        caps.append(a)
+    return caps[0], caps[1]
+
+
+def mdi_floors(mdi: dict) -> tuple[float, float]:
+    """The lower bounds of the billing month's peak M and of the next month's M2 (kW): the floor, the month's expected peak (`M_exp`,
+    plans.month_to_date: the rest of the month almost surely reaches it, so a kW under it costs nothing; round 7, engine-optimiser-02) and, for
+    M, the month's peak so far."""
+    exp = float(mdi.get("M_exp") or 0.0)
+    return max(float(mdi["M0"]), float(mdi["floor"]), exp), max(float(mdi["floor"]), exp)
 
 
 def wear_cost(battery: dict) -> float:

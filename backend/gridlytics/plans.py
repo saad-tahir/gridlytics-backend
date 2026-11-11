@@ -58,36 +58,63 @@ def billing_period(conn: dict | None, t0: int) -> tuple[int, int]:
 
 def month_to_date(site_id: str, conn: dict | None, t0: int) -> dict:
     """Billing-month-to-date imports (and exports) per period, the MDI peak so far, the open block's elapsed mean, and the recent import (and export)
-    per day per period. The month is the bill's: it starts the day after the previous meter reading (calendar month without a reading_day)."""
+    per day per period. The month is the bill's: it starts the day after the previous meter reading (calendar month without a reading_day).
+
+    A missing minute is unknown, not zero import (round 7, engine-optimiser-13): the month's imports and exports per period are the known
+    minutes' energy scaled to all the period's minutes so far (as verify.month_totals scales a scored month's), an MDI block counts only with
+    80 % of its minutes known, at the mean of those, and the open block's elapsed mean is that of its known minutes."""
     ms, me = billing_period(conn, t0)
     g = telemetry.minute_grid(site_id, min(ms, t0 - 7 * 86400), t0)
+    k_imp, k_exp = ~np.isnan(g["imp"]), ~np.isnan(g["exp"])
     imp = np.nan_to_num(g["imp"])
     exp = np.nan_to_num(g["exp"])
     pk = peak_mask(conn, g["ts"])
     in_month = g["ts"] >= ms
-    mtd = {"peak": float(imp[in_month & pk].sum() / 60), "off_peak": float(imp[in_month & ~pk].sum() / 60)}
-    mtd_exp = {"peak": float(exp[in_month & pk].sum() / 60), "off_peak": float(exp[in_month & ~pk].sum() / 60)}
+
+    def to_date(a: np.ndarray, known: np.ndarray) -> dict:
+        out = {}
+        for per, sel in (("peak", in_month & pk), ("off_peak", in_month & ~pk)):
+            n = int(np.sum(known & sel))
+            out[per] = float(a[known & sel].sum() / 60) * float(np.sum(sel)) / n if n else 0.0
+        return out
+
+    mtd, mtd_exp = to_date(imp, k_imp), to_date(exp, k_exp)
     week = g["ts"] >= t0 - 7 * 86400
     # the per-day rate divides by the days the telemetry actually covers (a new site, an upload gap), not by the window's seven
     days_w = max(1.0, float(np.sum(~np.isnan(g["imp"][week]))) / 1440)
     per_day = {"peak": float(imp[week & pk].sum() / 60 / days_w), "off_peak": float(imp[week & ~pk].sum() / 60 / days_w)}
     per_day_exp = {"peak": float(exp[week & pk].sum() / 60 / days_w), "off_peak": float(exp[week & ~pk].sum() / 60 / days_w)}
     interval = int((conn or {"data": {}})["data"].get("mdi_interval_min", 30))
-    m0 = 0.0
-    mi = imp[in_month]
-    mts = g["ts"][in_month]
-    if len(mi):
-        blk = (mts // (interval * 60))
-        uniq, inv = np.unique(blk, return_inverse=True)
-        sums = np.bincount(inv, weights=mi)
-        full = np.bincount(inv) >= interval * 0.8
-        if full.any():
-            m0 = float((sums[full] / interval).max())
+
+    def block_means(sel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The MDI blocks over the selected minutes with 80 % of their minutes known (their start, epoch seconds) and their mean import."""
+        if not sel.any():
+            return np.zeros(0, dtype=np.int64), np.zeros(0)
+        uniq, inv = np.unique(g["ts"][sel] // (interval * 60), return_inverse=True)
+        n_known = np.bincount(inv, weights=k_imp[sel].astype(float), minlength=len(uniq))
+        sums = np.bincount(inv, weights=imp[sel], minlength=len(uniq))
+        full = n_known >= interval * 0.8
+        return uniq[full] * interval * 60, sums[full] / np.maximum(n_known[full], 1.0)
+
+    _, means = block_means(in_month)
+    m0 = float(means.max()) if len(means) else 0.0
+    # the month's expected peak (round 7, engine-optimiser-02, engine-plans-live-07): the second-highest local day's peak of the seven days
+    # before t0, so one odd day does not set it. At a month's start M0 is near nothing, and every kW above the floor was priced as a whole
+    # month's demand charge: the plan drained the battery off-peak on the 1st to hold a peak the month's weekdays then passed anyway (Karachi:
+    # 797 kW on Sunday 1 Nov, 902 kW by the 4th). The rest of a month almost surely reaches the peak of the second-busiest of its last seven
+    # days, so a kW under it costs nothing; it bounds M (and M2, the next month's peak) from below. Once the seven days lie inside the month,
+    # the month so far covers it
+    starts, wk_means = block_means(week)
+    m_exp = 0.0
+    if len(starts):
+        days = (starts + 5 * 3600) // 86400
+        day_peaks = np.sort(np.array([float(wk_means[days == d].max()) for d in np.unique(days)]))[::-1]
+        m_exp = float(day_peaks[1]) if len(day_peaks) >= 2 else 0.0
     blk_start = t0 // (interval * 60) * (interval * 60)
-    el = imp[g["ts"] >= blk_start]
+    el_known = k_imp & (g["ts"] >= blk_start)
     n_el_steps = (t0 - blk_start) // 900
-    g_el = float(el.mean()) if len(el) else 0.0
-    return {"mtd": mtd, "per_day": per_day, "M0": m0, "G_elapsed": g_el, "n_elapsed": int(n_el_steps), "mtd_export": mtd_exp,
+    g_el = float(imp[el_known].mean()) if el_known.any() else 0.0
+    return {"mtd": mtd, "per_day": per_day, "M0": m0, "M_exp": m_exp, "G_elapsed": g_el, "n_elapsed": int(n_el_steps), "mtd_export": mtd_exp,
             "per_day_export": per_day_exp, "period_start": ms, "period_end": me}
 
 
@@ -115,6 +142,89 @@ def _carried_genset(site_id: str, t0: int) -> dict:
     today0 = int(datetime(_local(t0).year, _local(t0).month, _local(t0).day, tzinfo=PKT).timestamp())
     hours_today = float(np.nansum(filled[g["ts"] >= today0]) / 60)
     return {"u_prev": int(last), "elapsed": int(elapsed_steps), "hours_today": hours_today, "unknown": False}
+
+
+#: the fuel kinds that come by pipe: no tank to run dry, so the plan does not ration them (an explicit kind, never a tank of 0 litres)
+PIPED_FUELS = ("gas_captive", "lng_captive")
+
+
+def fuel_level(site: dict, t0: int) -> dict | None:
+    """The fuel the genset's tank holds at t0, for the plan to ration (Part 4.1 "fuel available", carried between ticks as Part 4.8 asks; round
+    7, engine-optimiser-05). Nothing wrote the carried level before, so every tick planned on a full tank, and `or 1e9` made a tank of 0 litres,
+    or a carried level of 0, unlimited fuel. `basis`:
+    - `carried`: the level the last tick planned on (`state.fuel_l` at `state.fuel_ts`), plus the fills logged since (the fuel log, by the time
+      each was logged), less the litres burnt since (`_fuel_burnt`), never under empty nor over the tank;
+    - `assumed_full`: no level carried yet: a full tank, as before (the first tick of a site, or one whose level was never written);
+    - `unknown`: a diesel tank of no size (tank_l 0): there is nothing to ration against, and the plan says so;
+    - `piped`: captive gas or RLNG by pipe (`PIPED_FUELS`): not rationed.
+    `litres` and `tank_l` are null for the last two. None without a genset."""
+    g = (site.get("assets") or {}).get("genset")
+    if not g:
+        return None
+    if g.get("fuel_kind", "hsd") in PIPED_FUELS:
+        return {"basis": "piped", "litres": None, "tank_l": None}
+    tank = float(g.get("tank_l") or 0.0)
+    if tank <= 0:
+        return {"basis": "unknown", "litres": None, "tank_l": None}
+    st = site.get("state") or {}
+    if st.get("fuel_l") is None:
+        return {"basis": "assumed_full", "litres": tank, "tank_l": tank}
+    level = float(st["fuel_l"])
+    ts0 = st.get("fuel_ts")
+    if ts0 is not None and int(ts0) < int(t0):
+        level += _fuel_filled(site["id"], int(ts0), int(t0)) - _fuel_burnt(site["id"], g, int(ts0), int(t0))
+    return {"basis": "carried", "litres": min(tank, max(0.0, level)), "tank_l": tank}
+
+
+def _fuel_filled(site_id: str, a: int, b: int) -> float:
+    """The litres logged as put in the tank (POST .../genset/fuel) with their log time in (a, b]: each fill counts once, in the first tick after
+    it was logged, whatever day it names."""
+    with store.connect() as con:
+        rows = con.execute("SELECT ts, detail FROM events WHERE site_id = ? AND type = 'fuel_log' AND ts >= ?",
+                           (site_id, _iso(a - 86400))).fetchall()
+    total = 0.0
+    for r in rows:
+        at = _ts(r["ts"])
+        if at is None or not (a < at <= b):
+            continue
+        try:
+            total += max(0.0, float(json.loads(r["detail"] or "{}").get("litres") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _fuel_burnt(site_id: str, g: dict, a: int, b: int) -> float:
+    """The litres the genset burnt in [a, b): metered where the minute carries litres; for a run with no litres read, the fuel curve at its
+    metered power (three quarters of its rating where none is read either); and for the minutes with no genset reading at all, the litres the
+    plan in force at `a` planned for them, so a site with no genset signal still burns its tank down as it was asked to run. Each reading
+    stands for the minutes up to the next one, at most the source's own interval (the median between its readings: a 5-minute source's row
+    is five minutes) and never more than GAP_MINUTES."""
+    d = telemetry.raw(site_id, a, b, ("genset_running", "genset_power_w", "genset_fuel_l"))
+    ts = np.asarray(d["ts"], dtype=np.int64)
+    flag, p_kw, fuel = d["genset_running"], d["genset_power_w"] / 1000.0, d["genset_fuel_l"]
+    S, ga, gb = float(g["rated_kw"]), float(g["a"]), float(g["b"])
+    burnt = float(np.nansum(fuel))
+    known = ~(np.isnan(flag) & np.isnan(p_kw) & np.isnan(fuel))
+    span = np.zeros(len(ts))
+    if len(ts):
+        every = min(float(np.median(np.diff(ts[known]))), GAP_MINUTES * 60.0) if known.sum() > 1 else 60.0
+        span = np.minimum(np.diff(np.append(ts, b)), max(60.0, every)) / 60.0
+        on = np.where(~np.isnan(flag), flag > 0.5, np.where(~np.isnan(p_kw), p_kw > 0.0, np.nan_to_num(fuel) > 0.0)) & known
+        curve = on & np.isnan(fuel)
+        kw = np.where(np.isnan(p_kw), 0.75 * S, p_kw)
+        burnt += float(np.sum((ga * kw[curve] + gb * S) / 60.0 * span[curve]))
+    # the minutes no reading covers, per 15-minute step, at the planned litres of that step
+    covered: dict[int, float] = {}
+    for t, m in zip(ts[known] // 900 * 900, span[known]):
+        covered[int(t)] = covered.get(int(t), 0.0) + float(m)
+    steps = range(a // 900 * 900, b, 900)
+    unread = {s: max(0.0, (min(s + 900, b) - max(s, a)) / 60.0 - covered.get(s, 0.0)) for s in steps}
+    if any(v > 1e-9 for v in unread.values()):
+        plan = active_at(site_id, a)
+        planned = {int(x["t"]): float(x.get("litres") or 0.0) for x in (plan or {}).get("steps") or []}
+        burnt += sum(planned.get(s, 0.0) * m / 15.0 for s, m in unread.items())
+    return burnt
 
 
 RELEASE_REASONS = {"pause_control": "control_paused", "force_native": "released_to_native"}
@@ -168,6 +278,42 @@ def offgrid_c_next(g_asset: dict, fuel_price: float, load: np.ndarray, pv: np.nd
                                    "c_om": g_asset["c_om_rs_per_kwh"], "c_runhr": g_asset["c_runhr_rs"]}, ratio)
 
 
+def fallback_floor_pct(site: dict) -> float:
+    """The fallback block's floor (`min_soc_floor_pct`): the site's reserve policy, which the edge enforces whatever the slots say (R6 I2)."""
+    return float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
+
+
+def bms_low_pct(site: dict) -> float:
+    """The battery's own cut-off (its soc_min) in percent."""
+    return float(((site.get("assets") or {}).get("battery") or {}).get("soc_min", 0.1)) * 100
+
+
+def delivered_floor_pct(site: dict) -> float:
+    """The state of charge the delivered table holds with the grid up: delivery.compile_mode_a clamps every slot's floor to
+    max(BMS low + 2, fallback floor), and the fallback floor is enforced by the edge whatever the slots say. The plan holds the same floor on its
+    grid-up steps (round 7, engine-delivery-02): before, it planned down to the BMS soc_min (10 %) against slots that all stop at 20 %, so its
+    peak discharges and its savings counted on energy the device keeps back. In an outage the battery-inverter carries the load to its own
+    cut-off, so there the plan keeps the BMS soc_min."""
+    return max(bms_low_pct(site) + 2.0, fallback_floor_pct(site))
+
+
+def terminal_cal_hold(b_cal: np.ndarray, c_imp: np.ndarray, load: np.ndarray, pv: np.ndarray, off_grid: bool) -> float:
+    """The terminal value's c_cal_hold (Part 4.4): the calendar cost of holding a kWh from the horizon's end until the next peak uses it, the
+    sum of the per-step slopes over the steps between (round 7, engine-optimiser-10: it was the mean slope of 32 steps, one 15-minute step's
+    cost, Rs 0.03 to 0.1 against Rs 1 to 6 for the hours the energy waits). The next peak is the day after's dearest step, c_next's own (the
+    horizon's last day stands for the day after, as it does for c_next), and off-grid the first step whose load PV does not cover; the slopes
+    are those of the same hours of the horizon's last day."""
+    n = min(96, len(b_cal))
+    if not n:
+        return 0.0
+    if off_grid:
+        short = np.flatnonzero(np.asarray(load, dtype=float)[-n:] > np.asarray(pv, dtype=float)[-n:] + 1e-9)
+        hold = int(short[0]) if len(short) else n
+    else:
+        hold = int(np.argmax(np.asarray(c_imp, dtype=float)[-n:]))
+    return float(np.sum(np.asarray(b_cal, dtype=float)[-n:][:hold]))
+
+
 def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     conn = (site.get("connections") or [None])[0]
     a = site.get("assets") or {}
@@ -212,12 +358,18 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     p = {"T": steps, "ts": ts, "L": L, "Lhi": np.maximum(Lhi, L), "Lc": np.minimum(Lc, L), "PV": PV, "PVlo": np.minimum(PVlo, PV), "g": g,
          "p_start": p_start, "dur_steps": dur, "c_imp": vec["c_imp"], "c_exp": vec["c_exp"], "peak": vec["peak"], "in_month": in_month,
          "G_max": G_max, "X_max": X_max, "off_grid": off_grid, "load_mode": int(d.get("outage_load_mode", 0)),
-         "voll": float(d.get("voll_rs_per_kwh", 500)), "reserve_threshold": float((d.get("reserve_policy") or {}).get("p_threshold", 0.2)),
-         "icp": vec["icp"], "regime": regime, "tariff_notices": vec.get("tariff_notices", [])}
+         # lost load is never valued under the dearest import price of the horizon (round 7, engine-optimiser-01): a VoLL the site saved under it
+         # (the setting accepts 0) made a manual floor's slack and an outage's shortfall cheaper than the grid
+         "voll": max(float(d.get("voll_rs_per_kwh", 500)), float(np.max(vec["c_imp"])) if len(vec["c_imp"]) else 0.0), "reserve_threshold": float((d.get("reserve_policy") or {}).get("p_threshold", 0.2)),
+         "icp": vec["icp"], "regime": regime, "tariff_notices": vec.get("tariff_notices", []),
+         # PV and the battery reach the AC side through the inverter: its kW AC bounds both, and the reserve (round 7, engine-plans-live-06)
+         "inverter_kw_ac": (float(a["inverter"]["kw_ac"]) if (a.get("inverter") or {}).get("kw_ac") else None)}
     if vec["mdi"] and mtd:
         month_end = int(vec["billing_month_end_step"]) if "billing_month_end_step" in vec else (int(np.argmin(in_month)) if not in_month.all() else steps)
         p["mdi"] = {"rate": vec["mdi"]["rate_rs_per_kw"], "M0": mtd["M0"], "floor": vec["mdi"]["floor_kw"], "n_mdi": vec["mdi"]["interval_steps"],
-                    "G_elapsed": mtd["G_elapsed"], "n_elapsed": mtd["n_elapsed"], "month_end_step": month_end}
+                    "G_elapsed": mtd["G_elapsed"], "n_elapsed": mtd["n_elapsed"], "month_end_step": month_end,
+                    # the month's expected peak (month_to_date): M and M2 are never bounded under it (round 7, engine-optimiser-02)
+                    "M_exp": mtd.get("M_exp", 0.0)}
     # overrides as bounds (Part 4.8)
     ovs = sites.overrides(site["id"])
     mask = {k: np.zeros(steps, dtype=bool) for k in ("genset_hold", "charge_block", "reserve", "pause_control", "force_native", "force_charge")}
@@ -237,22 +389,28 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     floor_pct = np.maximum(hold_pct, force_pct)
     # pause and release to native do not shape the solve (the tick holds the plan and the edge gets a release); the rest are operator holds
     p["override_mask"] = mask["genset_hold"] | mask["charge_block"] | mask["reserve"] | mask["force_charge"]
+    # each kind's own window, for the plan table's Flags column (round 7, pages-B-07; R8 2.9): every step names the overrides it lies inside
+    p["override_kinds"] = {k: m for k, m in mask.items() if m.any()}
     p["overrides"] = [{"kind": o["kind"], "value": o["value"], "until": o["until_ts"], "author": o["author"]} for o in ovs]
     gen = None
+    # each step's local (Pakistan) day from t0's: the genset's run-hour cap and the battery's cycle cap are per day
+    local_days = np.array([(_local(int(x)).date() - _local(t0).date()).days for x in ts])
     if g_asset and d.get("genset_start_control", "none") != "none":
+        # the fuel the tank holds (fuel_level; round 7, engine-optimiser-05): piped gas and a tank of no size are not rationed
+        fuel = fuel_level(site, t0)
+        p["fuel"] = fuel
         kind = g_asset.get("fuel_kind", "hsd")
         price, _src = tariffs.fuel_price(kind, _local(t0).date())
         carried = _carried_genset(site["id"], t0)
         control = d.get("genset_start_control", "manual")
         if carried["unknown"] and control == "auto_on_grid_loss" and len(g) and g[0] < 0.5:
             carried = {**carried, "u_prev": 1, "elapsed": 99}  # in an outage the panel has already started the set; this fixes nothing
-        local_days = np.array([(_local(int(x)).date() - _local(t0).date()).days for x in ts])
         c_om = g_asset["c_om_rs_per_kwh"] + (SELFGEN_DUTY_RS_PER_KWH if g_asset["rated_kw"] > 400 and (d.get("lat", 31) > 28) else 0.0)
         gen = {"S": g_asset["rated_kw"], "f_min": g_asset["f_min"], "a": g_asset["a"], "b": g_asset["b"], "c_fuel": price, "c_start": g_asset["c_start_rs"],
                "c_runhr": g_asset["c_runhr_rs"], "c_om": c_om, "UT": max(1, int(math.ceil(g_asset["min_up_h"] * 4))),
                "DT": max(1, int(math.ceil(g_asset["min_down_h"] * 4))), "u_prev": carried["u_prev"], "elapsed": carried["elapsed"],
                "cap_hours": g_asset["cap_hours_per_day"], "hours_today": carried["hours_today"], "day_index": local_days,
-               "fuel_available": float(site.get("state", {}).get("fuel_l", g_asset["tank_l"]) or 1e9), "parallel": g_asset["parallel_allowed"],
+               "fuel_available": float(fuel["litres"]) if fuel and fuel["litres"] is not None else 1e9, "parallel": g_asset["parallel_allowed"],
                "control": control, "hold": mask["genset_hold"], "unknown": carried["unknown"],
                "soc_on": sites.genset_start_soc(d)}  # twin.plant_of's start threshold
         p["genset"] = gen
@@ -272,8 +430,29 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                "a_gen_surplus": bool(d.get("gen_charge_allowed", True)),
                "c_cyc": optimise.wear_cost(b_asset),
                "b_cal": optimise.calendar_slope(temp, b_asset["replacement_cost_per_kwh"]) if d.get("calendar_cost_on", True) else np.zeros(steps),
-               "charge_block": mask["charge_block"]}
+               "charge_block": mask["charge_block"],
+               # the floor the delivered table and the fallback hold with the grid up (round 7, engine-delivery-02); never above soc_max
+               "soc_floor_grid": min(float(b_asset["soc_max"]), delivered_floor_pct(site) / 100.0),
+               # the site's daily cycle cap (round 7, brief-vs-build-04): kWh discharged per local day, at most cycle_cap_per_day times E_nom (a
+               # cycle as the battery page counts it), less what the battery discharged since midnight on t0's day
+               "cycle_cap_kwh": float(d.get("cycle_cap_per_day", 1.5)) * e_nom,
+               "discharged_today_kwh": float(bs.get("discharged_today_kwh") or 0.0), "day_index": local_days}
         p["battery"] = bat
+        # what the plan starts from, for the plan's summary (round 7, engine-optimiser-07): the state service's estimate, its uncertainty and the
+        # age of the reading it read; a reading older than one control period, or none (the plan then starts from an assumed state), is stale
+        age = bs.get("reading_age_min")
+        p["battery_state"] = {"soc_pct": round(soc * 100, 1), "sigma_pct": bs.get("sigma_pct"), "age_min": age,
+                              "stale": bool(bs.get("stale", True)) if bs.get("soc_pct") is not None else True,
+                              "anchor_soc_pct": bs.get("anchor_soc_pct") if bs.get("anchor_due") else None, "derate": None}
+        # the pack's temperature derating (round 7, brief-vs-build-05; R6 5.7: "a derate lowers P_dis at the next solve"): the limits its fresh
+        # temperature reading allows hold for the plan's first two hours, the rated powers after (each tick reads the temperature again)
+        lim_ch = float(bs.get("p_ch_limit_kw", b_asset["p_ch_kw"]))
+        lim_dis = float(bs.get("p_dis_limit_kw", b_asset["p_dis_kw"]))
+        if lim_ch < float(b_asset["p_ch_kw"]) - 1e-9 or lim_dis < float(b_asset["p_dis_kw"]) - 1e-9:
+            hold = min(steps, battery_service.DERATE_HOLD_STEPS)
+            bat["P_ch_t"], bat["P_dis_t"] = np.full(steps, float(b_asset["p_ch_kw"])), np.full(steps, float(b_asset["p_dis_kw"]))
+            bat["P_ch_t"][:hold], bat["P_dis_t"][:hold] = lim_ch, lim_dis
+            p["battery_state"]["derate"] = {"temp_c": bs.get("temp_c"), "p_ch_kw": lim_ch, "p_dis_kw": lim_dis, "until": int(t0 + hold * 900)}
         if floor_pct.any():
             # every manual floor (a caller that drops the overrides drops this key), and its two parts
             p["reserve_manual"] = floor_pct / 100.0 * e_nom
@@ -282,9 +461,27 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         c_next = float(np.max(vec["c_imp"][-96:])) if not off_grid else p["c_short"]
         if off_grid and gen:
             c_next = offgrid_c_next(g_asset, gen["c_fuel"], L[-96:], PV[-96:])
-        lam = p_out.get("lam_day") or 0.0
-        r_next = float(np.mean(Lc)) * 2.0 / b_asset["eta_d"] if (lam > 0.5 or off_grid) else 0.0
-        p["terminal"] = {"c_next": c_next, "H_peak": 4.0, "R_next": r_next, "c_cal_hold": float(np.mean(bat["b_cal"][:32])) if steps else 0.0}
+        # the reserve for the first outage beyond the horizon, held where the site's reserve policy asks for it: the chance that an outage starts
+        # on the horizon's last day (the forecast for the day after) at or above its threshold (round 7, engine-plans-live-12: a hard-coded
+        # 0.5 outages a day decided it, and the site's setting did nothing). Two hours of the critical load, never above what the battery and the
+        # inverter can deliver (engine-plans-live-06)
+        p_next = 1.0 - float(np.prod(1.0 - np.clip(p_start[-96:], 0.0, 1.0))) if len(p_start) else 0.0
+        # Part 4.4: at a grid-connected site c_next is the dearest import price of the day after, or the genset's marginal cost where that day's
+        # outage chance reaches the site's threshold (round 7, engine-optimiser-11: always the import price, so at an outage-heavy feeder a kWh
+        # left at the horizon's end, which a likely outage would take from the set at about Rs 130, was valued at a Rs 50 peak, and the plan
+        # ran the battery down towards hour 48). The dearer of the two: the kWh serves whichever use comes. Not behind an auto-start panel: there
+        # the set starts within a minute of the grid's loss and follows the load (twin.simulate), so a stored kWh spares it nothing beyond the
+        # start delay the reserve already covers (engine-plans-live-03), and Lahore's plan held its battery for an outage it never used
+        c_next_basis = "genset" if off_grid and gen else ("lost_load" if off_grid else "import")
+        if (not off_grid and gen and gen["control"] != "auto_on_grid_loss" and p_next >= p["reserve_threshold"]
+                and p["c_short"] > c_next):
+            c_next, c_next_basis = float(p["c_short"]), "genset"
+        kw_next = np.minimum(Lc[-96:], float(b_asset["p_dis_kw"]))
+        if p.get("inverter_kw_ac"):
+            kw_next = np.minimum(kw_next, float(p["inverter_kw_ac"]))
+        r_next = float(np.mean(kw_next)) * 2.0 / b_asset["eta_d"] if (off_grid or p_next >= p["reserve_threshold"]) and len(kw_next) else 0.0
+        p["terminal"] = {"c_next": c_next, "c_next_basis": c_next_basis, "H_peak": 4.0, "R_next": r_next,
+                         "c_cal_hold": terminal_cal_hold(bat["b_cal"], vec["c_imp"], L, PV, off_grid), "p_next": p_next}
     return p
 
 
@@ -297,14 +494,29 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
     out = []
     gen = p.get("genset")
     r_rows, man = res.get("r") or {}, res.get("manual_floor") or {}
+    r_gap = res.get("r_gap") or {}
     dump = s.get("W") if s.get("W") is not None else np.zeros(T)
+    # the override windows by kind (build_problem); a shortened (relaxed 24-hour) problem keeps the full masks, and only t < T is read
+    kinds = p.get("override_kinds") or {}
+
+    E_up = float(res.get("E_floor_grid") or 0.0)
 
     def floor_pct(t: int) -> float | None:
-        """The floor the plan holds at step t: soc_min, raised by the reserve row and the manual floor where those rows exist, never above
-        soc_max (the reserve row's 2-sigma widening can push its target past the band)."""
+        """The floor the plan holds at step t: soc_min, raised by the reserve rows and the manual floor where those rows exist and, with the grid
+        up, by the floor the delivered table holds (round 7, engine-delivery-02), never above soc_max (the reserve row's 2-sigma widening can
+        push its target past the band). A reserve row is soft: the plan holds its target less the slack it accepts at the row's price (round 7,
+        engine-plans-live-03: behind an AMF panel a failed start's 30 minutes, priced at one start in twenty, shipped as a 36 % floor the plan
+        never meant to hold)."""
         if not En:
             return None
-        f = bat["soc_min"] * En + (float(res["R"][t]) if t in r_rows else 0.0)
+        held = 0.0
+        if t in r_rows:
+            held = max(held, float(res["R"][t]) - float(r_rows[t]))
+        if t in r_gap:
+            held = max(held, float(res["R_gap"][t]) - float(r_gap[t]))
+        f = bat["soc_min"] * En + held
+        if float(p["g"][t]) > 0.5:
+            f = max(f, E_up)
         if t in man:
             f = max(f, float(man[t]))
         return round(min(bat["soc_max"] * En, f) / En * 100, 1)
@@ -331,7 +543,8 @@ def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
                     "grid_charge_permitted": bool(bat.get("a_grid", True)) if bat else False,
                     "unserved_kw": round(float(s["U"][t]), 2), "curtail_kw": round(float(s["K"][t]), 2),
                     "p_down": round(float(bundle["outage"]["p_down"][t]), 3), "p_start": round(float(p["p_start"][t]), 3), "grid_present": float(p["g"][t]),
-                    "cost_rs": round(cost, 2), "cum_rs": round(cost_cum, 2), "reason": rsn["reason"], "detail": rsn["detail"]})
+                    "cost_rs": round(cost, 2), "cum_rs": round(cost_cum, 2), "reason": rsn["reason"], "detail": rsn["detail"],
+                    "flags": [k for k, m in kinds.items() if bool(m[t])]})
     return out
 
 
@@ -459,6 +672,60 @@ def _keep_observed_outage(site_id: str, t0: int, now: int, bundle: dict, prior: 
     return {**bundle, "outage": {**out, "g": g_old[:n], "p_down": np.maximum(np.asarray(out["p_down"], dtype=float), pd_old[:n]), "observed": old}}
 
 
+def _ask_anchor(site: dict, p: dict, t0: int) -> None:
+    """The charge to the pack's top the battery service asks for to re-anchor its estimate (round 7, engine-optimiser-15; R6 5.7), put to a live
+    tick's problem (a hindsight solve of a past day, verify._bound, builds the problem without it). The first active plan that schedules it fixes
+    when (`anchor_by` in the site's state): re-planned every 15 minutes, a charge that costs the same tonight as tomorrow night would otherwise
+    move to the later night every time and never happen."""
+    bat, bs = p.get("battery"), p.get("battery_state") or {}
+    if not bat or not bs.get("anchor_soc_pct"):
+        return
+    bat["anchor_soc"] = float(bs["anchor_soc_pct"]) / 100.0
+    by = (site.get("state") or {}).get("anchor_by")
+    if by and int(by) > t0:
+        bat["anchor_by"] = int(by)
+
+
+#: a solve that stopped at its wall-clock limit with a gap to the solver's bound above KEEP_GAP, or an unknown gap (a relaxed retry after a first
+#: solve that found no plan in time), does not replace a plan in force made at most KEEP_MAX_AGE_S before, solved within KEEP_GAP, on the same
+#: observed outage and overrides: it is kept for reading, held with TIME_LIMIT_HELD, and that plan stays in force (round 7, engine-optimiser-08).
+#: The limits are wall-clock time (HANDOFF 8.A.3), so a loaded machine otherwise put a 30 % plan, and the table and genset requests that follow
+#: it, in place of an optimal one made 15 minutes before
+KEEP_GAP = 0.05
+KEEP_MAX_AGE_S = 2 * 3600
+TIME_LIMIT_HELD = "time_limited_gap"
+
+
+def _kept_by_time_limit(site_id: str, res: dict, t0: int, summary: dict) -> dict | None:
+    """`{plan_id, mip_gap, gap_limit}` of the plan in force that a time-limited solve far from its bound leaves in force (see KEEP_GAP), else
+    None: the solve finished or came within KEEP_GAP, nothing is in force, the plan in force is older or itself no closer, or the outage
+    observed or the overrides changed since it was made (it did not plan for them)."""
+    limited = bool(res.get("time_limited", res.get("status") == "feasible")) or bool(res.get("first_time_limited"))
+    gap = None if res.get("first_time_limited") else res.get("mip_gap")
+    if not limited or (gap is not None and float(gap) <= KEEP_GAP):
+        return None
+    prev = current(site_id)
+    if prev is None:
+        return None
+    made, until = _ts(prev.get("belief_time")), _ts(prev.get("valid_until"))
+    if made is None or not 0 <= t0 - made <= KEEP_MAX_AGE_S or until is None or until <= t0:
+        return None
+    ps = prev.get("summary") or {}
+    psv = ps.get("solver") or {}
+    if _plan_time_limited(ps) and (psv.get("first_time_limited") or psv.get("mip_gap") is None or float(psv["mip_gap"]) > KEEP_GAP):
+        return None
+
+    def observed(o):
+        return bool(o), (o or {}).get("since")
+
+    def same(a, b) -> bool:
+        return json.dumps(a or [], sort_keys=True, default=str) == json.dumps(b or [], sort_keys=True, default=str)
+
+    if observed(ps.get("outage_now")) != observed(summary.get("outage_now")) or not same(ps.get("overrides"), summary.get("overrides")):
+        return None
+    return {"plan_id": prev["id"], "mip_gap": gap, "gap_limit": KEEP_GAP}
+
+
 def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = True, time_limit: float = 10.0) -> dict:
     site = sites.full(site_id)
     if site is None:
@@ -473,6 +740,12 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     # a pause or a release to native is read before the solve, so a failed solve while one is in force still ends the pre-pause plan
     release = control_release(site_id, t0)
     p = build_problem(site, t0, bundle, steps)
+    _ask_anchor(site, p, t0)
+    fuel = p.get("fuel")
+    if save and fuel and fuel["basis"] in ("carried", "assumed_full") and int((site.get("state") or {}).get("fuel_ts") or 0) <= t0:
+        # the level this tick plans on is the next tick's start (Part 4.8; round 7, engine-optimiser-05), written whatever the solve does: the
+        # fills and burn up to t0 are in it. Never moved back by a tick for an earlier time
+        sites.put_state(site_id, fuel_l=round(float(fuel["litres"]), 3), fuel_ts=int(t0))
     res = optimise.solve_with_policy(p, time_limit=time_limit)
     if res.get("sol") is not None and len(res["sol"]["G"]) != p["T"]:
         p = optimise.shorten(p, len(res["sol"]["G"]))  # the relaxed retry solved a shorter horizon: steps, slots and the guard follow it
@@ -486,6 +759,13 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "outage_now": bundle["outage"].get("observed"), "adherence": bundle["outage"].get("adherence"),
                "icp": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in (p.get("icp") or {}).items()},
                "overrides": p.get("overrides", []), "genset_state_unknown": bool(p.get("genset", {}) and p["genset"].get("unknown")),
+               # the fuel the plan rationed (fuel_level): carried, a full tank assumed, unknown (a tank of no size) or piped
+               "fuel": ({"basis": fuel["basis"], "litres": round(float(fuel["litres"]), 1) if fuel["litres"] is not None else None,
+                         "tank_l": fuel["tank_l"]} if fuel else None),
+               # where an anchor charge is asked for, the end of the hour it is planned for and the kWh it stays short of the target
+               "battery_state": ({**p["battery_state"], "anchor_t": (res.get("anchor") or {}).get("t"),
+                                  "anchor_short_kwh": (res.get("anchor") or {}).get("short_kwh")}
+                                 if p.get("battery_state") and p["battery_state"].get("anchor_soc_pct") else p.get("battery_state")),
                "status_label": _status_label(res),
                "solver": {"status": res["status"], "variables": res.get("variables"), "rows": res.get("rows"), "binaries": res.get("binaries"),
                           "relaxed": res.get("relaxed"), "message": res.get("message"), "shed_rule_resolve": res.get("shed_rule_resolve"),
@@ -501,8 +781,15 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "horizon_steps": p["T"], "control_release": release,
                # a tariff version awaiting its notification the horizon reaches: the plan is priced with the one still in force (engine-tariffs-06)
                "tariff_notices": p.get("tariff_notices", [])}
+    # how many of the plans made in the 24 hours to this one, this one included, stopped at their time limit (round 7, engine-plans-live-19:
+    # time_limited_recent counted them and nothing read it), for the plan page; a failed solve counts as a plan, never as time-limited
+    recent = time_limited_recent(site_id, 24.0, now)
+    solved = res["status"] not in ("not_solved", "refused")
+    summary["time_limits_24h"] = {"hours": 24.0, "plans": recent["plans"] + 1,
+                                  "time_limited": recent["time_limited"] + int(solved and _plan_time_limited(summary))}
     if res["status"] in ("not_solved", "refused"):
-        reason = res.get("message", "not solved")
+        # a code the web app words, never the solver's own text (round 7, frontend-states-formats-07); the message stays in summary.solver
+        reason = failure_code(res)
         if save:
             with store.connect() as con:
                 if release:
@@ -516,17 +803,31 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                             (site_id, _iso(t0), started, store._now(), "failed", reason, pid))
             if release:
                 sites.put_state(site_id, active_plan=None, last_tick=_iso(t0))
-        return {"status": "failed", "reason": reason, "control_release": release}
+        return {"status": "failed", "reason": reason, "control_release": release, "in_force": None if release else _in_force_id(site_id)}
     steps_out = _steps_out(p, res, bundle)
-    fallback_floor = float((site["data"].get("reserve_policy") or {}).get("min_soc_pct", 20.0))
-    bms_low = ((site.get("assets") or {}).get("battery") or {}).get("soc_min", 0.1) * 100
-    compiled = delivery.compile_mode_a(steps_out, brand, p.get("battery"), fallback_floor, bms_low, res["M"][0] if res.get("M") else None, site=site)
+    # the slots' floors are max(bms_low + 2, fallback floor): delivered_floor_pct, the floor the plan held on its grid-up steps. A horizon that
+    # crosses the billing month's end compiles the new month's days with its own cap, M2 (round 7, engine-optimiser-02: every slot carried M,
+    # so the new month's shaved to the old month's peak). The month ends at a local midnight and slots are per local day, so the two compiles
+    # give the days a single one would, each with its month's cap
+    Ms = res.get("M") or []
+    split = int((p.get("mdi") or {}).get("month_end_step", p["T"])) if len(Ms) > 1 else p["T"]
+    compiled = delivery.compile_mode_a(steps_out[:split], brand, p.get("battery"), fallback_floor_pct(site), bms_low_pct(site),
+                                       Ms[0] if Ms else None, site=site)
+    if split < len(steps_out):
+        nxt = delivery.compile_mode_a(steps_out[split:], brand, p.get("battery"), fallback_floor_pct(site), bms_low_pct(site), Ms[1], site=site)
+        compiled = {**compiled, "days": compiled["days"] + nxt["days"]}
     guard = _guard(site, p, compiled, steps_out, res)
-    summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(res["M"][0], 1) if res.get("M") else None,
+    summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(Ms[0], 1) if Ms else None,
+                    # the next billing month's cap where the horizon crosses into it (its days' slots carry it), else null
+                    "mdi_cap_next_kw": round(Ms[1], 1) if len(Ms) > 1 else None,
                     "v_end": round(res.get("v_end", 0.0), 2), "guard": guard})
+    # a time-limited solve far from its bound leaves a recent, closer plan in force (_kept_by_time_limit; round 7, engine-optimiser-08)
+    kept = None if (release or guard) else _kept_by_time_limit(site_id, res, t0, summary)
+    if kept:
+        summary["time_limit_kept"] = kept
     # a pause or a release to native means no plan is in force: the plan is kept for reading, held, and the previous one stops being active
     # (so nothing stale is served or keyed in when the pause ends; the next tick publishes a fresh plan)
-    reason = release["reason"] if release else guard
+    reason = release["reason"] if release else (guard or (TIME_LIMIT_HELD if kept else None))
     status = "held" if reason else "active"
     plan_id = store.new_id()
     if save:
@@ -541,9 +842,42 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
             con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, solve_s, objective_rs, plan_id) VALUES (?,?,?,?,?,?,?,?,?)",
                         (site_id, _iso(t0), started, store._now(), status, reason or res["status"], res["solve_seconds"], res["objective_rs"], plan_id))
         active = plan_id if status == "active" else (None if release else site.get("state", {}).get("active_plan"))
-        sites.put_state(site_id, active_plan=active, last_tick=_iso(t0))
-    return {"status": status, "plan_id": plan_id, "objective_rs": res["objective_rs"], "solve_seconds": res["solve_seconds"], "steps": steps_out,
-            "slots": compiled, "summary": summary}
+        # the anchor charge's deadline (see _ask_anchor): set by the first active plan that schedules one, dropped once none is asked for
+        anchor = {}
+        by = (site.get("state") or {}).get("anchor_by")
+        if (p.get("battery") or {}).get("anchor_soc") and res.get("anchor"):
+            if status == "active" and not (by and int(by) > t0):
+                anchor["anchor_by"] = int(res["anchor"]["t"])
+        elif by is not None:
+            anchor["anchor_by"] = None
+        sites.put_state(site_id, active_plan=active, last_tick=_iso(t0), **anchor)
+    # why a plan was held, and the plan in force after this tick (null: none, as under a pause, a release or before the first plan passes the
+    # guard), so a re-solve says what stays in force (round 7, frontend-states-formats-07)
+    in_force = plan_id if status == "active" else (None if release else _in_force_id(site_id))
+    return {"status": status, "plan_id": plan_id, "reason": reason, "in_force": in_force, "objective_rs": res["objective_rs"],
+            "solve_seconds": res["solve_seconds"], "steps": steps_out, "slots": compiled, "summary": summary}
+
+
+#: a failed solve's reason by the solver's status (scipy.optimize.milp: 1 a time or iteration limit with no plan, 2 infeasible, 3 unbounded)
+FAILURE_CODES = {1: "solve_time_limit", 2: "solve_infeasible", 3: "solve_unbounded"}
+
+
+def failure_code(res: dict) -> str:
+    """Why a solve produced no plan, as a code (round 7, frontend-states-formats-07: the plan's reason was scipy's message, "Time limit reached.
+    (HiGHS Status 13: ...)", and the plan page and the re-solve toast showed it raw): problem_refused when the problem failed validation,
+    solve_recheck_failed when the solution failed the numpy re-check, else by the solver's status, solve_failed for any other."""
+    if res.get("status") == "refused":
+        return "problem_refused"
+    if str(res.get("message") or "").startswith("Re-check failed"):
+        return "solve_recheck_failed"
+    return FAILURE_CODES.get(res.get("solver_status"), "solve_failed")
+
+
+def _in_force_id(site_id: str) -> str | None:
+    """The id of the plan active once a tick has written its row, else None."""
+    with store.connect() as con:
+        r = con.execute("SELECT id FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
+    return r["id"] if r else None
 
 
 def _iso(ts: int) -> str:
@@ -663,6 +997,50 @@ def time_limited_recent(site_id: str, hours: float = 24.0, now: int | None = Non
     n = len(rows)
     return {"site_id": site_id, "hours": float(hours), "since": since, "plans": n, "time_limited": len(items),
             "share": round(len(items) / n, 3) if n else 0.0, "items": items}
+
+
+#: GET /plan/past: the hours a request may ask for (the plan table shows the last 24, R8 2.9)
+PAST_HOURS = (1, 48)
+#: the 15-minute means a past step carries as measured: power in W (sent as kW), the state of charge (the estimate, else the BMS's) and the grid
+PAST_SERIES = ("pv_power_w", "load_power_w", "grid_power_w", "battery_power_w", "genset_power_w", "battery_soc_est_pct", "battery_soc_bms_pct",
+               "grid_present")
+
+
+def past_steps(site_id: str, now: int, hours: int = 24) -> dict:
+    """The plan table's past rows (round 7, pages-B-07; UI-09 and R8 2.9: "the past 24 hours ... greyed, with actuals beside plan"): every
+    15-minute step of the `hours` before the current one, as the plan in force then planned it (active_at: none under a pause or a release to
+    native, or before the first plan) and as measured (telemetry.series' 15-minute means; null where no reading arrived, never zeros). Battery
+    positive is discharging and grid positive importing, as in the plan's steps. Money is the caller's to filter (routes_common.out)."""
+    t1 = forecast.align(int(now))
+    t0 = t1 - int(hours) * 3600
+    act = telemetry.series(site_id, t0, t1, list(PAST_SERIES), "15m")
+    at = {int(t): i for i, t in enumerate(act["ts"])}
+    ser = act["series"]
+
+    def kw(name: str, i: int) -> float | None:
+        v = ser[name][i]
+        return None if v is None else round(v / 1000, 2)
+
+    steps_of: dict[str, dict[int, dict]] = {}
+    rows = []
+    for t in range(t0, t1, 900):
+        plan = active_at(site_id, t)
+        step = None
+        if plan is not None:
+            if plan["id"] not in steps_of:
+                steps_of[plan["id"]] = {int(x["t"]): x for x in plan.get("steps") or []}
+            step = steps_of[plan["id"]].get(t)
+        i = at.get(t)
+        actual = None
+        if i is not None:
+            soc = ser["battery_soc_est_pct"][i]
+            actual = {"pv_kw": kw("pv_power_w", i), "load_kw": kw("load_power_w", i), "grid_kw": kw("grid_power_w", i),
+                      "battery_kw": kw("battery_power_w", i), "genset_kw": kw("genset_power_w", i),
+                      "soc_pct": soc if soc is not None else ser["battery_soc_bms_pct"][i], "grid_present": ser["grid_present"][i]}
+        local = _local(t)
+        rows.append({"t": t, "local": local.strftime("%H:%M"), "date": local.date().isoformat(), "plan_id": plan["id"] if step is not None else None,
+                     "planned": step, "actual": actual})
+    return {"from": t0, "to": t1, "hours": int(hours), "steps": rows}
 
 
 def history(site_id: str, limit: int = 50) -> list[dict]:

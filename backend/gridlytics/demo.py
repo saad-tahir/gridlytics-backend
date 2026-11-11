@@ -391,11 +391,35 @@ def _replan_seconds() -> int:
     return int(min(24.0, max(0.25, h)) * 3600) // 900 * 900
 
 
+def _top_up(site_id: str, t: int) -> None:
+    """The demo's operator keeps two days' diesel in the tank: a tank under half full, or under what the plan in force means to burn over its
+    horizon and a tenth more, is refilled to the top, a fill logged at the quarter `t` falls in (and after the level the last tick carried). The plan rations the
+    fuel the tank holds, carried between ticks from the fills logged less the fuel burnt (plans.fuel_level; round 7, engine-optimiser-05), and
+    the twin logs no fills, so without this the farm's 400 L would run dry within a week of history and its plans would ration it."""
+    import json
+
+    site = sites.full(site_id)
+    lvl = plans.fuel_level(site, t)
+    if not lvl or lvl["basis"] != "carried":
+        return
+    plan = plans.active_at(site_id, t)
+    planned = 1.1 * sum(float(x.get("litres") or 0.0) for x in (plan or {}).get("steps") or [])
+    if lvl["litres"] >= max(lvl["tank_l"] / 2, min(planned, lvl["tank_l"])):
+        return
+    at = max(forecast.align(t), int((site.get("state") or {}).get("fuel_ts") or 0) + 1)
+    detail = {"day": datetime.fromtimestamp(at, PKT).date().isoformat(), "litres": round(lvl["tank_l"] - lvl["litres"], 1),
+              "note": "Demo: tank refilled"}
+    with store.connect() as con:
+        con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
+                    (site_id, plans._iso(at), "fuel_log", "demo", json.dumps(detail)))
+
+
 def _replanned_span(site_id: str, t_from: int, t_to: int, every: int) -> None:
     """Runs the twin from t_from to t_to under plans made every `every` seconds, each from the state the twin left (the history's stand-in for
     the live 15-minute tick)."""
     t = t_from
     while t < t_to:
+        _top_up(site_id, t)
         r = plans.tick(site_id, at=t, steps=HISTORY_STEPS, time_limit=5.0)
         plan = plans.get(site_id, r["plan_id"]) if r.get("plan_id") else None
         _mark_tables(sites.full(site_id), t, t)        # an advisory site's installer marks the table keyed at the day's start, once
@@ -424,6 +448,7 @@ def build_history(site_id: str, days: int, progress=None) -> None:
     # today: re-planned up to now, then a full 48-hour plan from now
     now = _clock_minute()
     _replanned_span(site_id, twin.day_start_utc(today), now, every)
+    _top_up(site_id, now)
     plans.tick(site_id, at=now)
     for i in range(OBSERVE_DAYS, days):
         day = start + timedelta(days=i)
