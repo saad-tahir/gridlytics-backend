@@ -950,7 +950,8 @@ def _traced(monkeypatch) -> list:
 def test_telemetry_reads_take_a_read_transaction_and_only_writers_take_the_write_lock(company, monkeypatch):
     """Every reader of the telemetry file (the pages' series, the battery and genset figures, the export, the forecast issues, the outages' grid signal and
     the edge's sequence check) ran BEGIN IMMEDIATE, the write lock, so a company's readers and writers ran one at a time. A read now begins a deferred
-    transaction; the writes (ingest, write_rows, the sequence, the forecast issues, a site's removal) still take the write lock."""
+    transaction; the writes (ingest, write_rows, the sequence, the forecast issues, a site's removal) still take the write lock. The edge's duplicate
+    check (control-edge, audit engine-delivery-03) reads edge_seen in the workspace file and opens no telemetry connection at all."""
     from gridlytics import routes_edge, routes_telemetry
     sid = _genset_site("Reads")
     telemetry.ingest(sid, [{"ts": T0 + 60 * i, "grid_present": 1, "load_power_w": 1000.0, "genset_running": 0} for i in range(30)], "edge", now=NOW)
@@ -964,7 +965,7 @@ def test_telemetry_reads_take_a_read_transaction_and_only_writers_take_the_write
         "quality_days": lambda: telemetry.quality_days(sid, date(2026, 11, 5), date(2026, 11, 5), T0 + 7200),
         "export_csv": lambda: telemetry.export_csv(sid, T0, T0 + 3600), "latest_forecast": lambda: telemetry.latest_forecast(sid, "pv"),
         "outages": lambda: telemetry.outages(sid, T0, T0 + 3600), "genset_runs": lambda: _runs(sid),
-        "grid_signal": lambda: routes_telemetry._grid_signal(sid, T0 + 3600), "seq_last": lambda: routes_edge._seq_last(sid, "telemetry"),
+        "grid_signal": lambda: routes_telemetry._grid_signal(sid, T0 + 3600),
     }
     for name, read in readers.items():
         seen.clear()
@@ -973,6 +974,10 @@ def test_telemetry_reads_take_a_read_transaction_and_only_writers_take_the_write
         assert sql, name
         assert not any(s.strip().upper().startswith("BEGIN IMMEDIATE") for s in sql), (name, sql)
         assert any(s.strip().upper() == "BEGIN" for s in sql), (name, sql)
+    seen.clear()
+    with store.connect() as con:
+        assert routes_edge._was_stored(con, sid, "telemetry", 1, "0" * 64) is False
+    assert seen == []
     writers = {
         "ingest": lambda: telemetry.ingest(sid, [{"ts": T0 + 3600, "grid_present": 1}], "edge", now=NOW),
         "write_rows": lambda: _write(sid, T0 + 7200, 1, grid_present=1), "next_seq": lambda: telemetry.next_seq(sid, "telemetry", 1),
