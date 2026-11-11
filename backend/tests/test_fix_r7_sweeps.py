@@ -24,6 +24,44 @@ def _data_from_last_year(site_id: str) -> None:
                     (site_id, (datetime.now(PKT).date() - timedelta(days=400)).isoformat(), json.dumps({"pv_kwh": 0.0})))
 
 
+# ------------------------------------------------------------------------------------------------ frontend-states-formats-01 (fleet and reports)
+
+def test_the_fleet_names_each_site_s_fuel_and_never_adds_mmbtu_of_gas_to_litres_of_diesel(world):
+    a, v, sid, two = world.c["admin"], world.c["viewer"], world.site, world.other
+    t = today()
+    with world.use():
+        sites.put_asset(two, "genset", {"rated_kw": 1000, "fuel_kind": "gas_captive"}, "test")       # a captive-gas engine: its fuel is in MMBtu
+        _put_days(sid, {t.isoformat(): _claimed_day(700.0, 400.0, 520.0, 12.5)})
+        _put_days(two, {t.isoformat(): _claimed_day(300.0, 100.0, 100.0, 1.9)})
+    for c in (a, v):                                                       # a fuel kind is not money: every role reads it
+        fleet = c.get("/api/fleet").json()
+        assert _row(fleet, sid)["fuel_kind"] == "hsd" and _row(fleet, two)["fuel_kind"] == "gas_captive"
+        assert _row(fleet, two)["mtd_litres_saved"] == 1.9                  # the site's own fuel saved, in its own unit
+        # the summary's litres are diesel's alone (before: 14.4, the gas engine's 1.9 MMBtu added to 12.5 litres), and the gas has its own total
+        assert fleet["summary"]["mtd_litres_saved"] == 12.5 and fleet["summary"]["mtd_mmbtu_saved"] == 1.9
+    with world.use():
+        sites.remove_asset(two, "genset", "test")
+    fleet = a.get("/api/fleet").json()
+    assert _row(fleet, two)["fuel_kind"] is None and fleet["summary"]["mtd_mmbtu_saved"] is None    # no genset: no fuel, never a zero
+
+
+def test_the_monthly_and_fleet_reports_count_a_gas_genset_s_fuel_in_mmbtu(world, monkeypatch):
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    day = f"{month}-05"
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(day)], native=_baseline(litres_saved=1.9), tuned=_baseline(litres_saved=1.2)), [_tday(day)])
+    built = _story(monkeypatch)
+    with world.use():
+        _data_from_last_year(sid)
+        sites.put_asset(sid, "genset", {"rated_kw": 1000, "fuel_kind": "gas_captive"}, "test")
+        reports.generate("monthly_savings", sid, month, "test")
+        reports.generate("company_rollup", "", month, "test")
+    monthly, rollup = built[-2], built[-1]
+    assert "Gas saved (Estimated) | 1.9 MMBtu | 1.2 MMBtu" in monthly, monthly
+    assert "Diesel" not in monthly and " L " not in monthly and not any(ln.endswith(" L") for ln in monthly.splitlines()), monthly
+    assert "Fuel saved (Estimated)" in rollup and "1.9 MMBtu" in rollup and "Diesel" not in rollup, rollup
+
+
 # ------------------------------------------------------------------------------------------------ frontend-states-formats-02
 
 def test_unmetered_genset_fuel_over_a_savings_period_of_more_than_62_days_is_the_curve_s_or_not_counted_never_zero(world):

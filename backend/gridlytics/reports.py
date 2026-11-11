@@ -96,15 +96,24 @@ def _day_fidelity(s: dict) -> str:
     return words
 
 
-def _litres_saved(b: dict, scored: int, has_genset: bool) -> str:
-    """The diesel a baseline's ledger saved, as the page's ledger says it (savings-ledger.tsx): "not metered" when the genset's fuel was unknown on
-    every scored day (verify.summary sums such days as nothing, so its 0.0 is no figure), else the litres; "no genset" at a site without one."""
+def _fuel(site: dict | None) -> tuple[str, str]:
+    """The genset's fuel by name and its unit, as the pages say them (lib/format.ts fuelName, fuelUnit; round 7 sweeps, audit frontend-states-formats-01:
+    a captive-gas engine's MMBtu were printed as litres of diesel): ("Diesel", " L"), or ("Gas", " MMBtu") and ("RLNG", " MMBtu"), the unit their
+    curve and price are in (sites.GAS_FUELS); diesel at a site without a genset."""
+    kind = (((site or {}).get("assets") or {}).get("genset") or {}).get("fuel_kind") or "hsd"
+    return {"gas_captive": ("Gas", " MMBtu"), "lng_captive": ("RLNG", " MMBtu")}.get(kind, ("Diesel", " L"))
+
+
+def _litres_saved(b: dict, scored: int, has_genset: bool, unit: str = " L") -> str:
+    """The fuel a baseline's ledger saved, as the page's ledger says it (savings-ledger.tsx): "not metered" when the genset's fuel was unknown on
+    every scored day (verify.summary sums such days as nothing, so its 0.0 is no figure), else the figure in the fuel's `unit` (_fuel); "no genset" at
+    a site without one."""
     if not has_genset:
         return "no genset"
     unmetered = int(b.get("genset_unknown_days") or 0)
     if b.get("litres_saved") is None or (scored > 0 and unmetered >= scored):
         return "not metered"
-    return smart(b.get("litres_saved"), " L")
+    return smart(b.get("litres_saved"), unit)
 
 
 def _weeks(x) -> str:
@@ -314,10 +323,11 @@ def _on_grid(site: dict) -> bool:
 # ------------------------------------------------------------------------------------------------ the key figures (plan 8.3, the report's KPI grid)
 
 def diesel_line(site: dict, tdays: list[dict], nat: dict, scored: int, d0: date, d1: date) -> str:
-    """The genset's running hours, the litres it used (metered, or Estimated from the fuel curve, as verify.litres_used reads them for the page) and
-    the litres saved against the native settings."""
+    """The genset's running hours, the fuel it used (metered, or Estimated from the fuel curve, as verify.litres_used reads them for the page) and
+    the fuel saved against the native settings, in the fuel's own unit (_fuel)."""
     if not (site.get("assets") or {}).get("genset"):
         return "No genset at this site."
+    name, unit = _fuel(site)
     hours = sum(_finite(d.get("genset_hours")) or 0.0 for d in tdays)
     parts = [f"{smart(hours, ' h')} of running"]
     if 0 <= (d1 - d0).days <= 62:
@@ -326,9 +336,9 @@ def diesel_line(site: dict, tdays: list[dict], nat: dict, scored: int, d0: date,
         except Exception:  # noqa: BLE001  (a label beside the figures; never fail the report for it)
             lu = {}
         if lu.get("litres_source"):
-            parts.append(f"{smart(lu.get('litres'), ' L')} used ({'metered' if lu['litres_source'] == 'meter' else 'Estimated from the fuel curve'})")
-    saved = _litres_saved(nat, scored, True)
-    parts.append("litres saved not metered" if saved == "not metered" else f"{saved} saved against the native settings (Estimated)")
+            parts.append(f"{smart(lu.get('litres'), unit)} used ({'metered' if lu['litres_source'] == 'meter' else 'Estimated from the fuel curve'})")
+    saved = _litres_saved(nat, scored, True, unit)
+    parts.append(f"{name.lower()} saved not metered" if saved == "not metered" else f"{saved} saved against the native settings (Estimated)")
     return "; ".join(parts) + "."
 
 
@@ -630,20 +640,21 @@ def _monthly(doc: _Doc, site: dict, kind: str, p0: date, p1: date, today: date, 
     end = min(p1, today)
     if money:
         has_genset = bool((site.get("assets") or {}).get("genset"))
+        fuel, unit = _fuel(site)
         doc.h2("Summary")
         doc.p("The headline against both baselines: the inverter's own settings as captured (native) and the best static table of its brand (tuned).")
         doc.table([["Headline", "Against the native settings", "Against a tuned table"],
                    ["Saving, all days", rs(nat.get("saving_rs")), rs(tun.get("saving_rs"))],
                    ["Claimed (verified days only)", rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))],
-                   ["Diesel saved (Estimated)", _litres_saved(nat, scored, has_genset), _litres_saved(tun, scored, has_genset)],
+                   [f"{fuel} saved (Estimated)", _litres_saved(nat, scored, has_genset, unit), _litres_saved(tun, scored, has_genset, unit)],
                    ["Verified days", str(nat.get("verified_days", 0)), str(tun.get("verified_days", 0))]], [95 * mm, 42 * mm, 42 * mm])
         unmetered = max(int(nat.get("genset_unknown_days") or 0), int(tun.get("genset_unknown_days") or 0))
         if has_genset and 0 < unmetered:
-            doc.p(f"The genset's fuel was not metered on {unmetered} of {scored} days: those days add nothing to the litres or the genset lever.")
+            doc.p(f"The genset's fuel was not metered on {unmetered} of {scored} days: those days add nothing to the fuel saved or the genset lever.")
         doc.gap()
         doc.h2("Key figures")
         doc.table([["Figure", "This month"],
-                   ["Diesel", doc.cell(diesel_line(site, tdays, nat, scored, p0, end))],
+                   [fuel, doc.cell(diesel_line(site, tdays, nat, scored, p0, end))],
                    ["Peak (MDI)", doc.cell(peak_line(nat, True))],
                    ["Outage coverage", doc.cell(outage_line(outage_cover(site, p0, end)))],
                    ["Forecast skill", doc.cell(forecast_line(forecast_skill(site_id, p0, end)))],
@@ -674,7 +685,8 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
     """Plan 8.5's roll-up per company: each site's saving against both baselines, its claim, litres and verified days, and the company's totals, all
     from verify.summary as the fleet roll-up (GET /api/fleet/savings) reads them."""
     rows, out_rows, prelim_names, stale_names = [], [], [], []
-    tot = {"nat": 0.0, "tun": 0.0, "claimed": 0.0, "litres": 0.0, "verified": 0}
+    # the fuel saved in each unit apart, litres of diesel and MMBtu of gas, never added together (round 7 sweeps, frontend-states-formats-01)
+    tot = {"nat": 0.0, "tun": 0.0, "claimed": 0.0, "litres": 0.0, "mmbtu": 0.0, "verified": 0}
     doc.csv.writerow(["site_id", "site", "saving_native_rs", "saving_tuned_rs", "claimed_rs", "litres_saved", "verified_days", "preliminary",
                       "chain_stale_days"])
     computed = []
@@ -683,7 +695,9 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
         computed.append(summ.get("computed") or "")
         nat, tun = summ["baselines"].get("native", {}), summ["baselines"].get("tuned", {})
         scored = len(summ.get("days") or [])
-        has_genset = bool(sites.assets(s["id"]).get("genset"))
+        gen = sites.assets(s["id"]).get("genset")
+        has_genset = bool(gen)
+        _, unit = _fuel({"assets": {"genset": gen}})
         stale = list(summ.get("chain_stale_days") or [])
         if summ.get("preliminary"):
             prelim_names.append(s["name"])
@@ -691,7 +705,7 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
             stale_names.append(s["name"])
         status = "No scored days" if not scored else ("Preliminary" if summ.get("preliminary") else "Final") + ("; recompute needed" if stale else "")
         rows.append([doc.cell(s["name"]), rs(nat.get("saving_rs")), rs(tun.get("saving_rs")), rs(nat.get("claimed_rs")),
-                     _litres_saved(nat, scored, has_genset), str(nat.get("verified_days", 0)), doc.cell(status)])
+                     _litres_saved(nat, scored, has_genset, unit), str(nat.get("verified_days", 0)), doc.cell(status)])
         doc.csv.writerow([s["id"], s["name"], nat.get("saving_rs"), tun.get("saving_rs"), nat.get("claimed_rs"), nat.get("litres_saved"),
                           nat.get("verified_days"), bool(summ.get("preliminary")), ";".join(stale)])
         tot["nat"] += _finite(nat.get("saving_rs")) or 0.0
@@ -699,7 +713,7 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
         tot["claimed"] += _finite(nat.get("claimed_rs")) or 0.0
         tot["verified"] += int(nat.get("verified_days") or 0)
         if has_genset and _litres_saved(nat, scored, True) != "not metered":
-            tot["litres"] += _finite(nat.get("litres_saved")) or 0.0
+            tot["litres" if unit == " L" else "mmbtu"] += _finite(nat.get("litres_saved")) or 0.0
         out_rows.append(s["id"])
     inputs["computed"] = max(computed) if computed else None
     over = p1 < today
@@ -718,8 +732,10 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
     if not out_rows:
         doc.p("The company has no sites yet.")
         return prelim
-    doc.table([doc.head("Site", "Saving vs native", "Saving vs tuned", "Claimed", "Diesel saved (Estimated)", "Verified days", "Status")] + rows
-              + [["All sites", rs(tot["nat"]), rs(tot["tun"]), rs(tot["claimed"]), smart(tot["litres"], " L"), str(tot["verified"]), ""]],
+    fuel_total = [smart(tot["litres"], " L")] if tot["litres"] or not tot["mmbtu"] else []
+    fuel_total = "; ".join(fuel_total + ([smart(tot["mmbtu"], " MMBtu")] if tot["mmbtu"] else []))
+    doc.table([doc.head("Site", "Saving vs native", "Saving vs tuned", "Claimed", "Fuel saved (Estimated)", "Verified days", "Status")] + rows
+              + [["All sites", rs(tot["nat"]), rs(tot["tun"]), rs(tot["claimed"]), fuel_total, str(tot["verified"]), ""]],
               [45 * mm, 23 * mm, 23 * mm, 23 * mm, 22 * mm, 15 * mm, 29 * mm])
     doc.gap()
     doc.p("Each site is measured against a replay of its own inverter settings (native) and the best static table of its brand (tuned), on the same "

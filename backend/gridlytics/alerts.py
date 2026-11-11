@@ -338,7 +338,7 @@ def _forecast_stages(site_id: str, now: int) -> None:
 #: The tariff library's kinds in words, for the staleness rule's titles
 KIND_WORDS = {"schedule": "tariff schedule", "tou": "time-of-use calendar", "tax": "tax rules", "prosumer": "net billing or net metering rules",
               "icp": "incremental consumption package", "adder": "adjustment"}
-FUEL_WORDS = {"hsd": "diesel (HSD)", "gas_captive": "captive gas", "lng_captive": "captive LNG"}
+FUEL_WORDS = {"hsd": "diesel (HSD)", "gas_captive": "captive gas", "lng_captive": "captive RLNG"}  # as the pages name them (round 7 sweeps)
 #: From this day of the month an FCA or QTA for the month's bills is looked for: NEPRA notifies them during the month they are billed in
 ADDER_FROM_DAY = 15
 
