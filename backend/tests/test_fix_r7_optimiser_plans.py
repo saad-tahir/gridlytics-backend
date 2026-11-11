@@ -1265,6 +1265,30 @@ def test_slots_in_the_next_billing_month_carry_its_own_cap(company, monkeypatch)
                 assert s["grid_cap_w"] == round(cap2 * 1000)
 
 
+def test_a_new_months_day_table_that_is_not_safe_to_repeat_holds_the_plan(company, monkeypatch):
+    """Integration (optimiser-plans' two compiles at the billing month's end with delivery-twin's table_safety and control-edge's guard, audit
+    engine-delivery-08): the joined table kept the first compile's safety only, so a new month's day that was not safe to repeat with no new plan
+    went unchecked and the plan was signed. Each day's check is kept, and the guard holds the plan."""
+    from gridlytics import delivery
+    sid = _site()
+    t0 = twin.day_start_utc(date(2026, 10, 31)) + 10 * 3600
+    hot = twin.day_start_utc(date(2026, 10, 30)) + 10 * 3600
+    _import_minutes(sid, t0 - 8 * 86400, t0, lambda t: 400.0 if hot <= t < hot + 1800 else 150.0)
+    real = delivery.table_safety
+
+    def november_unsafe(compiled, steps, battery, site):
+        r = real(compiled, steps, battery, site)
+        days = [{**d, "ok": False, "reason": "reserve_short_on_repeat"} if d["date"] == "2026-11-01" else d for d in r["days"]]
+        return {"ok": all(d["ok"] for d in days), "days": days}
+
+    monkeypatch.setattr(delivery, "table_safety", november_unsafe)
+    out = plans.tick(sid, at=t0, save=False)
+    assert out["summary"]["mdi_cap_next_kw"] is not None                       # the horizon crosses the month's end: two compiles
+    assert [d["date"] for d in out["slots"]["safety"]["days"]][:2] == ["2026-10-31", "2026-11-01"]
+    assert out["slots"]["safety"]["ok"] is False
+    assert out["status"] == "held" and out["reason"] == "unsafe_table"
+
+
 # ------------------------------------------------------------------------------------------------ engine-plans-live-08, engine-optimiser-12
 
 LINES = ("energy_rs", "genset_rs", "wear_rs", "mdi_rise_rs", "mdi_month_rs", "calendar_rs", "unserved_rs", "expected_shortfall_rs",

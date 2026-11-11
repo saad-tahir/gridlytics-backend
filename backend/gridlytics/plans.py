@@ -815,7 +815,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                                        Ms[0] if Ms else None, site=site)
     if split < len(steps_out):
         nxt = delivery.compile_mode_a(steps_out[split:], brand, p.get("battery"), fallback_floor_pct(site), bms_low_pct(site), Ms[1], site=site)
-        compiled = {**compiled, "days": compiled["days"] + nxt["days"]}
+        compiled = _joined_tables(compiled, nxt)
     guard = _guard(site, p, compiled, steps_out, res)
     summary.update({"breakdown": res["breakdown"], "objective_rs": res["objective_rs"], "mdi_cap_kw": round(Ms[0], 1) if Ms else None,
                     # the next billing month's cap where the horizon crosses into it (its days' slots carry it), else null
@@ -856,6 +856,19 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     in_force = plan_id if status == "active" else (None if release else _in_force_id(site_id, now))
     return {"status": status, "plan_id": plan_id, "reason": reason, "in_force": in_force, "objective_rs": res["objective_rs"],
             "solve_seconds": res["solve_seconds"], "steps": steps_out, "slots": compiled, "summary": summary}
+
+
+def _joined_tables(first: dict, nxt: dict) -> dict:
+    """One compiled table from the two compiles of a horizon that crosses the billing month's end (tick): the days of both, in order, and each
+    day's safety check (delivery.table_safety, which the wrong-plan guard reads: a new month's day that is not safe to repeat holds the plan as an
+    old month's does) and the MDI note of either month (`mdi.not_enforceable`, at its own month's cap) kept. The rest (the fallback block, the
+    battery's limits, the cap `mdi.cap_kw`) is the month ending's."""
+    s1, s2 = first.get("safety") or {"ok": True, "days": []}, nxt.get("safety") or {"ok": True, "days": []}
+    m1, m2 = first.get("mdi") or {}, nxt.get("mdi") or {}
+    out = {**first, "days": first["days"] + nxt["days"], "safety": {"ok": bool(s1["ok"]) and bool(s2["ok"]), "days": s1["days"] + s2["days"]}}
+    if first.get("mdi") is not None or nxt.get("mdi") is not None:
+        out["mdi"] = {**m1, "not_enforceable": m1.get("not_enforceable") or m2.get("not_enforceable")}
+    return out
 
 
 #: a failed solve's reason by the solver's status (scipy.optimize.milp: 1 a time or iteration limit with no plan, 2 infeasible, 3 unbounded)
