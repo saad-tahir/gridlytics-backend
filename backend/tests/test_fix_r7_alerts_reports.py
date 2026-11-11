@@ -357,6 +357,8 @@ def test_the_genset_rules_unrequested_low_load_and_a_request_nobody_answered(wor
     plan = {"id": "p1", "steps": steps, "summary": {}, "valid_until": _iso(now + 86400).replace("Z", "+00:00")}
     monkeypatch.setattr(alerts.plans, "current", lambda site_id: plan)
     monkeypatch.setattr(alerts.plans, "active_at", lambda site_id, ts: plan)
+    # the rule's loop reads the hour's plans once (round 7, storage-perf: plans.InForce), so the plan in force is stood in there too
+    monkeypatch.setattr(alerts.plans.InForce, "at", lambda self, ts: plan)
     with world.use():
         # the grid is up and the plan runs no genset, yet the set ran the last 16 minutes at 20 kW (its minimum load is 30 % of 150 kW)
         telemetry.ingest(sid, _minutes(now - 3 * 3600, now - 16 * 60, genset_running=0)

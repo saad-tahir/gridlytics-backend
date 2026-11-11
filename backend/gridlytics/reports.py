@@ -358,9 +358,9 @@ def outage_cover(site: dict, d0: date, d1: date) -> dict | None:
     has_bat = bool((site.get("assets") or {}).get("battery"))
     with_reserve = entered_ok = 0
     if has_bat:
+        in_force = plans.InForce(site["id"], t0, t1)   # the period's plans read once, not once an outage (round 7, audit tests-and-perf-07)
         for o in outs:
-            plan = plans.active_at(site["id"], o["start"])
-            st = next((s for s in (plan or {}).get("steps", []) if s["t"] <= o["start"] < s["t"] + 900), None)
+            st = in_force.step(o["start"])
             if st and st.get("reserve_pct") and o.get("soc_start_pct") is not None:
                 with_reserve += 1
                 entered_ok += int(o["soc_start_pct"] >= st["reserve_pct"])

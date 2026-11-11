@@ -517,9 +517,9 @@ def genset_page(site_id: str, days: int = 14, month: str | None = None):
             prices[day] = tariffs.fuel_price(kind, day)[0]
         return prices[day]
 
+    in_force = plans.InForce(site_id, t0, t1)   # the period's plans read once, not once a run (round 7, audit tests-and-perf-07)
     for r in runs:
-        p = plans.active_at(site_id, r["start"])
-        stp = next((x for x in (p or {}).get("steps", []) if x["t"] <= r["start"] < x["t"] + 900), None)
+        stp = in_force.step(r["start"])
         r["plan_requested"] = bool(stp and stp["genset_on"])
         r["price_per_l"] = price_on(r["start"])
         r["fuel_cost_rs"] = round(r["litres"] * r["price_per_l"], 0)

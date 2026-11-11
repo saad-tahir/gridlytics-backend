@@ -5,6 +5,7 @@ in force), so the demo history and a later re-score run the same code as the liv
 """
 from __future__ import annotations
 
+import bisect
 import json
 import math
 from datetime import date, datetime, timedelta, timezone
@@ -1061,8 +1062,9 @@ def past_steps(site_id: str, now: int, hours: int = 24) -> dict:
 
     steps_of: dict[str, dict[int, dict]] = {}
     rows = []
+    in_force = InForce(site_id, t0, t1)        # the plans of the range read once, not once a step (round 7, audit tests-and-perf-07)
     for t in range(t0, t1, 900):
-        plan = active_at(site_id, t)
+        plan = in_force.at(t)
         step = None
         if plan is not None:
             if plan["id"] not in steps_of:
@@ -1093,41 +1095,130 @@ def _released_at(site_id: str, ts: int) -> bool:
     """Whether a pause or a release to native was in force at the instant `ts`, from the override history: from its creation (from_ts) to its end,
     or to when it was cleared if that came first. The instant, not its quarter: a plan published after a pause was cleared mid-quarter is in force
     from then on. A day in a native block of the switchback calendar is released all day (switchback_release)."""
-    if switchback_release(site_id, ts) is not None:
-        return True
-    for o in sites.overrides(site_id, active_only=False):
-        if o.get("kind") not in RELEASE_REASONS:
-            continue
-        start, end, cleared = _ts(o.get("from_ts")), _ts(o.get("until_ts")), _ts(o.get("cleared"))
-        if cleared is not None and (end is None or cleared < end):
-            end = cleared
-        if end is not None and (start is None or start <= ts) and ts < end:
+    return InForce(site_id, ts, ts).released(ts)
+
+
+#: how many of the latest rows at or before an instant active_at walks for the row that decides it before it asks for the latest plan made
+_DECIDE_ROWS = 200
+
+
+class InForce:
+    """active_at at any instant of [t0, t1] from one read of the plan rows that decide the range (their light columns, newest first, down to the
+    row that decides t0), one read of the override history, the switchback calendar once per Pakistan day and each plan in force parsed once (round
+    7, audit tests-and-perf-07: active_at ran once per genset run, peak quarter, outage or past step, each call reading the overrides and up to 200
+    plan rows and parsing a 130 KB plan). An instant outside the range is asked of active_at."""
+
+    def __init__(self, site_id: str, t0: int, t1: int):
+        self.site_id, self.t0, self.t1 = site_id, int(min(t0, t1)), int(max(t0, t1))
+        self._switchback: dict[date, bool] = {}
+        self._windows: list[tuple[int | None, int]] | None = None
+        self._rows: list | None = None          # oldest first
+        self._times: list[str] = []
+        self._cut = False                       # the read stopped before the site's first row
+        self._plans: dict[str, dict] = {}
+        self._steps: dict[str, tuple[list[int], list[dict]]] = {}
+
+    def released(self, ts: int) -> bool:
+        """_released_at: a pause or a release to native in force at the instant, or a native block of the switchback calendar on its day."""
+        day = _local(ts).date()
+        if day not in self._switchback:
+            self._switchback[day] = switchback_release(self.site_id, ts) is not None
+        if self._switchback[day]:
             return True
-    return False
+        if self._windows is None:
+            self._windows = []
+            for o in sites.overrides(self.site_id, active_only=False):
+                if o.get("kind") not in RELEASE_REASONS:
+                    continue
+                start, end, cleared = _ts(o.get("from_ts")), _ts(o.get("until_ts")), _ts(o.get("cleared"))
+                if cleared is not None and (end is None or cleared < end):
+                    end = cleared
+                if end is not None:
+                    self._windows.append((start, end))
+        return any((start is None or start <= ts) and ts < end for start, end in self._windows)
+
+    @staticmethod
+    def _decides(r) -> bool:
+        if r["status"] in ("active", "superseded"):
+            return True
+        if r["status"] == "held":
+            return r["reason"] in RELEASED_REASONS
+        return r["status"] == "failed" and bool((json.loads(r["summary"] or "{}") or {}).get("control_release"))
+
+    def _load(self) -> None:
+        lo = _iso(self.t0)
+        rows, below = [], 0
+        with store.connect() as con:
+            # newest first (the (site_id, belief_time) index); a failed row's summary only, for its control_release
+            cur = con.execute("SELECT id, belief_time, status, reason, valid_until, CASE WHEN status = 'failed' THEN summary END AS summary FROM plans "
+                              "WHERE site_id = ? AND belief_time <= ? ORDER BY belief_time DESC, generated_at DESC, rowid DESC",
+                              (self.site_id, _iso(self.t1)))
+            for r in cur:
+                rows.append(r)
+                if r["belief_time"] <= lo:
+                    below += 1
+                    if self._decides(r) or below >= _DECIDE_ROWS:
+                        self._cut = True
+                        break
+        self._rows = rows[::-1]
+        self._times = [r["belief_time"] for r in self._rows]
+
+    def _deciding(self, ts: int) -> tuple[str, str | None] | None:
+        """The (id, valid_until) of the plan made that decides the instant, before its valid_until is checked; None when a release decides it."""
+        if self._rows is None:
+            self._load()
+        j = bisect.bisect_right(self._times, _iso(ts))
+        lo = j - _DECIDE_ROWS
+        for k in range(j - 1, max(lo, 0) - 1, -1):
+            r = self._rows[k]
+            if not self._decides(r):
+                continue                        # a guard hold or a failed solve leaves the plan before in force
+            return (r["id"], r["valid_until"]) if r["status"] in ("active", "superseded") else None
+        if lo < 0 and not self._cut:
+            return None                         # no plan made at or before it
+        with store.connect() as con:
+            r = con.execute("SELECT id, valid_until FROM plans WHERE site_id = ? AND status IN ('active','superseded') AND belief_time <= ? "
+                            "ORDER BY belief_time DESC LIMIT 1", (self.site_id, _iso(ts))).fetchone()
+        return (r["id"], r["valid_until"]) if r else None
+
+    def plan(self, plan_id: str) -> dict | None:
+        if plan_id not in self._plans:
+            with store.connect() as con:
+                r = con.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+            self._plans[plan_id] = _plan_out(r) if r else None
+        return self._plans[plan_id]
+
+    def at(self, ts: int) -> dict | None:
+        """The plan in force at the instant (active_at)."""
+        ts = int(ts)
+        if not self.t0 <= ts <= self.t1:
+            return active_at(self.site_id, ts)
+        if self.released(ts):
+            return None
+        d = self._deciding(ts)
+        if d is None or _past_valid_until(d[1], ts):
+            return None
+        return self.plan(d[0])
+
+    def step(self, ts: int) -> dict | None:
+        """The step of the plan in force at the instant that covers it (t <= ts < t + 900), else None."""
+        p = self.at(ts)
+        if p is None:
+            return None
+        if p["id"] not in self._steps:
+            steps = sorted(p.get("steps") or [], key=lambda x: int(x["t"]))
+            self._steps[p["id"]] = ([int(x["t"]) for x in steps], steps)
+        t, steps = self._steps[p["id"]]
+        k = bisect.bisect_right(t, int(ts)) - 1
+        return steps[k] if k >= 0 and int(ts) < t[k] + 900 else None
 
 
 def active_at(site_id: str, ts: int) -> dict | None:
     """The plan that was in force at an instant: the latest generated at or before it (belief time not after it). None while a pause or a release
     to native was in force: the tick then stores its plan as held (or, when the solve failed, a failed row noting the release), and no plan is in
-    force; a guard hold or a failed tick otherwise leaves the previous plan in force, up to its valid_until (after it, None)."""
-    if _released_at(site_id, ts):
-        return None
-    with store.connect() as con:
-        # the latest rows first (the light columns only): a held or failed row of a pause ends the search with no plan in force
-        rows = con.execute("SELECT id, status, reason, summary, valid_until FROM plans WHERE site_id = ? AND belief_time <= ? "
-                           "ORDER BY belief_time DESC, generated_at DESC, rowid DESC LIMIT 200", (site_id, _iso(ts))).fetchall()
-        for r in rows:
-            if r["status"] in ("active", "superseded"):
-                if _past_valid_until(r["valid_until"], ts):
-                    return None
-                return _plan_out(con.execute("SELECT * FROM plans WHERE id = ?", (r["id"],)).fetchone())
-            if r["status"] == "held" and r["reason"] in RELEASED_REASONS:
-                return None
-            if r["status"] == "failed" and (json.loads(r["summary"] or "{}") or {}).get("control_release"):
-                return None
-        r = con.execute("SELECT * FROM plans WHERE site_id = ? AND status IN ('active','superseded') AND belief_time <= ? ORDER BY belief_time DESC LIMIT 1",
-                        (site_id, _iso(ts))).fetchone()
-    return _plan_out(r) if r and not _past_valid_until(r["valid_until"], ts) else None
+    force; a guard hold or a failed tick otherwise leaves the previous plan in force, up to its valid_until (after it, None). A reader asking for
+    many instants of a range builds one InForce instead."""
+    return InForce(site_id, ts, ts).at(ts)
 
 
 def now_and_next(plan: dict | None, now: int | None = None) -> dict | None:

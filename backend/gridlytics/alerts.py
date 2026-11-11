@@ -185,9 +185,9 @@ def _peak_unconfirmed(site: dict, now: int, today: str) -> bool:
         peak = np.asarray(plans.peak_mask(conn, quarters), dtype=bool)
     except (LookupError, ValueError, TypeError):
         return False
+    in_force = plans.InForce(site["id"], t0, t0 + 86400)   # the day's plans read once, not once a peak quarter (audit tests-and-perf-07)
     for t in quarters[peak & (quarters <= now - 1800)]:
-        p = plans.active_at(site["id"], int(t))
-        st = next((s for s in (p or {}).get("steps", []) if s["t"] <= t < s["t"] + 900), None)
+        st = in_force.step(int(t))
         if st and st.get("peak") and (st.get("discharge_kw") or 0) > 0.1:
             return True
     return False
@@ -508,10 +508,11 @@ def _genset_condition(site: dict, now: int, rules_: dict) -> None:
     # unrequested: the step of the plan in force at each such minute did not run the set
     steps_on: dict[int, bool] = {}
     unasked = 0
+    in_force = plans.InForce(sid, now - 3600 - STEP_S, now + 1)   # the hour's plans read once (audit tests-and-perf-07)
     for t in d["ts"][on & grid_up]:
         q = int(t) // STEP_S * STEP_S
         if q not in steps_on:
-            p = plans.active_at(sid, q)
+            p = in_force.at(q)
             st = next((x for x in (p or {}).get("steps", []) if x["t"] <= q < x["t"] + STEP_S), None)
             steps_on[q] = p is None or st is None or bool(st.get("genset_on"))   # no plan in force at it: nothing to hold the run against
         unasked += int(not steps_on[q])
@@ -608,9 +609,9 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     margin = float(_th(rules_, "Reserve", "reserve_margin_pct"))
     short = []
     if plan and (site.get("assets") or {}).get("battery"):
+        in_force = plans.InForce(site_id, now - 86400, now)   # the day's plans read once, not once an outage (audit tests-and-perf-07)
         for o in outs:
-            step = plans.active_at(site_id, o["start"])
-            st = next((s for s in (step or {}).get("steps", []) if s["t"] <= o["start"] < s["t"] + 900), None)
+            st = in_force.step(o["start"])
             if st and st.get("reserve_pct") and o["soc_start_pct"] is not None and o["soc_start_pct"] + margin < st["reserve_pct"]:
                 short.append({"start": o["start"], "soc": o["soc_start_pct"], "reserve": st["reserve_pct"]})
     _set(bool(short), site_id, "reserve_short", "Reserve", "warning", "An outage started with the battery below the planned reserve", {"outages": short[:5]})

@@ -411,6 +411,8 @@ def test_the_unconfirmed_apply_alert_reads_the_plan_in_force_at_the_peak(world, 
 
     monkeypatch.setattr(plans, "current", lambda site_id: plan_from(now // 900 * 900))
     monkeypatch.setattr(plans, "active_at", lambda site_id, ts: plan_from(int(ts) // 900 * 900))
+    # the alert's loop reads the plans of its day once (round 7, storage-perf: plans.InForce), so the plan in force is stood in there too
+    monkeypatch.setattr(plans.InForce, "at", lambda self, ts: plan_from(int(ts) // 900 * 900))
     monkeypatch.setattr(plans, "peak_mask", lambda conn, ts: (np.asarray(ts) >= day0 + 18 * 3600) & (np.asarray(ts) < day0 + 22 * 3600))
     with world.use():
         # since round 3 a Control alert waits for a plan and 7 days of data (plan 9.3): the site's data starts 8 days back

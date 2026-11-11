@@ -496,3 +496,149 @@ def test_the_native_capture_and_the_marked_table_are_read_without_their_photogra
     assert _photo_reads(seen.sql, "native_settings") == [] and _photo_reads(seen.sql, "applied") == []
     sites.capture_native(sid, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 25}, "t")
     assert sites.native_latest(sid)["has_photo"] is False and sites.native_latest(sid)["version"] == 2
+
+
+# ------------------------------------------------------------------------------------------------ tests-and-perf-07
+
+def _reference_active_at(sid: str, ts: int) -> dict | None:
+    """active_at as it was before round 7's storage-perf (one instant a call): the reference InForce must answer as."""
+    def released() -> bool:
+        if plans.switchback_release(sid, ts) is not None:
+            return True
+        for o in sites.overrides(sid, active_only=False):
+            if o.get("kind") not in plans.RELEASE_REASONS:
+                continue
+            start, end, cleared = plans._ts(o.get("from_ts")), plans._ts(o.get("until_ts")), plans._ts(o.get("cleared"))
+            if cleared is not None and (end is None or cleared < end):
+                end = cleared
+            if end is not None and (start is None or start <= ts) and ts < end:
+                return True
+        return False
+    if released():
+        return None
+    with store.connect() as con:
+        rows = con.execute("SELECT id, status, reason, summary, valid_until FROM plans WHERE site_id = ? AND belief_time <= ? "
+                           "ORDER BY belief_time DESC, generated_at DESC, rowid DESC LIMIT 200", (sid, plans._iso(ts))).fetchall()
+        for r in rows:
+            if r["status"] in ("active", "superseded"):
+                if plans._past_valid_until(r["valid_until"], ts):
+                    return None
+                return plans._plan_out(con.execute("SELECT * FROM plans WHERE id = ?", (r["id"],)).fetchone())
+            if r["status"] == "held" and r["reason"] in plans.RELEASED_REASONS:
+                return None
+            if r["status"] == "failed" and (json.loads(r["summary"] or "{}") or {}).get("control_release"):
+                return None
+        r = con.execute("SELECT * FROM plans WHERE site_id = ? AND status IN ('active','superseded') AND belief_time <= ? ORDER BY belief_time DESC LIMIT 1",
+                        (sid, plans._iso(ts))).fetchone()
+    return plans._plan_out(r) if r and not plans._past_valid_until(r["valid_until"], ts) else None
+
+
+def _history(sid: str) -> tuple[int, int, dict]:
+    """Two days of ticks with every kind of row that decides (or does not decide) the plan in force: plans made, a re-solve in a quarter, guard
+    holds, failed solves, a held tick of a pause, a failed tick under a release, a plan that ran out (valid_until) before the next, a pause in the
+    override history and a switchback native day."""
+    template = plans.get(sid, plans.tick(sid)["plan_id"])
+    with store.connect() as con:
+        con.execute("DELETE FROM plans WHERE site_id = ?", (sid,))
+    d0 = datetime.now(PKT).date() - timedelta(days=5)
+    t0 = twin.day_start_utc(d0)
+    ids = {}
+    for k in range(2 * 96):
+        q = t0 + 900 * k
+        if k in (5, 6, 7):
+            _clone(template, sid, q, status="held", reason="guard_mdi")
+        elif k == 30:
+            _clone(template, sid, q, status="failed", reason="solve_infeasible", steps=False)
+        elif k == 40:
+            _clone(template, sid, q, status="held", reason="control_paused")
+        elif k == 50:
+            pid = _clone(template, sid, q, status="failed", reason="solve_infeasible", steps=False)
+            with store.connect() as con:
+                con.execute("UPDATE plans SET summary = ? WHERE id = ?", (json.dumps({"control_release": {"reason": "released_to_native"}}), pid))
+        elif 60 <= k < 70:
+            continue                                                                    # no tick for 2.5 hours
+        else:
+            ids[k] = _clone(template, sid, q)
+            if k == 12:
+                ids["resolve"] = _clone(template, sid, q, made_after=400)
+            if k == 59:
+                with store.connect() as con:                                            # runs out an hour into the gap
+                    con.execute("UPDATE plans SET valid_until = ? WHERE id = ?", (plans._iso(q + 3600), ids[k]))
+    with store.connect() as con:
+        con.execute("INSERT INTO overrides (id, site_id, kind, value, from_ts, until_ts, author, reason, created, cleared) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (store.new_id(), sid, "pause_control", None, plans._iso(t0 + 80 * 900 + 300), plans._iso(t0 + 90 * 900), "t", "",
+                     plans._iso(t0), plans._iso(t0 + 85 * 900 + 120)))
+        con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,?)",
+                    (sid, (d0 + timedelta(days=1)).isoformat(), (d0 + timedelta(days=1)).isoformat(), "native", 1))
+    return t0, t0 + 2 * 86400, ids
+
+
+def test_the_plan_in_force_over_a_range_is_read_once_and_answers_as_active_at_did(company, monkeypatch):
+    """active_at ran once per genset run, peak quarter, outage or past step, each call reading the override history and up to 200 plan rows and
+    parsing a 130 KB plan: O(instants x plans). InForce reads the range's rows and the overrides once and parses each plan in force once, and answers
+    exactly as active_at did at every instant, whatever decides it."""
+    sid = _site()
+    t0, t1, ids = _history(sid)
+    from gridlytics import verify as verify_
+    assert verify_.arm_on(sid, datetime.fromtimestamp(t0, PKT).date() + timedelta(days=1)) == "native"
+    instants = list(range(t0 - 1800, t1 + 1800, 450)) + [t0 + 80 * 900 + 299, t0 + 85 * 900 + 119, t0 + 85 * 900 + 120]
+    instants += [t0 + 12 * 900 + 10]
+    want = {ts: (_reference_active_at(sid, ts) or {}).get("id") for ts in instants}
+    assert want[t0 + 12 * 900 + 10] == ids["resolve"] and want[t0 + 6 * 900] == ids[4]          # a re-solve wins its quarter; holds keep the plan
+    assert want[t0 + 40 * 900] is None and want[t0 + 50 * 900] is None and want[t0 + 30 * 900] == ids[29]
+    assert want[t0 + 62 * 900] == ids[59] and want[t0 + 63 * 900] is None                      # in force to its valid_until, then none
+    assert want[t0 + 82 * 900] is None and want[t0 + 86 * 900] == ids[86]                      # the pause, cleared early
+    assert want[t1 - 900] is None                                                                # the switchback native day
+    seen = _Statements(monkeypatch)
+    in_force = plans.InForce(sid, t0 - 1800, t1 + 1800)
+    got = {ts: (in_force.at(ts) or {}).get("id") for ts in instants}
+    assert got == want
+    overrides = [s for s in seen.sql if "FROM overrides" in s]
+    whole = [s for s in seen.plan_reads() if "SELECT *" in s]
+    assert len(overrides) == 1 and len(whole) == len({v for v in want.values() if v})          # each plan in force parsed once
+    assert len([s for s in seen.plan_reads() if "belief_time <=" in s]) == 1
+    for ts in instants[::7]:
+        assert (plans.active_at(sid, ts) or {}).get("id") == want[ts]                            # active_at is the one-instant InForce
+        step = in_force.step(ts)
+        ref = _step_at(_reference_active_at(sid, ts), ts)
+        assert step == ref
+
+
+def test_the_past_rows_the_genset_runs_the_outage_reserve_and_the_peak_check_read_the_plans_once(company, monkeypatch):
+    """The callers in loops (the plan table's 96 past steps, a genset run each, an outage each, a peak quarter each) read the override history and the
+    plans of their range once."""
+    from gridlytics import alerts, reserve, routes_telemetry
+    sid = _site()
+    sites.put_asset(sid, "genset", {"rated_kw": 150}, "t")
+    q = forecast_align(_now())
+    plans.tick(sid, at=q - 6 * 3600)
+    plans.tick(sid, at=q - 3 * 3600)
+    rows = []
+    for t in range(q - 5 * 3600, q - 60, 60):
+        k = (t - (q - 5 * 3600)) // 60
+        run = (k // 20) % 3 == 0                                                                   # a 20-minute run each hour
+        out = 60 <= k % 120 < 75                                                                   # a 15-minute outage every two hours
+        rows.append({"ts": t, "grid_present": 0 if out else 1, "genset_running": 1 if run else 0, "genset_power_w": 90_000 if run else 0,
+                     "battery_soc_bms_pct": 40.0, "load_power_w": 80_000, "grid_power_w": 0 if out else 60_000})
+    telemetry.ingest(sid, rows, "edge")
+    site = sites.full(sid)
+    real_connect = store._connect
+
+    def reads(fn) -> tuple[int, int]:
+        seen = _Statements(monkeypatch)
+        try:
+            fn()
+        finally:
+            monkeypatch.setattr(store, "_connect", real_connect)
+        return len([s for s in seen.sql if "FROM overrides" in s]), len([s for s in seen.plan_reads() if "belief_time <=" in s])
+
+    assert reads(lambda: plans.past_steps(sid, q, 24)) == (1, 1)
+    log = telemetry.outages(sid, q - 5 * 3600, q)
+    assert len(log) >= 2
+    assert reads(lambda: reserve.annotate(site, [dict(o) for o in log])) == (1, 1)
+    day = datetime.fromtimestamp(q, PKT).date()
+    assert reads(lambda: reports.outage_cover(site, day - timedelta(days=1), day)) == (1, 1)
+    assert len(routes_telemetry.genset_page(sid, days=1)["runs"]) >= 3
+    assert reads(lambda: routes_telemetry.genset_page(sid, days=1)) == (1, 1)
+    yesterday = day - timedelta(days=1)
+    assert reads(lambda: alerts._peak_unconfirmed(site, twin.day_start_utc(day), yesterday.isoformat())) == (1, 1)

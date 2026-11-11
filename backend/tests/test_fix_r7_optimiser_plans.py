@@ -2103,7 +2103,11 @@ def test_a_pause_leaves_no_plan_in_force_in_the_past_rows(world, monkeypatch):
     monkeypatch.setattr(routes_plans, "now_ts", lambda: q + 30)
     with world.use():
         assert plans.tick(sid, at=q - 3 * 3600)["status"] == "active"
-    monkeypatch.setattr(plans, "_released_at", lambda site_id, ts: q - 2 * 3600 <= ts < q - 3600)
+    # a pause from two hours ago to one hour ago in the override history (round 7, storage-perf: the past rows read the history once, so a real
+    # override row, not a patched _released_at)
+    with world.use(), store.connect() as con:
+        con.execute("INSERT INTO overrides (id, site_id, kind, value, from_ts, until_ts, author, reason, created) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (store.new_id(), sid, "pause_control", None, plans._iso(q - 2 * 3600), plans._iso(q - 3600), "t", "", plans._iso(q - 2 * 3600)))
     by = {x["t"]: x for x in a.get(f"/api/sites/{sid}/plan/past").json()["steps"]}
     assert by[q - 2 * 3600 - 900]["plan_id"] is not None
     assert by[q - 2 * 3600]["planned"] is None and by[q - 3600 - 900]["planned"] is None

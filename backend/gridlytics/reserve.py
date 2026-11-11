@@ -20,14 +20,14 @@ def has_battery(site: dict) -> bool:
     return on_grid and bool((site.get("assets") or {}).get("battery"))
 
 
-def target_at(site_id: str, start: int) -> dict | None:
+def target_at(site_id: str, start: int, in_force: plans.InForce | None = None) -> dict | None:
     """The reserve the plan held for an outage starting at `start`: {reserve_pct, forecastable}, or None with no plan in force then (or none covering the
     step). The target is the floor at the end of the step before the outage's step, from the plan in force during that step: optimise.py holds the
     reserve on E[t + 1] for an outage starting in step t + 1, so the outage's own step already holds the next step's reserve. The outage was
     forecastable when that plan gave a start in its step a chance of at least P_START_MIN (the step before's p_start) or modelled the step as an
     outage (an announced window it trusted: grid 0)."""
     k = int(start) // STEP_S * STEP_S
-    plan = plans.active_at(site_id, k - 1)
+    plan = in_force.at(k - 1) if in_force is not None else plans.active_at(site_id, k - 1)
     before = own = None
     for s in (plan or {}).get("steps") or []:
         if s.get("t") == k - STEP_S:
@@ -47,8 +47,11 @@ def annotate(site: dict, log: list[dict]) -> list[dict]:
     forecastable with a known state of charge); and `battery_minutes`, the minutes the genset did not run, which the battery and the PV carried
     (energy they could not serve is the row's unserved_kwh; None without a battery). Returns the log."""
     bat = has_battery(site)
+    starts = [int(o["start"]) for o in log]
+    # the log's plans read once, not once an outage (round 7, audit tests-and-perf-07)
+    in_force = plans.InForce(site["id"], min(starts) - STEP_S, max(starts)) if bat and starts else None
     for o in log:
-        tgt = target_at(site["id"], o["start"]) if bat else None
+        tgt = target_at(site["id"], o["start"], in_force) if bat else None
         o["reserve_pct"] = tgt["reserve_pct"] if tgt else None
         o["forecastable"] = bool(tgt and tgt["forecastable"])
         soc = o.get("soc_start_pct")
