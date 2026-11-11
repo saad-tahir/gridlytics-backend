@@ -1287,6 +1287,37 @@ def test_a_role_without_the_fee_reads_no_fee_multiple_in_the_pilot_nor_in_its_am
     assert world.c["analyst"].get(f"/api/sites/{sid}/pilot").json()["pilot"]["amendments"][0]["values"][0]["after"] == 2.5
 
 
+def test_a_viewer_reads_a_started_pilot_with_no_money_and_a_site_key_is_refused_it(world):
+    # pages-D-26 ship check at integration (savings-engine with auth-security): GET /pilot needs no permission of its own. A viewer reads the
+    # set-up's energy criteria, its calendar and its amendments' reasons; the fee multiple goes (_pilot_for_reader) and every money key would go
+    # (the API's filter on every JSON answer). A site key, even an administrator's with both read scopes, is out of scope there (KEY_READS)
+    import re
+    sid = _pilot_ready(world)
+    admin = world.c["admin"]
+    assert _start(world, sid).status_code == 200
+    assert admin.put(f"/api/sites/{sid}/pilot", json={"criteria": {"fee_multiple": 2.5}, "reason": "Fee renegotiated"}).status_code == 200
+    r = world.c["viewer"].get(f"/api/sites/{sid}/pilot")
+    assert r.status_code == 200
+    body = r.json()
+
+    def keys(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                yield k
+                yield from keys(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                yield from keys(v)
+
+    found = set(keys(body))
+    assert not {k for k in found if money.is_money(k) or k in money.FEE_KEYS}, found
+    assert "fee_multiple" not in r.text and not re.search(r"\bRs\.?\s*-?\d|\bPKR\s*-?\d|\brupees?\b", r.text, re.IGNORECASE)
+    assert body["pilot"]["criteria"]["min_saving_pct"] == 8.0 and body["switchback"] and body["started"]
+    assert body["pilot"]["amendments"][0]["reason"] == "Fee renegotiated"
+    k = world.anon.get(f"/api/sites/{sid}/pilot", headers=world.key(["sites:read", "plans:read"]))
+    assert k.status_code == 403 and k.json()["code"] == "out_of_scope", k.text
+
+
 # ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-09: one start
 
 def test_a_second_start_is_refused_and_the_start_and_sign_off_stand(world):
