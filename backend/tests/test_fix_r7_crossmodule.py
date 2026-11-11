@@ -3,6 +3,8 @@ stage-1 packages' code at once.
 
 - tracker-and-docs-01 (with pages-D-09): a site's connections are all priced where they are metered: the connection the plant and the site's
   meter readings are on (`plant`) is the one the plan, the ledger and the bill rebuild price, and a bill names the connection it is for.
+- engine-tariffs-09: Punjab's self-generation duty comes from the connection's province (else the site's DISCO's) and the tax version in force,
+  in the plan's genset cost and in the ledger's, instead of latitude > 28 and a constant in plans.py.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -46,6 +48,56 @@ def _problem_of(sid, day=NOV, steps=96):
     full = sites.full(sid)
     t0 = twin.day_start_utc(day)
     return plans.build_problem(full, t0, forecast.issue(full, t0, save=False), steps)
+
+
+# ------------------------------------------------------------------------------------------------ engine-tariffs-09
+
+def test_the_selfgen_duty_follows_the_connections_province_not_the_latitude(company):
+    """A Quetta site (Balochistan, latitude 30.2) with a 500 kW set paid Punjab's 4 paisa; a Punjab site south of latitude 28 did not."""
+    quetta = _genset_site("Quetta Mill", lat=30.2, disco="QESCO")
+    assert sites.full(quetta)["connections"][0]["data"]["tax"]["province"] == "balochistan"
+    assert _problem_of(quetta)["genset"]["c_om"] == pytest.approx(10.0)
+    sadiqabad = _genset_site("Sadiqabad Mill", lat=27.9, disco="MEPCO")
+    assert _problem_of(sadiqabad)["genset"]["c_om"] == pytest.approx(10.04)
+    # a set of 500 kVA or less pays nothing, nor does a farm on an agricultural connection
+    small = _genset_site("Small Mill", lat=31.4, rated_kw=400.0)
+    assert _problem_of(small)["genset"]["c_om"] == pytest.approx(10.0)
+    farm = _genset_site("Tube Well", lat=31.4, conn={"tariff_category": "D-2(b)", "sanctioned_load_kw": 800})
+    assert _problem_of(farm)["genset"]["c_om"] == pytest.approx(10.0)
+    # the set's size is its kVA: entered, else its kW over its own power factor (420 kW is 525 kVA at 0.8, above the line, and 467 kVA at 0.9)
+    full = sites.full(sadiqabad)
+    g = full["assets"]["genset"]
+    sized = lambda **k: tariffs.selfgen_duty({**full, "assets": {"genset": {**g, "rated_kva": None, **k}}}, NOV)  # noqa: E731
+    assert sized(rated_kw=420.0, power_factor=0.8) == pytest.approx(0.04)
+    assert sized(rated_kw=420.0, power_factor=0.9) == 0.0
+    assert sized(rated_kw=494.0, rated_kva=520.0, power_factor=0.95) == pytest.approx(0.04)
+
+
+def test_the_selfgen_duty_is_the_tax_version_in_force(company):
+    """The rate is the versioned tax body's punjab_selfgen_per_kwh, not a constant in plans.py: a new tax version moves the plan's genset cost."""
+    sid = _genset_site()
+    tax = tariffs.tax_rules(NOV)
+    assert tariffs.selfgen_duty(sites.full(sid), NOV) == pytest.approx(float(tax["punjab_selfgen_per_kwh"]))
+    body = {**tax, "punjab_selfgen_per_kwh": 0.10}
+    with store.connect() as con:
+        con.execute("UPDATE tariff_versions SET body = ? WHERE kind = 'tax' AND key = 'national' AND status = 'active'", (json.dumps(body),))
+    assert tariffs.selfgen_duty(sites.full(sid), NOV) == pytest.approx(0.10)
+    assert _problem_of(sid)["genset"]["c_om"] == pytest.approx(10.10)
+
+
+def test_the_ledger_prices_the_selfgen_duty_as_the_plan_does(company):
+    """verify._genset_cost left the duty out, so the plan and the ledger priced a genset kWh differently (Part 4 rule, R9 9.2)."""
+    punjab = sites.full(_genset_site("Punjab Mill"))
+    sindh = sites.full(_genset_site("Sindh Mill", lat=25.4, disco="HESCO"))
+    n = 1440
+    on = np.zeros(n, dtype=bool)
+    on[600:720] = True
+    sim = {"gen_on": on, "fuel": np.where(on, 0.5, 0.0), "gen": np.where(on, 300.0, 0.0)}
+    cost_p, litres_p = verify._genset_cost(punjab, sim, NOV)
+    cost_s, litres_s = verify._genset_cost(sindh, sim, NOV)
+    assert litres_p == litres_s
+    kwh = 300.0 * 120 / 60
+    assert cost_p - cost_s == pytest.approx(kwh * 0.04, abs=1e-6)
 
 
 # ------------------------------------------------------------------------------------------------ tracker-and-docs-01 (pages-D-09)

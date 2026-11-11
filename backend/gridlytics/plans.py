@@ -16,7 +16,6 @@ from . import delivery, forecast, optimise, sites, solar, store, tariffs, teleme
 
 PKT = timezone(timedelta(hours=5))
 H = 0.25
-SELFGEN_DUTY_RS_PER_KWH = 0.04  # Punjab, above 500 kVA (plan Part 4.1)
 
 
 def _local(ts: int) -> datetime:
@@ -266,16 +265,16 @@ def control_release(site_id: str, at: int | None = None) -> dict | None:
     return switchback_release(site_id, forecast.align(at))
 
 
-def offgrid_c_next(g_asset: dict, fuel_price: float, load: np.ndarray, pv: np.ndarray) -> float:
+def offgrid_c_next(g_asset: dict, fuel_price: float, load: np.ndarray, pv: np.ndarray, duty: float = 0.0) -> float:
     """The off-grid terminal value's price of a kWh left in the battery at the horizon's end: the ledger's rule (verify.compute_day's v_end), the
     genset's all-in cost per kWh at its after-dark load ratio (verify.night_load_ratio), here on the forecast load and PV of the horizon's last
     day. Not at 75 % load: after dark the set carries a small load near its minimum, where its no-load burn and run-hour cost weigh on every kWh,
-    so the plan and the savings ledger value stored energy alike."""
+    so the plan and the savings ledger value stored energy alike. `duty`: the self-generation duty per kWh (tariffs.selfgen_duty), as the ledger."""
     from . import verify  # verify imports plans at module load
 
     ratio = verify.night_load_ratio(g_asset, {"pv": np.asarray(pv, dtype=float), "load": np.asarray(load, dtype=float)})
     return optimise._gen_marginal({"S": g_asset["rated_kw"], "a": g_asset["a"], "b": g_asset["b"], "c_fuel": float(fuel_price),
-                                   "c_om": g_asset["c_om_rs_per_kwh"], "c_runhr": g_asset["c_runhr_rs"]}, ratio)
+                                   "c_om": g_asset["c_om_rs_per_kwh"] + float(duty), "c_runhr": g_asset["c_runhr_rs"]}, ratio)
 
 
 def fallback_floor_pct(site: dict) -> float:
@@ -407,7 +406,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         control = d.get("genset_start_control", "manual")
         if carried["unknown"] and control == "auto_on_grid_loss" and len(g) and g[0] < 0.5:
             carried = {**carried, "u_prev": 1, "elapsed": 99}  # in an outage the panel has already started the set; this fixes nothing
-        c_om = g_asset["c_om_rs_per_kwh"] + (SELFGEN_DUTY_RS_PER_KWH if g_asset["rated_kw"] > 400 and (d.get("lat", 31) > 28) else 0.0)
+        # Punjab's self-generation duty from the connection's province and the tax version in force (round 7, engine-tariffs-09), as the ledger
+        c_om = g_asset["c_om_rs_per_kwh"] + tariffs.selfgen_duty(site, _local(t0).date(), conn)
         gen = {"S": g_asset["rated_kw"], "f_min": g_asset["f_min"], "a": g_asset["a"], "b": g_asset["b"], "c_fuel": price, "c_start": g_asset["c_start_rs"],
                "c_runhr": g_asset["c_runhr_rs"], "c_om": c_om, "UT": max(1, int(math.ceil(g_asset["min_up_h"] * 4))),
                "DT": max(1, int(math.ceil(g_asset["min_down_h"] * 4))), "u_prev": carried["u_prev"], "elapsed": carried["elapsed"],
@@ -462,7 +462,7 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
             p["reserve_manual_force"] = force_pct / 100.0 * e_nom
         c_next = float(np.max(vec["c_imp"][-96:])) if not off_grid else p["c_short"]
         if off_grid and gen:
-            c_next = offgrid_c_next(g_asset, gen["c_fuel"], L[-96:], PV[-96:])
+            c_next = offgrid_c_next(g_asset, gen["c_fuel"], L[-96:], PV[-96:], gen["c_om"] - g_asset["c_om_rs_per_kwh"])
         # the reserve for the first outage beyond the horizon, held where the site's reserve policy asks for it: the chance that an outage starts
         # on the horizon's last day (the forecast for the day after) at or above its threshold (round 7, engine-plans-live-12: a hard-coded
         # 0.5 outages a day decided it, and the site's setting did nothing). Two hours of the critical load, never above what the battery and the

@@ -106,7 +106,8 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
 
 def _genset_cost(site: dict, sim: dict, day: date, on_before: bool = False) -> tuple[float, float]:
     """The genset's fuel, start, run-hour and O&M cost over the day, and its litres. A run already going before the day's first minute
-    (`on_before`) is not a start: a run across midnight is one start, as a continuous replay counts it."""
+    (`on_before`) is not a start: a run across midnight is one start, as a continuous replay counts it. The O&M per kWh carries Punjab's
+    self-generation duty where it applies, as the plan's does (tariffs.selfgen_duty; round 7, engine-tariffs-09)."""
     g = (site.get("assets") or {}).get("genset")
     if not g:
         return 0.0, 0.0
@@ -114,7 +115,8 @@ def _genset_cost(site: dict, sim: dict, day: date, on_before: bool = False) -> t
     on = np.asarray(sim["gen_on"], dtype=bool)
     starts = int(np.sum(on[1:] & ~on[:-1]) + (1 if len(on) and on[0] and not on_before else 0))
     litres = float(np.sum(sim["fuel"]))
-    cost = litres * price + starts * g["c_start_rs"] + on.sum() / 60 * g["c_runhr_rs"] + float(np.sum(sim["gen"]) / 60) * g["c_om_rs_per_kwh"]
+    c_om = g["c_om_rs_per_kwh"] + tariffs.selfgen_duty(site, day)
+    cost = litres * price + starts * g["c_start_rs"] + on.sum() / 60 * g["c_runhr_rs"] + float(np.sum(sim["gen"]) / 60) * c_om
     return cost, litres
 
 
@@ -831,7 +833,7 @@ def _terminal_value(site: dict, day: date, series: dict, pr: dict) -> tuple[floa
     if gen_asset and (c_next == 0.0):
         price, _ = tariffs.fuel_price(gen_asset.get("fuel_kind", "hsd"), day)
         c_next = optimise._gen_marginal({"S": gen_asset["rated_kw"], "a": gen_asset["a"], "b": gen_asset["b"], "c_fuel": price,
-                                         "c_om": gen_asset["c_om_rs_per_kwh"], "c_runhr": gen_asset["c_runhr_rs"]},
+                                         "c_om": gen_asset["c_om_rs_per_kwh"] + tariffs.selfgen_duty(site, day), "c_runhr": gen_asset["c_runhr_rs"]},
                                         night_load_ratio(gen_asset, series) if not on_grid else 0.75)
     v_end = max(0.0, (b["eta_d"] * c_next - optimise.wear_cost(b)) if b else 0.0)
     return c_next, v_end
@@ -1625,8 +1627,8 @@ def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, actual: d
         if p.get("genset"):
             p["genset"]["hold"] = np.zeros(T, dtype=bool)
             p["genset"]["fuel_available"] = 1e9
-            # the set's O&M as the ledger prices it (_genset_cost), without the self-generation duty the live plan adds for a large set
-            p["genset"]["c_om"] = float(site["assets"]["genset"]["c_om_rs_per_kwh"])
+            # the set's O&M as the ledger prices it (_genset_cost), with the self-generation duty the live plan adds where it applies
+            p["genset"]["c_om"] = float(site["assets"]["genset"]["c_om_rs_per_kwh"]) + tariffs.selfgen_duty(site, day)
         if p.get("battery"):
             p["battery"]["E0"] = soc0 * p["battery"]["E_nom"]
             p["battery"]["sigma0"] = 0.0

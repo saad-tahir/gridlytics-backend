@@ -242,7 +242,7 @@ def _short_price(s: dict, t0: int) -> tuple[float, str]:
     g = (s.get("assets") or {}).get("genset")
     if g and d.get("genset_start_control", "none") != "none":
         fuel, _src = tariffs.fuel_price(g.get("fuel_kind", "hsd"), datetime.fromtimestamp(int(t0), twin.PKT).date())
-        c_om = g["c_om_rs_per_kwh"] + (plans.SELFGEN_DUTY_RS_PER_KWH if g["rated_kw"] > 400 and d.get("lat", 31) > 28 else 0.0)
+        c_om = g["c_om_rs_per_kwh"] + tariffs.selfgen_duty(s, datetime.fromtimestamp(int(t0), twin.PKT).date())
         return optimise._gen_marginal({"S": g["rated_kw"], "a": g["a"], "b": g["b"], "c_fuel": fuel, "c_om": c_om, "c_runhr": g["c_runhr_rs"]}), "genset"
     return float(d.get("voll_rs_per_kwh", 500)), "lost_load"
 

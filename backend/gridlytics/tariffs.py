@@ -857,6 +857,45 @@ def _unit_duty(conn: dict, tax: dict) -> float:
     return float(rate) if _num(kva) and float(kva) > 500 else 0.0
 
 
+#: Punjab's duty on self-generated units applies to sets above 500 kVA (R9 section 7, Electricity Duty Rules 2026); a set's kVA is its rated kW over
+#: its power factor (0.8 where none is entered) where no kVA is entered
+SELFGEN_KVA_MIN = 500.0
+SELFGEN_PF = 0.8
+
+
+def selfgen_duty(site: dict, on, conn: dict | None = None) -> float:
+    """Punjab's duty on self-generated units, Rs per kWh the genset generates (R9 section 7: 4 paisa a unit for industrial and commercial consumers
+    above 500 kVA, collected by the electric inspector, not on the DISCO bill): the tax version in force's `punjab_selfgen_per_kwh`, where the site
+    is in Punjab (its connection's tax province, else its DISCO's), on an industrial or commercial footing (its connection's category; a site
+    without one by its type, a farm being agricultural) and its genset is above 500 kVA. 0 elsewhere. The plan's genset cost (plans.build_problem)
+    and the ledger's (verify._genset_cost) both read it (round 7, engine-tariffs-09: latitude > 28 stood for Punjab, from a constant in plans.py,
+    and the ledger left the duty out)."""
+    from . import sites as sites_mod  # sites imports tariffs at module load
+
+    g = ((site or {}).get("assets") or {}).get("genset")
+    if not g:
+        return 0.0
+    pf = g.get("power_factor") if _num(g.get("power_factor")) and g.get("power_factor") > 0 else SELFGEN_PF
+    kva = g.get("rated_kva") if _num(g.get("rated_kva")) else float(g.get("rated_kw") or 0.0) / pf
+    if not kva > SELFGEN_KVA_MIN:
+        return 0.0
+    if conn is None:
+        conn = sites_mod.plant_connection(site)  # the plant's connection, as build_problem reads it
+    data = (conn or {}).get("data") or {}
+    prov = (data.get("tax") or {}).get("province")
+    if not prov:
+        disco = ((site or {}).get("data") or {}).get("disco")
+        prov = (sites_mod.DISCO_PROVINCES.get(disco) or (None,))[0]
+    if data.get("tariff_category"):
+        cls = tariff_data.category_class(data["tariff_category"])
+    else:
+        cls = "agricultural" if ((site or {}).get("data") or {}).get("site_type") == "farm" else "industrial"
+    if prov != "punjab" or cls not in ("industrial", "commercial"):
+        return 0.0
+    rate = tax_rules(on).get("punjab_selfgen_per_kwh")
+    return float(rate) if _num(rate) and rate > 0 else 0.0
+
+
 def _extra_tax_rate(conn: dict, tax: dict, amount: float) -> float | None:
     """Extra tax for an industrial or commercial connection not on the FBR's Active Taxpayer List (R9 section 7: 5 to 17 percent by bill-amount slab):
     the rate of the slab the amount falls in, from the tax version's `extra_tax_non_atl` ([{"upto": rupees or null, "rate": fraction}], ascending
