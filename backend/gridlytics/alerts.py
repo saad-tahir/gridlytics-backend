@@ -325,6 +325,27 @@ def _bill_residual(site_id: str, pct: float) -> None:
          {"period_start": r["period_start"], "period_end": r["period_end"], "difference_pct": diff} if on else {})
 
 
+def _metering_factor(site: dict) -> None:
+    """Data: the plant connection's metering factor, fitted on its bills, lies outside verify.METERING_BAND (round 7 stage 2, audit engine-savings-09;
+    plan 6.3: a data finding, not a calibration): the site's meter reads apart from the DISCO's register by more than 3 %, a load the inverter does
+    not see or a second meter, and the ledger stays on the meter's own scale until it is found."""
+    from .verify import METERING_BAND, metering_of
+    conn = sites.plant_connection(site)
+    m = metering_of(site["id"], conn["id"]) if conn else {}
+    on = m.get("status") == "out_of_band"
+    title, detail = "", {}
+    if on:
+        parts = []
+        for key, more, less in (("energy", "more units", "fewer units"), ("mdi", "a higher MDI", "a lower MDI")):
+            k = m.get(key)
+            if isinstance(k, (int, float)) and not METERING_BAND[0] <= k <= METERING_BAND[1]:
+                parts.append(f"{abs(k - 1) * 100:.1f} % {more if k > 1 else less}")
+        title = (f"The DISCO's bills show {' and '.join(parts)} than the site's meter reads: a load the meter does not see, or a second meter. "
+                 "The savings stay on the meter's own readings until this is found")
+        detail = {"energy": m.get("energy"), "mdi": m.get("mdi"), "band": list(METERING_BAND), "connection_id": conn["id"]}
+    _set(on, site["id"], "metering_factor", "Data", "warning", title, detail)
+
+
 def _forecast_stages(site_id: str, now: int) -> None:
     """Forecast: a forecast's stage changed in the last day (R8 2.16, "stage change"): the latest issue against the latest a day before."""
     for kind, words in (("pv", "PV"), ("load", "load")):
@@ -610,6 +631,7 @@ def evaluate(site_id: str, now: int | None = None) -> None:
          {"day": today})
     _agreements(site, now, rules_)
     _bill_residual(site_id, float(_th(rules_, "Tariff", "bill_difference_pct")))
+    _metering_factor(site)
     tariff_staleness(site, now, rules_)
     _forecast_stages(site_id, now)
     _genset_condition(site, now, rules_)

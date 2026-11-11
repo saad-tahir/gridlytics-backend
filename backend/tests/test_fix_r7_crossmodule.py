@@ -5,6 +5,8 @@ stage-1 packages' code at once.
   meter readings are on (`plant`) is the one the plan, the ledger and the bill rebuild price, and a bill names the connection it is for.
 - engine-tariffs-09: Punjab's self-generation duty comes from the connection's province (else the site's DISCO's) and the tax version in force,
   in the plan's genset cost and in the ledger's, instead of latitude > 28 and a constant in plans.py.
+- engine-savings-09 (VER-13): the metering factor per connection, one energy and one MDI scalar fitted on two bills and tested on a held-out third,
+  applied to both arms before pricing; outside 0.97 to 1.03 a data finding raised as an alert; the 2 % gate closed only by a held-out bill.
 - followup bound-mdi (engine-optimiser-14): the perfect-foresight bound prices both arms' demand charge from the solve's own lower bound.
 
 Each test fails on the code before its fix."""
@@ -204,3 +206,86 @@ def test_the_site_answer_and_the_prices_name_the_plants_connection(world):
     ok = c.post(f"/api/sites/{sid}/bills", json={"period_start": "2026-10-01", "period_end": "2026-10-31", "total_rs": 5,
                                                  "connection_id": conns[1]["id"]})
     assert ok.status_code == 200 and ok.json()["check"]["verdict"] == "not_metered"
+
+
+# ------------------------------------------------------------------------------------------------ engine-savings-09 (the metering factor, VER-13)
+
+MONTHS = [(date(2026, 8, 1), date(2026, 8, 31)), (date(2026, 9, 1), date(2026, 9, 30)), (date(2026, 10, 1), date(2026, 10, 31))]
+
+
+def _metered_site(name):
+    from test_fix_r2_savings import _flat_rows
+    from test_fix_savings import make_site
+    sid = make_site(name=name)
+    _flat_rows(sid, MONTHS[0][0], 92, 100.0, step_min=15)
+    return sid
+
+
+def _printed(sid, p0, p1, k_e, k_m, total_off=1.0):
+    """The bill the DISCO prints when its register reads k_e times the site's meter on energy and k_m on MDI."""
+    conn = sites.connections(sid)[0]
+    raw = verify.rebuild_bill(sid, conn, p0, p1)
+    reg = verify.rebuild_bill(sid, conn, p0, p1, energy_scalar=k_e, mdi_scalar=k_m)
+    return {"period_start": p0.isoformat(), "period_end": p1.isoformat(), "total_rs": round(reg["total_rs"] * total_off, 2),
+            "units_peak": round(raw["import_kwh"]["peak"] * k_e, 1), "units_off_peak": round(raw["import_kwh"]["off_peak"] * k_e, 1),
+            "mdi_kw": round(raw["mdi_kw"] * k_m, 2)}
+
+
+def test_the_metering_factor_is_fitted_on_two_bills_tested_on_a_held_out_third_and_applied_to_both_arms(company):
+    """VER-13 (plan 6.3, 8.2): the site's meter reads the DISCO's register 2 % low on energy and 1 % low on MDI. Before, nothing fitted a factor: both
+    arms and the rebuild priced the raw meter, so every rupee lever was 2 % short and the bill check could never close. One energy and one MDI scalar
+    per connection are fitted on the bills before the latest and tested on the latest, held out; until three bills exist the rebuild runs
+    uncalibrated and the 2 % check stays open; once fitted, both arms are priced on the register's scale."""
+    sid = _metered_site("Metered Mill")
+    for p0, p1 in MONTHS[:2]:
+        b = verify.add_bill(sid, _printed(sid, p0, p1, 1.02, 1.01), "t")
+    m = b["metering"]
+    assert m["status"] == "uncalibrated" and m["applied"] is False and m["bills"] == 2 and m["gate"] == "open"
+    assert verify._minute_prices(sites.connections(sid)[0], date(2026, 10, 14), sid)["k_energy"] == 1.0
+    oct_ = verify.add_bill(sid, _printed(sid, *MONTHS[2], 1.02, 1.01), "t")
+    m = oct_["metering"]
+    assert m["status"] == "calibrated" and m["applied"] is True
+    assert m["energy"] == pytest.approx(1.02, abs=0.0005) and m["mdi"] == pytest.approx(1.01, abs=0.0005)
+    assert len(m["fit_bills"]) == 2 and m["held_out"]["bill_id"] == oct_["id"]
+    assert abs(m["held_out"]["difference_pct"]) <= 2.0 and m["held_out"]["within"] is True and m["gate"] == "closed"
+    assert all(b["metering"] == m for b in verify.bills(sid))
+    # applied to both arms before pricing: a day's import, export and MDI blocks are on the register's scale
+    conn = sites.connections(sid)[0]
+    pr = verify._minute_prices(conn, date(2026, 10, 14), sid)
+    assert pr["k_energy"] == pytest.approx(m["energy"]) and pr["k_mdi"] == pytest.approx(m["mdi"])
+    sim = {"imp": np.full(1440, 100.0), "exp": np.zeros(1440), "bat": np.zeros(1440), "gen": np.zeros(1440), "gen_on": np.zeros(1440, dtype=bool),
+           "fuel": np.zeros(1440), "unserved": np.zeros(1440)}
+    site = sites.full(sid)
+    scaled = verify.price_arm(site, sim, pr, date(2026, 10, 14), 0.0, 0.0)
+    plain = verify.price_arm(site, sim, {**pr, "k_energy": 1.0, "k_mdi": 1.0}, date(2026, 10, 14), 0.0, 0.0)
+    assert scaled["cost_rs"] == pytest.approx(plain["cost_rs"] * m["energy"], rel=1e-4)
+    assert scaled["peak_kw"] == pytest.approx(plain["peak_kw"] * m["mdi"], rel=1e-4)
+    # a day priced before the factor was fitted is priced on another basis, so its month is re-scored when it settles
+    assert verify._price_basis(pr, None) != verify._price_basis({**pr, "k_energy": 1.0, "k_mdi": 1.0}, None)
+
+
+def test_a_held_out_bill_off_by_more_than_2_percent_keeps_the_gate_open(company):
+    sid = _metered_site("Gate Mill")
+    for p0, p1 in MONTHS[:2]:
+        verify.add_bill(sid, _printed(sid, p0, p1, 1.02, 1.01), "t")
+    oct_ = verify.add_bill(sid, _printed(sid, *MONTHS[2], 1.02, 1.01, total_off=1.05), "t")
+    m = oct_["metering"]
+    assert m["status"] == "calibrated" and m["held_out"]["within"] is False and m["gate"] == "open"
+    # deleting the held-out bill leaves two: uncalibrated again
+    verify.delete_bill(sid, oct_["id"], "t")
+    assert verify.bills(sid)[0]["metering"]["status"] == "uncalibrated"
+    assert verify._minute_prices(sites.connections(sid)[0], date(2026, 10, 14), sid)["k_energy"] == 1.0
+
+
+def test_a_factor_outside_097_to_103_is_a_data_finding_not_a_calibration(company):
+    """A meter 6 % below the register is a load the inverter does not see or a second meter: raised as a data finding, never applied."""
+    from gridlytics import alerts
+    sid = _metered_site("Short Meter Mill")
+    for p0, p1 in MONTHS:
+        b = verify.add_bill(sid, _printed(sid, p0, p1, 1.06, 1.0), "t")
+    m = b["metering"]
+    assert m["status"] == "out_of_band" and m["applied"] is False and m["energy"] == pytest.approx(1.06, abs=0.0005) and m["gate"] == "open"
+    assert verify._minute_prices(sites.connections(sid)[0], date(2026, 10, 14), sid)["k_energy"] == 1.0
+    alerts.evaluate(sid)
+    found = [a for a in alerts.listing(site_id=sid) if a["rule"] == "metering_factor"]
+    assert found and found[0]["category"] == "Data" and "6.0 %" in found[0]["title"]

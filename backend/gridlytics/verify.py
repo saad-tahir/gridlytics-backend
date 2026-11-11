@@ -80,11 +80,17 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
     if conn is None or conn["data"].get("regime") == "off_grid":
         z = np.zeros(1440)
         return {"c_imp": z, "c_exp": z, "peak": np.zeros(1440, dtype=bool), "mdi_rate": 0.0, "mdi_floor": 0.0, "mdi_interval": 30, "icp": {},
-                "tariff_version": None}
+                "tariff_version": None, "k_energy": 1.0, "k_mdi": 1.0}
     if month_q is None or (month_x is None and _legacy(conn)):
         tot = month_totals(site_id, conn, day)
         month_q = tot["import"] if month_q is None else month_q
         month_x = tot["export"] if month_x is None else month_x
+    # the connection's metering factor (fit_metering; round 7 stage 2, audit engine-savings-09): the meter's flows on the DISCO register's scale, the
+    # month's totals that settle its ICP case included, before either arm is priced (price_arm)
+    k_e, k_m = metering_scalars(site_id, conn)
+    if k_e != 1.0:
+        month_q = {p: float(v) * k_e for p, v in month_q.items()} if isinstance(month_q, dict) else month_q
+        month_x = {p: float(v) * k_e for p, v in month_x.items()} if isinstance(month_x, dict) else month_x
     # no swing: the month's own totals settle each period's ICP case, so an above-baseline period prices every minute at the ICP rate (plus the positive
     # FCA), as the bill engine charges the increment; the optimiser's binary for the uncertain middle does not exist in a replay. Legacy net metering
     # nets each period's exports first, so its exports decide both the ICP case and whether a period ends the month in surplus
@@ -101,7 +107,7 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
             "mdi_rate": mdi.get("rate_rs_per_kw", 0.0), "mdi_floor": float(mdi.get("floor_kw", 0.0) or 0.0), "mdi_interval": iv,
             "icp": {p: info["case"] for p, info in (vec.get("icp") or {}).items()},
             # the schedule version the day's rates come from (round 7, audit engine-savings-05: a month's MDI is priced at its own version)
-            "tariff_version": tariffs.card_for(conn["data"]["tariff_category"], day)[1].get("id")}
+            "tariff_version": tariffs.card_for(conn["data"]["tariff_category"], day)[1].get("id"), "k_energy": k_e, "k_mdi": k_m}
 
 
 def _genset_cost(site: dict, sim: dict, day: date, on_before: bool = False) -> tuple[float, float]:
@@ -121,9 +127,13 @@ def _genset_cost(site: dict, sim: dict, day: date, on_before: bool = False) -> t
 
 
 def price_arm(site: dict, sim: dict, pr: dict, day: date, e_end_kwh: float, v_end: float, gen_before: bool = False) -> dict:
-    """An arm's day priced by lever. `gen_before`: the arm's genset was running before the day's first minute (_genset_cost)."""
+    """An arm's day priced by lever. `gen_before`: the arm's genset was running before the day's first minute (_genset_cost). The grid flows are
+    scaled to the DISCO register by the connection's metering factor (`pr`'s k_energy on import and export, k_mdi on the MDI blocks; 1 where none is
+    applied), so both arms are priced on the register's scale (plan 8.2 layer 3)."""
     b = (site.get("assets") or {}).get("battery")
-    imp, exp = sim["imp"], sim["exp"]
+    k_e, k_m = float(pr.get("k_energy", 1.0) or 1.0), float(pr.get("k_mdi", 1.0) or 1.0)
+    raw_imp = np.asarray(sim["imp"], dtype=float)
+    imp, exp = raw_imp * k_e, np.asarray(sim["exp"], dtype=float) * k_e
     peak = pr["peak"]
     energy_peak = float(np.sum(pr["c_imp"][peak] * imp[peak]) / 60)
     energy_off = float(np.sum(pr["c_imp"][~peak] * imp[~peak]) / 60)
@@ -134,7 +144,7 @@ def price_arm(site: dict, sim: dict, pr: dict, day: date, e_end_kwh: float, v_en
     iv = int(pr.get("mdi_interval", 30) or 30)
     if iv <= 0 or len(imp) % iv:
         iv = 30
-    blocks = imp.reshape(len(imp) // iv, iv).mean(axis=1)  # the connection's MDI blocks, aligned to the hour as the bill engine aligns them
+    blocks = raw_imp.reshape(len(imp) // iv, iv).mean(axis=1) * k_m  # the connection's MDI blocks, aligned to the hour as the bill engine aligns them
     return {"peak_energy_rs": round(energy_peak, 2), "offpeak_energy_rs": round(energy_off, 2), "export_credit_rs": round(export_credit, 2),
             "genset_rs": round(gen_rs, 2), "wear_rs": round(wear, 2), "litres": round(litres, 2),
             "cost_rs": round(energy_peak + energy_off - export_credit + gen_rs + wear, 2), "import_kwh": round(float(imp.sum() / 60), 2),
@@ -1494,6 +1504,9 @@ def _price_basis(pr: dict, fuel: float | None) -> str:
     h.update(np.asarray(pr["peak"], dtype=bool).tobytes())
     h.update(json.dumps([round(float(pr["mdi_rate"]), 6), round(float(pr["mdi_floor"]), 6), int(pr["mdi_interval"]), pr["icp"],
                          None if fuel is None else round(float(fuel), 6)], sort_keys=True).encode())
+    k = [round(float(pr.get("k_energy", 1.0)), 6), round(float(pr.get("k_mdi", 1.0)), 6)]
+    if k != [1.0, 1.0]:
+        h.update(json.dumps({"metering": k}).encode())  # a metering factor applied (fit_metering); none leaves a digest from before it unchanged
     return h.hexdigest()[:20]
 
 
@@ -1509,6 +1522,9 @@ def _month_fingerprint(site_id: str, conn: dict | None, p0: date, p1: date) -> s
     td = [[d["day"], d.get("import_kwh"), d.get("completeness"), d.get("import_completeness")]
           for d in telemetry.days(site_id, p0.isoformat(), p1.isoformat())]
     body = {"tariffs": tv, "fuel": fuel, "conn": (conn or {}).get("data"), "native": nv, "telemetry": td}
+    k = metering_scalars(site_id, conn)
+    if k != (1.0, 1.0):  # a metering factor fitted or refitted on a new bill re-prices the month (fit_metering)
+        body["metering"] = list(k)
     pins = pilot_capture_pins(site_id)
     if pins:  # the captures a started pilot replays (round 7, audit flow-savings-pilot-bill-12); absent without a pilot, so other months keep theirs
         body["pilot_pins"] = pins
@@ -1650,15 +1666,18 @@ def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, actual: d
         # (mdi_month_rs, which no plan changes) apart from the rise above it (mdi_rise_rs). The actual arm pays the same month charge and its own
         # rise above the same bound: before, its rise was measured above max(M0, floor) alone, so an actual peak under the expected month peak
         # counted as a rise the hindsight plan was spared. A day never crosses its billing month, so M is the day's one peak
-        month_rs = float(bd.get("mdi_month_rs", 0.0) or 0.0)
+        # the actual arm is priced on the DISCO register's scale (price_arm, the metering factor): so is the hindsight plan's grid, the solve's
+        # meter-scale demand terms scaled by k_mdi and its energy by k_energy (round 7 stage 2, audit engine-savings-09)
+        k_e, k_m = float(pr.get("k_energy", 1.0) or 1.0), float(pr.get("k_mdi", 1.0) or 1.0)
+        month_rs = float(bd.get("mdi_month_rs", 0.0) or 0.0) * k_m
         rise_a = 0.0
         if mdi and res.get("M"):
             above = float(list(res.get("M_lb") or optimise.mdi_floors(mdi))[0])
-            rise_a = float(mdi["rate"]) * max(0.0, float(actual["peak_kw"]) - above)
+            rise_a = float(mdi["rate"]) * max(0.0, float(actual["peak_kw"]) - above * k_m)
             out["mdi_m0_kw"] = round(float(mdi["M0"]), 2)
         e_end_h = float(sol["E"][-1]) if p.get("battery") else 0.0
-        energy_h = optimise.H * float(np.sum(c_imp * np.asarray(sol["G"]) - c_exp * np.asarray(sol["X"])))
-        hind = energy_h + bd["genset_rs"] + bd["wear_rs"] + bd["unserved_rs"] + month_rs + bd["mdi_rise_rs"] - v_end * e_end_h
+        energy_h = k_e * optimise.H * float(np.sum(c_imp * np.asarray(sol["G"]) - c_exp * np.asarray(sol["X"])))
+        hind = energy_h + bd["genset_rs"] + bd["wear_rs"] + bd["unserved_rs"] + month_rs + k_m * bd["mdi_rise_rs"] - v_end * e_end_h
         act = float(actual["cost_rs"]) + voll * float(actual["unserved_kwh"]) + month_rs + rise_a - v_end * float(e_end_actual)
         solved = act - hind
         head = max(0.0, solved)
@@ -2823,6 +2842,7 @@ def add_bill(site_id: str, fields: dict, by: str) -> dict:
     store.audit(by, "entered a DISCO bill", site_id, {"period": f"{first}..{p1}", "connection_id": conn["id"], "difference_pct": diff,
                                                       "residuals": _residuals(rows)})
     _rechain(conn["id"], p1, rebuilt.get("credit_carried_rs", 0.0))
+    refit_metering(site_id, conn["id"])
     return _bill_answer(bid)
 
 
@@ -2862,6 +2882,8 @@ def correct_bill(site_id: str, bill_id: str, fields: dict, by: str) -> dict:
     if old_end != p1 or r["connection_id"] != conn["id"]:
         _rechain(r["connection_id"], old_end, 0.0)  # the bill that followed the old period has no bill before it now
     _rechain(conn["id"], p1, rebuilt.get("credit_carried_rs", 0.0))
+    for cid in dict.fromkeys((r["connection_id"], conn["id"])):
+        refit_metering(site_id, cid)
     return _bill_answer(bill_id)
 
 
@@ -2873,6 +2895,7 @@ def delete_bill(site_id: str, bill_id: str, by: str) -> dict:
     store.audit(by, "deleted a DISCO bill", site_id, {"bill_id": bill_id, "period": f"{r['period_start']}..{r['period_end']}",
                                                       "real": json.loads(r["real"]), "difference_pct": r["difference_pct"]})
     _rechain(r["connection_id"], date.fromisoformat(r["period_end"]), 0.0)
+    refit_metering(site_id, r["connection_id"])
     return {"id": bill_id, "deleted": True}
 
 
@@ -2909,11 +2932,12 @@ def _profile_fill(ts: np.ndarray, a: np.ndarray, covered: np.ndarray) -> tuple[n
 
 
 def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_exclusive: bool = False, power_factor_pct: float | None = None,
-                 credit_brought_forward_rs: float = 0.0) -> dict:
+                 credit_brought_forward_rs: float = 0.0, energy_scalar: float = 1.0, mdi_scalar: float = 1.0) -> dict:
     """The connection's bill over [p0, p1] (both billed) rebuilt from telemetry; with period_start_exclusive, p0 is the previous reading date and
     the bill starts the day after it (tariffs.rebuild's convention). Minutes no reading covers are filled from the period's own profile
     (`_profile_fill`), never counted as zero import; `completeness` is the share of the period's minutes a grid reading covers and `filled_kwh`
-    what the fill added, and below BILL_COMPLETENESS_MIN the comparison gives no verdict (`_check`)."""
+    what the fill added, and below BILL_COMPLETENESS_MIN the comparison gives no verdict (`_check`). `energy_scalar` and `mdi_scalar`: the
+    connection's metering factor (`fit_metering`), 1 for the stored rebuild, which the fit reads."""
     first = p0 + timedelta(days=1) if period_start_exclusive else p0
     t0 = twin.day_start_utc(first)
     t1 = twin.day_start_utc(p1) + 86400
@@ -2921,7 +2945,8 @@ def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_excl
     covered = _grid_covered(g["imp"], g["exp"])
     imp, filled_imp = _profile_fill(g["ts"], g["imp"], covered)
     exp, filled_exp = _profile_fill(g["ts"], g["exp"], covered)
-    out = tariffs.rebuild(g["ts"], imp, exp, conn, p0, p1, period_start_exclusive=period_start_exclusive, power_factor_pct=power_factor_pct,
+    out = tariffs.rebuild(g["ts"], imp, exp, conn, p0, p1, energy_scalar=float(energy_scalar), mdi_scalar=float(mdi_scalar),
+                          period_start_exclusive=period_start_exclusive, power_factor_pct=power_factor_pct,
                           credit_brought_forward_rs=credit_brought_forward_rs)
     out["completeness"] = round(float(covered.mean()) if len(covered) else 0.0, 4)
     out["filled_kwh"] = {"import": round(filled_imp, 3), "export": round(filled_exp, 3)}
@@ -2939,13 +2964,15 @@ def _connection_label(conns: list[dict], cid: str) -> dict | None:
     return None
 
 
-def _bill_row(r, conns: list[dict] | None = None) -> dict:
+def _bill_row(r, conns: list[dict] | None = None, fits: dict | None = None) -> dict:
     """A stored bill as the bill list answers it: the row, its printed figures compared line by line and its verdict (computed on read, so a bill
-    stored before these existed gets them too), and `connection`, the connection it is for (`_connection_label`)."""
+    stored before these existed gets them too), `connection`, the connection it is for (`_connection_label`), and `metering`, that connection's
+    metering factor (`metering_of`)."""
     b = {**dict(r), "real": json.loads(r["real"]), "rebuilt": json.loads(r["rebuilt"])}
     b["reconciliation"] = _reconcile(b["real"], b["rebuilt"])
     b["check"] = _check(b["rebuilt"], b["difference_pct"], b["reconciliation"])
     b["connection"] = _connection_label(conns if conns is not None else sites.connections(r["site_id"]), r["connection_id"])
+    b["metering"] = metering_of(r["site_id"], r["connection_id"], fits)
     return b
 
 
@@ -2953,4 +2980,105 @@ def bills(site_id: str) -> list[dict]:
     with store.connect() as con:
         rows = con.execute("SELECT * FROM bills WHERE site_id = ? ORDER BY period_start DESC", (site_id,)).fetchall()
     conns = sites.connections(site_id)
-    return [_bill_row(r, conns) for r in rows]
+    fits = sites.state(site_id).get("metering") or {}
+    return [_bill_row(r, conns, fits) for r in rows]
+
+
+# ------------------------------------------------------------------------------------------------ the metering factor (plan 6.3, 8.2; VER-13)
+
+#: A fitted factor inside this band is a calibration; outside it, a data finding (a load the inverter does not see, a second meter, a CT ratio, an
+#: 11 kV-side register), never applied (plan Part 6.3)
+METERING_BAND = (0.97, 1.03)
+#: Bills a fit needs: at least two fitted and a third, the latest, held out to test it (plan 6.3: "fitted on at least two bills and tested on a
+#: held-out third"; market lens B-6: a factor tested on the bills it was fitted on proves nothing)
+METERING_FIT_MIN = 2
+
+
+def _metering_blank(status: str, n: int = 0) -> dict:
+    return {"status": status, "energy": None, "mdi": None, "applied": False, "bills": n, "needed": METERING_FIT_MIN + 1, "fit_bills": [],
+            "held_out": None, "gate": "open", "band": list(METERING_BAND)}
+
+
+def fit_metering(site_id: str, conn: dict) -> dict:
+    """The connection's metering factor (plan 6.3, 8.2 layer 3; VER-13; round 7 stage 2, audit engine-savings-09): the site's meter is a CT or a site
+    meter at 1-minute means, not the DISCO's register, so one energy scalar (the printed peak and off-peak units over the rebuilt imports by period)
+    and one MDI scalar (the printed MDI over the rebuilt) are fitted, each as a ratio of sums over the connection's bills before its latest, and
+    tested on the latest, held out: its rebuild on the fitted scale against its printed total, within BILL_CHECK_PCT closing the 2 % gate.
+    A bill counts when it is the plant's connection's (metered), has BILL_COMPLETENESS_MIN of meter data and prints its units or its MDI; a scalar
+    needs METERING_FIT_MIN fitted bills that print its line (else 1). With fewer bills than a fit and a held-out one the rebuild runs uncalibrated
+    ("uncalibrated", the gate open); a factor outside METERING_BAND is "out_of_band", a data finding raised as an alert and not applied; else
+    "calibrated", applied to both arms of the ledger before pricing (`_minute_prices`' k_energy and k_mdi, `price_arm`).
+
+    Answer: {status, energy, mdi (the fitted scalars, None when unfitted), applied, bills (the bills that count), needed, fit_bills (their ids),
+    held_out ({bill_id, period_start, period_end, printed_rs, rebuilt_rs, difference_pct, within} or None), gate ("closed" or "open"), band}."""
+    if not conn.get("plant", True):
+        return _metering_blank("not_metered")
+    with store.connect() as con:
+        rows = con.execute("SELECT * FROM bills WHERE site_id = ? AND connection_id = ? ORDER BY period_end, created", (site_id, conn["id"])).fetchall()
+    usable = []
+    for r in rows:
+        real, rebuilt = json.loads(r["real"]), json.loads(r["rebuilt"])
+        comp = rebuilt.get("completeness")
+        if rebuilt.get("metered") is False or (tariffs._num(comp) and comp < BILL_COMPLETENESS_MIN):
+            continue
+        lines = {x["line"]: x for x in _reconcile(real, rebuilt)}
+        if ("units_peak" in lines and "units_off_peak" in lines) or "mdi_kw" in lines:
+            usable.append((r, real, lines))
+    out = _metering_blank("uncalibrated", len(usable))
+    if len(usable) < METERING_FIT_MIN + 1:
+        return out
+    fit, held = usable[:-1], usable[-1]
+
+    def ratio(keys: tuple[str, ...]) -> float | None:
+        have = [ln for _, _, ln in fit if all(k in ln for k in keys) and sum(ln[k]["rebuilt"] for k in keys) > 0]
+        if len(have) < METERING_FIT_MIN:
+            return None
+        return sum(ln[k]["printed"] for ln in have for k in keys) / sum(ln[k]["rebuilt"] for ln in have for k in keys)
+
+    k_e, k_m = ratio(("units_peak", "units_off_peak")), ratio(("mdi_kw",))
+    out.update(energy=None if k_e is None else round(k_e, 4), mdi=None if k_m is None else round(k_m, 4), fit_bills=[r["id"] for r, _, _ in fit])
+    if k_e is None and k_m is None:
+        return out
+    if any(k is not None and not METERING_BAND[0] <= k <= METERING_BAND[1] for k in (k_e, k_m)):
+        out["status"] = "out_of_band"
+        return out
+    r, real, _ = held
+    rebuilt = json.loads(r["rebuilt"])
+    cal = rebuild_bill(site_id, conn, date.fromisoformat(r["period_start"]), date.fromisoformat(r["period_end"]),
+                       power_factor_pct=real.get("power_factor_pct"), credit_brought_forward_rs=float(rebuilt.get("credit_brought_forward_rs") or 0.0),
+                       energy_scalar=k_e or 1.0, mdi_scalar=k_m or 1.0)
+    printed = real.get("total_rs")
+    diff = _difference(cal, float(printed)) if tariffs._num(printed) else None
+    within = diff is not None and abs(diff) <= BILL_CHECK_PCT
+    out.update(status="calibrated", applied=True,
+               held_out={"bill_id": r["id"], "period_start": r["period_start"], "period_end": r["period_end"], "printed_rs": printed,
+                         "rebuilt_rs": cal.get("total_rs"), "difference_pct": diff, "within": within},
+               gate="closed" if within else "open")
+    return out
+
+
+def refit_metering(site_id: str, connection_id: str) -> dict:
+    """Fit the connection's metering factor again (`fit_metering`) after one of its bills is entered, corrected or deleted, and keep it in the site's
+    carried state (`metering`, by connection id), where the ledger and the bill list read it."""
+    conn = next((c for c in sites.connections(site_id) if c["id"] == connection_id), None)
+    fit = fit_metering(site_id, conn) if conn else _metering_blank("uncalibrated")
+    fits = dict(sites.state(site_id).get("metering") or {})
+    fits[connection_id] = fit
+    sites.put_state(site_id, metering=fits)
+    return fit
+
+
+def metering_of(site_id: str, connection_id: str, fits: dict | None = None) -> dict:
+    """The connection's metering factor as last fitted (`refit_metering`), or uncalibrated where none has been."""
+    fits = (sites.state(site_id).get("metering") or {}) if fits is None else fits
+    return fits.get(connection_id) or _metering_blank("uncalibrated")
+
+
+def metering_scalars(site_id: str, conn: dict | None) -> tuple[float, float]:
+    """The energy and MDI scalars the ledger applies to both arms for the connection: its fitted factor where it is "calibrated", else (1, 1)."""
+    if not conn or not site_id:
+        return 1.0, 1.0
+    m = metering_of(site_id, conn["id"])
+    if not m.get("applied"):
+        return 1.0, 1.0
+    return float(m.get("energy") or 1.0), float(m.get("mdi") or 1.0)
