@@ -12,7 +12,7 @@ from datetime import date, timedelta
 import numpy as np
 import pytest
 from test_fix_r3_savings import SHIFTING
-from test_fix_savings import company, make_site  # noqa: F401 (company is a fixture)
+from test_fix_savings import company, make_site, standing_plan  # noqa: F401 (company is a fixture)
 
 from gridlytics import demo, optimise, sites, store, tariffs, telemetry, twin, verify
 
@@ -30,13 +30,14 @@ def _farm(name: str) -> str:
     for role, fields in spec["assets"].items():
         sites.put_asset(sid, role, fields, "t")
     sites.set_tier_capable(sid, "closed_loop")
-    # closed loop, so a day the plan ran claims by construction (round 7, audit engine-delivery-18: a demo advisory day is confirmed only from its
-    # mark and telemetry, as any advisory day)
+    # closed loop, so a day the plan ran claims while a plan is in force (the standing plan below; round 7, audit engine-delivery-18: a demo advisory
+    # day is confirmed only from its mark and telemetry, as any advisory day; audit engine-savings-02: a closed-loop day claims only under a plan)
     sites.set_tier_allowed(sid, "closed_loop", "t", "demo")
     sites.capture_native(sid, spec["native"], "t")
     # the scored days are before the first shipped HSD price (30 Oct 2026), which claims nothing (audit engine-money-live-15): the price they were
     # priced with until then, entered for them
     tariffs.add_fuel_price("hsd", "2026-10-01", 400.67, "t")
+    standing_plan(sid)
     return sid
 
 
@@ -317,27 +318,26 @@ def test_a_day_withheld_on_a_read_load_keeps_the_chain_and_the_days_around_it_cl
         assert r["claimed_rs"] == pytest.approx(f["claimed_rs"], abs=0.01)
 
 
-def test_a_day_whose_fidelity_claims_nothing_keeps_the_chain_and_a_later_dropout_on_it_is_stale(company):
+def test_a_day_withheld_on_read_inputs_keeps_the_chain_and_a_later_dropout_on_it_is_stale(company):
+    # a day that claims nothing on fully read load and PV keeps the chain when the plan ran on it: here a day withheld for its battery's and genset's
+    # data alone (round 7, audit pr-review-03: a day the plan did not run, a monitor day or a table not applied, now restarts the next plan day's
+    # chain from the measured state; test_fix_r7_savings_engine)
     sid = _farm("Farm unclaimed r6")
     _run(sid, [LEAD] + DAYS, _night_runs)
     ref = [verify.compute_day(sid, d, with_bound=False)["native"] for d in DAYS]
-    # the first day scored while the site is at tier monitor: a recommendation, which claims nothing, on fully read inputs
-    sites.set_tier_allowed(sid, "monitor", "t", "test")
+    cols = ("battery_power_w", "battery_soc_est_pct", "battery_soc_bms_pct", "genset_running", "genset_power_w", "genset_fuel_l")
+    assert _blank_evening(sid, DAYS[0], cols=cols) == 240
     first = verify.compute_day(sid, DAYS[0], with_bound=False)["native"]
-    assert first["fidelity"] == "recommendation_only" and first["claimed_rs"] == 0.0
-    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
+    assert first["claim_withheld"] == "battery_flow_unknown" and first["claimed_rs"] == 0.0 and first["chain"]["end"]["unread_min"] == 0
     rows = [_rows(sid, d)["native"] for d in DAYS[1:]]
     assert rows[0]["chain"]["from"] == "previous_day" and rows[0]["chain"]["start"]["state"] == first["chain"]["end"]["state"]
     for r, f in zip(rows, ref[1:]):
         assert r["claimed_rs"] == pytest.approx(f["claimed_rs"], abs=0.01)
     span = (DAYS[0].isoformat(), DAYS[2].isoformat())
-    s = verify.summary(sid, *span)
-    assert s["chain_stale_days"] == [] and s["baselines"]["native"]["saving_rs"] == pytest.approx(_continuous(sid, DAYS, ref[-1]["actual"]["v_end"]), abs=3.0)
-    # a dropout found later on the unclaimed day, re-scored on its own: the second day still chains from it, so the summary names it
+    assert verify.summary(sid, *span)["chain_stale_days"] == []
+    # a dropout found later on the withheld day, re-scored on its own: the second day still chains from it, so the summary names it
     assert _blank_evening(sid, DAYS[0], 20.0, 22.0) == 120
-    sites.set_tier_allowed(sid, "monitor", "t", "test")
     verify.compute_day(sid, DAYS[0], with_bound=False, forward=False)
-    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
     assert verify.summary(sid, *span)["chain_stale_days"] == [DAYS[1].isoformat()]
     verify.compute_range(sid, DAYS[0], DAYS[0])  # forward: the second day restarts from the measured state
     assert _rows(sid, DAYS[1])["native"]["chain"]["reset"] == "unread_inputs"
@@ -346,10 +346,11 @@ def test_a_day_whose_fidelity_claims_nothing_keeps_the_chain_and_a_later_dropout
 
 # ------------------------------------------------------------------------------------------------ a switchback site is held to the segmented replay
 
-def test_a_switchback_plan_block_claims_its_own_continuous_replay_with_the_hand_over_at_v_end(company):
+def test_a_switchback_plan_block_claims_its_own_continuous_replay_with_the_hand_over_at_what_the_native_block_realised(company):
     # plan 8.2: each block's baseline is native from the block's measured start, and the plan block's last day credits the energy it hands to the
-    # native block at v_end. So a switchback site's claims are the segmented replay (the plan block straight through, then its end gap at v_end),
-    # not native run straight through both blocks, where the handed energy is worth what native makes of it in the native block
+    # native block at v_end. So a switchback site's stored claims are the segmented replay (the plan block straight through, then its end gap at
+    # v_end). Round 7 (audit brief-vs-build-11): once the native block is over, the period's claim takes the hand-over at what the native block
+    # realised with it, as native run straight through both blocks counts it (test_fix_r7_savings_engine)
     sid = _farm("Farm segmented r6")
     _run(sid, [LEAD] + DAYS, [_night_runs, _night_runs, _night_runs, lambda s, ts: twin.native_policy(s, ts)])
     with store.connect() as con:
@@ -359,9 +360,13 @@ def test_a_switchback_plan_block_claims_its_own_continuous_replay_with_the_hand_
     seg = _continuous(sid, DAYS[:2], rows[1]["actual"]["v_end"])
     assert rows[0]["claimed_rs"] + rows[1]["claimed_rs"] == pytest.approx(seg, abs=3.0), (rows[0]["claimed_rs"] + rows[1]["claimed_rs"], seg)
     credit = verify._carry_over_credits(verify.switchback_blocks(sid), {d.isoformat(): r for d, r in zip(DAYS, rows)})
-    assert credit[0]["credit_rs"] == pytest.approx(rows[1]["chain"]["end"]["carry_rs"], abs=1.0)  # the credit reads the rounded energies
+    assert credit[0]["credit_v_end_rs"] == pytest.approx(rows[1]["chain"]["end"]["carry_rs"], abs=1.0)  # the credit reads the rounded energies
     # the native block replays native from the state it was handed: the inverter ran native, so it scores about nothing and claims nothing
     assert rows[2]["chain"]["reset"] == "switchback" and rows[2]["claimed_rs"] == 0.0
-    assert abs(rows[2]["saving_rs"]) < 0.02 * abs(credit[0]["credit_rs"]) + 5.0, (rows[2]["saving_rs"], credit)
+    assert abs(rows[2]["saving_rs"]) < 0.02 * abs(credit[0]["credit_v_end_rs"]) + 5.0, (rows[2]["saving_rs"], credit)
+    # round 7: the native block is over, so the hand-over is what it realised: the claim is native straight through both blocks, less the native
+    # block's own (unclaimed) score. Before: the segmented replay, the hand-over at v_end
+    assert credit[0]["realised"] and credit[0]["credit_rs"] == pytest.approx(rows[1]["chain"]["end"]["carry_rs"] + rows[2]["handover"]["rs"], abs=0.02)
+    pure = _continuous(sid, DAYS, rows[2]["actual"]["v_end"])
     s = verify.summary(sid, DAYS[0].isoformat(), DAYS[2].isoformat())
-    assert s["baselines"]["native"]["claimed_rs"] == pytest.approx(seg, abs=3.0) and s["chain_stale_days"] == []
+    assert s["baselines"]["native"]["claimed_rs"] == pytest.approx(pure - rows[2]["saving_rs"], abs=3.0) and s["chain_stale_days"] == []

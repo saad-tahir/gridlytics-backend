@@ -41,7 +41,18 @@ def make_site(name="Mill", control="manual", load_mode=0, tier="closed_loop", tw
     sites.set_tier_capable(sid, "closed_loop")
     sites.set_tier_allowed(sid, tier, "t")
     sites.capture_native(sid, native or {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 20}, "t")
+    standing_plan(sid)
     return sid
+
+
+def standing_plan(sid):
+    """A plan in force on every test day (made in 2015, valid to 2100), as the 15-minute ticks keep one in force at a live site: a closed-loop or demo
+    day claims only while a plan was in force (round 7, audit engine-savings-02). Stored as superseded, so `plans.current` still reads only the plans
+    a test makes."""
+    with store.connect() as con:
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status) VALUES (?,?,?,?,?,?,?,?)",
+                    (store.new_id(), sid, "2015-01-01T00:00:00+00:00", "2015-01-01T00:00:00+00:00", "2015-01-01T00:00:00+00:00",
+                     "2100-01-01T00:00:00+00:00", "a", "superseded"))
 
 
 def twin_day(sid, day, soc0, seed=1, policy=None):
@@ -240,7 +251,9 @@ def test_the_mdi_lever_respects_the_billing_floor_and_the_mdi_interval(company):
     assert s["baselines"]["native"]["levers"]["mdi"] == 0.0  # before: Rs 50,000 though the bill is the same at both peaks
     assert s["baselines"]["native"]["claimed_rs"] == 0.0
     _put_rows(sid, {"2026-10-10": {b: _row(peak_a=80.0, peak_b=120.0, rate=1250.0, floor=100.0) for b in ("native", "tuned")}})
-    assert verify.summary(sid, "2026-10-01", "2026-10-31")["baselines"]["native"]["levers"]["mdi"] == pytest.approx(25_000.0)
+    n = verify.summary(sid, "2026-10-01", "2026-10-31")["baselines"]["native"]
+    # the month's lever is 25,000; its one scored day carries 1/31 of it (round 7, audit flow-savings-pilot-bill-01: a day's share, not the month's)
+    assert n["mdi_months"]["2026-10"]["lever_rs"] == pytest.approx(25_000.0) and n["levers"]["mdi"] == pytest.approx(25_000.0 / 31, abs=0.01)
     # 15-minute MDI blocks, as the bill engine reads them
     conn = {"id": "c1", "data": {"disco_group": "xwdisco", "tariff_category": "B-2(b)", "regime": "none", "sanctioned_load_kw": 400, "export_cap_kw": 0,
                                  "mdi_interval_min": 15, "icp": {"eligible": False}, "tax": {"province": "punjab"}, "seasonal_multiplier": 1.0,
@@ -452,12 +465,19 @@ def test_the_perfect_foresight_bound_prices_its_end_energy_and_ignores_todays_ov
 
     def fake_solve(p, time_limit=10.0, **kw):
         seen["p"] = p
-        return {"status": "optimal", "breakdown": {"energy_rs": 1000.0, "genset_rs": 0.0, "wear_rs": 50.0}, "sol": {"E": np.array([107.5, 21.5])}}
+        T = int(p["T"])
+        return {"status": "optimal", "time_limited": False, "M": [],
+                "breakdown": {"energy_rs": 1000.0, "genset_rs": 0.0, "wear_rs": 50.0, "unserved_rs": 0.0, "mdi_rise_rs": 0.0},
+                "sol": {"G": np.full(T, 1000.0 / (0.25 * 40.0 * T)), "X": np.zeros(T), "E": np.array([107.5, 21.5])}}
 
     monkeypatch.setattr(verify.optimise, "solve", fake_solve)
     s = _series(outage=None)
-    bound = verify._bound(sites.full(sid), WEEKDAY, s, {}, 0.5, 5000.0, e_end_native=107.5, c_next=40.0, v_end=30.0)
-    assert bound == pytest.approx(5000.0 - (1050.0 - (21.5 - 107.5) * 30.0))  # before: 3,950, the drained 86 kWh for free
+    # round 7 (audit engine-optimiser-14): the bound is the day's saving plus the hindsight plan's headroom over the actual arm, each priced on the
+    # solve's terms at the ledger's prices; here the actual arm cost 5,000 and ended where native did (107.5 kWh), the saving 0
+    pr = {"c_imp": np.full(1440, 40.0), "c_exp": np.zeros(1440), "peak": np.zeros(1440, dtype=bool)}
+    out = verify._bound(sites.full(sid), WEEKDAY, s, pr, 0.5, {"cost_rs": 5000.0, "unserved_kwh": 0.0, "peak_kw": 0.0}, 107.5, 0.0, c_next=40.0,
+                        v_end=30.0)
+    assert out["bound_rs"] == pytest.approx(5000.0 - (1050.0 - (21.5 - 107.5) * 30.0))  # before: 3,950, the drained 86 kWh for free
     p = seen["p"]
     assert p["terminal"]["c_next"] == 40.0 and p["terminal"]["H_peak"] >= 24
     assert not p["override_mask"].any() and "reserve_manual" not in p and not p["battery"]["charge_block"].any()
@@ -486,11 +506,14 @@ def test_the_switchback_credits_the_plan_block_for_the_energy_it_hands_over(comp
                                               v_end=30.0)}
     _put_rows(sid, rows)
     res = verify.switchback_result(sid)
-    credits = res["carry_over_credits"]
+    credits = [c for c in res["carry_over_credits"] if c["from_arm"] == "plan"]
     assert [c["boundary"] for c in credits] == ["2026-09-08", "2026-09-22"] and all(c["credit_rs"] == pytest.approx(4500.0) for c in credits)
+    # round 7 (audit engine-savings-11): the native block's hand-over to the plan block on 15 Sep is credited too, against the plan days' mean end
+    # energy ((12 x 100 + 2 x 200) / 14 kWh): the native block ended 14 kWh below it, so the plan block started short
+    back = (1600.0 / 14 - 100.0) * 30.0
     r = res["result"]
-    assert r["carry_over_credit_rs"] == pytest.approx(9000.0)
-    assert r["saving_rs_per_day_unadjusted"] == pytest.approx(1000.0 + 9000.0 / 14, abs=0.01)
+    assert r["carry_over_credit_rs"] == pytest.approx(9000.0 + back, abs=0.01)
+    assert r["saving_rs_per_day_unadjusted"] == pytest.approx(1000.0 + (9000.0 + back) / 14, abs=0.01)
     assert r["saving_rs_per_day_unadjusted_before_carry_over"] == pytest.approx(1000.0, abs=0.01)
 
 
@@ -502,11 +525,10 @@ def test_preliminary_holds_until_eight_switchback_weeks_and_the_fca_is_billed(co
     s = verify.summary(sid, "2026-10-01", "2026-10-31")
     assert s["baselines"]["native"]["verified_days"] >= 28
     assert s["preliminary"] is True and s["final_conditions"]["switchback_weeks"] == 0  # before: final at 28 verified days
+    # eight weeks of blocks painted the day before they began (round 7, audit security-roles-06: only blocks painted ahead count), then locked
+    verify.plan_switchback(sid, date(2026, 8, 1), 4, 7, "t", seed=1, painted_on=date(2026, 7, 31))
     with store.connect() as con:
-        for k in range(8):
-            a = date(2026, 8, 1) + timedelta(days=7 * k)
-            con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,1)",
-                        (sid, a.isoformat(), (a + timedelta(days=6)).isoformat(), "plan" if k % 2 else "native"))
+        con.execute("UPDATE switchback SET locked = 1 WHERE site_id = ?", (sid,))
     s = verify.summary(sid, "2026-10-01", "2026-10-31")
     assert s["final_conditions"]["fca_billed"] is True and s["preliminary"] is False
     _put_rows(sid, {d.isoformat(): {"native": _row(100.0, 100.0), "tuned": _row(100.0, 100.0)} for d in _days(date(2026, 11, 1), date(2026, 11, 28))})

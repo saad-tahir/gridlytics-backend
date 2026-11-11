@@ -424,7 +424,11 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
     The genset command per minute (manual start control): 1 a planned run, 0 no planned run (a planned run's tail stops after its minimum run; the operator
     still starts the genset when the lights would go out, and such a rescue run stops once the battery is charged or the grid returns), -1 the operator's own
     rule (the native baseline). `gen_elapsed0`, `outage_min0` and `gen_rescue0` carry the state of a run cut into several calls (the live demo's ticks);
-    the result's `gen_elapsed_end`, `outage_min_end` and `gen_rescue_end` are what the next call takes."""
+    the result's `gen_elapsed_end`, `outage_min_end` and `gen_rescue_end` are what the next call takes.
+
+    `policy["cycle_soc"]` (0-1 per minute, NaN where off; round 7, audit engine-savings-03) is HOMER's cycle charging, the tuned baseline's rule at a
+    genset site: in an outage a running set also charges the battery towards that state of charge, near its rating, and the operator's rule or a
+    soc_threshold controller stops it there instead of at its own level."""
     pv_av, load, crit, grid = series["pv"], series["load"], series["crit"], series["grid"]
     n = len(pv_av)
     dt = 1.0 / 60.0
@@ -449,6 +453,9 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
     if pv_full is None:
         pv_full = np.zeros(n, dtype=bool)
     has_bat = plant.e_nom > 0
+    cyc = policy.get("cycle_soc")
+    if cyc is None or not has_bat:
+        cyc = np.full(n, np.nan)
     for i in range(n):
         g = grid[i] > 0.5
         pv = pv_av[i]
@@ -536,12 +543,13 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                     want = outage_min >= 1
                 elif plant.gen_control == "soc_threshold":
                     soc_now = e / max(plant.e_nom, 1e-9)
-                    want = (gen_on and soc_now < min(0.9, plant.gen_soc_on + 0.5)) or soc_now < plant.gen_soc_on or not has_bat
+                    stop = min(0.9, plant.gen_soc_on + 0.5) if np.isnan(cyc[i]) else cyc[i]
+                    want = (gen_on and soc_now < stop) or soc_now < plant.gen_soc_on or not has_bat
                 elif plant.gen_control == "manual":
                     # the lights would go out: the battery is at its floor (or there is none) ten minutes into the outage
                     at_floor = (not has_bat) or e <= e_min + 0.02 * plant.e_nom
                     lights_out = at_floor and outage_min >= 10
-                    full = has_bat and e >= 0.8 * plant.e_nom
+                    full = has_bat and e >= (0.8 if np.isnan(cyc[i]) else cyc[i]) * plant.e_nom
                     if gcmd[i] == 1:
                         want = outage_min >= 5
                         if gen_on:
@@ -568,6 +576,8 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
             served = served_full if off_grid_site or (plant.load_mode == 1 and gen_on) else crit[i]
             if gen_on:
                 need = served - pv
+                if not np.isnan(cyc[i]):  # cycle charging: the set also charges the battery towards the set point, up to its rating
+                    need += min(plant.p_ch, max(0.0, cyc[i] * plant.e_nom - e) / plant.eta_c / dt)
                 gen = min(plant.gen_kw, max(plant.gen_fmin * plant.gen_kw, need))
                 surplus = gen + pv - served
                 if surplus > 0:

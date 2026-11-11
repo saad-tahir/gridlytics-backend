@@ -3,19 +3,25 @@
 The actual arm is the measured day; the baseline arms are the native capture and the tuned table replayed by the twin on the measured PV, load and
 outages. Each baseline's replays are chained: a day starts from that baseline's own end state of the day before (its state of charge and its genset's
 run, as the twin carries them), and from the actual arm's state only on the first scored day, after a day that was not scored, after a day that
-claims nothing and whose replay ran over unread load or PV, and on the first day of a switchback block that changes arm (_chain_starts). Every arm is priced at 1-minute resolution with the same tariff version, on the connection's
+claims nothing and whose replay ran over unread load or PV, on the first plan day after days the plan did not run, and on the first day of a
+switchback block that changes arm (_chain_starts). Every arm is priced at 1-minute resolution with the same tariff version, on the connection's
 bearable-cost basis, with the dated fuel price and the same wear charge; the gap in stored energy between the actual arm and the baseline is valued at
 the terminal value, and a day's carry-over is the change of that valued gap over the day, so the days of a chain add up to one continuous replay with
-its end-of-period energy term (carry-over priced, not removed). The perfect-foresight bound is a hindsight re-solve, labelled not achievable.
+its end-of-period energy term (carry-over priced, not removed). Energy a claiming day hands to days the plan did not run (a switchback native
+block, control paused) is claimed at what those days realised with it once they are over, provisional until then (_handover). The
+perfect-foresight bound is a hindsight re-solve, labelled not achievable: the day's saving plus what the hindsight plan saves over the actual arm on
+every term it minimised (_bound).
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 
-from . import forecast, optimise, plans, sites, store, tariffs, telemetry, twin
+from . import forecast, optimise, plans, sites, solar, store, tariffs, telemetry, twin
 from .schemas import Refusal
 
 PKT = timezone(timedelta(hours=5))
@@ -73,7 +79,8 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
     t0 = twin.day_start_utc(day)
     if conn is None or conn["data"].get("regime") == "off_grid":
         z = np.zeros(1440)
-        return {"c_imp": z, "c_exp": z, "peak": np.zeros(1440, dtype=bool), "mdi_rate": 0.0, "mdi_floor": 0.0, "mdi_interval": 30, "icp": {}}
+        return {"c_imp": z, "c_exp": z, "peak": np.zeros(1440, dtype=bool), "mdi_rate": 0.0, "mdi_floor": 0.0, "mdi_interval": 30, "icp": {},
+                "tariff_version": None}
     if month_q is None or (month_x is None and _legacy(conn)):
         tot = month_totals(site_id, conn, day)
         month_q = tot["import"] if month_q is None else month_q
@@ -92,7 +99,9 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
         iv = 30
     return {"c_imp": np.repeat(vec["c_imp"], 15), "c_exp": np.repeat(c_exp, 15), "peak": np.repeat(vec["peak"], 15),
             "mdi_rate": mdi.get("rate_rs_per_kw", 0.0), "mdi_floor": float(mdi.get("floor_kw", 0.0) or 0.0), "mdi_interval": iv,
-            "icp": {p: info["case"] for p, info in (vec.get("icp") or {}).items()}}
+            "icp": {p: info["case"] for p, info in (vec.get("icp") or {}).items()},
+            # the schedule version the day's rates come from (round 7, audit engine-savings-05: a month's MDI is priced at its own version)
+            "tariff_version": tariffs.card_for(conn["data"]["tariff_category"], day)[1].get("id")}
 
 
 def _genset_cost(site: dict, sim: dict, day: date, on_before: bool = False) -> tuple[float, float]:
@@ -132,16 +141,60 @@ def price_arm(site: dict, sim: dict, pr: dict, day: date, e_end_kwh: float, v_en
             "genset_hours": round(float(np.sum(sim["gen_on"]) / 60), 2), "e_end_kwh": round(e_end_kwh, 2), "v_end": round(v_end, 2)}
 
 
+def _balance_fill(g: dict, on_grid: bool, has_bat: bool, has_gen: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """A blank PV or load reading closed from the minute's energy balance (PV + import + battery discharge + genset = served load + export) where
+    every other flow of the minute was read (the genset's power, or its running flag reading off; no grid flow off grid): the replays run on what the
+    site had, not on a zero. Where both are blank the balance still gives their difference exactly, and the PV is drawn across the gap. Counted as
+    zero, a PV blank at noon made native's replay buy or burn for the whole array (+Rs 660 on a farm day for 5 minutes, +Rs 1,370 at a grid site for
+    15) and a load blank made it serve nothing (round 7, audit pr-review-11). Returns the PV and the load in kW (NaN where still unread) and which
+    minutes were filled."""
+    n = len(g["ts"])
+    zero = np.zeros(n)
+    pv, load = np.asarray(g["pv"], dtype=float), np.asarray(g["load"], dtype=float)
+    bat = np.asarray(g["bat"], dtype=float) if has_bat else zero
+    if has_gen:
+        p_gen = np.asarray(g["gen"], dtype=float)
+        gen = np.where(np.isnan(p_gen) & (np.nan_to_num(np.asarray(g["gen_on"], dtype=float), nan=1.0) < 0.5), 0.0, p_gen)
+    else:
+        gen = zero
+    imp, exp = (np.asarray(g["imp"], dtype=float), np.asarray(g["exp"], dtype=float)) if on_grid else (zero, zero)
+    rest = imp + bat + gen - exp                      # NaN wherever one of them is unread
+    known = ~np.isnan(rest)
+    pv_fill = np.isnan(pv) & ~np.isnan(load) & known
+    load_fill = np.isnan(load) & ~np.isnan(pv) & known
+    pv_out = np.where(pv_fill, np.maximum(load - rest, 0.0), pv)
+    load_out = np.where(load_fill, np.maximum(pv + rest, 0.0), load)
+    # both blank: the balance gives the net (load less PV) exactly, which the battery and the genset answer; the PV is drawn across the gap from the
+    # readings either side (at least what the net exports or charges), and the load is the PV plus the net
+    both = np.isnan(pv) & np.isnan(load) & known
+    if both.any():
+        have = np.where(~np.isnan(pv_out))[0]
+        guess = np.interp(np.arange(n), have, pv_out[have]) if have.size else zero
+        pv_both = np.maximum(np.maximum(guess, -rest), 0.0)
+        pv_out = np.where(both, pv_both, pv_out)
+        load_out = np.where(both, np.maximum(pv_both + rest, 0.0), load_out)
+        pv_fill, load_fill = pv_fill | both, load_fill | both
+    return pv_out, load_out, pv_fill, load_fill
+
+
 def _replay_inputs(site: dict, day: date) -> tuple[dict, dict] | tuple[None, None]:
+    """The replays' inputs for a day (PV available, load demanded, critical load, grid presence, temperature) and the measured day (`g`, the minute
+    grid; `f`, its gaps filled as telemetry.filled does). A blank PV or load closed from the balance is the replays' input there (_balance_fill;
+    `filled` names those minutes); what stays blank counts as zero."""
     t0 = twin.day_start_utc(day)
     g = telemetry.minute_grid(site["id"], t0, t0 + 86400)
     if g["completeness"] < 0.5:
         return None, None
     f = telemetry.filled(g)
+    conn = (site.get("connections") or [None])[0]
+    assets = site.get("assets") or {}
+    pv, load, pv_fill, load_fill = _balance_fill(g, conn is not None and conn["data"].get("regime") != "off_grid", bool(assets.get("battery")),
+                                                 bool(assets.get("genset")))
+    pv, load = np.nan_to_num(pv, nan=0.0), np.nan_to_num(load, nan=0.0)
     hours = ((g["ts"] + 5 * 3600) % 86400) // 3600
-    series = {"ts": g["ts"], "pv": f["pv"] + f["curtail"], "load": f["load"] + f["unserved"], "grid": f["grid"],
-              "crit": np.minimum(twin.critical_share(site)[hours], f["load"] + f["unserved"]), "temp": np.nan_to_num(g["temp"], nan=30.0)}
-    return series, {"g": g, "f": f}
+    series = {"ts": g["ts"], "pv": pv + f["curtail"], "load": load + f["unserved"], "grid": f["grid"],
+              "crit": np.minimum(twin.critical_share(site)[hours], load + f["unserved"]), "temp": np.nan_to_num(g["temp"], nan=30.0)}
+    return series, {"g": g, "f": f, "filled": {"pv": pv_fill, "load": load_fill}}
 
 
 def _soc(g: dict) -> np.ndarray:
@@ -528,12 +581,46 @@ def _gen_from_balance(g: dict, f: dict, bat: np.ndarray, plant: twin.Plant,
     return closed, on, gen, fuel, unseen
 
 
+def pilot_capture_pins(site_id: str) -> list[dict]:
+    """The native captures a started pilot replays, oldest first: [{version, from}], `from` the first local day each stands for. The start pins the
+    capture the pilot was signed off on, from the start's day; an amendment adopts a later capture from the day it was captured (round 7, audit
+    flow-savings-pilot-bill-12: a capture recorded after the start changes no baseline by itself). A pilot started before the start stored its pin
+    is pinned to the capture that was the latest at its start. No pilot started: []."""
+    with store.connect() as con:
+        r = con.execute("SELECT data, started FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
+        if r is None or not r["started"]:
+            return []
+        try:
+            data = json.loads(r["data"])
+        except ValueError:
+            data = {}
+        pins = data.get("capture_pins") if isinstance(data, dict) else None
+        if isinstance(pins, list) and pins:
+            return [{"version": int(p["version"]), "from": str(p["from"])[:10]} for p in pins if isinstance(p, dict) and p.get("version") and p.get("from")]
+        v = con.execute("SELECT MAX(version) FROM native_settings WHERE site_id = ? AND captured_at <= ?", (site_id, r["started"])).fetchone()[0]
+    if v is None:
+        return []
+    return [{"version": int(v), "from": local_day(r["started"]).isoformat()}]
+
+
+def local_day(stamp: str) -> date:
+    """The Pakistan day of a stored UTC time stamp."""
+    t = datetime.fromisoformat(stamp)
+    return (t if t.tzinfo else t.replace(tzinfo=timezone.utc)).astimezone(PKT).date()
+
+
 def native_for_day(site_id: str, day: date) -> dict | None:
     """The native capture in force on a day: the latest captured by the day's end, else the first one (the onboarding capture stands for the days before
-    it was recorded). Plan 8.1 and 8.4: a later installer change is a new dated capture, and a day is re-scored with that day's inputs."""
+    it was recorded). Plan 8.1 and 8.4: a later installer change is a new dated capture, and a day is re-scored with that day's inputs. From a
+    pilot's start on, the capture the pilot pinned (pilot_capture_pins): a later capture stands for a pilot day only once an amendment adopts it."""
+    pin = next((p for p in reversed(pilot_capture_pins(site_id)) if p["from"] <= day.isoformat()), None)
     end = datetime.fromtimestamp(twin.day_start_utc(day) + 86400, timezone.utc).isoformat(timespec="seconds")
     with store.connect() as con:
-        r = con.execute("SELECT * FROM native_settings WHERE site_id = ? AND captured_at <= ? ORDER BY version DESC LIMIT 1", (site_id, end)).fetchone()
+        r = None
+        if pin is not None:
+            r = con.execute("SELECT * FROM native_settings WHERE site_id = ? AND version = ?", (site_id, pin["version"])).fetchone()
+        if r is None:
+            r = con.execute("SELECT * FROM native_settings WHERE site_id = ? AND captured_at <= ? ORDER BY version DESC LIMIT 1", (site_id, end)).fetchone()
         if r is None:
             r = con.execute("SELECT * FROM native_settings WHERE site_id = ? ORDER BY version ASC LIMIT 1", (site_id,)).fetchone()
     if r is None:
@@ -544,7 +631,61 @@ def native_for_day(site_id: str, day: date) -> dict | None:
     return d
 
 
+#: a baseline day counts as complete when at least this share of its minutes was read: past the 5 % of unread minutes at which a replay withholds
+#: its claim (round 7, audit pr-review-11), a day is no reference (round 7, audit pages-D-19)
+BASELINE_DAY_COMPLETE = 0.95
+
+
+def baseline_quality(site_id: str, start: str | None, days: int, today: date) -> dict | None:
+    """The pilot's tab A check (R8 2.13: "data completeness check for the window so far"; round 7, audit pages-D-19): over the baseline window's
+    days that are over (`through`, at most yesterday), each day's share of minutes read (None: no data), how many have data, how many are complete
+    (BASELINE_DAY_COMPLETE), and the window's completeness so far (a day without data counts as 0). None without a window."""
+    if not start:
+        return None
+    d0 = date.fromisoformat(start)
+    d1 = d0 + timedelta(days=int(days) - 1)
+    through = min(d1, today - timedelta(days=1))
+    rows = {d["day"]: d for d in telemetry.days(site_id, d0.isoformat(), through.isoformat())} if through >= d0 else {}
+    out = []
+    d = d0
+    while d <= through:
+        c = (rows.get(d.isoformat()) or {}).get("completeness")
+        out.append({"day": d.isoformat(), "completeness": None if c is None else round(float(c), 4)})
+        d += timedelta(days=1)
+    n = len(out)
+    return {"from": d0.isoformat(), "to": d1.isoformat(), "through": through.isoformat() if n else None, "days_so_far": n,
+            "days_with_data": sum(1 for x in out if x["completeness"]),
+            "days_complete": sum(1 for x in out if (x["completeness"] or 0) >= BASELINE_DAY_COMPLETE),
+            "completeness": round(sum(x["completeness"] or 0.0 for x in out) / n, 4) if n else None, "day_complete_share": BASELINE_DAY_COMPLETE,
+            "days": out}
+
+
+def pilot_kpis(site_id: str) -> list[str]:
+    """The KPIs the pilot measures from the baseline window on (R8 2.13, tab A: "the list of KPIs that will be computed during it"; round 7, audit
+    pages-D-19): the telemetry day totals the site's connection and assets give, by their keys in telemetry_days (outage_hours from
+    outage_minutes), as the Savings page's energy figures name them."""
+    site = sites.full(site_id) or {}
+    assets = site.get("assets") or {}
+    conns = site.get("connections") or []
+    regime = conns[0]["data"].get("regime") if conns else "off_grid"
+    keys = []
+    if regime != "off_grid":
+        keys += ["import_kwh", "peak_import_kwh", "peak_kw"] + (["export_kwh"] if regime in ("net_billing", "net_metering_legacy") else []) + ["outage_hours"]
+    if assets.get("pv"):
+        keys.append("pv_kwh")
+    keys.append("load_kwh")
+    if assets.get("battery"):
+        keys += ["throughput_kwh", "min_soc"]
+    if assets.get("genset"):
+        keys += ["genset_hours", "litres"]
+    return keys + ["unserved_kwh"]
+
+
 TUNED_VARIANTS = [(fp, hb, gc) for fp in (20, 40) for hb in (False, True) for gc in (0, 80)]
+
+#: HOMER cycle charging's set points (state of charge, %) the tuned fit tries at a genset site with a battery (plan 8.1: "at genset sites additionally
+#: HOMER-style cycle charging with a set-point SoC (the genset runs near rated output and charges to the set point)"; round 7, audit engine-savings-03)
+CYCLE_SET_POINTS = (60.0, 80.0, 95.0)
 
 
 def tuned_table(site: dict, variant: tuple, peak_window: tuple[int, int]) -> list[dict]:
@@ -561,14 +702,59 @@ def tuned_table(site: dict, variant: tuple, peak_window: tuple[int, int]) -> lis
     return sorted(rows, key=lambda r: r["start"])
 
 
+def self_use_table(site: dict) -> list[dict]:
+    """The native-like self-use table: self-use all day at the native capture's backup floor, no grid charging and no forced discharge (round 7,
+    audit engine-money-live-11: every TUNED_VARIANTS table forces a discharge in the peak window, and none was plain self-use)."""
+    backup = float(((site.get("native") or {}).get("body") or {}).get("backup_soc_pct", 20.0))
+    return [{"start": "00:00", "mode": "self_use", "soc_floor_pct": backup, "soc_target_pct": 100.0, "grid_charge": False}]
+
+
+def tuned_candidates(site: dict, peak_window: tuple[int, int]) -> list[dict]:
+    """The rules the tuned fit tries, in order (a later one replaces an earlier one only when it is cheaper on the window): the native capture
+    itself (`kind` "native_capture", its body under `native`: the installer's own table or mode is a static table of the brand grammar, so the best
+    one is never worse than it), the native-like self-use table ("self_use") and the grid of TOU tables ("tou_variant", TUNED_VARIANTS). Round 7
+    (audit engine-money-live-11): before, only the grid was tried, so a hand-tuned capture beat the "best" table and the tuned arm could cost more
+    than native (plan VER-12: the fitted table replays to a lower bill than the native capture)."""
+    body = (site.get("native") or {}).get("body") or {"work_mode": "self_use", "backup_soc_pct": 20.0, "slots": []}
+    return ([{"kind": "native_capture", "table": None, "native": body, "cycle_soc_pct": None},
+             {"kind": "self_use", "table": self_use_table(site), "cycle_soc_pct": None}]
+            + [{"kind": "tou_variant", "table": tuned_table(site, v, peak_window), "cycle_soc_pct": None} for v in TUNED_VARIANTS])
+
+
+def tuned_policy(rule: dict, ts: np.ndarray) -> dict:
+    """The tuned baseline's per-minute policy (fit_tuned's rule): its static table (or, where the native capture is the best, the capture as the
+    inverter holds it), and at a genset site its cycle-charging set point, if any."""
+    if rule.get("native") is not None:
+        pol = twin.native_policy({"native": {"body": rule["native"]}}, ts)
+    else:
+        pol = twin.table_policy(rule["table"], ts)
+    if rule.get("cycle_soc_pct") is not None:
+        pol["cycle_soc"] = np.full(len(ts), float(rule["cycle_soc_pct"]) / 100.0)
+    return pol
+
+
+def _cycles(plant: twin.Plant) -> bool:
+    """Whether the tuned fit tries cycle charging: a genset someone or something starts, and a battery for it to charge."""
+    return plant.gen_kw > 0 and plant.gen_control != "none" and plant.e_nom > 0
+
+
 def _tuned_key(site: dict, day: date) -> str:
-    """The tuned table's cache key: per month and per native capture (its backup floor shapes the table)."""
-    return f"tuned:{site['id']}:{day.strftime('%Y-%m')}:v{(site.get('native') or {}).get('version', 0)}"
+    """The tuned rule's cache key: per month and per native capture (its backup floor shapes the table, and the capture is a candidate); `cc` since
+    the rule carries cycle charging, `nc` since the native capture and the self-use table are candidates (round 7: a rule cached before either is
+    fitted again)."""
+    return f"tuned:{site['id']}:{day.strftime('%Y-%m')}:v{(site.get('native') or {}).get('version', 0)}:cc:nc"
 
 
-def fit_tuned(site: dict, day: date) -> list[dict]:
-    """The best static table on the observation window (the 7 days before the month starts, else the first 7 measured days), cached per month and
-    capture."""
+def fit_tuned(site: dict, day: date) -> dict:
+    """The tuned baseline's rule, {"kind", "table", "native", "cycle_soc_pct", "fit"}: the cheapest of tuned_candidates on the observation window
+    (the 7 days before the month starts, else the first 7 measured days), cached per month and capture. At a genset site with a battery (plan 8.1)
+    the best rule is then tried with HOMER cycle charging at each of CYCLE_SET_POINTS (twin.simulate's `cycle_soc`: a running set charges the
+    battery near its rating and stops at the set point), and the cheapest of these on the window is the rule; `cycle_soc_pct` is None where the rule
+    alone is cheapest or there is no genset. Before (round 7, audit engine-savings-03), the tuned arm ran the operator's genset rule, so at an
+    off-grid site, where the table's modes do not apply, it was the native arm minute for minute.
+
+    `fit` holds the window's days and what the rule and the native capture cost over them, each day's stored-energy change valued as the ledger
+    values it: the rule's is never above the capture's, since the capture is a candidate (round 7, audit engine-money-live-11)."""
     key = _tuned_key(site, day)
     held = store.get_setting(key)
     if held:
@@ -579,14 +765,14 @@ def fit_tuned(site: dict, day: date) -> list[dict]:
     plant = twin.plant_of(site)
     month0 = day.replace(day=1)
     cands = [month0 - timedelta(days=i) for i in range(1, 8)]
-    best, best_cost = None, None
     inputs = [(d, *_replay_inputs(site, d)) for d in cands]
     inputs = [x for x in inputs if x[1] is not None]
     if not inputs:
         inputs = [(d, *_replay_inputs(site, d)) for d in (day - timedelta(days=i) for i in range(0, 7))]
         inputs = [x for x in inputs if x[1] is not None]
+    plain = {"kind": "tou_variant", "table": tuned_table(site, (20, False, 0), window), "cycle_soc_pct": None}
     if not inputs or not (site.get("assets") or {}).get("battery"):
-        return tuned_table(site, (20, False, 0), window)
+        return plain
     on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
     month_t: dict = {}
     prepared = []
@@ -598,19 +784,57 @@ def fit_tuned(site: dict, day: date) -> list[dict]:
         if on_grid and mk not in month_t:
             month_t[mk] = month_totals(site["id"], conn, d)
         tot = month_t.get(mk) or {}
-        prepared.append((d, series, _minute_prices(conn, d, site["id"], tot.get("import"), tot.get("export")), soc0))
+        pr = _minute_prices(conn, d, site["id"], tot.get("import"), tot.get("export"))
+        prepared.append((d, series, pr, soc0, _terminal_value(site, d, series, pr)[1]))
     if not prepared:
-        return tuned_table(site, (20, False, 0), window)
-    for v in TUNED_VARIANTS:
-        table = tuned_table(site, v, window)
+        return plain
+
+    def window_cost(rule: dict) -> float:
+        """The rule's cost over the window, each day's stored-energy change valued at its v_end as the ledger values it (round 7: priced at 0, a rule
+        that ends the day fuller paid for the energy and got nothing for it, and one that drains the battery got it free; part of audit
+        engine-money-live-11)."""
         total = 0.0
-        for d, series, pr, soc0 in prepared:
-            sim = twin.simulate(series, twin.table_policy(table, series["ts"]), plant, soc0)
-            total += price_arm(site, sim, pr, d, sim["soc"][-1] * plant.e_nom, 0.0)["cost_rs"]
+        for d, series, pr, soc0, v_end in prepared:
+            sim = twin.simulate(series, tuned_policy(rule, series["ts"]), plant, soc0)
+            e_end = float(sim["soc"][-1]) * plant.e_nom
+            total += price_arm(site, sim, pr, d, e_end, v_end)["cost_rs"] - v_end * (e_end - soc0 * plant.e_nom)
+        return total
+
+    best, best_cost, native_cost = None, None, None
+    for rule in tuned_candidates(site, window):
+        total = window_cost(rule)
+        if rule["kind"] == "native_capture":
+            native_cost = total
         if best_cost is None or total < best_cost:
-            best, best_cost = table, total
+            best, best_cost = rule, total
+    if _cycles(plant):
+        for sp in sorted({min(p, plant.soc_max * 100.0) for p in CYCLE_SET_POINTS}):
+            rule = {**best, "cycle_soc_pct": round(sp, 1)}
+            total = window_cost(rule)
+            if total < best_cost:
+                best, best_cost = rule, total
+    best = {**best, "fit": {"days": [d.isoformat() for d, *_ in prepared], "cost_rs": round(float(best_cost), 2),
+                    "native_cost_rs": round(float(native_cost), 2)}}
     store.set_setting(key, best)
     return best
+
+
+def _terminal_value(site: dict, day: date, series: dict, pr: dict) -> tuple[float, float]:
+    """What the ledger values a kWh left in the battery at the day's end at: (c_next, v_end). c_next is the day's dearest import price on a grid
+    connection, else the genset's all-in cost per kWh (off grid at its night load ratio, night_load_ratio; 75 % load elsewhere); v_end is what a kWh
+    stored is worth after the discharge loss and the wear, never below zero."""
+    conn = (site.get("connections") or [None])[0]
+    on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
+    a = site.get("assets") or {}
+    b, gen_asset = a.get("battery"), a.get("genset")
+    c_next = float(np.max(pr["c_imp"])) if on_grid else 0.0
+    if gen_asset and (c_next == 0.0):
+        price, _ = tariffs.fuel_price(gen_asset.get("fuel_kind", "hsd"), day)
+        c_next = optimise._gen_marginal({"S": gen_asset["rated_kw"], "a": gen_asset["a"], "b": gen_asset["b"], "c_fuel": price,
+                                         "c_om": gen_asset["c_om_rs_per_kwh"], "c_runhr": gen_asset["c_runhr_rs"]},
+                                        night_load_ratio(gen_asset, series) if not on_grid else 0.75)
+    v_end = max(0.0, (b["eta_d"] * c_next - optimise.wear_cost(b)) if b else 0.0)
+    return c_next, v_end
 
 
 def night_load_ratio(gen_asset: dict, series: dict) -> float:
@@ -635,7 +859,7 @@ def night_load_ratio(gen_asset: dict, series: dict) -> float:
 
 # ------------------------------------------------------------------------------------------------ chained baseline replays (HANDOFF 8.A.1)
 
-#: how many later days a scored day walks to re-score those whose chain no longer starts where the day before ends (_recompute_forward); a day
+#: how many later days a scored day walks to re-score those whose chain no longer starts where the day before ends (_walk_forward); a day
 #: beyond them keeps its old start and the summary lists it in `chain_stale_days` until it is recomputed
 FORWARD_MAX_DAYS = 62
 
@@ -663,23 +887,181 @@ def _gen_running_before(site_id: str, t0: int) -> bool:
     return bool(np.nan_to_num(fuel) > 0.0)
 
 
+# ------------------------------------------------------------------------------------------------ control in force (plan 8.3 control health, gating 8.4)
+
+#: A closed-loop or demo day's share of minutes under the plan: at or above CONTROL_CONFIRMED the day is confirmed, at or above CONTROL_PARTIAL
+#: partial (it claims, its share beside it as its fidelity, plan 8.4), below it not applied (it claims nothing)
+CONTROL_CONFIRMED = 0.95
+CONTROL_PARTIAL = 0.5
+#: a closed-loop day's classes, worst first: its share under the plan and what its edge reported (plans.edge_fidelity), the worse of the two counts
+CONTROL_FIDELITY_ORDER = ("not_applied", "partial", "confirmed")
+#: ems-edge/1.0 events that put the device on its own settings, each with the event that ends it
+EDGE_NATIVE_EVENTS = {"fallback_engaged": "fallback_cleared", "control_disabled": "control_enabled"}
+
+
+def _epoch(iso) -> int | None:
+    """Epoch seconds of a stored ISO time (UTC unless it says otherwise); None for a blank or unreadable one."""
+    if not iso:
+        return None
+    try:
+        return plans._ts(str(iso))
+    except (TypeError, ValueError):
+        return None
+
+
+def _plan_decides(r) -> tuple[bool, int | None] | None:
+    """What a stored tick says about the plan in force from its belief time on (plans.active_at's rules): (True, valid_until) for a plan made
+    (active or superseded), (False, None) for a held or failed tick of a pause or a release to native (no plan in force), None for a tick that
+    leaves the plan before it in force (a guard hold, a failed solve)."""
+    if r["status"] in ("active", "superseded"):
+        return True, _epoch(r["valid_until"]) or 0
+    if r["status"] == "held" and r["reason"] in plans.RELEASE_REASONS.values():
+        return False, None
+    if r["status"] == "failed":
+        try:
+            release = (json.loads(r["summary"] or "{}") or {}).get("control_release")
+        except (TypeError, ValueError, AttributeError):
+            release = None
+        if release:
+            return False, None
+    return None
+
+
+def _spans(marks: list[tuple[int, bool]], ts: np.ndarray) -> np.ndarray:
+    """The minutes of `ts` inside the spans that `marks` open and close: (time, True) opens one, (time, False) closes the open one."""
+    out = np.zeros(len(ts), dtype=bool)
+    start = None
+    for t, opens in sorted(marks, key=lambda m: m[0]):
+        if opens and start is None:
+            start = t
+        elif not opens and start is not None:
+            out |= (ts >= start) & (ts < t)
+            start = None
+    if start is not None:
+        out |= ts >= start
+    return out
+
+
+def _control(site_id: str, g: dict, edge: bool) -> dict:
+    """Which minutes of a day the plan was in control at a closed-loop or demo site (plan 8.3's control health), as minutes and the share in force:
+    - `released_min`: a pause or a release to native in force, from the override history (its start to its end, or to when it was cleared;
+      plans._released_at): the tick holds its plans and the edge, or the demo's twin, runs the native settings;
+    - `no_plan_min`: no plan in force, by plans.active_at's rules over the stored ticks: none made yet, the one in force past its valid_until (the
+      edge reverts to native on expiry), or a held or failed tick of a pause or release ended it (a guard hold or a failed solve otherwise leaves
+      the plan before it in force);
+    - `edge_fallback_min` (`edge`: a closed-loop site's own edge, not the demo's twin): the edge reported the device on its own settings
+      (fallback_engaged to fallback_cleared, control_disabled to control_enabled);
+    - `edge_unheard_min` (`edge`): minutes with no telemetry row at all, where nothing shows the edge running the plan.
+    `in_force_share` is the share of the day's minutes free of all four."""
+    ts = np.asarray(g["ts"], dtype=np.int64)
+    n = len(ts)
+    if not n:
+        return {"in_force_share": 0.0, "released_min": 0, "no_plan_min": 0, "edge_fallback_min": 0, "edge_unheard_min": 0}
+    t0, t1 = int(ts[0]), int(ts[-1]) + 60
+    with store.connect() as con:
+        ovs = con.execute("SELECT from_ts, until_ts, cleared FROM overrides WHERE site_id = ? AND kind IN (?, ?)",
+                          (site_id, *plans.RELEASE_REASONS)).fetchall()
+        cols = "status, reason, belief_time, valid_until, summary"
+        today = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND belief_time >= ? AND belief_time < ? "
+                            "ORDER BY belief_time, generated_at, rowid", (site_id, plans._iso(t0), plans._iso(t1))).fetchall()
+        before = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND belief_time < ? ORDER BY belief_time DESC, generated_at DESC, rowid DESC "
+                             "LIMIT 200", (site_id, plans._iso(t0))).fetchall()
+        last = None
+        if not any(_plan_decides(r) for r in before):
+            last = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND status IN ('active', 'superseded') AND belief_time < ? "
+                               "ORDER BY belief_time DESC LIMIT 1", (site_id, plans._iso(t0))).fetchone()
+        evs = con.execute(f"SELECT ts, type FROM events WHERE site_id = ? AND type IN ({', '.join('?' * 2 * len(EDGE_NATIVE_EVENTS))}) ORDER BY id",
+                          (site_id, *EDGE_NATIVE_EVENTS, *EDGE_NATIVE_EVENTS.values())).fetchall() if edge else []
+    released = np.zeros(n, dtype=bool)
+    for o in ovs:
+        start, end, cleared = _epoch(o["from_ts"]), _epoch(o["until_ts"]), _epoch(o["cleared"])
+        if cleared is not None and (end is None or cleared < end):
+            end = cleared
+        if end is not None:
+            released |= (ts < end) & (ts >= (start if start is not None else t0 - 1))
+    # the plan in force at the day's start: the latest tick before it that decides (a plan made, or a pause's tick that ended it)
+    state = next((d for d in map(_plan_decides, before) if d is not None), None) or (_plan_decides(last) if last else None)
+    valid = state[1] if state and state[0] else None
+    in_force = np.zeros(n, dtype=bool)
+    i0 = 0
+    for r in today:
+        d = _plan_decides(r)
+        if d is None:
+            continue
+        i1 = int(np.searchsorted(ts, _epoch(r["belief_time"]) or t0, side="left"))
+        if valid is not None:
+            in_force[i0:i1] = ts[i0:i1] < valid
+        valid, i0 = (d[1] if d[0] else None), max(i0, i1)
+    if valid is not None:
+        in_force[i0:] = ts[i0:] < valid
+    fallback = np.zeros(n, dtype=bool)
+    unheard = np.zeros(n, dtype=bool)
+    if edge:
+        for opens, closes in EDGE_NATIVE_EVENTS.items():
+            marks = [(t, e["type"] == opens) for e in evs if e["type"] in (opens, closes) and (t := _epoch(e["ts"])) is not None]
+            fallback |= _spans(marks, ts)
+        unheard = ~np.asarray(g.get("present", np.ones(n, dtype=bool)), dtype=bool)
+    ok = in_force & ~released & ~fallback & ~unheard
+    return {"in_force_share": round(float(np.mean(ok)), 4), "released_min": int(released.sum()), "no_plan_min": int((~in_force).sum()),
+            "edge_fallback_min": int(fallback.sum()), "edge_unheard_min": int(unheard.sum())}
+
+
 def _claims(row: dict | None) -> bool:
     """Whether a stored row claims its saving: a claiming fidelity (CLAIMING) and no claim withheld."""
     return bool(row) and row.get("fidelity") in CLAIMING and not row.get("claim_withheld")
 
 
-def _unread_minutes(g: dict, on_grid: bool) -> int:
-    """The minutes of a day whose replay inputs were not read: the load or the PV blank (the replay counts them as zero), or, on a grid
-    connection, the grid's presence blank (carried forward, so an outage there is unseen). Native's end state after them is not its own."""
-    out = np.isnan(np.asarray(g["load"], dtype=float)) | np.isnan(np.asarray(g["pv"], dtype=float))
+#: A day whose replays ran over unread load or PV (by daylight) for more than this share of its minutes claims nothing (`claim_withheld:
+#: inputs_unread`): the replay counts a blank load or PV as zero, so native's costs and end state there are not its own. The same 5 % the grid's
+#: own rule allows unresolved (GRID_UNRESOLVED_MAX), which does not count a minute with neither load nor PV read, so a logger offline for hours
+#: was capped by nothing. Shorter gaps are carried as counted (a 70-minute logger gap claims within 2 % of its metered claim, round 3; a 20-minute
+#: load gap at the farm moves the day by a few tens of rupees); the day after a withheld one restarts (_expected_start)
+REPLAY_UNREAD_MAX = GRID_UNRESOLVED_MAX
+
+
+def _unread_mask(g: dict, on_grid: bool, sun_up: np.ndarray | None = None, filled: dict | None = None) -> np.ndarray:
+    """The minutes of a day whose replay inputs were not read: the load blank, or the PV blank while the sun is up (`sun_up`; None counts every
+    PV blank; a site without PV passes all False), both counted as zero by the replay unless the balance closed them (`filled`, _balance_fill), or,
+    on a grid connection, the grid's presence blank (carried forward, so an outage there is unseen). Native's end state after them is not its own.
+    A PV blank at night hides nothing: the replay's zero is right there."""
+    filled = filled or {}
+    pv_blank = np.isnan(np.asarray(g["pv"], dtype=float)) & ~np.asarray(filled.get("pv", False), dtype=bool)
+    if sun_up is not None:
+        pv_blank = pv_blank & np.asarray(sun_up, dtype=bool)
+    out = (np.isnan(np.asarray(g["load"], dtype=float)) & ~np.asarray(filled.get("load", False), dtype=bool)) | pv_blank
     if on_grid:
         out = out | np.isnan(np.asarray(g["grid"], dtype=float))
-    return int(np.sum(out))
+    return out
 
 
-def _expected_start(prev: dict | None, switch: bool, earlier: bool) -> dict:
+def _unread_minutes(g: dict, on_grid: bool, sun_up: np.ndarray | None = None, filled: dict | None = None) -> int:
+    """How many minutes _unread_mask counts."""
+    return int(np.sum(_unread_mask(g, on_grid, sun_up, filled)))
+
+
+def _sun_up(site: dict, ts: np.ndarray) -> np.ndarray:
+    """The minutes the sun is above the horizon at the site, where a PV reading can be other than zero; all False at a site without PV."""
+    if not (site.get("assets") or {}).get("pv"):
+        return np.zeros(len(ts), dtype=bool)
+    zen, _ = solar.sun_position(np.asarray(ts) + 30, float(site["data"].get("lat") or 31.5), float(site["data"].get("lon") or 74.3))
+    return zen < 90.0
+
+
+#: Fidelities of a day whose actual arm was not the plan: a recommendation (monitor), a switchback native block, a table not applied (or control
+#: not in force) and a mark telemetry has not confirmed. The first plan day after one restarts its chain from the measured state ("arm_change")
+NOT_PLAN_ARM = ("recommendation_only", "native_block", "not_applied", "pending")
+
+
+def _plan_arm(tier: str | None, arm: str | None) -> bool:
+    """Whether a day's actual arm can be the plan, before its fidelity is known: not a monitor site (it only recommends) and not a switchback native
+    block. Its stored row says the same: a fidelity other than recommendation_only and native_block."""
+    return tier != "monitor" and arm != "native"
+
+
+def _expected_start(prev: dict | None, switch: bool, earlier: bool, plan_arm: bool = True) -> dict:
     """Where a baseline's replay starts on a day, given that baseline's stored row of the day before (`prev`, None where there is none), whether
-    the day opens a switchback block of the other arm (`switch`), and whether any day before it is stored (`earlier`). See _chain_starts."""
+    the day opens a switchback block of the other arm (`switch`), whether any day before it is stored (`earlier`), and whether the day's own arm
+    can be the plan (`plan_arm`, _plan_arm). See _chain_starts."""
     if switch:
         return {"from": "actual", "reset": "switchback"}
     if not prev:
@@ -687,6 +1069,8 @@ def _expected_start(prev: dict | None, switch: bool, earlier: bool) -> dict:
     end = (prev.get("chain") or {}).get("end") or {}
     if not end.get("state"):
         return {"from": "actual", "reset": "no_state"}
+    if plan_arm and prev.get("fidelity") in NOT_PLAN_ARM:
+        return {"from": "actual", "reset": "arm_change"}
     if not _claims(prev) and int(end.get("unread_min") or 0) > 0:
         return {"from": "actual", "reset": "unread_inputs"}
     return {"from": "previous_day", "reset": None, "state": end["state"], "v_rs_per_kwh": float(end.get("v_rs_per_kwh") or 0.0)}
@@ -701,19 +1085,50 @@ def _chain_starts(site_id: str, day: date) -> dict[str, dict]:
       _unread_minutes): the replay counted a blank load or PV as zero, so its end state is not native's own, and the day's own share of that error
       is not claimed while the next day's would be. Chained on, a 19:00-23:00 dropout on a withheld farm day raised the next two days' claims by
       Rs 1,140 (round 6 verifier, seed 7). The next day's claim then rests on nothing the dropout hid: it is the claim it makes with that day not
-      scored. A day that claims nothing on fully read inputs (a monitor site, a table not applied, a day withheld for its grid meter, battery or
-      genset alone) keeps the chain: native's replay of it is valid, so the days around it claim what they claim on complete data;
+      scored. A day withheld for its grid meter, battery or genset alone, on read load and PV, keeps the chain: native's replay of it is valid, so
+      the days around it claim what they claim on complete data;
+    - on a day whose arm can be the plan (_plan_arm) after a day the plan did not run (NOT_PLAN_ARM: a monitor day, a table not applied or control
+      not in force, an unconfirmed mark), "arm_change": the inverter ran native there, so the gap between native's replay and the real battery is
+      the replay's drift, not the plan's doing, and chained on it would be credited or debited at v_end in the first claim (round 7, audit
+      pr-review-03). Days the plan did not run chain among themselves (native against native);
     - on the first day of a switchback block whose arm differs from the day before's ("switchback", plan 8.2): each block's baseline is native from
       the block's measured start, so a plan block's last day carries the hand-over credit at v_end, and a native block, where the inverter ran
-      native, scores about zero. A switchback site is held to that segmented replay (DESIGN_LOG, round 6)."""
+      native, scores about zero. A switchback site is held to that segmented replay (DESIGN_LOG, round 6). Each native block day also says where
+      its hand-over replay starts (`handover`, _expected_handover): the claim values the credit at what the block realised (round 7)."""
     prev = day - timedelta(days=1)
-    switch = (arm_on(site_id, day) == "native") != (arm_on(site_id, prev) == "native")
+    arm = arm_on(site_id, day)
+    switch = (arm == "native") != (arm_on(site_id, prev) == "native")
+    plan_arm = _plan_arm((sites.get(site_id) or {}).get("tier", "monitor"), arm)
     with store.connect() as con:
         rows = {r["baseline"]: json.loads(r["data"]) for r in
                 con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, prev.isoformat()))}
         earlier = bool(rows) or con.execute("SELECT 1 FROM savings_days WHERE site_id = ? AND day_local < ? LIMIT 1",
                                             (site_id, prev.isoformat())).fetchone() is not None
-    return {base: _expected_start(rows.get(base), switch, earlier) for base in ("native", "tuned")}
+    return {base: {**_expected_start(rows.get(base), switch, earlier, plan_arm), "handover": _expected_handover(rows.get(base), switch, arm == "native")}
+            for base in ("native", "tuned")}
+
+
+def _expected_handover(prev: dict | None, switch: bool, native_block: bool) -> dict | None:
+    """Where a switchback native block day's hand-over replay starts (round 7, audit brief-vs-build-11): on the block's first day (`switch`), from
+    that baseline's own end state of the plan day before it, with the credit that day booked for the energy it handed over (its end gap at v_end);
+    on the block's later days, from the hand-over replay's end state of the day before. None on other days, or without that row's end state."""
+    if not native_block or not prev:
+        return None
+    src = ((prev.get("chain") or {}) if switch else (prev.get("handover") or {})).get("end") or {}
+    if not src.get("state"):
+        return None
+    return {"state": src["state"], "carry_rs": float(src.get("carry_rs") or 0.0)}
+
+
+def _handover_matches(row: dict | None, expect: dict | None) -> bool:
+    """Whether a stored row's hand-over replay started where the rows before it now say it starts (none expected, none stored, matches too)."""
+    have = (row or {}).get("handover")
+    if not expect:
+        return not have
+    if not have:
+        return False
+    st = have.get("start") or {}
+    return _same_state(st.get("state"), expect["state"]) and abs(float(st.get("carry_rs") or 0.0) - expect["carry_rs"]) <= 1e-6
 
 
 def _same_state(a: dict | None, b: dict | None) -> bool:
@@ -736,37 +1151,114 @@ def _start_matches(chain: dict | None, expect: dict) -> bool:
     return _same_state(s.get("state"), expect["state"]) and abs(float(s.get("v_rs_per_kwh") or 0.0) - expect["v_rs_per_kwh"]) <= 1e-9
 
 
-def _recompute_forward(site_id: str, day: date) -> list[str]:
+#: the audit lines of re-scoring (round 7, audit pr-review-02): a recompute's, with each day it re-scored, and the forward walk's after a day scored
+RECOMPUTED = "recomputed savings days"
+WALKED = "re-scored later savings days"
+
+
+def _stored_rows(site_id: str, day: date) -> dict[str, tuple[dict, str]]:
+    """A day's stored rows by baseline, each with when it was computed."""
+    with store.connect() as con:
+        return {r["baseline"]: (json.loads(r["data"]), r["computed"]) for r in
+                con.execute("SELECT baseline, data, computed FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, day.isoformat()))}
+
+
+def _restate(site_id: str, day: date, before: dict[str, tuple[dict, str]], why: str, by: str) -> bool:
+    """After a day is re-scored: whether its claim changed in a billing month that had already closed when the day was last scored (round 7, audit
+    pr-review-02). Such a change restates a closed month (its report, its fee check): the rows keep `restated`, a list of {at, why, by,
+    claimed_rs_before, claimed_rs_after}, carried through later re-scores, and summary() lists the period's restated days. A day re-scored while
+    its month is open, or at the month's settle when it was last scored open, is no restatement."""
+    if not before:
+        return False
+    conn = (sites.connections(site_id) or [None])[0]
+    _, p1 = tariffs.billing_period_for(conn, day)
+    closed_at = datetime(p1.year, p1.month, p1.day, tzinfo=PKT) + timedelta(days=1)
+    month_closed = p1 < _today()
+    out = False
+    now = store._now()
+    with store.connect() as con:
+        for base, (a, _) in _stored_rows(site_id, day).items():
+            b, computed = before.get(base, (None, None))
+            hist = list((b or {}).get("restated") or [])
+            try:
+                was_final = bool(computed) and datetime.fromisoformat(computed) >= closed_at
+            except (TypeError, ValueError):
+                was_final = False
+            if (b is not None and month_closed and was_final
+                    and abs(float(b.get("claimed_rs") or 0.0) - float(a.get("claimed_rs") or 0.0)) > 0.005):
+                hist.append({"at": now, "why": why, "by": by, "claimed_rs_before": b.get("claimed_rs"), "claimed_rs_after": a.get("claimed_rs")})
+                out = True
+            if hist:
+                a["restated"] = hist
+                con.execute("UPDATE savings_days SET data = ? WHERE site_id = ? AND day_local = ? AND baseline = ?",
+                            (json.dumps(a), site_id, day.isoformat(), base))
+    return out
+
+
+def _rescored(day: date, why: str, before: dict[str, tuple[dict, str]], after: dict, restated: bool) -> dict:
+    """One re-scored day for the audit trail: why, and its claim against the native settings before and after."""
+    return {"day": day.isoformat(), "why": why, "claimed_rs_before": ((before.get("native") or ({}, None))[0]).get("claimed_rs"),
+            "claimed_rs_after": (after.get("native") or {}).get("claimed_rs"), "restated": restated}
+
+
+def _walk_forward(site_id: str, day: date, by: str = "system") -> list[dict]:
     """Walk the stored days after `day` in order, up to the first day with no row (the chain restarts there) or FORWARD_MAX_DAYS, and re-score each
-    whose chain no longer starts where the day before's row now ends (_start_matches; a day that still matches is only read). A day keeps its
-    perfect-foresight bound only where it had one. Returns the days re-scored."""
-    done: list[str] = []
+    whose chain (or native block hand-over replay) no longer starts where the day before's row now ends (_start_matches, _handover_matches; a
+    day that still matches is only read). A day keeps its perfect-foresight bound only where it had one. Returns each day re-scored (_rescored),
+    a restatement of a closed month marked on its rows (_restate)."""
+    done: list[dict] = []
     d = day
     for _ in range(FORWARD_MAX_DAYS):
         d = d + timedelta(days=1)
-        with store.connect() as con:
-            rows = {r["baseline"]: json.loads(r["data"]) for r in
-                    con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, d.isoformat()))}
-        if not rows:
+        before = _stored_rows(site_id, d)
+        if not before:
             break
+        rows = {b: r for b, (r, _) in before.items()}
         expect = _chain_starts(site_id, d)
-        if all(_start_matches(rows[b].get("chain"), expect[b]) for b in rows if b in expect):
+        if all(_start_matches(rows[b].get("chain"), expect[b]) and _handover_matches(rows[b], expect[b].get("handover")) for b in rows if b in expect):
             continue
-        if compute_day(site_id, d, with_bound="perfect_foresight_rs" in (rows.get("native") or {}), forward=False) is None:
+        new = _score_day(site_id, d, with_bound="perfect_foresight_rs" in (rows.get("native") or {}))
+        if new is None:
             break
-        done.append(d.isoformat())
+        done.append(_rescored(d, "chain", before, new, _restate(site_id, d, before, "chain", by)))
     return done
 
 
-def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool = True) -> dict | None:
+def _recompute_forward(site_id: str, day: date, by: str = "system") -> list[str]:
+    """_walk_forward, the days it re-scored."""
+    return [x["day"] for x in _walk_forward(site_id, day, by)]
+
+
+def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool = True, by: str = "system") -> dict | None:
     """Score a day against the native and the tuned baseline and store its rows (one per baseline).
 
     Each baseline's replay is chained (_chain_starts): it starts from that baseline's own end state of the day before, so the days of a chain add up
-    to one continuous replay; a day after one that claims nothing and ran over unread inputs restarts from the actual arm's state, so a claim never
-    rests on what a dropout hid. Its carry-over lever is the change of the valued gap in stored energy over the day: v_end x (actual - baseline end
+    to one continuous replay. A day whose replays ran over unread load or PV (by daylight) for more than REPLAY_UNREAD_MAX of its minutes claims
+    nothing, and
+    the day after a day that claims nothing over unread inputs restarts from the actual arm's state, so no claim rests on a dropout longer than
+    that; a shorter gap is carried, counted as zero load or PV, into the day's claim and the next day's start (a known limit: filling it from the
+    load forecast is a later item). Its carry-over lever is the change of the valued gap in stored energy over the day: v_end x (actual - baseline end
     energy) less the day before's v_end x (actual - baseline start energy), which is zero where the chain restarts from the actual arm's state. A
     run of the genset across midnight is one start on each arm. The row stores the chain's start and end (`chain`), and with `forward` the stored
-    later days whose chain started from this day's old end are re-scored (_recompute_forward)."""
+    later days whose chain started from this day's old end are re-scored (_walk_forward: one audit line, WALKED, with each day's claim before and
+    after), and the day's billing month, once over, and the month before it are settled: their days re-scored where their prices, native capture
+    or data changed since (_settle_months; the nightly job scores yesterday this way, so a month is re-scored at its end and after an FCA or late
+    data). A re-score that changes a claim of a closed month is marked on the rows (_restate). `by`: who asked, for the audit trail."""
+    before = _stored_rows(site_id, day)
+    rows = _score_day(site_id, day, with_bound)
+    if rows is not None:
+        _restate(site_id, day, before, "recompute", by)
+    if forward:
+        if rows is not None:
+            walked = _walk_forward(site_id, day, by)
+            if walked:
+                store.audit(by, WALKED, site_id, {"after_day": day.isoformat(), "days": walked})
+        _settle_months(site_id, day)
+    return rows
+
+
+def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
+    """compute_day's scoring of the one day: its rows per baseline, stored (None when the day cannot be scored)."""
     site = sites.full(site_id)
     if site is None:
         return None
@@ -806,13 +1298,7 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
     imp_unknown = on_grid and (float(act["g"].get("imp_completeness", 1.0)) < 0.5 or unresolved_share > GRID_UNRESOLVED_MAX)
     f_act = {**act["f"], "imp": g_imp, "exp": g_exp, "bat": g_bat} if on_grid else act["f"]
     actual = _actual_sim(f_act, act["g"], plant if gen_asset else None)
-    c_next = float(np.max(pr["c_imp"])) if conn and conn["data"].get("regime") != "off_grid" else 0.0
-    if gen_asset and (c_next == 0.0):
-        price, _ = tariffs.fuel_price(gen_asset.get("fuel_kind", "hsd"), day)
-        c_next = optimise._gen_marginal({"S": gen_asset["rated_kw"], "a": gen_asset["a"], "b": gen_asset["b"], "c_fuel": price,
-                                         "c_om": gen_asset["c_om_rs_per_kwh"], "c_runhr": gen_asset["c_runhr_rs"]},
-                                        night_load_ratio(gen_asset, series) if not on_grid else 0.75)
-    v_end = max(0.0, (b["eta_d"] * c_next - optimise.wear_cost(b)) if b else 0.0)
+    c_next, v_end = _terminal_value(site, day, series, pr)
     # the actual arm's battery flow where its power is blank (_masked_charge): read as zero, its discharge went unworn while each baseline's was worn,
     # and on the masked minutes its charge went unbilled while each baseline's was billed. On the masked minutes each arm's charge beyond PV, and its
     # wear, is priced only where that flow is known; elsewhere it stands in for the actual arm's discharge and wear, and where it is unknown the wear
@@ -841,11 +1327,15 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
     arms = {"actual": price_arm(site, masked_actual, pr, day, e_end_actual, v_end, gen_before=gen_before)}
     # each baseline's replay starts from its own end state of the day before (its chain), or from the actual arm's state where the chain restarts
     starts = _chain_starts(site_id, day)
-    policies = {"native": twin.native_policy(site, series["ts"]), "tuned": twin.table_policy(fit_tuned(site, day), series["ts"])}
+    tuned_rule = fit_tuned(site, day)
+    policies = {"native": twin.native_policy(site, series["ts"]), "tuned": tuned_policy(tuned_rule, series["ts"])}
     e_start_actual = soc0 * plant.e_nom
-    # minutes the replays ran over unread inputs: a day after one that claims nothing restarts when there were any (_chain_starts)
-    unread = _unread_minutes(act["g"], on_grid)
-    sims, chains, befores = {}, {}, {}
+    # minutes the replays ran over unread inputs: a day after one that claims nothing restarts when there were any (_chain_starts), and a day with
+    # unread load or PV over more than REPLAY_UNREAD_MAX of its minutes claims nothing
+    sun = _sun_up(site, act["g"]["ts"])
+    unread = _unread_minutes(act["g"], on_grid, sun, act.get("filled"))
+    blank_inputs = _unread_minutes(act["g"], False, sun, act.get("filled"))
+    sims, chains, handovers = {}, {}, {}
     for k, pol in policies.items():
         st = starts[k]
         if st["from"] == "previous_day":
@@ -858,7 +1348,7 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
             sim = twin.simulate(series, pol, plant, soc0, gen0)
             on_before, soc_start, v_start = gen_before, soc0, 0.0
             start_state = {"soc": float(soc0), "gen_on": gen0, "gen_elapsed": 0, "outage_min": 0, "gen_rescue": False}
-        sims[k], befores[k] = sim, on_before
+        sims[k] = sim
         e_end_base = float(sim["soc"][-1]) * plant.e_nom
         arms[k] = price_arm(site, _grid_masked(sim, unresolved, series["pv"], known=charge_known, load=load_read), pr, day, e_end_base, v_end,
                             gen_before=on_before)
@@ -870,10 +1360,32 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
                                "v_rs_per_kwh": v_start, "carry_rs": v_start * gap_start},
                      "end": {"state": _end_state(sim), "baseline_e_kwh": e_end_base, "actual_e_kwh": e_end_actual, "gap_kwh": gap_end,
                              "v_rs_per_kwh": v_end, "carry_rs": v_end * gap_end, "unread_min": unread}}
-    # fidelity gates the claim (plan 8.4): a monitor site only recommends, even in the demo; a closed-loop day by what its edge reported
-    # (plans.edge_fidelity; the demo's edge is the twin); in tier advisory a day counts only once telemetry confirms the keyed table (plan 7.6), never
-    # on the mark alone, at a demo site too (audit engine-delivery-18: every demo day was confirmed, marked or not)
+        ho = st.get("handover")
+        if ho:
+            # a switchback native block's day (round 7, audit brief-vs-build-11): the baseline replayed on from where it stood at the plan block's
+            # end, beside its replay from the block's measured start, prices what the energy the plan block handed over did here. The day's
+            # `rs` is the cost that energy saved plus the change of the still-unspent gap at v_end; the plan day's credit plus the native block's
+            # days' `rs` is the hand-over's realised value (_handover), which the claim takes in place of the credit at v_end
+            hs = ho["state"]
+            sim_h = twin.simulate(series, pol, plant, float(hs["soc"]), bool(hs["gen_on"]), gen_elapsed0=int(hs["gen_elapsed"]),
+                                  outage_min0=int(hs["outage_min"]), gen_rescue0=bool(hs["gen_rescue"]))
+            e_h = float(sim_h["soc"][-1]) * plant.e_nom
+            cost_h = price_arm(site, _grid_masked(sim_h, unresolved, series["pv"], known=charge_known, load=load_read), pr, day, e_h, v_end,
+                               gen_before=bool(hs["gen_on"]))["cost_rs"]
+            gap_h = e_end_base - e_h
+            handovers[k] = {"start": {"state": dict(hs), "carry_rs": ho["carry_rs"]},
+                            "end": {"state": _end_state(sim_h), "baseline_e_kwh": e_h, "gap_kwh": gap_h, "v_rs_per_kwh": v_end, "carry_rs": v_end * gap_h},
+                            "cost_rs": cost_h, "segmented_cost_rs": arms[k]["cost_rs"],
+                            "rs": round(cost_h - arms[k]["cost_rs"] + v_end * gap_h - ho["carry_rs"], 2)}
+    # fidelity gates the claim (plan 8.4): a monitor site only recommends, even in the demo; a closed-loop day follows the plan only while one is in
+    # force (_control: no pause or release to native, a plan made and not expired, and at the site's own edge no fallback to native and telemetry
+    # heard), so the day's class is its share of minutes under the plan, and no better than what its edge reported (plans.edge_fidelity: a plan
+    # refused, reported expired or applied in part, control disabled or a fallback that day; the demo's edge is the twin); in tier advisory a day
+    # counts only once telemetry confirms the keyed table (plan 7.6), never on the mark alone, at a demo site too (audit engine-delivery-18: every
+    # demo day was confirmed, marked or not)
     tier = site.get("tier", "monitor")
+    projected = on_grid and int(datetime.now(timezone.utc).timestamp()) < _billing_bounds(conn, day)[1]
+    basis = _price_basis(pr, _fuel_rs_per_l(gen_asset, day))
     with store.connect() as con:
         applied = con.execute("SELECT * FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1",
                               (site_id, day.isoformat())).fetchone()
@@ -881,13 +1393,18 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
                         (site_id, day.isoformat(), day.isoformat())).fetchone()
     switch = r["arm"] if r else None
     fidelity_score = None
+    control = None
     if switch == "native":
         fidelity = "native_block"
     elif tier == "monitor":
         fidelity = "recommendation_only"
     elif tier == "closed_loop":
-        # what the edge reported decides: a day it ran on fallback, with control disabled or the plan refused claims nothing (audit engine-delivery-12)
-        fidelity = plans.edge_fidelity(site_id, day)
+        control = _control(site_id, act["g"], edge=not site.get("demo_link"))
+        share = control["in_force_share"]
+        fidelity = "confirmed" if share >= CONTROL_CONFIRMED else "partial" if share >= CONTROL_PARTIAL else "not_applied"
+        fidelity_score = round(share, 3)
+        # what the edge reported caps it: a day it ran on fallback, with control disabled or the plan refused claims nothing (audit engine-delivery-12)
+        fidelity = min(fidelity, plans.edge_fidelity(site_id, day), key=CONTROL_FIDELITY_ORDER.index)
     elif tier == "advisory_writes":
         if applied is None:
             fidelity = "not_applied"
@@ -921,49 +1438,175 @@ def compute_day(site_id: str, day: date, with_bound: bool = True, forward: bool 
         saving = round(sum(v for v in levers.values() if v is not None), 2)
         # a day whose import or whose actual battery flow is unknown claims nothing: withholding only its wear lever would credit the baseline's whole
         # wear when the actual cycled more (the "never over-claim" rule of plan 8.4); likewise a day whose genset may have run unseen, whose energy
-        # the grid levers or the carry-over would credit without its fuel
+        # the grid levers or the carry-over would credit without its fuel, a day whose replays ran over unread load or PV for more than
+        # REPLAY_UNREAD_MAX of it (counted as zero, so native's costs and end state there are not its own), and a genset day priced with a fuel
+        # price it did not have
         withheld = ("import_unknown" if imp_unknown else "battery_flow_unknown" if wear_unknown else "genset_unknown" if gen_unseen
+                    else "inputs_unread" if blank_inputs > REPLAY_UNREAD_MAX * len(act["g"]["ts"])
                     else "no_fuel_price" if no_fuel_price else None)
         claim = saving if fidelity in CLAIMING and not withheld else 0.0
         rows[base] = {"saving_rs": saving, "claimed_rs": claim, "levers": levers, "actual": a, "baseline": n, "fidelity": fidelity,
                       "fidelity_score": fidelity_score, "litres_saved": None if g_unknown else round(n["litres"] - a["litres"], 2),
-                      "genset_unknown": g_unknown, "import_unknown": imp_unknown, "claim_withheld": withheld,
+                      "genset_unknown": g_unknown, "import_unknown": imp_unknown, "claim_withheld": withheld, "inputs_unread_min": blank_inputs,
                       "import_completeness": round(float(act["g"].get("imp_completeness", 1.0)), 4),
                       "import_rebuilt_share": round(float(np.mean(rebuilt)), 4) if len(rebuilt) else 0.0,
                       "import_unresolved_share": round(unresolved_share, 4),
                       "peak_kw_actual": a["peak_kw"], "peak_kw_baseline": n["peak_kw"], "mdi_rate": pr["mdi_rate"],
-                      "mdi_floor_kw": pr["mdi_floor"], "mdi_interval_min": pr["mdi_interval"], "icp_case": pr["icp"],
+                      "mdi_floor_kw": pr["mdi_floor"], "mdi_interval_min": pr["mdi_interval"], "icp_case": pr["icp"], "tariff_version": pr["tariff_version"],
                       "native_capture_version": (site.get("native") or {}).get("version"),
-                      "unserved_kwh_actual": a["unserved_kwh"], "unserved_kwh_baseline": n["unserved_kwh"], "chain": chains[base]}
+                      "unserved_kwh_actual": a["unserved_kwh"], "unserved_kwh_baseline": n["unserved_kwh"], "chain": chains[base],
+                      "control": control,
+                      # what the day was priced and replayed on, to find it again when its month is settled (round 7, audit engine-savings-10):
+                      # whether the month's totals were projected (the month not over: its ICP case can still flip), its prices' digest and how
+                      # complete its telemetry was
+                      "month_totals_projected": projected, "price_basis": basis, "inputs_completeness": round(float(act["g"]["completeness"]), 4)}
+        if base in handovers:
+            rows[base]["handover"] = handovers[base]
+    # the tuned baseline's rule (round 7, audit engine-savings-03): its table and, at a genset site, its cycle-charging set point
+    rows["tuned"]["tuned_rule"] = tuned_rule
     if with_bound and b:
-        # the hindsight solve prices every minute: it is held against the native arm priced the same way
-        native_cost = (price_arm(site, sims["native"], pr, day, 0.0, 0.0, gen_before=befores["native"])["cost_rs"] if unresolved.any()
-                       else arms["native"]["cost_rs"])
-        rows["native"]["perfect_foresight_rs"] = _bound(site, day, series, pr, soc0, native_cost,
-                                                        e_end_native=float(sims["native"]["soc"][-1]) * plant.e_nom, c_next=c_next, v_end=v_end,
-                                                        carry_start=chains["native"]["start"]["carry_rs"])
+        # the day's realised saving plus what a hindsight plan saves over the actual arm on every term it minimised (_bound): never below the
+        # saving nor zero, and none where the solve was stopped at its limit (round 7, audit engine-optimiser-14)
+        pf = _bound(site, day, series, pr, soc0, arms["actual"], e_end_actual, rows["native"]["saving_rs"], c_next=c_next, v_end=v_end)
+        rows["native"]["perfect_foresight_rs"] = pf["bound_rs"]
+        rows["native"]["perfect_foresight"] = pf
     now = store._now()
     with store.connect() as con:
         for base, data in rows.items():
             con.execute("INSERT INTO savings_days (site_id, day_local, baseline, data, computed) VALUES (?,?,?,?,?) ON CONFLICT(site_id, day_local, baseline) "
                         "DO UPDATE SET data = excluded.data, computed = excluded.computed", (site_id, day.isoformat(), base, json.dumps(data), now))
-    if forward:
-        _recompute_forward(site_id, day)
     return rows
 
 
-def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, native_cost: float, e_end_native: float | None = None,
-           c_next: float = 0.0, v_end: float = 0.0, carry_start: float = 0.0) -> float | None:
-    """A hindsight re-solve of the day on the realised PV, load and outages at 15 minutes: the upper bound, not achievable.
+def _fuel_rs_per_l(gen_asset: dict | None, day: date) -> float | None:
+    """The genset's dated fuel price on a day (None without a genset)."""
+    return tariffs.fuel_price(gen_asset.get("fuel_kind", "hsd"), day)[0] if gen_asset else None
 
-    The solve values the energy it leaves in the battery at the day's terminal value and the bound credits the difference from the native arm's end
-    energy at the same v_end, as the daily saving does (otherwise the bound earns free energy by draining the battery). The solve starts where the
-    actual arm started, so a chained native replay's start gap is charged as the daily saving charges it (`carry_start`, the day before's v_end x
-    (actual - native start energy)). The day is solved with its own inputs: overrides, a manual reserve and the tank level active today do not apply
-    to a past day."""
+
+def _price_basis(pr: dict, fuel: float | None) -> str:
+    """A digest of what a day is priced on: its minute prices (import, export, peak flags), its MDI terms, its ICP case and the genset's fuel price.
+    Two days' digests agree when re-pricing one would give the other's rupees."""
+    h = hashlib.sha1()
+    for k in ("c_imp", "c_exp"):
+        h.update(np.round(np.asarray(pr[k], dtype=float), 6).tobytes())
+    h.update(np.asarray(pr["peak"], dtype=bool).tobytes())
+    h.update(json.dumps([round(float(pr["mdi_rate"]), 6), round(float(pr["mdi_floor"]), 6), int(pr["mdi_interval"]), pr["icp"],
+                         None if fuel is None else round(float(fuel), 6)], sort_keys=True).encode())
+    return h.hexdigest()[:20]
+
+
+def _month_fingerprint(site_id: str, conn: dict | None, p0: date, p1: date) -> str:
+    """What a billing month's stored days were priced and replayed on, short of reading its minutes: every tariff version (rates, calendars, taxes,
+    the ICP rule, the adders, such as an FCA approved after the month), the dated fuel prices, the connection's settings, the native captures
+    (and those a started pilot pinned) and the month's telemetry day totals (late data re-aggregates them). While it is unchanged, a settled
+    month needs no re-scoring."""
+    with store.connect() as con:
+        tv = [list(r) for r in con.execute("SELECT id, status, effective_from, effective_to FROM tariff_versions ORDER BY id")]
+        fuel = [list(r) for r in con.execute("SELECT kind, valid_from, price FROM fuel_prices ORDER BY kind, valid_from")]
+        nv = [list(r) for r in con.execute("SELECT version, captured_at FROM native_settings WHERE site_id = ? ORDER BY version", (site_id,))]
+    td = [[d["day"], d.get("import_kwh"), d.get("completeness"), d.get("import_completeness")]
+          for d in telemetry.days(site_id, p0.isoformat(), p1.isoformat())]
+    body = {"tariffs": tv, "fuel": fuel, "conn": (conn or {}).get("data"), "native": nv, "telemetry": td}
+    pins = pilot_capture_pins(site_id)
+    if pins:  # the captures a started pilot replays (round 7, audit flow-savings-pilot-bill-12); absent without a pilot, so other months keep theirs
+        body["pilot_pins"] = pins
+    return hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _settle_month(site_id: str, conn: dict | None, p0: date, p1: date) -> list[dict]:
+    """Re-score the stored days of a closed billing month [p0, p1] whose inputs changed since they were scored (plan 8.2: the ICP lever comes from the
+    full month; 8.4: every day re-scorable with its own inputs; round 7, audit engine-savings-10): a day scored while the month was open was priced
+    on month totals projected from the days so far, so its ICP case can flip once the month ends; an FCA, a tariff version or a fuel price can be
+    approved after it (its price digest changes); a native capture can come to stand for it; late telemetry can fill its gaps. A row from before
+    the digest is re-scored where its ICP case or MDI rate differs. The days are walked in order, so a day whose chain an earlier re-score moved is
+    re-scored too, then the stored days after the month (_walk_forward, `then` in the same audit line). Each re-scored day is audited with its
+    claim before and after, and marked where it restates a claim made after the month closed (_restate: an FCA approved later, say)."""
+    with store.connect() as con:
+        rows: dict[str, dict] = {}
+        for r in con.execute("SELECT day_local, baseline, data FROM savings_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? "
+                             "ORDER BY day_local", (site_id, p0.isoformat(), p1.isoformat())):
+            rows.setdefault(r["day_local"], {})[r["baseline"]] = json.loads(r["data"])
+    if not rows:
+        return []
+    on_grid = conn is not None and conn["data"].get("regime") != "off_grid"
+    tot = month_totals(site_id, conn, p0) if on_grid else {"import": None, "export": None}
+    gen_asset = (sites.assets(site_id) or {}).get("genset")
+    tdays = {d["day"]: d for d in telemetry.days(site_id, p0.isoformat(), p1.isoformat())}
+    done: list[dict] = []
+    for day in sorted(rows):
+        d, by = date.fromisoformat(day[:10]), rows[day]
+        row = by.get("native") or next(iter(by.values()))
+        pr = _minute_prices(conn if on_grid else None, d, site_id, tot["import"], tot["export"])
+        if "price_basis" in row:
+            priced = row["price_basis"] != _price_basis(pr, _fuel_rs_per_l(gen_asset, d))
+        else:
+            priced = (row.get("icp_case") or {}) != pr["icp"] or abs(float(row.get("mdi_rate") or 0.0) - float(pr["mdi_rate"])) > 1e-6
+        cap = native_for_day(site_id, d)
+        td = tdays.get(day) or {}
+        late = any(td.get(k) is not None and row.get(rk) is not None and float(td[k]) > float(row[rk]) + 1e-4
+                   for k, rk in (("completeness", "inputs_completeness"), ("import_completeness", "import_completeness")))
+        expect = _chain_starts(site_id, d) if done else {}
+        moved = any(not (_start_matches(by[b].get("chain"), expect[b]) and _handover_matches(by[b], expect[b].get("handover"))) for b in by if b in expect)
+        why = ("prices" if priced else "native_capture" if cap is not None and cap.get("version") != row.get("native_capture_version")
+               else "late_data" if late else "chain" if moved else None)
+        if why is None:
+            continue
+        before = _stored_rows(site_id, d)
+        new = _score_day(site_id, d, with_bound="perfect_foresight_rs" in (by.get("native") or {}))
+        if new is not None:
+            done.append({"day": day, "why": why, "claimed_rs_before": row.get("claimed_rs"), "claimed_rs_after": new["native"]["claimed_rs"],
+                         "restated": _restate(site_id, d, before, why, "system")})
+    if done:
+        then = _walk_forward(site_id, p1)
+        store.audit("system", "re-scored a closed month's savings days", site_id, {"billing_period": [p0.isoformat(), p1.isoformat()], "days": done,
+                                                                                    "then": then})
+    return done
+
+
+def _settle_months(site_id: str, day: date) -> None:
+    """Settle the day's billing month once it is over, and the month before it (an FCA approved or data arriving after it closed): each only when
+    its fingerprint changed since it was last settled (_month_fingerprint), so a quiet night reads a few small tables and re-scores nothing."""
+    conn = (sites.connections(site_id) or [None])[0]
+    p0, p1 = tariffs.billing_period_for(conn, day)
+    today = _today()
+    for a, b in (tariffs.billing_period_for(conn, p0 - timedelta(days=1)), (p0, p1)):
+        if b >= today:
+            continue
+        key = f"savings_month_settled:{site_id}:{a.isoformat()}"
+        if store.get_setting(key) == _month_fingerprint(site_id, conn, a, b):
+            continue
+        _settle_month(site_id, conn, a, b)
+        store.set_setting(key, _month_fingerprint(site_id, conn, a, b))
+
+
+#: the hindsight solve's wall-clock limit (s): a solve stopped at it is not proven optimal, so it gives no bound (round 7, audit engine-optimiser-14)
+BOUND_TIME_LIMIT_S = 5.0
+
+
+def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, actual: dict, e_end_actual: float, saving_rs: float, c_next: float = 0.0,
+           v_end: float = 0.0) -> dict:
+    """The day's perfect-foresight bound (plan 8.2: a hindsight re-solve, the upper bound, not achievable), against the same baseline replay as the
+    day's saving. Returns {"bound_rs", "headroom_rs", "solved_headroom_rs", "status", "time_limited", "mdi_m0_kw"}; "bound_rs" is None where there is
+    no bound.
+
+    The day is re-solved at 15 minutes on its realised PV, load and outages from where the actual arm started (its state of charge and genset run),
+    at the ledger's own prices (`pr`: the month's settled ICP case, exports as billed), against the month's maximum demand before the day (M0), with
+    the energy left at the end valued at the ledger's v_end and no calendar ageing (the ledger prices none). The solve and the actual arm are then
+    priced on every term the solve minimised: energy, genset, wear, unserved load at the site's VoLL and the rise of the month's maximum demand above
+    M0 (or the floor), less the end energy at v_end. The bound is the day's realised saving plus the headroom, what the hindsight plan saves over the
+    actual arm on those terms; it carries the day's chained native replay, its start gap and its carry-over as the saving does. The actual's own
+    schedule and the native settings were both open to a planner with hindsight, so the bound is never below the realised saving nor below zero:
+    a negative headroom (the 15-minute model cannot follow a schedule the site ran minute by minute, a short genset run say) counts as none and is
+    kept as `solved_headroom_rs`. A solve stopped at its time limit, or not solved, is no bound. The day is solved with its own inputs: overrides,
+    a manual reserve and the tank level active today do not apply to a past day.
+
+    Before (round 7, audit engine-optimiser-14 and its duplicates): the bound priced energy, genset and wear only, while the solve also traded
+    against unserved load and the MDI rise, solved at the tariff's projected prices with today's M0, accepted a time-limited solve, and was held
+    against the 1-minute native arm, so it came out below the claim and negative (Karachi Rs 615 against Rs 43,594; Lahore -Rs 7,314)."""
+    out = {"bound_rs": None, "headroom_rs": None, "solved_headroom_rs": None, "status": "not_solved", "time_limited": False, "mdi_m0_kw": None}
     try:
         t0 = twin.day_start_utc(day)
-        q = lambda a: np.asarray(a).reshape(96, 15).mean(axis=1)
+        q = lambda a: np.asarray(a, dtype=float).reshape(96, 15).mean(axis=1)  # noqa: E731
         bundle = {"pv": {"q": {"q50": q(series["pv"]), "q25": q(series["pv"])}, "stage": 1},
                   "load": {"q": {"q50": q(series["load"]), "q75": q(series["load"])}, "crit": q(series["crit"]), "stage": 1},
                   "outage": {"g": (q(series["grid"]) > 0.5).astype(float), "p_start": np.zeros(96), "dur_steps": np.full(96, 4), "p_down": 1 - q(series["grid"])}}
@@ -974,26 +1617,48 @@ def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, native_co
         p["override_mask"] = np.zeros(T, dtype=bool)
         p["overrides"] = []
         p.pop("reserve_manual", None)
+        # the ledger's prices: the month's settled ICP case is in them, so no uncertain-case rows; a legacy export's tie-break is the solver's
+        c_imp, c_exp = q(pr["c_imp"]), q(pr["c_exp"])
+        conn = (site.get("connections") or [None])[0]
+        p["c_imp"], p["peak"], p["icp"] = c_imp, np.asarray(pr["peak"], dtype=bool)[::15], {}
+        p["c_exp"] = c_exp - (tariffs.LEGACY_EXPORT_TIE_BREAK if _legacy(conn) else 0.0)
         if p.get("genset"):
             p["genset"]["hold"] = np.zeros(T, dtype=bool)
             p["genset"]["fuel_available"] = 1e9
+            # the set's O&M as the ledger prices it (_genset_cost), without the self-generation duty the live plan adds for a large set
+            p["genset"]["c_om"] = float(site["assets"]["genset"]["c_om_rs_per_kwh"])
         if p.get("battery"):
             p["battery"]["E0"] = soc0 * p["battery"]["E_nom"]
             p["battery"]["sigma0"] = 0.0
             p["battery"]["charge_block"] = np.zeros(T, dtype=bool)
-        valued = e_end_native is not None and v_end > 0
+            p["battery"]["b_cal"] = np.zeros(T)
+        valued = v_end > 0
         # H_peak of a day: the terminal value may cover the whole battery, as the ledger's carry-over does
         p["terminal"] = {"c_next": float(c_next) if valued else 0.0, "H_peak": 24.0 if valued else 0.0, "R_next": 0.0}
-        res = optimise.solve(p, time_limit=5.0)
-        if res["status"] == "not_solved":
-            return None
-        bd = res["breakdown"]
-        cost = bd["energy_rs"] + bd["genset_rs"] + bd["wear_rs"]
-        if p.get("battery") and e_end_native is not None:
-            cost -= (float(res["sol"]["E"][-1]) - float(e_end_native)) * v_end
-        return round(native_cost - cost - float(carry_start or 0.0), 2)
+        res = optimise.solve(p, time_limit=BOUND_TIME_LIMIT_S)
+        out["time_limited"] = bool(res.get("time_limited"))
+        if res["status"] != "optimal" or out["time_limited"]:
+            out["status"] = "time_limited" if out["time_limited"] else "not_solved"
+            return out
+        bd, sol = res["breakdown"], res["sol"]
+        voll = float(p["voll"])
+        mdi = p.get("mdi")
+        rise_a = 0.0
+        if mdi and res.get("M"):
+            above = max(float(mdi["M0"]), float(mdi["floor"]))
+            rise_a = float(mdi["rate"]) * max(0.0, float(actual["peak_kw"]) - above)
+            out["mdi_m0_kw"] = round(float(mdi["M0"]), 2)
+        e_end_h = float(sol["E"][-1]) if p.get("battery") else 0.0
+        energy_h = optimise.H * float(np.sum(c_imp * np.asarray(sol["G"]) - c_exp * np.asarray(sol["X"])))
+        hind = energy_h + bd["genset_rs"] + bd["wear_rs"] + bd["unserved_rs"] + bd["mdi_rise_rs"] - v_end * e_end_h
+        act = float(actual["cost_rs"]) + voll * float(actual["unserved_kwh"]) + rise_a - v_end * float(e_end_actual)
+        solved = act - hind
+        head = max(0.0, solved)
+        out.update({"status": "optimal", "solved_headroom_rs": round(solved, 2), "headroom_rs": round(head, 2),
+                    "bound_rs": round(max(0.0, float(saving_rs) + head), 2)})
+        return out
     except Exception:
-        return None
+        return out
 
 
 def _record_confirmation(applied: dict, cls: str, score: float | None, detail: dict) -> None:
@@ -1170,18 +1835,32 @@ def confirm_applied(site: dict, day: date, applied: dict, act: dict, plant: twin
     return {"class": cls, "fidelity": score, **detail}
 
 
-def compute_range(site_id: str, d0: date, d1: date) -> int:
+def compute_range_detail(site_id: str, d0: date, d1: date, by: str = "system") -> dict:
     """Score the days d0..d1 in order, each baseline's chain carried from one to the next, then re-score the stored days after d1 whose chain the
-    range moved (_recompute_forward). Returns the days d0..d1 scored."""
+    range moved (_walk_forward). One audit line (RECOMPUTED) lists every day re-scored, why ("recompute", "chain"), and its claim before and
+    after; a closed month's changed claims are marked (_restate). Returns {"days": the days d0..d1 scored, "rescored_days": the later days the
+    walk re-scored, "restated_days": the days whose claim changed in a closed month} (round 7, audit pr-review-02: before, the answer counted the
+    range only, and nothing recorded what the walk rewrote)."""
     n = 0
+    entries: list[dict] = []
     d = d0
     while d <= d1:
-        if compute_day(site_id, d, forward=False):
+        before = _stored_rows(site_id, d)
+        new = _score_day(site_id, d)
+        if new is not None:
             n += 1
+            entries.append(_rescored(d, "recompute", before, new, _restate(site_id, d, before, "recompute", by)))
         d += timedelta(days=1)
-    if d1 >= d0:
-        _recompute_forward(site_id, d1)
-    return n
+    walked = _walk_forward(site_id, d1, by) if d1 >= d0 else []
+    entries += walked
+    if entries:
+        store.audit(by, RECOMPUTED, site_id, {"start": d0.isoformat(), "end": d1.isoformat(), "days": entries})
+    return {"days": n, "rescored_days": [x["day"] for x in walked], "restated_days": [x["day"] for x in entries if x["restated"]]}
+
+
+def compute_range(site_id: str, d0: date, d1: date, by: str = "system") -> int:
+    """compute_range_detail, the count of the days d0..d1 scored."""
+    return compute_range_detail(site_id, d0, d1, by)["days"]
 
 
 def _months_between(d0: str, d1: str) -> list[str]:
@@ -1207,7 +1886,8 @@ def _chain_stale(site_id: str, days: dict[str, dict]) -> list[str]:
     """The days whose stored chain no longer starts where the rows before them now say it starts (_chain_starts' rules on the stored rows): a day
     before them was re-scored without re-scoring them, its row is gone or has come, or its claim or its unread minutes changed (a day after one
     that claims nothing over unread inputs restarts from the actual arm's state). Their figures do not add up with the days before them until they
-    are recomputed. A restart at a switchback block is never stale."""
+    are recomputed. A restart at a switchback block is never stale; a native block's day whose hand-over replay (round 7) is missing or starts
+    elsewhere than the day before now ends is."""
     if not days:
         return []
     first = min(days)
@@ -1227,13 +1907,159 @@ def _chain_stale(site_id: str, days: dict[str, dict]) -> list[str]:
             continue
         prev = days.get(prev_day) or (prev_rows if prev_day == before else {})
         switch = (_arm_in(blocks, day[:10]) == "native") != (_arm_in(blocks, prev_day) == "native")
-        # `earlier` only names a restart's reason, and every restart from the actual arm's state gives the same figures
-        if any(not _start_matches(row.get("chain"), _expected_start(prev.get(base), switch, earlier=True)) for base, row in days[day].items()):
+        # `earlier` only names a restart's reason, and every restart from the actual arm's state gives the same figures; whether the day's arm could be
+        # the plan is read from its own row (a recommendation or a native block could not)
+        native_block = _arm_in(blocks, day[:10]) == "native"
+        if any(not _start_matches(row.get("chain"), _expected_start(prev.get(base), switch, earlier=True,
+                                                                     plan_arm=row.get("fidelity") not in ("recommendation_only", "native_block")))
+               or not _handover_matches(row, _expected_handover(prev.get(base), switch, native_block))
+               for base, row in days[day].items()):
             stale.append(day)
     return stale
 
 
+def _rows_after(site_id: str, base: str, day: str, n: int = FORWARD_MAX_DAYS) -> dict[str, dict]:
+    """A baseline's stored rows of the n days after `day`, by day."""
+    d = date.fromisoformat(day[:10])
+    with store.connect() as con:
+        return {r["day_local"]: json.loads(r["data"]) for r in
+                con.execute("SELECT day_local, data FROM savings_days WHERE site_id = ? AND baseline = ? AND day_local > ? AND day_local <= ?",
+                            (site_id, base, d.isoformat(), (d + timedelta(days=n)).isoformat()))}
+
+
+def _handover(day: str, row: dict, after: dict[str, dict], blocks: list[dict]) -> dict | None:
+    """What a claiming day's stored energy was worth on the days after it that the plan did not run (round 7, audit brief-vs-build-11, engine-
+    savings-08; HANDOFF 8.A.1): None unless the next day is such a day (NOT_PLAN_ARM: a switchback native block, control paused, a table not
+    applied). The day booked its end gap at v_end (its carry-over); those days realised that energy as native ran on it, which can differ (the
+    farm's genset hours, Faisalabad's off-peak use: 3,263 credited against 1,771 realised in round 6). The realised value is the credit plus each
+    following day's part: a native block's day its hand-over replay's `rs` (the block's replay restarts from the measured state, so the hand-over
+    is replayed beside it), a day chained from the one before its own saving (native against native from each arm's own state). The run ends at a
+    day the plan ran, at a native block's last day before a plan block, at a day whose chain restarted from the measured state, or after
+    FORWARD_MAX_DAYS days; the last day's part values the gap still unspent at its v_end. `settled` once every day of the run is known and it has
+    ended: until then the credit is provisional. `after`: the baseline's rows of the following days, by day."""
+    d = date.fromisoformat(day[:10])
+    nxt = after.get((d + timedelta(days=1)).isoformat())
+    if not nxt or nxt.get("fidelity") not in NOT_PLAN_ARM:
+        return None
+    end = (row.get("chain") or {}).get("end") or {}
+    credit = float(end["carry_rs"]) if "carry_rs" in end else float((row.get("levers") or {}).get("carry_over") or 0.0)
+    total, n, known, ended = 0.0, 0, True, False
+    for i in range(1, FORWARD_MAX_DAYS + 1):
+        dd = (d + timedelta(days=i)).isoformat()
+        r = after.get(dd)
+        if r is None:  # not scored yet: the run is not known to have ended
+            break
+        if r.get("fidelity") not in NOT_PLAN_ARM:
+            ended = True
+            break
+        if r.get("fidelity") == "native_block":
+            ho = r.get("handover")
+            if not ho:  # stored before the hand-over replay: recompute it (the summary lists it in chain_stale_days)
+                known = False
+                break
+            total += float(ho["rs"])
+        elif (r.get("chain") or {}).get("from") == "previous_day":
+            if _day_withheld(r):
+                known = False
+                break
+            total += float(r.get("saving_rs") or 0.0)
+        else:  # the chain restarted from the measured state: the hand-over ended with the day before
+            ended = True
+            break
+        n += 1
+        if r.get("fidelity") == "native_block" and _arm_in(blocks, (d + timedelta(days=i + 1)).isoformat()) != "native":
+            ended = True
+            break
+    else:
+        ended = True
+    settled = known and ended
+    return {"days": n, "v_end_rs": round(credit, 2), "realised_rs": round(credit + total, 2) if settled else None, "settled": settled}
+
+
+def _earlier_method(by: dict[str, dict]) -> bool:
+    """Whether a day's rows were scored before round 6's chained replays (round 7, audit pr-review-04): such a row has no `chain`, and its
+    carry-over is the whole end-of-day gap in stored energy at v_end, not the change of the valued gap over the day, so a period mixing it with
+    chained days does not add up as one replay. It is never stale by the chain's rules (_start_matches reads it as a start from the actual arm, and
+    the day after it restarts from the measured state, "no_state"), so it is named apart until the period is recomputed."""
+    return any(isinstance(row, dict) and "chain" not in row for row in by.values())
+
+
+def _day_withheld(d: dict) -> bool:
+    """A priced day whose claim is withheld for missing data (`claim_withheld`, or a row from before it with its import unknown): its saving is not
+    known, only some of its levers."""
+    return bool(d.get("claim_withheld")) or bool(d.get("import_unknown"))
+
+
+def _day_claims(d: dict) -> bool:
+    """A stored day that claims its saving: a claiming fidelity and nothing withheld (_claims, and a row from before `claim_withheld` with its
+    import unknown claims nothing)."""
+    return _claims(d) and not d.get("import_unknown")
+
+
+def _today() -> date:
+    """Today in Pakistan time."""
+    return datetime.now(PKT).date()
+
+
+def _measured_peak_kw(site_id: str, tday: dict, interval_min: int) -> float:
+    """A telemetry day's highest MDI block (kW): its stored 30-minute peak (aggregate_day), or its minutes read again for another interval."""
+    if interval_min == 30 or interval_min <= 0 or 1440 % interval_min:
+        return float(tday.get("peak_kw") or 0.0)
+    t0 = twin.day_start_utc(date.fromisoformat(tday["day"][:10]))
+    imp = np.nan_to_num(np.asarray(telemetry.filled(telemetry.minute_grid(site_id, t0, t0 + 86400))["imp"], dtype=float))
+    return float(imp.reshape(len(imp) // interval_min, interval_min).mean(axis=1).max()) if len(imp) == 1440 else float(tday.get("peak_kw") or 0.0)
+
+
+def _mdi_month(site_id: str, conn: dict | None, bm: str, today: date) -> dict:
+    """A billing month's MDI lever per baseline, from every day of the month so far (plan 8.2: the MDI is the month's single highest block, so the
+    lever comes from the full-month counterfactual only and is the same whatever range is viewed; round 7, audit flow-savings-pilot-bill-01).
+
+    A scored day whose saving is known gives each arm its own peak. A day with telemetry and no row (the native settings ran it, or it could not be
+    scored) and a day withheld for missing data give their measured peak to both arms: the bill's MDI counts them, and the plan is credited nothing
+    on them (audit engine-savings-04: an unseen parallel genset run cuts the actual peak the replay cannot see). The month is priced at its own rate
+    and floor, those its last scored day was priced at, i.e. the tariff version in force latest in the month, as the bill takes the version at its
+    end (audit engine-savings-05). Each day of the billing month carries 1/days of the lever (summary), and the lever is provisional until the
+    month is over: a later day can still set its peak (audit pages-D-03)."""
+    p0, p1 = tariffs.billing_period_for(conn, date(int(bm[:4]), int(bm[5:7]), 1))
+    with store.connect() as con:
+        rows = con.execute("SELECT day_local, baseline, data FROM savings_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? "
+                           "ORDER BY day_local", (site_id, p0.isoformat(), p1.isoformat())).fetchall()
+    by_day: dict[str, dict] = {}
+    for r in rows:
+        by_day.setdefault(r["day_local"], {})[r["baseline"]] = json.loads(r["data"])
+    last = by_day[max(by_day)] if by_day else {}
+    terms = last.get("native") or next(iter(last.values()), {})
+    rate, floor = float(terms.get("mdi_rate") or 0.0), float(terms.get("mdi_floor_kw") or 0.0)
+    measured: list[float] = []
+    if rate > 0:  # the measured peaks of the month's days with no row, read only where the lever has a price
+        iv = int(terms.get("mdi_interval_min") or 30)
+        measured = [_measured_peak_kw(site_id, t, iv) for t in telemetry.days(site_id, p0.isoformat(), min(p1, today).isoformat())
+                    if t["day"] not in by_day]
+    out = {"from": p0.isoformat(), "to": p1.isoformat(), "days_in_month": (p1 - p0).days + 1, "closed": p1 < today, "rate": rate, "floor": floor,
+           "tariff_version": terms.get("tariff_version"), "by_base": {}}
+    for base in ("native", "tuned"):
+        a_pk = b_pk = max(measured, default=0.0)
+        for by in by_day.values():
+            r = by.get(base)
+            if r is None:
+                continue
+            x = float(r.get("peak_kw_actual") or 0.0)
+            y = x if _day_withheld(r) else float(r.get("peak_kw_baseline") or 0.0)
+            a_pk, b_pk = max(a_pk, x), max(b_pk, y)
+        # the bill charges max(floor, MDI) a month: below the floor a lower peak saves nothing
+        out["by_base"][base] = {"actual_kw": a_pk, "baseline_kw": b_pk, "lever": (max(floor, b_pk) - max(floor, a_pk)) * rate}
+    return out
+
+
 def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
+    """The period's ledger per baseline and its days (plan 8.5). Per baseline: `claimed_rs`, the headline (the claiming days' savings, less the
+    carry-over still provisional, plus their shares of the MDI lever), with `levers_claimed_rs` its split by lever; `saving_rs` and `levers`, the
+    replay over every scored day whose saving is known (a day withheld for missing data adds to neither); `carry_over_provisional_rs`, the claiming
+    days' carry-over no later scored day has used yet; `carry_over_handover_adjustment_rs`, the change the claim took where days the plan did not run
+    (a switchback native block, control paused) realised a claiming day's handed energy at another value than its credit at v_end (_handover);
+    and the days that claim, are withheld or claim nothing on read data. The MDI lever is each
+    billing month's, from every day of the month (_mdi_month); a day adds 1/days of its month's lever where it adds its saving, so sub-ranges add up
+    to the whole, and `mdi_provisional_rs` is the claimed part from months not over yet (round 7)."""
     site = sites.get(site_id)
     with store.connect() as con:
         rows = con.execute("SELECT day_local, baseline, data, computed FROM savings_days WHERE site_id = ? AND day_local >= ? AND day_local <= ? ORDER BY day_local",
@@ -1243,7 +2069,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
     for r in rows:
         days.setdefault(r["day_local"], {})[r["baseline"]] = json.loads(r["data"])
         computed = max(computed or "", r["computed"])
-    out = {"from": d0, "to": d1, "computed": computed, "days": [], "baselines": {}, "chain_stale_days": _chain_stale(site_id, days)}
+    out = {"from": d0, "to": d1, "computed": computed, "days": [], "baselines": {}, "chain_stale_days": _chain_stale(site_id, days),
+           # round 7 (audit pr-review-04): the days scored by the method before chained replays, until the period is recomputed
+           "earlier_method_days": [d for d in sorted(days) if _earlier_method(days[d])]}
     native_capture = sites.native_latest(site_id) is not None
     conns = sites.connections(site_id) if site else []
     on_grid = bool(conns) and conns[0]["data"].get("regime") != "off_grid"
@@ -1257,122 +2085,369 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         except ValueError:
             return day[:7]
 
-    #: per baseline and month: (claimed rupees of the days, days scored, the month's claimed MDI lever), for the fee check
-    per_month: dict[str, dict[str, tuple[float, int, float]]] = {}
+    # a claiming day's carry-over is its end gap valued at v_end: what the stored energy it leaves will be worth. Until a later day is scored, nothing
+    # has used that energy, so the credit is provisional (round 7, audit role-owner-02): left out of the claim and shown apart. A later day's row
+    # settles it: a day the plan ran, whose replay starts where this day's ended, at v_end; days the plan did not run (a switchback native block,
+    # control paused, a table not applied) at what they realised with it, once they are over (_handover; audit brief-vs-build-11)
+    after = (date.fromisoformat(max(days)[:10]) + timedelta(days=1)).isoformat() if days else None
+    with store.connect() as con:
+        next_rows = {r["baseline"]: json.loads(r["data"]) for r in
+                     con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ? AND day_local = ?", (site_id, after))} if after else {}
+    blocks = switchback_blocks(site_id)
+
+    def carry(day: str, base: str, d: dict) -> tuple[float, float, dict | None]:
+        """The day's carry-over credit no later scored day has used yet (0 when one has, or when the day does not claim), the change the claim takes
+        where days the plan did not run realised the handed energy at another value than the credit, and that hand-over (_handover)."""
+        if not _day_claims(d):
+            return 0.0, 0.0, None
+        nxt = (date.fromisoformat(day[:10]) + timedelta(days=1)).isoformat()
+        nrow = days.get(nxt, {}).get(base) or (next_rows.get(base) if nxt == after else None)
+        end = (d.get("chain") or {}).get("end") or {}
+        # a row stored before chaining valued its whole end gap as its carry-over lever
+        credit = float(end["carry_rs"]) if "carry_rs" in end else float((d.get("levers") or {}).get("carry_over") or 0.0)
+        if nrow is None:
+            return credit, 0.0, None
+        if nrow.get("fidelity") in NOT_PLAN_ARM:
+            ho = _handover(day, d, _rows_after(site_id, base, day), blocks)
+            if ho and ho["settled"]:
+                return 0.0, ho["realised_rs"] - ho["v_end_rs"], ho
+            return credit, 0.0, ho
+        return 0.0, 0.0, None
+
+    today = _today()
+    #: per billing month the days touch: its MDI lever per baseline, from every day of the month
+    mdi_info = {bm: _mdi_month(site_id, conn0, bm, today) for bm in sorted({bill_month(d) for d in days})}
+
+    def mdi_share(day: str, base: str) -> float:
+        """The day's share of its billing month's MDI lever: 1/days of the month's."""
+        info = mdi_info[bill_month(day)]
+        return info["by_base"][base]["lever"] / info["days_in_month"]
+
+    #: per baseline and month: (claimed rupees of the days, their MDI shares included; days whose saving is known), for the fee check
+    per_month: dict[str, dict[str, tuple[float, int]]] = {}
+    #: per baseline and day: the provisional carry-over left out of the claim, and the hand-over to days the plan did not run
+    prov_by_day: dict[str, dict[str, float]] = {}
+    ho_by_day: dict[str, dict[str, dict | None]] = {}
     for base in ("native", "tuned"):
         levers: dict[str, float] = {}
-        total = claimed = litres = 0.0
+        levers_claimed: dict[str, float] = {}
+        total = claimed = litres = prov_total = ho_adj_total = 0.0
+        claiming_days = withheld_days = unclaimed_days = 0
         verified = 0
         gen_unknown_days = imp_unknown_days = 0
-        bound = 0.0
-        # per month: actual peak, baseline peak, billing-demand floor, claiming days, claimed rupees, days scored (a day whose import is unknown is not)
+        bound = bound_claimed = 0.0
+        bound_days = bound_missing = 0
+        # per billing month: claimed rupees (MDI shares included), days whose saving is known, claiming days, MDI shares of the known days and of
+        # the claiming days
         months: dict[str, list] = {}
+        mdi = mdi_claimed = mdi_prov = 0.0
         unserved_a = unserved_b = 0.0
-        rate = 0.0
         for day, by in days.items():
             d = by.get(base)
             if not d:
                 continue
-            for k, v in d["levers"].items():
-                if v is not None:  # a lever withheld (an unmetered genset) adds nothing
-                    levers[k] = levers.get(k, 0.0) + v
-            total += d["saving_rs"]
-            claimed += d["claimed_rs"]
+            # a day whose claim is withheld for missing data has an unknown saving: its partial levers add to no total (before, its carry-over was
+            # credited without, say, its unknown grid levers); a day that claims nothing on read data (the plan not in control, a recommendation, a
+            # native block) adds to every scored day's total, not to the claim (round 7, audit engine-savings-06)
+            withheld = _day_withheld(d)
+            claims = _day_claims(d)
+            prov, ho_adj, ho = carry(day, base, d)
+            prov_by_day.setdefault(base, {})[day] = prov
+            ho_by_day.setdefault(base, {})[day] = ho
+            if not withheld:
+                for k, v in d["levers"].items():
+                    if v is not None:  # a lever withheld (an unmetered genset) adds nothing
+                        levers[k] = levers.get(k, 0.0) + v
+                total += d["saving_rs"]
+            if claims:
+                for k, v in d["levers"].items():
+                    if v is not None:
+                        levers_claimed[k] = levers_claimed.get(k, 0.0) + v
+                levers_claimed["carry_over"] = levers_claimed.get("carry_over", 0.0) - prov + ho_adj
+                claimed += d["claimed_rs"] - prov + ho_adj
+                prov_total += prov
+                ho_adj_total += ho_adj
+            claiming_days += int(claims)
+            withheld_days += int(withheld)
+            unclaimed_days += int(not claims and not withheld)
             litres += d.get("litres_saved") or 0.0
             gen_unknown_days += int(bool(d.get("genset_unknown")))
             imp_unknown = bool(d.get("import_unknown"))
             imp_unknown_days += int(imp_unknown)
             verified += int(d["fidelity"] == "confirmed" and not imp_unknown and not d.get("claim_withheld"))
-            bound += d.get("perfect_foresight_rs") or 0.0
-            m = months.setdefault(bill_month(day), [0.0, 0.0, 0.0, 0, 0.0, 0])
-            if not imp_unknown:  # an unmetered day's actual peak reads zero: it says nothing about the month's MDI on either arm
-                m[0] = max(m[0], d["peak_kw_actual"])
-                m[1] = max(m[1], d["peak_kw_baseline"])
-            m[2] = max(m[2], float(d.get("mdi_floor_kw") or 0.0))
-            m[3] += int(d["fidelity"] in CLAIMING and not imp_unknown)
-            m[4] += d["claimed_rs"]
-            m[5] += int(not imp_unknown and not d.get("claim_withheld"))  # an unknown saving is not a zero saving: the fee's rate is over the days that could claim
-            rate = d.get("mdi_rate") or rate
+            # the day's share of its month's MDI lever goes where its saving goes: a withheld day's to no total, a day that claims nothing's not to the
+            # claim (round 7, audit engine-savings-04: before, one claiming day claimed the whole month's lever, a withheld day's included)
+            share = mdi_share(day, base)
+            # the bound is held against the claim: the claiming days with a bound by the current method (_bound), each on the claim's own terms
+            # (its provisional carry-over out, its hand-over's realised value in, its MDI share), beside what those days claim, so it is never
+            # below it; a claiming day with none (the solve stopped at its limit, or scored before) is counted apart. Days that claim nothing (a
+            # native block, the plan not in control) add nothing (round 7, audit engine-optimiser-14)
+            if claims:
+                pf = d.get("perfect_foresight_rs")
+                if isinstance(d.get("perfect_foresight"), dict) and pf is not None:
+                    bound += pf - prov + ho_adj + share
+                    bound_claimed += d["claimed_rs"] - prov + ho_adj + share
+                    bound_days += 1
+                else:
+                    bound_missing += 1
+            closed = mdi_info[bill_month(day)]["closed"]
+            m = months.setdefault(bill_month(day), [0.0, 0, 0, 0.0, 0.0])
+            m[0] += d["claimed_rs"] - prov + ho_adj + (share if claims else 0.0)
+            m[1] += int(not withheld)  # an unknown saving is not a zero saving: the fee's rate is over the days that could claim
+            m[2] += int(claims)
+            m[3] += 0.0 if withheld else share
+            m[4] += share if claims else 0.0
+            mdi += 0.0 if withheld else share
+            mdi_claimed += share if claims else 0.0
+            mdi_prov += share if claims and not closed else 0.0
             unserved_a += d["unserved_kwh_actual"]
             unserved_b += d["unserved_kwh_baseline"]
-        # the bill charges max(floor, MDI) a month: below the floor a lower peak saves nothing
-        mdi_by_month = {k: (max(v[2], v[1]) - max(v[2], v[0])) * rate for k, v in months.items()}
-        mdi = sum(mdi_by_month.values())
-        mdi_claimed = sum(x for k, x in mdi_by_month.items() if months[k][3])
-        per_month[base] = {k: (v[4], v[5], mdi_by_month[k] if v[3] else 0.0) for k, v in months.items()}
+        per_month[base] = {k: (v[0], v[1]) for k, v in months.items()}
         levers["mdi"] = round(mdi, 2)
+        levers_claimed = {k: levers_claimed.get(k, 0.0) for k in levers if k != "mdi"} | {k: v for k, v in levers_claimed.items() if k not in levers}
+        levers_claimed["mdi"] = round(mdi_claimed, 2)
         out["baselines"][base] = {"saving_rs": round(total + mdi, 2), "claimed_rs": round(claimed + mdi_claimed, 2),
-                                  "levers": {k: round(v, 2) for k, v in levers.items()}, "litres_saved": round(litres, 1), "verified_days": verified,
-                                  "perfect_foresight_rs": round(bound, 2) if base == "native" else None,
-                                  "mdi_months": {k: {"actual_kw": v[0], "baseline_kw": v[1], "floor_kw": v[2]} for k, v in months.items()},
+                                  "levers": {k: round(v, 2) for k, v in levers.items()},
+                                  "levers_claimed_rs": {k: round(v, 2) for k, v in levers_claimed.items()},
+                                  "carry_over_provisional_rs": round(prov_total, 2), "mdi_provisional_rs": round(mdi_prov, 2),
+                                  "carry_over_handover_adjustment_rs": round(ho_adj_total, 2),
+                                  "claiming_days": claiming_days, "withheld_days": withheld_days,
+                                  "unclaimed_days": unclaimed_days, "litres_saved": round(litres, 1), "verified_days": verified,
+                                  # a planner with hindsight could always have run the native settings: never below zero
+                                  "perfect_foresight_rs": round(max(0.0, bound), 2) if base == "native" and bound_days else None,
+                                  "perfect_foresight_claimed_rs": round(bound_claimed, 2) if base == "native" and bound_days else None,
+                                  "perfect_foresight_days": bound_days if base == "native" else None,
+                                  "perfect_foresight_missing_days": bound_missing if base == "native" else None,
+                                  "mdi_months": {k: {"actual_kw": mdi_info[k]["by_base"][base]["actual_kw"],
+                                                     "baseline_kw": mdi_info[k]["by_base"][base]["baseline_kw"], "floor_kw": mdi_info[k]["floor"],
+                                                     "rate_rs_per_kw": mdi_info[k]["rate"], "tariff_version": mdi_info[k]["tariff_version"],
+                                                     "lever_rs": round(mdi_info[k]["by_base"][base]["lever"], 2), "from": mdi_info[k]["from"],
+                                                     "to": mdi_info[k]["to"], "days_in_month": mdi_info[k]["days_in_month"], "scored_days": v[1],
+                                                     "claiming_days": v[2], "share_rs": round(v[3], 2), "claimed_rs": round(v[4], 2),
+                                                     "provisional": not mdi_info[k]["closed"]} for k, v in months.items()},
                                   "unserved_kwh_actual": round(unserved_a, 1), "unserved_kwh_baseline": round(unserved_b, 1),
                                   "genset_unknown_days": gen_unknown_days, "import_unknown_days": imp_unknown_days}
+        if base == "tuned":
+            # round 7 (audit engine-savings-03): the tuned rule of the period's last scored day, its cycle-charging set point None where it has none
+            rule = next((by["tuned"].get("tuned_rule") for _, by in sorted(days.items(), reverse=True) if (by.get("tuned") or {}).get("tuned_rule")),
+                        None)
+            out["baselines"][base]["cycle_charge_soc_pct"] = (rule or {}).get("cycle_soc_pct")
+            # round 7 (audit engine-money-live-11): which candidate the rule is (the native capture, the self-use table or a TOU table; None on a
+            # rule fitted before) and its fit window, with what the rule and the native capture cost over it (money: hidden from a viewer)
+            out["baselines"][base]["rule_kind"] = (rule or {}).get("kind")
+            out["baselines"][base]["rule_fit"] = (rule or {}).get("fit")
     for day, by in sorted(days.items()):
         n = by.get("native", {})
-        out["days"].append({"day": day, "saving_native_rs": n.get("saving_rs"), "saving_tuned_rs": (by.get("tuned") or {}).get("saving_rs"),
+        t = by.get("tuned") or {}
+        withheld = _day_withheld(n)
+        prov = (prov_by_day.get("native") or {}).get(day, 0.0)
+        reason = None if _day_claims(n) else (n.get("claim_withheld") or ("import_unknown" if n.get("import_unknown") else n.get("fidelity")))
+        # round 7 (audit engine-savings-06): a withheld day's saving is unknown (null), with the levers it still priced; every day says what it
+        # claims, why it claims nothing, and whether its carry-over is still provisional
+        out["days"].append({"day": day, "saving_native_rs": None if withheld else n.get("saving_rs"),
+                            "saving_tuned_rs": None if _day_withheld(t) else t.get("saving_rs"),
+                            "claimed_native_rs": n.get("claimed_rs"), "claimed_tuned_rs": t.get("claimed_rs"), "claims": _day_claims(n),
+                            "not_claimed_reason": reason,
+                            "levers_kept": [k for k, v in (n.get("levers") or {}).items() if v is not None] if withheld else None,
+                            "carry_over_provisional": bool(prov), "carry_over_provisional_native_rs": round(prov, 2) if prov else None,
+                            # round 7 (audit brief-vs-build-11): the energy the day handed to days the plan did not run, its credit at v_end and
+                            # what those days realised with it (the claim's figure once settled)
+                            "carry_over_handover": (ho_by_day.get("native") or {}).get(day),
+                            "control_share": (n.get("control") or {}).get("in_force_share"), "inputs_unread_min": n.get("inputs_unread_min"),
                             "fidelity": n.get("fidelity"), "actual_cost_rs": (n.get("actual") or {}).get("cost_rs"),
                             "native_cost_rs": (n.get("baseline") or {}).get("cost_rs"), "litres_actual": (n.get("actual") or {}).get("litres"),
                             "litres_native": (n.get("baseline") or {}).get("litres"), "peak_kw": (n.get("actual") or {}).get("peak_kw"),
                             "peak_import_kwh": (n.get("actual") or {}).get("peak_import_kwh"), "levers": n.get("levers"),
                             "import_unknown": bool(n.get("import_unknown")), "claim_withheld": n.get("claim_withheld"),
-                            "baseline_start": (n.get("chain") or {}).get("from")})
+                            "baseline_start": (n.get("chain") or {}).get("from"), "earlier_method": _earlier_method(by),
+                            # round 7: the day's share of its billing month's MDI lever (in its saving where the day's saving counts), and whether
+                            # the month is still open
+                            "mdi_month": bill_month(day), "mdi_share_native_rs": round(mdi_share(day, "native"), 2) if n else None,
+                            "mdi_provisional": not mdi_info[bill_month(day)]["closed"],
+                            # scored while its billing month was open: its ICP case rests on projected month totals until the month is settled
+                            "month_totals_projected": bool(n.get("month_totals_projected"))})
+    # round 7 (audit pr-review-02): the period's days whose claim was re-scored after their billing month closed, each with its latest change (a
+    # report of that month made before `at` shows the old figures)
+    out["restated_days"] = []
+    for day, by in sorted(days.items()):
+        hist = (by.get("native") or {}).get("restated") or (by.get("tuned") or {}).get("restated")
+        if hist:
+            last = hist[-1]
+            out["restated_days"].append({"day": day, "at": last.get("at"), "why": last.get("why"), "times": len(hist),
+                                         "claimed_rs_before": last.get("claimed_rs_before"), "claimed_rs_after": last.get("claimed_rs_after")})
     verified = out["baselines"].get("native", {}).get("verified_days", 0)
     # plan 8.5: "Preliminary" until 8 weeks of switchback have run and the FCA of every month in the period has been billed
-    today_l = datetime.now(PKT).date()
-    sb_days = sum((date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in switchback_blocks(site_id)
-                  if date.fromisoformat(b["block_end"]) < today_l)
+    sb_weeks = _switchback_weeks(blocks, today)
     fca_billed = (not on_grid) or all(tariffs.fca_billed(mk) for mk in _months_between(bill_month(d0) + "-01", bill_month(d1) + "-01"))
-    out["preliminary"] = (verified < VERIFIED_DAYS_FOR_FINAL or not native_capture or sb_days < 7 * SWITCHBACK_WEEKS_FOR_FINAL or not fca_billed)
+    out["preliminary"] = (verified < VERIFIED_DAYS_FOR_FINAL or not native_capture or sb_weeks < SWITCHBACK_WEEKS_FOR_FINAL or not fca_billed)
     out["final_conditions"] = {"verified_days": verified, "verified_days_needed": VERIFIED_DAYS_FOR_FINAL, "native_capture": native_capture,
-                               "switchback_weeks": round(sb_days / 7, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL, "fca_billed": fca_billed}
+                               "switchback_weeks": round(sb_weeks, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL, "fca_billed": fca_billed}
     out["blocked"] = None if native_capture else "Capture the inverter's native settings first: the baseline is what the inverter did on its own"
     out["method"] = ("Counterfactual replay at 1-minute resolution against the native capture and a tuned table, priced on the bearable-cost basis "
                      "(recoverable GST and adjustable s.235 excluded), with the dated fuel price and the same wear charge on both arms")
     if see_fee and site:
         fee = float(store.get_setting(f"fee:{site_id}", 0) or 0)
-        # each month's claimed rate scaled to the whole billing month (a part month is not a month), plus its MDI lever; the smaller of the two
-        # baselines (plan 8.1: claims must beat the tuned baseline); the months averaged
+        # each month's claimed rate, the days' MDI shares included, scaled to the whole billing month (a part month is not a month; a month whose
+        # every day claims scales to its whole MDI lever); the smaller of the two baselines (plan 8.1: claims must beat the tuned baseline); the
+        # months averaged
         monthly = []
         for mk in sorted({bill_month(d) for d in days}):
-            b0, b1 = tariffs.billing_period_for(conn0, date(int(mk[:4]), int(mk[5:7]), 1))  # day 1 is billed in its own month's bill
-            dim = (b1 - b0).days + 1
-            cands = [c / n * dim + mdi_c for (c, n, mdi_c) in (per_month.get(base, {}).get(mk, (0.0, 0, 0.0)) for base in ("native", "tuned")) if n]
+            dim = mdi_info[mk]["days_in_month"]
+            cands = [c / n * dim for (c, n) in (per_month.get(base, {}).get(mk, (0.0, 0)) for base in ("native", "tuned")) if n]
             if cands:
                 monthly.append(min(cands))
         saving_pm = sum(monthly) / len(monthly) if monthly else 0.0
         out["fee"] = {"fee_rs_per_month": fee, "verified_saving_rs_per_month": round(saving_pm, 0),
                       "within_one_third": fee <= saving_pm / 3 if fee else None,
-                      "basis": "claimed saving per scored day x days in the month, plus the month's MDI lever; the smaller of the native and tuned baselines"}
+                      "basis": ("claimed saving per scored day, each day's share of its month's MDI lever included, x days in the month; the smaller "
+                                "of the native and tuned baselines")}
     return out
 
 
 # ------------------------------------------------------------------------------------------------ switchback (Part 8.2)
 
-def plan_switchback(site_id: str, start: date, fortnights: int, block_days: int, by: str, seed: int | None = None) -> list[dict]:
-    """Paint the calendar: a coin flip per fortnight. Refused once the pilot has locked it (a repaint would re-roll or overlap the signed-off blocks)."""
-    rng = np.random.default_rng(seed if seed is not None else int(datetime.now().timestamp()))
+#: plan 8.2 / VER-08 (round 7, audit flow-savings-pilot-bill-25, pages-D-11): the block lengths each control tier runs. Tier 2 (advisory writes)
+#: switches by a table the installer keys in, so its blocks are 7 days (one table change per switch); tier 3 (closed loop) writes within its
+#: budget, so 3-day blocks too; a monitor site only recommends the plan, so no block of it would ever run the plan (R8 2.13: the calendar is
+#: disabled, and R8 2.12: switchback is unavailable there)
+BLOCK_DAYS_BY_TIER = {"monitor": (), "advisory_writes": (7,), "closed_loop": (3, 7)}
+#: plan 8.2: the block lengths a switchback may have at all (the calendar's "length" check answers them, so the page holds no copy of the rule;
+#: round 7, audit parity-architecture-23)
+BLOCK_DAYS_OPTIONS = (3, 7)
+
+
+def _paint_key(site_id: str) -> str:
+    return f"switchback:{site_id}"
+
+
+def paint_record(site_id: str) -> dict | None:
+    """The calendar's paint as stored with it (round 7, audit security-roles-06): when (`painted_at`, and `painted_on`, the Pakistan day it stands
+    for), by whom, how the arms were drawn (`draw`: "os_entropy", or "seeded" for the demo and tests), the pairs, the block length, the blocks it
+    drew and how many times the calendar has been painted. None for a calendar painted before the record existed."""
+    rec = store.get_setting(_paint_key(site_id))
+    return rec if isinstance(rec, dict) else None
+
+
+def plan_switchback(site_id: str, start: date, fortnights: int, block_days: int, by: str, seed: int | None = None,
+                    painted_on: date | None = None) -> list[dict]:
+    """Paint the calendar: a coin flip per pair of blocks (a fortnight of 7-day blocks, six days of 3-day ones). Round 7 (audit security-roles-06):
+    the flips come from the operating system's entropy (`secrets`), so nobody can work the arms out in advance (before: a generator seeded by the
+    clock's second); a `seed` (the demo, tests) draws reproducibly and is recorded as "seeded". The paint is stored with the calendar
+    (paint_record), written with the blocks in one transaction and audited with its arms. `painted_on` is the Pakistan day of the paint (today;
+    the demo's history paints on the day it starts), so only blocks painted before they began count towards the 8 weeks (_switchback_weeks).
+    Whether the start may lie in the past is the caller's rule (the API refuses a start before tomorrow). Refused once the pilot has locked the
+    calendar (a repaint would re-roll or overlap the signed-off blocks)."""
+    if seed is None:
+        flips = [secrets.randbits(1) == 1 for _ in range(fortnights)]
+    else:
+        rng = np.random.default_rng(seed)
+        flips = [bool(rng.random() < 0.5) for _ in range(fortnights)]
+    now = store._now()
+    on = painted_on or local_day(now)
     rows = []
-    with store.connect() as con:
+    with store.write_transaction() as con:
         if con.execute("SELECT 1 FROM switchback WHERE site_id = ? AND locked = 1 LIMIT 1", (site_id,)).fetchone():
             raise CalendarLocked()
+        old = con.execute("SELECT value FROM settings WHERE key = ?", (_paint_key(site_id),)).fetchone()
+        try:
+            count = int(json.loads(old["value"]).get("paint_count") or 0) if old else 0
+        except (ValueError, TypeError, AttributeError):
+            count = 0
         con.execute("DELETE FROM switchback WHERE site_id = ? AND locked = 0", (site_id,))
         d = start
-        for _ in range(fortnights):
-            first = "plan" if rng.random() < 0.5 else "native"
-            for arm in (first, "native" if first == "plan" else "plan"):
+        for plan_first in flips:
+            for arm in (("plan", "native") if plan_first else ("native", "plan")):
                 end = d + timedelta(days=block_days - 1)
                 con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,0)",
                             (site_id, d.isoformat(), end.isoformat(), arm))
                 rows.append({"block_start": d.isoformat(), "block_end": end.isoformat(), "arm": arm})
                 d = end + timedelta(days=1)
-    store.audit(by, "painted the switchback calendar", site_id, {"start": start.isoformat(), "fortnights": fortnights, "block_days": block_days})
+        rec = {"painted_at": now, "painted_on": on.isoformat(), "by": by, "draw": "os_entropy" if seed is None else "seeded", "start": start.isoformat(),
+               "pairs": fortnights, "block_days": block_days, "blocks": rows, "paint_count": count + 1}
+        con.execute("INSERT INTO settings (key, value, updated) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                    "updated = excluded.updated", (_paint_key(site_id), json.dumps(rec), now))
+        store.audit(by, "painted the switchback calendar", site_id,
+                    {"start": start.isoformat(), "fortnights": fortnights, "block_days": block_days, "draw": rec["draw"], "painted_on": rec["painted_on"],
+                     "paint_count": rec["paint_count"], "arms": [r["arm"] for r in rows]}, con=con)
     return rows
 
 
 def switchback_blocks(site_id: str) -> list[dict]:
+    """The calendar's blocks in date order. Each says whether the stored paint drew it before it began (`painted_before_start`; round 7, audit
+    security-roles-06): a block written any other way, or painted on or after its first day, does not count towards the 8 weeks. A calendar with no
+    paint record (painted before the record existed) that a started pilot locked: a locked block that begins after the start's day was painted
+    before it began (the paint precedes the lock), so it counts."""
     with store.connect() as con:
         rows = con.execute("SELECT * FROM switchback WHERE site_id = ? ORDER BY block_start", (site_id,)).fetchall()
-    return [dict(r) for r in rows]
+        p = con.execute("SELECT started FROM pilots WHERE site_id = ?", (site_id,)).fetchone() if rows else None
+    rec = paint_record(site_id) if rows else None
+    drawn = {(b.get("block_start"), b.get("block_end"), b.get("arm")) for b in (rec or {}).get("blocks") or [] if isinstance(b, dict)}
+    on = str((rec or {}).get("painted_on") or "")
+    locked_on = local_day(p["started"]).isoformat() if rec is None and p is not None and p["started"] else ""
+    out = []
+    for r in rows:
+        b = dict(r)
+        if rec is None:
+            b["painted_before_start"] = bool(locked_on) and bool(b.get("locked")) and b["block_start"] > locked_on
+        else:
+            b["painted_before_start"] = bool(on) and (b["block_start"], b["block_end"], b["arm"]) in drawn and b["block_start"] > on
+        out.append(b)
+    return out
+
+
+def calendar_checks(blocks: list[dict], tier: str, baseline_end: date | None, today: date, closures: list[dict], started: bool) -> list[dict]:
+    """The switchback calendar's rule checks (plan 8.2 and 9.3, R8 2.13, UI-13 tab C), as the start gates them (round 7, audit
+    flow-savings-pilot-bill-11, pages-D-18, flow-savings-pilot-bill-25): each {id, ok} with the facts its words need. Both arms equally often
+    ("balanced"); one block of each arm per pair, in random order ("paired"; `unit` "fortnight" for 7-day blocks, else "pair"); back to back
+    ("joined"); one length of 3 or 7 days ("length") that the control tier runs ("tier-length", BLOCK_DAYS_BY_TIER); enough days on each arm for
+    a result ("enough", SWITCHBACK_MIN_DAYS_PER_ARM); with a baseline window, a start after it ends ("after-baseline"); before the start, a first
+    block after today ("future"); with declared holiday closures, no block on one ("closures"). No blocks: no checks.
+
+    The pilot page shows these checks as they are and only words them (round 7, audit parity-architecture-23: it judged them itself, and its
+    "enough" rule had drifted from switchback_result's), so each carries the numbers its words need: the rule's own (`options`, `allowed`,
+    `min_days`) as well as the calendar's."""
+    blocks = sorted(blocks, key=lambda b: b["block_start"])
+    if not blocks:
+        return []
+    span = [(date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in blocks]
+    plan = [n for n, b in zip(span, blocks) if b["arm"] == "plan"]
+    native = [n for n, b in zip(span, blocks) if b["arm"] != "plan"]
+    lengths = sorted(set(span))
+    allowed = list(BLOCK_DAYS_BY_TIER.get(tier, ()))
+    first = blocks[0]["block_start"]
+    paired = len(blocks) % 2 == 0 and all(blocks[i]["arm"] != blocks[i + 1]["arm"] for i in range(0, len(blocks) - 1, 2))
+    joined = all(date.fromisoformat(b["block_start"]) == date.fromisoformat(a["block_end"]) + timedelta(days=1) for a, b in zip(blocks, blocks[1:]))
+    out = [{"id": "balanced", "ok": len(plan) == len(native), "plan_blocks": len(plan), "native_blocks": len(native)},
+           {"id": "paired", "ok": paired, "unit": "fortnight" if lengths == [7] else "pair"},
+           {"id": "joined", "ok": joined},
+           {"id": "length", "ok": len(lengths) == 1 and lengths[0] in BLOCK_DAYS_OPTIONS, "lengths": lengths, "options": list(BLOCK_DAYS_OPTIONS)},
+           {"id": "tier-length", "ok": len(lengths) == 1 and lengths[0] in allowed, "lengths": lengths, "allowed": allowed, "tier": tier},
+           {"id": "enough", "ok": min(sum(plan), sum(native)) >= SWITCHBACK_MIN_DAYS_PER_ARM, "plan_days": sum(plan), "native_days": sum(native),
+            "min_days": SWITCHBACK_MIN_DAYS_PER_ARM}]
+    if baseline_end is not None:
+        out.append({"id": "after-baseline", "ok": first > baseline_end.isoformat(), "baseline_end": baseline_end.isoformat(), "first_day": first})
+    if not started:
+        out.append({"id": "future", "ok": first > today.isoformat(), "first_day": first, "today": today.isoformat()})
+    if closures:
+        hits = [c for c in closures if any(b["block_start"] <= c["end"] and b["block_end"] >= c["start"] for b in blocks)]
+        out.append({"id": "closures", "ok": not hits, "hits": hits, "count": len(closures)})
+    return out
+
+
+def pilot_gates(site_id: str, pilot: dict, today: date, started: bool = False) -> tuple[list[dict], list[dict]]:
+    """What the pilot's start needs (round 7, audit flow-savings-pilot-bill-11, pages-D-18, pages-D-11), each {id, ok}: a control tier that can
+    run the plan ("tier": not monitor, where the plan is only recommended and every day is recommendation_only), the native capture ("capture"),
+    a baseline window ("baseline"), a painted calendar ("calendar") and its rule checks met ("rules", `failing` naming those that are not); and the
+    calendar's checks (calendar_checks)."""
+    tier = (sites.get(site_id) or {}).get("tier", "monitor")
+    blocks = switchback_blocks(site_id)
+    b0 = pilot.get("baseline_start")
+    b_end = date.fromisoformat(b0) + timedelta(days=int(pilot.get("baseline_days") or 14) - 1) if b0 else None
+    checks = calendar_checks(blocks, tier, b_end, today, [c for c in pilot.get("closures") or [] if isinstance(c, dict)], started)
+    gates = [{"id": "tier", "ok": tier != "monitor", "tier": tier}, {"id": "capture", "ok": sites.native_latest(site_id) is not None},
+             {"id": "baseline", "ok": bool(b0)}, {"id": "calendar", "ok": bool(blocks)},
+             {"id": "rules", "ok": all(c["ok"] for c in checks), "failing": [c["id"] for c in checks if not c["ok"]]}]
+    return gates, checks
 
 
 def arm_on(site_id: str, day: date) -> str | None:
@@ -1383,22 +2458,44 @@ def arm_on(site_id: str, day: date) -> str | None:
 
 
 def _carry_over_credits(blocks: list[dict], by_day: dict[str, dict]) -> list[dict]:
-    """Plan 8.2: at each plan-to-native boundary the plan block hands its stored energy to the native block; the plan arm is credited with
-    (E_end_plan - E_end_native) x v_end, where E_end_native is the native replay's end energy on the plan block's last day. A native block's last day has
-    no plan replay to compare with, so native-to-plan boundaries carry no credit."""
+    """Plan 8.2: "at every block boundary the bill engine credits the arm that ends with more stored energy by (E_end_A - E_end_B) x v_end".
+    `credit_rs` is the credit to the plan's saving at each boundary (negative where the native block handed over more):
+    - plan to native: the plan block hands its stored energy to the native block; E_end_native is the native replay's end energy on the plan
+      block's last day. Round 7 (audit brief-vs-build-11): once the native block is over and scored with its hand-over replay, the credit is what
+      the native block realised with that energy (_handover: `realised`, the v_end figure kept as `credit_v_end_rs`); until then it is the v_end
+      figure, `provisional`. The brief's common state of charge, without the reset (a control action the native mode never performs, plan 8.2);
+    - native to plan (round 7, audit engine-savings-11): the native block hands its stored energy to the plan block, which starts on it (a backup
+      mode that holds its battery full flatters the plan block's first day; a self-use native that ends empty handicaps it). The plan arm is not
+      replayed on a native day, so its end energy there is the plan days' mean end energy (`e_end_plan_basis: "plan_days_mean"`: the days of the
+      calendar the plan was in control, none withheld); with no such day yet there is no credit."""
+    plan_ends = [float(r["actual"].get("e_end_kwh") or 0.0) for d, r in by_day.items()
+                 if _arm_in(blocks, d) == "plan" and r.get("fidelity") in CLAIMING and not _day_withheld(r)]
+    e_plan_ref = float(np.mean(plan_ends)) if plan_ends else None
     out = []
     for a, b in zip(blocks, blocks[1:]):
-        if a["arm"] != "plan" or b["arm"] != "native":
+        if {a["arm"], b["arm"]} != {"plan", "native"}:
             continue
         if date.fromisoformat(a["block_end"]) + timedelta(days=1) != date.fromisoformat(b["block_start"]):
             continue
         r = by_day.get(a["block_end"])
         if not r:
             continue
-        e_a, e_b = float(r["actual"].get("e_end_kwh") or 0.0), float(r["baseline"].get("e_end_kwh") or 0.0)
         v = float(r["actual"].get("v_end") or 0.0)
-        out.append({"boundary": b["block_start"], "from_arm": "plan", "to_arm": "native", "e_end_plan_kwh": round(e_a, 2), "e_end_native_kwh": round(e_b, 2),
-                    "v_end": round(v, 2), "credit_rs": round((e_a - e_b) * v, 2)})
+        ho = None
+        if a["arm"] == "plan":
+            e_p, e_n = float(r["actual"].get("e_end_kwh") or 0.0), float(r["baseline"].get("e_end_kwh") or 0.0)
+            basis = "plan_block_last_day"
+            ho = _handover(a["block_end"], r, by_day, blocks)
+        else:
+            if e_plan_ref is None:
+                continue
+            e_p, e_n = e_plan_ref, float(r["actual"].get("e_end_kwh") or 0.0)
+            basis = "plan_days_mean"
+        at_v_end = round((e_p - e_n) * v, 2)
+        settled = bool(ho and ho["settled"])
+        out.append({"boundary": b["block_start"], "from_arm": a["arm"], "to_arm": b["arm"], "e_end_plan_kwh": round(e_p, 2), "e_end_native_kwh": round(e_n, 2),
+                    "e_end_plan_basis": basis, "v_end": round(v, 2), "credit_rs": ho["realised_rs"] if settled else at_v_end, "credit_v_end_rs": at_v_end,
+                    "realised": settled, "provisional": a["arm"] == "plan" and not settled})
     return out
 
 
@@ -1413,12 +2510,60 @@ def _curtailed_by_day(site_id: str, d0: str, d1: str) -> dict[str, float]:
     return {datetime.fromtimestamp(int(b), PKT).date().isoformat(): float(v or 0.0) * 24 / 1000 for b, v in zip(s["ts"], s["series"]["curtail_w"])}
 
 
+#: plan 8.2 / VER-08: a switchback figure needs at least this many priced days on each arm, so the 5-coefficient adjustment (intercept, arm, PV,
+#: load, outage hours) is fitted with at least 7 degrees of freedom; the pilot's own rule (6 days on each arm) and the panel's text say the same
+SWITCHBACK_MIN_DAYS_PER_ARM = 6
+#: plan 8.2: "the two estimates (counterfactual and switchback) must agree within 15 percent of the switchback saving or Rs 300 a day, whichever
+#: is larger; a disagreement is a finding, not a rounding"
+AGREEMENT_SHARE = 0.15
+AGREEMENT_FLOOR_RS_PER_DAY = 300.0
+
+
+def _switchback_weeks(blocks: list[dict], today: date) -> float:
+    """Weeks of switchback run: the days of the blocks that have ended (plan 8.5's "Preliminary until 8 weeks of switchback have run"), each painted
+    before it began (round 7, audit security-roles-06: a calendar painted over days already run, its arms chosen after their costs were seen,
+    clears nothing)."""
+    days = sum((date.fromisoformat(b["block_end"]) - date.fromisoformat(b["block_start"])).days + 1 for b in blocks
+               if date.fromisoformat(b["block_end"]) < today and b.get("painted_before_start"))
+    return days / 7
+
+
+def _fit(X: np.ndarray, y: np.ndarray) -> tuple[float, float | None, int]:
+    """The arm's coefficient of a least-squares fit (column 1), its standard error (None without a degree of freedom) and the degrees of freedom.
+    A covariate that does not vary (no outage in any day) is left out, so it takes no degree of freedom."""
+    keep = [0, 1] + [j for j in range(2, X.shape[1]) if np.ptp(X[:, j]) > 1e-9]
+    X = X[:, keep]
+    coef, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
+    df = int(len(y) - rank)
+    if df <= 0:
+        return float(coef[1]), None, df
+    resid = y - X @ coef
+    cov = float(resid @ resid) / df * np.linalg.pinv(X.T @ X)
+    return float(coef[1]), float(np.sqrt(max(cov[1, 1], 0.0))), df
+
+
+def _lower_80(est: float, se: float | None, df: float) -> float | None:
+    """The one-sided lower 80 percent confidence bound of an estimate (Student's t; plan Part 15.3's statistic)."""
+    if se is None or df <= 0:
+        return None
+    from scipy.stats import t as student_t
+    return est - float(student_t.ppf(0.8, df)) * se
+
+
 def switchback_result(site_id: str) -> dict:
     """Mean daily cost on plan blocks against native blocks, unadjusted and adjusted by a regression on PV kWh (available), load kWh (served plus
-    unserved) and outage hours, with the carry-over credit of every plan-to-native boundary added to the plan's saving and shown beside it."""
+    unserved) and outage hours, with the carry-over credit of every plan-to-native boundary added to the plan's saving and shown beside it.
+
+    Round 7 (audit flow-savings-pilot-bill-03, engine-savings-12, role-analyst-01): a plan day is evidence for the plan only while the plan was in
+    control (a claiming fidelity: a recommendation at a monitor tier, a table not applied or control paused ran the inverter's own settings), and a
+    day withheld for missing data is evidence for neither arm (its actual cost is not known). No figure until each arm has SWITCHBACK_MIN_DAYS_PER_ARM
+    such days (`result_withheld`: "too_few_days", or "monitor_tier" where the plan never controls). The result carries the adjustment's standard
+    error, degrees of freedom and lower 80 percent bound, is Preliminary until 8 weeks of switchback have run, and holds the counterfactual saving
+    per plan day beside the switchback's (`agreement`: within 15 % of the switchback saving or Rs 300 a day, whichever is larger)."""
     blocks = switchback_blocks(site_id)
     if not blocks:
-        return {"blocks": [], "result": None}
+        return {"blocks": [], "result": None, "result_withheld": "no_calendar"}
+    tier = (sites.get(site_id) or {}).get("tier", "monitor")
     d0, d1 = blocks[0]["block_start"], max(b["block_end"] for b in blocks)
     tdays = {d["day"]: d for d in telemetry.days(site_id, d0, d1)}
     curtailed = _curtailed_by_day(site_id, d0, d1)
@@ -1427,33 +2572,68 @@ def switchback_result(site_id: str) -> dict:
                            (site_id, d0, d1)).fetchall()
     by_day = {r["day_local"]: json.loads(r["data"]) for r in rows}
     credits = _carry_over_credits(blocks, by_day)
-    X, y, arms = [], [], []
+    # the counterfactual of a plan block's last day values its hand-over as the switchback's credit does: realised once the native block is over
+    realised = {(date.fromisoformat(c["boundary"]) - timedelta(days=1)).isoformat(): c["credit_rs"] - c["credit_v_end_rs"] for c in credits if c["realised"]}
+    X, y, arms, cf = [], [], [], []
+    excluded = {"plan_not_in_control": 0, "withheld": 0}
     for day in sorted(by_day):
-        arm = next((b["arm"] for b in sorted(blocks, key=lambda b: (-int(b.get("locked") or 0), b["block_start"]))
-                    if b["block_start"] <= day <= b["block_end"]), None)
+        arm = _arm_in(blocks, day)
         t = tdays.get(day)
-        if arm is None or t is None or by_day[day].get("import_unknown"):  # an unmetered day's grid cost reads zero: it is no evidence for either arm
+        r = by_day[day]
+        if arm is None or t is None:
+            continue
+        if _day_withheld(r):  # an unmetered day's grid cost reads zero, an unseen genset run's fuel is missing: no evidence for either arm
+            excluded["withheld"] += 1
+            continue
+        if arm == "plan" and r.get("fidelity") not in CLAIMING:  # the inverter ran its own settings: no evidence for the plan
+            excluded["plan_not_in_control"] += 1
             continue
         pv = float(t.get("pv_kwh") or 0.0) + curtailed.get(day, 0.0)
         load = float(t.get("load_kwh") or 0.0) + float(t.get("unserved_kwh") or 0.0)
         X.append([1.0, 1.0 if arm == "plan" else 0.0, pv, load, (t.get("outage_minutes") or 0) / 60])
-        y.append(by_day[day]["actual"]["cost_rs"])
+        y.append(r["actual"]["cost_rs"])
         arms.append(arm)
-    if len(set(arms)) < 2 or len(y) < 6:
-        return {"blocks": blocks, "result": None, "days": len(y), "carry_over_credits": credits}
-    X, y = np.array(X), np.array(y)
+        if arm == "plan":
+            cf.append(float(r.get("saving_rs") or 0.0) + realised.get(day, 0.0))
     a = np.array(arms)
-    unadj = float(np.mean(y[a == "native"]) - np.mean(y[a == "plan"]))
-    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-    adj = float(-coef[1])
-    plan_days = int(np.sum(a == "plan"))
+    arm_days = {"plan": int(np.sum(a == "plan")), "native": int(np.sum(a == "native"))}
+    today = _today()
+    weeks = _switchback_weeks(blocks, today)
+    out = {"blocks": blocks, "days": len(y), "carry_over_credits": credits, "arm_days": arm_days, "min_days_per_arm": SWITCHBACK_MIN_DAYS_PER_ARM,
+           "excluded_days": excluded, "switchback_weeks": round(weeks, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL}
+    if min(arm_days.values()) < SWITCHBACK_MIN_DAYS_PER_ARM:
+        # a monitor-tier site only recommends: its plan days are recommendation_only, never the plan in control, so it never gets a result
+        return {**out, "result": None, "result_withheld": "monitor_tier" if tier == "monitor" else "too_few_days"}
+    X, y = np.array(X), np.array(y)
+    yn, yp = y[a == "native"], y[a == "plan"]
+    unadj = float(np.mean(yn) - np.mean(yp))
+    se_un = float(np.sqrt(np.var(yn, ddof=1) / len(yn) + np.var(yp, ddof=1) / len(yp)))
+    # Welch-Satterthwaite degrees of freedom for the difference of the two means
+    vn, vp = np.var(yn, ddof=1) / len(yn), np.var(yp, ddof=1) / len(yp)
+    df_un = float((vn + vp) ** 2 / (vn ** 2 / (len(yn) - 1) + vp ** 2 / (len(yp) - 1))) if (vn + vp) > 0 else 0.0
+    coef_plan, se_adj, df = _fit(X, y)
+    adj = -coef_plan
+    plan_days = arm_days["plan"]
     credit = float(sum(c["credit_rs"] for c in credits))
     per_day = credit / plan_days if plan_days else 0.0
-    return {"blocks": blocks, "days": len(y), "carry_over_credits": credits,
-            "result": {"saving_rs_per_day_unadjusted": round(unadj + per_day, 2), "saving_rs_per_day_adjusted": round(adj + per_day, 2),
-                       "plan_days": plan_days, "native_days": int(np.sum(a == "native")), "carry_over_credit_rs": round(credit, 2),
+    sb_adj, sb_un = adj + per_day, unadj + per_day
+    cf_day = float(np.mean(cf)) if cf else 0.0
+    tol = max(AGREEMENT_SHARE * abs(sb_adj), AGREEMENT_FLOOR_RS_PER_DAY)
+    lo_adj, lo_un = _lower_80(sb_adj, se_adj, df), _lower_80(sb_un, se_un if se_un > 0 else None, df_un)
+    reasons = (["under_8_weeks"] if weeks < SWITCHBACK_WEEKS_FOR_FINAL else []) + (["carry_over_provisional"] if any(c["provisional"] for c in credits) else [])
+    return {**out, "result_withheld": None,
+            "result": {"saving_rs_per_day_unadjusted": round(sb_un, 2), "saving_rs_per_day_adjusted": round(sb_adj, 2),
+                       "plan_days": plan_days, "native_days": arm_days["native"], "carry_over_credit_rs": round(credit, 2),
                        "carry_over_rs_per_plan_day": round(per_day, 2), "saving_rs_per_day_unadjusted_before_carry_over": round(unadj, 2),
-                       "saving_rs_per_day_adjusted_before_carry_over": round(adj, 2)}}
+                       "saving_rs_per_day_adjusted_before_carry_over": round(adj, 2),
+                       "std_error_rs_per_day_adjusted": None if se_adj is None else round(se_adj, 2), "degrees_of_freedom": df,
+                       "lower_80_rs_per_day_adjusted": None if lo_adj is None else round(lo_adj, 2),
+                       "std_error_rs_per_day_unadjusted": round(se_un, 2),
+                       "lower_80_rs_per_day_unadjusted": None if lo_un is None else round(lo_un, 2),
+                       "preliminary": bool(reasons), "preliminary_reasons": reasons,
+                       "agreement": {"counterfactual_rs_per_day": round(cf_day, 2), "switchback_rs_per_day": round(sb_adj, 2),
+                                     "difference_rs_per_day": round(sb_adj - cf_day, 2), "tolerance_rs_per_day": round(tol, 2),
+                                     "agrees": bool(abs(sb_adj - cf_day) <= tol)}}}
 
 
 # ------------------------------------------------------------------------------------------------ bill truth (Part 8.2 layer 3)
