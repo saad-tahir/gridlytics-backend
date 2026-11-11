@@ -200,8 +200,8 @@ def test_grid_present_written_as_on_and_off_is_read(company):
     sid = _site("Words")
     rows = [(_local(T0 + 9 * 3600 + 60 * i), "OFF" if 10 <= i < 25 else "On", 50000) for i in range(60)]
     res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), rows), 5, now=NOW)
+    assert _day(sid)["outage_minutes"] == 15  # the behaviour first: OFF read as 0 (it was 0 outage minutes, every word unreadable)
     assert not res["warnings"]
-    assert _day(sid)["outage_minutes"] == 15
 
 
 def test_a_file_whose_grid_present_cannot_be_read_is_refused(company):
@@ -223,7 +223,7 @@ def test_some_unreadable_grid_present_cells_are_a_warning(company):
     sid = _site("Partly")
     rows = [(_local(T0 + 9 * 3600 + 60 * i), "?" if i < 10 else 1, 50000) for i in range(60)]
     res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w"), rows), 5, now=NOW)
-    assert any(w.startswith("10 grid_present cells could not be read") for w in res["warnings"]), res["warnings"]
+    assert any(w.startswith("10 grid_present cells could not be read") for w in res.get("warnings", [])), res.get("warnings")
     assert res["status"] == "done_with_warnings" and telemetry.imports(sid)[0]["status"] == "done_with_warnings"
 
 
@@ -240,8 +240,8 @@ def test_kilowatts_in_watt_columns_are_reported(company):
     sid = _site("Units")
     rows = [(_local(T0 + 60 * i), 1, 250, _solar(T0 + 60 * i, 150)) for i in range(1440)]
     res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w", "pv_power_w"), rows), 5, now=NOW)
-    text = " ".join(res["warnings"])
-    assert "load_power_w" in text and "pv_power_w" in text and "kW" in text, res["warnings"]
+    text = " ".join(res.get("warnings", []))  # the warning itself is the fix: without it the import was a plain "done"
+    assert "load_power_w" in text and "pv_power_w" in text and "kW" in text, res.get("warnings")
     assert res["status"] == "done_with_warnings" and telemetry.imports(sid)[0]["status"] == "done_with_warnings"
     assert all(w in res["log"] for w in res["warnings"])  # the quality page's imports row shows them too
     good = [(_local(T0 + 86400 + 60 * i), 1, 250000, _solar(T0 + 86400 + 60 * i, 150000)) for i in range(1440)]
@@ -268,7 +268,7 @@ def test_impossible_values_are_stored_as_missing_and_reported(company):
     day = _day(sid)
     assert day["max_soc"] == 60.0 and day["min_soc"] == 60.0
     assert day["load_kwh"] == pytest.approx(80 * 55 / 60, abs=0.01)
-    w = " | ".join(res["warnings"])
+    w = " | ".join(res.get("warnings", []))
     assert "5 load_power_w cells were below -500 W" in w, w
     assert "1 pv_power_w cell was below -500 W" in w, w
     assert "2 battery_soc_bms_pct cells were outside 0 to 100 %" in w, w
@@ -278,7 +278,7 @@ def test_a_state_of_charge_given_as_a_fraction_is_reported(company):
     sid = _site("Fraction")
     rows = [(_local(T0 + 8 * 3600 + 60 * i), 1, 80000, round(0.4 + 0.004 * i, 3)) for i in range(120)]
     res = telemetry.import_csv(sid, _file(("ts", "grid_present", "load_power_w", "battery_soc_bms_pct"), rows), 5, now=NOW)
-    assert any("battery_soc_bms_pct never goes above 1" in w for w in res["warnings"]), res["warnings"]
+    assert any("battery_soc_bms_pct never goes above 1" in w for w in res.get("warnings", [])), res.get("warnings")
 
 
 # ------------------------------------------------------------------------------------------------ frontend-states-formats-06 / flow-telemetry-plan-control-11
@@ -290,7 +290,7 @@ def test_solar_power_at_night_reports_a_probable_time_zone_slip(company):
     local_rows = [(_local(T0 + 60 * i), 1, 200000, _solar(T0 + 60 * i, 150000)) for i in range(1440)]
     body = _file(("ts", "grid_present", "load_power_w", "pv_power_w"), local_rows)
     wrong = telemetry.import_csv(sid, body, 0, now=NOW)
-    assert any("Karachi time" in w and "zone" in w for w in wrong["warnings"]), wrong["warnings"]
+    assert any("Karachi time" in w and "zone" in w for w in wrong.get("warnings", [])), wrong.get("warnings")
     sid2 = _site("Zone right")
     right = telemetry.import_csv(sid2, body, 5, now=NOW)
     assert right["warnings"] == []
@@ -590,9 +590,10 @@ def test_the_overview_month_names_where_its_litres_came_from(world):
         _one_run(metered, start, minutes=minutes, fuel=0.5)
         _one_run(unmetered, start, minutes=minutes)
     m = c.get(f"/api/sites/{metered}/now").json()["month"]
-    assert (m["litres"], m["litres_source"]) == (round(0.5 * minutes, 1), "meter")
     u = c.get(f"/api/sites/{unmetered}/now").json()["month"]
-    assert (u["litres"], u["litres_source"]) == (round(31.0 * minutes / 60, 1), "curve")
+    # the litres first: the unmetered set's are the curve's (they were 0 L), then the source each names
+    assert (m["litres"], u["litres"]) == (round(0.5 * minutes, 1), round(31.0 * minutes / 60, 1))
+    assert (m.get("litres_source"), u.get("litres_source")) == ("meter", "curve")
 
 
 # ================================================================================================ batch 3: CSV mapping, refusals, data quality and series
@@ -1220,6 +1221,22 @@ def test_a_month_at_the_calendar_s_edge_is_refused_in_one_sentence_not_a_server_
     r = c.get(f"/api/sites/{sid}/genset", params={"month": "2015-01"})
     assert r.status_code == 200, r.text
     assert r.json()["previous"]["month"] == "2014-12" and r.json()["kpis"]["hours"] is None
+
+
+def test_the_genset_page_counts_a_run_with_a_blank_sample_once_and_a_coarse_run_in_full(world):
+    """Review of pages-C-04 through the page itself: a 1-minute run of 2 hours with one blank row is one start of 2 hours (the page counted two starts,
+    the blank read as off), and a 15-minute source's 2-hour run at 100 kW is 2 hours and 200 kWh (it was 1.77 hours and 13.3 kWh, a row per minute)."""
+    c = world.owner
+    one, coarse = _route_site(c, "Blank run"), _route_site(c, "Coarse run")
+    t = _pk_ts(_pk_day(1), 10)
+    with world.use():
+        _write(one, t, 180, grid_present=0, genset_running=lambda i: None if i == 30 else int(i < 120),
+               genset_power_w=lambda i: None if i == 30 else (100000 if i < 120 else 0))
+        _write(coarse, t, 16, 900, grid_present=1, genset_running=lambda i: int(i < 8), genset_power_w=lambda i: 100000 if i < 8 else 0)
+    k = c.get(f"/api/sites/{one}/genset").json()["kpis"]
+    assert (k["starts"], k["hours"]) == (1, 2.0)
+    k = c.get(f"/api/sites/{coarse}/genset").json()["kpis"]
+    assert (k["starts"], k["hours"]) == (1, 2.0) and k["kwh"] == pytest.approx(200.0)
 
 
 def test_a_minute_written_inside_a_run_between_the_page_s_two_reads_is_not_a_server_error(company, monkeypatch):
