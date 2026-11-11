@@ -155,3 +155,18 @@ def test_the_unconfirmed_slot_table_alert_says_why_in_plain_words(world, monkeyp
     assert not _re.search(r"\btier \d\b|read-back", title), title
     assert title.endswith("until the table is marked applied on the Control page"), title
 
+
+def test_the_hot_full_battery_alert_names_its_24_hours_not_the_last_day(world):
+    """A follow-up of role-operator-31: the hot_high_soc title said "in the last day", still read after the alert cleared."""
+    from gridlytics import battery
+    sid = world.site
+    end = int(datetime(2026, 11, 9, 20, 0, tzinfo=PKT).timestamp())
+    with world.use():
+        sites.put_asset(sid, "battery", {"nameplate_kwh": 200, "p_ch_kw": 100, "p_dis_kw": 100}, "test")
+        # three hours at 95 % and 40 degrees, the minute before 20:00 the last
+        rows = [(sid, end - 180 * 60 + 60 * i, "edge", 95.0, 40.0, 1) for i in range(180)]
+        telemetry.write_rows(rows, ("site_id", "ts", "source_id", "battery_soc_bms_pct", "battery_temp_c", "grid_present"))
+        st = battery.state(sites.full(sid), end)
+    text = dict(st["alerts"])["hot_high_soc"]
+    assert text == "3.0 hours above 90 percent charge above 35 degrees in the 24 hours to 9 Nov 20:00", text
+    assert "last day" not in text

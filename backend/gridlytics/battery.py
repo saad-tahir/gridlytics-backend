@@ -183,7 +183,10 @@ def state(site: dict, now: int | None = None) -> dict | None:
     day = slice(max(0, last - 1440), last + 1)
     hot = np.nansum((est[day] > 0.9) & (g["temp"][day] > 35)) / 60.0
     if hot > 2:
-        alerts.append(("hot_high_soc", f"{hot:.1f} hours above 90 percent charge above 35 degrees in the last day"))
+        # the title names its 24 hours, as the other alerts name their day (round 7 sweeps, a follow-up of role-operator-31: "in the last day" was
+        # still read after the alert cleared); Karachi time
+        to = datetime.fromtimestamp(int(g["ts"][last]) + 60 + PKT_OFFSET_S, timezone.utc)
+        alerts.append(("hot_high_soc", f"{hot:.1f} hours above 90 percent charge above 35 degrees in the 24 hours to {to.day} {to:%b %H:%M}"))
     alerts += pack_alerts
     disch = np.nansum(np.maximum(g["bat"], 0)) / 60.0
     days_seen = max(1.0, known.sum() / 1440)
