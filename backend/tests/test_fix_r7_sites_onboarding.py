@@ -690,8 +690,8 @@ def test_mode_b_without_an_edge_device_is_a_setup_warning_and_meta_gives_the_fal
     assert warning not in a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "edge", "grid_signal_confirmed": True}}).json()["setup_warnings"]
     assert warning not in a.put(f"/api/sites/{sid}", json={"control_mode": "mode_a", "data_source": {"kind": "csv", "grid_signal_confirmed": True}}).json()[
         "setup_warnings"]
-    # what every plan falls back to (delivery's fallback block), for tab D to show
-    assert a.get("/api/meta").json()["fallback"] == {"on_expiry": "inverter_native", "revert_after_hours": delivery.FALLBACK_HOURS}
+    # what every plan falls back to (delivery's fallback block, which has no revert timer since engine-delivery-14), for tab D to show
+    assert a.get("/api/meta").json()["fallback"] == {"on_expiry": "inverter_native", "on_link_loss_after_s": delivery.LINK_LOSS_AFTER_S}
 
 
 # ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-12, the capture form's half

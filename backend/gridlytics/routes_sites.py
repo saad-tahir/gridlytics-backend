@@ -29,9 +29,10 @@ def meta():
             "permissions": {p: auth.can(p) for p in auth.PERMISSIONS},
             # the categories the ICP applies to, so tab C asks for the ICP baseline only there (audit engine-tariffs-05)
             "icp_categories": _icp_categories(),
-            # what every plan falls back to when no newer one arrives (delivery's fallback block, the floor being the site's reserve floor), for tab D
-            # to show (plan 9.3 tab D "fallback"; audit flow-onboarding-22)
-            "fallback": {"on_expiry": "inverter_native", "revert_after_hours": delivery.FALLBACK_HOURS}}
+            # what every plan falls back to when no newer one arrives (delivery.fallback_block: no revert timer, as a keyed table stays and repeats each
+            # day; an edge keeps the plan it holds through a lost link to its end, then the inverter returns to its native settings; the floor is at least
+            # the site's reserve floor), for tab D to show (plan 9.3 tab D "fallback", Part 7.1 step 6; audit flow-onboarding-22, engine-delivery-14)
+            "fallback": {"on_expiry": "inverter_native", "on_link_loss_after_s": delivery.LINK_LOSS_AFTER_S}}
 
 
 def _icp_categories() -> list[str]:
