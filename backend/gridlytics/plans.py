@@ -1464,8 +1464,8 @@ def ack_lines(body: dict) -> list[dict]:
 
 def readback(site_id: str, now: int | None = None) -> dict:
     """The read-back panel (UI-15, closed loop; audit role-operator-11): the last plan message sent to the edge (a release aside), the edge's latest
-    ack of that plan ({received_at, status, outcome, codes, detail}: contract.ack_outcome) with its lines per primitive (ack_lines), and today's
-    fidelity from what the edge reported (edge_fidelity). plan_id, sent_at and ack are None before the first send."""
+    ack of that plan ({received_at, status, outcome, codes, detail}: contract.ack_outcome) with its lines per primitive (`primitives`: ack_lines),
+    and today's fidelity from what the edge reported (edge_fidelity). plan_id, sent_at and ack are None before the first send."""
     from . import contract
 
     now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
@@ -1474,13 +1474,14 @@ def readback(site_id: str, now: int | None = None) -> dict:
                            "LIMIT 1", (site_id,)).fetchone()
         ack = con.execute("SELECT body, status, received_at FROM acks WHERE site_id = ? AND plan_id = ? ORDER BY received_at DESC, rowid DESC LIMIT 1",
                           (site_id, sent["plan_id"])).fetchone() if sent else None
-    out = {"plan_id": sent["plan_id"] if sent else None, "sent_at": sent["sent_at"] if sent else None, "ack": None, "lines": [],
+    # its lines per primitive are `primitives`: a key named `lines` is a bill's, which the money filter removes from every reader without costs
+    out = {"plan_id": sent["plan_id"] if sent else None, "sent_at": sent["sent_at"] if sent else None, "ack": None, "primitives": [],
            "fidelity_today": edge_fidelity(site_id, _local(now).date())}
     if ack is not None:
         body = json.loads(ack["body"])
         outcome, codes = contract.ack_outcome(body)
         out["ack"] = {"received_at": ack["received_at"], "status": ack["status"], "outcome": outcome, "codes": codes, "detail": body.get("detail")}
-        out["lines"] = ack_lines(body)
+        out["primitives"] = ack_lines(body)
     return out
 
 

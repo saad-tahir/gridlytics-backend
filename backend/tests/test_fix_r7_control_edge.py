@@ -1543,7 +1543,7 @@ def test_the_read_back_says_per_primitive_what_was_asked_written_and_read_back(w
     sid, pid, kh, items = _ack_world(world)
     rb = world.c["viewer"].get(f"/api/sites/{sid}/control/readback").json()
     assert rb["plan_id"] == pid and rb["sent_at"] and rb["ack"]["outcome"] == "partial" and rb["ack"]["codes"] == ["NOT_SUPPORTED"], rb
-    lines = {ln["primitive"]: ln for ln in rb["lines"]}
+    lines = {ln["primitive"]: ln for ln in rb["primitives"]}
     assert lines["soc_floor_pct"] == {"device": "inv1", "primitive": "soc_floor_pct", "requested": 40, "written": 40, "read_back": 40, "match": True,
                                       "status": "ok", "codes": []}
     assert lines["max_charge_w"]["status"] == "clamped" and lines["max_charge_w"]["match"] is True      # written below what was asked
@@ -1553,12 +1553,12 @@ def test_the_read_back_says_per_primitive_what_was_asked_written_and_read_back(w
     # this contract's items: a value read back that differs is a mismatch with its code
     assert world.anon.post(f"/api/edge/{sid}/ack", headers=kh, json=_env(2, **items)).status_code == 200
     rb = world.c["viewer"].get(f"/api/sites/{sid}/control/readback").json()
-    assert rb["lines"] == [{"device": "inv1", "primitive": "export_limit_w", "requested": None, "written": 0, "read_back": 500, "match": False,
+    assert rb["primitives"] == [{"device": "inv1", "primitive": "export_limit_w", "requested": None, "written": 0, "read_back": 500, "match": False,
                             "status": "failed", "codes": ["READBACK_MISMATCH"]}], rb
     # before any send there is nothing to read back
     with world.use(), store.connect() as con:
         con.execute("DELETE FROM plan_messages")
-    assert world.c["viewer"].get(f"/api/sites/{sid}/control/readback").json() == {"plan_id": None, "sent_at": None, "ack": None, "lines": [],
+    assert world.c["viewer"].get(f"/api/sites/{sid}/control/readback").json() == {"plan_id": None, "sent_at": None, "ack": None, "primitives": [],
                                                                                     "fidelity_today": "partial"}
 
 
