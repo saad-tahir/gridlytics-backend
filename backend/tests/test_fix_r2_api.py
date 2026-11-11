@@ -477,14 +477,14 @@ def test_resume_re_solves_at_once_and_a_failed_tick_does_not_undo_it(world, monk
 
     def fake_tick(site_id, *a, **k):
         ticks.append(site_id)
-        return {"status": "active", "plan_id": "p-resume"}
+        return {"status": "active", "plan_id": "p-resume", "in_force": "p-resume"}
 
     monkeypatch.setattr(plans, "tick", fake_tick)
     assert admin.post(f"/api/sites/{sid}/control/pause", json={"hours": 2}).json()["control"]["key"] == "paused"
     r = admin.post(f"/api/sites/{sid}/control/resume", json={})
     assert r.status_code == 200 and r.json()["control"]["key"] != "paused", r.text
     # the pause re-solved at once too (round 7, audit flow-telemetry-plan-control-15: every control action takes effect at once)
-    assert ticks == [sid, sid] and r.json()["resolve"] == {"status": "active", "plan_id": "p-resume", "reason": None}
+    assert ticks == [sid, sid] and r.json()["resolve"] == {"status": "active", "plan_id": "p-resume", "reason": None, "in_force": "p-resume"}
     # nothing to resume: no solve
     assert "resolve" not in admin.post(f"/api/sites/{sid}/control/resume", json={}).json() and ticks == [sid, sid]
 

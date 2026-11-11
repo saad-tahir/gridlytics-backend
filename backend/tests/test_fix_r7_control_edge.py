@@ -901,7 +901,7 @@ def _no_ticks(monkeypatch) -> list[str]:
 
     def fake_tick(site_id, *a, **k):
         ticks.append(site_id)
-        return {"status": "active", "plan_id": f"p-{len(ticks)}"}
+        return {"status": "active", "plan_id": f"p-{len(ticks)}", "in_force": f"p-{len(ticks)}"}
 
     monkeypatch.setattr(plans, "tick", fake_tick)
     return ticks
@@ -1073,6 +1073,7 @@ def test_a_hold_whose_re_solve_the_guard_holds_says_why_and_the_plan_of_before_s
     assert r.status_code == 200, r.text
     resolve = r.json()["resolve"]
     assert resolve["status"] == "held" and resolve["reason"] == "sheds_load_with_grid_up" and resolve["plan_id"] != before["plan_id"], resolve
+    assert resolve["in_force"] == before["plan_id"]                            # the answer names the plan that stays in force (optimiser-plans)
     assert r.json()["control"]["key"] == "hold"                                  # the hold stands
     with world.use():
         assert plans.current(sid)["id"] == before["plan_id"]                      # the plan of before is in force
@@ -1101,7 +1102,7 @@ def test_every_action_re_solves_and_a_failed_re_solve_leaves_the_action_standing
     ticks = _no_ticks(monkeypatch)
     for n, action in enumerate(("hold", "release", "pause", "resume"), start=1):
         r = admin.post(f"/api/sites/{sid}/control/{action}", json={} if action == "resume" else {"hours": 2})
-        assert r.status_code == 200 and r.json()["resolve"] == {"status": "active", "plan_id": f"p-{n}", "reason": None}, (action, r.text)
+        assert r.status_code == 200 and r.json()["resolve"] == {"status": "active", "plan_id": f"p-{n}", "reason": None, "in_force": f"p-{n}"}, (action, r.text)
     assert ticks == [sid] * 4
     assert "resolve" not in admin.post(f"/api/sites/{sid}/control/resume", json={}).json() and len(ticks) == 4   # nothing to resume
 

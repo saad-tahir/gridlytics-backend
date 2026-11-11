@@ -456,7 +456,9 @@ def _resolve_now(site_id: str, action: str) -> dict:
         # then the plan of before stays in force (a hold the site can keep only by shedding load with the grid up, say)
         rel = plans.control_release(site_id)
         reason = rel["reason"] if rel else (r.get("summary") or {}).get("guard")
-    return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": reason}
+    # the plan in force after it (null: none), as POST /plan/solve answers it, so the page says "the plan of before stays in force" only when one
+    # does; a failed solve's reason is a code (plans.failure_code), as there
+    return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": reason, "in_force": r.get("in_force")}
 
 
 _ = verify
