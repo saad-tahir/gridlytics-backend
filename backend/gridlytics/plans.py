@@ -1147,6 +1147,15 @@ def _write_issue(site_id: str, day_local: str, plan_id: str, reason: str, at: in
     return row
 
 
+def issue_first(site_id: str, plan: dict, day_local: str, at: int) -> dict | None:
+    """A day's first table, issued at `at` from `plan`, when nothing is issued for the day yet and the plan has a table for it (as issue_tables
+    issues a day's first): for a day the scheduler never reached, such as the history the demo builds (its installer keys what was issued). The
+    issue, else None."""
+    if issued_for(site_id, day_local) is not None or _day_slots(plan, day_local) is None:
+        return None
+    return _write_issue(site_id, day_local, plan["id"], "first", at)
+
+
 def _day_slots(plan: dict | None, day_local: str) -> list[dict] | None:
     """A plan's compiled slots for one Karachi day, else None."""
     return next((d["slots"] for d in ((plan or {}).get("slots") or {}).get("days") or [] if d.get("date") == day_local), None)

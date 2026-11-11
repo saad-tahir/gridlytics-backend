@@ -166,6 +166,39 @@ def test_the_demo_installer_marks_one_table_a_day_and_the_mill_marks_it_the_next
     assert len(written) and set(written) == {"discharge"}                  # the table keyed for today, before anyone marks it
 
 
+def test_the_demo_installer_keys_the_table_issued_for_the_day_so_its_chip_and_applied_log_agree(company):
+    """demo-seed's marks with control-edge's issued tables (audit role-owner-08, pages-B-02): the demo installer keys the table issued for the day
+    (the nightly job's, 23:05 the night before), and on a day none was issued (the history, built before the scheduler ran) the table in force at the
+    day's start is the day's first issue. So after the scheduler's own issue the farm, marked the same day, still reads "Following plan (table
+    applied)" (it read "New table issued: key it in and mark it" for a later plan holding the same table), its applied log names the issue it keyed
+    (not "a table that was not issued for the day") and the day counts one table write; the mill, whose mark comes the next morning, reads "Table
+    not confirmed today", as its alert says, and yesterday's mark is the table the nightly job issued for it, not a later plan's."""
+    from gridlytics import routes_sites
+    farm, mill = _demo("farm"), _demo("textile")
+    today = datetime.now(PKT).date()
+    d0 = twin.day_start_utc(today)
+    chip = lambda sid: routes_sites.control_state(sites.get(sid), telemetry.latest(sid), int(time.time()))  # noqa: E731
+    # the farm: no table issued for today yet
+    keyed = _plan(farm, d0, "discharge", status="superseded")                # in force at the day's start
+    _plan(farm, d0 + 900, "discharge")                                       # a later plan with the same table for today
+    demo.advance(farm)
+    plans.issue_tables(farm)                                                 # the scheduler's tick after the solve (scheduler._after_tick)
+    assert chip(farm) == {"key": "following", "label": "Following plan (table applied)"}
+    row = plans.applied_rows(farm)[0]
+    assert row["plan_id"] == keyed and row["day_local"] == today.isoformat() and row["table"] is not None
+    assert plans.writes_used(farm, today) == 1
+    # the mill: yesterday's table issued by the nightly job, then a plan in force at yesterday's start that the installer never keyed
+    yesterday = today - timedelta(days=1)
+    nightly = _plan(mill, d0 - 86400 - 3300, "discharge", status="superseded")
+    plans._write_issue(mill, yesterday.isoformat(), nightly, "nightly", d0 - 86400 - 3300)
+    _plan(mill, d0 - 86400 - 900, "charge_grid")
+    demo.advance(mill)
+    plans.issue_tables(mill)
+    assert chip(mill) == {"key": "unconfirmed", "label": "Table not confirmed today"}
+    row = plans.applied_rows(mill)[0]
+    assert row["plan_id"] == nightly and row["day_local"] == yesterday.isoformat() and row["table"]["reason"] == "nightly"
+
+
 def test_the_demo_history_keys_the_nightly_table_once_a_day_and_runs_it(company, monkeypatch):
     """build_history with the solver replaced by plans written straight to the table: each 00:00 plan discharges all day, every later re-plan
     charges from the grid. Before: the twin ran every 3-hourly plan at once and no day carried a mark."""

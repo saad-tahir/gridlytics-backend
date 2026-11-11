@@ -215,14 +215,25 @@ def _keyed_plan(site: dict, day: date) -> dict | None:
     """The table an advisory (tier 2) demo site's inverter runs on a day (plan Part 7.6: a person keys a daily table in through the vendor app, a few
     writes a day at most; audit engine-delivery-18: the twin ran every 3-hourly, and live every 15-minute, plan the moment it was made, and each such
     day counted as confirmed). The table marked applied for the day (the latest mark: a person's own wins); else, where the demo's installer keys
-    tables (the spec's `marks`), the plan in force at the day's start, the nightly table, keyed before its mark comes; else none: the inverter runs
-    its native settings."""
+    tables (the spec's `marks`), the nightly table, keyed before its mark comes: the table issued first for the day (_issued_first), else the plan
+    in force at the day's start; else none: the inverter runs its native settings."""
     with store.connect() as con:
         r = con.execute("SELECT plan_id FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1",
                         (site["id"], day.isoformat())).fetchone()
     if r is not None:
         return plans.get(site["id"], r["plan_id"])
-    return plans.active_at(site["id"], twin.day_start_utc(day)) if _spec(site).get("marks") else None
+    if not _spec(site).get("marks"):
+        return None
+    return _issued_first(site["id"], day) or plans.active_at(site["id"], twin.day_start_utc(day))
+
+
+def _issued_first(site_id: str, day: date) -> dict | None:
+    """The plan of the table issued first for a day (round 7, control-edge: the nightly job's, plans.issue_nightly, else the day's first,
+    plans.issue_tables; audit pages-B-02), the one table a day the demo's installer keys; None when none was issued or its plan has no table for
+    the day."""
+    first = next(iter(plans.issued_tables(site_id, day.isoformat())), None)
+    plan = plans.get(site_id, first["plan_id"]) if first else None
+    return plan if plan is not None and day.isoformat() in {d.get("date") for d in (plan.get("slots") or {}).get("days") or []} else None
 
 
 def _mark_tables(site: dict, t_from: int, t_to: int) -> None:
@@ -230,12 +241,21 @@ def _mark_tables(site: dict, t_from: int, t_to: int) -> None:
     site whose installer keys tables, each day's keyed table (the nightly one), one mark a day at most, within every brand's write budget; the farm's
     on its own day, the Faisalabad mill's on the next (so the mill's own day is never marked yet, as its alert says). A day with no plan in force at
     its start (an observation day), whose plan has no table for it, or on a native block of the switchback calendar gets no mark. The mark is dated
-    when it was due (the day's start, or the next day's), or the span's start if that is later."""
+    when it was due (the day's start, or the next day's), or the span's start if that is later.
+    The keyed table is the one issued for the day (round 7, control-edge: the table that reaches the inverter is the issued one, audit pages-B-02):
+    a day the span reaches with nothing issued for it (the history, built before the scheduler runs) has the plan in force at its start issued as
+    its first table, at its start, so the chip, the applied log and the write meter read one table a day, the one keyed."""
     late = {"same_day": 0, "next_day": 1}.get(_spec(site).get("marks"))
     if late is None or site.get("tier") != "advisory_writes":
         return
     sid = site["id"]
     first, last = datetime.fromtimestamp(int(t_from), PKT).date(), datetime.fromtimestamp(int(t_to), PKT).date()
+    for k in range((last - first).days + 1 + late):
+        day = first + timedelta(days=k - late)
+        if plans.issued_for(sid, day.isoformat()) is None and verify.arm_on(sid, day) != "native":
+            plan = plans.active_at(sid, twin.day_start_utc(day))
+            if plan is not None:
+                plans.issue_first(sid, plan, day.isoformat(), twin.day_start_utc(day))
     for k in range((last - first).days + 1):
         day = first + timedelta(days=k - late)
         due = twin.day_start_utc(day + timedelta(days=late))
@@ -244,8 +264,8 @@ def _mark_tables(site: dict, t_from: int, t_to: int) -> None:
                 continue
         if verify.arm_on(sid, day) == "native":
             continue
-        plan = plans.active_at(sid, twin.day_start_utc(day))
-        if plan is None or day.isoformat() not in {d.get("date") for d in (plan.get("slots") or {}).get("days") or []}:
+        plan = _issued_first(sid, day)
+        if plan is None:
             continue
         row = plans.mark_applied(sid, plan["id"], day.isoformat(), INSTALLER, "vendor_app")
         with store.connect() as con:
