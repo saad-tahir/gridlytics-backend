@@ -1,4 +1,5 @@
-"""Background jobs (master PS-17): the optimizer's search run in a small thread pool, so that a long search does not hold a page's request open.
+"""Background jobs (master PS-17; plan Part 10.6): work that can take seconds (a re-solve of a site's plan, a report) run in a small thread pool, so
+that it does not hold a page's request open (round 7, audit performance-live-05: the re-solve ran in the request, 3.6 s measured and up to 30 s).
 
 A job is started by a POST that returns its id, read with a GET (candidates done of the total, and the result once it is done) and stopped with a DELETE. Jobs and
 their results are kept in memory, not in the database: a restart of the server drops them, and a page that finds its job gone starts the search again. The
@@ -57,7 +58,7 @@ def _company() -> str:
 
 
 class Job:
-    def __init__(self, kind: str, org: str, owner: str, key: str, expected: int = 0, company: str = ""):
+    def __init__(self, kind: str, org: str, owner: str, key: str, expected: int = 0, company: str = "", abandon: bool = True):
         self.id = uuid.uuid4().hex[:16]
         self.seq = next(_order)                # the order the searches were asked in (two can share a clock tick)
         self.kind, self.org, self.owner, self.key = kind, org, owner, key
@@ -74,10 +75,11 @@ class Job:
         self.finished: float | None = None
         self.cancel = threading.Event()
         self.future: Future | None = None
+        self.abandon = abandon                 # stopped when nobody reads it (a search); a re-solve runs to its end, its page open or not
 
     def abandoned(self, now: float | None = None) -> bool:
         """Whether the search still waits or runs although nobody has read it for ABANDON_SECONDS (review R-172)."""
-        return self.state in ACTIVE and (now if now is not None else time.time()) - self.last_read > ABANDON_SECONDS
+        return self.abandon and self.state in ACTIVE and (now if now is not None else time.time()) - self.last_read > ABANDON_SECONDS
 
     def view(self, with_result: bool = False) -> dict:
         out = {"id": self.id, "kind": self.kind, "state": self.state, "done": self.done, "total": self.total, "cached": self.cached, "error": self.error,
@@ -142,9 +144,10 @@ def _stop_abandoned(now: float) -> None:
                 j.state, j.finished = "cancelled", now
 
 
-def start(kind: str, org: str, owner: str, key: str, run, expected: int = 0) -> Job:
+def start(kind: str, org: str, owner: str, key: str, run, expected: int = 0, cache: bool = True, abandon: bool = True) -> Job:
     """Start a job, or answer it at once from the cache, or join the same search this user already has running. `run(progress, cancelled)` makes the result;
-    `expected` is the most it will check, for the wait a search queued behind it is told (review R-173)."""
+    `expected` is the most it will check, for the wait a search queued behind it is told (review R-173). `cache` False: the result is never kept for
+    another start nor answered from it (a re-solve solves again each time); `abandon` False: the job runs to its end though nobody reads it."""
     now = time.time()
     company = _company()
     cached = (company, key)
@@ -156,8 +159,8 @@ def start(kind: str, org: str, owner: str, key: str, run, expected: int = 0) -> 
                      and not j.cancel.is_set()), None)
         if same is not None:
             return same
-        job = Job(kind, org, owner, key, expected, company)
-        hit = _cache.get(cached)
+        job = Job(kind, org, owner, key, expected, company, abandon)
+        hit = _cache.get(cached) if cache else None
         if hit is not None:
             _cache.move_to_end(cached)
             job.state, job.result, job.cached, job.finished = "done", hit, True, now
@@ -168,10 +171,10 @@ def start(kind: str, org: str, owner: str, key: str, run, expected: int = 0) -> 
         if len(mine) >= MAX_ACTIVE_PER_WORKSPACE:
             # how many are the person's own, which they can see and cancel (review R-172)
             own = sum(1 for j in mine if j.owner == owner)
-            raise Refused(f"This workspace already has {len(mine)} searches waiting or running ({own or 'none'} of them yours); wait for one to finish, or cancel one of yours "
-                          "under Your searches on the Structure optimizer")
+            raise Refused(f"This company already has {len(mine)} tasks waiting or running ({own or 'none'} of them yours); wait a moment for one to "
+                          "finish")
         if sum(1 for j in mine if j.owner == owner) >= MAX_ACTIVE_PER_USER:
-            raise Refused(f"You already have {MAX_ACTIVE_PER_USER} searches waiting or running; wait for one to finish, or cancel one")
+            raise Refused(f"You already have {MAX_ACTIVE_PER_USER} tasks waiting or running; wait a moment for one to finish")
         _jobs[job.id] = job
 
     def progress(done: int, total: int) -> None:
@@ -197,7 +200,7 @@ def start(kind: str, org: str, owner: str, key: str, run, expected: int = 0) -> 
         except ValueError as exc:
             job.state, job.error = "failed", str(exc)
         except Exception:        # the server's log has the trace; the person is told the search could not be made
-            job.state, job.error = "failed", "The search could not be completed"
+            job.state, job.error = "failed", "The task could not be completed"
             import logging
             logging.getLogger("gridlytics").exception("job %s (%s) failed", job.id, kind)
         else:
@@ -206,9 +209,10 @@ def start(kind: str, org: str, owner: str, key: str, run, expected: int = 0) -> 
                 took = time.time() - (job.started or job.created)
                 if job.done > 0 and took > 0:
                     _rate = job.done / took if _rate is None else 0.5 * _rate + 0.5 * job.done / took
-                _cache[cached] = result
-                while len(_cache) > CACHE_ENTRIES:
-                    _cache.popitem(last=False)
+                if cache:
+                    _cache[cached] = result
+                    while len(_cache) > CACHE_ENTRIES:
+                        _cache.popitem(last=False)
         finally:
             job.finished = time.time()
 

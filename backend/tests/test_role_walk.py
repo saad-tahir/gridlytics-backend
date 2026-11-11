@@ -82,6 +82,9 @@ def walk(tmp_path_factory):
     assert client.post(f"/api/sites/{sids[0]}/genset/fuel", headers=h["operator"], json={"litres": 50, "cost_rs": 14321.5, "note": "tanker"}).status_code == 200
     for kind in ("monthly_savings", "energy_only"):
         assert client.post("/api/reports", headers=h["admin"], json={"kind": kind, "site_id": sids[0]}).status_code == 200
+    r = client.post(f"/api/sites/{sids[0]}/plan/solve", headers=h["admin"])
+    assert r.status_code in (200, 202), r.text           # 202 while a slow solve still runs: its job is read all the same
+    jobs_ = [r.json()["job_id"]]                        # a re-solve is a job (round 7, storage-perf): GET /api/sites/{site_id}/jobs/{job_id}
     assert client.put("/api/drafts/walk-draft", headers=h["admin"], json={"name": "Half a site"}).status_code == 200
     k = client.post("/api/platform/keys", headers=h["admin"], json={"name": "walk", "scopes": ["sites:read", "plans:read"], "site_id": edge_site,
                                                                     "kind": "edge"})
@@ -93,7 +96,7 @@ def walk(tmp_path_factory):
         rows = client.get(f"/api/sites/{sid}/plans", headers=h["admin"]).json()
         rows = rows.get("plans", rows) if isinstance(rows, dict) else rows
         plan_ids[sid] = [rows[0]["id"]] if rows else []
-    fill = {"kind": ["pv", "load", "outage"], "draft_id": ["walk-draft"]}
+    fill = {"kind": ["pv", "load", "outage"], "draft_id": ["walk-draft"], "job_id": jobs_}
 
     answers: dict[str, dict[str, dict[str, tuple]]] = {}
     unfilled = []

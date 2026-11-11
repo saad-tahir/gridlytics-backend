@@ -794,3 +794,54 @@ def test_the_header_reads_no_history_and_the_overview_and_battery_page_share_one
         _minutes(world.site, t0 + 12 * 3600, t0 + 12 * 3600 + 60, 30_000.0)        # a newer reading: estimated again
     a.get(f"/api/sites/{world.site}/now")
     assert len(month()) == 2 * n
+
+
+# ------------------------------------------------------------------------------------------------ performance-live-05
+
+def test_a_re_solve_and_a_resume_run_as_jobs_and_answer_202_when_the_solve_outlasts_the_wait(world, monkeypatch):
+    """Re-solve, resume (and every control action's re-solve) ran the solver inside the HTTP request: 3.6 s measured, up to 30 s, past a proxy's read
+    timeout while the work went on. Now the solve is a job on the job pool (jobs.py): the request waits SOLVE_WAIT_S for it, answers its outcome if
+    it ended, else 202 with the job, whose outcome its starter reads at GET /sites/:id/jobs/:job_id (another person reads a 404)."""
+    from gridlytics import routes_plans
+    release, threads = threading.Event(), []
+    real = plans.tick
+
+    def slow(site_id, *a, **k):
+        threads.append(threading.current_thread().name)
+        assert release.wait(10)
+        return real(site_id, *a, **k)
+    monkeypatch.setattr(plans, "tick", slow)
+    monkeypatch.setattr(routes_plans, "SOLVE_WAIT_S", 0.2)
+    a, sid = world.c["admin"], world.site
+    r = a.post(f"/api/sites/{sid}/plan/solve")
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] in ("queued", "running") and body["job_id"] and body["plan_id"] is None
+    job = f"/api/sites/{sid}/jobs/{body['job_id']}"
+    assert a.get(job).json()["status"] in ("queued", "running")
+    assert world.c["operator"].get(job).status_code == 404                   # another person's job is not theirs to read
+    release.set()
+    assert _wait(lambda: a.get(job).json()["status"] not in ("queued", "running"), 30)
+    done = a.get(job).json()
+    assert done["status"] == "active" and done["plan_id"] and done["solve_seconds"] is not None and done["job_id"] == body["job_id"]
+    assert threads and all(t.startswith("gridlytics-job") for t in threads)  # solved on the job pool, not the request's thread
+    with world.use():
+        assert plans.current(sid)["id"] == done["plan_id"]
+        assert any(x["action"] == "re-solved the plan" for x in store.list_audit())
+    # a resume clears its override at once, and its re-solve is a job too
+    release.clear()
+    with world.use():
+        sites.add_override(sid, {"kind": "pause_control", "until": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()}, "t")
+    r = a.post(f"/api/sites/{sid}/control/resume", json={})
+    assert r.status_code == 202, r.text
+    res = r.json()
+    assert res["control"]["key"] != "paused" and res["resolve"]["status"] in ("queued", "running") and res["resolve"]["job_id"]
+    release.set()
+    job = f"/api/sites/{sid}/jobs/{res['resolve']['job_id']}"
+    assert _wait(lambda: a.get(job).json()["status"] not in ("queued", "running"), 30)
+    assert a.get(job).json()["status"] == "active"
+    # a solve that ends within the wait answers at once, as before
+    monkeypatch.setattr(routes_plans, "SOLVE_WAIT_S", 30.0)
+    routes_plans._last_solve.clear()
+    r = a.post(f"/api/sites/{sid}/plan/solve")
+    assert r.status_code == 200 and r.json()["status"] == "active" and r.json()["plan_id"] and r.json()["job_id"]
