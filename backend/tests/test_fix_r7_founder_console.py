@@ -257,6 +257,40 @@ def test_a_restore_puts_back_the_workspace_its_telemetry_and_its_keys_together(f
                 backups.restore(name)
 
 
+def test_a_restored_backup_set_signs_the_plan_with_the_key_the_edge_was_given(fdb):
+    """founder-console-01 and -12 with control-edge's engine-delivery-13: a key is kept by its file name in the company's keys folder, and a backup set
+    takes that folder. A set restored after the key file was lost signs the plan again with the same key, so the site's edge, given its public key at
+    enrolment, still accepts it; until then nothing is signed and no new key is made in its place."""
+    from gridlytics import plans
+    c = _console()
+    cid, path = _company_with_data(c)
+    with store.use_company(path):
+        sid = sites.listing()[0]["id"]
+        sites.set_tier_capable(sid, "closed_loop")
+        sites.set_tier_allowed(sid, "closed_loop", "test", "test")
+        t0 = int(datetime.now(timezone.utc).timestamp()) // 900 * 900
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="seconds")  # noqa: E731
+        with store.connect() as con:
+            con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, summary, steps, slots) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?)", ("plan-kept", sid, iso(t0), iso(t0), iso(t0), iso(t0 + 86400), "a", "active",
+                                                           json.dumps({"status_label": "Following"}), "[]", json.dumps({"days": [], "fallback": None})))
+        before = delivery.public_key(sid)
+        assert delivery.verify(plans.signed_message(sid, record=False), before["public_key"])
+    copy = _ok(c.post(f"/api/founder/companies/{cid}/backups", json={}))["made"]
+    with store.use_company(path):
+        (delivery._key_dir() / f"{sid}-{before['key_id']}.pem").unlink()          # the keys folder lost (a data folder moved without it)
+        with pytest.raises(delivery.KeyMissing):
+            plans.signed_message(sid, record=False)
+        assert delivery.public_key(sid)["missing"] is True
+        assert backups.restore(copy)["keys"] == 1
+        msg = plans.signed_message(sid, record=False)
+        assert delivery.public_key(sid) == {**before, "missing": False}
+        with store.connect() as con:
+            assert con.execute("SELECT count(*) FROM site_keys WHERE site_id = ?", (sid,)).fetchone()[0] == 1
+    assert msg["plan_id"] == "plan-kept" and msg["signature"]["key_id"] == before["key_id"]
+    assert delivery.verify(msg, before["public_key"])                             # the edge's public key, given before the loss, accepts it
+
+
 def test_a_copy_made_with_no_telemetry_restores_an_empty_telemetry_file(fdb):
     """founder-console-01: a copy taken before the company had telemetry leaves no later minute behind when it is put back."""
     c = _console()
