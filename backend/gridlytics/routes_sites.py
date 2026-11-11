@@ -552,10 +552,14 @@ def site_now(site_id: str):
             "grid_kw": (s["connections"][0]["data"]["sanctioned_load_kw"] if s.get("connections") else None)}
     bs = battery.state(s, now)
     sum_ = lambda k: round(sum((d.get(k) or 0) for d in tdays), 1)
+    from . import verify
+    # the month's litres as the Savings page reads them, with their source (meter or curve; audit R7 pages-A-06: the overview said "estimated" always)
+    fuel = verify.litres_used(site_id, t.replace(day=1).isoformat(), t.isoformat()) if a.get("genset") else {"litres": 0.0, "litres_source": None}
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "status", "demo_link")}, "control": control_state(s, last, now), "now": _snapshot(last),
                 "caps": caps, "now_next": plans.now_and_next(plan, now), "plan_status": (plan or {}).get("summary", {}).get("status_label"),
                 "stage": (plan or {}).get("summary", {}).get("stage"), "today": td,
-                "month": {"import_kwh": sum_("import_kwh"), "pv_kwh": sum_("pv_kwh"), "genset_hours": sum_("genset_hours"), "litres": sum_("litres"),
+                "month": {"import_kwh": sum_("import_kwh"), "pv_kwh": sum_("pv_kwh"), "genset_hours": sum_("genset_hours"), "litres": fuel["litres"],
+                          "litres_source": fuel["litres_source"],
                           "outage_hours": round(sum((d.get("outage_minutes") or 0) for d in tdays) / 60, 1),
                           "peak_kw": max([d.get("peak_kw") or 0 for d in tdays] or [0]), "saving_rs": mtd,
                           "saving_rs_method": MTD_SAVING_METHOD, "saving_rs_computed": computed},

@@ -28,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, apikeys, auth, backups, companies, identity, money, store, store_members, version
+from . import __version__, apikeys, auth, backups, companies, identity, money, store, store_members, telemetry, version
 from . import platform as platformdb
 from .schemas import Refusal
 
@@ -235,7 +235,8 @@ async def _guarded(request, call_next, rid: str):
         if ctype != "application/json" and not ctype.endswith("+json") and not bodiless and not multipart:
             return _refusal(rid, 415, "Requests that change anything must be JSON", "must_be_json")
         if request.scope.get("body_too_large") or int(request.headers.get("content-length") or 0) > MAX_BODY:
-            return _refusal(rid, 413, "The request is too large")
+            # a CSV upload over the cap is told the importer's own sentence (telemetry.UPLOAD_MAX_BYTES is this cap; flow-telemetry-plan-control-25)
+            return _refusal(rid, 413, telemetry.TOO_LARGE if path.endswith("/telemetry/upload") else "The request is too large")
     address = request.client.host if request.client else ""
     api_call = path.startswith("/api/") and path != "/api/health"
     bearer = request.headers.get("authorization") or ""

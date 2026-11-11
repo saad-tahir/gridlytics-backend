@@ -10,9 +10,12 @@ import hashlib
 import io
 import json
 import math
+import re
 import sqlite3
 import threading
 import time
+from array import array
+from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
@@ -100,6 +103,8 @@ def _open() -> sqlite3.Connection:
 
 @contextmanager
 def connect():
+    """A write to the telemetry file: BEGIN IMMEDIATE, the file's one write lock, taken at the start so a read-then-write (the sequence check) never
+    fails half-way. Reads use reading()."""
     con = _open()
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -113,14 +118,42 @@ def connect():
         con.close()
 
 
+@contextmanager
+def reading():
+    """A read of the telemetry file: a deferred transaction, so the statements inside it see one snapshot of the file and, in WAL mode, never take the
+    write lock, never wait for a writer and never make one wait. Every read took BEGIN IMMEDIATE before (audit R7 performance-live-03), so a company's
+    page reads, ticks, CSV imports and edge batches ran one at a time behind one lock. Nothing inside it may write: a write belongs in connect()."""
+    con = _open()
+    try:
+        con.execute("BEGIN")
+        yield con
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
 # ------------------------------------------------------------------------------------------------ writing
 
-def write_rows(rows: list[tuple], columns: tuple = COLUMNS) -> int:
+def _insert_sql(columns: tuple, merge: bool) -> str:
+    """The minute rows' write. Without `merge` a row replaces the stored minute whole (the twin's own rows); with it, a stored minute keeps every column
+    the new row leaves missing (None), so an upload or a batch that carries fewer columns never erases the others (audit R7, overlap)."""
+    base = f"INSERT INTO minute ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})"
+    if not merge:
+        return base.replace("INSERT INTO", "INSERT OR REPLACE INTO", 1)
+    sets = ", ".join(f"{c} = excluded.{c}" if c == "source_id" else f"{c} = COALESCE(excluded.{c}, minute.{c})"
+                     for c in columns if c not in ("site_id", "ts"))
+    return f"{base} ON CONFLICT(site_id, ts) DO UPDATE SET {sets}"
+
+
+def write_rows(rows: list[tuple], columns: tuple = COLUMNS, merge: bool = False) -> int:
     if not rows:
         return 0
-    sql = f"INSERT OR REPLACE INTO minute ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})"
     with connect() as con:
-        con.executemany(sql, rows)
+        con.executemany(_insert_sql(columns, merge), rows)
     return len(rows)
 
 
@@ -148,6 +181,66 @@ EARLIEST_TS = int(datetime(2015, 1, 1, tzinfo=timezone.utc).timestamp())
 AHEAD_S = 86400
 #: one CSV upload spans at most this many days: the import aggregates every day it fills
 UPLOAD_MAX_DAYS = 400
+#: the words loggers write for an on/off signal (grid_present, genset_running), read as 1 and 0 in a CSV
+FLAG_WORDS = {"on": "1", "off": "0", "true": "1", "false": "0", "yes": "1", "no": "0"}
+#: a CSV's rows are at most this many minutes apart (an hourly logger); rows further apart are refused, as no minute between them can be filled
+STEP_MAX_MIN = 60
+#: one CSV upload carries at most this many bytes: the API's body limit (api.MAX_BODY), which answers a larger upload with TOO_LARGE too, so the page, the
+#: API and the importer give one limit in one sentence (flow-telemetry-plan-control-25)
+UPLOAD_MAX_BYTES = 25_000_000
+TOO_LARGE = "The file is larger than 25 MB, the most one upload can carry; split it by month"
+#: the ways a CSV's ts column is read: "auto" reads ISO 8601 (a time without an offset is in the chosen zone) and epoch seconds or milliseconds (UTC, as
+#: on the edge path); "dmy" and "mdy" read day-first and month-first dates such as 06/11/2026 09:00, which the column mapping chooses between, as no
+#: reader can tell 06/11 from 11/06
+TS_FORMATS = ("auto", "dmy", "mdy")
+_SLASHED = re.compile(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?\s*([AaPp][Mm])?)?$")
+_NUMBER = re.compile(r"^\d+(\.\d+)?$")
+#: an epoch number at or above this is in milliseconds (1e11 seconds is the year 5138)
+_EPOCH_MS = 1e11
+_FORMATS_READ = "times must be ISO 8601, e.g. 2026-11-06T09:00 or 2026-11-06 09:00, or epoch seconds"
+
+
+def csv_time(cell, tz_offset_h: float = 0.0, fmt: str = "auto") -> int | None:
+    """A CSV ts cell as epoch seconds UTC, or None when it is not a time in `fmt` (see TS_FORMATS); a time past the calendar's edge raises OverflowError,
+    as the callers count it apart. An epoch number reads as UTC whatever the zone chosen; an ISO time with its own offset reads as written."""
+    text = str(cell if cell is not None else "").strip()
+    if not text:
+        return None
+    if _NUMBER.match(text):
+        x = float(text)
+        return int(x / 1000) if x >= _EPOCH_MS else int(x)
+    tz = timezone(timedelta(hours=tz_offset_h))
+    m = _SLASHED.match(text) if fmt in ("dmy", "mdy") else None
+    if m:
+        a, b, year, hh, mm, ss, half = m.groups()
+        day, month = (int(a), int(b)) if fmt == "dmy" else (int(b), int(a))
+        hour = int(hh or 0)
+        if half:
+            if not 1 <= hour <= 12:
+                return None
+            hour = hour % 12 + (12 if half.lower() == "pm" else 0)
+        try:
+            return int(datetime(int(year), month, day, hour, int(mm or 0), int(ss or 0), tzinfo=tz).timestamp())
+        except ValueError:
+            return None
+    try:
+        t = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int((t if t.tzinfo else t.replace(tzinfo=tz)).timestamp())
+
+
+def _no_times(first: str | None, fmt: str) -> str:
+    """The refusal of a file in which no row's time can be read, naming the first cell and the formats read (flow-telemetry-plan-control-25)."""
+    if not first:
+        return f"No row has a time in its ts column: {_FORMATS_READ}"
+    if fmt == "auto" and _SLASHED.match(first):
+        return (f"No row's time could be read: the file writes times as {first} (a day and a month in an order the import cannot tell); write them as "
+                f"ISO 8601, e.g. 2026-11-06T09:00, or as epoch seconds, or choose day first or month first in the column mapping")
+    if fmt in ("dmy", "mdy"):
+        order = "day first, e.g. 06/11/2026 09:00" if fmt == "dmy" else "month first, e.g. 11/06/2026 09:00"
+        return f"No row's time could be read (the first ts is {first!r}): the mapping reads dates {order}; {_FORMATS_READ}"
+    return f"No row's time could be read (the first ts is {first!r}): {_FORMATS_READ}"
 
 
 def _now_ts() -> int:
@@ -169,8 +262,15 @@ def _epoch(v) -> int | None:
     return int(v)
 
 
+#: the columns that hold a row's energy over its interval, not a reading at its start: a coarse CSV row's value is spread evenly over the minutes it covers
+INTERVAL_ENERGY = ("grid_import_wh", "grid_export_wh", "genset_fuel_l")
+
+
 def ingest(site_id: str, records: list[dict], source: str, now: int | None = None) -> dict:
-    """Normalised dict rows (edge batches and CSV) into the minute table; idempotent by (site, minute), the last value wins.
+    """Normalised dict rows (edge batches) into the minute table; idempotent by (site, minute), the last value wins.
+
+    A stored minute is merged, never replaced whole: a column the row leaves missing (absent, blank or unreadable) keeps its stored value, so a batch
+    that carries fewer columns never erases the others, nor a CSV's (audit R7). A CSV is read and written by import_csv, in columns and by day.
 
     A row whose ts is not a time, or lies before 2015 or more than a day after `now`, is skipped and counted (`skipped`, and `out_of_range` for the
     dated ones), never raised: one bad row must not fail the batch on every retry."""
@@ -185,8 +285,7 @@ def ingest(site_id: str, records: list[dict], source: str, now: int | None = Non
             skipped += 1
             out_of_range += 1
             continue
-        ts = ts // 60 * 60
-        row = [site_id, ts, source]
+        row = [site_id, ts // 60 * 60, source]
         for c in ALL[3:]:
             v = r.get(c)
             if c in ("inverter_mode_active", "quality_flags"):
@@ -198,29 +297,27 @@ def ingest(site_id: str, records: list[dict], source: str, now: int | None = Non
         if row[3] is None and row[_VOLT] is not None:
             row[3] = 1.0 if row[_VOLT] >= 180 else 0.0  # grid present from voltage (plan Part 7.5; 180 V to confirm); an unreadable voltage stays unknown
         rows.append(tuple(row))
-    write_rows(rows, ALL)
-    return {"accepted": len(rows), "skipped": skipped, "unreadable_cells": unreadable, "out_of_range": out_of_range}
+    res = {"accepted": len(rows), "skipped": skipped, "unreadable_cells": unreadable, "out_of_range": out_of_range}
+    if rows:
+        with connect() as con:
+            con.executemany(_insert_sql(ALL, merge=True), rows)
+    return res
 
 
-def _check_window(stamps: list[int], now: int | None = None) -> None:
-    """Refuses (ValueError, in words) parsed upload times with a row before 2015, a row more than a day ahead, or a span over UPLOAD_MAX_DAYS."""
+def _check_window(stamps, now: int | None = None) -> None:
+    """Refuses (ValueError, in words) parsed upload times (any array of epoch seconds) with a row before 2015, a row more than a day ahead, or a span
+    over UPLOAD_MAX_DAYS."""
+    a = np.asarray(stamps, dtype=np.int64)
     latest_ok = (_now_ts() if now is None else int(now)) + AHEAD_S
-    early = sum(1 for t in stamps if t < EARLIEST_TS)
-    late = sum(1 for t in stamps if t > latest_ok)
+    early = int(np.sum(a < EARLIEST_TS))
+    late = int(np.sum(a > latest_ok))
     if early or late:
         raise ValueError(f"{early + late} row{'s are' if early + late != 1 else ' is'} dated "
                          + ("before 2015" if early and not late else "in the future" if late and not early else "before 2015 or in the future")
                          + ": check the logger's clock (and the timezone) and upload again")
-    span = (max(stamps) - min(stamps)) // 86400 if stamps else 0
+    span = int(a.max() - a.min()) // 86400 if len(a) else 0
     if span > UPLOAD_MAX_DAYS:
         raise ValueError(f"The file spans {span} days; upload at most {UPLOAD_MAX_DAYS} days per file")
-
-
-def _local_days(stamps) -> list[date]:
-    """The local (PKT) days that hold at least one of the times, in order."""
-    ks = sorted({(int(t) + 5 * 3600) // 86400 for t in stamps})
-    epoch = date(1970, 1, 1)
-    return [epoch + timedelta(days=k) for k in ks]
 
 
 #: the columns an imports row gains beyond the workspace schema's: the uploaded range (epoch seconds UTC of the file's first and last row) and the
@@ -270,72 +367,578 @@ def imports(site_id: str, limit: int = 20) -> list[dict]:
     return out
 
 
+#: plausibility of a CSV's readings (audit R7): a negative PV or load reading down to this is kept as read (an inverter's standby draw at night, a
+#: meter's noise); below it the cell is stored as missing and counted
+NEGATIVE_TOLERANCE_W = 500.0
+#: a load column, or a PV column between 10:00 and 14:00 Karachi time, whose largest reading over at least an hour stays under this many watts probably
+#: holds kW: the product serves commercial and industrial sites, whose load and midday PV run to tens of kW at least
+KW_SUSPECT_W = 1000.0
+_MIDDAY_H = (10, 14)
+_WHY_NOT_NEGATIVE = {"pv_power_w": "a solar array does not draw power beyond an inverter's standby",
+                     "load_power_w": "a load does not feed power back"}
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return f"{n:,} {one if n == 1 else many}"
+
+
+def _local_hour(ts: np.ndarray) -> np.ndarray:
+    return (ts + 5 * 3600) % 86400 // 3600
+
+
+def _check_values(ts: np.ndarray, cols: dict, spans: np.ndarray) -> list[str]:
+    """The file's implausible readings, as warnings: PV or load below -NEGATIVE_TOLERANCE_W and a BMS state of charge outside 0 to 100 % are stored as
+    missing (blanked here, in the file's columns of numbers, NaN for missing, before they are written); a load or midday PV column that never reaches
+    KW_SUSPECT_W, and a state of charge that never goes above 1, are kept as read and named, as a unit slip (kW for W, a fraction for percent) the
+    person must check. `spans` holds the minutes each row stands for."""
+    out, top = [], {}
+    hour = _local_hour(ts)
+    for c, why in _WHY_NOT_NEGATIVE.items():
+        x = cols.get(c)
+        if x is None:
+            continue
+        read = ~np.isnan(x)
+        below = read & (x < -NEGATIVE_TOLERANCE_W)
+        x[below] = np.nan
+        n = int(below.sum())
+        if n:
+            out.append(f"{_plural(n, f'{c} cell was', f'{c} cells were')} below -{NEGATIVE_TOLERANCE_W:,.0f} W ({why}) and "
+                       f"{'was' if n == 1 else 'were'} stored as missing")
+        judged = read & ~below & ((_MIDDAY_H[0] <= hour) & (hour < _MIDDAY_H[1]) if c == "pv_power_w" else True)
+        top[c] = (float(np.abs(x[judged]).max()) if judged.any() else 0.0, int(spans[judged].sum()))
+    x = cols.get("battery_soc_bms_pct")
+    if x is not None:
+        read = ~np.isnan(x)
+        wrong = read & ~((x >= 0) & (x <= 100))
+        x[wrong] = np.nan
+        n = int(wrong.sum())
+        if n:
+            out.append(f"{_plural(n, 'battery_soc_bms_pct cell was', 'battery_soc_bms_pct cells were')} outside 0 to 100 % and "
+                       f"{'was' if n == 1 else 'were'} stored as missing")
+        inside = read & ~wrong
+        if inside.any() and 0 < float(x[inside].max()) <= 1 and int(spans[inside].sum()) >= 60:
+            out.append("battery_soc_bms_pct never goes above 1 in this file: it may hold the state of charge as a fraction (0 to 1) where percent "
+                       "(0 to 100) is expected; the values were stored as read")
+    for c, (peak, minutes) in top.items():
+        if minutes >= 60 and 0 < peak < KW_SUSPECT_W:
+            where = " between 10:00 and 14:00 Karachi time" if c == "pv_power_w" else ""
+            out.append(f"{c} never reaches {KW_SUSPECT_W:,.0f} W{where} in this file (at most {peak:,.1f}): the column may hold kW where watts are "
+                       f"expected; the values were stored as read")
+    return out
+
+
+#: 20:00 to 05:00 Karachi time is dark all year in Pakistan (sunset by about 19:20, sunrise from about 05:00)
+_NIGHT_H = (20, 5)
+
+
+def _zone_warning(ts: np.ndarray, cols: dict, spans: np.ndarray) -> str | None:
+    """A probable time-zone slip (frontend-states-formats-06): PV above 5 % of the file's largest reading (and above KW_SUSPECT_W) for half an hour or
+    more between 20:00 and 05:00 Karachi time. A local-time file read as UTC puts the afternoon's PV after 20:00; a UTC file read as Karachi time puts the
+    morning's before 05:00."""
+    pv = cols.get("pv_power_w")
+    if pv is None:
+        return None
+    read = ~np.isnan(pv)
+    top = float(pv[read].max()) if read.any() else 0.0
+    if top < KW_SUSPECT_W:
+        return None
+    bar = max(KW_SUSPECT_W, 0.05 * top)
+    hour = _local_hour(ts)
+    night = int(spans[read & (pv > bar) & ~((_NIGHT_H[1] <= hour) & (hour < _NIGHT_H[0]))].sum())
+    if night < 30:
+        return None
+    return (f"pv_power_w is above {bar / 1000:,.1f} kW for {night:,} minutes between 20:00 and 05:00 Karachi time, when there is no sun: the times in "
+            f"the file may be in another zone than the one chosen (UTC or Karachi time)")
+
+
+# ------------------------------------------------------------------------------------------------ the CSV column mapping
+
+#: the units a mapped column may be written in, per key, with the factor to the stored unit (the first is the stored unit); a key not listed has no unit
+#: (a time, an on/off signal, a mode). The column mapping of plan Part 7.5 and UI-06 (flow-telemetry-plan-control-12): column to key, unit and sign.
+_POWER_UNITS = {"W": 1.0, "kW": 1000.0, "MW": 1e6}
+_ENERGY_UNITS = {"Wh": 1.0, "kWh": 1000.0, "MWh": 1e6}
+UNITS: dict[str, dict[str, float]] = {
+    **{k: _POWER_UNITS for k in ("grid_power_w", "pv_power_w", "load_power_w", "battery_power_w", "genset_power_w")},
+    "grid_import_wh": _ENERGY_UNITS, "grid_export_wh": _ENERGY_UNITS, "grid_voltage_v": {"V": 1.0, "kV": 1000.0}, "battery_voltage_v": {"V": 1.0},
+    "battery_current_a": {"A": 1.0}, "battery_temp_c": {"°C": 1.0}, "battery_soc_bms_pct": {"%": 1.0, "fraction": 100.0}, "genset_fuel_l": {"L": 1.0},
+}
+#: the keys whose sign a mapping may reverse: the product's battery discharge and grid import are positive (OpenEMS signs)
+SIGNED = ("grid_power_w", "battery_power_w", "battery_current_a")
+#: what a file must carry: a time, and the grid signal (grid_present, or grid_voltage_v to derive it)
+REQUIRED = ("ts", "grid_present")
+TIER1_NOTE = "No inverter_mode_active column: this source supports monitor (tier 1) only, because the counterfactual needs the inverter's mode"
+
+#: a header's words for each key, as common loggers and inverter clouds write them (the unit, in brackets or as a kW/kWh suffix, is read apart); the
+#: first pattern that matches the whole of a header's words wins, so the more particular come first
+_ALIASES = (
+    ("ts", r"ts|time ?stamp|date ?time|date and time|date time|time|date|local time|time utc|collection time|updated time|record time"),
+    ("grid_present", r"grid present|grid (status|state|on|available|availability|connected)|(utility|mains|wapda)( status| present| available)?"),
+    ("grid_voltage_v", r"(grid|utility|mains|wapda|ac input) (voltage|volt|v)( l1| r| phase a)?"),
+    ("grid_import_wh", r"grid import( energy)?|(energy )?(imported|purchased|bought)( energy)?|import energy|buy energy|energy from grid|grid buy"),
+    ("grid_export_wh", r"grid export( energy)?|(energy )?(exported|sold|fed in)( energy)?|export energy|sell energy|feed ?in energy|energy to grid"
+                       r"|grid sell"),
+    ("grid_power_w", r"grid( active)? power|grid|meter( active)? power|(utility|mains|wapda) power|total grid power"),
+    ("pv_power_w", r"pv|solar|(pv|solar|dc)( input| output| total| active)? power|total (pv|solar|dc) power|(pv|solar) production|production( power)?"),
+    ("load_power_w", r"load|(total |house |home |ac )?load( active)? power|(total )?consumption( power)?|total load|load consumption|house load"
+                     r"|home load"),
+    ("battery_soc_bms_pct", r"soc|(battery|bat|bms) soc|(battery )?state of charge|battery (level|capacity)"),
+    ("battery_voltage_v", r"(battery|bat) (voltage|volt|v)"),
+    ("battery_current_a", r"(battery|bat) (current|i)"),
+    ("battery_temp_c", r"(battery|bat|bms) (temperature|temp)"),
+    ("battery_power_w", r"battery|bat|(battery|bat)( active| charge discharge| charging discharging)? power"),
+    ("genset_running", r"(genset|generator|gen|dg) (running|status|state|on)"),
+    ("genset_fuel_l", r"((genset|generator|gen|dg) )?(fuel|diesel)( used| consumption| consumed| litres| liters)?"),
+    ("genset_power_w", r"genset|generator|(genset|generator|gen|dg|diesel generator)( active)? power"),
+    ("inverter_mode_active", r"inverter mode( active)?|(work|working|operating) mode"),
+    ("quality_flags", r"quality( flags)?"),
+)
+_ALIAS_RE = tuple((k, re.compile(p)) for k, p in _ALIASES)
+_SIGNAL_OF = {"grid_power_w": "grid_present", "genset_power_w": "genset_running"}
+_UNIT_WORDS = {"w": "W", "kw": "kW", "mw": "MW", "wh": "Wh", "kwh": "kWh", "mwh": "MWh", "%": "%", "pct": "%", "percent": "%", "v": "V", "kv": "kV",
+               "a": "A", "°c": "°C", "c": "°C", "degc": "°C", "deg c": "°C", "l": "L", "litre": "L", "litres": "L", "liter": "L", "liters": "L",
+               "ltr": "L"}
+#: the units a header may end in without brackets (load_kw, Energy kWh); one letter alone (grid v) is a word, not a unit
+_UNIT_SUFFIX = ("kw", "mw", "kwh", "mwh", "kv")
+_BRACKETED = re.compile(r"[\(\[]\s*([^\)\]]*?)\s*[\)\]]")
+_DECIMAL_COMMA = re.compile(r"^-?[\d.]*\d,\d+$")
+
+
+def _dialect(text: str) -> tuple[str, str]:
+    """A file's cell separator (",", ";" or a tab: whichever its header line has most of, "," on a tie) and decimal mark ("," when cells are separated
+    by ";" or a tab and numbers are written 12,5, as European loggers export them)."""
+    lines = text.splitlines()
+    head = next((line for line in lines if line.strip()), "")
+    delim = max((",", ";", "\t"), key=lambda d: (head.count(d), d == ","))
+    if delim != ",":
+        for row in csv.reader(lines[1:51], delimiter=delim):
+            if any(_DECIMAL_COMMA.match(c.strip()) for c in row):
+                return delim, ","
+    return delim, "."
+
+
+def mapping_of(mapping: dict | None) -> dict:
+    """A column mapping as {"columns": {file column: {"key", "unit", "reverse"}}, "ts_format"}; also takes the short form {file column: key}. A key of
+    None ignores the column; a column the mapping does not name is read by its own name. Raises ValueError, in one sentence, for a key that is not one
+    of CSV_COLUMNS, a unit the key is not written in (UNITS), a reversed key without a sign (SIGNED) or a time format not in TS_FORMATS."""
+    if not mapping:
+        return {"columns": {}, "ts_format": "auto"}
+    full = isinstance(mapping.get("columns"), dict)
+    cols, fmt = (mapping["columns"], mapping.get("ts_format") or "auto") if full else (mapping, "auto")
+    out = {}
+    for name, c in cols.items():
+        c = c if isinstance(c, dict) else {"key": c}
+        key, unit, reverse = c.get("key"), c.get("unit"), bool(c.get("reverse"))
+        if key is not None and key not in CSV_COLUMNS:
+            raise ValueError(f"Column {name} is mapped to {key}, which is not a key a CSV may carry ({', '.join(CSV_COLUMNS)})")
+        if unit is not None and unit not in UNITS.get(key, {}):
+            units = UNITS.get(key)
+            raise ValueError(f"Column {name} cannot be read in {unit}: "
+                             + (f"the units of {key} are {', '.join(units)}" if units else f"{key} has no unit"))
+        if reverse and key not in SIGNED:
+            raise ValueError(f"Column {name}'s sign cannot be reversed: only {', '.join(SIGNED)} have a sign")
+        out[str(name)] = {"key": key, "unit": unit, "reverse": reverse}
+    if fmt not in TS_FORMATS:
+        raise ValueError(f"The time format is one of {', '.join(TS_FORMATS)}")
+    return {"columns": out, "ts_format": fmt}
+
+
+def _column_names(fields: list[str], m: dict) -> dict:
+    """Each of a file's columns as the key it is read as (None: ignored), by the mapping, else by its own name; two columns read as one key are refused."""
+    names = {f: (m["columns"][f]["key"] if f in m["columns"] else f) for f in fields}
+    twice = Counter(n for n in names.values() if n in CSV_COLUMNS)
+    for key, n in twice.items():
+        if n > 1:
+            cols = [f for f, k in names.items() if k == key]
+            raise ValueError(f"Columns {' and '.join(cols[:3])} are both read as {key}: map one of them to another key, or to none")
+    return names
+
+
+def _found(fields: list[str]) -> str:
+    shown = [f for f in fields if f.strip()][:12]
+    more = len([f for f in fields if f.strip()]) - len(shown)
+    return ", ".join(shown) + (f" and {more} more" if more > 0 else "")
+
+
+def _header_words(name: str) -> tuple[str, str | None]:
+    """A header as (its words in lower case without its unit, the unit it names, if any)."""
+    unit = None
+    m = _BRACKETED.search(name)
+    if m:
+        unit = _UNIT_WORDS.get(m.group(1).strip().lower())
+        name = _BRACKETED.sub(" ", name)
+    if "%" in name:
+        unit, name = unit or "%", name.replace("%", " ")
+    words = re.sub(r"[^0-9a-z°]+", " ", name.lower()).split()
+    if len(words) > 1 and words[-1] in _UNIT_SUFFIX:
+        unit, words = unit or _UNIT_WORDS[words[-1]], words[:-1]
+    return " ".join(words), unit
+
+
+def _ts_format_of(cells: list[str]) -> tuple[str, bool]:
+    """The date order a file's times are written in, and whether it is a guess: day first when a first number is over 12, month first when a second
+    one is; when none is, day first (as Pakistan writes dates), flagged as ambiguous."""
+    slashed = [m for c in cells if (m := _SLASHED.match(c.strip()))]
+    if not slashed:
+        return "auto", False
+    if any(int(m.group(1)) > 12 for m in slashed):
+        return "dmy", False
+    if any(int(m.group(2)) > 12 for m in slashed):
+        return "mdy", False
+    return "dmy", True
+
+
+def guess_mapping(head: str, saved: dict | None = None) -> dict:
+    """The mapping step's first answer for a file's head (its first lines): the cell separator and decimal mark, each column with the key, unit and sign
+    it is read as and where that came from ("saved": the site's saved mapping names the column; "name": it is a documented key; "guess": its header
+    reads as one, see _ALIASES; None: not read), its first cells, the date order of its times (with `ts_ambiguous` when only a guess), the keys still
+    missing (ts, grid_present) and notes (no inverter_mode_active: tier 1 only). One column per key: a later column a key is guessed for again is left
+    unread. Nothing is stored."""
+    text = head.lstrip("\ufeff")
+    delim, decimal = _dialect(text)
+    rows = list(csv.reader(io.StringIO(text), delimiter=delim))
+    header = rows[0] if rows else []
+    body = [r for r in rows[1:52] if any(c.strip() for c in r)]
+    if len(body) > 1 and len(body[-1]) < len(header):
+        body = body[:-1]  # the head was cut in the middle of its last line
+    saved_cols = mapping_of(saved)["columns"] if saved else {}
+    cols, used = [], set()
+    for i, name in enumerate(header):
+        cells = [r[i].strip() for r in body if i < len(r)]
+        if name in saved_cols:
+            c, src = dict(saved_cols[name]), "saved"
+        elif name.strip() in CSV_COLUMNS:
+            c, src = {"key": name.strip(), "unit": None, "reverse": False}, "name"
+        else:
+            words, unit = _header_words(name)
+            key = next((k for k, rx in _ALIAS_RE if words and rx.fullmatch(words)), None)
+            if unit not in UNITS.get(key, {}):
+                unit = None
+            if key == "battery_soc_bms_pct" and unit is None:
+                vals = [x for c in cells if (x := _num(c.replace(",", ".") if decimal == "," else c)[0]) is not None]
+                unit = "fraction" if vals and 0 < max(vals) <= 1 else None
+            # a "Grid" or "Generator" column whose cells are on and off (or 1 and 0) is the signal, not the power
+            if key in _SIGNAL_OF and cells and all(c.strip().lower() in FLAG_WORDS or c.strip() in ("0", "1") for c in cells if c.strip()) \
+                    and any(c.strip() for c in cells):
+                key, unit = _SIGNAL_OF[key], None
+            c, src = {"key": key, "unit": unit, "reverse": False}, ("guess" if key else None)
+        if c["key"] in used:
+            c, src = {"key": None, "unit": None, "reverse": False}, None
+        if c["key"]:
+            used.add(c["key"])
+        cols.append({"name": name, **c, "from": src, "sample": cells[:5]})
+    ts_cells = next(([r[i] for r in body if i < len(r)] for i, c in enumerate(cols) if c["key"] == "ts"), [])
+    fmt, ambiguous = _ts_format_of(ts_cells)
+    saved_fmt = mapping_of(saved)["ts_format"] if saved else "auto"
+    if ambiguous and saved_fmt != "auto" and any(c["from"] == "saved" for c in cols):
+        fmt = saved_fmt  # the date order the site's saved mapping chose, where the file's own dates cannot tell
+    missing = [k for k in ("ts",) if k not in used] + ([] if used & {"grid_present", "grid_voltage_v"} else ["grid_present"])
+    return {"delimiter": delim, "decimal": decimal, "ts_format": fmt, "ts_ambiguous": ambiguous, "columns": cols, "missing": missing,
+            "notes": [] if "inverter_mode_active" in used else [TIER1_NOTE], "saved": any(c["from"] == "saved" for c in cols)}
+
+
+def ts_column(fields: list[str], mapping: dict | None) -> str | None:
+    """The file column read as ts, by the mapping or by its name."""
+    cols = mapping_of(mapping)["columns"]
+    return next((f for f in fields if (cols[f]["key"] if f in cols else f) == "ts"), None)
+
+
+def saved_mapping(site_id: str) -> dict | None:
+    """The site's saved CSV column mapping (its CSV source's data_sources row): {mapping, updated, by}, or None."""
+    with store.connect() as con:
+        r = con.execute("SELECT data FROM data_sources WHERE site_id = ? AND kind = 'csv' ORDER BY created LIMIT 1", (site_id,)).fetchone()
+    try:
+        data = json.loads(r["data"]) if r else {}
+        if not isinstance(data, dict) or not isinstance(data.get("mapping"), dict):
+            return None
+        return {"mapping": mapping_of(data["mapping"]), "updated": data.get("updated"), "by": data.get("by")}
+    except ValueError:  # not JSON, or a mapping this version no longer reads: as if none were saved
+        return None
+
+
+def save_mapping(site_id: str, mapping: dict, by: str) -> dict:
+    """Saves the site's CSV column mapping (checked by mapping_of), replacing the one saved before: {mapping, updated, by}."""
+    data = {"mapping": mapping_of(mapping), "updated": store._now(), "by": by}
+    with store.connect() as con:
+        r = con.execute("SELECT id FROM data_sources WHERE site_id = ? AND kind = 'csv' ORDER BY created LIMIT 1", (site_id,)).fetchone()
+        if r:
+            con.execute("UPDATE data_sources SET data = ? WHERE id = ?", (json.dumps(data), r["id"]))
+        else:
+            con.execute("INSERT INTO data_sources (id, site_id, kind, data, created) VALUES (?,?,?,?,?)",
+                        (store.new_id(), site_id, "csv", json.dumps(data), store._now()))
+    return data
+
+
+def _mapping_words(m: dict) -> str | None:
+    """The import note of a mapping's effect: the columns it renames, their units and signs, and the date order."""
+    parts = []
+    for f, c in m["columns"].items():
+        if c["key"] is None or (c["key"] == f and not c["unit"] and not c["reverse"]):
+            continue
+        parts.append(f"{f} as {c['key']}" + (f" in {c['unit']}" if c["unit"] and c["unit"] != next(iter(UNITS.get(c["key"], {"": 0}))) else "")
+                     + (" with its sign reversed" if c["reverse"] else ""))
+    order = {"dmy": "; dates read day first", "mdy": "; dates read month first"}.get(m["ts_format"], "")
+    if not parts and not order:
+        return None
+    shown = ", ".join(parts[:12]) + (f" and {len(parts) - 12} more" if len(parts) > 12 else "")
+    return f"Read with the column mapping: {shown or 'the columns by their names'}{order}"
+
+
+#: the CSV keys that are text, kept as written (at most 40 characters); every other key is a number
+_CSV_TEXT = ("inverter_mode_active", "quality_flags")
+#: a parsed time beyond this magnitude is clamped (it is refused as before 2015 or in the future either way), so it fits a 64-bit column of times
+_TS_CLAMP = 2 ** 62
+#: how much of a file's start is decoded to find its separator and decimal mark (the header and the first rows)
+_HEAD_BYTES = 65536
+
+
+class _Columns:
+    """A CSV's rows as columns (performance-live-04): the time of each readable row (epoch seconds UTC, array('q')), per number key the values
+    (array('d'), NaN for missing) and a byte per cell set where the cell could not be read, per text key the cells. One streamed pass fills them, so an
+    upload costs a few machine words a cell instead of a dict and a tuple per row."""
+
+    def __init__(self, keys: list[str]):
+        self.ts = array("q")
+        self.num = {k: array("d") for k in keys if k not in _CSV_TEXT}
+        self.bad = {k: bytearray() for k in self.num}
+        self.text = {k: [] for k in keys if k in _CSV_TEXT}
+
+
+def _read_columns(content: bytes, delim: str, decimal: str, at: dict, scale: dict, tz_offset_h: float, ts_format: str) -> tuple[_Columns, int, str | None]:
+    """The file's rows, read once, as _Columns: `at` gives each key's column (the last of two columns with one name, as a reader by name keeps), `scale`
+    each mapped key's factor (its unit and sign). The text is decoded as it is read, never whole. Cells are read as import_csv documents (decimal commas,
+    on/off words, blanks missing); a row without a readable time is skipped and counted. Returns (columns, rows skipped, the first unreadable time)."""
+    cols = _Columns([k for k in at if k != "ts"])
+    text = io.TextIOWrapper(io.BytesIO(content), encoding="utf-8-sig", errors="replace", newline="")
+    reader = csv.reader(text, delimiter=delim)
+    next(reader, None)  # the header, read by the caller
+    t_at = at["ts"]
+    nums = [(k, i, cols.num[k].append, cols.bad[k].append, scale.get(k), k in ("grid_present", "genset_running")) for k, i in at.items() if k in cols.num]
+    texts = [(k, i, cols.text[k].append) for k, i in at.items() if k in cols.text]
+    words: dict[str, str] = {}  # one string per distinct text cell (an inverter mode repeats on every row)
+    nan = math.nan
+    bad_ts, first_bad = 0, None
+    for row in reader:
+        if not row:
+            continue  # a blank line
+        n = len(row)
+        cell = row[t_at] if t_at < n else None
+        try:
+            t = csv_time(cell, tz_offset_h, ts_format)
+        except (ValueError, TypeError, OverflowError):
+            t = None
+        if t is None:
+            bad_ts += 1
+            first_bad = first_bad or (cell or "").strip() or None
+            continue
+        cols.ts.append(max(-_TS_CLAMP, min(_TS_CLAMP, t)))
+        for k, i, put, put_bad, x, flag in nums:
+            v = row[i] if i < n else None
+            if v is not None:
+                if decimal == "," and _DECIMAL_COMMA.match(v.strip()):
+                    v = v.strip().replace(".", "").replace(",", ".")
+                if flag:
+                    v = FLAG_WORDS.get(v.strip().lower(), v)
+            f, bad = _num(v)
+            if f is not None and x is not None:
+                f *= x
+                if abs(f) > CELL_MAX:  # a mapped unit that takes a reading past any meter's range: unreadable, as _num reads it
+                    f, bad = None, True
+            put(nan if f is None else f)
+            put_bad(bad)
+        for k, i, put in texts:
+            v = row[i] if i < n else None
+            put(None if v in (None, "") else words.setdefault(v[:40], v[:40]))
+    return cols, bad_ts, first_bad
+
+
+def _write_days(site_id: str, ts: np.ndarray, cols: dict, texts: dict, spans: np.ndarray, latest_ok: int) -> dict:
+    """The kept rows into the minute table, merged per column (_insert_sql with merge), one Karachi day per write transaction, each day aggregated after
+    its write (performance-live-04: the whole file was one executemany under one BEGIN IMMEDIATE, and every reader and edge batch of the company
+    waited for it). Each row is stored on the minutes it covers (`spans`), none past `latest_ok`. A failure part-way leaves the days before it stored;
+    uploading the file again stores the same minutes (the write is idempotent by site and minute). Returns {accepted, overlap}."""
+    start = ts // 60 * 60
+    row = np.repeat(np.arange(len(ts)), spans)
+    k = np.arange(len(row)) - np.repeat(np.cumsum(spans) - spans, spans)
+    minute = start[row] + 60 * k
+    keep = (k == 0) | (minute <= latest_ok)
+    row, minute = row[keep], minute[keep]
+    names = tuple(cols) + tuple(texts)
+    sql = _insert_sql(("site_id", "ts", "source_id") + names, merge=True)
+    day = (minute + 5 * 3600) // 86400
+    cuts = np.flatnonzero(np.diff(day)) + 1
+    accepted = overlap = 0
+    for a, b in zip(np.r_[0, cuts], np.r_[cuts, len(minute)]):
+        r = row[a:b]
+        stamps = minute[a:b].tolist()
+        cells = [np.where(np.isnan(cols[c][r]), None, cols[c][r]).tolist() for c in cols] + [[texts[c][i] for i in r.tolist()] for c in texts]
+        with connect() as con:
+            have = {t for (t,) in con.execute("SELECT ts FROM minute WHERE site_id = ? AND ts >= ? AND ts <= ?", (site_id, stamps[0], stamps[-1]))}
+            overlap += sum(1 for t in stamps if t in have)
+            con.executemany(sql, ((site_id, t, "csv", *v) for t, *v in zip(stamps, *cells)))
+        accepted += len(stamps)
+        aggregate_day(site_id, date(1970, 1, 1) + timedelta(days=int(day[a])))
+    return {"accepted": accepted, "overlap": overlap}
+
+
 def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
-               file_name: str | None = None) -> dict:
-    """A CSV upload: one row per minute; blanks are missing; duplicates keep the last; gaps over 5 minutes are reported.
+               file_name: str | None = None, ts_format: str = "auto") -> dict:
+    """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
+    `duplicates` the rows dropped, both in the notes); rows 2 to 60 minutes apart are stored as the minutes each covers (`step_min`, `minutes`; see
+    _write_days), rows further apart are refused; gaps over 5 minutes (or over the step) are reported. A file in which no row's grid_present (or
+    grid_voltage_v) can be read is refused; on and off, true and false, yes and no are read as 1 and 0. Implausible readings are checked
+    (_check_values: impossible cells stored as missing, probable unit slips named). What may make the import wrong is listed in
+    `warnings` (also at the end of `log`), and the import's `status` is then "done_with_warnings", not "done".
+
+    The file is read once, in one streamed pass, into a column of numbers per key (_read_columns), so the import's memory is a small multiple of the
+    file's, and the minutes are written one Karachi day per transaction, each day aggregated after its write (_write_days; audit R7 performance-live-04:
+    the file was decoded and parsed twice, a dict and a tuple per row, and written in one transaction that every reader and writer waited for).
 
     The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
     nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
-    rows are aggregated. The imports row keeps the uploaded range (`from_ts`, `to_ts`) and the file's name when given (`file_name`, see _file_name)."""
-    if len(content) > 30_000_000:
-        raise ValueError("The file is larger than 30 MB; split it by month")
-    text = content.decode("utf-8-sig", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames or "ts" not in [(mapping or {}).get(f, f) for f in reader.fieldnames]:
+    rows are aggregated. Times are read by csv_time in `ts_format` (ISO 8601 or epoch seconds by default); a file in which none can be read is refused
+    with the formats read, a file over UPLOAD_MAX_BYTES with TOO_LARGE, and a time-zone offset outside -23 to 23 hours in one sentence. The imports row
+    keeps the uploaded range (`from_ts`, `to_ts`) and the file's name when given (`file_name`, see _file_name).
+
+    `mapping` (see mapping_of; flow-telemetry-plan-control-12) reads a vendor's columns as the product's keys, in their units and signs, and its
+    `ts_format` (day-first or month-first dates) when `ts_format` is left "auto". Cells separated by ";" or tabs, with decimal commas, are read
+    (_dialect). A file without a ts column, or without a grid signal, is refused with the columns it has."""
+    if len(content) > UPLOAD_MAX_BYTES:
+        raise ValueError(TOO_LARGE)
+    try:
+        timezone(timedelta(hours=tz_offset_h))
+    except (ValueError, OverflowError, TypeError):
+        raise ValueError("The timezone offset is hours from UTC, between -23 and 23") from None
+    m = mapping_of(mapping)
+    if ts_format == "auto":
+        ts_format = m["ts_format"]
+    if ts_format not in TS_FORMATS:
+        raise ValueError(f"The time format is one of {', '.join(TS_FORMATS)}")
+    delim, decimal = _dialect(content[:_HEAD_BYTES].decode("utf-8-sig", errors="replace"))
+    fields = next(csv.reader(io.TextIOWrapper(io.BytesIO(content), encoding="utf-8-sig", errors="replace", newline=""), delimiter=delim), None)
+    if not fields:
         raise ValueError("The file needs a header row with a ts column (UTC, or set the timezone)")
-    log, records = [], []
-    names = {f: (mapping or {}).get(f, f) for f in reader.fieldnames}
+    names = _column_names(fields, m)
+    if "ts" not in names.values():
+        raise ValueError(f"The file has no ts column (its columns are {_found(fields)}): choose the column that holds the time in the column "
+                         f"mapping, or name the columns as the keys a file may carry: {', '.join(CSV_COLUMNS)}")
+    log = []
+    if delim != ",":
+        log.append(f"Cells are separated by {'semicolons' if delim == ';' else 'tabs'}" + (" and decimals by commas (12,5)" if decimal == "," else ""))
+    mapped = _mapping_words(m)
+    if mapped:
+        log.append(mapped)
     ignored = [f for f, n in names.items() if n not in CSV_COLUMNS]
     if ignored:
         log.append(f"Ignored columns: {', '.join(ignored[:10])}")
     if "inverter_mode_active" not in names.values():
-        log.append("No inverter_mode_active column: this source supports monitor (tier 1) only, because the counterfactual needs the inverter's mode")
+        log.append(TIER1_NOTE)
     if "grid_present" not in names.values() and "grid_voltage_v" not in names.values():
-        raise ValueError("The file needs a grid_present column (or grid_voltage_v to derive it): the product cannot see outages without it")
+        raise ValueError(f"The file needs a grid_present column (or grid_voltage_v to derive it): the product cannot see outages without it. Its "
+                         f"columns are {_found(fields)}: choose the one that holds the grid's state in the column mapping")
+    # a mapped column's unit and sign: its readings scaled to the stored unit and the product's sign (discharge and import positive)
+    scale = {c["key"]: UNITS.get(c["key"], {}).get(c["unit"] or "", 1.0) * (-1.0 if c["reverse"] else 1.0)
+             for f, c in m["columns"].items() if f in names and c["key"] and (c["unit"] or c["reverse"])}
+    scale = {k: x for k, x in scale.items() if x != 1.0}
     if "grid_import_wh" not in names.values() and "grid_export_wh" not in names.values():
         log.append("No grid_import_wh or grid_export_wh column: import and export are read from grid_power_w (positive is import)"
                    if "grid_power_w" in names.values() else
                    "No grid_import_wh, grid_export_wh or grid_power_w column: grid import and export are missing for this file, not zero")
-    bad_ts = 0
-    for line in reader:
-        rec = {names[k]: v for k, v in line.items() if k in names and names[k] in CSV_COLUMNS}
-        ts = rec.get("ts") or ""  # a short row leaves its missing trailing cells as None
-        try:
-            t = datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00"))
-            if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone(timedelta(hours=tz_offset_h)))
-            rec["ts"] = int(t.timestamp())
-        except (ValueError, TypeError, OverflowError):
-            bad_ts += 1
-            continue
-        if str(rec.get("genset_running") or "").strip() == "":
-            rec.pop("genset_running", None)
-        records.append(rec)
-    if not records:
-        raise ValueError("No rows with a readable ts were found")
+    at = {}
+    for i, f in enumerate(fields):
+        if names.get(f) in CSV_COLUMNS:
+            at[names[f]] = i  # a name given twice: its last column, as a reader by name keeps
+    parsed, bad_ts, first_bad = _read_columns(content, delim, decimal, at, scale, tz_offset_h, ts_format)
+    if not parsed.ts:
+        raise ValueError(_no_times(first_bad, ts_format))
     now = _now_ts() if now is None else int(now)
-    _check_window([r["ts"] for r in records], now)  # before anything is written
+    ts = np.frombuffer(parsed.ts, dtype=np.int64)
+    _check_window(ts, now)  # before anything is written
     if bad_ts:
         log.append(f"{bad_ts} rows without a readable ts were skipped")
-    records.sort(key=lambda r: r["ts"])
-    gaps = sum(1 for a, b in zip(records, records[1:]) if b["ts"] - a["ts"] > 300)
-    res = ingest(site_id, records, "csv", now=now)
-    res["skipped"] += bad_ts
-    if res.get("unreadable_cells"):
-        log.append(f"{res['unreadable_cells']} cells were not finite numbers (text such as N/A, NaN or inf) or were beyond any meter's range "
+    # duplicate times keep the last row (plan Part 7.5) and are counted once: a stable sort keeps, of two rows with one time, the later in the file later
+    order = np.argsort(ts, kind="stable")
+    minute = ts[order] // 60
+    order = order[np.r_[minute[1:] != minute[:-1], True]]
+    duplicates = len(ts) - len(order)
+    del minute
+    if duplicates == 0 and bool(np.all(order[1:] > order[:-1])):
+        # a file in time order without repeats (the usual one): the parsed columns are used as they are, not copied
+        cols = {k: np.frombuffer(v, dtype=float) for k, v in parsed.num.items()}
+        bad = {k: np.frombuffer(v, dtype=bool) for k, v in parsed.bad.items()}
+        texts = parsed.text
+    else:  # one column at a time, each parsed column let go once reordered
+        ts = ts[order]
+        cols = {k: np.frombuffer(parsed.num.pop(k), dtype=float)[order] for k in list(parsed.num)}
+        bad = {k: np.frombuffer(parsed.bad.pop(k), dtype=bool)[order] for k in list(parsed.bad)}
+        texts = {k: [v[i] for i in order.tolist()] for k, v in parsed.text.items()}
+    del parsed, order
+    if duplicates:
+        log.append(f"{duplicates:,} row{'s repeat' if duplicates != 1 else ' repeats'} a minute that a later row of the file also gives: the last row "
+                   f"of each minute was kept")
+    n = len(ts)
+    # grid_present is what the product sees outages by: a file in which no row's grid signal can be read is refused, and unreadable cells are a warning
+    warnings: list[str] = []
+    none = np.zeros(n, dtype=bool)
+    grid_read = ~np.isnan(cols["grid_present"]) if "grid_present" in cols else none
+    volt_read = ~np.isnan(cols["grid_voltage_v"]) if "grid_voltage_v" in cols else none
+    if not (grid_read | volt_read).any():
+        raise ValueError("No row's grid_present (or grid_voltage_v) can be read: write grid_present as 1 for grid on and 0 for grid off (on and off "
+                         "are read too) and upload again; the product cannot see outages without it")
+    unreadable_grid = int(np.sum(~grid_read & ~volt_read & bad["grid_present"])) if "grid_present" in bad else 0
+    if unreadable_grid:
+        warnings.append(f"{unreadable_grid:,} grid_present cell{'s' if unreadable_grid != 1 else ''} could not be read (1 is grid on, 0 is grid off): "
+                        f"the grid is stored as unknown in those minutes, so an outage in them is not seen")
+    # the logger's interval: the most common step between rows, in whole minutes (the shorter on a tie). A 5- or 15-minute row is stored as the minutes it
+    # starts (up to the next row), so its energy, the day's peak and its outage minutes are counted in full (audit R7)
+    diffs = np.diff(ts // 60)
+    if len(diffs):
+        values, counts = np.unique(diffs, return_counts=True)
+        step = int(values[np.argmax(counts)])  # np.unique sorts the steps, and argmax takes the first of equal counts: the shorter on a tie
+    else:
+        step = 1
+    if step > STEP_MAX_MIN:
+        raise ValueError(f"Rows are {step} minutes apart: the import reads rows at most {STEP_MAX_MIN} minutes apart; upload the logger's "
+                         f"1-, 5- or 15-minute rows")
+    spans = np.r_[np.minimum(step, diffs), step].astype(np.int64)
+    if step > 1:
+        log.append(f"Rows are {step} minutes apart: each row was stored as the {step} minutes it starts, its readings held over them and its energy "
+                   f"({', '.join(INTERVAL_ENERGY)}) spread evenly")
+    gaps = int(np.sum(diffs > max(5, step)))
+    warnings += _check_values(ts, cols, spans)
+    zone = _zone_warning(ts, cols, spans)
+    if zone:
+        warnings.append(zone)
+    unreadable = int(sum(int(b.sum()) for b in bad.values()))
+    del bad
+    if "grid_voltage_v" in cols:  # grid present from voltage (plan Part 7.5; 180 V to confirm); an unreadable voltage stays unknown
+        grid = cols.get("grid_present", np.full(n, np.nan))
+        derive = np.isnan(grid) & volt_read
+        grid[derive] = (cols["grid_voltage_v"][derive] >= 180).astype(float)
+        cols["grid_present"] = grid
+    if step > 1:
+        for c in INTERVAL_ENERGY:
+            if c in cols:
+                cols[c] /= step
+    res = _write_days(site_id, ts, cols, texts, spans, now + AHEAD_S)
+    if res["overlap"]:
+        log.append(f"{res['overlap']:,} minutes were already stored: the file's values replaced theirs, and the columns the file does not carry (or "
+                   f"leaves blank) were kept")
+    if unreadable:
+        log.append(f"{unreadable} cells were not finite numbers (text such as N/A, NaN or inf) or were beyond any meter's range "
                    f"(over a billion), and were stored as missing")
+    log += warnings  # the imports row keeps them with the notes; the answer also lists them apart
+    status = "done_with_warnings" if warnings else "done"
     digest = hashlib.sha256(content).hexdigest()[:16]
-    first, last = records[0]["ts"], records[-1]["ts"]
+    first, last = int(ts[0]), int(ts[-1])
     name = _file_name(file_name)
     with store.connect() as con:
         _imports_columns(con)
         iid = store.new_id()
         con.execute("INSERT INTO imports (id, site_id, source, file_hash, rows, gaps, status, log, created, from_ts, to_ts, file_name) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (iid, site_id, "csv", digest, res["accepted"], gaps, "done", json.dumps(log), store._now(), first, last, name))
-    for day in _local_days(r["ts"] for r in records):  # only the days that received rows, not every day between the first and the last
-        aggregate_day(site_id, day)
-    return {"id": iid, "rows": res["accepted"], "skipped": res["skipped"], "gaps": gaps, "log": log,
+                    (iid, site_id, "csv", digest, n, gaps, status, json.dumps(log), store._now(), first, last, name))
+    return {"id": iid, "rows": n, "skipped": bad_ts, "gaps": gaps, "log": log, "duplicates": duplicates, "minutes": res["accepted"],
+            "step_min": step, "overlap": res["overlap"], "warnings": warnings, "status": status,
             "from": datetime.fromtimestamp(first, timezone.utc).isoformat(), "to": datetime.fromtimestamp(last, timezone.utc).isoformat(),
             "from_ts": first, "to_ts": last, "file_name": name}
 
@@ -348,19 +951,47 @@ def _finite(v):
 
 
 def latest(site_id: str) -> dict | None:
-    with connect() as con:
+    with reading() as con:
         r = con.execute("SELECT * FROM minute WHERE site_id = ? ORDER BY ts DESC LIMIT 1", (site_id,)).fetchone()
     return {k: _finite(v) for k, v in dict(r).items()} if r else None
 
 
 def first_ts(site_id: str) -> int | None:
-    with connect() as con:
+    with reading() as con:
         r = con.execute("SELECT MIN(ts) FROM minute WHERE site_id = ?", (site_id,)).fetchone()
     return r[0] if r else None
 
 
+def battery_totals(site_id: str, t0: int, t1: int) -> dict:
+    """The battery's figures over [t0, t1) from the stored minutes in one aggregate query (the battery page's month, round 7 pages-C-13): the energy
+    discharged (kWh, as aggregate_day's discharge_kwh), the minutes with a battery power reading, a state-of-charge reading (the estimate, else the
+    BMS) and a temperature reading, the minutes above 90 % charge and 35 °C (battery.state's hot-and-full rule), and the first minute that discharged.
+    Each stored row is one minute (a coarser logger's rows are stored on the minutes they cover); a cell past CELL_MAX is no reading."""
+    soc = "COALESCE(battery_soc_est_pct, battery_soc_bms_pct)"
+    sql = ("SELECT SUM(CASE WHEN battery_power_w > 0 AND battery_power_w <= :m THEN battery_power_w END), "
+           "COUNT(CASE WHEN ABS(battery_power_w) <= :m THEN 1 END), "
+           f"COUNT(CASE WHEN ABS({soc}) <= :m THEN 1 END), "
+           "COUNT(CASE WHEN ABS(battery_temp_c) <= :m THEN 1 END), "
+           f"COUNT(CASE WHEN {soc} > 90 AND {soc} <= :m AND battery_temp_c > 35 AND battery_temp_c <= :m THEN 1 END), "
+           "MIN(CASE WHEN battery_power_w > 0 AND battery_power_w <= :m THEN ts END) "
+           "FROM minute WHERE site_id = :s AND ts >= :t0 AND ts < :t1")
+    with reading() as con:
+        r = con.execute(sql, {"m": CELL_MAX, "s": site_id, "t0": int(t0), "t1": int(t1)}).fetchone()
+    return {"discharge_kwh": float(r[0] or 0.0) / 60000.0, "power_minutes": int(r[1]), "soc_minutes": int(r[2]), "temp_minutes": int(r[3]),
+            "hot_full_minutes": int(r[4]), "first_discharge_ts": r[5]}
+
+
+def soc_reading(site_id: str, ts: int) -> dict | None:
+    """The stored state-of-charge readings of the minute starting at ts (a minute grid's cell: minute_grid's cells start where the caller's t0 put
+    them, so the row is the one inside [ts, ts + 60)): which of the estimate and the BMS that minute holds."""
+    with reading() as con:
+        r = con.execute("SELECT battery_soc_est_pct, battery_soc_bms_pct FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts LIMIT 1",
+                        (site_id, int(ts), int(ts) + 60)).fetchone()
+    return {"est": _finite(r[0]), "bms": _finite(r[1])} if r else None
+
+
 def raw(site_id: str, t0: int, t1: int, columns: tuple = COLUMNS[3:]) -> dict:
-    with connect() as con:
+    with reading() as con:
         rows = con.execute(f"SELECT ts, {', '.join(columns)} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
                            (site_id, int(t0), int(t1))).fetchall()
     out = {"ts": np.array([r[0] for r in rows], dtype=np.int64)}
@@ -433,12 +1064,28 @@ def filled(g: dict) -> dict:
 SERIES_KIND = {"grid_import_wh": "sum", "grid_export_wh": "sum", "genset_fuel_l": "sum", "grid_present": "min"}
 
 
-def series(site_id: str, t0: int, t1: int, names: list[str], res: str = "auto") -> dict:
-    """Chart series at a resolution: 1m, 15m, 1h or 1d (auto picks so a request never returns more than about 3,000 points)."""
-    span = t1 - t0
-    if res == "auto":
-        res = "1m" if span <= 2 * 86400 else "15m" if span <= 31 * 86400 else "1h" if span <= 120 * 86400 else "1d"
-    step = {"1m": 60, "15m": 900, "1h": 3600, "1d": 86400}[res]
+#: a chart series answers at most this many buckets (plan Part 9 and the telemetry.py row of Part 11: about 2,000 points per series; R7 section 8)
+SERIES_MAX_POINTS = 2000
+#: the resolutions a series is read at, finest first, with their bucket in seconds (R8's steps; 1d buckets are Karachi days)
+RESOLUTIONS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "1d": 86400}
+
+
+def _buckets(t0: int, t1: int, step: int, off: int) -> int:
+    """The buckets of `step` seconds (shifted back by `off`) that [t0, t1) touches: a range starting part-way through a bucket touches one more."""
+    return 0 if t1 <= t0 else (int(t1) - 1 + off) // step - (int(t0) + off) // step + 1
+
+
+def series(site_id: str, t0: int, t1: int, names: list[str], res: str = "auto", max_points: int = SERIES_MAX_POINTS) -> dict:
+    """Chart series at a resolution of RESOLUTIONS. "auto" is the finest whose buckets over [t0, t1) stay within max_points; an explicit resolution
+    that would answer more is coarsened to that one, whoever asks (audit R7 tests-and-perf-05: 400 days at 1 minute built some 576,000 buckets of
+    every series; performance-live-13: 2 days at 1 minute gave 2,880), and 1d is never coarsened. The answer gives the resolution used, the one asked
+    (`requested_resolution`) and the cap (`max_points`)."""
+    if res != "auto" and res not in RESOLUTIONS:
+        raise ValueError(f"The resolution is auto or one of {', '.join(RESOLUTIONS)}")
+    asked = res
+    finest = 0 if res == "auto" else list(RESOLUTIONS).index(res)
+    res = next((r for r in list(RESOLUTIONS)[finest:] if _buckets(t0, t1, RESOLUTIONS[r], 5 * 3600 if r == "1d" else 0) <= max_points), "1d")
+    step = RESOLUTIONS[res]
     names = [n for n in names if n in NUMERIC] or ["pv_power_w", "load_power_w", "grid_power_w", "battery_power_w", "battery_soc_est_pct"]
     off = 5 * 3600 if res == "1d" else 0
     parts = []
@@ -448,9 +1095,9 @@ def series(site_id: str, t0: int, t1: int, names: list[str], res: str = "auto") 
         parts.append(f"{fn}({n})")
     sql = (f"SELECT ((ts + {off}) / {step}) * {step} - {off} AS b, {', '.join(parts)} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? "
            f"GROUP BY b ORDER BY b")
-    with connect() as con:
+    with reading() as con:
         rows = con.execute(sql, (site_id, int(t0), int(t1))).fetchall()
-    return {"resolution": res, "ts": [r[0] for r in rows],
+    return {"resolution": res, "requested_resolution": asked, "max_points": int(max_points), "ts": [r[0] for r in rows],
             "series": {n: [None if r[i + 1] is None or not math.isfinite(float(r[i + 1])) else round(float(r[i + 1]), 3) for r in rows]
                        for i, n in enumerate(names)}}
 
@@ -464,7 +1111,7 @@ def heatmap(site_id: str, name: str, days: int = 28) -> dict:
     sql = (f"SELECT ((ts + 18000) / 86400 + 3) % 7 AS dow, ((ts + 18000) % 86400) / 3600 AS h, AVG({name}) FROM minute WHERE site_id = ? AND ts >= ? "
            f"GROUP BY dow, h")
     grid = [[None] * 24 for _ in range(7)]
-    with connect() as con:
+    with reading() as con:
         for dow, h, v in con.execute(sql, (site_id, t0)).fetchall():
             grid[int(dow)][int(h)] = None if v is None or not math.isfinite(float(v)) else round(v, 2)
     # rows Monday..Sunday: 1970-01-01 was a Thursday, so (days since the epoch + 3) % 7 already gives 0 = Monday and 6 = Sunday, as in
@@ -472,29 +1119,198 @@ def heatmap(site_id: str, name: str, days: int = 28) -> dict:
     return {"series": name, "days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], "values": grid}
 
 
+# ------------------------------------------------------------------------------------------------ genset runs and outages, in minutes
+
+#: A genset run or an outage goes on across rows that carry no reading of its signal (a blank cell, a lost row, the minutes between a 5- or 15-minute
+#: source's rows) while two of its readings are at most RUN_GAP_S apart (two of the source's own intervals, when longer): a missing signal is unknown, not
+#: off (plan 7.5, U3 3.7), as the forecaster's outage runs bridge them (forecast.OUTAGE_GAP_MINUTES). A reading that says otherwise (grid up, set off)
+#: ends it. Each row stands for the seconds to the next row, at most the source's own interval, so a coarse source's minutes, energy and litres are
+#: counted in full (audit R7 pages-C-04: they were counted per row, a blank row ended a run or an outage).
+RUN_GAP_S = 15 * 60
+
+
+def sample_seconds(ts) -> int:
+    """The seconds one row of a source stands for: the median gap between its rows (60 for a 1-minute source, 300 for a 5-minute one), from 60 to
+    RUN_GAP_S (as forecast.sample_minutes)."""
+    ts = np.asarray(ts, dtype=np.int64)
+    if len(ts) < 2:
+        return 60
+    return int(min(RUN_GAP_S, max(60, round(float(np.median(np.diff(ts))) / 60) * 60)))
+
+
+def _stretches(ts: np.ndarray, known: np.ndarray, on: np.ndarray, step: int, t1: int) -> list[tuple[int, int, bool]]:
+    """(first row, last row, ongoing) of each stretch of `on` readings: rows without a reading between two `on` readings at most RUN_GAP_S (or two
+    steps) apart continue it, a known not-`on` reading ends it. `ongoing`: nothing has ended it and its last reading is recent (within the gap of t1)."""
+    idx = np.flatnonzero(known & on)
+    if not len(idx):
+        return []
+    offs = np.cumsum(known & ~on)  # known not-on readings up to and including each row
+    gap = max(RUN_GAP_S, 2 * step)
+    brk = (np.diff(ts[idx]) > gap) | (offs[idx[1:]] != offs[idx[:-1]])
+    starts = idx[np.concatenate([[True], brk])]
+    ends = idx[np.concatenate([brk, [True]])]
+    out = []
+    for s, e in zip(starts.tolist(), ends.tolist()):
+        ended = bool(offs[-1] != offs[e]) or int(t1) - int(ts[e]) > gap
+        out.append((s, e, not ended))
+    return out
+
+
+def _spans(ts: np.ndarray, s: int, e: int, step: int) -> tuple[np.ndarray, np.ndarray]:
+    """Seconds each row s..e of a stretch stands for (to the next row; the last row its own interval, at most the next row) and the part of it the
+    row's own reading covers (at most the source's interval: the rest is a gap the stretch bridges)."""
+    dur = np.empty(e - s + 1, dtype=float)
+    dur[:-1] = np.diff(ts[s:e + 1])
+    dur[-1] = min(step, int(ts[e + 1] - ts[e])) if e + 1 < len(ts) else step
+    return dur, np.minimum(dur, step)
+
+
+def _held(a: np.ndarray, both: bool = False) -> np.ndarray:
+    """A stretch's readings with each blank carried from the reading before it (and, with `both`, leading blanks from the first reading)."""
+    a = np.asarray(a, dtype=float).copy()
+    if not len(a):
+        return a
+    pos = np.arange(len(a))
+    last = np.maximum.accumulate(np.where(~np.isnan(a), pos, -1))
+    fill = np.isnan(a) & (last >= 0)
+    a[fill] = a[last[fill]]
+    if both and np.isnan(a[0]) and (~np.isnan(a)).any():
+        a[:int(np.flatnonzero(~np.isnan(a))[0])] = a[~np.isnan(a)][0]
+    return a
+
+
+def _genset_state(d: dict) -> tuple[np.ndarray, np.ndarray]:
+    """(known, running) per row, as the savings' actual arm reads the set (verify._actual_sim): the running flag, else its power, else its litres. A row
+    with none of the three is unknown, not off."""
+    flag, p, fuel = d["genset_running"], d["genset_power_w"], d["genset_fuel_l"]
+    known = ~np.isnan(flag) | ~np.isnan(p) | ~np.isnan(fuel)
+    on = np.where(~np.isnan(flag), flag > 0.5, np.where(~np.isnan(p), p > 0.0, np.nan_to_num(fuel) > 0.0))
+    return known, on & known
+
+
+def _local_day(ts) -> np.ndarray:
+    return (np.asarray(ts, dtype=np.int64) + 5 * 3600) // 86400
+
+
+def _grid_stretches(d: dict, step: int, t1: int) -> list[tuple[int, int, bool]]:
+    grid = d["grid_present"]
+    known = ~np.isnan(grid)
+    return _stretches(d["ts"], known, known & (grid < 0.5), step, t1)
+
+
+#: the columns a genset run reads: the set's own and the grid's (outages); and, only for a run with no output read, the site's balance
+_RUN_COLUMNS = ("genset_running", "genset_power_w", "genset_fuel_l", "grid_present")
+_BALANCE_COLUMNS = ("load_power_w", "pv_power_w", "battery_power_w", "grid_power_w", "grid_import_wh", "grid_export_wh")
+
+
+def _at(d: dict, ts: np.ndarray) -> dict:
+    """raw()'s numeric columns at the times `ts` (NaN where `d` has no row at that time): a second read lined up with the first by minute."""
+    pos = np.minimum(np.searchsorted(d["ts"], ts), max(0, len(d["ts"]) - 1))
+    hit = (pos < len(d["ts"])) & (d["ts"][pos] == ts) if len(d["ts"]) else np.zeros(len(ts), dtype=bool)
+    out = {"ts": np.asarray(ts)}
+    for c, v in d.items():
+        if c != "ts":
+            a = np.full(len(ts), np.nan)
+            a[hit] = v[pos[hit]]
+            out[c] = a
+    return out
+
+
+def genset_runs(site_id: str, t0: int, t1: int, genset: dict) -> dict:
+    """The genset's runs in [t0, t1), oldest first, counted in minutes (see RUN_GAP_S), with their litres as the Savings page reads them
+    (verify.litres_used, plan 8.3: metered where a fuel meter reads, else the fuel curve a x output + b x rating, the output read, else held from the
+    run's last reading, else the site's balance within the set's range). Answers:
+
+    - `signal` {present, last_seen, running}: whether any row of the period read the set (its running flag, power or litres), the last such row and what
+      it said; without one the set's state is unknown, not off (plan 7.5);
+    - `runs[]` {start, end, hours, kwh, kwh_estimated (some output from the balance), litres, litres_metered, litres_curve, litres_source ("meter", or
+      "curve" when any of its litres come from the curve), load_ratio, hours_below_min (hours whose read output was under f_min of the rating),
+      in_outage (it overlapped an outage), ongoing?};
+    - `daily[]` {day, hours, litres}: per Karachi day of the period, null on a day without a genset reading;
+    - `fuel_read`: whether any row read the fuel meter (a period of metered zeros is "meter", not unknown)."""
+    s_kw = float(genset.get("rated_kw") or 0.0)
+    a, b, f_min = float(genset.get("a") or 0.0), float(genset.get("b") or 0.0), float(genset.get("f_min") or 0.0)
+    d = raw(site_id, t0, t1, _RUN_COLUMNS)
+    ts = d["ts"]
+    known, on = _genset_state(d)
+    step = sample_seconds(ts)
+    outs = [(int(ts[s]), int(ts[e]) + int(_spans(ts, s, e, step)[0][-1])) for s, e, _ in _grid_stretches(d, step, t1)]
+    p_kw = d["genset_power_w"] / 1000.0
+    fuel = d["genset_fuel_l"]
+    first_day, last_day = int(_local_day([t0])[0]), int(_local_day([max(t0, t1 - 1)])[0])
+    n_days = last_day - first_day + 1
+    day_hours, day_litres = np.zeros(n_days), np.zeros(n_days)
+    runs = []
+    for s, e, ongoing in _stretches(ts, known, on, step, t1):
+        dur, own = _spans(ts, s, e, step)
+        power = _held(p_kw[s:e + 1], both=True)
+        balanced = np.isnan(power)
+        if balanced.any():
+            # no output read in the run: the load the grid, PV and battery leave over, within the set's range (as verify._actual_sim); the run's own
+            # minutes, matched by time, as a minute written between the two reads would otherwise misalign the arrays (review r7: a 500)
+            bd = _at(raw(site_id, int(ts[s]), int(ts[e]) + 1, _BALANCE_COLUMNS), ts[s:e + 1])
+            grid_kw = np.where(~np.isnan(bd["grid_power_w"]), bd["grid_power_w"] / 1000.0,
+                               (np.nan_to_num(bd["grid_import_wh"]) - np.nan_to_num(bd["grid_export_wh"])) * 3.6 / own)
+            bal = (np.nan_to_num(bd["load_power_w"]) - np.nan_to_num(bd["pv_power_w"]) - np.nan_to_num(bd["battery_power_w"])) / 1000.0
+            est = np.clip(bal - np.nan_to_num(grid_kw), f_min * s_kw, s_kw) if s_kw > 0 else np.zeros(len(bal))
+            power = np.where(balanced, est, power)
+        metered_row = ~np.isnan(fuel[s:e + 1])
+        metered = float(np.nansum(fuel[s:e + 1]))
+        curve_s = dur - np.where(metered_row, own, 0.0)
+        curve_rows = (a * power + b * s_kw) * curve_s / 3600.0
+        curve = float(curve_rows.sum())
+        litres_rows = np.where(metered_row, np.nan_to_num(fuel[s:e + 1]), 0.0) + curve_rows
+        start = int(ts[s])
+        end = int(ts[e]) + int(dur[-1])
+        kwh = float(np.sum(power * dur) / 3600.0)
+        hours = (end - start) / 3600.0
+        below = float(np.sum(dur[~balanced & (power < f_min * s_kw - 1e-9)]) / 3600.0) if s_kw > 0 else 0.0
+        run = {"start": start, "end": end, "hours": round(hours, 2), "kwh": round(kwh, 1), "kwh_estimated": bool(balanced.any()),
+               "litres": round(metered + curve, 1), "litres_metered": round(metered, 1), "litres_curve": round(curve, 1),
+               "litres_source": "curve" if curve > 1e-9 else "meter", "load_ratio": round(kwh / max(1e-6, hours * s_kw), 2) if s_kw > 0 else None,
+               "hours_below_min": round(below, 2), "in_outage": any(os < end and start < oe for os, oe in outs)}
+        if ongoing:
+            run["ongoing"] = True
+        runs.append(run)
+        days = _local_day(ts[s:e + 1]) - first_day
+        ok = (days >= 0) & (days < n_days)
+        np.add.at(day_hours, days[ok], dur[ok] / 3600.0)
+        np.add.at(day_litres, days[ok], litres_rows[ok])
+    seen = set((_local_day(ts[known]) - first_day).tolist())
+    daily = [{"day": date.fromordinal(date(1970, 1, 1).toordinal() + first_day + i).isoformat(),
+              "hours": round(float(day_hours[i]), 2) if i in seen else None, "litres": round(float(day_litres[i]), 1) if i in seen else None}
+             for i in range(n_days)]
+    last = int(np.flatnonzero(known)[-1]) if known.any() else None
+    signal = {"present": last is not None, "last_seen": int(ts[last]) if last is not None else None,
+              "running": bool(on[last]) if last is not None else None}
+    return {"signal": signal, "runs": runs, "daily": daily, "fuel_read": bool((~np.isnan(fuel)).any())}
+
+
 def outages(site_id: str, t0: int, t1: int) -> list[dict]:
-    """Outage intervals from the grid-present flag (a gap in data is not an outage)."""
-    d = raw(site_id, t0, t1, ("grid_present", "battery_soc_est_pct", "battery_soc_bms_pct", "genset_running", "unserved_w"))
+    """Outage intervals from the grid-present flag, counted in minutes (see RUN_GAP_S): a gap in the data is not an outage, and a blank reading does not
+    end one. `genset_minutes` are the minutes the genset's runs (as genset_runs reads them) overlap the outage; `unserved_kwh` holds each reading over the
+    minutes its row stands for."""
+    d = raw(site_id, t0, t1, ("grid_present", "battery_soc_est_pct", "battery_soc_bms_pct", "genset_running", "genset_power_w", "genset_fuel_l",
+                              "unserved_w"))
+    ts = d["ts"]
+    if not len(ts):
+        return []
+    step = sample_seconds(ts)
     soc = np.where(np.isnan(d["battery_soc_est_pct"]), d["battery_soc_bms_pct"], d["battery_soc_est_pct"])  # the BMS where there is no estimate
-    out, cur = [], None
-    for i, t in enumerate(d["ts"]):
-        down = d["grid_present"][i] == 0
-        if down and cur is None:
-            cur = {"start": int(t), "soc_start_pct": None if np.isnan(soc[i]) else round(float(soc[i]), 1),
-                   "genset_minutes": 0, "unserved_kwh": 0.0}
-        if down and cur is not None:
-            cur["end"] = int(t) + 60
-            cur["genset_minutes"] += int(d["genset_running"][i] == 1)
-            cur["unserved_kwh"] += float(np.nan_to_num(d["unserved_w"][i])) / 60000
-        if not down and cur is not None:
-            out.append(cur)
-            cur = None
-    if cur is not None:
-        cur["ongoing"] = True
-        out.append(cur)
-    for o in out:
-        o["minutes"] = (o["end"] - o["start"]) // 60
-        o["unserved_kwh"] = round(o["unserved_kwh"], 2)
+    known, on = _genset_state(d)
+    gen = [(int(ts[s]), int(ts[e]) + int(_spans(ts, s, e, step)[0][-1])) for s, e, _ in _stretches(ts, known, on, step, t1)]
+    out = []
+    for s, e, ongoing in _grid_stretches(d, step, t1):
+        dur, _own = _spans(ts, s, e, step)
+        start, end = int(ts[s]), int(ts[e]) + int(dur[-1])
+        unserved = np.nan_to_num(_held(d["unserved_w"][s:e + 1]))
+        o = {"start": start, "end": end, "minutes": (end - start) // 60,
+             "soc_start_pct": None if np.isnan(soc[s]) else round(float(soc[s]), 1),
+             "genset_minutes": int(sum(max(0, min(end, ge) - max(start, gs)) for gs, ge in gen) // 60),
+             "unserved_kwh": round(float(np.sum(unserved * dur)) / 3.6e6, 2)}
+        if ongoing:
+            o["ongoing"] = True
+        out.append(o)
     return out
 
 
@@ -568,6 +1384,38 @@ def days(site_id: str, d0: str, d1: str) -> list[dict]:
     return out
 
 
+#: today's share of minutes is counted from Karachi midnight up to this long ago: a source that sends its minutes in batches is not counted missing for the
+#: minutes still on their way
+QUALITY_GRACE_S = 900
+
+
+def quality_days(site_id: str, d0: date, d1: date, now: int) -> list[dict]:
+    """Each stored day's completeness from d0 to d1 (local days, inclusive), for the data-quality strips (role-viewer-07). A past day's share is of its
+    1,440 minutes; today's is of the minutes elapsed so far (from midnight to QUALITY_GRACE_S ago, at least one), marked `in_progress`, so a healthy
+    feed is 100 % at noon instead of 50 %, and a feed that stopped falls as the day goes on. A site with earlier data that has sent nothing yet today
+    shows today at 0 % once the grace has passed."""
+    out = [{"day": r["day"], "completeness": r.get("completeness")} for r in days(site_id, d0.isoformat(), d1.isoformat())]
+    now = int(now)
+    day = datetime.fromtimestamp(now, PKT).date()
+    if not d0 <= day <= d1:
+        return out
+    t0 = int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
+    upto = (now - QUALITY_GRACE_S) // 60 * 60
+    row = next((r for r in out if r["day"] == day.isoformat()), None)
+    if row is None:
+        first = first_ts(site_id)
+        if first is None or first >= t0 or upto <= t0:
+            return out
+        row = {"day": day.isoformat()}
+        out.append(row)
+    upto = max(upto, t0 + 60)
+    with reading() as con:
+        n = con.execute("SELECT COUNT(*) FROM minute WHERE site_id = ? AND ts >= ? AND ts < ?", (site_id, t0, upto)).fetchone()[0]
+    row["completeness"] = round(min(1.0, n / ((upto - t0) // 60)), 4)
+    row["in_progress"] = True
+    return out
+
+
 _FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
 
 
@@ -581,13 +1429,16 @@ def _csv_cell(v):
 
 
 def export_csv(site_id: str, t0: int, t1: int) -> str:
+    """The stored minutes of [t0, t1) as CSV. The rows are fetched in one read and formatted after it has closed, so the formatting (about half a second
+    for 32 days) holds no transaction open (performance-live-03)."""
+    with reading() as con:
+        rows = con.execute(f"SELECT ts, {', '.join(COLUMNS[3:])} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+                           (site_id, int(t0), int(t1))).fetchall()
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["ts_utc"] + list(COLUMNS[3:]))
-    with connect() as con:
-        for r in con.execute(f"SELECT ts, {', '.join(COLUMNS[3:])} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
-                             (site_id, int(t0), int(t1))):
-            w.writerow([datetime.fromtimestamp(r[0], timezone.utc).isoformat().replace("+00:00", "Z")] + [_csv_cell(_finite(v)) for v in r[1:]])
+    for r in rows:
+        w.writerow([datetime.fromtimestamp(r[0], timezone.utc).isoformat().replace("+00:00", "Z")] + [_csv_cell(_finite(v)) for v in r[1:]])
     return buf.getvalue()
 
 
@@ -599,16 +1450,35 @@ def delete_site(site_id: str) -> None:
 
 # ------------------------------------------------------------------------------------------------ forecast issues
 
+#: forecast issues are kept whole for ISSUE_ALL_DAYS, the hourly ones for ISSUE_HOURLY_DAYS (the stage-1 bands read the last 16 days' issues, the night's
+#: scoring the last 3), then only each Karachi day's day-ahead issue: the latest at or before its midnight and at most DAY_AHEAD_S before it, which the
+#: day's scoring reads (forecast.score_day). An issue is about 27 KB a site for its three kinds; kept hourly for ever they came to about 240 MB a
+#: site-year, four times the minute rows (audit R7 performance-live-06); kept so, about 30 MB a site plus 10 MB a site-year.
+ISSUE_ALL_DAYS = 3
+ISSUE_HOURLY_DAYS = 35
+DAY_AHEAD_S = 6 * 3600
+#: the seconds from an issue's belief time to the Karachi midnight at or after it
+_TO_MIDNIGHT = "((86400 - (belief_time + 18000) % 86400) % 86400)"
+
+
 def save_forecast(site_id: str, kind: str, belief_time: int, stage: int, version: str, body: dict) -> None:
+    """Saves an issue and prunes the site's issues of that kind by age from this one's belief time (ISSUE_ALL_DAYS, ISSUE_HOURLY_DAYS; see there)."""
+    bt = int(belief_time)
     with connect() as con:
         con.execute("INSERT OR REPLACE INTO forecast_issues (site_id, kind, belief_time, stage, model_version, body) VALUES (?,?,?,?,?,?)",
-                    (site_id, kind, int(belief_time), stage, version, json.dumps(body)))
+                    (site_id, kind, bt, stage, version, json.dumps(body)))
         con.execute("DELETE FROM forecast_issues WHERE site_id = ? AND kind = ? AND belief_time < ? AND belief_time % 3600 != 0",
-                    (site_id, kind, int(belief_time) - 3 * 86400))
+                    (site_id, kind, bt - ISSUE_ALL_DAYS * 86400))
+        later = (f"SELECT 1 FROM forecast_issues AS later WHERE later.site_id = forecast_issues.site_id AND later.kind = forecast_issues.kind "
+                 f"AND later.belief_time > forecast_issues.belief_time AND later.belief_time <= forecast_issues.belief_time + "
+                 f"{_TO_MIDNIGHT.replace('belief_time', 'forecast_issues.belief_time')}")
+        con.execute(f"DELETE FROM forecast_issues WHERE site_id = ? AND kind = ? AND belief_time < ? "
+                    f"AND NOT ({_TO_MIDNIGHT} <= ? AND NOT EXISTS ({later}))",
+                    (site_id, kind, bt - ISSUE_HOURLY_DAYS * 86400, DAY_AHEAD_S))
 
 
 def latest_forecast(site_id: str, kind: str, at_or_before: int | None = None) -> dict | None:
-    with connect() as con:
+    with reading() as con:
         if at_or_before is None:
             r = con.execute("SELECT * FROM forecast_issues WHERE site_id = ? AND kind = ? ORDER BY belief_time DESC LIMIT 1", (site_id, kind)).fetchone()
         else:
