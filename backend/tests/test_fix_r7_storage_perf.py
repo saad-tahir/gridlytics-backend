@@ -460,3 +460,39 @@ def test_the_founder_console_counts_each_companys_sites_whose_ticks_make_no_plan
     scheduler.tick_company(world.db)
     view = store_founder.company_view(world.company["id"])
     assert view["sites_failing"] == 1 and view["sites"] == 2
+
+
+# ------------------------------------------------------------------------------------------------ tests-and-perf-08
+
+def _photo_reads(sql: list[str], table: str) -> list[str]:
+    """The statements that read a photograph column of `table` (SELECT * or the column itself in the select list), not only its byte length."""
+    import re
+    reads = [s for s in sql if f"FROM {table}" in s and s.lstrip().upper().startswith("SELECT")]
+    return [s for s in reads if "SELECT *" in s or re.search(r"\bphoto\b", re.sub(r"(octet_)?length\(photo\)", "", s.split(" FROM ")[0]))]
+
+
+def test_the_native_capture_and_the_marked_table_are_read_without_their_photograph(company, monkeypatch):
+    """native_latest ran SELECT * and so read the capture's photograph (up to 7 MB) on every sites.full(): every tick and nearly every site page, then
+    threw it away; the replay's capture of the day and its applied mark did the same per replayed day. Now the readers name their columns and has_photo
+    comes from the photograph's length."""
+    sid = _site()
+    photo = "data:image/jpeg;base64," + "A" * 1_000_000
+    sites.capture_native(sid, {"source": "photo", "work_mode": "self_use", "backup_soc_pct": 20, "photo": photo}, "t")
+    day = datetime.now(PKT).date() - timedelta(days=1)
+    t0 = twin.day_start_utc(day)
+    telemetry.ingest(sid, [{"ts": t, "grid_present": 1, "battery_soc_bms_pct": 50.0, "load_power_w": 50_000, "grid_power_w": 40_000,
+                            "pv_power_w": 10_000} for t in range(t0, t0 + 86400, 60)], "edge")
+    pid = plans.tick(sid)["plan_id"]
+    with store.connect() as con:
+        con.execute("INSERT INTO applied (id, site_id, plan_id, day_local, by, method, photo, created) VALUES (?,?,?,?,?,?,?,?)",
+                    (store.new_id(), sid, pid, day.isoformat(), "t", "photo", photo, store._now()))
+    seen = _Statements(monkeypatch)
+    latest, full, of_day = sites.native_latest(sid), sites.full(sid), verify.native_for_day(sid, day)
+    for got in (latest, full["native"], of_day):
+        assert got["has_photo"] is True and "photo" not in got and got["body"]["backup_soc_pct"] == 20 and got["version"] == 1
+        assert set(got) == {"site_id", "version", "captured_at", "by", "source", "body", "has_photo"}
+    verify.compute_day(sid, day)
+    assert any("FROM native_settings" in s for s in seen.sql) and any("FROM applied" in s for s in seen.sql)
+    assert _photo_reads(seen.sql, "native_settings") == [] and _photo_reads(seen.sql, "applied") == []
+    sites.capture_native(sid, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 25}, "t")
+    assert sites.native_latest(sid)["has_photo"] is False and sites.native_latest(sid)["version"] == 2

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sqlite3
 from datetime import date, datetime, timezone
 from typing import Literal
 
@@ -875,15 +876,27 @@ class NativeCapture(Strict):
         return self
 
 
-def native_latest(site_id: str) -> dict | None:
-    with store.connect() as con:
-        r = con.execute("SELECT * FROM native_settings WHERE site_id = ? ORDER BY version DESC LIMIT 1", (site_id,)).fetchone()
+#: The columns a reader of a native capture selects: never the photograph (up to 7 MB, read on every sites.full(), so every tick and nearly every site
+#: page), only whether there is one. Its byte length (octet_length, SQLite 3.43 on) comes from the record header without loading the photograph's
+#: pages; an older SQLite counts its characters (round 7, audit tests-and-perf-08).
+NATIVE_COLUMNS = ("site_id, version, captured_at, by, source, body, "
+                  + ("octet_length(photo)" if sqlite3.sqlite_version_info >= (3, 43, 0) else "length(photo)") + " > 0 AS has_photo")
+
+
+def native_row(r) -> dict | None:
+    """A native_settings row read with NATIVE_COLUMNS, as the readers return it."""
     if r is None:
         return None
     d = dict(r)
     d["body"] = json.loads(d["body"])
-    d["has_photo"] = bool(d.pop("photo"))
+    d["has_photo"] = bool(d["has_photo"])
     return d
+
+
+def native_latest(site_id: str) -> dict | None:
+    with store.connect() as con:
+        r = con.execute(f"SELECT {NATIVE_COLUMNS} FROM native_settings WHERE site_id = ? ORDER BY version DESC LIMIT 1", (site_id,)).fetchone()
+    return native_row(r)
 
 
 def native_versions(site_id: str) -> list[dict]:
