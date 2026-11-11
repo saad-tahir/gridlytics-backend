@@ -391,9 +391,10 @@ def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Depend
 
 def _bust_resolve(site_id: str, background: BackgroundTasks) -> str | None:
     """An intra-day forecast bust re-solves the plan (round 7 stage 2, audit brief-vs-build-15; plan Part 2.4 and OPT-15): once a telemetry batch is
-    stored, the last 30 minutes' PV against the forecast issue the plan in force was solved on (alerts.intraday_bust, at the site's Forecast bust
-    threshold). One re-solve per issue (the re-solve issues a new forecast, which is judged afresh once 20 minutes of it are read), and at most one
-    event re-solve per site every RESOLVE_GAP_S. 'scheduled', 'rate_limited' or None."""
+    stored, the last 30 minutes' PV against the forecast issue in force at each minute, the latest (the one the plan in force was solved on) missing
+    too (alerts.intraday_bust, at the site's Forecast bust threshold). One re-solve per latest issue (a re-solve within the quarter replaces it, and the
+    next tick's issue is judged once five minutes of it are read), and at most one event re-solve per site every RESOLVE_GAP_S. 'scheduled',
+    'rate_limited' or None."""
     pct = float(alerts._th(alerts.site_rules(site_id), "Forecast", "bust_pct"))
     bust = alerts.intraday_bust(site_id, now_ts(), pct)
     if bust is None or sites.state(site_id).get("bust_resolved_issue") == bust["belief_time"]:

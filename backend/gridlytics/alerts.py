@@ -1152,39 +1152,70 @@ def forecast_bust(site: dict, day: date, bust_pct: float = 30.0) -> dict | None:
             "nrmse_pct": round(float(np.sqrt(np.mean((pred[ok] - act[ok]) ** 2)) / kw) * 100, 1) if ok.any() else None}
 
 
-#: The window an intra-day forecast bust is judged over (plan Part 2.4: a PV error above the threshold of the clear-sky ceiling over 30 minutes), and the
-#: least of it that must be read
+#: The window an intra-day forecast bust is judged over (plan Part 2.4: a PV error above the threshold of the clear-sky ceiling over 30 minutes), the
+#: least of it that must be read, and the least of the latest issue (the one the plan in force was solved on) that must be read and miss too
 BUST_WINDOW_S = 1800
 BUST_MIN_READ_MIN = 20
+BUST_LATEST_MIN = 5
+
+
+def _pv_issues_in_force(site_id: str, start: int, end: int) -> list[tuple[int, np.ndarray, np.ndarray]]:
+    """The PV forecast issues in force over [start, end): the latest issued at or before `start` and every later one before `end`, oldest first, as
+    (belief time, q50, clear-sky ceiling)."""
+    first = telemetry.latest_forecast(site_id, "pv", start)
+    lo = int(first["belief_time"]) if first else int(start)
+    with telemetry.reading() as con:
+        rows = con.execute("SELECT belief_time, body FROM forecast_issues WHERE site_id = ? AND kind = 'pv' AND belief_time >= ? AND belief_time < ? "
+                           "ORDER BY belief_time", (site_id, lo, int(end))).fetchall()
+    out = []
+    for r in rows:
+        body = json.loads(r["body"])
+        q50, cs = body.get("q50"), body.get("cs")
+        if isinstance(q50, list) and isinstance(cs, list) and q50 and cs:
+            out.append((int(r["belief_time"]), np.array([np.nan if x is None else float(x) for x in q50], dtype=float),
+                        np.array([np.nan if x is None else float(x) for x in cs], dtype=float)))
+    return out
 
 
 def intraday_bust(site_id: str, now: int, bust_pct: float = 30.0) -> dict | None:
-    """Whether the PV forecast the plan in force was solved on (the latest issue) has busted over the last 30 minutes (plan Part 2.4; round 7 stage 2,
-    audit brief-vs-build-15: a busted forecast waited for the next quarter's tick): the measured mean PV against the issue's median over the minutes it
-    covers, as a share of their clear-sky ceiling, above `bust_pct`. At least BUST_MIN_READ_MIN minutes must be covered and read, in daylight (a
-    ceiling above a tenth of the issue's highest), so an issue a few minutes old is not judged. {err_pct, belief_time} when it busted, else None."""
+    """Whether the PV forecast has busted over the last 30 minutes (plan Part 2.4; round 7 stage 2, audit brief-vs-build-15: a busted forecast waited
+    for the next quarter's tick): the measured mean PV against the median of the issue in force at each minute (a tick saves an issue every quarter),
+    as a share of their clear-sky ceiling, above `bust_pct`. At least BUST_MIN_READ_MIN minutes must be read, in daylight (a ceiling above a tenth
+    of the latest issue's highest), and the latest issue, the one the plan in force was solved on, must be read for BUST_LATEST_MIN minutes and
+    miss as much, so a plan a tick has just solved on a new issue is not re-solved before that issue is seen to miss. {err_pct, belief_time (the
+    latest issue's)} when it busted, else None."""
     pv = (sites.assets(site_id) or {}).get("pv")
     if not pv:
         return None
     end = int(now) // 60 * 60
-    f = telemetry.latest_forecast(site_id, "pv", end)
-    if f is None or not f.get("cs") or not f.get("q50"):
-        return None
-    start = max(end - BUST_WINDOW_S, int(f["belief_time"]))
-    if end - start < BUST_MIN_READ_MIN * 60:
+    start = end - BUST_WINDOW_S
+    issues = _pv_issues_in_force(site_id, start, end)
+    if not issues:
         return None
     g = telemetry.minute_grid(site_id, start, end)
+    ts = np.asarray(g["ts"], dtype=np.int64)
     act = np.asarray(g["pv"], dtype=float)
-    idx = ((np.asarray(g["ts"]) - int(f["belief_time"])) // STEP_S).astype(int)
-    q50, cs = np.asarray(f["q50"], dtype=float), np.asarray(f["cs"], dtype=float)
-    ok = ~np.isnan(act) & (idx >= 0) & (idx < len(q50)) & (idx < len(cs))
-    if int(ok.sum()) < BUST_MIN_READ_MIN:
+    pred, ceil = np.full(len(ts), np.nan), np.full(len(ts), np.nan)
+    for bt, q50, cs in issues:                           # oldest first: a later issue takes over from its belief time
+        idx = (ts - bt) // STEP_S
+        m = (ts >= bt) & (idx < min(len(q50), len(cs)))
+        pred[m], ceil[m] = q50[idx[m]], cs[idx[m]]
+    ok = ~np.isnan(act) & ~np.isnan(pred) & ~np.isnan(ceil)
+    latest_bt, _, latest_cs = issues[-1]
+    mine = ok & (ts >= latest_bt)
+    if int(ok.sum()) < BUST_MIN_READ_MIN or int(mine.sum()) < BUST_LATEST_MIN:
         return None
-    ceiling = float(np.mean(cs[idx[ok]]))
-    if ceiling <= 0.1 * max(float(np.max(cs)), 1e-6):
+
+    def err(sel: np.ndarray) -> float | None:
+        ceiling = float(np.mean(ceil[sel]))
+        if ceiling <= 0.1 * max(float(np.nanmax(latest_cs)), 1e-6):
+            return None                                  # night or dusk: no ceiling to judge against
+        return abs(float(np.mean(pred[sel])) - float(np.mean(act[sel]))) / ceiling
+
+    e, e_latest = err(ok), err(mine)
+    if e is None or e_latest is None or e <= bust_pct / 100 or e_latest <= bust_pct / 100:
         return None
-    err = abs(float(np.mean(q50[idx[ok]])) - float(np.mean(act[ok]))) / ceiling
-    return {"err_pct": round(err * 100, 1), "belief_time": int(f["belief_time"])} if err > bust_pct / 100 else None
+    return {"err_pct": round(e * 100, 1), "belief_time": int(latest_bt)}
 
 
 def nightly(site_id: str, day: date) -> None:

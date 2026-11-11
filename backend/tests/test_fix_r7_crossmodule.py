@@ -758,3 +758,37 @@ def test_the_twin_charges_from_a_running_set_only_in_a_gen_charge_slot():
     assert follow["gen"][30:].max() == pytest.approx(48.0 * 0.3, abs=0.01)          # the set follows a 10 kW load at its minimum
     assert charge["gen"][30:].max() == pytest.approx(48.0, abs=0.01)                # at its rating: 10 kW of load, 38 kW into the battery
     assert charge["soc"][-1] > follow["soc"][-1] + 0.2
+
+
+# ------------------------------------------------------------------------------------------------ review fixes (the package's sign-off)
+
+def test_review_a_forecast_bust_is_judged_on_the_issue_in_force_each_minute_as_ticks_issue_one_every_quarter(world, monkeypatch):
+    """Review of brief-vs-build-15: every 15-minute tick saves a new forecast issue, so a window measured from the latest issue's belief time never
+    held the 20 minutes of readings the check asks for, and on a live site no bust ever re-solved a plan (the test above stored one issue only).
+    The last 30 minutes are judged minute by minute against the issue in force at each minute; the latest issue, the one the plan in force was
+    solved on, must be seen to miss too, so the first batch after a scheduled tick does not re-solve the plan that tick has just made."""
+    from gridlytics import alerts
+    from test_fix_api import _batch, _now
+    from test_fix_r2_api import _clock
+    sid = world.site
+    kh = world.key(["telemetry:write"])
+    with world.use():
+        sites.set_status(sid, "active")
+        sites.put_asset(sid, "pv", {"kwp_dc": 300, "kw_ac": 250}, "t")
+    ticks = []
+    monkeypatch.setattr(plans, "tick", lambda site_id, *a, **k: ticks.append(site_id) or {"status": "active"})
+    q = (_now() // 900 - 4) * 900
+    with world.use():
+        for k in range(3):                                   # the ticks at q, q + 15 and q + 30 minutes each issued one
+            telemetry.save_forecast(sid, "pv", q + 900 * k, 1, "t", {"q50": [200.0] * 192, "cs": [240.0] * 192})
+    cols = ("ts", "grid_present", "pv_power_w")
+    clock = _clock(monkeypatch, q + 32 * 60 + 5)
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_batch(1, rows=[[q + 60 * i, 1, 60_000] for i in range(32)], columns=cols))
+    assert r.status_code == 200 and r.json().get("resolve") is None and ticks == [], r.text   # two minutes of the latest issue read: not yet
+    clock["now"] = q + 40 * 60 + 5
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_batch(2, rows=[[q + 60 * i, 1, 60_000] for i in range(32, 40)], columns=cols))
+    assert r.json().get("resolve") == "scheduled" and r.json()["resolve_reason"] == "forecast_bust" and ticks == [sid], r.text
+    with world.use():
+        bust = alerts.intraday_bust(sid, q + 40 * 60 + 5)
+    assert bust["belief_time"] == q + 1800 and bust["err_pct"] == pytest.approx(140 / 240 * 100, abs=0.1)
+
