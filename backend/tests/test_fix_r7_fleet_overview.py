@@ -225,6 +225,10 @@ def test_the_fleet_counts_the_sites_on_a_plan_and_on_native_settings_and_names_t
     with world.use():
         sites.set_tier_capable(sid, "closed_loop")
         sites.set_tier_allowed(sid, "closed_loop", "test")
+    # closed loop runs through an edge device: with none ever heard from, nothing reaches the inverter (control-edge, role-operator-11)
+    assert _row(a.get("/api/fleet").json(), sid)["on_plan"] is False
+    with world.use():
+        sites.put_state(sid, edge_last_seen=_now())
     fleet = a.get("/api/fleet").json()
     assert _row(fleet, sid)["on_plan"] is True and fleet["summary"]["on_plan"] == 1 and _row(fleet, sid)["on_native"] is False
     # released to its native settings: no longer on a plan, and counted as handed back (the row says so, so the web app's count of the real sites
