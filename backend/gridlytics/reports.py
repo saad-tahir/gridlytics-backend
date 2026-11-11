@@ -516,17 +516,27 @@ def _switchback(doc: _Doc, site_id: str, d0: date, d1: date, whole: bool = False
     credits = [c for c in sb.get("carry_over_credits") or [] if whole or d0.isoformat() <= str(c.get("boundary")) <= d1.isoformat()]
     if credits:
         doc.gap(2)
-        doc.table([["Switch to native on", "Plan arm ended with", "Native arm ended with", "Valued at", "Carry-over credit to the plan"]]
-                  + [[_short_day(c["boundary"]), smart(c.get("e_end_plan_kwh"), " kWh"), smart(c.get("e_end_native_kwh"), " kWh"),
-                      f"Rs {_round(_finite(c.get('v_end')) or 0.0, 2):.2f}/kWh", rs(c.get("credit_rs"))] for c in credits],
-                  [35 * mm, 35 * mm, 35 * mm, 30 * mm, 45 * mm])
+        # round 7 (audit pages-D-05): a switch either way carries a credit (a native block hands its stored energy to the plan block too), so each
+        # row says which way it went; a plan arm's end energy on a native-to-plan switch is the plan days' mean (verify._carry_over_credits)
+        doc.table([["Switch on", "From and to", "Plan arm ended with", "Native arm ended with", "Valued at", "Carry-over credit to the plan"]]
+                  + [[_short_day(c["boundary"]), f"{ARM_WORDS.get(c.get('from_arm'), str(c.get('from_arm')))} to "
+                                                 f"{ARM_WORDS.get(c.get('to_arm'), str(c.get('to_arm'))).lower()}",
+                      smart(c.get("e_end_plan_kwh"), " kWh") + (" (mean of the plan days)" if c.get("e_end_plan_basis") == "plan_days_mean" else ""),
+                      smart(c.get("e_end_native_kwh"), " kWh"), f"Rs {_round(_finite(c.get('v_end')) or 0.0, 2):.2f}/kWh", rs(c.get("credit_rs"))]
+                     for c in credits],
+                  [25 * mm, 35 * mm, 32 * mm, 28 * mm, 25 * mm, 35 * mm])
     res = sb.get("result")
     doc.gap(2)
     if res:
         doc.p(f"Over the calendar so far ({_plural(int(res.get('plan_days') or 0), 'plan day')}, {_plural(int(res.get('native_days') or 0), 'native day')}): "
               f"the plan saves {rs(res.get('saving_rs_per_day_adjusted'))} a day adjusted for sun, load and outages "
-              f"({rs(res.get('saving_rs_per_day_unadjusted'))} a day unadjusted). Carry-over credit: {rs(res.get('carry_over_credit_rs'))} in all, "
-              f"{rs(res.get('carry_over_rs_per_plan_day'))} a plan day, included in both.")
+              f"({rs(res.get('saving_rs_per_day_unadjusted'))} a day unadjusted)"
+              # round 7 (audit pages-D-05): the figures before the credit, beside it
+              + (f"; {rs(res['saving_rs_per_day_adjusted_before_carry_over'])} a day adjusted and "
+                 f"{rs(res['saving_rs_per_day_unadjusted_before_carry_over'])} unadjusted before the carry-over credit"
+                 if _finite(res.get("saving_rs_per_day_adjusted_before_carry_over")) is not None
+                 and _finite(res.get("saving_rs_per_day_unadjusted_before_carry_over")) is not None else "")
+              + f". Carry-over credit: {rs(res.get('carry_over_credit_rs'))} in all, {rs(res.get('carry_over_rs_per_plan_day'))} a plan day, included in both.")
     else:
         doc.p(f"No switchback result yet: it needs at least six scored days on both arms ({_plural(int(sb.get('days') or 0), 'day')} scored so far).")
 

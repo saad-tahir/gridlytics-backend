@@ -114,3 +114,50 @@ def test_the_reports_say_which_days_claim_and_never_that_the_claim_counts_the_ve
     assert rows["Verified days (plan followed in full)"].split(" | ")[1:] == ["1", "1"], rows
     assert "every scored day" in monthly and "followed in full or in part" in monthly, monthly
     assert "a verified day is one whose plan was followed in full" in rollup, rollup
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-05: the switchback's carry-over
+
+class _Doc:
+    """A stand-in for the report's document: the tables and paragraphs a section writes."""
+
+    def __init__(self):
+        self.tables, self.paras = [], []
+
+    def table(self, rows, widths=None, right=True):
+        self.tables.append(rows)
+
+    def p(self, text, lead=""):
+        self.paras.append(text)
+
+    def gap(self, n=3):
+        pass
+
+
+def test_the_reports_switchback_names_each_switch_both_ways_and_the_figures_before_the_carry_over(monkeypatch):
+    """pages-D-05: both switchback figures add the carry-over credit of every switch, a native-to-plan switch included (engine-savings-11), but the
+    report's table headed every row 'Switch to native on' and its sentence gave the figures without what they were before the credit. Each row now
+    says which way the switch went, a plan arm's stored energy that is the plan days' mean says so, and the sentence gives both figures before the
+    credit beside the credit."""
+    from gridlytics import reports
+    credits = [{"boundary": "2026-11-16", "from_arm": "plan", "to_arm": "native", "e_end_plan_kwh": 120.0, "e_end_native_kwh": 60.0,
+                "e_end_plan_basis": "plan_block_last_day", "v_end": 30.0, "credit_rs": 1800.0, "credit_v_end_rs": 1800.0, "realised": False,
+                "provisional": True},
+               {"boundary": "2026-11-23", "from_arm": "native", "to_arm": "plan", "e_end_plan_kwh": 90.0, "e_end_native_kwh": 100.0,
+                "e_end_plan_basis": "plan_days_mean", "v_end": 40.0, "credit_rs": -400.0, "credit_v_end_rs": -400.0, "realised": False,
+                "provisional": False}]
+    blocks = [{"block_start": "2026-11-09", "block_end": "2026-11-15", "arm": "plan"}, {"block_start": "2026-11-16", "block_end": "2026-11-22", "arm": "native"},
+              {"block_start": "2026-11-23", "block_end": "2026-11-29", "arm": "plan"}]
+    res = {"plan_days": 14, "native_days": 7, "saving_rs_per_day_adjusted": 1200.0, "saving_rs_per_day_unadjusted": 1300.0,
+           "carry_over_credit_rs": 1400.0, "carry_over_rs_per_plan_day": 100.0, "saving_rs_per_day_adjusted_before_carry_over": 1100.0,
+           "saving_rs_per_day_unadjusted_before_carry_over": 1200.0}
+    monkeypatch.setattr(verify, "switchback_result", lambda site_id: {"blocks": blocks, "carry_over_credits": credits, "result": res})
+    doc = _Doc()
+    reports._switchback(doc, "s", date(2026, 11, 1), date(2026, 11, 30), whole=True)
+    head, *rows = doc.tables[1]
+    assert head[:2] == ["Switch on", "From and to"]                              # before: "Switch to native on" for both
+    assert rows[0][1] == "The plan to the native settings" and rows[1][1] == "The native settings to the plan"
+    assert rows[1][2] == "90.0 kWh (mean of the plan days)" and rows[1][-1] == "-Rs 400"
+    text = " ".join(doc.paras)
+    assert "Rs 1,100 a day adjusted and Rs 1,200 unadjusted before the carry-over credit" in text, text
+    assert "Carry-over credit: Rs 1,400 in all, Rs 100 a plan day, included in both." in text, text
