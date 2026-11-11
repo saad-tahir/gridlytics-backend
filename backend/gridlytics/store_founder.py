@@ -216,7 +216,7 @@ def read_file(row: dict) -> dict:
     counted, as `sites` counts them (audit founder-console-11)."""
     path = platformdb.company_file(row)
     if path is None or not path.exists():
-        return {"members": {}, "sites": 0, "sites_closed_loop": 0, "plans_issued": 0, "activity": dict.fromkeys(ACTIVITY, 0)}
+        return {"members": {}, "sites": 0, "sites_closed_loop": 0, "sites_failing": 0, "plans_issued": 0, "activity": dict.fromkeys(ACTIVITY, 0)}
     now = datetime.now(timezone.utc).replace(microsecond=0)
     month = now.replace(day=1, hour=0, minute=0, second=0).isoformat()
     since7, since30 = (now - timedelta(days=7)).isoformat(), (now - timedelta(days=30)).isoformat()
@@ -231,6 +231,10 @@ def read_file(row: dict) -> dict:
             figures = {"sites": one("SELECT COUNT(*) FROM sites WHERE deleted IS NULL"),
                        "sites_closed_loop": one("SELECT COUNT(*) FROM sites WHERE deleted IS NULL AND tier_capable = 'closed_loop' "
                                                 "AND tier_allowed = 'closed_loop'"),
+                       # the active sites whose latest scheduled tick made no plan: it raised or its solve failed (round 7, storage-perf,
+                       # parity-architecture-06: a company whose every tick raised looked as well as any)
+                       "sites_failing": one("SELECT COUNT(*) FROM sites s WHERE s.deleted IS NULL AND s.status = 'active' AND "
+                                            "(SELECT r.status FROM runs r WHERE r.site_id = s.id ORDER BY r.tick DESC LIMIT 1) IN ('error', 'failed')"),
                        "plans_issued": one(f"SELECT COUNT(*) FROM plans WHERE {IN_USE}")}
             activity = {"plans_month": one(f"SELECT COUNT(*) FROM plans WHERE {IN_USE} AND generated_at >= ?", month),
                         "plans_30": one(f"SELECT COUNT(*) FROM plans WHERE {IN_USE} AND generated_at >= ?", since30),
@@ -624,6 +628,7 @@ def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None
             "admins": sum(m["role"] == "admin" and not accounts.get(m["user_id"], {}).get("disabled") for m in seated) if seated is not None else None,
             "last_seen": max(seen) if seen else None,
             "sites": read["sites"] if read is not None else None, "sites_closed_loop": read["sites_closed_loop"] if read is not None else None,
+            "sites_failing": read["sites_failing"] if read is not None else None,
             "plans_issued": read["plans_issued"] if read is not None else None, "archived": row["id"] in shelved}
 
 

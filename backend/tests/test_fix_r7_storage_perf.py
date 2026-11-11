@@ -444,3 +444,19 @@ def test_a_newer_builds_fuel_prices_reach_an_existing_company_and_never_displace
     tariffs.ensure_shipped()
     with store.connect() as con:
         assert con.execute("SELECT COUNT(*) FROM fuel_prices").fetchone()[0] == len(after)   # a second check adds nothing
+
+
+def test_the_founder_console_counts_each_companys_sites_whose_ticks_make_no_plan(world, monkeypatch):
+    """parity-architecture-06's last part: the founder console counted no failing site, so a company whose every tick raised looked as well as any.
+    Now each company's row has `sites_failing`: its active sites whose latest scheduled tick made no plan."""
+    from gridlytics import scheduler, store_founder, tariffs
+    with world.use():
+        sites.set_status(world.site, "active")
+    assert store_founder.company_view(world.company["id"])["sites_failing"] == 0
+
+    def broken(site_id, *a, **k):
+        raise tariffs.NoTariffVersion("No version of the schedule is in force")
+    monkeypatch.setattr(plans, "tick", broken)
+    scheduler.tick_company(world.db)
+    view = store_founder.company_view(world.company["id"])
+    assert view["sites_failing"] == 1 and view["sites"] == 2
