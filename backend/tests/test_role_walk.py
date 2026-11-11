@@ -32,10 +32,11 @@ FILES = ("/export.csv", "/calendar.ics", "/api/reports/{rid}/{which}")
 #: A rupee figure inside a sentence ("Rs 1,500", "Rs. 12", "PKR 300")
 #: The query a route needs to answer at all
 QUERY = {"/api/tariffs/card": "?category=B-2(b)"}
-#: The GET routes a key with sites:read and plans:read reaches (apikeys.RESOURCES; the signed plan message is an edge device's key's only, apikeys.EDGE_ONLY)
+#: The GET routes a key with sites:read and plans:read reaches (apikeys.RESOURCES; the signed plan message is an edge device's key's only, apikeys.EDGE_ONLY,
+#: at a closed-loop site): the control state is the read-back and the write log too (control-edge, audit role-operator-11), which carry no money
 KEY_READS = {"/api/sites/{site_id}", "/api/sites/{site_id}/native", "/api/sites/{site_id}/overrides", "/api/sites/{site_id}/plan",
              "/api/sites/{site_id}/plan/compare", "/api/sites/{site_id}/plans", "/api/sites/{site_id}/plans/{plan_id}", "/api/sites/{site_id}/plans/current/message",
-             "/api/sites/{site_id}/control"}
+             "/api/sites/{site_id}/control", "/api/sites/{site_id}/control/readback", "/api/sites/{site_id}/control/writes"}
 RUPEES = re.compile(r"\bRs\.?\s*-?\d|\bPKR\s*-?\d|\brupees?\b", re.IGNORECASE)
 
 
@@ -71,14 +72,17 @@ def walk(tmp_path_factory):
         return {"Authorization": "Bearer " + r.json()["access_token"]}
 
     h = {"admin": login("owner@onyxleaf.demo"), "operator": login("operator@onyxleaf.demo"), "viewer": login("viewer@onyxleaf.demo")}
-    sids = [s["id"] for s in client.get("/api/fleet", headers=h["admin"]).json()["sites"]]
+    fleet = client.get("/api/fleet", headers=h["admin"]).json()["sites"]
+    sids = [s["id"] for s in fleet]
     assert len(sids) == 4
+    # the edge device's key is the closed-loop demo site's: only a closed-loop site's edge is sent a plan (control-edge, flow-telemetry-plan-control-03)
+    edge_site = next(s["id"] for s in fleet if s["tier"] == "closed_loop")
     # money in places a page reads rarely: a fuel log's cost, a monthly savings report and an energy-only one, a draft
     assert client.post(f"/api/sites/{sids[0]}/genset/fuel", headers=h["operator"], json={"litres": 50, "cost_rs": 14321.5, "note": "tanker"}).status_code == 200
     for kind in ("monthly_savings", "energy_only"):
         assert client.post("/api/reports", headers=h["admin"], json={"kind": kind, "site_id": sids[0]}).status_code == 200
     assert client.put("/api/drafts/walk-draft", headers=h["admin"], json={"name": "Half a site"}).status_code == 200
-    k = client.post("/api/platform/keys", headers=h["admin"], json={"name": "walk", "scopes": ["sites:read", "plans:read"], "site_id": sids[0],
+    k = client.post("/api/platform/keys", headers=h["admin"], json={"name": "walk", "scopes": ["sites:read", "plans:read"], "site_id": edge_site,
                                                                     "kind": "edge"})
     assert k.status_code == 200, k.text
     h["key"] = {"Authorization": "Bearer " + k.json()["token"]}
@@ -117,12 +121,12 @@ def walk(tmp_path_factory):
             url += QUERY.get(template, "")
             got = answers.setdefault(template, {}).setdefault(url, {})
             for reader in READERS:
-                if reader == "key" and sid != sids[0]:
+                if reader == "key" and sid != edge_site:
                     continue                                   # a key is bound to one site; another site's path is refused (test_api_walk)
                 r = client.get(url, headers=h[reader])
                 body = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
                 got[reader] = (r.status_code, body)
-    yield {"answers": answers, "unfilled": unfilled, "sites": sids, "client": client, "headers": h}
+    yield {"answers": answers, "unfilled": unfilled, "sites": sids, "edge_site": edge_site, "client": client, "headers": h}
     if old is None:
         os.environ.pop("GRIDLYTICS_DATA_DIR", None)
     else:
@@ -247,7 +251,7 @@ def test_a_route_that_forgets_the_filter_is_filtered_all_the_same(walk):
     api.app.add_api_route("/api/sites/{site_id}/plan/walk-forgetful", lambda site_id: forgetful(), methods=["GET"])
     added = api.app.router.routes[-1]
     try:
-        sid = walk["sites"][0]
+        sid = walk["edge_site"]                                # the key's own site
         url = f"/api/sites/{sid}/plan/walk-forgetful"
         assert client.get(url, headers=h["admin"]).json() == forgetful()
         for reader in ("viewer", "key"):
