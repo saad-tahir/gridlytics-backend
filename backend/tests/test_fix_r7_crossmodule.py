@@ -143,6 +143,10 @@ def test_the_bound_measures_both_arms_mdi_from_the_peak_the_solve_could_not_lowe
     # a peak above the bound is the actual arm's own rise, at the rate
     above = verify._bound(sites.full(sid), WEEKDAY, _series(outage=None), pr, 0.5, {**actual, "peak_kw": 160.0}, 100.0, 0.0)
     assert above["solved_headroom_rs"] == pytest.approx(10.0 * float(seen["p"]["mdi"]["rate"]), abs=0.01)
+    # a solve stopped at its time limit is no upper bound
+    monkeypatch.setattr(verify.optimise, "solve", lambda p, time_limit=10.0, **kw: {**solve(p), "status": "feasible", "time_limited": True})
+    limited = verify._bound(sites.full(sid), WEEKDAY, _series(outage=None), pr, 0.5, actual, 100.0, 0.0)
+    assert limited["status"] == "time_limited" and limited["bound_rs"] is None and limited["time_limited"] is True
 
 
 # ------------------------------------------------------------------------------------------------ tracker-and-docs-01 (pages-D-09)
