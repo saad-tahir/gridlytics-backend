@@ -129,3 +129,29 @@ def test_unmetered_genset_fuel_over_a_savings_period_of_more_than_62_days_is_the
     blind = a.get(f"/api/sites/{sid}/savings", params={"start": start}).json()["energy"]
     assert blind["litres"] is None and blind["litres_source"] == "not_counted", blind
     assert a.get(f"/api/sites/{sid}/savings", params={"start": (today() - timedelta(days=10)).isoformat()}).json()["energy"]["litres_source"] == "curve"
+
+
+# ------------------------------------------------------------------------------------------------ role-owner-37 (jargon) and the hot_high_soc follow-up
+
+def test_the_unconfirmed_slot_table_alert_says_why_in_plain_words(world, monkeypatch):
+    """role-owner-37: the title read "tier 2 has no read-back"."""
+    import re as _re
+    from gridlytics import alerts
+    from test_fix_r7_alerts_reports import _iso, _minutes, _ready
+    sid = world.site
+    now = int(datetime(2026, 11, 9, 20, 0, tzinfo=PKT).timestamp())
+    _ready(monkeypatch)
+    plan = {"id": "p1", "steps": [], "summary": {}, "valid_until": _iso(now + 86400).replace("Z", "+00:00")}
+    monkeypatch.setattr(alerts.plans, "current", lambda site_id: plan)
+    monkeypatch.setattr(alerts, "_peak_unconfirmed", lambda site, now, today: True)
+    with world.use():
+        sites.set_tier_capable(sid, "advisory_writes")
+        sites.set_tier_allowed(sid, "advisory_writes", "test")
+        telemetry.ingest(sid, _minutes(now - 90 * 60, now), "edge", now=now)
+        alerts.evaluate(sid, now)
+        title = {a["rule"]: a for a in alerts.listing("active", sid)}["apply_unconfirmed"]["title"]
+    assert title.startswith("The slot table for Monday 9 November 2026 is not marked as applied: at the advisory tier nothing reads the inverter's "
+                            "settings back"), title
+    assert not _re.search(r"\btier \d\b|read-back", title), title
+    assert title.endswith("until the table is marked applied on the Control page"), title
+

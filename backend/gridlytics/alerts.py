@@ -602,10 +602,12 @@ def evaluate(site_id: str, now: int | None = None) -> None:
         # the demo mill's story (plan Part 9.6): its installer marks a day's table the next morning, so it stays raised until today's is marked
         with store.connect() as con:
             unconfirmed = con.execute("SELECT 1 FROM applied WHERE site_id = ? AND day_local = ?", (site_id, today)).fetchone() is None
-    # the title names the day (audit role-operator-31: "Today's slot table" was still read the next day)
+    # the title names the day (audit role-operator-31: "Today's slot table" was still read the next day), and says why in plain words (round 7
+    # sweeps, audit role-owner-37: "tier 2 has no read-back")
     day = datetime.fromtimestamp(now, PKT).date()
     _set(ready and unconfirmed, site_id, "apply_unconfirmed", "Control", "warning",
-         f"The slot table for {day:%A} {_long(day)} is not marked as applied: tier 2 has no read-back, so the saving is not claimed until it is",
+         f"The slot table for {day:%A} {_long(day)} is not marked as applied: at the advisory tier nothing reads the inverter's settings back, so "
+         "the day's saving is not claimed until the table is marked applied on the Control page",
          {"day": today})
     _agreements(site, now, rules_)
     _bill_residual(site_id, float(_th(rules_, "Tariff", "bill_difference_pct")))
