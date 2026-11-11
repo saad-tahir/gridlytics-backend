@@ -55,7 +55,12 @@ def recompute(site_id: str, inp: dict = Body(default={})):
     if (d1 - d0).days > 62:
         raise Refusal(422, "Recompute at most 62 days at a time", "invalid")
     # round 7 (audit pr-review-02): the later days the forward walk re-scored, and those whose claim changed in a closed month, beside the count
-    return verify.compute_range_detail(site_id, d0, d1, by=auth.actor())
+    done = verify.compute_range_detail(site_id, d0, d1, by=auth.actor())
+    if not done["days"] and not done["rescored_days"]:
+        # a recompute that scored no day (no data in the range) writes no line of its own: the request is audited all the same (round 7, audit
+        # security-roles-04)
+        store.audit(auth.actor(), verify.RECOMPUTED, site_id, {"start": d0.isoformat(), "end": d1.isoformat(), "days": []})
+    return done
 
 
 @router.get("/api/sites/{site_id}/savings/export.csv")
@@ -156,8 +161,11 @@ def fee_put(site_id: str, inp: dict = Body(...)):
             raise ValueError("The fee cannot be negative")
     except (TypeError, ValueError) as exc:
         raise bad(exc) from None
+    held = store.get_setting(f"fee:{site_id}", None)
     store.set_setting(f"fee:{site_id}", fee)
-    store.audit(auth.actor(), "set the fee", site_id, {"fee_rs_per_month": fee})
+    # the fee before and after (round 7, audit security-roles-04: a money setting's line says what it was)
+    store.audit(auth.actor(), "set the fee", site_id, {"fee_rs_per_month": fee, "changes": store.changes(
+        {"fee_rs_per_month": None if held is None else float(held)}, {"fee_rs_per_month": fee})})
     return {"fee_rs_per_month": fee}
 
 

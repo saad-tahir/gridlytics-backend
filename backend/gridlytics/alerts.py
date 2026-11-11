@@ -1025,8 +1025,10 @@ def set_rules(body: dict, by: str) -> dict:
     """The company's rules replaced by `body` ({category: rule}); a category left out is put back to its defaults."""
     body = _check_body(body)
     out = {c: _rule(c, body.get(c), True) for c in CATEGORIES}
+    held = rules()
     store.set_setting("alert_rules", out)
-    store.audit(by, "changed the alert rules")
+    # each category whose rule changed, before and after (round 7, audit security-roles-04: the line said nothing of what changed)
+    store.audit(by, "changed the alert rules", "", {"changes": store.changes(held, out)})
     return out
 
 
@@ -1078,8 +1080,10 @@ def set_site_rules(site_id: str, body: dict, by: str) -> dict:
                   "thresholds": {**company[c]["thresholds"], **th}}
         if d := _diff(_rule(c, merged, True), company[c]):
             over[c] = d
+    held = site_overrides(site_id)
     store.set_setting(_site_key(site_id), over)
-    store.audit(by, "changed a site's alert rules", site_id, {"categories": sorted(over)})
+    # the site's own rules per category, before and after (round 7, audit security-roles-04)
+    store.audit(by, "changed a site's alert rules", site_id, {"categories": sorted(over), "changes": store.changes(held, over)})
     return {"site_id": site_id, "rules": site_rules(site_id), "overrides": site_overrides(site_id)}
 
 

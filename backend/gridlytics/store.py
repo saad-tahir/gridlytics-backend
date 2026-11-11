@@ -378,3 +378,12 @@ def set_setting(key: str, value) -> None:
     with connect() as con:
         con.execute("INSERT INTO settings (key, value, updated) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated = excluded.updated",
                     (key, json.dumps(value, default=str), _now()))
+
+
+def changes(before: dict | None, after: dict, keys=None) -> dict:
+    """The fields whose value a save changed, each {"before": ..., "after": ...} (a field the save added has before None), for an audit line (plan
+    Part 2.8: "who, why, before, after"; round 7, audit security-roles-04). `keys` limits them to those fields. Keyed by the field's own name, so a money
+    setting's values (replacement_cost_per_kwh, voll_rs_per_kwh) are money keys the money filter takes out for a reader who may not see them."""
+    before = before or {}
+    names = list(keys) if keys is not None else sorted(set(before) | set(after))
+    return {k: {"before": before.get(k), "after": after.get(k)} for k in names if before.get(k) != after.get(k)}

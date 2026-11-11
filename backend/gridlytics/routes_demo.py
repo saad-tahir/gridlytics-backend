@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from . import auth, demo
+from . import auth, demo, store
 
 router = APIRouter()
 
@@ -25,10 +25,14 @@ def load():
     auth.need("edit_workspace", "Loading the demo sites")
     st = demo.load(auth.actor())
     st.pop("trace", None)
+    # the build runs on: each site it adds is audited as it is made, and the request itself here (round 7, audit security-roles-04)
+    store.audit(auth.actor(), "loaded the demo sites", "", {"state": st.get("state")})
     return st
 
 
 @router.delete("/api/demo")
 def remove():
     auth.need("edit_workspace", "Removing the demo sites")
-    return {"removed": demo.remove(auth.actor())}
+    n = demo.remove(auth.actor())
+    store.audit(auth.actor(), "removed the demo sites", "", {"sites": n})
+    return {"removed": n}

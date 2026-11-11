@@ -540,7 +540,11 @@ def update(site_id: str, fields: dict, by: str, if_unchanged=UNCHECKED) -> dict:
         capable = _source_capable(con, site_id, data, before, r["tier_capable"]) or r["tier_capable"]
         con.execute("UPDATE sites SET name = ?, data = ?, tier_capable = ?, updated = ? WHERE id = ?",
                     (data["name"], json.dumps(data), capable, _now(), site_id))
-        store.audit(by, "changed a site", data["name"], {"site_id": site_id, "fields": sorted(fields)}, con=con)
+        # each changed field's value before and after, a money setting's too (round 7, audit security-roles-04: the names alone could not say what the
+        # value of lost load was before an edit)
+        store.audit(by, "changed a site", data["name"], {"site_id": site_id, "fields": sorted(fields),
+                                                         "changes": store.changes(before, data, sorted(k for k in fields if k in SiteFields.model_fields))},
+                    con=con)
     return get(site_id)
 
 
@@ -549,11 +553,17 @@ def set_status(site_id: str, status: str) -> None:
         con.execute("UPDATE sites SET status = ?, updated = ? WHERE id = ?", (status, _now(), site_id))
 
 
-def set_tier_capable(site_id: str, tier: str) -> None:
+def set_tier_capable(site_id: str, tier: str, by: str = "system") -> None:
+    """The control tier the site's data source supports, as its edge (or the demo) reports it. A change is audited with the tier before and after
+    (round 7, audit security-roles-04): it bounds the tier an administrator may allow."""
     if tier not in TIERS:
         raise ValueError(tier)
-    with store.connect() as con:
+    with store.write_transaction() as con:
+        held = con.execute("SELECT tier_capable FROM sites WHERE id = ?", (site_id,)).fetchone()
         con.execute("UPDATE sites SET tier_capable = ?, updated = ? WHERE id = ?", (tier, _now(), site_id))
+        if held is not None and held["tier_capable"] != tier:
+            store.audit(by, "changed the control tier the site's source supports", site_id,
+                        {"changes": {"tier_capable": {"before": held["tier_capable"], "after": tier}}}, con=con)
 
 
 def set_tier_allowed(site_id: str, tier: str, by: str, signoff: str = "") -> dict:
@@ -598,7 +608,8 @@ def put_connection(site_id: str, fields: dict, by: str, conn_id: str | None = No
             con.execute("UPDATE connections SET data = ?, updated = ? WHERE id = ?", (json.dumps(data), now, conn_id))
         else:
             con.execute("INSERT INTO connections (id, site_id, data, created, updated) VALUES (?,?,?,?,?)", (cid, site_id, json.dumps(data), now, now))
-        store.audit(by, "saved a connection", site_id, {"connection_id": cid, "category": data["tariff_category"]}, con=con)
+        store.audit(by, "saved a connection", site_id, {"connection_id": cid, "category": data["tariff_category"],
+                                                        "changes": store.changes(json.loads(held["data"]) if held else None, data)}, con=con)
     return next(c for c in connections(site_id) if c["id"] == cid)
 
 
@@ -628,7 +639,8 @@ def put_asset(site_id: str, role: str, fields: dict, by: str, if_unchanged=UNCHE
         else:
             con.execute("INSERT INTO assets (id, site_id, role, data, created, updated) VALUES (?,?,?,?,?,?)",
                         (store.new_id(), site_id, role, json.dumps(data), now, now))
-        store.audit(by, f"saved the {role}", site_id, con=con)
+        # each changed field before and after, the money settings (the battery's price, the genset's costs) included (round 7, audit security-roles-04)
+        store.audit(by, f"saved the {role}", site_id, {"changes": store.changes(json.loads(held["data"]) if held else None, data)}, con=con)
     return assets(site_id)[role]
 
 
