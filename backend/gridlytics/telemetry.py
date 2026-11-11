@@ -1429,7 +1429,9 @@ def aggregate_day(site_id: str, day: date, peak_flags: np.ndarray | None = None,
             "throughput_kwh": round(float(np.nansum(np.abs(np.minimum(g["bat"], 0))) / 60), 2),
             "discharge_kwh": round(float(np.nansum(np.maximum(g["bat"], 0)) / 60), 2),
             "outage_minutes": int(np.sum(g["grid"] == 0)), "unserved_kwh": round(float(f["unserved"].sum() / 60), 2),
-            "completeness": round(g["completeness"], 4), "import_completeness": round(g["imp_completeness"], 4)}
+            "completeness": round(g["completeness"], 4), "import_completeness": round(g["imp_completeness"], 4),
+            # the newest minute in the row, so a reader of today's row knows when a newer one has arrived (round 7, audit tests-and-perf-10)
+            "last_ts": int(g["ts"][np.flatnonzero(g["present"])[-1]])}
     if peak_flags is not None:
         data["peak_import_kwh"] = round(float(imp[peak_flags].sum() / 60), 2)
     if keep:

@@ -9,7 +9,7 @@ import numpy as np
 from fastapi import APIRouter, Body, Header, HTTPException
 from pydantic import ValidationError
 
-from . import alerts, auth, battery, delivery, demo, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, verify
+from . import alerts, auth, battery, delivery, demo, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, twin, verify
 from .routes_common import PKT, bad, full_or_404, now_ts, out, put_state, site_or_404, today
 from .schemas import Refusal
 
@@ -663,6 +663,57 @@ def _waiting_genset_requests(site_id: str, limit: int = 3) -> list[dict]:
     return [r for r in alerts.requests_for(site_id) if r["status"] == "pending" and not r.get("outcome")][:limit]
 
 
+def _today_row(s: dict, day: date, last: dict | None, stored: dict | None) -> dict | None:
+    """Today's day row, aggregated again whenever a minute newer than the stored row's last (`last_ts`) has arrived, with the TOU peak flags, as the
+    nightly job writes a day (round 7, audit tests-and-perf-10: GET /now wrote today's row once, without the peak flags, and nothing refreshed it
+    until the next night, so a live site's 'today' tiles, the month's sums and the savings page's energy kept the first view's figures). A row with
+    nothing newer is read as stored; without any reading, nothing is written."""
+    if last is None or (stored is not None and int(stored.get("last_ts") or 0) >= int(last["ts"])):
+        return stored
+    conn = (s.get("connections") or [None])[0]
+    flags = None
+    if conn is not None and not _off_grid(s, conn):
+        try:
+            flags = plans.peak_mask(conn, twin.minutes_of(day))
+        except (LookupError, ValueError, TypeError):
+            flags = None                             # a tariff the calendar cannot read: the day without its peak import, never a 500
+    row = telemetry.aggregate_day(s["id"], day, flags, keep=stored)
+    return {"day": day.isoformat(), **row} if row else (stored if stored is not None else row)
+
+
+#: the month's litres a site's overview reads (verify.litres_used), reused while the site's newest reading and its genset are the same: an unmetered
+#: genset's litres replay the month's minutes, on every 30-second poll before (round 7, storage-perf follow-up of performance-live-02)
+_month_litres: "dict[tuple, dict]" = {}
+_month_litres_lock = threading.Lock()
+_MONTH_LITRES_KEPT = 512
+
+
+def _litres_of_month(s: dict, d0: str, d1: str, last: dict | None) -> dict:
+    key = (str(store.db_path()), s["id"], d0, d1, last["ts"] if last else None, json.dumps((s.get("assets") or {}).get("genset"), sort_keys=True, default=str))
+    with _month_litres_lock:
+        hit = _month_litres.get(key)
+    if hit is not None:
+        return dict(hit)
+    got = verify.litres_used(s["id"], d0, d1)
+    with _month_litres_lock:
+        if len(_month_litres) >= _MONTH_LITRES_KEPT:
+            _month_litres.clear()
+        _month_litres[key] = got
+    return dict(got)
+
+
+@router.get("/api/sites/{site_id}/header")
+def site_header(site_id: str):
+    """What every site page's header shows (plan Part 9.2): the site's name, tier, status and demo link, the control chip and the last-data stamp, from
+    a few indexed reads (round 7, audit performance-live-02: the header polled the whole /now snapshot every 30 seconds for these three, a 30-day
+    battery read and the month's savings included). No money."""
+    s = full_or_404(site_id)
+    now = now_ts()
+    last = telemetry.latest(site_id)
+    return {"site": {k: s[k] for k in ("id", "name", "tier", "status", "demo_link")}, "control": control_state(s, last, now),
+            "last_data": last["ts"] if last else None}
+
+
 @router.get("/api/sites/{site_id}/now")
 def site_now(site_id: str):
     """The overview's snapshot: the energy flow now, the plan's current step and the next three reasons, today's and the month's figures."""
@@ -672,18 +723,19 @@ def site_now(site_id: str):
     plan = plans.current(site_id)
     t = today()
     tdays = telemetry.days(site_id, t.replace(day=1).isoformat(), t.isoformat())
-    td = next((d for d in tdays if d["day"] == t.isoformat()), None)
-    if td is None and last:
-        td = telemetry.aggregate_day(site_id, t)
+    stored = next((d for d in tdays if d["day"] == t.isoformat()), None)
+    td = _today_row(s, t, last, stored)
+    if td is not None and td is not stored:
+        tdays = [d for d in tdays if d["day"] != t.isoformat()] + [td]      # the month's sums with today's fresh row
     mtd, computed, spark, _ = _mtd_saving(site_id)
     a = s.get("assets") or {}
     caps = {"pv_kw": (a.get("pv") or {}).get("kw_ac"), "battery_kw": (a.get("battery") or {}).get("p_dis_kw"), "genset_kw": (a.get("genset") or {}).get("rated_kw"),
             "grid_kw": (s["connections"][0]["data"]["sanctioned_load_kw"] if s.get("connections") else None)}
-    bs = battery.state(s, now)
+    # the battery estimate shared by the site's open pages for a minute (battery.estimate; round 7, audit performance-live-02)
+    bs = battery.estimate(s, now, last["ts"] if last else None)
     sum_ = lambda k: round(sum((d.get(k) or 0) for d in tdays), 1)
-    from . import verify
     # the month's litres as the Savings page reads them, with their source (meter or curve; audit R7 pages-A-06: the overview said "estimated" always)
-    fuel = verify.litres_used(site_id, t.replace(day=1).isoformat(), t.isoformat()) if a.get("genset") else {"litres": 0.0, "litres_source": None}
+    fuel = _litres_of_month(s, t.replace(day=1).isoformat(), t.isoformat(), last) if a.get("genset") else {"litres": 0.0, "litres_source": None}
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "status", "demo_link")}, "control": control_state(s, last, now), "now": _snapshot(last),
                 "caps": caps, "now_next": plans.now_and_next(plan, now), "plan_status": (plan or {}).get("summary", {}).get("status_label"),
                 "stage": (plan or {}).get("summary", {}).get("stage"), "today": td,

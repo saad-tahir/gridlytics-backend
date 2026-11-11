@@ -384,7 +384,8 @@ def battery_page(site_id: str):
     if not (s.get("assets") or {}).get("battery"):
         return {"battery": None}
     now = now_ts()
-    st = battery.state(s, now)
+    last = telemetry.latest(site_id)
+    st = battery.estimate(s, now, last["ts"] if last else None)   # shared with /now for a minute (round 7, audit performance-live-02)
     t = today()
     daily = telemetry.days(site_id, (t - timedelta(days=30)).isoformat(), t.isoformat())
     e_nom = st["e_nom_kwh"] or 1

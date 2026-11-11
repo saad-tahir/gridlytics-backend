@@ -720,3 +720,77 @@ def test_a_tick_reads_its_sites_minute_rows_once_and_reads_the_same_numbers(comp
         n, held = len(seen.reads), w.reads
         assert len(telemetry.raw(other, now - 3600, now)["ts"]) == 1 and w.reads == held          # not the window's site: the file's answer
         assert len(telemetry.raw(sid, now - 40 * 86400, now)["ts"]) == 40 * 1440 and len(seen.reads) == n + 1   # more than the window holds
+
+
+# ------------------------------------------------------------------------------------------------ tests-and-perf-10, performance-live-02
+
+def _minutes(sid: str, a: int, b: int, grid_w: float) -> None:
+    telemetry.ingest(sid, [{"ts": t, "grid_present": 1, "grid_power_w": grid_w, "grid_import_wh": grid_w / 60, "pv_power_w": 20_000.0,
+                            "load_power_w": 60_000.0, "battery_power_w": 0.0, "battery_soc_bms_pct": 60.0, "genset_running": 0}
+                           for t in range(a, b, 60)], "edge")
+
+
+def _pinned_day(world, monkeypatch, hour: int) -> tuple[date, int]:
+    """The routes' clock set to `hour` o'clock of the day before yesterday, Pakistan time (so a test's minutes are all in the past)."""
+    from gridlytics import routes_sites, routes_telemetry
+    day = datetime.now(PKT).date() - timedelta(days=2)
+    t0 = twin.day_start_utc(day)
+    for module in (routes_sites, routes_telemetry):
+        monkeypatch.setattr(module, "today", lambda: day)
+        monkeypatch.setattr(module, "now_ts", lambda: t0 + hour * 3600)
+    return day, t0
+
+
+def test_the_overview_s_today_follows_a_live_sites_newest_minutes_with_its_peak_import(world, monkeypatch):
+    """GET /now wrote today's day row once, without the peak flags, and nothing refreshed it until the next night: an edge site's 'Grid import today',
+    'Solar today', 'Peak demand today' and 'Outage today', the month's sums and the savings page's energy kept the first view's figures. Now the row is
+    aggregated again whenever a newer minute has arrived, with the peak import, and read as stored otherwise."""
+    day, t0 = _pinned_day(world, monkeypatch, 22)
+    a = world.c["admin"]
+    with world.use():
+        _minutes(world.site, t0 + 8 * 3600, t0 + 9 * 3600, 30_000.0)
+    first = a.get(f"/api/sites/{world.site}/now").json()
+    assert first["today"]["import_kwh"] == pytest.approx(30.0, abs=0.1) and first["today"]["last_ts"] == t0 + 9 * 3600 - 60
+    assert "peak_import_kwh" in first["today"]
+    with world.use():
+        _minutes(world.site, t0 + 9 * 3600, t0 + 21 * 3600, 60_000.0)          # through the evening peak
+    later = a.get(f"/api/sites/{world.site}/now").json()
+    assert later["today"]["import_kwh"] == pytest.approx(30.0 + 12 * 60.0, abs=0.5) and later["today"]["last_ts"] == t0 + 21 * 3600 - 60
+    assert later["today"]["peak_import_kwh"] > 0 and later["month"]["import_kwh"] == pytest.approx(later["today"]["import_kwh"], abs=0.2)
+    with world.use():
+        stored = telemetry.days(world.site, day.isoformat(), day.isoformat())[0]
+    assert stored["import_kwh"] == later["today"]["import_kwh"] and stored["peak_import_kwh"] == later["today"]["peak_import_kwh"]
+    # nothing newer: the stored row is read, not aggregated again
+    seen = _MinuteReads(monkeypatch, world.site)
+    assert a.get(f"/api/sites/{world.site}/now").json()["today"] == later["today"]
+    assert not [r for r in seen.reads if abs(r[0] - 1.0) < 1e-9]                  # no day's aggregation
+
+
+def test_the_header_reads_no_history_and_the_overview_and_battery_page_share_one_estimate_a_minute(world, monkeypatch):
+    """Every site page polled /now every 30 s only for its header (tier, control, last data), and /now re-read 30 days of minutes (battery.state) on
+    each call, as did the battery page beside it: about 7 /now a second saturated the API. The header now has its own few indexed reads; the overview
+    and the battery page share one battery estimate a minute while no newer reading arrives, and the month's litres likewise."""
+    from gridlytics import battery
+    day, t0 = _pinned_day(world, monkeypatch, 12)
+    with world.use():
+        _minutes(world.site, t0 + 6 * 3600, t0 + 12 * 3600, 30_000.0)
+    battery._estimates.clear()
+    a, v = world.c["admin"], world.c["viewer"]
+    seen = _MinuteReads(monkeypatch, world.site)
+    h = v.get(f"/api/sites/{world.site}/header")
+    assert h.status_code == 200, h.text
+    body = h.json()
+    assert set(body) == {"site", "control", "last_data"} and body["last_data"] == t0 + 12 * 3600 - 60 and body["control"]["key"]
+    assert body["site"] == {"id": world.site, "name": "Mill One", "tier": "monitor", "status": body["site"]["status"], "demo_link": None}
+    assert seen.reads == []                                                          # no range read of the minutes at all
+    month = lambda: [r for r in seen.reads if abs(r[0] - 30.0) < 1e-6]            # the estimate's 30 days
+    assert a.get(f"/api/sites/{world.site}/now").json()["battery"]["soc_pct"] == 60.0
+    n = len(month())
+    assert n >= 1
+    a.get(f"/api/sites/{world.site}/now")
+    a.get(f"/api/sites/{world.site}/battery")
+    assert len(month()) == n                                                         # the second poll and the battery page reuse it
+    with world.use():
+        _minutes(world.site, t0 + 12 * 3600, t0 + 12 * 3600 + 60, 30_000.0)        # a newer reading: estimated again
+    a.get(f"/api/sites/{world.site}/now")
+    assert len(month()) == 2 * n
