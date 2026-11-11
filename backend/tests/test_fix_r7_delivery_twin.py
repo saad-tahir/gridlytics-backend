@@ -467,6 +467,9 @@ def test_a_plan_its_signed_message_and_a_release_carry_the_same_block_and_a_rele
     sites.put_asset(sid, "pv", {"kwp_dc": 200, "kw_ac": 180}, "t")
     sites.put_asset(sid, "battery", {"nameplate_kwh": 200, "p_ch_kw": 100, "p_dis_kw": 100}, "t")
     sites.capture_native(sid, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 20}, "t")
+    # a plan message reaches a closed-loop site's edge only (control-edge, flow-telemetry-plan-control-03)
+    sites.set_tier_capable(sid, "closed_loop")
+    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
     r = plans.tick(sid, steps=96)
     assert r["status"] == "active"
     fb = r["slots"]["fallback"]
