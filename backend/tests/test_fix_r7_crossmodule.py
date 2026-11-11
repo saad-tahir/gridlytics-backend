@@ -824,3 +824,22 @@ def test_review_a_rounded_battery_power_is_not_a_power_limit_for_the_next_solve(
                     ("a2", sid, "p-2", "partial", json.dumps(ranged), later))
     assert _problem_of(sid)["battery"]["P_ch"] == pytest.approx(60.0)
 
+
+def test_review_a_dear_icp_rate_at_a_legacy_site_never_makes_the_solve_infeasible():
+    """Review of the icp-gross follow-up (engine-tariffs-10): where the ICP rate is the dearer (a negative FCA the ICP units do not get can do it),
+    the increment's floor row stayed beside the new net-import cap, so a period whose gross increment exceeds the month's net import (a legacy site
+    that exports a lot) asked for more increment than the cap allows: no plan. There the cap is left out: the plan prices the whole gross increment
+    at the ICP rate, the dearer side, and is always solvable."""
+    from gridlytics import optimise
+    from test_fix_optimiser import _problem
+    p = _problem(T=96, battery=True)
+    p["X_max"], p["regime"] = 200.0, "net_metering_legacy"
+    p["c_exp"] = p["c_imp"] - 0.01
+    # the off-peak period is already 100 kWh over its baseline on gross imports, and the month has exported 2,500 kWh more than it imported
+    p["icp"] = {"off_peak": {"case": "uncertain", "baseline_kwh": 1000.0, "q_kwh": 1100.0, "rate": 80.0, "gross": True, "cap_kwh": -2500.0,
+                             "other_inc_kwh": 0.0}}
+    r = optimise.solve(p, time_limit=20.0)
+    assert r["status"] == "optimal", r.get("message")
+    G = np.asarray(r["sol"]["G"])
+    off = ~np.asarray(p["peak"], dtype=bool)
+    assert r["objective_rs"] >= (100.0 + optimise.H * float(G[off].sum())) * (80.0 - 28.0) - 1.0   # every off-peak kWh over the baseline at the ICP rate

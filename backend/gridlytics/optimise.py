@@ -692,6 +692,7 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
     # (`cap_kwh` so far and forecast, the horizon's own imports less exports, less the other period's increment): importing and exporting at once
     # moves the cap by nothing, so circulating energy through the meter both ways never earns the ICP rate (round 3 read net import per step instead)
     month_up = np.asarray(p["in_month"]) & (g > 0.5)
+    capped_icp = False  # a gross period whose increment the net-import cap may cut (the ICP rate the cheaper): one direction a step, below
     for per, info in icp.items():
         if info.get("case") != "uncertain":
             continue
@@ -711,14 +712,17 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             m.row([Z] + q_cols, [1] + q_vals, lb=Q - base, name=f"icp_lo[{per}]")
         m.row([Z, b], [1, -Mp], ub=0, name=f"icp_b[{per}]")
         m.row([Z] + q_cols + [b], [1] + q_vals + [Mp], ub=Q - base + Mp, name=f"icp_hi[{per}]")
-        if gross:
+        if gross and coef < 0:
             # with an increment (b = 1), at most the month's net import (so far and forecast, plus the horizon's imports less exports) less the other
-            # period's increment; with none (b = 0) the row is idle
+            # period's increment; with none (b = 0) the row is idle. Only where the ICP rate is the cheaper: where it is the dearer (a negative FCA
+            # the ICP units do not get) the floor row above stays, and beside it the cap could ask for less increment than the floor, so no plan
+            # (round 7 stage 2 review); there the plan prices the whole gross increment at the dearer rate, never less than the bill
+            capped_icp = True
             all_up = np.where(month_up)[0]
             room = float(info.get("cap_kwh", 0.0)) - float(info.get("other_inc_kwh", 0.0))
             Mc = Mp + p["X_max"] * len(all_up) * H + abs(room) + 1.0
             m.row([Z, b] + list(G[all_up]) + list(X[all_up]), [1, Mc] + [-H] * len(all_up) + [H] * len(all_up), ub=room + Mc, name=f"icp_cap[{per}]")
-    if any(info.get("case") == "uncertain" and info.get("gross") for info in icp.values()) and float(p.get("X_max") or 0.0) > 0:
+    if capped_icp and float(p.get("X_max") or 0.0) > 0:
         # counted on gross imports, an import and an export in the same step would add to the increment while leaving the net, and so the bill's
         # cap, as it was: the meter reads one direction at a time, so a step imports or exports, never both (one binary per in-month grid-up step,
         # at the rare legacy ICP site in its uncertain case only)
