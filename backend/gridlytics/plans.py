@@ -554,7 +554,8 @@ def achieved(site_id: str, t0: int) -> dict:
 def _apply_achieved(site: dict, t0: int, p: dict) -> None:
     """The next solve plans with what the edge could apply (`achieved`), at a closed-loop site: a refused grid or genset charging permission is
     planned as off; a clamped battery power caps the charge or discharge power at what was written; a floor clamped upwards raises the grid-up floor
-    to it; a clamped export limit caps the export. The adjustments are kept on the problem (`achieved`), so the plan says what it planned within."""
+    to it; a clamped export limit caps the export. The adjustments are kept on the problem (`achieved`) and the stored plan's summary, so the plan
+    says what it planned within."""
     if site.get("tier") != "closed_loop" or not site.get("id"):
         return
     got = achieved(site["id"], t0)
@@ -870,6 +871,9 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                # the compare drawer values both arms' end energy at (round 7 stage 2, engine-plans-live-10)
                "end_price": ({"c_next_rs_per_kwh": round(float(p["terminal"]["c_next"]), 2), "basis": p["terminal"].get("c_next_basis")}
                              if p.get("terminal") else None),
+               # what the edge last reported it could apply, which this solve planned within (_apply_achieved; R6 C5): absent where nothing was
+               # refused or clamped (round 7 stage 2 review, engine-delivery-12)
+               **({"achieved": p["achieved"]} if p.get("achieved") else {}),
                "status_label": _status_label(res),
                "solver": {"status": res["status"], "variables": res.get("variables"), "rows": res.get("rows"), "binaries": res.get("binaries"),
                           "relaxed": res.get("relaxed"), "message": res.get("message"), "shed_rule_resolve": res.get("shed_rule_resolve"),

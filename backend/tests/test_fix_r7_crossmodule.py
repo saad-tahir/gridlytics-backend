@@ -843,3 +843,23 @@ def test_review_a_dear_icp_rate_at_a_legacy_site_never_makes_the_solve_infeasibl
     G = np.asarray(r["sol"]["G"])
     off = ~np.asarray(p["peak"], dtype=bool)
     assert r["objective_rs"] >= (100.0 + optimise.H * float(G[off].sum())) * (80.0 - 28.0) - 1.0   # every off-peak kWh over the baseline at the ICP rate
+
+
+def test_review_the_plan_says_what_it_planned_within_from_the_edges_last_ack(company):
+    """Review of the achieved follow-up (engine-delivery-12): the solve planned within what the edge last applied, but only the problem recorded it,
+    so the plan an operator reads did not say why it planned no grid charge or less power than the battery has. The stored plan's summary now
+    carries `achieved` (not money)."""
+    from test_fix_savings import make_site
+    sid = make_site(name="Achieved Mill", genset=False)                 # closed loop
+    t0 = twin.day_start_utc(NOV)
+    body = {"contract": "ems-edge/1.0", "plan_id": "p-sent", "status": "partial", "per_device": [
+        {"device_id": "inv1", "status": "partial", "applied": [], "rejected": [{"primitive": "grid_charge_allowed", "reason": "NOT_SUPPORTED"}]}]}
+    at = datetime.fromtimestamp(t0 - 600, timezone.utc).isoformat(timespec="seconds")
+    with store.connect() as con:
+        con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
+                    ("a1", sid, "p-sent", "partial", json.dumps(body), at))
+    plans.tick(sid, at=t0 + 60, steps=96, time_limit=20.0)
+    with store.connect() as con:
+        summary = json.loads(con.execute("SELECT summary FROM plans WHERE site_id = ? ORDER BY generated_at DESC, rowid DESC LIMIT 1",
+                                         (sid,)).fetchone()["summary"])
+    assert summary["achieved"] == {"plan_id": "p-sent", "received_at": at, "grid_charge_allowed": "refused"}
