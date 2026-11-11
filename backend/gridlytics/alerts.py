@@ -541,6 +541,18 @@ def _genset_condition(site: dict, now: int, rules_: dict) -> None:
          {"requested_start": missed["start"], "kw": missed.get("kw")} if missed else {})
 
 
+def _attempt_words(attempt: dict | None) -> str:
+    """The plan_failed alert's words for the latest attempt that left the plan in force: a solve that produced no plan, a plan kept back for
+    stopping at its time limit far from the best possible plan (plans.TIME_LIMIT_HELD, optimiser-plans), or one the wrong-plan guard held back."""
+    if not attempt:
+        return ""
+    if attempt.get("status") == "held":
+        if attempt.get("reason") == plans.TIME_LIMIT_HELD:
+            return "The last plan stopped at its time limit far from the best possible plan and was kept back; the previous plan stays active"
+        return "The last plan was held back by the wrong-plan guard; the previous plan stays active"
+    return "The last solve did not produce a plan; the previous plan stays active"
+
+
 def evaluate(site_id: str, now: int | None = None) -> None:
     """Raises and clears the site's alerts. A Control or Savings condition counts only once the site is `settled`: before, it is not raised and an open
     one is closed."""
@@ -554,8 +566,8 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     plan = plans.current(site_id)
     ready = settled(site_id, plan, now)
     latest_attempt = (plan or {}).get("latest_attempt")
-    _set(ready and bool(latest_attempt), site_id, "plan_failed", "Control", "warning",
-         "The last solve did not produce a plan; the previous plan stays active", {"reason": (latest_attempt or {}).get("reason")})
+    _set(ready and bool(latest_attempt), site_id, "plan_failed", "Control", "warning", _attempt_words(latest_attempt),
+         {"reason": (latest_attempt or {}).get("reason")})
     _gap(site_id, now, float(_th(rules_, "Data", "gap_hours")))
     _edge_events(site_id, now, ready)
     _plan_expired(site_id, plan, now, ready)

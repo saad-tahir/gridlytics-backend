@@ -1922,6 +1922,30 @@ def test_a_time_limited_plan_far_from_its_bound_is_published_where_nothing_bette
     assert plans.tick(moved, at=T_LIM + 900)["status"] == "active"              # an override since: the plan in force did not know it
 
 
+def test_the_plan_failed_alert_says_a_plan_was_kept_back_never_that_no_plan_came(company, monkeypatch):
+    """Integration (optimiser-plans' time_limited_gap hold with alerts-reports' plan_failed alert): a plan kept back for stopping at its time limit
+    far from its bound is the latest attempt, and the alert said "The last solve did not produce a plan". It now says what happened; a guard's
+    hold and a failed solve keep their own words."""
+    from gridlytics import alerts
+    sid = _site()
+    assert plans.tick(sid, at=T_LIM)["status"] == "active"
+    _far_from_its_bound(monkeypatch)
+    assert plans.tick(sid, at=T_LIM + 900)["status"] == "held"
+    plan = plans.current(sid, T_LIM + 1000)
+    monkeypatch.setattr(plans, "current", lambda site_id, now=None: plan)
+    telemetry.ingest(sid, [{"ts": T_LIM - 8 * 86400, "grid_present": 1}], "edge")      # a week of data: Control alerts are raised
+    title = lambda: next(a["title"] for a in alerts.listing("active", sid) if a["rule"] == "plan_failed")
+    alerts.evaluate(sid, T_LIM + 1000)
+    assert title() == ("The last plan stopped at its time limit far from the best possible plan and was kept back; the previous plan stays "
+                       "active")
+    plan["latest_attempt"] = {**plan["latest_attempt"], "reason": "mdi_cap_exceeded"}
+    alerts.evaluate(sid, T_LIM + 1000)
+    assert title() == "The last plan was held back by the wrong-plan guard; the previous plan stays active"
+    plan["latest_attempt"] = {**plan["latest_attempt"], "status": "failed", "reason": "solve_time_limit"}
+    alerts.evaluate(sid, T_LIM + 1000)
+    assert title() == "The last solve did not produce a plan; the previous plan stays active"
+
+
 def test_a_relaxed_retry_after_a_time_out_does_not_replace_a_recent_plan(company, monkeypatch):
     from test_fix_r4_optimiser import _first_times_out_without_a_plan
 
