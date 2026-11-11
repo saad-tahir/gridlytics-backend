@@ -1596,6 +1596,28 @@ def test_report_files_are_kept_inside_the_data_folder_and_still_served_after_it_
             assert r.status_code == 404 and "missing" in r.json()["detail"], (bad, r.status_code)
 
 
+def test_a_generated_report_is_in_the_companys_backup_and_downloads_again_after_a_restore(world):
+    """parity-architecture-11 at integration with founder-console (-16, the backup half): a report row keeps 'reports/<company file stem>/<id>.pdf', and
+    the backup copies the data folder's reports/<company file stem> beside the workspace file; a report lost after the copy is put back by the restore
+    and downloads again."""
+    import shutil
+    from gridlytics import backups
+    a = world.c["admin"]
+    made = a.post("/api/reports", json={"kind": "energy_only", "site_id": world.site, "period": _past_month()}).json()
+    pdf = a.get(f"/api/reports/{made['id']}/pdf").content
+    assert pdf[:4] == b"%PDF"
+    with world.use():
+        copy = store.backup("manual")
+        assert next(b for b in backups.list_backups() if b["name"] == copy.name)["reports"] == 2      # its PDF and its CSV
+    shutil.rmtree(platformdb.data_dir() / "reports" / world.db.stem)
+    assert a.get(f"/api/reports/{made['id']}/pdf").status_code == 404
+    with world.use():
+        assert backups.restore(copy.name)["reports"] == 2
+    for which in ("pdf", "csv"):
+        assert a.get(f"/api/reports/{made['id']}/{which}").status_code == 200, which
+    assert a.get(f"/api/reports/{made['id']}/pdf").content == pdf
+
+
 # ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-13
 
 def _month_words(d) -> str:
