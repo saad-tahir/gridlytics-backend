@@ -431,7 +431,9 @@ def vector_files() -> dict[str, str]:
     body = {"contract": CONTRACT, "msg_type": "plan", "msg_id": "8a6d3f0e-2b1c-4e5f-9a7b-0c1d2e3f4a5b", "type": "plan", "plan_id": "plan-example",
             "site_id": "example-site", "seq": 7, "sent_at": "2026-11-10T12:00:05+00:00", "issued_at": "2026-11-10T12:00:00+00:00",
             "valid_from": "2026-11-10T12:00:00+00:00", "valid_until": "2026-11-11T12:00:00+00:00", "timezone": "Asia/Karachi", "mode": "a",
-            "fallback": {"on_expiry": "inverter_native", "min_soc_floor_pct": 20.0, "revert_after_hours": 3},
+            # the fallback block as delivery.fallback_block writes it (no revert timer: delivery-twin, audit brief-vs-build-07)
+            "fallback": {"on_expiry": "inverter_native", "on_link_loss_after_s": 300, "min_soc_floor_pct": 20.0, "max_export_w_floor": 0,
+                         "native_settings_ref": "example-site:v1"},
             "mode_a": {"days": [{"date": "2026-11-10", "slots": [
                 {"start": "17:00", "end": "21:00", "start_ts": 1794312000, "end_ts": 1794326400, "mode": "discharge", "soc_floor_pct": 20.0,
                  "soc_target_pct": 20.0, "max_discharge_w": 50000.0, "max_charge_w": 0.0, "grid_charge": False, "export_allowed": False}]}]},

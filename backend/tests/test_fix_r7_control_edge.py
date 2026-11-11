@@ -1923,6 +1923,8 @@ def test_the_published_signing_vectors_are_the_code_and_verify():
     sig = sent.pop("signature")
     assert sig["key_id"] == s["key_id"] and delivery.canonical(sent).decode() == s["signed_text"]
     Ed25519PublicKey.from_public_bytes(base64.b64decode(s["public_key"])).verify(base64.b64decode(sig["value"]), s["signed_text"].encode())
+    # the example's fallback block has the fields a plan's has (delivery.fallback_block; delivery-twin, audit brief-vs-build-07: no revert timer)
+    assert set(sent["fallback"]) == set(delivery.fallback_block({"id": "example-site", "native": {"version": 1}}, 20.0))
 
 
 # ------------------------------------------------------------------------------------------------ batch 6: engine-delivery-23
