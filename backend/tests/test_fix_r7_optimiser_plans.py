@@ -1235,15 +1235,18 @@ def test_slots_in_the_next_billing_month_carry_its_own_cap(company, monkeypatch)
     crosses the month's end compiles the new month's days with M2's cap, and the summary gives it."""
     from gridlytics import delivery
     sid = _site()
+    # an edge at the closed-loop tier holds a slot's grid cap (delivery-twin: a keyed Deye table holds none, so its slots carry no grid_cap_w)
+    sites.set_tier_capable(sid, "closed_loop")
+    sites.set_tier_allowed(sid, "closed_loop", "t", "test")
     t0 = twin.day_start_utc(date(2026, 10, 31)) + 10 * 3600             # 10:00 on 31 Oct: 14 hours of October, then November
     hot = twin.day_start_utc(date(2026, 10, 30)) + 10 * 3600            # October's peak, 400 kW, on the 30th; 150 kW otherwise
     _import_minutes(sid, t0 - 8 * 86400, t0, lambda t: 400.0 if hot <= t < hot + 1800 else 150.0)
     seen = []
     real = delivery.compile_mode_a
 
-    def spy(steps, brand, battery, fallback, bms_low=10.0, mdi_cap_kw=None):
+    def spy(steps, brand, battery, fallback, bms_low=10.0, mdi_cap_kw=None, *, site=None):
         seen.append(({plans._local(s["t"]).date() for s in steps}, mdi_cap_kw))
-        return real(steps, brand, battery, fallback, bms_low, mdi_cap_kw)
+        return real(steps, brand, battery, fallback, bms_low, mdi_cap_kw, site=site)
 
     monkeypatch.setattr(delivery, "compile_mode_a", spy)
     out = plans.tick(sid, at=t0, save=False)
