@@ -253,3 +253,73 @@ def test_the_nightly_job_prunes_every_sites_plans(company, monkeypatch):
     monkeypatch.setattr(verify, "compute_day", lambda *a, **k: None)
     scheduler.nightly_company(company)
     assert sorted(done) == sorted([a, b])
+
+
+# ------------------------------------------------------------------------------------------------ parity-architecture-06
+
+from test_fix_api import world  # noqa: E402,F401  (world is a fixture: a company file with a planned mill and the four roles' clients)
+
+
+def _wait(cond, seconds: float = 3.0) -> bool:
+    import time
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return cond()
+
+
+def test_a_tick_that_raises_is_recorded_alerted_and_named_on_the_plan_answer(world, monkeypatch):
+    """A tick that raised (here a tariff with no version in force) was only logged: no runs row, alerts.evaluate skipped, GET /alerts answered [] and
+    GET /plan {plan: null, held: null}, so the page promised the first plan within 15 minutes hours after the first failure. Now the tick writes an
+    error runs row, the site's alerts are still evaluated and plan_failed is raised at once (a set-up fault, not a new site's noise), GET /plan names
+    the failing ticks, and the record goes to GRIDLYTICS_ERROR_WEBHOOK."""
+    from gridlytics import alerts, scheduler, tariffs
+    with world.use():
+        sites.set_status(world.site, "active")
+
+    def broken(site_id, *a, **k):
+        raise tariffs.NoTariffVersion("No version of the schedule is in force")
+    monkeypatch.setattr(plans, "tick", broken)
+    evaluated = []
+    real = alerts.evaluate
+    monkeypatch.setattr(alerts, "evaluate", lambda sid, *a, **k: (evaluated.append(sid), real(sid, *a, **k))[1])
+    posted = []
+    monkeypatch.setattr(scheduler, "_post_record", lambda url, record: posted.append((url, record)))
+    monkeypatch.setenv("GRIDLYTICS_ERROR_WEBHOOK", "https://errors.example/hook")
+    for _ in range(2):
+        assert scheduler.tick_company(world.db)["failed"] == 1
+    assert evaluated == [world.site, world.site]
+    with world.use(), store.connect() as con:
+        run = dict(con.execute("SELECT * FROM runs WHERE site_id = ?", (world.site,)).fetchone())
+    assert run["status"] == "error" and run["reason"] == "no_tariff_version" and run["error"].startswith("NoTariffVersion") and run["finished"]
+    got = world.c["admin"].get(f"/api/alerts?site_id={world.site}").json()
+    rows = got if isinstance(got, list) else got.get("alerts", got.get("items", []))
+    failed = [a for a in rows if a["rule"] == "plan_failed"]
+    assert len(failed) == 1 and "tariff" in failed[0]["title"] and failed[0]["detail"]["reason"] == "no_tariff_version", rows
+    answer = world.c["admin"].get(f"/api/sites/{world.site}/plan").json()
+    assert answer["plan"] is None and answer["held"] is None
+    assert answer["failing"] == {"status": "error", "reason": "no_tariff_version", "since": run["tick"], "at": run["tick"], "ticks": 1}
+    assert _wait(lambda: len(posted) == 2)
+    url, record = posted[0]
+    assert url == "https://errors.example/hook"
+    assert record["event"] == "tick_failed" and record["site_id"] == world.site and record["error"] == "NoTariffVersion"
+    assert record["reason"] == "no_tariff_version" and record["company"] == world.db.stem and "No version" not in json.dumps(record)
+
+
+def test_the_plan_answer_names_failing_solves_too_and_nothing_once_a_tick_plans(world, monkeypatch):
+    """Ticks whose solve made no plan, with no plan in force, also left the page promising a first plan: GET /plan names them (the solve's code) until
+    a tick makes a plan."""
+    from gridlytics import scheduler
+    with world.use():
+        sites.set_status(world.site, "active")
+    real = plans.tick
+    monkeypatch.setattr(plans, "tick", lambda site_id, *a, **k: {"status": "failed", "reason": "solve_infeasible", "in_force": None})
+    scheduler.tick_company(world.db)
+    answer = world.c["admin"].get(f"/api/sites/{world.site}/plan").json()
+    assert answer["plan"] is None and answer["failing"]["status"] == "failed" and answer["failing"]["reason"] == "solve_infeasible"
+    monkeypatch.setattr(plans, "tick", real)
+    scheduler.tick_company(world.db)
+    answer = world.c["admin"].get(f"/api/sites/{world.site}/plan").json()
+    assert answer["plan"] is not None and "failing" not in answer

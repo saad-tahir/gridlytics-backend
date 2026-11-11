@@ -5,11 +5,13 @@ process for v1; at about 90 sites per core the solves move to workers behind the
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 
-from . import alerts, demo, plans, platform as platformdb, sites, store, telemetry, verify
+from . import alerts, demo, forecast, plans, platform as platformdb, sites, store, tariffs, telemetry, verify
 
 log = logging.getLogger("gridlytics.scheduler")
 PKT = timezone(timedelta(hours=5))
@@ -28,23 +30,88 @@ def _after_tick(site_id: str) -> None:
             log.exception("%s failed for site %s", what, site_id)
 
 
+#: GRIDLYTICS_ERROR_WEBHOOK names an https address (http only on this machine) a record of each failed scheduled tick is posted to as JSON, in the
+#: background, so any error tracker with a webhook can sit behind it (the family's observability: Solarlytics' SOLARLYTICS_ERROR_WEBHOOK; round 7,
+#: parity-architecture-06). The record carries no error text (it may quote a site's figures), only its type and code.
+def _post_record(url: str, record: dict) -> None:
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, data=json.dumps(record).encode("utf-8"), method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception as exc:  # the tracker being down never matters to the tick
+        log.warning("the error record of site %s was not posted: %s", record.get("site_id"), type(exc).__name__)
+
+
+def _report_error(record: dict) -> None:
+    url = os.environ.get("GRIDLYTICS_ERROR_WEBHOOK", "")
+    if not url:
+        return
+    from urllib.parse import urlparse
+    try:
+        parts = urlparse(url)
+        fit = (parts.scheme == "https" and bool(parts.hostname)) or (parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1"))
+    except ValueError:
+        fit = False
+    if fit:
+        threading.Thread(target=_post_record, args=(url, record), daemon=True).start()
+
+
+def error_code(exc: BaseException) -> str:
+    """A tick's error as the code its runs row, its plan_failed alert and GET /plan's `failing` carry: no_tariff_version (a connection's tariff has
+    no version in force for the days planned), else tick_error."""
+    return "no_tariff_version" if isinstance(exc, tariffs.NoTariffVersion) else "tick_error"
+
+
+def _run_row(site_id: str, tick: str, started: str, status: str, reason: str = "", plan_id: str | None = None, solve_s: float | None = None,
+             objective_rs: float | None = None, error: str = "") -> None:
+    """The scheduled tick's durable runs row for a site (plan Part 2.4), written here only (round 7, performance-live-09: a manual re-solve in the
+    same quarter overwrote it, and a tick that raised wrote none)."""
+    with store.connect() as con:
+        con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, solve_s, objective_rs, plan_id, error) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)", (site_id, tick, started, store._now(), status, reason or "", solve_s, objective_rs, plan_id, error))
+
+
+def _site_tick(path, s: dict, tick: str) -> str:
+    """One site's part of a scheduled tick: a demo site's twin catches up to now, the solve (plans.tick), its runs row, today's table and the early
+    check (_after_tick), then the site's alerts. A tick that raises writes an `error` runs row with its code and the error's type and words, is
+    posted to the error webhook, and the alerts are still evaluated, so plan_failed says so (round 7, parity-architecture-06). Returns the runs
+    status."""
+    started = store._now()
+    try:
+        if s.get("demo_link"):
+            demo.advance(s["id"])
+        r = plans.tick(s["id"])
+        status = r["status"]
+        _run_row(s["id"], tick, started, status, r.get("reason") or r.get("solver_status") or "", r.get("plan_id") or r.get("row_id"),
+                 r.get("solve_seconds"), r.get("objective_rs"))
+        _after_tick(s["id"])
+    except Exception as exc:
+        log.exception("tick failed for site %s", s["id"])
+        status = "error"
+        try:
+            _run_row(s["id"], tick, started, status, error_code(exc), error=f"{type(exc).__name__}: {exc}"[:500])
+        except Exception:
+            log.exception("the failed tick of site %s was not recorded", s["id"])
+        _report_error({"event": "tick_failed", "company": getattr(path, "stem", str(path)), "site_id": s["id"], "tick": tick,
+                       "reason": error_code(exc), "error": type(exc).__name__, "time": store._now()})
+    try:
+        alerts.evaluate(s["id"])
+    except Exception:
+        log.exception("the alerts failed for site %s", s["id"])
+    return status
+
+
 def tick_company(path) -> dict:
+    tick = plans._iso(forecast.align(int(datetime.now(timezone.utc).timestamp())))
     out = {"sites": 0, "failed": 0}
     with store.use_company(path):
         for s in sites.listing():
             if s.get("status") not in ("active",):
                 continue
-            try:
-                if s.get("demo_link"):
-                    demo.advance(s["id"])
-                r = plans.tick(s["id"])
-                out["sites"] += 1
-                out["failed"] += int(r["status"] == "failed")
-                _after_tick(s["id"])
-                alerts.evaluate(s["id"])
-            except Exception:
-                log.exception("tick failed for site %s", s["id"])
-                out["failed"] += 1
+            status = _site_tick(path, s, tick)
+            out["sites"] += int(status != "error")
+            out["failed"] += int(status in plans.FAILING_RUNS)
     return out
 
 

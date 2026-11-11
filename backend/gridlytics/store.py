@@ -246,6 +246,8 @@ _V6 = [
     "CREATE INDEX IF NOT EXISTS plan_messages_site ON plan_messages (site_id, sent_at)",
     "CREATE INDEX IF NOT EXISTS acks_site ON acks (site_id, received_at)",
 ]
+#: and a scheduled tick that raised keeps the error's type and words in its runs row (audit parity-architecture-06: it left no row at all)
+_V6_COLUMNS = (("runs", "error", "TEXT NOT NULL DEFAULT ''"),)
 
 
 def _migrate(con: sqlite3.Connection, version: int) -> None:
@@ -269,6 +271,9 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
     if version < 6:
         for sql in _V6:
             con.execute(sql)
+        for table, column, kind in _V6_COLUMNS:
+            if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
 
 def backup(tag: str) -> Path | None:

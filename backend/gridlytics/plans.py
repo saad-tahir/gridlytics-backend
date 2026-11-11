@@ -732,7 +732,6 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
         raise KeyError(site_id)
     now = int(at if at is not None else datetime.now(timezone.utc).timestamp())
     t0 = forecast.align(now)
-    started = store._now()
     # the observed grid state reads telemetry up to the actual tick time, so a grid loss inside the current quarter is planned for at once
     prior = _saved_outage(site_id, t0)
     bundle = forecast.issue(site, t0, save=save, now=now)
@@ -799,11 +798,12 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                 con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, reason, solver, summary) "
                             "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (pid, site_id, store._now() if at is None else _iso(now), _iso(t0), _iso(t0),
                                                              _iso(t0 + p["T"] * 900), "a", "failed", reason, "highs", json.dumps(summary)))
-                con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, plan_id) VALUES (?,?,?,?,?,?,?)",
-                            (site_id, _iso(t0), started, store._now(), "failed", reason, pid))
             if release:
                 sites.put_state(site_id, active_plan=None, last_tick=_iso(t0))
-        return {"status": "failed", "reason": reason, "control_release": release, "in_force": None if release else _in_force_id(site_id, now)}
+        # the scheduled tick's runs row is the scheduler's (round 7, performance-live-09: a re-solve in the same quarter overwrote it); `row_id` is
+        # the failed row written here, for that row
+        return {"status": "failed", "reason": reason, "control_release": release, "in_force": None if release else _in_force_id(site_id, now),
+                "row_id": pid if save else None}
     steps_out = _steps_out(p, res, bundle)
     # the slots' floors are delivery.fallback_floor: delivered_floor_pct, the floor the plan held on its grid-up steps. A horizon that
     # crosses the billing month's end compiles the new month's days with its own cap, M2 (round 7, engine-optimiser-02: every slot carried M,
@@ -839,8 +839,6 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                         (plan_id, site_id, store._now() if at is None else _iso(now), _iso(t0), _iso(t0), _iso(t0 + p["T"] * 900),
                          "b" if site["data"].get("control_mode") == "mode_b" else "a", status, reason or "", "highs", res["solve_seconds"], res["objective_rs"],
                          res["config_hash"], json.dumps(summary), json.dumps(steps_out), json.dumps(compiled)))
-            con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, solve_s, objective_rs, plan_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (site_id, _iso(t0), started, store._now(), status, reason or res["status"], res["solve_seconds"], res["objective_rs"], plan_id))
         active = plan_id if status == "active" else (None if release else site.get("state", {}).get("active_plan"))
         # the anchor charge's deadline (see _ask_anchor): set by the first active plan that schedules one, dropped once none is asked for
         anchor = {}
@@ -855,7 +853,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     # guard), so a re-solve says what stays in force (round 7, frontend-states-formats-07)
     in_force = plan_id if status == "active" else (None if release else _in_force_id(site_id, now))
     return {"status": status, "plan_id": plan_id, "reason": reason, "in_force": in_force, "objective_rs": res["objective_rs"],
-            "solve_seconds": res["solve_seconds"], "steps": steps_out, "slots": compiled, "summary": summary}
+            "solve_seconds": res["solve_seconds"], "steps": steps_out, "slots": compiled, "summary": summary, "solver_status": res["status"]}
 
 
 def _joined_tables(first: dict, nxt: dict) -> dict:
@@ -962,6 +960,25 @@ def held_info(site_id: str, now: int | None = None) -> dict | None:
     if active is not None and _past_valid_until(active["valid_until"], now):
         return {"reason": EXPIRED_REASON, "until": None, "plan_id": active["id"], "since": active["valid_until"]}
     return None
+
+
+#: The runs statuses of a scheduled tick that made no plan: `error`, the tick raised (a set-up fault such as a tariff with no version in force, or a
+#: bug); `failed`, its solve produced no plan
+FAILING_RUNS = ("error", "failed")
+
+
+def tick_failing(site_id: str, limit: int = 96) -> dict | None:
+    """The site's scheduled ticks failing now (round 7, parity-architecture-06: a tick that raised was only logged, so the plan page promised a first
+    plan within 15 minutes hours after the first failure): when its latest scheduled tick (the scheduler's runs row) made no plan, `{status, reason,
+    since, at, ticks}`: that tick's status (FAILING_RUNS) and reason code (no_tariff_version or tick_error for a tick that raised, failure_code's for
+    a solve), the tick the run of failures began at and the latest (ISO UTC quarters) and how many ticks in a row (up to `limit`). None when the
+    latest tick made or held a plan, or none ran yet."""
+    with store.connect() as con:
+        rows = con.execute("SELECT tick, status, reason FROM runs WHERE site_id = ? ORDER BY tick DESC LIMIT ?", (site_id, int(limit))).fetchall()
+    n = next((i for i, r in enumerate(rows) if r["status"] not in FAILING_RUNS), len(rows))
+    if n == 0:
+        return None
+    return {"status": rows[0]["status"], "reason": rows[0]["reason"], "since": rows[n - 1]["tick"], "at": rows[0]["tick"], "ticks": n}
 
 
 def get(site_id: str, plan_id: str) -> dict | None:

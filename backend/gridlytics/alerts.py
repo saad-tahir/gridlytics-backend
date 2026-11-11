@@ -553,6 +553,20 @@ def _attempt_words(attempt: dict | None) -> str:
     return "The last solve did not produce a plan; the previous plan stays active"
 
 
+#: Why a scheduled tick raised, by its code (scheduler.error_code)
+TICK_ERROR_WORDS = {"no_tariff_version": "a grid connection's tariff has no version in force for the days planned; check the site's tariff",
+                    "tick_error": "an error stopped the planning run; the server's log has the details"}
+
+
+def _tick_error_words(failing: dict) -> str:
+    """The plan_failed alert's words for scheduled ticks that raised: since when, how many, and why."""
+    n = int(failing.get("ticks") or 1)
+    since = _event_ts(failing.get("since"))
+    when = f" since {_when(since)}" if since is not None and n > 1 else ""
+    return (f"No plan was made at the last {n} ticks{when}" if n > 1 else "No plan was made at the last tick") + ": " + \
+        TICK_ERROR_WORDS.get(str(failing.get("reason")), TICK_ERROR_WORDS["tick_error"])
+
+
 def evaluate(site_id: str, now: int | None = None) -> None:
     """Raises and clears the site's alerts. A Control or Savings condition counts only once the site is `settled`: before, it is not raised and an open
     one is closed."""
@@ -566,8 +580,15 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     plan = plans.current(site_id)
     ready = settled(site_id, plan, now)
     latest_attempt = (plan or {}).get("latest_attempt")
-    _set(ready and bool(latest_attempt), site_id, "plan_failed", "Control", "warning", _attempt_words(latest_attempt),
-         {"reason": (latest_attempt or {}).get("reason")})
+    failing = plans.tick_failing(site_id)
+    if failing and failing["status"] == "error":
+        # the scheduled tick raised (round 7, parity-architecture-06): a set-up fault or a bug that keeps every plan away, raised at once, not the
+        # noise of a new site's first days that `settled` waits out
+        _open(site_id, "plan_failed", "Control", "warning", _tick_error_words(failing),
+              {"reason": failing["reason"], "since": failing["since"], "ticks": failing["ticks"]})
+    else:
+        _set(ready and bool(latest_attempt), site_id, "plan_failed", "Control", "warning", _attempt_words(latest_attempt),
+             {"reason": (latest_attempt or {}).get("reason")})
     _gap(site_id, now, float(_th(rules_, "Data", "gap_hours")))
     _edge_events(site_id, now, ready)
     _plan_expired(site_id, plan, now, ready)

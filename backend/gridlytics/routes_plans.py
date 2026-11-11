@@ -113,19 +113,22 @@ RESUMED_KINDS = ("pause_control", "force_native", "reserve")
 def plan_current(site_id: str):
     """The plan in force, or `{plan: null, held}` when none is: `held` says why ({reason, until, plan_id}: control paused or released to native until
     a time, a native-block day of the switchback calendar until the block ends, the latest plan held by its guard, or the last plan past its
-    valid_until, with `since` its end), and is null when no plan was made yet (or the last solve failed).
+    valid_until, with `since` its end), and is null when no plan was made yet (or the last solve failed). Both answers carry `failing` while the
+    scheduled ticks make no plan (plans.tick_failing: how many in a row, since when and why), and leave it out otherwise.
     A pause or a release to native in force answers `{plan: null, held}` even while the plan of before it is still stored as active: no plan is in force
     under one (plans.active_at), and the tick stores its plan as held only at the next quarter."""
     site_or_404(site_id)
+    # the scheduled ticks failing now (round 7, parity-architecture-06): the empty page says why no plan comes, never "within 15 minutes"
+    failing = {"failing": f} if (f := plans.tick_failing(site_id)) else {}
     rel = plans.control_release(site_id, now_ts())
     if rel is not None:
         held = _held(site_id) or {"reason": rel.get("reason"), "until": rel.get("until"), "plan_id": None}
-        return {"plan": None, "held": held}
+        return {"plan": None, "held": held, **failing}
     p = plans.current(site_id)
     if p is None:
-        return {"plan": None, "held": _held(site_id)}
+        return {"plan": None, "held": _held(site_id), **failing}
     p["now_next"] = plans.now_and_next(p)
-    return out({"plan": p})
+    return out({"plan": p, **failing})
 
 
 def _held(site_id: str) -> dict | None:
