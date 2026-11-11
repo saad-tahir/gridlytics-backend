@@ -236,6 +236,10 @@ class ConnectionFields(Strict):
     #: the meter's reading day of the month (from the onboarding bill): a day after it belongs to the next month's bill (tariffs.billing_period_for);
     #: unset, the bill is the calendar month. 29 to 31 read as the month's last day in a shorter month
     reading_day: int | None = Field(None, ge=1, le=31)
+    #: the site's inverter, battery and genset are on this connection, and the site's meter readings (its telemetry's grid import and export) are
+    #: this meter's (round 7 stage 2, audit tracker-and-docs-01): the plan, the savings ledger and the bill rebuild price this connection. A site has
+    #: one such connection: the first saved, unless another is marked (marking one unmarks the others). A save that leaves it out keeps it as stored
+    plant: bool = False
 
     @field_validator("agreement_start", "agreement_end", mode="before")
     @classmethod
@@ -436,7 +440,7 @@ def _now() -> str:
 UNCHECKED = object()
 
 ASSET_NAMES = {"pv": "PV array", "inverter": "inverter", "battery": "battery", "genset": "genset"}
-_FIELD_WORDS = {"lat": "latitude", "lon": "longitude", "load_peak_kw": "typical peak load", "sanctioned_load_kw": "sanctioned load",
+_FIELD_WORDS = {"plant": "plant connection", "lat": "latitude", "lon": "longitude", "load_peak_kw": "typical peak load", "sanctioned_load_kw": "sanctioned load",
                 "export_cap_kw": "export cap", "mdi_interval_min": "MDI interval", "kwp_dc": "DC size", "kw_ac": "AC size", "gamma_pdc": "temperature coefficient",
                 "losses_pct": "losses", "nameplate_kwh": "nameplate energy", "soh": "state of health", "p_ch_kw": "charge power", "p_dis_kw": "discharge power",
                 "eta_c": "charge efficiency", "eta_d": "discharge efficiency", "soc_min": "lowest state of charge", "soc_max": "highest state of charge",
@@ -574,9 +578,22 @@ def delete(site_id: str, by: str) -> None:
 # ------------------------------------------------------------------------------------------------ connections and assets
 
 def connections(site_id: str) -> list[dict]:
+    """The site's connections, the plant's first (round 7 stage 2, audit tracker-and-docs-01): the one marked `plant`, else the first saved, then the
+    rest as saved. Every engine path that reads a site's connection reads the first (the plan, the ledger, the bill rebuild, the twin, the alerts and
+    the reports), which is the meter the site's readings are and the connection the plant's flows reach; a second connection was stored, shown with
+    its own prices and then ignored while the first was priced in its place. Each row's `plant` (beside `data`) says which one that is."""
     with store.connect() as con:
-        rows = con.execute("SELECT * FROM connections WHERE site_id = ? ORDER BY created", (site_id,)).fetchall()
-    return [store.row(r) for r in rows]
+        rows = con.execute("SELECT * FROM connections WHERE site_id = ? ORDER BY CASE WHEN json_extract(data, '$.plant') = 1 THEN 0 ELSE 1 END, "
+                           "created, rowid", (site_id,)).fetchall()
+    out = [store.row(r) for r in rows]
+    for i, c in enumerate(out):
+        c["plant"] = i == 0
+    return out
+
+
+def plant_connection(site: dict | None) -> dict | None:
+    """The connection the site's plant and meter readings are on (`connections`' first), or None for a site without one."""
+    return ((site or {}).get("connections") or [None])[0]
 
 
 def put_connection(site_id: str, fields: dict, by: str, conn_id: str | None = None, if_unchanged=UNCHECKED) -> dict:
@@ -594,6 +611,12 @@ def put_connection(site_id: str, fields: dict, by: str, conn_id: str | None = No
             raise ValueError(problem)
         held = con.execute("SELECT data FROM connections WHERE id = ? AND site_id = ?", (conn_id, site_id)).fetchone() if conn_id else None
         check_unchanged(json.loads(held["data"]) if held else None, if_unchanged, "The grid connection")
+        if held and not (isinstance(fields, dict) and "plant" in fields):
+            data["plant"] = bool((json.loads(held["data"]) or {}).get("plant", False))  # a save that leaves it out keeps it
+        if data["plant"]:
+            # one connection carries the plant: marking this one unmarks the site's others
+            con.execute("UPDATE connections SET data = json_set(data, '$.plant', json('false')), updated = ? WHERE site_id = ? AND id != ? "
+                        "AND json_extract(data, '$.plant') = 1", (now, site_id, cid))
         if held:
             con.execute("UPDATE connections SET data = ?, updated = ? WHERE id = ?", (json.dumps(data), now, conn_id))
         else:

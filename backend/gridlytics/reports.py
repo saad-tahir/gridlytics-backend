@@ -540,10 +540,15 @@ def _bills(doc: _Doc, site: dict, d0: date, d1: date) -> None:
         doc.p("No DISCO bill covering this period has been entered yet: the comparison is made when one is (Savings, Bill comparison).")
         return
     # a bill whose period has too little meter data is not compared (tariffs: verify.bills' check.verdict "not_comparable"), as the Savings page says
-    diff = lambda b: ("Not compared" if (b.get("check") or {}).get("verdict") == "not_comparable" else _pct(b.get("difference_pct")))  # noqa: E731
+    # and a bill of a connection the site's readings do not meter is kept, not rebuilt (verify._unmetered; round 7 stage 2, tracker-and-docs-01)
+    verdict = lambda b: (b.get("check") or {}).get("verdict")  # noqa: E731
+    diff = lambda b: ("Not compared" if verdict(b) == "not_comparable" else "Not rebuilt" if verdict(b) == "not_metered"  # noqa: E731
+                      else _pct(b.get("difference_pct")))
     doc.table([["Billing period", "Printed bill", "Rebuilt by Gridlytics", "Difference"]]
               + [[f"{_short_day(b['period_start'])} to {_short_day(b['period_end'])}", rs((b.get("real") or {}).get("total_rs")),
                   rs((b.get("rebuilt") or {}).get("total_rs")), diff(b)] for b in rows], [60 * mm, 35 * mm, 40 * mm, 25 * mm])
+    if any(verdict(b) == "not_metered" for b in rows):
+        doc.p("Not rebuilt: the bill of a connection whose meter the site's readings are not, kept for the record.")
     if any((b.get("check") or {}).get("verdict") == "not_comparable" for b in rows):
         doc.p(f"Not compared: less than {verify.BILL_COMPLETENESS_MIN * 100:.0f} % of the billing period has meter data, so the rebuild is an "
               "estimate and gives no verdict.")

@@ -2696,6 +2696,8 @@ def _carried_into(connection_id: str, first: date, skip_id: str = "") -> float:
 
 
 def _difference(rebuilt: dict, total: float) -> float | None:
+    if not tariffs._num(rebuilt.get("total_rs")):
+        return None  # not rebuilt: a connection the site's readings do not meter (_unmetered)
     return round((rebuilt["total_rs"] - total) / total * 100, 2) if total else None
 
 
@@ -2738,9 +2740,12 @@ def _reconcile(real: dict, rebuilt: dict) -> list[dict]:
 
 
 def _check(rebuilt: dict, difference_pct: float | None, rows: list[dict]) -> dict:
-    """The bill's verdict: "not_comparable" when less than BILL_COMPLETENESS_MIN of the period has meter data (no pass or fail on an estimate),
-    "outside" when the total or a printed line is off by more than BILL_CHECK_PCT (`outside` names them), "within", or "no_total"."""
+    """The bill's verdict: "not_metered" for a connection whose meter the site's readings are not (`_unmetered`: kept, not rebuilt),
+    "not_comparable" when less than BILL_COMPLETENESS_MIN of the period has meter data (no pass or fail on an estimate), "outside" when the total or
+    a printed line is off by more than BILL_CHECK_PCT (`outside` names them), "within", or "no_total"."""
     out = {"limit_pct": BILL_CHECK_PCT, "completeness_min": BILL_COMPLETENESS_MIN, "outside": []}
+    if rebuilt.get("metered") is False:
+        return {**out, "verdict": "not_metered"}
     comp = rebuilt.get("completeness")
     if tariffs._num(comp) and comp < BILL_COMPLETENESS_MIN:
         return {**out, "verdict": "not_comparable"}
@@ -2752,19 +2757,54 @@ def _residuals(rows: list[dict]) -> list[dict]:
     return [{k: r[k] for k in ("line", "printed", "rebuilt", "difference_pct")} for r in rows]
 
 
-def add_bill(site_id: str, fields: dict, by: str) -> dict:
-    """Enter a DISCO bill and rebuild it from telemetry (`_bill_fields` gives the two forms of the period; both are stored as the first and last day
-    billed). A period that overlaps a bill of the connection already entered is refused: that one is corrected (`correct_bill`) or deleted. The
-    rebuild takes the credit the bill before carried forward, and hands its own on to a bill entered after it."""
+def _bill_connection(site_id: str, fields: dict, held: str | None = None) -> dict:
+    """The connection a bill is for: the one `connection_id` names (refused when the site has no such connection), else the bill's own (`held`, a
+    correction), else the site's plant connection (sites.connections' first). Round 7 stage 2 (audit tracker-and-docs-01, pages-D-09): every bill
+    went to the first connection and was rebuilt against its tariff and meter."""
     conns = sites.connections(site_id)
     if not conns:
         raise ValueError("Add the site's grid connection first")
-    conn = conns[0]
+    want = fields.get("connection_id") if isinstance(fields, dict) else None
+    if want not in (None, ""):
+        conn = next((c for c in conns if c["id"] == want), None)
+        if conn is None:
+            raise ValueError("This site has no such grid connection: pick one of its connections")
+        return conn
+    if held:
+        conn = next((c for c in conns if c["id"] == held), None)
+        if conn is None:
+            raise ValueError("This bill's grid connection no longer exists: delete the bill instead")
+        return conn
+    return conns[0]
+
+
+def _unmetered(conn: dict, p0: date, p1: date, exclusive: bool) -> dict:
+    """The stored 'rebuild' of a bill for a connection whose meter the site's readings are not (sites.connections: the plant's connection is the
+    one metered): kept for the record and the bill list, not rebuilt, since rebuilding it from the site's readings would price another meter's flows
+    under this connection's tariff."""
+    first = p0 + timedelta(days=1) if exclusive else p0
+    return {"metered": False, "completeness": 0.0, "lines": [], "period_start": first.isoformat(), "period_end": p1.isoformat(),
+            "connection_id": conn["id"]}
+
+
+def _rebuild_for(site_id: str, conn: dict, p0: date, p1: date, exclusive: bool, real: dict, carried: float) -> dict:
+    """A bill's rebuild for its connection: from the site's meter readings on the plant's connection, else not rebuilt (`_unmetered`)."""
+    if not conn.get("plant", True):
+        return _unmetered(conn, p0, p1, exclusive)
+    return rebuild_bill(site_id, conn, p0, p1, period_start_exclusive=exclusive, power_factor_pct=real.get("power_factor_pct"),
+                        credit_brought_forward_rs=carried)
+
+
+def add_bill(site_id: str, fields: dict, by: str) -> dict:
+    """Enter a DISCO bill and rebuild it from telemetry (`_bill_fields` gives the two forms of the period; both are stored as the first and last day
+    billed). A period that overlaps a bill of the connection already entered is refused: that one is corrected (`correct_bill`) or deleted. The
+    rebuild takes the credit the bill before carried forward, and hands its own on to a bill entered after it. The bill is for the connection
+    `connection_id` names, else the plant's (`_bill_connection`); a bill of a connection the site's readings do not meter is kept, not rebuilt."""
+    conn = _bill_connection(site_id, fields)
     p0, p1, first, exclusive, total, real = _bill_fields(fields)
     with store.connect() as con:
         _bill_overlap(con, conn["id"], first, p1)
-    rebuilt = rebuild_bill(site_id, conn, p0, p1, period_start_exclusive=exclusive, power_factor_pct=real.get("power_factor_pct"),
-                           credit_brought_forward_rs=_carried_into(conn["id"], first))
+    rebuilt = _rebuild_for(site_id, conn, p0, p1, exclusive, real, _carried_into(conn["id"], first))
     diff = _difference(rebuilt, total)
     bid = store.new_id()
     with store.write_transaction() as con:
@@ -2772,7 +2812,8 @@ def add_bill(site_id: str, fields: dict, by: str) -> dict:
         con.execute("INSERT INTO bills (id, site_id, connection_id, period_start, period_end, real, rebuilt, difference_pct, created) VALUES (?,?,?,?,?,?,?,?,?)",
                     (bid, site_id, conn["id"], first.isoformat(), p1.isoformat(), json.dumps(real), json.dumps(rebuilt), diff, store._now()))
     rows = _reconcile(real, rebuilt)
-    store.audit(by, "entered a DISCO bill", site_id, {"period": f"{first}..{p1}", "difference_pct": diff, "residuals": _residuals(rows)})
+    store.audit(by, "entered a DISCO bill", site_id, {"period": f"{first}..{p1}", "connection_id": conn["id"], "difference_pct": diff,
+                                                      "residuals": _residuals(rows)})
     _rechain(conn["id"], p1, rebuilt.get("credit_carried_rs", 0.0))
     return _bill_answer(bid)
 
@@ -2794,26 +2835,24 @@ def _bill_of(site_id: str, bill_id: str):
 def correct_bill(site_id: str, bill_id: str, fields: dict, by: str) -> dict:
     """Correct a bill entered with a mistake: the same fields as entering one, rebuilt again and compared; the audit line keeps what it was."""
     r = _bill_of(site_id, bill_id)
-    conn = next((c for c in sites.connections(site_id) if c["id"] == r["connection_id"]), None)
-    if conn is None:
-        raise ValueError("This bill's grid connection no longer exists: delete the bill instead")
+    # a correction may move the bill to the connection it belongs to (`connection_id`), else it stays with its own
+    conn = _bill_connection(site_id, fields, held=r["connection_id"])
     p0, p1, first, exclusive, total, real = _bill_fields(fields)
     with store.connect() as con:
         _bill_overlap(con, conn["id"], first, p1, skip_id=bill_id)
-    rebuilt = rebuild_bill(site_id, conn, p0, p1, period_start_exclusive=exclusive, power_factor_pct=real.get("power_factor_pct"),
-                           credit_brought_forward_rs=_carried_into(conn["id"], first, skip_id=bill_id))
+    rebuilt = _rebuild_for(site_id, conn, p0, p1, exclusive, real, _carried_into(conn["id"], first, skip_id=bill_id))
     diff = _difference(rebuilt, total)
     with store.write_transaction() as con:
         _bill_overlap(con, conn["id"], first, p1, skip_id=bill_id)
-        con.execute("UPDATE bills SET period_start = ?, period_end = ?, real = ?, rebuilt = ?, difference_pct = ? WHERE id = ?",
-                    (first.isoformat(), p1.isoformat(), json.dumps(real), json.dumps(rebuilt), diff, bill_id))
+        con.execute("UPDATE bills SET connection_id = ?, period_start = ?, period_end = ?, real = ?, rebuilt = ?, difference_pct = ? WHERE id = ?",
+                    (conn["id"], first.isoformat(), p1.isoformat(), json.dumps(real), json.dumps(rebuilt), diff, bill_id))
     store.audit(by, "corrected a DISCO bill", site_id, {"bill_id": bill_id, "period": f"{first}..{p1}", "difference_pct": diff,
                                                         "was": {"period": f"{r['period_start']}..{r['period_end']}", "real": json.loads(r["real"]),
                                                                 "difference_pct": r["difference_pct"]},
                                                         "residuals": _residuals(_reconcile(real, rebuilt))})
     old_end = date.fromisoformat(r["period_end"])
-    if old_end != p1:
-        _rechain(conn["id"], old_end, 0.0)  # the bill that followed the old period has no bill before it now
+    if old_end != p1 or r["connection_id"] != conn["id"]:
+        _rechain(r["connection_id"], old_end, 0.0)  # the bill that followed the old period has no bill before it now
     _rechain(conn["id"], p1, rebuilt.get("credit_carried_rs", 0.0))
     return _bill_answer(bill_id)
 
@@ -2881,16 +2920,29 @@ def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_excl
     return out
 
 
-def _bill_row(r) -> dict:
+def _connection_label(conns: list[dict], cid: str) -> dict | None:
+    """The connection a bill is for, as the bill list names it: its meter reference, tariff category, place among the site's connections and
+    whether it is the plant's (the metered one); None when it was removed."""
+    for i, c in enumerate(conns):
+        if c["id"] == cid:
+            d = c.get("data") or {}
+            return {"id": cid, "number": i + 1, "meter_ref": d.get("meter_ref") or "", "tariff_category": d.get("tariff_category"),
+                    "plant": bool(c.get("plant", i == 0))}
+    return None
+
+
+def _bill_row(r, conns: list[dict] | None = None) -> dict:
     """A stored bill as the bill list answers it: the row, its printed figures compared line by line and its verdict (computed on read, so a bill
-    stored before these existed gets them too)."""
+    stored before these existed gets them too), and `connection`, the connection it is for (`_connection_label`)."""
     b = {**dict(r), "real": json.loads(r["real"]), "rebuilt": json.loads(r["rebuilt"])}
     b["reconciliation"] = _reconcile(b["real"], b["rebuilt"])
     b["check"] = _check(b["rebuilt"], b["difference_pct"], b["reconciliation"])
+    b["connection"] = _connection_label(conns if conns is not None else sites.connections(r["site_id"]), r["connection_id"])
     return b
 
 
 def bills(site_id: str) -> list[dict]:
     with store.connect() as con:
         rows = con.execute("SELECT * FROM bills WHERE site_id = ? ORDER BY period_start DESC", (site_id,)).fetchall()
-    return [_bill_row(r) for r in rows]
+    conns = sites.connections(site_id)
+    return [_bill_row(r, conns) for r in rows]

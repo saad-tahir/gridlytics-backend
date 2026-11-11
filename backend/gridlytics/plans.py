@@ -315,7 +315,9 @@ def terminal_cal_hold(b_cal: np.ndarray, c_imp: np.ndarray, load: np.ndarray, pv
 
 
 def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
-    conn = (site.get("connections") or [None])[0]
+    # the connection the plant and the site's meter readings are on (round 7 stage 2, tracker-and-docs-01): the plan's import and export are its; a
+    # site's other connections carry loads the plan neither meters nor changes, so their bills are the same whatever it does
+    conn = sites.plant_connection(site)
     a = site.get("assets") or {}
     b_asset, g_asset = a.get("battery"), a.get("genset")
     d = site["data"]

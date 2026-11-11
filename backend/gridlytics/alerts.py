@@ -307,8 +307,9 @@ def _bill_residual(site_id: str, pct: float) -> None:
     'not_comparable'), so it raises nothing."""
     from .verify import BILL_COMPLETENESS_MIN
     with store.connect() as con:
-        r = con.execute("SELECT id, period_start, period_end, difference_pct, rebuilt FROM bills WHERE site_id = ? ORDER BY period_end DESC, created DESC "
-                        "LIMIT 1", (site_id,)).fetchone()
+        # a bill of a connection the site's readings do not meter is kept, not rebuilt (verify._unmetered; round 7 stage 2, tracker-and-docs-01)
+        r = con.execute("SELECT id, period_start, period_end, difference_pct, rebuilt FROM bills WHERE site_id = ? "
+                        "AND COALESCE(json_extract(rebuilt, '$.metered'), 1) = 1 ORDER BY period_end DESC, created DESC LIMIT 1", (site_id,)).fetchone()
     diff = r["difference_pct"] if r else None
     try:
         comp = (json.loads(r["rebuilt"] or "{}") or {}).get("completeness") if r else None
