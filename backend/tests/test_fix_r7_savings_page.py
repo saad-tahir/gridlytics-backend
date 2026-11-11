@@ -50,6 +50,7 @@ def test_the_fee_check_names_the_baseline_the_claim_and_the_days_its_monthly_fig
     store.set_setting(f"fee:{empty}", 5000.0)
     fee = verify.summary(empty, "2026-11-01", "2026-11-06", see_fee=True)["fee"]
     assert fee["months"] == [] and fee["baseline"] is None and fee["scored_days"] == 0 and fee["preliminary"] is True
+    assert fee["within_one_third"] is None                            # before: False, "Fee above one third" with nothing scored
 
 
 def test_the_fee_check_is_preliminary_on_a_part_month_even_when_the_method_is_complete(company, monkeypatch):

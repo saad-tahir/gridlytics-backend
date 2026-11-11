@@ -2307,7 +2307,8 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         bases = {m["baseline"] for m in used}
         scaled = any(m["scored_days"] < m["days_in_month"] for m in used)
         out["fee"] = {"fee_rs_per_month": fee, "verified_saving_rs_per_month": round(saving_pm, 0),
-                      "within_one_third": fee <= saving_pm / 3 if fee else None,
+                      # no verdict without a fee, nor without a scored day to rest on (a zero saving is not a measured one)
+                      "within_one_third": fee <= saving_pm / 3 if fee and used else None,
                       "basis": ("each billing month's claim (the claiming days, each day's share of its month's MDI lever included) per day whose "
                                 "saving is known, x days in the month; the smaller of the native and tuned baselines, month by month; the months "
                                 "averaged"),
