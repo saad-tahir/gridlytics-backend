@@ -973,8 +973,9 @@ def _what_happened(doc: _Doc, site: dict, day: date) -> None:
 def _daily_sheet(doc: _Doc, site: dict, day: date, today: date, now_ts: int) -> None:
     """The daily operations sheet of `day` (audit pages-D-24 and flow-reports-alerts-members-keys-01: it printed the 48-hour plan's partial last
     day, undated, as tomorrow's table). Today's sheet prints the plan in force now as two dated day-tables, today's remainder and tomorrow (plan
-    Part 7.1 step 6), tomorrow's being the one to key in; a past day's prints the day's table as the plan in force at its start had it, then what
-    happened that day."""
+    Part 7.1 step 6), tomorrow's being the one to key in; where tables are issued (plans.issues_tables), today's is the table issued for the day,
+    as the inverter holds it (control-edge's issue, R7 integration); a past day's prints the day's table as the plan in force at its start had
+    it, then what happened that day."""
     doc.csv.writerow(["date", "start", "end", "mode", "soc_floor_pct", "soc_target_pct", "intent"])
     ref = now_ts if day >= today else int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp())
     plan = plans.active_at(site["id"], ref)
@@ -987,10 +988,24 @@ def _daily_sheet(doc: _Doc, site: dict, day: date, today: date, now_ts: int) -> 
             doc.p(f"From the plan in force {'now' if day >= today else 'at the start of the day'}, made at {made:%H:%M} on {day_words(made.date())}.")
         except (TypeError, ValueError):
             pass
-        days = {d.get("date"): d for d in ((plan.get("slots") or {}).get("days") or [])}
+        comp = plan.get("slots") or {}
+        issued: dict = {}
+        if day >= today and comp and plans.issues_tables(site):
+            # each day's table as it reaches the inverter (control-edge, plans.issued_view: GET /control and the edge's message show the same): today's
+            # is the one issued, which a later plan replaces only when its re-issue is worth the write
+            comp, info = plans.issued_view(site["id"], comp)
+            issued = {i["day"]: i for i in info if i.get("plan_id")}
+        days = {d.get("date"): d for d in (comp.get("days") or [])}
         if day >= today:
             nxt = day + timedelta(days=1)
-            _slot_table(doc, days.get(day.isoformat()), f"Today, {day_words(day)}: the rest of the day")
+            iss = issued.get(day.isoformat())
+            if iss and iss["plan_id"] != plan.get("id"):
+                at = datetime.fromisoformat(str(iss["issued_at"])).astimezone(PKT)
+                _slot_table(doc, days.get(day.isoformat()), f"Today, {day_words(day)}: the table issued at {at:%H:%M}, which the inverter holds")
+                doc.p("The plan in force now has another table for today that is not issued: a later plan's table is issued only when it is worth "
+                      "the write, so the inverter keeps this one.")
+            else:
+                _slot_table(doc, days.get(day.isoformat()), f"Today, {day_words(day)}: the rest of the day")
             _slot_table(doc, days.get(nxt.isoformat()), f"Tomorrow, {day_words(nxt)}: the table to key in, in the vendor's layout")
         else:
             _slot_table(doc, days.get(day.isoformat()), f"{day_words(day)}: the table as planned at the start of the day")

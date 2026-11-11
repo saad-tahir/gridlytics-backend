@@ -1005,6 +1005,40 @@ def test_todays_daily_sheet_prints_the_dated_tables_of_today_and_tomorrow_not_th
     assert f"daily-operations-{today.isoformat()}.pdf" in named, named
 
 
+def test_todays_daily_sheet_prints_the_table_issued_to_the_inverter_not_a_later_plans_that_was_not_issued(world, monkeypatch):
+    """R7 integration (alerts-reports with control-edge, audit pages-D-24 and pages-B-02): at the advisory tier today's table is issued once and a later
+    plan's table is re-issued only when it is worth the write, so the inverter holds the issued table; the sheet printed the plan in force's own,
+    which GET /control and the edge's message do not show and the installer has not keyed."""
+    from gridlytics import plans
+    sid = world.site
+    now = _now()
+    today = datetime.now(PKT).date()
+    tomorrow = today + timedelta(days=1)
+    with world.use():
+        sites.set_tier_capable(sid, "advisory_writes")
+        sites.set_tier_allowed(sid, "advisory_writes", "test")
+        _put_plan(sid, "p-night", now - 7200, {today.isoformat(): [_slot("00:00", "17:00", "hold", 30, 30), _slot("17:00", "00:00", "discharge", 30, 30)]},
+                  status="superseded")
+        plans._write_issue(sid, today.isoformat(), "p-night", "first", now - 7000)
+        _put_plan(sid, "p-now", now - 600, {today.isoformat(): [_slot("17:15", "00:00", "discharge", 20, 20)],
+                                            tomorrow.isoformat(): [_slot("00:00", "17:45", "charge_grid", 20, 95)]})
+        assert plans.current(sid)["id"] == "p-now" and plans.issued_for(sid, today.isoformat())["plan_id"] == "p-night"
+    issued_at = datetime.fromtimestamp(now - 7000, PKT)
+    built = _story(monkeypatch)
+    r = world.c["operator"].post("/api/reports", json={"kind": "daily_operations", "site_id": sid})
+    assert r.status_code == 200, r.text
+    text = built[-1]
+    assert f"Today, {_day_words(today)}: the table issued at {issued_at:%H:%M}, which the inverter holds" in text, text
+    assert "17:00 | 00:00 | Discharge | 30 | 30" in text and "17:15 | 00:00" not in text, text       # the issued table, not p-now's
+    assert f"Tomorrow, {_day_words(tomorrow)}: the table to key in" in text and "00:00 | 17:45 | Charge from grid | 20 | 95" in text, text
+    # once p-now's table is issued, the sheet prints it as the rest of the day
+    with world.use():
+        plans._write_issue(sid, today.isoformat(), "p-now", "event", now - 300)
+    world.c["operator"].post("/api/reports", json={"kind": "daily_operations", "site_id": sid})
+    text = built[-1]
+    assert f"Today, {_day_words(today)}: the rest of the day" in text and "17:15 | 00:00 | Discharge | 20 | 20" in text, text
+
+
 def test_a_past_days_sheet_prints_the_plan_in_force_at_its_start_and_what_happened(world, monkeypatch):
     sid = world.site
     today = datetime.now(PKT).date()
