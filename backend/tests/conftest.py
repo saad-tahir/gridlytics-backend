@@ -108,7 +108,25 @@ _SOLARLYTICS_ONLY = {
 }
 
 
+#: The opt-in solver benchmarks (round 7, audit pr-review-01): a registered marker, not an ad-hoc switch per test. They run with `-m slow` (only them) or with
+#: GRIDLYTICS_SLOW_TESTS=1 (them and the rest, HANDOFF section 9); any other run skips them by name, so the count shows. Their correctness halves are not
+#: here: each benchmark keeps a default-suite test of what it asserts (test_fix_r5_genset: the farm's 192-step plans from two marks)
+SLOW = "slow"
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", f"{SLOW}: an opt-in solver benchmark (wall-clock ratios over many solves); run with -m {SLOW} or "
+                                       "GRIDLYTICS_SLOW_TESTS=1, before changing optimise.py (HANDOFF section 9)")
+
+
+def _slow_runs(config) -> bool:
+    return os.environ.get("GRIDLYTICS_SLOW_TESTS") == "1" or SLOW in (config.getoption("markexpr", "") or "").split()
+
+
 def pytest_collection_modifyitems(config, items):
+    slow = _slow_runs(config)
     for item in items:
+        if item.get_closest_marker(SLOW) and not slow:
+            item.add_marker(pytest.mark.skip(reason=f"an opt-in solver benchmark: -m {SLOW} or GRIDLYTICS_SLOW_TESTS=1 runs it (HANDOFF section 9)"))
         if item.originalname in _SOLARLYTICS_ONLY:
             item.add_marker(pytest.mark.skip(reason="asserts Solarlytics' own data; re-aim for Gridlytics (DESIGN_LOG: Lifted tests)"))
