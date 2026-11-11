@@ -289,12 +289,12 @@ def bms_low_pct(site: dict) -> float:
 
 
 def delivered_floor_pct(site: dict) -> float:
-    """The state of charge the delivered table holds with the grid up: delivery.compile_mode_a clamps every slot's floor to
-    max(BMS low + 2, fallback floor), and the fallback floor is enforced by the edge whatever the slots say. The plan holds the same floor on its
-    grid-up steps (round 7, engine-delivery-02): before, it planned down to the BMS soc_min (10 %) against slots that all stop at 20 %, so its
-    peak discharges and its savings counted on energy the device keeps back. In an outage the battery-inverter carries the load to its own
-    cut-off, so there the plan keeps the BMS soc_min."""
-    return max(bms_low_pct(site) + 2.0, fallback_floor_pct(site))
+    """The state of charge the delivered table holds with the grid up: delivery.compile_mode_a clamps every slot's floor to the fallback block's
+    absolute floor (delivery.fallback_floor: the larger of BMS low + 2, the fallback floor and 10 %), and the fallback floor is enforced by the
+    edge whatever the slots say. The plan holds the same floor on its grid-up steps (round 7, engine-delivery-02): before, it planned down to the
+    BMS soc_min (10 %) against slots that all stop at 20 %, so its peak discharges and its savings counted on energy the device keeps back. In an
+    outage the battery-inverter carries the load to its own cut-off, so there the plan keeps the BMS soc_min."""
+    return delivery.fallback_floor(fallback_floor_pct(site), bms_low_pct(site))
 
 
 def terminal_cal_hold(b_cal: np.ndarray, c_imp: np.ndarray, load: np.ndarray, pv: np.ndarray, off_grid: bool) -> float:
@@ -805,7 +805,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                 sites.put_state(site_id, active_plan=None, last_tick=_iso(t0))
         return {"status": "failed", "reason": reason, "control_release": release, "in_force": None if release else _in_force_id(site_id, now)}
     steps_out = _steps_out(p, res, bundle)
-    # the slots' floors are max(bms_low + 2, fallback floor): delivered_floor_pct, the floor the plan held on its grid-up steps. A horizon that
+    # the slots' floors are delivery.fallback_floor: delivered_floor_pct, the floor the plan held on its grid-up steps. A horizon that
     # crosses the billing month's end compiles the new month's days with its own cap, M2 (round 7, engine-optimiser-02: every slot carried M,
     # so the new month's shaved to the old month's peak). The month ends at a local midnight and slots are per local day, so the two compiles
     # give the days a single one would, each with its month's cap

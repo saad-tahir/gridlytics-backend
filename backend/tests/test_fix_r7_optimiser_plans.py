@@ -535,6 +535,33 @@ def test_a_ticked_plan_never_plans_grid_up_energy_under_the_delivered_floor(comp
     assert min(s["soc_floor_pct"] for d in out["slots"]["days"] for s in d["slots"]) >= 20.0
 
 
+def test_the_plan_holds_the_delivered_tables_absolute_floor_and_mode_b_sends_it(company):
+    """Integration (optimiser-plans' delivered floor with delivery-twin's absolute floor, audit engine-delivery-02, engine-delivery-14): the slots and
+    the fallback block stop at the larger of BMS low + 2, the reserve policy's floor and 10 %, but the plan held max(BMS low + 2, reserve) only, so a
+    pack with a 5 % cut-off and a 5 % policy was planned down to 7 % against slots at 10 %. The plan's grid-up floor, the slots and Mode B's
+    per-step floor (the step's reserve, never above its own state of charge) now agree."""
+    from gridlytics import delivery
+    sid = _site(load_peak_kw=150)
+    sites.put_asset(sid, "battery", {"nameplate_kwh": 200, "p_ch_kw": 100, "p_dis_kw": 100, "soc_min": 0.05}, "t")
+    sites.update(sid, {"reserve_policy": {"p_threshold": 0.2, "min_soc_pct": 5.0}}, "t")
+    full = sites.full(sid)
+    assert plans.delivered_floor_pct(full) == pytest.approx(delivery.FLOOR_MIN_PCT)
+    t0 = twin.day_start_utc(date(2026, 11, 1))
+    rows = [(sid, t, "test", 1.0, 150.0 * 1000 / 60, 0.0, 0.0, 150.0 * 1000) for t in range(twin.day_start_utc(date(2026, 10, 18)), t0 + 13 * 3600, 60)]
+    telemetry.write_rows(rows, ("site_id", "ts", "source_id", "grid_present", "grid_import_wh", "grid_export_wh", "pv_power_w", "load_power_w"))
+    out = plans.tick(sid, at=t0 + 13 * 3600, save=False)
+    assert out["status"] == "active"
+    floor = out["slots"]["fallback"]["min_soc_floor_pct"]
+    assert floor == pytest.approx(delivery.FLOOR_MIN_PCT)
+    up = [x for x in out["steps"] if x["grid_present"] > 0.5]
+    assert sum(x["discharge_kw"] for x in up) > 1.0
+    assert min(x["soc_pct"] for x in up) >= floor - 0.05
+    assert all(x["reserve_pct"] >= floor - 0.05 for x in up)
+    assert min(s["soc_floor_pct"] for d in out["slots"]["days"] for s in d["slots"]) >= floor
+    mode_b = delivery.mode_b(out["steps"])["steps"]
+    assert all(m["soc_floor_pct"] >= floor - 0.05 for m, x in zip(mode_b, out["steps"]) if x["grid_present"] > 0.5)
+
+
 # ------------------------------------------------------------------------------------------------ flow-onboarding-09 (engine half)
 
 def test_the_dispatch_stays_within_the_inverters_ac_rating():
