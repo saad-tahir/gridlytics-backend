@@ -704,7 +704,7 @@ def _kept_by_time_limit(site_id: str, res: dict, t0: int, summary: dict) -> dict
     gap = None if res.get("first_time_limited") else res.get("mip_gap")
     if not limited or (gap is not None and float(gap) <= KEEP_GAP):
         return None
-    prev = current(site_id)
+    prev = current(site_id, t0)  # the plan in force at the tick's own time (a past tick, as the demo's history makes, reads its own day's)
     if prev is None:
         return None
     made, until = _ts(prev.get("belief_time")), _ts(prev.get("valid_until"))
@@ -803,7 +803,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                             (site_id, _iso(t0), started, store._now(), "failed", reason, pid))
             if release:
                 sites.put_state(site_id, active_plan=None, last_tick=_iso(t0))
-        return {"status": "failed", "reason": reason, "control_release": release, "in_force": None if release else _in_force_id(site_id)}
+        return {"status": "failed", "reason": reason, "control_release": release, "in_force": None if release else _in_force_id(site_id, now)}
     steps_out = _steps_out(p, res, bundle)
     # the slots' floors are max(bms_low + 2, fallback floor): delivered_floor_pct, the floor the plan held on its grid-up steps. A horizon that
     # crosses the billing month's end compiles the new month's days with its own cap, M2 (round 7, engine-optimiser-02: every slot carried M,
@@ -853,7 +853,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
         sites.put_state(site_id, active_plan=active, last_tick=_iso(t0), **anchor)
     # why a plan was held, and the plan in force after this tick (null: none, as under a pause, a release or before the first plan passes the
     # guard), so a re-solve says what stays in force (round 7, frontend-states-formats-07)
-    in_force = plan_id if status == "active" else (None if release else _in_force_id(site_id))
+    in_force = plan_id if status == "active" else (None if release else _in_force_id(site_id, now))
     return {"status": status, "plan_id": plan_id, "reason": reason, "in_force": in_force, "objective_rs": res["objective_rs"],
             "solve_seconds": res["solve_seconds"], "steps": steps_out, "slots": compiled, "summary": summary}
 
@@ -873,11 +873,13 @@ def failure_code(res: dict) -> str:
     return FAILURE_CODES.get(res.get("solver_status"), "solve_failed")
 
 
-def _in_force_id(site_id: str) -> str | None:
-    """The id of the plan active once a tick has written its row, else None."""
+def _in_force_id(site_id: str, now: int) -> str | None:
+    """The id of the plan in force at `now` once a tick has written its row, else None: the latest active plan while `now` is before its
+    valid_until, as current() reads it (a plan past it is not in force, and the edge runs its fallback)."""
     with store.connect() as con:
-        r = con.execute("SELECT id FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
-    return r["id"] if r else None
+        r = con.execute("SELECT id, valid_until FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1",
+                        (site_id,)).fetchone()
+    return r["id"] if r and not _past_valid_until(r["valid_until"], now) else None
 
 
 def _iso(ts: int) -> str:

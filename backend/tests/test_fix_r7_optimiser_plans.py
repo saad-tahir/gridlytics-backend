@@ -1086,10 +1086,14 @@ def test_an_anchor_deadline_sooner_than_any_hour_end_keeps_the_first_hour_end():
 
 # ------------------------------------------------------------------------------------------------ flow-telemetry-plan-control-09 (the plans against native)
 
-def _compare(sid, monkeypatch):
-    """The plan page's Compare with native (routes_plans.plan_compare: both replayed through the twin on the plan's own forecast), rupees kept."""
+def _compare(sid, monkeypatch, at):
+    """The plan page's Compare with native (routes_plans.plan_compare: both replayed through the twin on the plan's own forecast), rupees kept,
+    read at `at`, the plan's own time: a plan past its valid_until is not in force (control-edge, audit engine-delivery-24)."""
     from gridlytics import routes_plans
     monkeypatch.setattr(routes_plans, "out", lambda o: o)
+    monkeypatch.setattr(routes_plans, "now_ts", lambda: int(at))
+    real = plans.current
+    monkeypatch.setattr(plans, "current", lambda site_id, now=None: real(site_id, int(at) if now is None else now))
     return routes_plans.plan_compare(sid)["compare"]
 
 
@@ -1117,7 +1121,7 @@ def test_a_pack_that_charges_to_its_top_each_day_is_used_in_the_peak_and_the_pla
     assert out["status"] == "active"
     assert out["summary"]["battery_state"]["sigma_pct"] < 4.0          # anchored this afternoon at the pack's own top
     assert sum(s["discharge_kw"] for s in out["steps"] if s["peak"]) * H > 40.0
-    arms = _compare(sid, monkeypatch)
+    arms = _compare(sid, monkeypatch, now)
     # before: sigma at 15 points, and the mill's plan cost about Rs 900 more than native over the 48 hours (it bought energy to hold above the band)
     assert arms["plan"]["energy_rs"] <= arms["native"]["energy_rs"]
     assert arms["plan"]["unserved_kwh"] <= arms["native"]["unserved_kwh"]
@@ -1839,14 +1843,14 @@ def test_a_time_limited_plan_far_from_its_bound_does_not_replace_the_plan_in_for
     second = plans.tick(sid, at=T_LIM + 900)
     assert second["status"] == "held"
     assert second["summary"]["time_limit_kept"] == {"plan_id": first["plan_id"], "mip_gap": 0.3, "gap_limit": 0.05}
-    cur = plans.current(sid)
+    cur = plans.current(sid, T_LIM + 1000)
     assert cur["id"] == first["plan_id"] and cur["latest_attempt"]["reason"] == "time_limited_gap"
     assert plans.active_at(sid, T_LIM + 1000)["id"] == first["plan_id"]
     assert sites.state(sid)["active_plan"] == first["plan_id"]
     # within 5 % of its bound a time-limited plan replaces it
     _far_from_its_bound(monkeypatch, gap=0.01)
     third = plans.tick(sid, at=T_LIM + 1800)
-    assert third["status"] == "active" and plans.current(sid)["id"] == third["plan_id"]
+    assert third["status"] == "active" and plans.current(sid, T_LIM + 1900)["id"] == third["plan_id"]
 
 
 def test_a_time_limited_plan_far_from_its_bound_is_published_where_nothing_better_alike_and_recent_is_in_force(company, monkeypatch):
@@ -1873,7 +1877,7 @@ def test_a_relaxed_retry_after_a_time_out_does_not_replace_a_recent_plan(company
     r = plans.tick(sid, at=T_LIM + 900)
     assert r["summary"]["solver"]["first_time_limited"] is True and "relaxed_retry" in r["summary"]["notes"]
     assert r["status"] == "held" and r["summary"]["time_limit_kept"]["mip_gap"] is None
-    assert plans.current(sid)["id"] == first["plan_id"]
+    assert plans.current(sid, T_LIM + 1000)["id"] == first["plan_id"]
 
 
 def _runs_of(u) -> list[tuple[int, int]]:
@@ -2065,6 +2069,23 @@ def test_a_held_tick_says_why_and_which_plan_stays_in_force(company, monkeypatch
     monkeypatch.setattr(plans, "_guard", lambda *a, **k: "import_in_outage")
     held = plans.tick(sid, at=T_LIM + 1800)
     assert held["status"] == "held" and held["reason"] == "import_in_outage" and held["in_force"] == good["plan_id"]
+
+
+def test_a_held_or_failed_tick_after_the_plan_in_force_ran_out_says_none_is_in_force(company, monkeypatch):
+    """Integration (optimiser-plans with control-edge's expiry rule, audit engine-delivery-24): the tick read the latest row stored active as the
+    plan in force, so a hold or a failed solve after that plan's valid_until answered "the previous plan stays in force" while GET /plan, the edge
+    and the keyed table had none. The tick now reads the plan in force at its own time, as plans.current does."""
+    sid = _site()
+    good = plans.tick(sid, at=T_LIM)
+    assert good["status"] == "active"
+    end = plans._ts(plans.get(sid, good["plan_id"])["valid_until"])
+    monkeypatch.setattr(plans, "_guard", lambda *a, **k: "replayed_soc_below_floor")
+    assert plans.tick(sid, at=end - 900)["in_force"] == good["plan_id"]       # still in force in its last quarter
+    late = plans.tick(sid, at=end + 900)
+    assert late["status"] == "held" and late["in_force"] is None
+    _fails(monkeypatch)
+    failed = plans.tick(sid, at=end + 1800)
+    assert failed["status"] == "failed" and failed["in_force"] is None
 
 
 def test_a_tick_under_a_pause_leaves_no_plan_in_force(company):
