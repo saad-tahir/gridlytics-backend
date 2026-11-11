@@ -840,6 +840,44 @@ def test_the_monthly_report_carries_what_plan_8_5_lists(world, monkeypatch):
     assert month not in text.replace(f"{month}-", "")                          # no "YYYY-MM" month in the words
 
 
+def test_a_bill_with_too_little_meter_data_is_not_compared_in_the_monthly_report(world, monkeypatch):
+    """R7 integration (alerts-reports with tariffs, audit pages-D-07): tariffs gives no verdict on a bill whose period has less than 90 % meter data
+    (verify.bills' check.verdict 'not_comparable'; the Savings page says 'Not compared'), yet the report printed its difference as a finding."""
+    from gridlytics import reports, verify
+    sid, month = world.site, _past_month()
+    with world.use():
+        _plan_8_5_world(monkeypatch, sid, month)
+        bill = {**verify.bills(sid)[0], "rebuilt": {"total_rs": 1250000.0, "completeness": 0.6}, "difference_pct": 25.0,
+                "check": {"verdict": "not_comparable"}}
+        monkeypatch.setattr(verify, "bills", lambda site_id: [bill])
+        built = _story(monkeypatch)
+        reports.generate("monthly_savings", sid, month, "test")
+    text = built[-1]
+    line = next(ln for ln in text.splitlines() if "Rs 1,000,000" in ln)
+    assert line.endswith("| Not compared") and "25.0 %" not in line, line
+    assert "less than 90 % of the billing period has meter data" in text, text
+
+
+def test_a_bill_with_too_little_meter_data_raises_no_bill_alert(world):
+    """R7 integration (alerts-reports with tariffs, audit pages-D-14): the bill_residual alert read the difference of a bill tariffs does not compare
+    (rebuilt from less than 90 % of the period's meter data)."""
+    sid = world.site
+    now = _now()
+    with world.use():
+        cid = sites.connections(sid)[0]["id"]
+        with store.connect() as con:
+            con.execute("INSERT INTO bills (id, site_id, connection_id, period_start, period_end, real, rebuilt, difference_pct, created) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", ("b1", sid, cid, "2026-09-01", "2026-09-30", "{}", json.dumps({"completeness": 0.6}), 25.0,
+                                                       store._now()))
+        alerts.evaluate(sid, now)
+        assert "bill_residual" not in _rules_of(alerts.listing("active", sid))
+        with store.connect() as con:
+            con.execute("UPDATE bills SET rebuilt = ? WHERE id = 'b1'", (json.dumps({"completeness": 0.95}),))
+        alerts.evaluate(sid, now)
+        got = [a for a in alerts.listing("active", sid) if a["rule"] == "bill_residual"]
+    assert len(got) == 1 and "25.0 %" in got[0]["title"], got
+
+
 def test_a_company_roll_up_report_lists_every_site_and_the_total(world, monkeypatch):
     """pages-D-07 (and tracker-and-docs-14, flow-reports-alerts-members-keys-03): plan 8.5 asks for a roll-up per company; POST /api/reports needed a
     site."""

@@ -302,12 +302,20 @@ def _edge_offline(site: dict, now: int, ready: bool, minutes: float) -> None:
 
 
 def _bill_residual(site_id: str, pct: float) -> None:
-    """Tariff: the latest bill entered, rebuilt from telemetry, differs from the printed total by more than the rules' percent (R8 2.16)."""
+    """Tariff: the latest bill entered, rebuilt from telemetry, differs from the printed total by more than the rules' percent (R8 2.16). A bill whose
+    period has less than verify.BILL_COMPLETENESS_MIN of meter data is not compared (tariffs: no pass or fail on an estimate, the bill's verdict is
+    'not_comparable'), so it raises nothing."""
+    from .verify import BILL_COMPLETENESS_MIN
     with store.connect() as con:
-        r = con.execute("SELECT id, period_start, period_end, difference_pct FROM bills WHERE site_id = ? ORDER BY period_end DESC, created DESC LIMIT 1",
-                        (site_id,)).fetchone()
+        r = con.execute("SELECT id, period_start, period_end, difference_pct, rebuilt FROM bills WHERE site_id = ? ORDER BY period_end DESC, created DESC "
+                        "LIMIT 1", (site_id,)).fetchone()
     diff = r["difference_pct"] if r else None
-    on = isinstance(diff, (int, float)) and abs(diff) > pct
+    try:
+        comp = (json.loads(r["rebuilt"] or "{}") or {}).get("completeness") if r else None
+    except (TypeError, ValueError, AttributeError):
+        comp = None
+    compared = not (tariffs._num(comp) and comp < BILL_COMPLETENESS_MIN)
+    on = compared and isinstance(diff, (int, float)) and abs(diff) > pct
     title = ""
     if on:
         a, b = date.fromisoformat(r["period_start"][:10]), date.fromisoformat(r["period_end"][:10])

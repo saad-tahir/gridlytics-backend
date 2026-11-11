@@ -539,9 +539,14 @@ def _bills(doc: _Doc, site: dict, d0: date, d1: date) -> None:
     if not rows:
         doc.p("No DISCO bill covering this period has been entered yet: the comparison is made when one is (Savings, Bill comparison).")
         return
+    # a bill whose period has too little meter data is not compared (tariffs: verify.bills' check.verdict "not_comparable"), as the Savings page says
+    diff = lambda b: ("Not compared" if (b.get("check") or {}).get("verdict") == "not_comparable" else _pct(b.get("difference_pct")))  # noqa: E731
     doc.table([["Billing period", "Printed bill", "Rebuilt by Gridlytics", "Difference"]]
               + [[f"{_short_day(b['period_start'])} to {_short_day(b['period_end'])}", rs((b.get("real") or {}).get("total_rs")),
-                  rs((b.get("rebuilt") or {}).get("total_rs")), _pct(b.get("difference_pct"))] for b in rows], [60 * mm, 35 * mm, 40 * mm, 25 * mm])
+                  rs((b.get("rebuilt") or {}).get("total_rs")), diff(b)] for b in rows], [60 * mm, 35 * mm, 40 * mm, 25 * mm])
+    if any((b.get("check") or {}).get("verdict") == "not_comparable" for b in rows):
+        doc.p(f"Not compared: less than {verify.BILL_COMPLETENESS_MIN * 100:.0f} % of the billing period has meter data, so the rebuild is an "
+              "estimate and gives no verdict.")
 
 
 def _method(doc: _Doc, site: dict, summ: dict) -> None:
