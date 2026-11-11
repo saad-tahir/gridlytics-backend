@@ -232,9 +232,11 @@ def test_a_pause_before_its_first_tick_is_held_with_no_plan_id(world, monkeypatc
 def test_an_off_grid_site_activates_on_its_connection_or_its_flag_and_reads_off_grid_in_the_fleet(world):
     a = world.c["admin"]
     two = world.other
+    source = {"data_source": {"kind": "csv", "grid_signal_confirmed": True}}     # a confirmed source is asked for too (audit flow-onboarding-08)
     with world.use():
+        sites.update(two, source, "test")
         sites.put_asset(two, "inverter", {"kw_ac": 50}, "test")
-        three = sites.create({"name": "Three", "site_type": "office"}, "test")["id"]
+        three = sites.create({"name": "Three", "site_type": "office", **source}, "test")["id"]
         sites.put_asset(three, "inverter", {"kw_ac": 50}, "test")
     r = a.post(f"/api/sites/{two}/activate")
     assert r.status_code == 422 and "tab C" in r.json()["detail"], r.text
@@ -574,7 +576,8 @@ def test_a_pause_or_release_answers_no_plan_while_the_plan_of_before_is_still_ac
 
 def _ali(w, n: int):
     import identities
-    return identities.client(f"ali.{n}@fix.test", "operator", w.company, "member", name="Ali Khan", raise_server_exceptions=False)
+    # administrators: saving a draft is the administrator's (audit role-operator-07); the name, not the role, is what these tests are about
+    return identities.client(f"ali.{n}@fix.test", "admin", w.company, "member", name="Ali Khan", raise_server_exceptions=False)
 
 
 def test_two_members_with_one_name_keep_their_own_drafts(world):

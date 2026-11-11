@@ -48,6 +48,9 @@ PERMISSIONS = {
     "refresh_forecasts": {"admin", "analyst"},
     #: the energy-only report carries no money (plan Part 8.5: the viewer-safe report), so every member may generate it, a viewer included
     "energy_report": {"admin", "operator", "analyst", "viewer"},
+    #: adding, activating and drafting sites and changing their control limits (plan Part 9.4: the administrator "creates sites ... edits limits"; the
+    #: operator places holds and overrides within them; audit role-operator-07). Editing a site's other fields stays edit_sites
+    "manage_sites": {"admin"},
 }
 #: No member holds a permission beyond the role: plan Part 10.5's "a named viewer may be granted see_costs by an admin" is not offered, because the owner's
 #: rule is that a viewer never sees money (review of audit security-roles-16, deferred to the owner). Someone who must read costs is given the operator's or

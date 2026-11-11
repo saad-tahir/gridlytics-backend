@@ -1,18 +1,21 @@
 """Sites, their connections (one per DISCO meter), assets, carried state, overrides, native-settings captures and wizard drafts (plan Part 3.2).
 
 A site's own fields, each connection's and each asset's are strict pydantic models (`SiteFields`, `ConnectionFields`, the asset models): a bad field is a 422
-in one sentence. The control tier is two facts (plan Part 2.3): `tier_capable`, asserted by the data source (an edge's capabilities, or `monitor`), and
+in one sentence. The control tier is two facts (plan Part 2.3): `tier_capable`, asserted by the data source (an edge's capabilities;
+advisory writes for a CSV or cloud source, SOURCE_CAPABLE; else `monitor`), and
 `tier_allowed`, set by an administrator; the effective tier is the lower.
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import math
+import re
+from datetime import date, datetime, timezone
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
-from . import store
+from . import store, tariff_data, telemetry
 from .schemas import Strict, check
 
 TIERS = ("monitor", "advisory_writes", "closed_loop")
@@ -56,6 +59,9 @@ class SiteFields(Strict):
     site_type: Literal[SITE_TYPES] = "industrial_2_shift"
     outage_unit: OutageUnit = OutageUnit()
     genset_start_control: Literal["auto_on_grid_loss", "soc_threshold", "manual", "none"] = "none"
+    #: the battery state of charge (%) at which a soc_threshold controller starts the genset (audit flow-onboarding-11: never asked, so the plan assumed
+    #: the reserve floor plus 5 points whatever the controller did); None: that assumption (genset_start_soc), which the web app marks Preliminary
+    genset_start_soc_pct: float | None = Field(None, gt=0, le=100)
     outage_load_mode: Literal[0, 1] = 0
     critical_load_kw: list[float] = Field(default_factory=lambda: [0.0] * 24, min_length=24, max_length=24)
     voll_rs_per_kwh: float = Field(500.0, ge=0.0, le=10000.0)
@@ -80,6 +86,40 @@ class SiteFields(Strict):
     half_days: list[Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]] = Field(default_factory=list, max_length=7)
 
 
+def genset_start_soc(data: dict) -> float:
+    """The state of charge (a share) at which the site's soc_threshold controller starts the genset, as the plan (plans.build_problem) and the twin
+    (twin.plant_of) model it: the site's own threshold, else the reserve floor plus 5 points."""
+    own = (data or {}).get("genset_start_soc_pct")
+    if isinstance(own, (int, float)) and not isinstance(own, bool) and own > 0:
+        return float(own) / 100.0
+    return float(((data or {}).get("reserve_policy") or {}).get("min_soc_pct", 20.0)) / 100.0 + 0.05
+
+
+#: The highest tier a source that is not an edge device supports by itself (plan Part 2.3, 7.5 and 7.6; audit flow-onboarding-03: a CSV or cloud site
+#: stayed at monitor for good, although plans reach it as slot tables a person keys in). An edge device's own capabilities message sets its tier.
+SOURCE_CAPABLE = {"csv": "advisory_writes", "oem_cloud": "advisory_writes"}
+
+
+def _source_capable(con, site_id: str, data: dict, before: dict | None, held: str = "monitor") -> str | None:
+    """`tier_capable` as the saved data source sets it, or None to keep the stored one (`held`). A CSV or cloud source chosen (on a new site, or in place
+    of another kind): SOURCE_CAPABLE; kept by a later save (a note, the name): never lowered, only raised to SOURCE_CAPABLE (a site saved at monitor
+    before this rule), so what the site's edge asserted meanwhile stays until the kind is changed. A change to an edge device from another kind: what
+    that site's edge last asserted (its latest capabilities message), else monitor until it reports. No source (a site added before sources were
+    recorded, the demo's), or an edge kept: unchanged."""
+    kind = (data.get("data_source") or {}).get("kind")
+    old = ((before or {}).get("data_source") or {})
+    old_kind = old.get("kind") if isinstance(old, dict) else None
+    if kind in SOURCE_CAPABLE:
+        if kind == old_kind and held in TIERS and TIERS.index(held) > TIERS.index(SOURCE_CAPABLE[kind]):
+            return None
+        return SOURCE_CAPABLE[kind]
+    if kind == "edge" and old_kind in SOURCE_CAPABLE:
+        r = con.execute("SELECT body FROM capabilities WHERE site_id = ? ORDER BY seq DESC LIMIT 1", (site_id,)).fetchone()
+        tier = (json.loads(r["body"]) or {}).get("tier") if r else None
+        return tier if tier in TIERS else "monitor"
+    return None
+
+
 def _stamp_source(data: dict, before: dict | None, by: str) -> None:
     """Who confirmed the data source's grid-present signal, and when, from the save itself: a new confirmation (or one for another kind of source) is
     stamped with the person saving and the time now; a confirmation saved before keeps its stamp; an unconfirmed source carries none."""
@@ -96,11 +136,30 @@ def _stamp_source(data: dict, before: dict | None, by: str) -> None:
         src["confirmed_by"], src["at"] = str(by or "")[:120], _now()
 
 
+#: The largest ICP baseline a month and period may hold (kWh): a 100 MW sanctioned load (ConnectionFields' bound) for a whole month is 74,400,000
+ICP_BASELINE_MAX = 100_000_000
+
+
 class IcpBaseline(Strict):
     eligible: bool = False
     #: kWh per calendar month (1-12) and period of the reference year Dec 2023 to Nov 2024, before the 2.8 percent escalation
     peak: dict[str, float] = Field(default_factory=dict)
     off_peak: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("peak", "off_peak")
+    @classmethod
+    def _months(cls, v: dict[str, float]) -> dict[str, float]:
+        """Keyed by calendar month, '1' to '12' (tariffs.icp_baseline reads str(month); audit engine-tariffs-05: any key and any figure were stored), each
+        from 0 kWh up."""
+        out: dict[str, float] = {}
+        for k, kwh in v.items():
+            month = int(k) if str(k).strip().isdigit() else 0
+            if not 1 <= month <= 12:
+                raise ValueError("The ICP baseline is by calendar month, 1 to 12")
+            if not 0 <= kwh <= ICP_BASELINE_MAX:
+                raise ValueError(f"An ICP baseline is from 0 to {ICP_BASELINE_MAX:,} kWh")
+            out[str(month)] = kwh
+        return out
 
 
 class TaxFlags(Strict):
@@ -110,24 +169,123 @@ class TaxFlags(Strict):
     atl: bool = True
     province: Literal["punjab", "sindh", "kp", "balochistan", "ict"] = "punjab"
 
+    @model_validator(mode="after")
+    def _registered(self):
+        """Input GST is claimed back only under a sales-tax registration (plan Part 6.1; audit engine-tariffs-05: {strn: false} alone kept
+        gst_recoverable true, so a no-STRN site's price left its GST out). Without an STRN the GST is borne; saying it is recovered is refused."""
+        if not self.strn and self.gst_recoverable:
+            if "gst_recoverable" in self.model_fields_set:
+                raise ValueError("A connection without a sales-tax registration (STRN) cannot recover the bill's GST")
+            self.gst_recoverable = False
+        return self
+
+
+#: The province of each DISCO's customers, for the electricity duty (R9 sections 7 and 8.4), the usual one first: K-Electric serves Karachi (Sindh) and
+#: Hub and Lasbela (Balochistan); IESCO serves Islamabad (ICT) and the Rawalpindi circle (Punjab)
+DISCO_PROVINCES = {"IESCO": ("ict", "punjab"), "LESCO": ("punjab",), "GEPCO": ("punjab",), "FESCO": ("punjab",), "MEPCO": ("punjab",), "PESCO": ("kp",),
+                   "HESCO": ("sindh",), "SEPCO": ("sindh",), "QESCO": ("balochistan",), "TESCO": ("kp",), "HAZECO": ("kp",),
+                   "K-Electric": ("sindh", "balochistan")}
+
+
+def group_for_disco(disco: str | None) -> str:
+    """The time-of-use calendar a DISCO's customers are billed on (R9 section 2): K-Electric's own, or the one of the other DISCOs."""
+    return "ke" if disco == "K-Electric" else "xwdisco"
+
+
+def _from_disco(fields, disco: str | None):
+    """A connection's DISCO group and province, where the save leaves them out, from the site's DISCO (audit flow-onboarding-02: a K-Electric site took
+    the other DISCOs' peak windows and Punjab's duty by default). A site with no DISCO keeps ConnectionFields' defaults."""
+    if not disco or disco not in DISCO_PROVINCES or not isinstance(fields, dict):
+        return fields
+    out = dict(fields)
+    out.setdefault("disco_group", group_for_disco(disco))
+    tax = out.get("tax")
+    if tax is None:
+        out["tax"] = {"province": DISCO_PROVINCES[disco][0]}
+    elif isinstance(tax, dict) and "province" not in tax:
+        out["tax"] = {**tax, "province": DISCO_PROVINCES[disco][0]}
+    return out
+
+
+def group_problem(group: str | None, disco: str | None) -> str | None:
+    """The sentence when a connection's DISCO group contradicts the site's DISCO (the DISCO group is not printed on the bill, so it follows the DISCO),
+    else None; a site with no DISCO may use either."""
+    if not disco or group == group_for_disco(disco):
+        return None
+    if disco == "K-Electric":
+        return "This site's DISCO is K-Electric: its connection uses K-Electric's time-of-use windows"
+    return f"This site's DISCO is {disco}: its connection uses the other DISCOs' time-of-use windows, not K-Electric's"
+
 
 class ConnectionFields(Strict):
     meter_ref: str = Field("", max_length=40)
     disco_group: Literal[DISCO_GROUPS] = "xwdisco"
     tariff_category: str = Field("B-2(b)", max_length=20)
     regime: Literal["net_billing", "net_metering_legacy", "none", "flat", "off_grid"] = "none"
-    agreement_start: str | None = None
-    agreement_end: str | None = None
+    #: the net-metering or net-billing agreement's first and last day, YYYY-MM-DD (audit flow-onboarding-18: any text was stored, and an end before the start)
+    agreement_start: str | None = Field(None, max_length=10)
+    agreement_end: str | None = Field(None, max_length=10)
     sanctioned_load_kw: float = Field(400.0, gt=0, le=100000)
     export_cap_kw: float = Field(0.0, ge=0, le=100000)
     mdi_interval_min: Literal[15, 30] = 30
     icp: IcpBaseline = IcpBaseline()
     tax: TaxFlags = TaxFlags()
     seasonal_multiplier: float = Field(1.0, ge=1.0, le=1.5)
+    #: Tariff F's season (R9 1.2: seasonal industrial consumers, at least six months), calendar months 1 to 12; empty: not on Tariff F
     season_months: list[int] = Field(default_factory=list)
     #: the meter's reading day of the month (from the onboarding bill): a day after it belongs to the next month's bill (tariffs.billing_period_for);
     #: unset, the bill is the calendar month. 29 to 31 read as the month's last day in a shorter month
     reading_day: int | None = Field(None, ge=1, le=31)
+
+    @field_validator("agreement_start", "agreement_end", mode="before")
+    @classmethod
+    def _agreement_day(cls, v, info):
+        """A calendar day written YYYY-MM-DD, or blank (None; an empty text is blank too)."""
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        which = "start" if info.field_name == "agreement_start" else "end"
+        day = v.strip() if isinstance(v, str) else ""
+        try:
+            if len(day) != 10 or day[4] != "-" or day[7] != "-":
+                raise ValueError
+            date.fromisoformat(day)
+        except ValueError:
+            raise ValueError(f"The agreement {which} is a date (YYYY-MM-DD)") from None
+        return day
+
+    @model_validator(mode="after")
+    def _agreement_order(self):
+        if self.agreement_start and self.agreement_end and self.agreement_end < self.agreement_start:
+            raise ValueError("The agreement must end after it starts")
+        return self
+
+    @field_validator("season_months")
+    @classmethod
+    def _season(cls, v: list[int]) -> list[int]:
+        """Tariff F's season (audit engine-tariffs-05: any numbers were stored): distinct calendar months, six at least, as the tariff bills."""
+        if any(not 1 <= m <= 12 for m in v):
+            raise ValueError("A season month is 1 to 12")
+        if len(set(v)) != len(v):
+            raise ValueError("Each season month is listed once")
+        if v and len(v) < 6:
+            raise ValueError("Tariff F's season runs at least six months")
+        return v
+
+    @model_validator(mode="after")
+    def _tariff_f(self):
+        if self.season_months and tariff_data.category_class(self.tariff_category) != "industrial":
+            raise ValueError("Tariff F (a season) is for industrial connections")
+        return self
+
+    @field_validator("tariff_category")
+    @classmethod
+    def _category(cls, v: str) -> str:
+        """A category the rate cards know (audit flow-onboarding-07): an empty one was stored, and the site then never planned and raised no alert."""
+        if not v:
+            raise ValueError("Choose the tariff category printed on the bill")
+        if v not in tariff_data.CARDS_279:
+            raise ValueError(f"Unknown tariff category {v}")
+        return v
 
 
 class PvFields(Strict):
@@ -166,11 +324,36 @@ class BatteryFields(Strict):
         return self
 
 
+#: The upper bound of the genset's money figures and tank, with the sentence a larger one is refused in (the web app's site-form.ts has the same bounds)
+GENSET_UPPER = {"c_start_rs": (1_000_000, "The cost per start is at most Rs 1,000,000"),
+                "c_runhr_rs": (1_000_000, "The cost per running hour is at most Rs 1,000,000"),
+                "c_om_rs_per_kwh": (10_000, "The upkeep per kWh is at most Rs 10,000"),
+                "tank_l": (1_000_000, "The tank holds at most 1,000,000 L")}
+
+
+def _num(x: float) -> str:
+    """A figure in a sentence: thousands separated, at most one decimal ("5,000", "266.4")."""
+    return f"{x:,.1f}".rstrip("0").rstrip(".")
+
+
+#: Each fuel's typical curve and tank, taken where a save leaves them out (audit flow-onboarding-10: a captive gas engine kept the diesel curve, 0.273 litres
+#: a kWh read as MMBtu, so its fuel cost came out about 35 times too high and the plan never ran it). Diesel is in litres; captive gas and RLNG are in
+#: MMBtu, the unit their price is set in (tariff_data's fuel prices), with the demo's gas engine's curve (0.0085 MMBtu a kWh, about 40 % efficient, and
+#: 0.0010 MMBtu an hour per rated kW at no load). Both gases are piped: no tank, which the plan reads as no fuel limit.
+FUEL_CURVES = {"hsd": {"a": 0.273, "b": 0.033, "tank_l": 2000.0},
+               "gas_captive": {"a": 0.0085, "b": 0.0010, "tank_l": 0.0},
+               "lng_captive": {"a": 0.0085, "b": 0.0010, "tank_l": 0.0}}
+GAS_FUELS = ("gas_captive", "lng_captive")
+#: A curve in the other fuel's unit: a diesel slope under 0.1 L a kWh would burn under one kWh of diesel for a kWh out, and a gas slope over 0.05 MMBtu
+#: a kWh (under 7 % efficient) or a no-load term over 0.01 MMBtu an hour per rated kW is a diesel curve in litres
+HSD_A_MIN, GAS_A_MAX, GAS_B_MAX = 0.1, 0.05, 0.01
+
+
 class GensetFields(Strict):
     rated_kw: float = Field(gt=0, le=50000)
     f_min: float = Field(0.3, ge=0.0, le=1.0)
     fuel_kind: Literal["hsd", "gas_captive", "lng_captive"] = "hsd"
-    #: HOMER's convention: fuel units per hour = b * rated_kw * on + a * output_kw (litres, or m3 / MMBtu for gas)
+    #: HOMER's convention: fuel units per hour = b * rated_kw * on + a * output_kw (litres of diesel, or MMBtu of captive gas or RLNG: FUEL_CURVES)
     a: float = Field(0.273, gt=0, le=5)
     b: float = Field(0.033, ge=0, le=1)
     c_start_rs: float = Field(1500.0, ge=0)
@@ -181,6 +364,63 @@ class GensetFields(Strict):
     cap_hours_per_day: float = Field(24.0, ge=0, le=24)
     tank_l: float = Field(2000.0, ge=0)
     parallel_allowed: bool = False
+    #: the nameplate's rating in kVA and the power factor it is rated at (audit flow-onboarding-16: sets are sold and labelled in kVA, so a 250 kVA set
+    #: typed as 250 kW was overstated by a quarter): the plan counts on rated_kw, which is rated_kva x power_factor (taken from them when left out).
+    #: None: a rating given in kW only, as before
+    rated_kva: float | None = Field(None, gt=0, le=62500)
+    power_factor: float = Field(0.8, ge=0.5, le=1.0)
+
+    @field_validator("c_start_rs", "c_runhr_rs", "c_om_rs_per_kwh", "tank_l")
+    @classmethod
+    def _upper(cls, v: float, info) -> float:
+        """The money figures and the tank are bounded, as the other fields are (audit flow-onboarding-18: Rs 1e12 a start and a 1e12 L tank were
+        stored)."""
+        hi, words = GENSET_UPPER[info.field_name]
+        if v > hi:
+            raise ValueError(words)
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fuel_defaults(cls, v):
+        """The fuel's own curve and tank where the save leaves them out (FUEL_CURVES), not diesel's whatever the fuel."""
+        if isinstance(v, dict) and v.get("fuel_kind") in FUEL_CURVES:
+            v = {**{k: x for k, x in FUEL_CURVES[v["fuel_kind"]].items() if k not in v}, **v}
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _kw_from_kva(cls, v):
+        """A rating given in kVA alone: its kW at the power factor (0.8 where it is left out)."""
+        if isinstance(v, dict) and "rated_kw" not in v and isinstance(v.get("rated_kva"), (int, float)) and not isinstance(v.get("rated_kva"), bool):
+            pf = v.get("power_factor", 0.8)
+            if isinstance(pf, (int, float)) and not isinstance(pf, bool):
+                v = {**v, "rated_kw": round(float(v["rated_kva"]) * float(pf), 3)}
+        return v
+
+    @model_validator(mode="after")
+    def _kva_agrees(self):
+        """The kW the plan counts on is the nameplate's kVA times its power factor."""
+        if self.rated_kva is not None:
+            kw = self.rated_kva * self.power_factor
+            if abs(self.rated_kw - kw) > max(0.05, 0.001 * kw):
+                raise ValueError(f"A genset's rating in kW is its kVA times its power factor: {_num(self.rated_kva)} kVA at {self.power_factor:g} is "
+                                 f"{_num(kw)} kW")
+        return self
+
+    @model_validator(mode="after")
+    def _fuel_units(self):
+        """A curve in the fuel's own unit, and no tank on piped gas."""
+        if self.fuel_kind in GAS_FUELS:
+            if self.a > GAS_A_MAX:
+                raise ValueError(f"A gas genset's fuel curve is in MMBtu: its slope (a) is at most {GAS_A_MAX} MMBtu per kWh")
+            if self.b > GAS_B_MAX:
+                raise ValueError(f"A gas genset's fuel at no load (b) is at most {GAS_B_MAX} MMBtu an hour per rated kW")
+            if self.tank_l > 0:
+                raise ValueError("A genset on piped gas has no tank: its tank is 0 L")
+        elif self.a < HSD_A_MIN:
+            raise ValueError(f"A diesel genset's fuel curve is in litres: its slope (a) is at least {HSD_A_MIN} L per kWh")
+        return self
 
 
 ASSET_MODELS = {"pv": PvFields, "inverter": InverterFields, "battery": BatteryFields, "genset": GensetFields}
@@ -188,6 +428,54 @@ ASSET_MODELS = {"pv": PvFields, "inverter": InverterFields, "battery": BatteryFi
 
 def _now() -> str:
     return store._now()
+
+
+# ------------------------------------------------------------------------------------------------ saves based on older values (audit flow-onboarding-05)
+
+#: A save that carries no `if_unchanged`: written without the check, as before
+UNCHECKED = object()
+
+ASSET_NAMES = {"pv": "PV array", "inverter": "inverter", "battery": "battery", "genset": "genset"}
+_FIELD_WORDS = {"lat": "latitude", "lon": "longitude", "load_peak_kw": "typical peak load", "sanctioned_load_kw": "sanctioned load",
+                "export_cap_kw": "export cap", "mdi_interval_min": "MDI interval", "kwp_dc": "DC size", "kw_ac": "AC size", "gamma_pdc": "temperature coefficient",
+                "losses_pct": "losses", "nameplate_kwh": "nameplate energy", "soh": "state of health", "p_ch_kw": "charge power", "p_dis_kw": "discharge power",
+                "eta_c": "charge efficiency", "eta_d": "discharge efficiency", "soc_min": "lowest state of charge", "soc_max": "highest state of charge",
+                "rated_kw": "rating", "f_min": "minimum loading", "tank_l": "tank", "min_up_h": "minimum run", "min_down_h": "minimum rest",
+                "rated_kva": "rating in kVA", "power_factor": "power factor",
+                "genset_start_control": "genset start method", "genset_start_soc_pct": "genset start threshold"}
+
+
+class Changed(Exception):
+    """A save based on stored values that were changed since: the route answers 409 `site_changed` with this sentence and the fields (`changed`)."""
+
+    def __init__(self, sentence: str, changed: list[str]):
+        super().__init__(sentence)
+        self.changed = changed
+
+
+def _listing(words: list[str]) -> str:
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def check_unchanged(held: dict | None, expect, what: str) -> None:
+    """The optimistic check of the site editors: `expect` is the save's `if_unchanged`, the stored values its form was based on as the client last read
+    them (an object of fields), or None when it read none stored. When they are no longer what is held, someone changed them since (in Site settings, or
+    another person), and the save raises Changed rather than writing over the newer values. UNCHECKED (left out of the save) checks nothing."""
+    if expect is UNCHECKED:
+        return
+    if expect is not None and not isinstance(expect, dict):
+        raise ValueError("if_unchanged is the set of stored values the form was based on")
+    again = "load the current values, or save yours over them"
+    if expect is None:
+        if held is not None:
+            raise Changed(f"{what} was added after this form was loaded: {again}", [])
+        return
+    if held is None:
+        raise Changed(f"{what} was removed after this form was loaded: {again}", [])
+    changed = sorted(k for k, v in expect.items() if held.get(k) != v)
+    if changed:
+        words = [_FIELD_WORDS.get(k, k.replace("_", " ")) for k in changed]
+        raise Changed(f"{what}'s {_listing(words)} changed after this form was loaded: {again}", changed)
 
 
 # ------------------------------------------------------------------------------------------------ sites
@@ -222,31 +510,37 @@ def create(fields: dict, by: str, site_id: str | None = None, demo_link: str | N
     sid = site_id or store.new_id()
     now = _now()
     with store.connect() as con:
+        capable = _source_capable(con, sid, data, None) or "monitor"
         con.execute("INSERT INTO sites (id, name, status, tier_capable, tier_allowed, demo_link, data, created, updated) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (sid, data["name"], "observing", "monitor", "monitor", demo_link, json.dumps(data), now, now))
+                    (sid, data["name"], "observing", capable, "monitor", demo_link, json.dumps(data), now, now))
     store.audit(by, "added a site", data["name"], {"site_id": sid})
     return get(sid)
 
 
-def update(site_id: str, fields: dict, by: str) -> dict:
+def update(site_id: str, fields: dict, by: str, if_unchanged=UNCHECKED) -> dict:
     """The site's fields changed by `fields` (a partial set, or the form sent back whole). A stored key SiteFields does not know (a demo site's `twin`,
-    which the demo writes) is carried through unvalidated and unchanged: the request may send it back as stored, never change or add it."""
-    site = get(site_id)
-    if site is None:
-        raise KeyError(site_id)
-    stored = dict(site.get("data") or {})
-    carried = {k: stored.pop(k) for k in list(stored) if k not in SiteFields.model_fields}
-    incoming = dict(fields)
-    for k in [k for k in incoming if k in carried]:
-        if incoming[k] != carried[k]:
-            raise ValueError(f"The site's {k.replace('_', ' ')} is kept as stored and cannot be changed here")
-        incoming.pop(k)
-    data = check(SiteFields, {**stored, **incoming}).model_dump()
-    _stamp_source(data, site.get("data"), by)
-    data = {**data, **carried}
-    with store.connect() as con:
-        con.execute("UPDATE sites SET name = ?, data = ?, updated = ? WHERE id = ?", (data["name"], json.dumps(data), _now(), site_id))
-    store.audit(by, "changed a site", data["name"], {"site_id": site_id, "fields": sorted(fields)})
+    which the demo writes) is carried through unvalidated and unchanged: the request may send it back as stored, never change or add it.
+    `if_unchanged` (check_unchanged) is compared with the stored fields in the same write transaction as the write, so no save lands in between."""
+    with store.write_transaction() as con:
+        r = con.execute("SELECT * FROM sites WHERE id = ? AND deleted IS NULL", (site_id,)).fetchone()
+        if r is None:
+            raise KeyError(site_id)
+        before = store.row(r).get("data") or {}
+        check_unchanged(before, if_unchanged, "The site")
+        stored = dict(before)
+        carried = {k: stored.pop(k) for k in list(stored) if k not in SiteFields.model_fields}
+        incoming = dict(fields)
+        for k in [k for k in incoming if k in carried]:
+            if incoming[k] != carried[k]:
+                raise ValueError(f"The site's {k.replace('_', ' ')} is kept as stored and cannot be changed here")
+            incoming.pop(k)
+        data = check(SiteFields, {**stored, **incoming}).model_dump()
+        _stamp_source(data, before, by)
+        data = {**data, **carried}
+        capable = _source_capable(con, site_id, data, before, r["tier_capable"]) or r["tier_capable"]
+        con.execute("UPDATE sites SET name = ?, data = ?, tier_capable = ?, updated = ? WHERE id = ?",
+                    (data["name"], json.dumps(data), capable, _now(), site_id))
+        store.audit(by, "changed a site", data["name"], {"site_id": site_id, "fields": sorted(fields)}, con=con)
     return get(site_id)
 
 
@@ -285,16 +579,26 @@ def connections(site_id: str) -> list[dict]:
     return [store.row(r) for r in rows]
 
 
-def put_connection(site_id: str, fields: dict, by: str, conn_id: str | None = None) -> dict:
-    data = check(ConnectionFields, fields).model_dump()
+def put_connection(site_id: str, fields: dict, by: str, conn_id: str | None = None, if_unchanged=UNCHECKED) -> dict:
+    """Saves the connection `conn_id` (or a new one). `if_unchanged` is checked against that connection's stored fields (none stored: None) in the
+    write's own transaction. The DISCO group and the province follow the site's DISCO where the save leaves them out, and a group that contradicts the
+    DISCO is refused (audit flow-onboarding-02)."""
     cid = conn_id or store.new_id()
     now = _now()
-    with store.connect() as con:
-        if conn_id and con.execute("SELECT 1 FROM connections WHERE id = ? AND site_id = ?", (conn_id, site_id)).fetchone():
+    with store.write_transaction() as con:
+        site = con.execute("SELECT data FROM sites WHERE id = ?", (site_id,)).fetchone()
+        disco = (json.loads(site["data"]) or {}).get("disco") if site else None
+        data = check(ConnectionFields, _from_disco(fields, disco)).model_dump()
+        problem = group_problem(data["disco_group"], disco)
+        if problem:
+            raise ValueError(problem)
+        held = con.execute("SELECT data FROM connections WHERE id = ? AND site_id = ?", (conn_id, site_id)).fetchone() if conn_id else None
+        check_unchanged(json.loads(held["data"]) if held else None, if_unchanged, "The grid connection")
+        if held:
             con.execute("UPDATE connections SET data = ?, updated = ? WHERE id = ?", (json.dumps(data), now, conn_id))
         else:
             con.execute("INSERT INTO connections (id, site_id, data, created, updated) VALUES (?,?,?,?,?)", (cid, site_id, json.dumps(data), now, now))
-    store.audit(by, "saved a connection", site_id, {"connection_id": cid, "category": data["tariff_category"]})
+        store.audit(by, "saved a connection", site_id, {"connection_id": cid, "category": data["tariff_category"]}, con=con)
     return next(c for c in connections(site_id) if c["id"] == cid)
 
 
@@ -309,19 +613,22 @@ def assets(site_id: str) -> dict:
     return out
 
 
-def put_asset(site_id: str, role: str, fields: dict, by: str) -> dict:
+def put_asset(site_id: str, role: str, fields: dict, by: str, if_unchanged=UNCHECKED) -> dict:
+    """Saves the site's asset of this role. `if_unchanged` is checked against the stored asset's fields (none stored: None) in the write's own
+    transaction."""
     if role not in ASSET_MODELS:
         raise ValueError(f"An asset is one of {', '.join(ASSET_MODELS)}")
     data = check(ASSET_MODELS[role], fields).model_dump()
     now = _now()
-    with store.connect() as con:
-        held = con.execute("SELECT id FROM assets WHERE site_id = ? AND role = ?", (site_id, role)).fetchone()
+    with store.write_transaction() as con:
+        held = con.execute("SELECT id, data FROM assets WHERE site_id = ? AND role = ?", (site_id, role)).fetchone()
+        check_unchanged(json.loads(held["data"]) if held else None, if_unchanged, f"The {ASSET_NAMES[role]}")
         if held:
             con.execute("UPDATE assets SET data = ?, updated = ? WHERE id = ?", (json.dumps(data), now, held["id"]))
         else:
             con.execute("INSERT INTO assets (id, site_id, role, data, created, updated) VALUES (?,?,?,?,?,?)",
                         (store.new_id(), site_id, role, json.dumps(data), now, now))
-    store.audit(by, f"saved the {role}", site_id)
+        store.audit(by, f"saved the {role}", site_id, con=con)
     return assets(site_id)[role]
 
 
@@ -337,6 +644,119 @@ def full(site_id: str) -> dict | None:
     if site is None:
         return None
     return {**site, "connections": connections(site_id), "assets": assets(site_id), "state": state(site_id), "native": native_latest(site_id)}
+
+
+# ------------------------------------------------------------------------------------------------ what the setup says against itself
+
+#: A PV AC size above this many times its DC size is a typing slip worth a word: the array never gives the AC side more than its DC
+PV_AC_DC_MAX = 1.5
+
+
+def setup_warnings(site: dict) -> list[str]:
+    """Sentences on what the site's equipment, connections and critical load say against each other, and on a missing feeder code, for every site
+    answer (audit flow-onboarding-09: a 5 kW inverter took a 5,000 kW battery, PV 900 kW AC from 10 kWp DC and an export cap far above the sanctioned
+    load with no word; flow-onboarding-17: a blank feeder code was saved with no word). They do not refuse a save: a site may have PV on inverters of
+    its own, or a battery rated above its inverter, and the plan keeps PV and battery power within the inverter's kW AC whatever is typed. `site` is
+    full() of a site."""
+    out: list[str] = []
+    kw = lambda x: f"{_num(float(x))} kW"  # noqa: E731
+    a, d = site.get("assets") or {}, site.get("data") or {}
+    pv, bat = a.get("pv") or {}, a.get("battery") or {}
+    inv = float((a.get("inverter") or {}).get("kw_ac") or 0) or None
+    if inv and pv.get("kw_ac", 0) > inv:
+        out.append(f"The PV's AC size ({kw(pv['kw_ac'])}) is above the inverter's ({kw(inv)}): the plan passes no more than {kw(inv)} of PV and battery "
+                   "power through it")
+    if pv.get("kwp_dc") and pv.get("kw_ac", 0) > PV_AC_DC_MAX * pv["kwp_dc"]:
+        out.append(f"The PV's AC size ({kw(pv['kw_ac'])}) is more than one and a half times its DC size ({_num(pv['kwp_dc'])} kWp): check both")
+    for key, name in (("p_ch_kw", "charge power"), ("p_dis_kw", "discharge power")):
+        if inv and bat.get(key, 0) > inv:
+            out.append(f"The battery's {name} ({kw(bat[key])}) is above the inverter's AC size ({kw(inv)}): the plan keeps it within {kw(inv)}")
+    conns = [c.get("data") or {} for c in site.get("connections") or []]
+    for c in conns:
+        cap = float(c.get("export_cap_kw") or 0)
+        if inv and cap > inv:
+            out.append(f"The export cap ({kw(cap)}) is above the inverter's AC size ({kw(inv)}): the site cannot export more than the inverter passes")
+        if c.get("sanctioned_load_kw") and cap > c["sanctioned_load_kw"]:
+            out.append(f"The export cap ({kw(cap)}) is above the sanctioned load ({kw(c['sanctioned_load_kw'])}): a net-metering or net-billing agreement "
+                       "allows no more than the sanctioned load")
+        # the site's DISCO changed after the connection was saved (group_problem; activation asks for it, an active site is told here): it is priced on
+        # the other calendar's peak windows until the connection is saved again (audit flow-onboarding-02)
+        if c.get("regime") != "off_grid" and group_problem(c.get("disco_group"), d.get("disco")):
+            ke = group_for_disco(d.get("disco")) == "ke"
+            held, wanted = ("the other DISCOs'", "K-Electric's") if ke else ("K-Electric's", "the other DISCOs'")
+            out.append(f"The grid connection is priced on {held} time-of-use windows, but this site's DISCO is {d['disco']}: save the connection again "
+                       f"with {wanted} (tab C, or Site settings Tariff)")
+    crit = max([float(x) for x in d.get("critical_load_kw") or [] if isinstance(x, (int, float))] or [0.0])
+    if crit > 0 and bat.get("p_dis_kw"):
+        by_inverter = bool(inv) and inv < bat["p_dis_kw"]
+        if crit > (inv if by_inverter else bat["p_dis_kw"]):
+            what = f"the battery can give through the inverter ({kw(inv)})" if by_inverter else f"the battery's discharge power ({kw(bat['p_dis_kw'])})"
+            out.append(f"The critical load ({kw(crit)} at most) is more than {what}: it cannot carry it alone in an outage")
+    if crit > 0 and d.get("load_peak_kw") and crit > d["load_peak_kw"]:
+        out.append(f"The critical load ({kw(crit)} at most) is above the typical peak load ({kw(d['load_peak_kw'])}): check both")
+    # the outage model pools the company's sites on one feeder or transformer code (forecast: sites.outage_unit, "the key the outage model pools on")
+    on_grid = not d.get("off_grid") and (any(c.get("regime") != "off_grid" for c in conns) if conns else bool(d.get("disco")))
+    if on_grid and not str((d.get("outage_unit") or {}).get("code") or "").strip():
+        out.append("No feeder or transformer code is given: the outage forecast learns from this site's own outages only, not from the company's other "
+                   "sites on its feeder")
+    # Mode B is set-points an edge device writes (plan Part 7.2): a CSV or cloud source has no writer, so its plans arrive as slot tables (audit
+    # flow-onboarding-22: chosen for a CSV site without a word)
+    if d.get("control_mode") == "mode_b" and (d.get("data_source") or {}).get("kind") in SOURCE_CAPABLE:
+        out.append(MODE_B_WITHOUT_EDGE)
+    return list(dict.fromkeys(out))
+
+
+MODE_B_WITHOUT_EDGE = ("Mode B (set-points written by the edge device) needs an edge device: with a CSV or cloud source the plan reaches the inverter as "
+                       "slot tables a person keys in, so choose Mode A or advisory")
+
+
+# ------------------------------------------------------------------------------------------------ the data source's test (audit flow-onboarding-22)
+
+#: The points a source test looks for in the data received (plan 9.3 tab A and R8 2.2, "Test connection": the rows received and the detected points),
+#: grid presence first: without it outages cannot be seen and the reserve cannot be planned
+SOURCE_POINTS = ("grid_present", "grid_voltage_v", "grid_power_w", "pv_power_w", "load_power_w", "battery_power_w", "battery_soc_bms_pct",
+                 "genset_running", "inverter_mode_active")
+GRID_POINTS = ("grid_present", "grid_voltage_v")
+#: The grid points in the sentence's words (the points themselves are listed in `points`)
+GRID_POINT_WORDS = {"grid_present": "the grid-present signal", "grid_voltage_v": "the grid voltage"}
+#: How far back from the last minute received the test reads: a day of minutes
+SOURCE_TEST_S = 86400
+SOURCE_NO_DATA = "No data has arrived from this site yet: test the source again once its first readings are in"
+SOURCE_NO_GRID = ("The data received carries no grid presence (grid_present or the grid voltage): outages cannot be seen and the reserve cannot be "
+                  "planned. Add the point to the source, or choose a source that reports it")
+
+
+def _iso(ts) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat()
+
+
+def source_test(site_id: str) -> dict:
+    """What the site's data source has sent (plan 9.3 tab A: a connection test that refuses a source without a grid-present signal; until then the
+    wizard had only the person's tick): the minutes received in the day up to the last one, the points among SOURCE_POINTS that carry a value, and
+    `grid_signal`: "found" (grid_present or the grid voltage is among them), "missing" (data arrived without either) or "no_data" (nothing yet: a site
+    is set up before its data flows, so this is no refusal). Times are ISO, UTC."""
+    kind = (((get(site_id) or {}).get("data") or {}).get("data_source") or {}).get("kind")
+    last = telemetry.latest(site_id)
+    if not last:
+        return {"kind": kind, "grid_signal": "no_data", "rows": 0, "first_at": None, "last_at": None, "points": [], "sentence": SOURCE_NO_DATA}
+    got = telemetry.raw(site_id, int(last["ts"]) - SOURCE_TEST_S + 60, int(last["ts"]) + 60, columns=SOURCE_POINTS)
+    ts = got["ts"]
+
+    def carried(name: str) -> bool:
+        return any(v not in (None, "") for v in got[name]) if name == "inverter_mode_active" else any(not math.isnan(v) for v in got[name])
+
+    points = [p for p in SOURCE_POINTS if carried(p)]
+    grid = [p for p in GRID_POINTS if p in points]
+    return {"kind": kind, "grid_signal": "found" if grid else "missing", "rows": len(ts), "first_at": _iso(ts[0]), "last_at": _iso(ts[-1]),
+            "points": points,
+            "sentence": f"Grid presence is in the data received ({' and '.join(GRID_POINT_WORDS[p] for p in grid)}), so outages can be seen" if grid
+            else SOURCE_NO_GRID}
+
+
+def grid_connected(site: dict) -> bool:
+    """Whether the site (full()) draws on a grid it can lose: not off-grid, with a connection of another regime than off_grid."""
+    d = site.get("data") or {}
+    return not d.get("off_grid") and any((c.get("data") or {}).get("regime") != "off_grid" for c in site.get("connections") or [])
 
 
 # ------------------------------------------------------------------------------------------------ carried state (plan Part 4.8)
@@ -410,13 +830,26 @@ def clear_override(site_id: str, oid: str, author: str) -> None:
 
 # ------------------------------------------------------------------------------------------------ native-settings captures (immutable, plan Part 8.1)
 
+#: A slot's start: a time of day from 00:00 to 23:59 (audit flow-onboarding-14: '99:99' was stored, and the replay read it as a minute that never comes)
+SLOT_START = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+#: The most slots any brand's table holds (Huawei's fourteen periods, delivery.BRANDS); a site's own inverter may hold fewer (routes_sites.native_post)
+NATIVE_MAX_SLOTS = 14
+
+
 class NativeSlot(Strict):
-    start: str = Field(pattern=r"^\d{2}:\d{2}$")
+    start: str
     mode: Literal["self_use", "hold", "charge_grid", "charge_pv_only", "discharge", "export"] = "self_use"
     soc_floor_pct: float = Field(20.0, ge=0, le=100)
     soc_target_pct: float = Field(100.0, ge=0, le=100)
     grid_charge: bool = False
     max_charge_kw: float | None = None
+
+    @field_validator("start")
+    @classmethod
+    def _start(cls, v: str) -> str:
+        if not SLOT_START.match(v):
+            raise ValueError("Each slot starts at a time from 00:00 to 23:59")
+        return v
 
 
 class NativeCapture(Strict):
@@ -424,8 +857,22 @@ class NativeCapture(Strict):
     work_mode: Literal["self_use", "tou", "backup", "feed_in_first"] = "self_use"
     backup_soc_pct: float = Field(20.0, ge=0, le=100)
     grid_charge_allowed: bool = False
-    slots: list[NativeSlot] = Field(default_factory=list, max_length=14)
+    slots: list[NativeSlot] = Field(default_factory=list)
     photo: str = Field("", max_length=7_000_000)
+
+    @field_validator("slots", mode="before")
+    @classmethod
+    def _count(cls, v):
+        if isinstance(v, list) and len(v) > NATIVE_MAX_SLOTS:
+            raise ValueError(f"An inverter's table holds at most {NATIVE_MAX_SLOTS} slots")
+        return v
+
+    @model_validator(mode="after")
+    def _distinct(self):
+        starts = [s.start for s in self.slots]
+        if len(set(starts)) < len(starts):
+            raise ValueError("Two slots cannot start at the same time")
+        return self
 
 
 def native_latest(site_id: str) -> dict | None:

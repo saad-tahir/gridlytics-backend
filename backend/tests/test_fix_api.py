@@ -239,7 +239,7 @@ def test_only_an_administrator_changes_money_settings(world):
     assert operator.put(f"/api/sites/{sid}/assets/battery", json={**bat, "soh": 0.85}).status_code == 200
     r = operator.put(f"/api/sites/{sid}", json={"name": "Mill One East", "voll_rs_per_kwh": 800})
     assert r.status_code == 200 and "voll_rs_per_kwh" not in r.json()["data"]
-    assert operator.post("/api/sites", json={"name": "New site"}).status_code == 200
+    assert admin.post("/api/sites", json={"name": "New site"}).status_code == 200    # adding a site is the administrator's (audit role-operator-07)
     with world.use():
         assert sites.assets(sid)["battery"]["replacement_cost_per_kwh"] == 60000
         assert sites.get(sid)["data"]["voll_rs_per_kwh"] == 800

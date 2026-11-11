@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 from fastapi import APIRouter, Body, Header, HTTPException
+from pydantic import ValidationError
 
 from . import alerts, auth, battery, delivery, demo, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, verify
 from .routes_common import PKT, bad, full_or_404, now_ts, out, put_state, site_or_404, today
@@ -25,7 +26,19 @@ def meta():
             "brand_grammars": {k: {kk: vv for kk, vv in v.items()} for k, v in delivery.BRANDS.items()},
             "categories": sorted(tariff_data.CARDS_279.keys()), "regimes": ["net_billing", "net_metering_legacy", "none", "flat", "off_grid"],
             "override_kinds": sites.OVERRIDE_KINDS, "role": (auth.current.get() or {}).get("role"),
-            "permissions": {p: auth.can(p) for p in auth.PERMISSIONS}}
+            "permissions": {p: auth.can(p) for p in auth.PERMISSIONS},
+            # the categories the ICP applies to, so tab C asks for the ICP baseline only there (audit engine-tariffs-05)
+            "icp_categories": _icp_categories(),
+            # what every plan falls back to when no newer one arrives (delivery's fallback block, the floor being the site's reserve floor), for tab D
+            # to show (plan 9.3 tab D "fallback"; audit flow-onboarding-22)
+            "fallback": {"on_expiry": "inverter_native", "revert_after_hours": delivery.FALLBACK_HOURS}}
+
+
+def _icp_categories() -> list[str]:
+    """The tariff categories of the ICP version in force today (none in force: the shipped one's)."""
+    v = tariffs.resolve("icp", "national", today())
+    body = v["body"] if v else next(x["body"] for x in tariff_data.SHIPPED if x["kind"] == "icp")
+    return list(body.get("categories") or [])
 
 
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -221,8 +234,29 @@ ASSET_MONEY_FIELDS = {"battery": ("replacement_cost_per_kwh", "warranted_cycles"
                       "genset": ("c_start_rs", "c_runhr_rs", "c_om_rs_per_kwh")}
 
 
+#: The site's control limits (plan Part 9.4: the administrator "edits limits", the operator works within them; audit role-operator-07): the reserve floor
+#: and its outage threshold, which the plan never crosses, the cycle cap, the control mode, the critical load and the battery's charge sources
+SITE_LIMIT_FIELDS = ("control_mode", "reserve_policy", "cycle_cap_per_day", "critical_load_kw", "grid_charge_allowed", "gen_charge_allowed")
+
+
 def _defaults(model, names) -> dict:
     return {k: model.model_fields[k].default for k in names if k in model.model_fields}
+
+
+def _limits_changed(inp: dict, data: dict) -> bool:
+    """Whether the save changes a control limit (SITE_LIMIT_FIELDS): the limits as sites.update would store them, against the stored ones, so a limit sent
+    as stored (the form sent back whole, 20 for a stored 20.0, a key a site saved before it existed lacks sent at its default) is no change, while a
+    reserve policy sent in part changes the part it leaves out (filled with its default). A limit the model refuses counts as a change: the role is
+    checked first, and an administrator's save then gets the field's 422."""
+    sent = {k: inp[k] for k in SITE_LIMIT_FIELDS if isinstance(inp, dict) and k in inp}
+    if not sent:
+        return False
+    held = {k: data[k] for k in SITE_LIMIT_FIELDS if k in data}
+    as_stored = lambda fields: sites.SiteFields.model_validate({"name": "-", **fields}).model_dump(include=set(sent))  # noqa: E731
+    try:
+        return as_stored({**held, **sent}) != as_stored(held)
+    except ValidationError:
+        return True
 
 
 def _need_money_settings(inp: dict, before: dict, names, doing: str) -> None:
@@ -238,7 +272,7 @@ def sites_list():
 
 @router.post("/api/sites")
 def site_create(inp: dict = Body(...)):
-    auth.need("edit_sites", "Adding a site")
+    auth.need("manage_sites", "Adding a site")
     _need_money_settings(inp, _defaults(sites.SiteFields, SITE_MONEY_FIELDS), SITE_MONEY_FIELDS, "Setting the site's value of lost load or wear costing")
     try:
         s = sites.create(inp, auth.actor())
@@ -254,14 +288,37 @@ def site_get(site_id: str):
     return _site_answer(site_id)
 
 
+def _if_unchanged(inp: dict, held_may_be_none: bool = True):
+    """The save's `if_unchanged` (sites.check_unchanged), taken out of the body: the stored values the client's form was based on, or null when it read
+    none stored (a connection or an asset only: a site always exists). Left out, the save is not checked (sites.UNCHECKED)."""
+    if "if_unchanged" not in inp:
+        return sites.UNCHECKED
+    expect = inp.pop("if_unchanged")
+    if not isinstance(expect, dict) and not (expect is None and held_may_be_none):
+        raise Refusal(422, "if_unchanged is the set of stored values the form was based on", "invalid")
+    return expect
+
+
+def _changed(exc: sites.Changed) -> Refusal:
+    """A save based on values changed since (audit flow-onboarding-05): 409, with the fields that changed."""
+    return Refusal(409, str(exc), "site_changed", extra={"changed": exc.changed})
+
+
 @router.put("/api/sites/{site_id}")
 def site_update(site_id: str, inp: dict = Body(...)):
+    """Saves the site's fields (a partial set). With `if_unchanged` (the stored fields the form was based on), a save whose fields were changed since is
+    refused with 409 `site_changed` (and `changed`, the fields) instead of writing over the newer values."""
     auth.need("edit_sites", "Editing a site")
     s = site_or_404(site_id)
+    expect = _if_unchanged(inp, held_may_be_none=False)
+    if _limits_changed(inp, s.get("data") or {}):
+        auth.need("manage_sites", "Changing the site's control limits")
     _need_money_settings(inp, {**_defaults(sites.SiteFields, SITE_MONEY_FIELDS), **(s.get("data") or {})}, SITE_MONEY_FIELDS,
                          "Changing the site's value of lost load or wear costing")
     try:
-        sites.update(site_id, inp, auth.actor())
+        sites.update(site_id, inp, auth.actor(), expect)
+    except sites.Changed as exc:
+        raise _changed(exc) from None
     except ValueError as exc:
         raise bad(exc) from None
     return _site_answer(site_id)
@@ -282,22 +339,47 @@ def _grid_settled(site: dict, connections: list[dict]) -> bool:
     return bool(connections) or data.get("site_type") == "farm" or bool(data.get("off_grid"))
 
 
+@router.post("/api/sites/{site_id}/source/test")
+def site_source_test(site_id: str):
+    """The data source's test (plan 9.3 tab A, R8 2.2 "Test connection"; audit flow-onboarding-22): the minutes received in the last day of data, the
+    points they carry and whether grid presence is among them (sites.source_test). Nothing is changed: activation refuses a grid-connected site whose
+    data carries no grid presence."""
+    auth.need("edit_sites", "Testing the data source")
+    site_or_404(site_id)
+    return sites.source_test(site_id)
+
+
 @router.post("/api/sites/{site_id}/activate")
 def site_activate(site_id: str):
-    auth.need("edit_sites", "Activating a site")
+    auth.need("manage_sites", "Activating a site")
     s = sites.full(site_id) or {}
     if not s:
         raise HTTPException(status_code=404, detail="No such site")
     missing = []
+    src = (s.get("data") or {}).get("data_source") or {}
+    if not (isinstance(src, dict) and src.get("kind") in sites.DATA_SOURCE_KINDS and src.get("grid_signal_confirmed")):
+        # plan 9.3 tab A: without a grid-presence signal outages cannot be seen and the reserve cannot be planned (audit flow-onboarding-08: a site with no
+        # source, or an unconfirmed one, was activated and planned)
+        missing.append("the data source, with its grid-presence signal confirmed (tab A)")
+    elif sites.grid_connected(s) and sites.source_test(site_id)["grid_signal"] == "missing":
+        # the source's test (plan 9.3: "refuses a source without a grid-present signal"; audit flow-onboarding-22): data arrived, and none of it says
+        # whether the grid is up, whatever the tick says
+        missing.append("the grid-presence signal to the data the source sends (the data received has neither grid_present nor the grid voltage; tab A)")
     if not (s.get("assets") or {}).get("inverter"):
         missing.append("the inverter (tab B)")
     if not _grid_settled(s, s.get("connections") or []):
         missing.append("the grid connection and tariff (tab C)")
+    elif any((c.get("data") or {}).get("tariff_category") not in tariff_data.CARDS_279 for c in s.get("connections") or []):
+        # a connection stored before the category was checked (audit flow-onboarding-07): the tick could price nothing and the site never planned
+        missing.append("the tariff category of each grid connection (tab C)")
+    elif any(sites.group_problem((c.get("data") or {}).get("disco_group"), (s.get("data") or {}).get("disco")) for c in s.get("connections") or []):
+        # the site's DISCO changed after its connection was saved: it would be priced with the other DISCO's peak windows (audit flow-onboarding-02)
+        missing.append("the DISCO group of each grid connection, to match the site's DISCO (tab C)")
     if missing:
         raise Refusal(422, "Add " + " and ".join(missing) + " before activating", "incomplete")
     sites.set_status(site_id, "active")
     store.audit(auth.actor(), "activated a site", site_id)
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 #: A new connection's save is idempotent (a retried first save never inserts a second row): by the client's key when it sends one (the Idempotency-Key
@@ -326,7 +408,8 @@ def _same_connection(site_id: str, inp: dict, key: str | None) -> str | None:
 def connection_put(site_id: str, inp: dict = Body(...), idempotency_key: str | None = Header(default=None)):
     """Saves a connection: with `id`, that one; without, a new one, unless the save repeats one already made (`_same_connection`), which is then saved
     in place, so a retried first save never makes a duplicate. Two connections on one site differ in regime, tariff or meter reference, or are saved
-    with idempotency keys of their own."""
+    with idempotency keys of their own. With `id` and `if_unchanged` (that connection's stored fields the form was based on, or null when it read
+    none), a save whose connection was changed since is refused with 409 `site_changed`."""
     auth.need("edit_sites", "Editing the grid connection")
     site_or_404(site_id)
     conn_id = inp.pop("id", None)
@@ -334,20 +417,25 @@ def connection_put(site_id: str, inp: dict = Body(...), idempotency_key: str | N
     if key is not None and (not isinstance(key, str) or not 1 <= len(key.strip()) <= IDEMPOTENCY_KEY_MAX):
         raise Refusal(422, f"The idempotency key is text of 1 to {IDEMPOTENCY_KEY_MAX} characters", "invalid")
     key = key.strip() if key else None
+    # if_unchanged (the stored fields of the connection `id` the form was read from) goes with that id: a new connection has nothing stored to compare
+    expect = _if_unchanged(inp)
+    if expect is not sites.UNCHECKED and not conn_id:
+        raise Refusal(422, "if_unchanged goes with the id of the saved connection it was read from", "invalid")
     try:
-        if inp.get("tariff_category") and inp["tariff_category"] not in tariff_data.CARDS_279:
-            raise ValueError(f"Unknown tariff category {inp['tariff_category']}")
+        # the tariff category is checked by ConnectionFields (an empty or unknown one is refused, audit flow-onboarding-07)
         if conn_id:
-            sites.put_connection(site_id, inp, auth.actor(), conn_id)
+            sites.put_connection(site_id, inp, auth.actor(), conn_id, expect)
         else:
             with _connection_lock:
                 same = _same_connection(site_id, inp, key)
                 saved = sites.put_connection(site_id, inp, auth.actor(), same)
                 if key:
                     store.set_setting(_idem_setting(site_id, key), saved["id"])
+    except sites.Changed as exc:
+        raise _changed(exc) from None
     except ValueError as exc:
         raise bad(exc) from None
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 @router.delete("/api/sites/{site_id}/connection/{conn_id}")
@@ -366,14 +454,19 @@ def connection_delete(site_id: str, conn_id: str):
         con.execute("DELETE FROM connections WHERE id = ? AND site_id = ?", (conn_id, site_id))
         con.execute("DELETE FROM settings WHERE key LIKE ? AND value = ?", (_idem_setting(site_id, "%"), json.dumps(conn_id)))
     store.audit(auth.actor(), "removed a connection", site_id, {"connection_id": conn_id})
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 @router.put("/api/sites/{site_id}/assets/{role}")
 def asset_put(site_id: str, role: str, inp: dict = Body(...)):
+    """Saves the site's asset of this role. With `if_unchanged` (the stored asset's fields the form was based on, or null when it read none), a save
+    whose asset was changed, added or removed since is refused with 409 `site_changed`."""
     auth.need("edit_sites", "Editing the site's equipment")
     site_or_404(site_id)
     inp.pop("id", None)
+    expect = _if_unchanged(inp)
+    if isinstance(expect, dict):
+        expect.pop("id", None)
     names = ASSET_MONEY_FIELDS.get(role, ())
     if names:
         cur = sites.assets(site_id).get(role)
@@ -386,10 +479,12 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
             inp.update({k: cur[k] for k in names if k in cur and (k not in inp or k in hidden and inp[k] == defaults.get(k))})
         _need_money_settings(inp, before, names, "Changing the equipment's money settings (prices and wear)")
     try:
-        sites.put_asset(site_id, role, inp, auth.actor())
+        sites.put_asset(site_id, role, inp, auth.actor(), expect)
+    except sites.Changed as exc:
+        raise _changed(exc) from None
     except ValueError as exc:
         raise bad(exc) from None
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
 
 
 def _money_set(role: str, cur: dict | None) -> bool:
@@ -410,7 +505,14 @@ def asset_delete(site_id: str, role: str):
     if _money_set(role, sites.assets(site_id).get(role)):
         auth.need("edit_money_settings", "Removing equipment whose money settings (prices and wear) an administrator set")
     sites.remove_asset(site_id, role, auth.actor())
-    return out(sites.full(site_id))
+    return _site_answer(site_id)
+
+
+def _has_inverter_mode(site_id: str) -> bool:
+    """Whether any minute of the site carries the inverter's mode: a CSV source without the inverter_mode_active column is for monitor only (plan Part 7.5,
+    telemetry.import_csv says so on import), while one with it supports advisory writes (sites.SOURCE_CAPABLE; audit flow-onboarding-03)."""
+    with telemetry.connect() as con:
+        return con.execute("SELECT 1 FROM minute WHERE site_id = ? AND inverter_mode_active IS NOT NULL LIMIT 1", (site_id,)).fetchone() is not None
 
 
 @router.put("/api/sites/{site_id}/tier")
@@ -422,6 +524,9 @@ def tier_put(site_id: str, inp: dict = Body(...)):
         raise Refusal(422, "The tier is monitor, advisory_writes or closed_loop", "invalid")
     if sites.TIERS.index(tier) > sites.TIERS.index(s["tier_capable"]):
         raise Refusal(422, f"This site's data source supports {s['tier_capable'].replace('_', ' ')} at most", "above_capable")
+    if tier != "monitor" and ((s.get("data") or {}).get("data_source") or {}).get("kind") == "csv" and not _has_inverter_mode(site_id):
+        raise Refusal(422, "No imported file of this site carries inverter_mode_active, the inverter's mode that the savings comparison needs: until one does, "
+                      "a CSV source supports monitor only", "no_inverter_mode")
     if tier != "monitor" and not sites.native_latest(site_id):
         raise Refusal(422, "Capture the inverter's native settings before control is allowed: they are the fallback and the baseline", "no_capture")
     signoff = str(inp.get("signoff", "") or "")[:200]
@@ -451,9 +556,12 @@ def _tier_signoff(site_id: str, state: dict | None) -> dict | None:
 
 
 def _site_answer(site_id: str) -> dict:
+    """Every answer that is the site: what GET gives, with `tier_signoff` and `setup_warnings` (sites.setup_warnings: what the equipment, connections
+    and critical load say against each other, and a missing feeder code; audit flow-onboarding-09 and -17)."""
     s = full_or_404(site_id)
     s.pop("photo", None)
     s["tier_signoff"] = _tier_signoff(site_id, s.get("state"))
+    s["setup_warnings"] = sites.setup_warnings(s)
     return out(s)
 
 
@@ -463,10 +571,30 @@ def native_get(site_id: str):
     return {"latest": sites.native_latest(site_id), "versions": sites.native_versions(site_id)}
 
 
+def _native_slots_fit(site_id: str, inp: dict) -> None:
+    """A capture holds no more slots than the site's inverter table: its brand's `max_slots` (delivery.BRANDS, GET /api/meta brand_grammars; audit
+    role-operator-16: fourteen were accepted for a six-program Deye). Without a recorded inverter the most any brand holds applies (sites.NativeCapture)."""
+    slots = inp.get("slots") if isinstance(inp, dict) else None
+    brand = ((sites.assets(site_id).get("inverter")) or {}).get("brand")
+    gram = delivery.BRANDS.get(brand) if brand else None
+    if gram and isinstance(slots, list) and len(slots) > gram["max_slots"]:
+        whose = "An inverter's" if brand == "other" else f"A {gram['label']} inverter's"
+        raise Refusal(422, f"{whose} table holds at most {gram['max_slots']} slots", "invalid")
+
+
+#: A capture sent by a person (POST /native needs edit_sites, which no API key holds) was typed in or taken from a photograph: only the edge device reads the
+#: settings back (audit flow-savings-pilot-bill-12, the form's half: a typed capture was marked "read back by the edge device", the most trusted source)
+NATIVE_NOT_READ_BACK = ("Only the edge device reads the inverter's settings back: a capture sent here was typed in or taken from a photograph of the screen, "
+                        "so say which")
+
+
 @router.post("/api/sites/{site_id}/native")
 def native_post(site_id: str, inp: dict = Body(...)):
     auth.need("edit_sites", "Capturing the native settings")
     site_or_404(site_id)
+    if isinstance(inp, dict) and inp.get("source") == "read_back":
+        raise Refusal(422, NATIVE_NOT_READ_BACK, "invalid")
+    _native_slots_fit(site_id, inp)
     try:
         return sites.capture_native(site_id, inp, auth.actor())
     except ValueError as exc:
@@ -648,7 +776,7 @@ def draft_put(draft_id: str, inp: dict = Body(...), site_id: str | None = None):
     site the draft made, once it exists; a draft saved without one keeps the site it has. A query `site_id` that names no site is refused (422); the
     body's is the form's own field, which the wizard sends in every autosave, so one that names no site (deleted meanwhile) is not recorded and the
     save stands. A draft id another member's draft holds is refused (409), never written over; the check and the write are one write transaction."""
-    auth.need("edit_sites", "Saving a draft")
+    auth.need("manage_sites", "Saving a draft")
     if len(json.dumps(inp)) > 200_000:
         raise Refusal(422, "The draft is too large", "invalid")
     if site_id:
@@ -673,7 +801,7 @@ def draft_put(draft_id: str, inp: dict = Body(...), site_id: str | None = None):
 def draft_delete(draft_id: str):
     """Discards the caller's own draft ("Add a site" offers it next to Resume). Another member's draft, or none, answers 404: a draft is private to
     the person who started it."""
-    auth.need("edit_sites", "Discarding a draft")
+    auth.need("manage_sites", "Discarding a draft")
     owner = _draft_owner()
     with store.write_transaction() as con:
         n = con.execute("DELETE FROM site_drafts WHERE draft_id = ? AND person = ?", (draft_id, owner)).rowcount

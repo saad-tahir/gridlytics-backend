@@ -254,7 +254,7 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                "cap_hours": g_asset["cap_hours_per_day"], "hours_today": carried["hours_today"], "day_index": local_days,
                "fuel_available": float(site.get("state", {}).get("fuel_l", g_asset["tank_l"]) or 1e9), "parallel": g_asset["parallel_allowed"],
                "control": control, "hold": mask["genset_hold"], "unknown": carried["unknown"],
-               "soc_on": float((d.get("reserve_policy") or {}).get("min_soc_pct", 20.0)) / 100.0 + 0.05}  # twin.plant_of's start threshold
+               "soc_on": sites.genset_start_soc(d)}  # twin.plant_of's start threshold
         p["genset"] = gen
     p["c_short"] = optimise._gen_marginal(gen) if gen else p["voll"]
     bat = None
