@@ -652,13 +652,14 @@ def _mall(p_start=0.01, T=96):
 def test_behind_an_amf_panel_the_battery_is_free_to_shave_the_peak():
     """The mall's plan bought 65 kWh from the grid at Rs 39.48 and held 95 % for 48 hours with no discharge: its reserve was 30 minutes of
     the whole critical load priced at diesel cost. Behind an AMF panel the battery bridges only the start delay, and the rest of a failed start
-    (one start in twenty), so the reserve is a few kWh and the battery shaves the peak."""
-    p = _mall()
+    (one start in twenty), so the reserve is a few kWh and the battery shaves the peak. At a 5 % chance of an outage starting every step the
+    old reserve (85 kWh at p c_short) let the battery shave 12.5 kWh of the peak; now it shaves about 80 (review: at 1 % both shaved)."""
+    p = _mall(p_start=0.05)
     r = optimise.solve(p)
     assert r["status"] == "optimal"
-    assert r["breakdown"]["discharge_kwh"] > 20.0
+    assert r["breakdown"]["discharge_kwh"] > 40.0
     s, pk = r["sol"], np.asarray(p["peak"])
-    assert float(np.sum(s["D"][pk])) * H > 20.0
+    assert float(np.sum(s["D"][pk])) * H > 40.0
     assert not any(s["C"][t] > 0.1 and s["G"][t] > 0.1 for t in range(p["T"]) if pk[t])     # no grid charging in the peak for the reserve
     # the start delay's reserve: a minute of what the battery can deliver (50 kW), well under the old 115 kWh
     assert float(r["R_gap"][20]) == pytest.approx(50.0 * optimise.AMF_START_DELAY_S / 3600 / 0.95, abs=1e-6)
