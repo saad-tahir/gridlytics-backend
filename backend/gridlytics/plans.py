@@ -2138,8 +2138,13 @@ def write_log(site_id: str, day: date, primitive: str | None = None) -> list[dic
                            (site_id, lo, hi)).fetchall()
         acks = con.execute("SELECT plan_id, status, body, received_at FROM acks WHERE site_id = ? AND received_at >= ? AND received_at < ?",
                            (site_id, lo, hi)).fetchall()
-        evs = con.execute(f"SELECT ts, type, source, detail FROM events WHERE site_id = ? AND type IN ({','.join('?' * len(WRITE_LOG_EVENTS))})",
-                          (site_id, *WRITE_LOG_EVENTS)).fetchall()
+        # the edge's events of the day (round 7, storage-perf follow-up): their times are ISO texts in any offset, so the (site_id, ts) index reads
+        # the dates a day either side of the day's and the Karachi day is kept below; a time not written date first (none should be) is read too.
+        # Every write-log event of the site was read and parsed before, for any day asked
+        kinds = f"SELECT ts, type, source, detail FROM events WHERE site_id = ? AND type IN ({','.join('?' * len(WRITE_LOG_EVENTS))}) AND "
+        d_lo, d_hi = (date.fromisoformat(lo[:10]) - timedelta(days=1)).isoformat(), (date.fromisoformat(hi[:10]) + timedelta(days=2)).isoformat()
+        evs = con.execute(kinds + "ts >= ? AND ts < ?", (site_id, *WRITE_LOG_EVENTS, d_lo, d_hi)).fetchall()
+        evs += con.execute(kinds + "ts NOT GLOB '[0-9][0-9][0-9][0-9]-*'", (site_id, *WRITE_LOG_EVENTS)).fetchall()
     edge_who = (sites.state(site_id).get("edge_heartbeat") or {}).get("edge_id") or "Edge device"
     rows: list[dict] = []
 

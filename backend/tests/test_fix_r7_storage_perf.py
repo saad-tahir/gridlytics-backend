@@ -918,3 +918,26 @@ def test_the_compare_replays_a_plan_against_its_capture_once(world, monkeypatch)
     with world.use():
         plans.tick(sid)
     assert compare(a)[1] == 2
+
+
+# ------------------------------------------------------------------------------------------------ follow-up: plans.write_log's day of events
+
+def test_the_write_log_reads_the_days_events_through_the_index_and_finds_every_one(company, monkeypatch):
+    """plans.write_log read every write-log event of the site and parsed each time in Python to keep one day's: the whole history on every read of
+    the log. Now the (site_id, ts) index reads the dates a day either side, and the day's events are the same ones, whatever offset their time has."""
+    sid = _site()
+    day = datetime.now(PKT).date() - timedelta(days=3)
+    t0 = twin.day_start_utc(day)
+    kind = plans.WRITE_LOG_EVENTS[0]
+    iso = lambda t, tz=timezone.utc: datetime.fromtimestamp(t, tz).isoformat(timespec="seconds")   # noqa: E731
+    rows = [(sid, iso(t0 - 86400 * k + 3600), kind, "edge", "{}") for k in range(1, 400)]           # the site's history: other days
+    inside = [iso(t0 + 60), iso(t0 + 3600, PKT), iso(t0 + 86400 - 60).replace("+00:00", "Z"), iso(t0 + 7200, timezone(timedelta(hours=-11)))]
+    edges = [iso(t0 - 60), iso(t0 + 86400), iso(t0 - 30, timezone(timedelta(hours=14)))]             # just outside the Karachi day
+    rows += [(sid, t, kind, "edge", "{}") for t in inside + edges]
+    with store.connect() as con:
+        con.executemany("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)", rows)
+    seen = _Statements(monkeypatch)
+    log = [r for r in plans.write_log(sid, day) if r["kind"] == "event"]
+    assert sorted(r["at"] for r in log) == sorted(plans._iso_utc(plans._ts(t)) for t in inside)
+    reads = [s for s in seen.sql if "FROM events" in s]
+    assert reads and any("ts >= " in s for s in reads), reads
