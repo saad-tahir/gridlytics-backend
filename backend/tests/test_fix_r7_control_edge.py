@@ -1272,7 +1272,10 @@ def test_a_hold_issues_the_table_at_once_and_nothing_is_issued_under_a_release_o
     with world.use():
         _tier(sid, "advisory_writes")
         _charged(sid)                                                              # a hold at 80 % the site keeps at any hour
-        first = plans.tick(sid)
+        assert plans.tick(sid)["status"] == "active"
+        # the day's first table discharges in the evening (_day_table), so the hold's table differs from it at any hour: after 22:00 Karachi time
+        # the solved plan already holds for the rest of the day, and a hold that leaves today's table as issued has nothing to issue
+        first = {"plan_id": _today_plan(sid, datetime.now(PKT).date())}
         assert plans.issue_tables(sid)["reason"] == "first"
     r = op.post(f"/api/sites/{sid}/control/hold", json={"hours": 2, "soc_pct": 80})
     assert r.status_code == 200, r.text
