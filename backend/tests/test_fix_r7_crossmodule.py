@@ -792,3 +792,35 @@ def test_review_a_forecast_bust_is_judged_on_the_issue_in_force_each_minute_as_t
         bust = alerts.intraday_bust(sid, q + 40 * 60 + 5)
     assert bust["belief_time"] == q + 1800 and bust["err_pct"] == pytest.approx(140 / 240 * 100, abs=0.1)
 
+
+def test_review_a_rounded_battery_power_is_not_a_power_limit_for_the_next_solve(company):
+    """Review of the achieved follow-up (engine-delivery-12): ack_lines marks a value clamped whenever the one written differs from the one asked,
+    which includes the edge rounding it to its register's step. A charge of -40,003 W written as -40,000 W was taken for a charge limit and capped
+    every next solve's charge power at 40 kW (the battery does 100), and a charge raised to a register's least value (-5,000 W written as -8,000 W)
+    capped it at 8 kW. Only a value cut by more than rounding is a limit; a range clamp still is."""
+    from test_fix_savings import make_site
+    sid = make_site(name="Rounding Mill", genset=False)                 # closed loop
+    rounded = {"contract": "ems-edge/1.0", "plan_id": "p-1", "status": "applied", "per_device": [
+        {"device_id": "inv1", "status": "applied",
+         "applied": [{"primitive": "battery_power_w", "requested": -40003, "written": -40000, "readback": -40000},
+                     {"primitive": "battery_power_w", "requested": 25004, "written": 25000, "readback": 25000},
+                     {"primitive": "battery_power_w", "requested": -5000, "written": -8000, "readback": -8000},
+                     {"primitive": "export_limit_w", "requested": 12345, "written": 12340, "readback": 12340}]}],
+        "items": [{"device": "inv1", "primitive": "battery_power_w", "written": -30000, "read_back": -30000, "status": "clamped",
+                   "codes": ["STEP_ROUNDED"]}]}
+    at = datetime.fromtimestamp(twin.day_start_utc(NOV) - 1200, timezone.utc).isoformat(timespec="seconds")
+    with store.connect() as con:
+        con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
+                    ("a1", sid, "p-1", "applied", json.dumps(rounded), at))
+    p = _problem_of(sid)
+    assert p["battery"]["P_ch"] == pytest.approx(100.0) and p["battery"]["P_dis"] == pytest.approx(100.0) and "achieved" not in p
+    # a value the edge clamped to its register's range is the limit it reports
+    ranged = {"contract": "ems-edge/1.0", "plan_id": "p-2", "status": "partial",
+              "items": [{"device": "inv1", "primitive": "battery_power_w", "written": -60000, "read_back": -60000, "status": "clamped",
+                         "codes": ["RANGE_CLAMPED"]}]}
+    later = datetime.fromtimestamp(twin.day_start_utc(NOV) - 600, timezone.utc).isoformat(timespec="seconds")
+    with store.connect() as con:
+        con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
+                    ("a2", sid, "p-2", "partial", json.dumps(ranged), later))
+    assert _problem_of(sid)["battery"]["P_ch"] == pytest.approx(60.0)
+

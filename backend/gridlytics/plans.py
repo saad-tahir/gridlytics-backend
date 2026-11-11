@@ -502,6 +502,28 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
 #: How long an edge's ack of what it applied stands for the next solves: a plan's horizon (the edge acks each plan it is sent, so a newer one
 #: replaces it well before then)
 ACHIEVED_WINDOW_S = 2 * 86400
+#: A value written within this much of the one asked was rounded to the register's step (U3 3.3, STEP_ROUNDED), not clamped to a limit: watts
+#: (the larger of these and ROUNDED_SHARE of the value asked) for a power or export primitive, points for a state of charge
+ROUNDED_W = 100.0
+ROUNDED_SHARE = 0.01
+ROUNDED_PCT = 1.0
+
+
+def _not_a_limit(ln: dict) -> bool:
+    """Whether an ack line the edge marks clamped (ack_lines: also any value written that differs from the one asked) says nothing about what the
+    device can do: the value was only rounded to its register's step (its codes say STEP_ROUNDED and not RANGE_CLAMPED, or the value written is
+    within rounding of the one asked), or a power or export value was written above the one asked (a register's least value, never its most).
+    Such a line is no limit for the next solve (round 7 stage 2 review: a charge of -40,003 W written as -40,000 W capped every next solve's
+    charge power at 40 kW)."""
+    codes = set(ln.get("codes") or [])
+    if "STEP_ROUNDED" in codes and "RANGE_CLAMPED" not in codes:
+        return True
+    req, w = ln.get("requested"), ln.get("written")
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (req, w)):
+        return False
+    if str(ln.get("primitive", "")).endswith("_pct"):
+        return abs(float(w) - float(req)) <= ROUNDED_PCT
+    return abs(float(w)) >= abs(float(req)) or abs(float(w) - float(req)) <= max(ROUNDED_W, ROUNDED_SHARE * abs(float(req)))
 
 
 def achieved(site_id: str, t0: int) -> dict:
@@ -522,7 +544,8 @@ def achieved(site_id: str, t0: int) -> dict:
             continue
         if ln["status"] in ("rejected", "failed") and ln.get("written") is None:
             out["refused"].append(prim)
-        elif ln["status"] == "clamped" and isinstance(ln.get("written"), (int, float)) and not isinstance(ln.get("written"), bool):
+        elif (ln["status"] == "clamped" and isinstance(ln.get("written"), (int, float)) and not isinstance(ln.get("written"), bool)
+              and not _not_a_limit(ln)):
             out["clamped"].setdefault(prim, []).append(float(ln["written"]))
     out["refused"] = sorted(set(out["refused"]))
     return out if out["clamped"] or out["refused"] else {}
