@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 
 from . import alerts, demo, forecast, plans, platform as platformdb, sites, store, tariffs, telemetry, verify
@@ -94,6 +95,18 @@ def tick_workers() -> int:
     return max(1, min(8, asked)) if asked > 0 else max(1, min(4, cores))
 
 
+#: the history a tick reads: the forecasters' 14, 21 and 28 days, the 30 days of the battery's estimate and the month to date (from the billing
+#: month's start, at most 31 days back, or 7 days), with an hour to spare
+TICK_HISTORY_S = 32 * 86400 + 3600
+
+
+def history_window(site_id: str, now: int | None = None):
+    """The window of minute rows a tick of the site reads, as telemetry.window (round 7, audit tests-and-perf-09): its reads (the forecasters', the
+    battery estimate's, the month to date's, the alerts') are slices of one read of each column, not seven reads of up to 30 days each."""
+    now = int(now if now is not None else time.time())
+    return telemetry.window(site_id, now - TICK_HISTORY_S, now + 600)
+
+
 def _site_tick(path, s: dict, tick: str) -> tuple[str, float]:
     """One site's part of a scheduled tick, on a worker thread of the company's file: a demo site's twin catches up to now, the solve (plans.tick),
     its runs row, today's table and the early check (_after_tick), then the site's alerts. A tick that raises writes an `error` runs row with its
@@ -101,11 +114,13 @@ def _site_tick(path, s: dict, tick: str) -> tuple[str, float]:
     parity-architecture-06). The runs row keeps the site's whole time, alerts included (`seconds`; round 7, performance-live-09). Returns the runs
     status and that time."""
     t = time.monotonic()
-    with store.use_company(path):
+    with store.use_company(path), ExitStack() as hold:
         started = store._now()
         try:
             if s.get("demo_link"):
                 demo.advance(s["id"])
+            # the site's minute rows read once for the solve and the alerts (round 7, audit tests-and-perf-09)
+            hold.enter_context(history_window(s["id"]))
             r = plans.tick(s["id"])
             status = r["status"]
             _run_row(s["id"], tick, started, status, r.get("reason") or r.get("solver_status") or "", r.get("plan_id") or r.get("row_id"),
@@ -124,6 +139,7 @@ def _site_tick(path, s: dict, tick: str) -> tuple[str, float]:
             alerts.evaluate(s["id"])
         except Exception:
             log.exception("the alerts failed for site %s", s["id"])
+        hold.close()
         seconds = round(time.monotonic() - t, 3)
         try:
             with store.connect() as con:

@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from datetime import date, datetime, timedelta, timezone
 
+import numpy as np
 import pytest
 
 from gridlytics import plans, reports, reserve, sites, store, telemetry, twin, verify
@@ -642,3 +643,80 @@ def test_the_past_rows_the_genset_runs_the_outage_reserve_and_the_peak_check_rea
     assert reads(lambda: routes_telemetry.genset_page(sid, days=1)) == (1, 1)
     yesterday = day - timedelta(days=1)
     assert reads(lambda: alerts._peak_unconfirmed(site, twin.day_start_utc(day), yesterday.isoformat())) == (1, 1)
+
+
+# ------------------------------------------------------------------------------------------------ tests-and-perf-09
+
+class _MinuteReads:
+    """The range reads of the minute table while installed (telemetry._open wrapped with a trace callback): each as (days, a measure of its
+    columns)."""
+
+    def __init__(self, monkeypatch, sid: str):
+        import re
+        self.reads: list[tuple[float, int]] = []
+        real = telemetry._open
+        pattern = re.compile(rf"SELECT (.*?) FROM minute WHERE site_id = '{sid}' AND ts >= (\d+) AND ts < (\d+) ORDER BY ts")
+
+        def traced(statement: str) -> None:
+            m = pattern.search(statement)
+            if m and m.group(1).startswith("ts"):                  # a read of rows (a read of their text columns alone goes with one)
+                self.reads.append(((int(m.group(3)) - int(m.group(2))) / 86400, m.group(1).count(",")))
+
+        def opened():
+            con = real()
+            con.set_trace_callback(traced)
+            return con
+        monkeypatch.setattr(telemetry, "_open", opened)
+
+    def days(self) -> float:
+        return sum(d for d, _ in self.reads)
+
+
+def _history_site(days: int = 40) -> tuple[str, int]:
+    sid = _site()
+    sites.put_asset(sid, "genset", {"rated_kw": 150}, "t")
+    sites.set_status(sid, "active")
+    now = _now() // 60 * 60
+    for k in range(days):
+        t0 = now - (days - k) * 86400
+        telemetry.ingest(sid, [{"ts": x, "grid_present": 1 if (x // 3600) % 7 else 0, "grid_power_w": 40_000.0, "pv_power_w": 10_000.0,
+                                "load_power_w": 50_000.0, "battery_power_w": 0.0, "battery_soc_bms_pct": 50.0 + (x // 3600) % 30,
+                                "battery_soh_pct": 99.0, "inverter_mode_active": "self_use"} for x in range(t0, t0 + 86400, 60)], "edge", now=now)
+    return sid, now
+
+
+def test_a_tick_reads_its_sites_minute_rows_once_and_reads_the_same_numbers(company, monkeypatch):
+    """Each tick read about four months of 1-minute rows a site, 17 columns, in seven overlapping reads (the forecasters' 14, 21 and 28 days, the
+    month to date, the tick's and the alerts' 30-day battery estimates), converted cell by cell in Python. Now the scheduler's tick reads each column of
+    the site's window once (the forecasters, the battery and the alerts slice it), and a slice is what the file holds."""
+    from gridlytics import battery, scheduler
+    sid, now = _history_site()
+    seen = _MinuteReads(monkeypatch, sid)
+    assert scheduler._site_tick(company, sites.get(sid), "2026-11-11T00:00:00+00:00")[0] == "active"
+    long_reads = [r for r in seen.reads if r[0] > 1.5]
+    assert len(long_reads) <= 2 and seen.days() < 80, seen.reads             # 10 reads, 190 days before
+    # inside the window every read is the file's own answer: the minute grid, a raw read of text and numbers, the battery estimate
+    site = sites.full(sid)
+    plain = {"grid": telemetry.minute_grid(sid, now - 21 * 86400 + 30, now - 7), "raw": telemetry.raw(sid, now - 86400, now, ("inverter_mode_active",
+             "battery_soh_pct", "grid_present")), "battery": battery.state(site, now)}
+    with scheduler.history_window(sid, now) as w:
+        inside = {"grid": telemetry.minute_grid(sid, now - 21 * 86400 + 30, now - 7), "raw": telemetry.raw(sid, now - 86400, now, (
+                  "inverter_mode_active", "battery_soh_pct", "grid_present")), "battery": battery.state(site, now)}
+        assert w.reads <= 2
+    for part in ("grid", "raw"):
+        assert plain[part].keys() == inside[part].keys()
+        for k, v in plain[part].items():
+            if isinstance(v, np.ndarray):
+                assert np.array_equal(v, inside[part][k], equal_nan=True), (part, k)
+            else:
+                assert v == inside[part][k], (part, k)
+    assert plain["battery"] == inside["battery"]
+    assert inside["raw"]["inverter_mode_active"][-1] == "self_use" and len(inside["raw"]["ts"]) == 1440
+    # another site's read, or a range the window does not hold, goes to the file
+    other = _site("Other")
+    telemetry.ingest(other, [{"ts": now - 600, "grid_present": 1}], "edge", now=now)
+    with scheduler.history_window(sid, now) as w:
+        telemetry.raw(sid, now - 3600, now)
+        n, held = len(seen.reads), w.reads
+        assert len(telemetry.raw(other, now - 3600, now)["ts"]) == 1 and w.reads == held          # not the window's site: the file's answer
+        assert len(telemetry.raw(sid, now - 40 * 86400, now)["ts"]) == 40 * 1440 and len(seen.reads) == n + 1   # more than the window holds
