@@ -495,7 +495,70 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         r_next = float(np.mean(kw_next)) * 2.0 / b_asset["eta_d"] if (off_grid or p_next >= p["reserve_threshold"]) and len(kw_next) else 0.0
         p["terminal"] = {"c_next": c_next, "c_next_basis": c_next_basis, "H_peak": 4.0, "R_next": r_next,
                          "c_cal_hold": terminal_cal_hold(bat["b_cal"], vec["c_imp"], L, PV, off_grid), "p_next": p_next}
+    _apply_achieved(site, t0, p)
     return p
+
+
+#: How long an edge's ack of what it applied stands for the next solves: a plan's horizon (the edge acks each plan it is sent, so a newer one
+#: replaces it well before then)
+ACHIEVED_WINDOW_S = 2 * 86400
+
+
+def achieved(site_id: str, t0: int) -> dict:
+    """What the edge reported it could not apply as planned, in its latest ack before `t0` of a plan sent to it (R6 C5: partial or rejected acks
+    re-enter the optimiser; round 7 stage 2, the optimiser half of audit engine-delivery-12): per primitive the value it wrote where it clamped
+    the one asked, and the primitives it refused. {} without such an ack within ACHIEVED_WINDOW_S, or at a site whose edge applied everything."""
+    lo = datetime.fromtimestamp(int(t0) - ACHIEVED_WINDOW_S, timezone.utc).isoformat(timespec="seconds")
+    hi = datetime.fromtimestamp(int(t0) + 900, timezone.utc).isoformat(timespec="seconds")
+    with store.connect() as con:
+        r = con.execute("SELECT plan_id, body, received_at FROM acks WHERE site_id = ? AND plan_id != 'release' AND received_at >= ? AND received_at < ? "
+                        "ORDER BY received_at DESC, rowid DESC LIMIT 1", (site_id, lo, hi)).fetchone()
+    if r is None:
+        return {}
+    out: dict = {"plan_id": r["plan_id"], "received_at": r["received_at"], "clamped": {}, "refused": []}
+    for ln in ack_lines(json.loads(r["body"])):
+        prim = ln.get("primitive")
+        if not prim:
+            continue
+        if ln["status"] in ("rejected", "failed") and ln.get("written") is None:
+            out["refused"].append(prim)
+        elif ln["status"] == "clamped" and isinstance(ln.get("written"), (int, float)) and not isinstance(ln.get("written"), bool):
+            out["clamped"].setdefault(prim, []).append(float(ln["written"]))
+    out["refused"] = sorted(set(out["refused"]))
+    return out if out["clamped"] or out["refused"] else {}
+
+
+def _apply_achieved(site: dict, t0: int, p: dict) -> None:
+    """The next solve plans with what the edge could apply (`achieved`), at a closed-loop site: a refused grid or genset charging permission is
+    planned as off; a clamped battery power caps the charge or discharge power at what was written; a floor clamped upwards raises the grid-up floor
+    to it; a clamped export limit caps the export. The adjustments are kept on the problem (`achieved`), so the plan says what it planned within."""
+    if site.get("tier") != "closed_loop" or not site.get("id"):
+        return
+    got = achieved(site["id"], t0)
+    if not got:
+        return
+    bat, used = p.get("battery"), {}
+    if bat:
+        if "grid_charge_allowed" in got["refused"] and bat.get("a_grid"):
+            bat["a_grid"], used["grid_charge_allowed"] = False, "refused"
+        if "gen_charge_allowed" in got["refused"] and bat.get("a_gen"):
+            bat["a_gen"], used["gen_charge_allowed"] = False, "refused"
+        power = got["clamped"].get("battery_power_w") or []
+        ch = [-w / 1000.0 for w in power if w < 0]
+        dis = [w / 1000.0 for w in power if w > 0]
+        if ch and max(ch) < bat["P_ch"]:
+            bat["P_ch"] = used["charge_kw"] = round(max(ch), 3)
+        if dis and max(dis) < bat["P_dis"]:
+            bat["P_dis"] = used["discharge_kw"] = round(max(dis), 3)
+        floors = got["clamped"].get("soc_floor_pct") or []
+        if floors and bat.get("soc_floor_grid") is not None and max(floors) / 100.0 > float(bat["soc_floor_grid"]):
+            bat["soc_floor_grid"] = min(float(bat["soc_max"]), max(floors) / 100.0)
+            used["soc_floor_pct"] = round(max(floors), 1)
+    exports = got["clamped"].get("export_limit_w") or []
+    if exports and p.get("X_max", 0.0) > max(0.0, min(exports) / 1000.0):
+        p["X_max"] = used["export_kw"] = max(0.0, min(exports) / 1000.0)
+    if used:
+        p["achieved"] = {"plan_id": got["plan_id"], "received_at": got["received_at"], **used}
 
 
 def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:

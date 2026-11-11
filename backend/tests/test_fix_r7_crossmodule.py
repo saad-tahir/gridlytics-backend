@@ -15,6 +15,7 @@ stage-1 packages' code at once.
 - followup icp-gross (engine-tariffs-10, the optimiser half): a legacy site's ICP case and rows count gross imports, capped at the net.
 - followup mdi-override (engine-tariffs-08 h): a site override's MDI block mode and scope reach the plan, the guard and the ledger.
 - followup native-bill (pages-D-10, the rest): the bill rebuilt for the native arm beside the actual arm's.
+- followup achieved (engine-delivery-12, the optimiser half): what the edge could apply re-enters the next solve.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -609,6 +610,38 @@ def test_the_bill_is_rebuilt_for_the_native_arm_beside_the_actual(company):
     # a period the ledger has not scored has no native bill
     none = verify.add_bill(sid, {"period_start": "2026-09-01", "period_end": "2026-09-30", "total_rs": 100_000}, "t")
     assert none["rebuilt"]["native_arm"] is None
+
+
+# ------------------------------------------------------------------------------------------------ followup:achieved (engine-delivery-12, the optimiser half)
+
+def test_what_the_edge_could_apply_re_enters_the_next_solve(company):
+    """R6 C5: a partial or rejected ack re-enters the optimiser. The acks were stored and shown, and the next solve planned the same grid charge the
+    device refused and the same power it clamped. It now plans within what the edge last reported it applied."""
+    from test_fix_savings import make_site
+    sid = make_site(name="Clamped Mill", genset=False)                  # closed loop
+    p0 = _problem_of(sid)
+    assert p0["battery"]["a_grid"] is True and p0["battery"]["P_ch"] == pytest.approx(100.0) and "achieved" not in p0
+    body = {"contract": "ems-edge/1.0", "plan_id": "p-sent", "status": "partial", "per_device": [
+        {"device_id": "inv1", "status": "partial",
+         "applied": [{"primitive": "battery_power_w", "requested": -100000, "written": -60000, "readback": -60000},
+                     {"primitive": "battery_power_w", "requested": 90000, "written": 70000, "readback": 70000},
+                     {"primitive": "soc_floor_pct", "requested": 20, "written": 30, "readback": 30}],
+         "rejected": [{"primitive": "grid_charge_allowed", "reason": "NOT_SUPPORTED"}]}]}
+    at = datetime.fromtimestamp(twin.day_start_utc(NOV) - 600, timezone.utc).isoformat(timespec="seconds")
+    with store.connect() as con:
+        con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
+                    ("a1", sid, "p-sent", "partial", json.dumps(body), at))
+    p = _problem_of(sid)
+    bat = p["battery"]
+    assert bat["a_grid"] is False and bat["P_ch"] == pytest.approx(60.0) and bat["P_dis"] == pytest.approx(70.0)
+    assert bat["soc_floor_grid"] == pytest.approx(0.30)
+    assert p["achieved"] == {"plan_id": "p-sent", "received_at": at, "grid_charge_allowed": "refused", "charge_kw": 60.0, "discharge_kw": 70.0,
+                             "soc_floor_pct": 30.0}
+    # an advisory site (no edge acks what it runs) and an ack older than a plan's horizon change nothing
+    sites.set_tier_allowed(sid, "advisory_writes", "t")
+    assert "achieved" not in _problem_of(sid)
+    sites.set_tier_allowed(sid, "closed_loop", "t")
+    assert "achieved" not in _problem_of(sid, day=NOV + timedelta(days=3))
 
 
 # ------------------------------------------------------------------------------------------------ engine-plans-live-18: charging from the genset
