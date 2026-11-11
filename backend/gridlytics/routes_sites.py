@@ -367,10 +367,13 @@ def site_activate(site_id: str):
         raise HTTPException(status_code=404, detail="No such site")
     missing = []
     src = (s.get("data") or {}).get("data_source") or {}
-    if not (isinstance(src, dict) and src.get("kind") in sites.DATA_SOURCE_KINDS and src.get("grid_signal_confirmed")):
+    # an off-grid site has no grid to report: its source needs no grid-presence signal (round 7 sweeps, a sites-onboarding review follow-up: the farm was
+    # asked to confirm one)
+    off_grid = _off_grid(s, (s.get("connections") or [None])[0])
+    if not (isinstance(src, dict) and src.get("kind") in sites.DATA_SOURCE_KINDS and (src.get("grid_signal_confirmed") or off_grid)):
         # plan 9.3 tab A: without a grid-presence signal outages cannot be seen and the reserve cannot be planned (audit flow-onboarding-08: a site with no
         # source, or an unconfirmed one, was activated and planned)
-        missing.append("the data source, with its grid-presence signal confirmed (tab A)")
+        missing.append("the data source (tab A)" if off_grid else "the data source, with its grid-presence signal confirmed (tab A)")
     elif sites.grid_connected(s) and sites.source_test(site_id)["grid_signal"] == "missing":
         # the source's test (plan 9.3: "refuses a source without a grid-present signal"; audit flow-onboarding-22): data arrived, and none of it says
         # whether the grid is up, whatever the tick says

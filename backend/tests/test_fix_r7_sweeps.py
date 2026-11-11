@@ -199,3 +199,31 @@ def test_the_inbox_and_its_badge_count_only_the_kinds_of_alert_a_person_follows(
     assert op.put("/api/platform/notifications", json={"follow": []}).status_code == 200
     assert op.get("/api/alerts/counts").json()["total"] == 0 and op.get("/api/alerts").json() == []
 
+
+# ------------------------------------------------------------------------------------------------ sites-onboarding review: an off-grid source has no grid signal
+
+def test_an_off_grid_site_activates_without_a_grid_presence_signal_and_a_grid_site_still_needs_one(world):
+    a = world.c["admin"]
+    with world.use():
+        farm = sites.create({"name": "Farm", "site_type": "farm", "data_source": {"kind": "oem_cloud", "grid_signal_confirmed": False}}, "test")["id"]
+        sites.put_asset(farm, "inverter", {"kw_ac": 50}, "test")
+        mill = sites.create({"name": "Mill", "site_type": "industrial_1_shift", "data_source": {"kind": "oem_cloud", "grid_signal_confirmed": False}},
+                            "test")["id"]
+        sites.put_asset(mill, "inverter", {"kw_ac": 50}, "test")
+    r = a.post(f"/api/sites/{farm}/activate")
+    assert r.status_code == 200 and r.json()["status"] == "active", r.text      # before: "Add the data source, with its grid-presence signal confirmed"
+    # a grid site's source still needs it, and an off-grid site still needs a source
+    assert a.put(f"/api/sites/{mill}/connection", json={"tariff_category": "B-2(b)", "sanctioned_load_kw": 400}).status_code == 200
+    r = a.post(f"/api/sites/{mill}/activate")
+    assert r.status_code == 422 and "the data source, with its grid-presence signal confirmed (tab A)" in r.json()["detail"], r.text
+    with world.use():
+        bare = sites.create({"name": "Bare farm", "site_type": "farm"}, "test")["id"]
+        sites.put_asset(bare, "inverter", {"kw_ac": 50}, "test")
+    r = a.post(f"/api/sites/{bare}/activate")
+    assert r.status_code == 422 and r.json()["detail"] == "Add the data source (tab A) before activating", r.text
+    # a site whose connection is of the off_grid regime is off-grid too
+    with world.use():
+        sites.update(mill, {"data_source": {"kind": "csv", "grid_signal_confirmed": False}}, "test")
+        conn = sites.connections(mill)[0]
+        sites.put_connection(mill, {**conn["data"], "regime": "off_grid"}, "test", conn_id=conn["id"])
+    assert a.post(f"/api/sites/{mill}/activate").status_code == 200
