@@ -356,14 +356,17 @@ def _connection_label(c: dict, i: int, conns: list[dict]) -> str:
 
 def _agreements(site: dict, now: int, rules_: dict) -> None:
     """Tariff: a connection's agreement ending within the rules' days (60 by default), a warning that says the day it ends; once that day has passed
-    (audit pages-D-16) a critical alert that says it ended and what to do, since the site is then priced on an agreement that no longer holds. With more
-    than one connection the title names which (flow-reports-alerts-members-keys-25)."""
+    (audit pages-D-16) a critical alert that says it ended, what the tariffs engine does with the site's export from the day after, and what to do. The
+    agreement's state and the regime billed are the engine's (tariffs.agreement_state, tariffs.regime_on), as on the Tariffs page: after a net-billing
+    agreement the plan, the bill and the savings price the export at zero; after a legacy net-metering one the site is billed under net billing. Only
+    net billing and legacy net metering have an agreement the engine reads, so under another regime the dates change nothing and raise nothing. With
+    more than one connection the title names which (flow-reports-alerts-members-keys-25)."""
     conns = site.get("connections") or []
     today = datetime.fromtimestamp(now, PKT).date()
     for i, c in enumerate(conns):
         end = c["data"].get("agreement_end")
         left = None
-        if end:
+        if end and tariffs.agreement_state(c, today) is not None:
             try:
                 left = (date.fromisoformat(end) - today).days
             except ValueError:
@@ -371,8 +374,14 @@ def _agreements(site: dict, now: int, rules_: dict) -> None:
         ended = left is not None and left < 0
         which = f" of {_connection_label(c, i, conns)}" if len(conns) > 1 else ""
         regime = _regime(c["data"].get("regime"))
-        title = (f"The {regime} agreement{which} ended on {_long_day(end)}: enter the agreement that follows it in the site's settings" if ended
-                 else f"The {regime} agreement{which} ends on {_long_day(end)}")
+        if ended:
+            since = _long(date.fromisoformat(end) + timedelta(days=1))
+            then = ("the site is billed under net billing, nothing is netted and its export earns the net-billing rate"
+                    if tariffs.regime_on(c, today) == "net_billing" else "the plan, the bill and the savings price its export at zero")
+            title = (f"The {regime} agreement{which} ended on {_long_day(end)}: since {since} {then}. Enter the agreement that follows it in the "
+                     "site's settings")
+        else:
+            title = f"The {regime} agreement{which} ends on {_long_day(end)}"
         _set(left is not None and left <= _th(rules_, "Tariff", "agreement_days"), site["id"], f"regime_expiring_{c['id']}", "Tariff",
              "critical" if ended else "warning", title, {"connection": _connection_words(c["data"]), "agreement_end": end, "ended": ended})
 

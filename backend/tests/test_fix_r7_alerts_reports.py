@@ -1272,8 +1272,10 @@ def test_an_agreement_that_has_ended_says_it_ended_and_two_connections_are_told_
         sites.put_connection(sid, {**conn["data"], "regime": "net_billing", "agreement_end": ended.isoformat()}, "test", conn_id=conn["id"])
         alerts.evaluate(sid, now)
         got = next(a for a in alerts.listing("active", sid) if a["rule"].startswith("regime_expiring_"))
-    assert got["title"] == (f"The net billing agreement ended on {ended.day} {ended:%B %Y}: enter the agreement that follows it in the "
-                            "site's settings"), got["title"]
+    after = ended + timedelta(days=1)
+    # what the tariffs engine does after a net-billing agreement (tariffs.regime_on: "none", the export earns nothing; R7 integration with tariffs)
+    assert got["title"] == (f"The net billing agreement ended on {ended.day} {ended:%B %Y}: since {after.day} {after:%B %Y} the plan, the bill and "
+                            "the savings price its export at zero. Enter the agreement that follows it in the site's settings"), got["title"]
     assert got["severity"] == "critical" and got["detail"]["ended"] is True and got["detail"]["agreement_end"] == ended.isoformat(), got
     # the day it ends it still "ends"; the day after, it has ended
     with world.use():
@@ -1292,6 +1294,34 @@ def test_an_agreement_that_has_ended_says_it_ended_and_two_connections_are_told_
     assert titles[f"regime_expiring_{conn['id']}"].startswith(f"The net billing agreement of meter FS-24-11-0042 ended on {ended.day}"), titles
     assert titles[f"regime_expiring_{two['id']}"] == f"The net billing agreement of connection 2 (B-3) ends on {soon.day} {soon:%B %Y}", titles
     assert not any(conn["id"] in t or two["id"] in t for t in titles.values())
+
+
+def test_an_ended_agreements_alert_says_what_the_tariffs_engine_does_with_the_export(world):
+    """pages-D-16 at integration with tariffs (flow-onboarding-01): the engine credits export only inside an agreement's dates. After a legacy
+    net-metering agreement the site is billed under net billing (tariffs.regime_on), so its alert must not say the export is priced at zero; and under
+    a regime with no export agreement the engine reads no dates, so an end date raises nothing."""
+    from gridlytics import tariffs
+    sid, now = world.site, _now()
+    today = datetime.fromtimestamp(now, PKT).date()
+    ended = today - timedelta(days=10)
+    after = ended + timedelta(days=1)
+    with world.use():
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "regime": "net_metering_legacy", "agreement_end": ended.isoformat()}, "test", conn_id=conn["id"])
+        c = sites.connections(sid)[0]
+        assert tariffs.agreement_state(c, today) == "ended" and tariffs.regime_on(c, today) == "net_billing"
+        alerts.evaluate(sid, now)
+        got = next(a for a in alerts.listing("active", sid) if a["rule"] == f"regime_expiring_{conn['id']}")
+    assert got["title"] == (f"The legacy net metering agreement ended on {ended.day} {ended:%B %Y}: since {after.day} {after:%B %Y} the site is "
+                            "billed under net billing, nothing is netted and its export earns the net-billing rate. Enter the agreement that "
+                            "follows it in the site's settings"), got["title"]
+    assert got["severity"] == "critical" and "zero" not in got["title"], got
+    # a connection with no export agreement: its dates are not the engine's, so the alert clears
+    with world.use():
+        sites.put_connection(sid, {**conn["data"], "regime": "none", "agreement_end": ended.isoformat()}, "test", conn_id=conn["id"])
+        assert tariffs.agreement_state(sites.connections(sid)[0], today) is None
+        alerts.evaluate(sid, now + 900)
+        assert not any(a["rule"].startswith("regime_expiring_") for a in alerts.listing("active", sid))
 
 
 # ------------------------------------------------------------------------------------------------ role-operator-31 (an alert names its day)
