@@ -170,3 +170,32 @@ def test_the_hot_full_battery_alert_names_its_24_hours_not_the_last_day(world):
     text = dict(st["alerts"])["hot_high_soc"]
     assert text == "3.0 hours above 90 percent charge above 35 degrees in the 24 hours to 9 Nov 20:00", text
     assert "last day" not in text
+
+
+# ------------------------------------------------------------------------------------------------ the rest of role-analyst-32: the inbox follows a person's choices
+
+def test_the_inbox_and_its_badge_count_only_the_kinds_of_alert_a_person_follows(world):
+    from gridlytics import alerts
+    a, op, sid = world.c["admin"], world.c["operator"], world.site
+    with world.use():
+        alerts._open(sid, "data_stale", "Data", "warning", "No data for 40 minutes", {})
+        alerts._open(sid, "sigma_high", "Battery", "warning", "The battery estimate may be off", {})
+        alerts._open(sid, "genset_unanswered", "Genset", "critical", "A genset request was not answered", {})
+    every = op.get("/api/alerts/counts").json()
+    assert every["total"] == 3 and every["following"] is None, every                  # until a person chooses, every kind
+    assert op.put("/api/platform/notifications", json={"follow": ["Data", "Genset"]}).status_code == 200
+    mine = op.get("/api/alerts/counts").json()
+    assert mine["total"] == 2 and mine["following"] == ["Data", "Genset"], mine       # the badge counts the kinds followed
+    assert mine["by_severity"] == {"warning": 1, "critical": 1} and mine["by_site"] == {sid: 2}, mine
+    assert "Battery" in mine["categories"]                                          # the kinds the role receives, for the filter
+    inbox = op.get("/api/alerts").json()
+    assert sorted(x["category"] for x in inbox) == ["Data", "Genset"], inbox
+    assert sorted(x["category"] for x in op.get("/api/alerts", params={"every": "true"}).json()) == ["Battery", "Data", "Genset"]
+    # another person's choices are their own: the administrator still counts every kind
+    assert a.get("/api/alerts/counts").json()["total"] == 3
+    # the fleet and a site's own page are not the inbox: they show every alert the role receives
+    with world.use():
+        assert alerts.counts()["total"] == 3
+    assert op.put("/api/platform/notifications", json={"follow": []}).status_code == 200
+    assert op.get("/api/alerts/counts").json()["total"] == 0 and op.get("/api/alerts").json() == []
+

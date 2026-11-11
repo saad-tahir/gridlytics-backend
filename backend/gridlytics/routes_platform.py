@@ -68,7 +68,7 @@ def _me() -> str:
 
 
 def _notify_key(user_id: str) -> str:
-    return f"notify:{user_id}"
+    return alerts.notify_key(user_id)     # the inbox and its badge read the same setting (alerts.followed_categories)
 
 
 def _notify_out(kept: dict | None) -> dict:

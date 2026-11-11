@@ -42,6 +42,30 @@ def reader_categories() -> tuple[str, ...]:
     return tuple(c for c in CATEGORIES if c not in CATEGORY_NEEDS or auth.can(CATEGORY_NEEDS[c]))
 
 
+def notify_key(user_id: str) -> str:
+    """The company-file setting that holds a person's notification choices (routes_platform, My account; audit role-analyst-32)."""
+    return f"notify:{user_id}"
+
+
+def followed_categories() -> tuple[str, ...] | None:
+    """The kinds of alert the signed-in person follows (My account's notification choices: `follow` under `notify:<user_id>` in the company's file;
+    round 7 sweeps, the rest of role-analyst-32), or None where every kind is read: nobody signed in (the scheduler, a job, an API key), or a person
+    who has not chosen yet. The inbox and its badge count only these (`listing` and `counts` with `followed_only`)."""
+    me = auth.current.get()
+    if not me or me.get("api_key") or not me.get("id"):
+        return None
+    kept = store.get_setting(notify_key(me["id"]))
+    follow = kept.get("follow") if isinstance(kept, dict) else None
+    return tuple(c for c in CATEGORIES if c in follow) if isinstance(follow, list) else None
+
+
+def _categories(followed_only: bool) -> tuple[str, ...]:
+    """The categories read: the reader's role's (`reader_categories`), and with `followed_only` only those the person follows."""
+    cats = reader_categories()
+    follow = followed_categories() if followed_only else None
+    return cats if follow is None else tuple(c for c in cats if c in follow)
+
+
 #: The SQL that adds one event (`_event`) at the end of an alert's history (audit pages-D-28)
 _HISTORY = "history = json_insert(history, '$[#]', json(?))"
 
@@ -772,9 +796,11 @@ def _in(cats: tuple[str, ...]) -> tuple[str, list]:
     return f" AND category IN ({','.join('?' * len(cats))})", list(cats)
 
 
-def listing(state: str | None = None, site_id: str | None = None, category: str | None = None, limit: int = 300) -> list[dict]:
-    """The inbox, most severe first: only the categories the reader receives (`reader_categories`)."""
-    cond, args = _in(reader_categories())
+def listing(state: str | None = None, site_id: str | None = None, category: str | None = None, limit: int = 300,
+            followed_only: bool = False) -> list[dict]:
+    """The inbox, most severe first: only the categories the reader receives (`reader_categories`), and with `followed_only` the kinds the person
+    follows (`followed_categories`)."""
+    cond, args = _in(_categories(followed_only))
     q = "SELECT * FROM alerts WHERE 1=1" + cond
     if state == "active":
         q += " AND state IN ('open','acknowledged')"
@@ -795,15 +821,18 @@ def listing(state: str | None = None, site_id: str | None = None, category: str 
     return [_row(r, names.get(r["site_id"], "")) for r in rows]
 
 
-def counts() -> dict:
-    """The open and acknowledged alerts by severity and by site, of the categories the reader receives (named in `categories`)."""
-    cats = reader_categories()
+def counts(followed_only: bool = False) -> dict:
+    """The open and acknowledged alerts by severity and by site, of the categories the reader receives (named in `categories`), and with
+    `followed_only` of the kinds the person follows (the inbox's badge; named in `following`, None while they follow every kind)."""
+    cats = _categories(followed_only)
+    following = list(cats) if followed_only and followed_categories() is not None else None
     cond, args = _in(cats)
     with store.connect() as con:
         rows = con.execute("SELECT severity, COUNT(*) n FROM alerts WHERE state IN ('open','acknowledged')" + cond + " GROUP BY severity", args).fetchall()
         by_site = con.execute("SELECT site_id, COUNT(*) n FROM alerts WHERE state IN ('open','acknowledged')" + cond + " GROUP BY site_id", args).fetchall()
     out = {r["severity"]: r["n"] for r in rows}
-    return {"total": sum(out.values()), "by_severity": out, "by_site": {r["site_id"]: r["n"] for r in by_site}, "categories": list(cats)}
+    return {"total": sum(out.values()), "by_severity": out, "by_site": {r["site_id"]: r["n"] for r in by_site}, "categories": list(reader_categories()),
+            "following": following}
 
 
 ASSIGNEE_WORDS = "Assign the alert to a member who acts on alerts (an administrator or an operator), picked from the list"
