@@ -1645,15 +1645,21 @@ def _bound(site: dict, day: date, series: dict, pr: dict, soc0: float, actual: d
         bd, sol = res["breakdown"], res["sol"]
         voll = float(p["voll"])
         mdi = p.get("mdi")
+        # the demand charge on both arms from the same lower bound (round 7 stage 2, engine-optimiser-14's follow-up): build_problem bounds M under
+        # the month so far, the floor and the month's expected peak (optimise.mdi_floors), and the breakdown itemises the charge at that bound
+        # (mdi_month_rs, which no plan changes) apart from the rise above it (mdi_rise_rs). The actual arm pays the same month charge and its own
+        # rise above the same bound: before, its rise was measured above max(M0, floor) alone, so an actual peak under the expected month peak
+        # counted as a rise the hindsight plan was spared. A day never crosses its billing month, so M is the day's one peak
+        month_rs = float(bd.get("mdi_month_rs", 0.0) or 0.0)
         rise_a = 0.0
         if mdi and res.get("M"):
-            above = max(float(mdi["M0"]), float(mdi["floor"]))
+            above = float(list(res.get("M_lb") or optimise.mdi_floors(mdi))[0])
             rise_a = float(mdi["rate"]) * max(0.0, float(actual["peak_kw"]) - above)
             out["mdi_m0_kw"] = round(float(mdi["M0"]), 2)
         e_end_h = float(sol["E"][-1]) if p.get("battery") else 0.0
         energy_h = optimise.H * float(np.sum(c_imp * np.asarray(sol["G"]) - c_exp * np.asarray(sol["X"])))
-        hind = energy_h + bd["genset_rs"] + bd["wear_rs"] + bd["unserved_rs"] + bd["mdi_rise_rs"] - v_end * e_end_h
-        act = float(actual["cost_rs"]) + voll * float(actual["unserved_kwh"]) + rise_a - v_end * float(e_end_actual)
+        hind = energy_h + bd["genset_rs"] + bd["wear_rs"] + bd["unserved_rs"] + month_rs + bd["mdi_rise_rs"] - v_end * e_end_h
+        act = float(actual["cost_rs"]) + voll * float(actual["unserved_kwh"]) + month_rs + rise_a - v_end * float(e_end_actual)
         solved = act - hind
         head = max(0.0, solved)
         out.update({"status": "optimal", "solved_headroom_rs": round(solved, 2), "headroom_rs": round(head, 2),

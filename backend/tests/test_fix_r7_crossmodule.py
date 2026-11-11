@@ -5,6 +5,7 @@ stage-1 packages' code at once.
   meter readings are on (`plant`) is the one the plan, the ledger and the bill rebuild price, and a bill names the connection it is for.
 - engine-tariffs-09: Punjab's self-generation duty comes from the connection's province (else the site's DISCO's) and the tax version in force,
   in the plan's genset cost and in the ledger's, instead of latitude > 28 and a constant in plans.py.
+- followup bound-mdi (engine-optimiser-14): the perfect-foresight bound prices both arms' demand charge from the solve's own lower bound.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -98,6 +99,39 @@ def test_the_ledger_prices_the_selfgen_duty_as_the_plan_does(company):
     assert litres_p == litres_s
     kwh = 300.0 * 120 / 60
     assert cost_p - cost_s == pytest.approx(kwh * 0.04, abs=1e-6)
+
+
+# ------------------------------------------------------------------------------------------------ followup:bound-mdi (engine-optimiser-14)
+
+def test_the_bound_measures_both_arms_mdi_from_the_peak_the_solve_could_not_lower(company, monkeypatch):
+    """build_problem now bounds the month's peak M under the month's expected peak (M_exp, mdi_floors) and itemises the charge at that bound
+    (mdi_month_rs) apart from the rise above it (mdi_rise_rs). The bound took the hindsight plan's rise above that bound but the actual arm's rise
+    above max(M0, floor) alone, so an actual peak under the expected month peak counted as a rise the hindsight plan was spared: headroom made of
+    nothing. Both arms now pay the month's charge at the solve's own lower bound plus their rise above it; a time-limited solve is still no bound."""
+    from test_fix_savings import WEEKDAY, _series, make_site
+    sid = make_site(name="Bound M_exp r7", genset=False)
+    seen: dict = {}
+
+    def solve(p, time_limit=10.0, **kw):
+        seen["p"] = p
+        T = int(p["T"])
+        return {"status": "optimal", "time_limited": False, "M": [150.0], "M_lb": [150.0],
+                "breakdown": {"energy_rs": 0.0, "genset_rs": 0.0, "wear_rs": 0.0, "unserved_rs": 0.0, "mdi_rise_rs": 0.0,
+                              "mdi_month_rs": 150.0 * float(p["mdi"]["rate"])},
+                "sol": {"G": np.full(T, 100.0), "X": np.zeros(T), "E": np.r_[np.full(T, 100.0), 100.0]}}
+
+    monkeypatch.setattr(verify.optimise, "solve", solve)
+    pr = {"c_imp": np.full(1440, 40.0), "c_exp": np.zeros(1440), "peak": np.zeros(1440, dtype=bool)}
+    # the actual arm: the same energy as the hindsight plan, a peak of 130 kW, under the 150 kW the month will reach anyway
+    actual = {"cost_rs": 96_000.0, "unserved_kwh": 0.0, "peak_kw": 130.0}
+    out = verify._bound(sites.full(sid), WEEKDAY, _series(outage=None), pr, 0.5, actual, 100.0, 0.0, c_next=0.0, v_end=0.0)
+    assert "mdi" in seen["p"] and seen["p"]["mdi"]["rate"] > 0
+    assert out["status"] == "optimal"
+    assert out["solved_headroom_rs"] == pytest.approx(0.0, abs=0.01)
+    assert out["bound_rs"] == pytest.approx(0.0, abs=0.01)
+    # a peak above the bound is the actual arm's own rise, at the rate
+    above = verify._bound(sites.full(sid), WEEKDAY, _series(outage=None), pr, 0.5, {**actual, "peak_kw": 160.0}, 100.0, 0.0)
+    assert above["solved_headroom_rs"] == pytest.approx(10.0 * float(seen["p"]["mdi"]["rate"]), abs=0.01)
 
 
 # ------------------------------------------------------------------------------------------------ tracker-and-docs-01 (pages-D-09)
