@@ -1220,3 +1220,28 @@ def test_a_month_at_the_calendar_s_edge_is_refused_in_one_sentence_not_a_server_
     r = c.get(f"/api/sites/{sid}/genset", params={"month": "2015-01"})
     assert r.status_code == 200, r.text
     assert r.json()["previous"]["month"] == "2014-12" and r.json()["kpis"]["hours"] is None
+
+
+def test_a_minute_written_inside_a_run_between_the_page_s_two_reads_is_not_a_server_error(company, monkeypatch):
+    """Review of pages-C-03: a run without its output read takes its power from the site's balance, read in a second query over the run's minutes. A minute
+    written into the run between the two reads (an upload of the same hours) gave the balance one row more than the run: numpy could not line the two
+    up and the genset page answered 500. The balance is read by minute, so a row the first read did not see is left out."""
+    sid = _genset_site("Racing")
+    t = T0 + 10 * 3600
+    on = lambda i: 10 <= i < 70  # noqa: E731
+    _write(sid, t - 600, 80, grid_present=0, genset_running=lambda i: int(on(i)), load_power_w=150000, pv_power_w=0, battery_power_w=0)
+    with telemetry.connect() as con:  # a minute missing inside the run, which another writer fills between the reads
+        con.execute("DELETE FROM minute WHERE site_id = ? AND ts = ?", (sid, t + 1800))
+    real, calls = telemetry.raw, []
+
+    def raw(site_id, t0, t1, columns=telemetry.COLUMNS[3:]):
+        calls.append(columns)
+        if len(calls) == 2:
+            _write(sid, t + 1800, 1, grid_present=0, genset_running=1, load_power_w=150000, pv_power_w=0, battery_power_w=0)
+        return real(site_id, t0, t1, columns)
+
+    monkeypatch.setattr(telemetry, "raw", raw)
+    runs = _runs(sid)["runs"]
+    assert len(calls) == 2  # the run's own read, then the balance over its minutes
+    assert [(r["start"], r["end"], r["hours"]) for r in runs] == [(t, t + 3600, 1.0)]
+    assert runs[0]["kwh"] == pytest.approx(150.0) and runs[0]["kwh_estimated"] is True

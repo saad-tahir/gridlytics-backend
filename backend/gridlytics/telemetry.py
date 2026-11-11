@@ -1203,6 +1203,19 @@ _RUN_COLUMNS = ("genset_running", "genset_power_w", "genset_fuel_l", "grid_prese
 _BALANCE_COLUMNS = ("load_power_w", "pv_power_w", "battery_power_w", "grid_power_w", "grid_import_wh", "grid_export_wh")
 
 
+def _at(d: dict, ts: np.ndarray) -> dict:
+    """raw()'s numeric columns at the times `ts` (NaN where `d` has no row at that time): a second read lined up with the first by minute."""
+    pos = np.minimum(np.searchsorted(d["ts"], ts), max(0, len(d["ts"]) - 1))
+    hit = (pos < len(d["ts"])) & (d["ts"][pos] == ts) if len(d["ts"]) else np.zeros(len(ts), dtype=bool)
+    out = {"ts": np.asarray(ts)}
+    for c, v in d.items():
+        if c != "ts":
+            a = np.full(len(ts), np.nan)
+            a[hit] = v[pos[hit]]
+            out[c] = a
+    return out
+
+
 def genset_runs(site_id: str, t0: int, t1: int, genset: dict) -> dict:
     """The genset's runs in [t0, t1), oldest first, counted in minutes (see RUN_GAP_S), with their litres as the Savings page reads them
     (verify.litres_used, plan 8.3: metered where a fuel meter reads, else the fuel curve a x output + b x rating, the output read, else held from the
@@ -1233,8 +1246,9 @@ def genset_runs(site_id: str, t0: int, t1: int, genset: dict) -> dict:
         power = _held(p_kw[s:e + 1], both=True)
         balanced = np.isnan(power)
         if balanced.any():
-            # no output read in the run: the load the grid, PV and battery leave over, within the set's range (as verify._actual_sim); the same rows
-            bd = raw(site_id, int(ts[s]), int(ts[e]) + 1, _BALANCE_COLUMNS)
+            # no output read in the run: the load the grid, PV and battery leave over, within the set's range (as verify._actual_sim); the run's own
+            # minutes, matched by time, as a minute written between the two reads would otherwise misalign the arrays (review r7: a 500)
+            bd = _at(raw(site_id, int(ts[s]), int(ts[e]) + 1, _BALANCE_COLUMNS), ts[s:e + 1])
             grid_kw = np.where(~np.isnan(bd["grid_power_w"]), bd["grid_power_w"] / 1000.0,
                                (np.nan_to_num(bd["grid_import_wh"]) - np.nan_to_num(bd["grid_export_wh"])) * 3.6 / own)
             bal = (np.nan_to_num(bd["load_power_w"]) - np.nan_to_num(bd["pv_power_w"]) - np.nan_to_num(bd["battery_power_w"])) / 1000.0
