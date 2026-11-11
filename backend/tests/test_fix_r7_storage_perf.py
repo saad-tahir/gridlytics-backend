@@ -414,3 +414,33 @@ def test_a_tick_that_runs_into_the_next_quarter_raises_an_alert_the_next_tick_in
     second = scheduler.tick_all([company])
     assert not second["overran"]
     assert not [a for a in alerts.listing("active", sid) if a["rule"] == "tick_overrun"]
+
+
+# ------------------------------------------------------------------------------------------------ follow-up (tariffs review): newer shipped fuel prices
+
+def test_a_newer_builds_fuel_prices_reach_an_existing_company_and_never_displace_its_own(company, monkeypatch):
+    """The shipped fuel prices were seeded only into a file with no fuel price, so a later build's OGRA prices never reached an existing company. Now
+    each shipped day the file lacks is added when the build starts, unless the price in force on that day is one the company entered: an entered
+    price is never changed, nor displaced from the days it prices."""
+    from gridlytics import tariff_data, tariffs
+    assert tariffs.fuel_price("hsd", "2026-11-06")[0] == 382.25                       # a file seeded by this build
+    tariffs.add_fuel_price("hsd", "2026-11-05", 389.0, "owner")                         # the company's own price on a shipped day
+    tariffs.add_fuel_price("hsd", "2026-11-08", 386.0, "owner")                         # and after the last shipped one
+    tariffs.add_fuel_price("gas_captive", "2026-08-01", 3900.0, "owner")                # its gas contract price
+    with store.connect() as con:
+        before = {(r["kind"], r["valid_from"]): (r["price"], r["source"]) for r in con.execute("SELECT * FROM fuel_prices")}
+    newer = [*tariff_data.FUEL_PRICES, ("hsd", "2026-10-29", 401.10), ("hsd", "2026-11-07", 380.10), ("hsd", "2026-11-10", 377.00),
+             ("hsd", "2026-11-05", 999.0), ("gas_captive", "2026-09-01", 4300.0)]
+    monkeypatch.setattr(tariff_data, "FUEL_PRICES", newer)
+    tariffs._SEEDED.clear()                                                               # a newer build starts
+    assert tariffs.fuel_price("hsd", "2026-11-07")[0] == 380.10                         # added: the day before was a shipped price
+    assert tariffs.fuel_price("hsd", "2026-10-29")[0] == 401.10                         # added: before the first price
+    assert tariffs.fuel_price("hsd", "2026-11-12")[0] == 386.0                          # not added: the company's 8 November price stands
+    assert tariffs.fuel_price("gas_captive", "2026-09-15")[0] == 3900.0                 # not added: its contract price stands
+    with store.connect() as con:
+        after = {(r["kind"], r["valid_from"]): (r["price"], r["source"]) for r in con.execute("SELECT * FROM fuel_prices")}
+    assert {k: v for k, v in after.items() if k in before} == before                    # no row the file held is changed
+    assert set(after) - set(before) == {("hsd", "2026-10-29"), ("hsd", "2026-11-07")}
+    tariffs.ensure_shipped()
+    with store.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM fuel_prices").fetchone()[0] == len(after)   # a second check adds nothing

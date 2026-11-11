@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import calendar as _calendar
 import hashlib
 import json
@@ -78,6 +79,32 @@ def _shipped_todo(con) -> list[tuple[dict, object]]:
     return todo
 
 
+def _fuel_todo(con) -> list[tuple[str, str, float]]:
+    """The shipped fuel prices (tariff_data.FUEL_PRICES) the company file should take: every one on a fresh file, and on a file seeded by an earlier
+    build each shipped day it holds no price for, unless the price in force on that day is one the company entered (source kind manual), which a
+    shipped price never displaces from the days it prices (round 7, tariffs review: the prices went only into a file with no fuel price, so a later
+    build's OGRA prices never reached an existing company). A row the file holds is never changed."""
+    held: dict[str, list[tuple[str, bool]]] = {}
+    for r in con.execute("SELECT kind, valid_from, source FROM fuel_prices ORDER BY kind, valid_from"):
+        try:
+            entered = (json.loads(r["source"]) or {}).get("kind") == "manual"
+        except (TypeError, ValueError, AttributeError):
+            entered = True                                  # a source that cannot be read is taken as the company's own
+        held.setdefault(r["kind"], []).append((r["valid_from"], entered))
+    todo = []
+    for kind, day, price in sorted(tariff_data.FUEL_PRICES):
+        rows = held.setdefault(kind, [])
+        days = [d for d, _ in rows]
+        if day in days:
+            continue
+        i = bisect.bisect_right(days, day) - 1
+        if i >= 0 and rows[i][1]:
+            continue                                        # the company's own price is in force that day
+        todo.append((kind, day, price))
+        bisect.insort(rows, (day, False))
+    return todo
+
+
 #: The company files whose shipped library this process has checked, each as (path, device, inode): a lookup checks a file the first time this
 #: process reads it, not on every call (audit tests-and-perf-25: the check cost a connection and a scan of every version, 6 to 8 times a price
 #: vector). The shipped library cannot change while a process runs, so a newer build checks each file again when it starts. The app never deletes a
@@ -106,14 +133,15 @@ def ensure_shipped() -> None:
     """Seed the shipped versions and fuel prices into the company's file the first time it is used, add a shipped version that a newer build ships
     and the file lacks (matched on kind, key and start; a start the company already holds a version for is never doubled), and apply a newer build's
     correction of a shipped body (`_shipped_todo`): the old shipped row is superseded, as an approved correction for the same start supersedes it.
+    A newer build's fuel prices are added too, never over a price the company entered (`_fuel_todo`).
     The lookups run it once per file and process (`_seeded`); called directly it always checks.
 
     The cheap check runs unlocked; the seeding runs inside an immediate write transaction that checks again, so callers racing on a fresh file (two
     requests, a request and the scheduler tick) seed it once: the first seeds, the rest find the rows."""
     with store.connect() as con:
         todo = _shipped_todo(con)
-        fuel = con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is not None
-    if not todo and fuel:
+        fuel = _fuel_todo(con)
+    if not todo and not fuel:
         _remember_seeded()
         return
     with store.write_transaction() as con:
@@ -130,10 +158,14 @@ def ensure_shipped() -> None:
             if old is not None:
                 store.audit("shipped", "corrected a shipped tariff version", f"{v['kind']}/{v['key']}",
                             {"version_id": vid, "corrects": old["id"], "effective_from": v["effective_from"]}, con=con)
-        if con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is None:
-            for kind, day, price in tariff_data.FUEL_PRICES:
-                con.execute("INSERT OR IGNORE INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?)",
-                            (kind, day, price, json.dumps(tariff_data.FUEL_SOURCE[kind])))
+        fresh = con.execute("SELECT 1 FROM fuel_prices LIMIT 1").fetchone() is None
+        added = _fuel_todo(con)
+        for kind, day, price in added:
+            con.execute("INSERT OR IGNORE INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?)",
+                        (kind, day, price, json.dumps(tariff_data.FUEL_SOURCE[kind])))
+        if added and not fresh:
+            store.audit("shipped", "added the shipped fuel prices", ", ".join(sorted({k for k, _, _ in added})),
+                        {"days": [[k, d] for k, d, _ in added]}, con=con)
     _remember_seeded()
 
 
@@ -527,8 +559,8 @@ def fuel_price(kind: str, on: date | str) -> tuple[float, dict]:
 
 
 def add_fuel_price(kind: str, valid_from: str, price: float, by: str) -> None:
-    """Enter a fuel price from a day (a day already priced takes the new price). The shipped prices are seeded first: they go only into a file
-    with no fuel price, so a price entered on a fresh file would otherwise keep them out for good."""
+    """Enter a fuel price from a day (a day already priced takes the new price). The shipped prices are seeded first, so the entered price is the
+    one in force from its day on: a later build's shipped prices never displace it (`_fuel_todo`)."""
     if kind not in ("hsd", "gas_captive", "lng_captive") or not (0 < price < 100000):
         raise ValueError("A fuel price needs a kind (hsd, gas_captive, lng_captive) and a positive price")
     valid_from = _canonical_day(valid_from, "A fuel price's start")
