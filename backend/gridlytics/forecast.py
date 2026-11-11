@@ -182,7 +182,8 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
 #: conformal residual bands (plan Part 5.1, PV stage 1 "from day 3": "conformal residual bands by horizon class and sky class ... conformal from the
 #: last 14 to 28 days"; Part 5.2, load: "empirical spread ... plus conformal residuals after week 2", here once 7 days of errors are scored, so in the
 #: site's second week at the earliest, as stage 1 starts on day 3; R5 4.1 item 7). The errors are the stored stage-1 issues' against
-#: what happened over the CONFORMAL_DAYS local days before the issue's own day (every third local hour's issue; quarter issues are pruned after 3 days):
+#: what happened over the CONFORMAL_DAYS local days before the issue's own day (every third local hour's issue; quarter issues are pruned after 3 days
+#: and hourly ones after telemetry.ISSUE_HOURLY_DAYS, which must stay above CONFORMAL_DAYS and the 2 days read before them):
 #: the actual minus the issue's median per 15-minute step, divided by the step's clear sky for PV (an error of clearness, so a band widens at noon and
 #: closes at dusk; daylight steps only) or by the issue's median for load (floored at a tenth of its mean, so a night slot near zero does not blow up).
 #: Load errors read the unshed minutes only, as the scores do. They are binned by plan Part 5.5's horizon class (HORIZON_CLASSES) and, for PV, by the
@@ -235,7 +236,7 @@ def _conformal(site: dict, kind: str, day0: int) -> dict:
     sql = ("FROM forecast_issues WHERE site_id = ? AND kind = ? AND stage = 1 AND belief_time >= ? AND belief_time < ? "
            "AND (belief_time + 18000) % ? = 0")
     args = (sid, kind, w0 - 2 * 86400, int(day0), every)
-    with telemetry.connect() as con:
+    with telemetry.reading() as con:
         n, last = con.execute(f"SELECT COUNT(*), MAX(belief_time) {sql}", args).fetchone()
     key = (str(store.telemetry_path()), sid, kind, int(day0))
     hit = _CONFORMAL.get(key)
@@ -243,7 +244,7 @@ def _conformal(site: dict, kind: str, day0: int) -> dict:
         return hit[1]
     table: dict = {"by": {}, "pairs": {}, "days": 0}
     if n:
-        with telemetry.connect() as con:
+        with telemetry.reading() as con:
             rows = con.execute(f"SELECT belief_time, body {sql} ORDER BY belief_time", args).fetchall()
         g = telemetry.minute_grid(sid, w0 - 3 * 86400, int(day0))  # the oldest issue's sky reads the day before it
         g0 = int(g["ts"][0])
@@ -1022,9 +1023,10 @@ def _nrmse(pred: np.ndarray, act: np.ndarray, denom: float) -> float:
 
 
 def _issues(site_id: str, kind: str, b0: int, b1: int, key: str) -> list[tuple[int, np.ndarray]]:
-    """The stored issues of a kind with a belief time in (b0, b1), oldest first, as (belief time, the issue's array `key`). Quarter issues older than
-    3 days are pruned (telemetry.save_forecast) and hourly ones kept, so the nightly job sees every issue of the day before."""
-    with telemetry.connect() as con:
+    """The stored issues of a kind with a belief time in (b0, b1), oldest first, as (belief time, the issue's array `key`). Every issue is kept for
+    telemetry.ISSUE_ALL_DAYS, the hourly ones for telemetry.ISSUE_HOURLY_DAYS, then each Karachi day's day-ahead issue alone (telemetry.save_forecast),
+    so the nightly job sees every issue of the day before. A read: a deferred transaction, never the file's write lock (telemetry.reading)."""
+    with telemetry.reading() as con:
         rows = con.execute("SELECT belief_time, body FROM forecast_issues WHERE site_id = ? AND kind = ? AND belief_time > ? AND belief_time < ? "
                            "ORDER BY belief_time", (site_id, kind, int(b0), int(b1))).fetchall()
     out = []

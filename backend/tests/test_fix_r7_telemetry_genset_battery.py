@@ -951,8 +951,9 @@ def test_telemetry_reads_take_a_read_transaction_and_only_writers_take_the_write
     """Every reader of the telemetry file (the pages' series, the battery and genset figures, the export, the forecast issues, the outages' grid signal and
     the edge's sequence check) ran BEGIN IMMEDIATE, the write lock, so a company's readers and writers ran one at a time. A read now begins a deferred
     transaction; the writes (ingest, write_rows, the sequence, the forecast issues, a site's removal) still take the write lock. The edge's duplicate
-    check (control-edge, audit engine-delivery-03) reads edge_seen in the workspace file and opens no telemetry connection at all."""
-    from gridlytics import routes_edge, routes_telemetry
+    check (control-edge, audit engine-delivery-03) reads edge_seen in the workspace file and opens no telemetry connection at all. The forecasts' issue
+    reads (the conformal table, the scoring's issues) and the outages page's calendar (forecasts-outages) are reads too."""
+    from gridlytics import forecast, routes_edge, routes_telemetry
     sid = _genset_site("Reads")
     telemetry.ingest(sid, [{"ts": T0 + 60 * i, "grid_present": 1, "load_power_w": 1000.0, "genset_running": 0} for i in range(30)], "edge", now=NOW)
     telemetry.save_forecast(sid, "pv", T0, 1, "v", {"q50": [0.0]})
@@ -966,6 +967,9 @@ def test_telemetry_reads_take_a_read_transaction_and_only_writers_take_the_write
         "export_csv": lambda: telemetry.export_csv(sid, T0, T0 + 3600), "latest_forecast": lambda: telemetry.latest_forecast(sid, "pv"),
         "outages": lambda: telemetry.outages(sid, T0, T0 + 3600), "genset_runs": lambda: _runs(sid),
         "grid_signal": lambda: routes_telemetry._grid_signal(sid, T0 + 3600),
+        "outage_calendar": lambda: routes_telemetry._outage_calendar(sid, [], T0 + 3600, 1),
+        "forecast_issues": lambda: forecast._issues(sid, "pv", T0 - 1, T0 + 1, "q50"),
+        "conformal": lambda: forecast._conformal({"id": sid}, "load", T0 + 86400),
     }
     for name, read in readers.items():
         seen.clear()

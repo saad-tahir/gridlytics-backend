@@ -269,7 +269,7 @@ def _outage_calendar(site_id: str, log: list[dict], now: int, days: int) -> dict
         h = (np.arange(max(int(o["start"]), d0), int(o["end"]), 60, dtype=np.int64) - d0) // 3600
         np.add.at(mins, h[h < n], 1)
     known = np.zeros(n, dtype=bool)
-    with telemetry.connect() as con:
+    with telemetry.reading() as con:
         for h, c in con.execute("SELECT (ts - ?) / 3600 AS h, COUNT(grid_present) FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? GROUP BY h",
                                 (d0, site_id, d0, now)).fetchall():
             if 0 <= int(h) < n and c:
