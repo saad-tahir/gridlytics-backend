@@ -59,6 +59,7 @@ Each test works in a data folder of its own (GRIDLYTICS_DATA_DIR) with a company
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
@@ -1003,9 +1004,38 @@ def test_marking_a_plan_applied_takes_only_a_date_of_its_table(world):
 
 def _charged(sid: str, soc: float = 0.9) -> None:
     """The site's battery at `soc` (it has no readings, so the solve starts from the carried state): a hold at 80 % is then reachable without a charge
-    at any hour. From 50 %, a hold at 80 % in the evening peak can be kept only by shedding load with the grid up, which the wrong-plan guard refuses
-    (the re-solve is held and the plan of before stays in force), so a test of the hold's own effect read the time of day (review)."""
+    at any hour. From 50 %, a hold at 80 % in the evening peak was kept by shedding load with the grid up, which the wrong-plan guard refuses (the
+    re-solve was held and the plan of before stayed in force), so a test of the hold's own effect read the time of day (review). Since optimiser-plans'
+    rule that the plan never sheds load with the grid up, such a hold is planned (the next test)."""
     sites.put_state(sid, soc=soc)
+
+
+def test_a_hold_above_the_present_charge_in_the_evening_peak_is_planned_not_held_by_the_guard(world):
+    """Integration (control-edge's hold and guard with optimiser-plans' engine-optimiser-01): from 50 %, a hold at 80 % in the evening peak was
+    planned by shedding load with the grid up to keep the MDI cap, and the wrong-plan guard held every such plan (sheds_load_with_grid_up). With no
+    grid-up shed, the plan charges to the hold from the grid, and it passes the guard."""
+    sid, op = world.site, world.c["operator"]
+    now = _now()
+    eve = int(datetime.fromtimestamp(now + 3600, PKT).replace(hour=18, minute=0, second=0, microsecond=0).timestamp())
+    if eve < now + 3600:
+        eve += 86400                                                          # the next 18:00 Karachi time at least an hour away
+    hours = math.ceil((eve + 2 * 3600 - now) / 900) / 4                       # the hold runs to two hours into the evening peak
+    with world.use():
+        _closed_loop(sid)
+        _charged(sid, 0.5)
+    r = op.post(f"/api/sites/{sid}/control/hold", json={"hours": hours, "soc_pct": 80})
+    assert r.status_code == 200, r.text
+    with world.use():
+        (o,) = sites.overrides(sid)
+        sites.put_state(sid, soc=0.5)                                         # the evening's solve starts from 50 %
+        out = plans.tick(sid, at=eve, save=False)
+    until = plans._ts(o["until_ts"])
+    held = [s for s in out["steps"] if s["t"] < until]
+    assert held and held[0]["peak"] and held[0]["soc_start_pct"] == pytest.approx(50.0, abs=0.5)
+    assert out["status"] == "active" and out["reason"] is None, (out["status"], out["reason"])
+    assert all(s["unserved_kw"] < 0.01 for s in out["steps"] if s["grid_present"] > 0.5)
+    assert all(s["reserve_pct"] >= 80 for s in held)
+    assert max(s["soc_pct"] for s in held) >= 80 - 0.5                    # it charges to the hold inside the peak
 
 
 def test_a_hold_re_solves_at_once_so_the_plan_and_the_edge_take_it(world):
