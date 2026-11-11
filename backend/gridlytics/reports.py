@@ -548,7 +548,7 @@ def _bills(doc: _Doc, site: dict, d0: date, d1: date) -> None:
               + [[f"{_short_day(b['period_start'])} to {_short_day(b['period_end'])}", rs((b.get("real") or {}).get("total_rs")),
                   rs((b.get("rebuilt") or {}).get("total_rs")), diff(b)] for b in rows], [60 * mm, 35 * mm, 40 * mm, 25 * mm])
     if any(verdict(b) == "not_metered" for b in rows):
-        doc.p("Not rebuilt: the bill of a connection whose meter the site's readings are not, kept for the record.")
+        doc.p("Not rebuilt: the site's meter readings are another connection's, so this connection's bill is kept for the record and not rebuilt.")
     if any((b.get("check") or {}).get("verdict") == "not_comparable" for b in rows):
         doc.p(f"Not compared: less than {verify.BILL_COMPLETENESS_MIN * 100:.0f} % of the billing period has meter data, so the rebuild is an "
               "estimate and gives no verdict.")

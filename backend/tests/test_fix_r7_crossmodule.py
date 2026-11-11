@@ -863,3 +863,23 @@ def test_review_the_plan_says_what_it_planned_within_from_the_edges_last_ack(com
         summary = json.loads(con.execute("SELECT summary FROM plans WHERE site_id = ? ORDER BY generated_at DESC, rowid DESC LIMIT 1",
                                          (sid,)).fetchone()["summary"])
     assert summary["achieved"] == {"plan_id": "p-sent", "received_at": at, "grid_charge_allowed": "refused"}
+
+
+def test_review_the_monthly_report_marks_another_connections_bill_not_rebuilt_in_plain_words(world, monkeypatch):
+    """Review of tracker-and-docs-01: the report's bill table prints 'Not rebuilt' for a bill of a connection the site's readings do not meter (it
+    had no test), and its note read 'the bill of a connection whose meter the site's readings are not', which is not a plain sentence."""
+    from gridlytics import reports
+    from test_fix_r7_alerts_reports import _past_month, _plan_8_5_world, _story
+    sid, month = world.site, _past_month()
+    with world.use():
+        _plan_8_5_world(monkeypatch, sid, month)
+        bill = {**verify.bills(sid)[0], "rebuilt": {"metered": False, "completeness": 0.0, "lines": []}, "difference_pct": None,
+                "check": {"verdict": "not_metered"}}
+        monkeypatch.setattr(verify, "bills", lambda site_id: [bill])
+        built = _story(monkeypatch)
+        reports.generate("monthly_savings", sid, month, "test")
+    text = built[-1]
+    line = next(ln for ln in text.splitlines() if "Rs 1,000,000" in ln)
+    assert line.endswith("| Not rebuilt"), line
+    assert ("Not rebuilt: the site's meter readings are another connection's, so this connection's bill is kept for the record and not "
+            "rebuilt.") in " ".join(text.split()), text
