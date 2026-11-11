@@ -471,6 +471,9 @@ def control_line(c: dict) -> str:
 # ------------------------------------------------------------------------------------------------ sections
 
 ARM_WORDS = {"plan": "The plan", "native": "The native settings"}
+#: The claim's row (round 7, audit pages-D-21): the days that claim are those whose plan was followed in full or in part (verify.CLAIMING), a
+#: verified day only one followed in full, so the claim is never said to count "the verified days only"
+CLAIMED_ROW = "Claimed (plan followed in full or in part)"
 
 
 def _ledger(doc: _Doc, nat: dict, tun: dict, scored: int) -> None:
@@ -488,12 +491,13 @@ def _ledger(doc: _Doc, nat: dict, tun: dict, scored: int) -> None:
     rows = [["Lever", "Against the native settings", "Against a tuned table"]]
     rows += [[LEVER_NAMES.get(k, k.replace("_", " ").capitalize()), cell(nat, k), cell(tun, k)] for k in keys]
     rows += [["Saving, all days", rs(nat.get("saving_rs")), rs(tun.get("saving_rs"))],
-             ["Claimed (verified days only)", rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))]]
+             [CLAIMED_ROW, rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))]]
     if nat.get("perfect_foresight_rs") is not None:
         rows.append(["Perfect foresight (not achievable, for reference)", rs(nat["perfect_foresight_rs"]), "-"])
     doc.table(rows, [95 * mm, 42 * mm, 42 * mm])
     doc.p("The ledger sums every scored day of the period, the days that claim nothing included (a table not applied, a native block, a withheld "
-          "claim); the claimed figures count the verified days only.")
+          "claim); the claimed figures count the days whose plan was followed in full or in part, less the carry-over still provisional. A "
+          "verified day is one whose plan was followed in full, so a partly followed day claims without being a verified day.")
 
 
 def _switchback(doc: _Doc, site_id: str, d0: date, d1: date, whole: bool = False) -> None:
@@ -634,9 +638,11 @@ def _monthly(doc: _Doc, site: dict, kind: str, p0: date, p1: date, today: date, 
         doc.p("The headline against both baselines: the inverter's own settings as captured (native) and the best static table of its brand (tuned).")
         doc.table([["Headline", "Against the native settings", "Against a tuned table"],
                    ["Saving, all days", rs(nat.get("saving_rs")), rs(tun.get("saving_rs"))],
-                   ["Claimed (verified days only)", rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))],
+                   [CLAIMED_ROW, rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))],
                    ["Diesel saved (Estimated)", _litres_saved(nat, scored, has_genset), _litres_saved(tun, scored, has_genset)],
-                   ["Verified days", str(nat.get("verified_days", 0)), str(tun.get("verified_days", 0))]], [95 * mm, 42 * mm, 42 * mm])
+                   ["Days that claim (plan followed in full or in part)", str(nat.get("claiming_days", 0)), str(tun.get("claiming_days", 0))],
+                   ["Verified days (plan followed in full)", str(nat.get("verified_days", 0)), str(tun.get("verified_days", 0))]],
+                  [95 * mm, 42 * mm, 42 * mm])
         unmetered = max(int(nat.get("genset_unknown_days") or 0), int(tun.get("genset_unknown_days") or 0))
         if has_genset and 0 < unmetered:
             doc.p(f"The genset's fuel was not metered on {unmetered} of {scored} days: those days add nothing to the litres or the genset lever.")
@@ -723,8 +729,8 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
               [45 * mm, 23 * mm, 23 * mm, 23 * mm, 22 * mm, 15 * mm, 29 * mm])
     doc.gap()
     doc.p("Each site is measured against a replay of its own inverter settings (native) and the best static table of its brand (tuned), on the same "
-          "day's sun, load and outages; the claimed figure counts the verified days only. The totals add the sites' figures as each site's report "
-          "states them.")
+          "day's sun, load and outages; the claimed figure counts the days whose plan was followed in full or in part, and a verified day is one "
+          "whose plan was followed in full. The totals add the sites' figures as each site's report states them.")
     return prelim
 
 

@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from test_fix_api import world  # noqa: F401 (a fixture)
+from test_fix_r7_alerts_reports import _baseline, _day_row, _fake_summary, _past_month, _story, _tday, _with_summary
 from test_fix_savings import _days, _put_rows, _row, company, make_site  # noqa: F401 (company is a fixture)
 
 from gridlytics import store, tariffs, verify
@@ -87,3 +88,28 @@ def test_the_fee_notice_calls_the_saving_verified_only_when_the_fee_check_is_not
             (got,) = [a for a in alerts.listing("active", sid) if a["rule"] == "fee_above_third"]
             assert got["title"] == want, got["title"]
 
+
+# ------------------------------------------------------------------------------------------------ pages-D-21: the claimed wording
+
+def test_the_reports_say_which_days_claim_and_never_that_the_claim_counts_the_verified_days_only(world, monkeypatch):
+    """pages-D-21: a partly followed day claims its saving but is not a verified day, yet the monthly PDF headed the claim 'Claimed (verified days
+    only)' and said 'the claimed figures count the verified days only', and the company roll-up the same. The reports now count the days that claim
+    beside the verified days and say what each is."""
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    d1, d2 = f"{month}-03", f"{month}-04"
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(d1), _day_row(d2, fidelity="partial")], native=_baseline(claiming_days=2, verified_days=1),
+                                             tuned=_baseline(claiming_days=2, verified_days=1, claimed_rs=780.0)), [_tday(d1), _tday(d2)])
+    built = _story(monkeypatch)
+    with world.use():
+        reports.generate("monthly_savings", sid, month, "test")
+        reports.generate("company_rollup", None, month, "test")
+    monthly, rollup = built[-2], built[-1]
+    for text in (monthly, rollup):
+        assert "verified days only" not in text, text
+    rows = {ln.split(" | ")[0]: ln for ln in monthly.splitlines() if " | " in ln}
+    assert "Claimed (plan followed in full or in part)" in rows, rows
+    assert rows["Days that claim (plan followed in full or in part)"].split(" | ")[1:] == ["2", "2"], rows
+    assert rows["Verified days (plan followed in full)"].split(" | ")[1:] == ["1", "1"], rows
+    assert "every scored day" in monthly and "followed in full or in part" in monthly, monthly
+    assert "a verified day is one whose plan was followed in full" in rollup, rollup
