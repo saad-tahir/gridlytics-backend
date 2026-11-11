@@ -437,6 +437,40 @@ def test_a_reset_sequence_is_stored_not_acknowledged_as_a_duplicate(world):
             assert con.execute("SELECT count(*) FROM events WHERE site_id = ? AND type = 'readback_mismatch'", (sid,)).fetchone()[0] == 1
 
 
+def test_the_edges_events_as_u3_sends_them_raise_their_alerts_and_count_in_the_reports_control_health(world, monkeypatch):
+    """R7 integration (control-edge with alerts-reports, audit pages-D-14, pages-D-07): the edge route stores an event that names its device with source
+    'edge:<device>', and U3's names as sent (override_local), so the alerts and the monthly report's control health, which read source 'edge' and this
+    contract's names alone, missed every event a U3 edge sends (each of U3 5.5's examples names its device), and the clock_unsynced the cloud records
+    from the heartbeats' offset (source 'cloud')."""
+    from gridlytics import alerts, reports
+    sid, kh = world.site, world.key(["telemetry:write"])
+    now = _now()
+    sent = [{"ts": _iso(now - 600), "type": "readback_mismatch", "source": "inv1", "detail": {"primitive": "soc_floor_pct"}},
+            {"ts": _iso(now - 300), "type": "override_local", "source": "inv1"},
+            {"ts": _iso(now - 200), "type": "write_failed"}]
+    r = world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_env(1, events=sent))
+    assert r.status_code == 200 and r.json()["stored"] == 3, r.text
+    monkeypatch.setattr(alerts, "settled", lambda site_id, plan, now: True)
+    with world.use():
+        with store.connect() as con:
+            assert {(e["source"], e["type"]) for e in con.execute("SELECT source, type FROM events WHERE site_id = ?", (sid,))} >= {
+                ("edge:inv1", "readback_mismatch"), ("edge:inv1", "override_local"), ("edge", "write_failed")}
+        alerts.evaluate(sid, now)
+        got = {a["rule"] for a in alerts.listing("active", sid)}
+        day = datetime.fromtimestamp(now, PKT).date()
+        health = reports.control_health(sid, [], day - timedelta(days=1), day)
+    assert {"edge_readback_mismatch", "edge_local_override", "edge_write_failed"} <= got, got
+    assert health["events"] == {"readback_mismatch": 1, "local_override": 1, "write_failed": 1}, health
+    # the cloud's clock check of the heartbeats records clock_unsynced as source 'cloud': it raises the Data alert too
+    assert "edge_clock_unsynced" not in got
+    beat = world.anon.post(f"/api/edge/{sid}/heartbeat", headers=kh, json=_env(2, uptime_s=60, clock_offset_s=150, control_state="executing"))
+    assert beat.json()["warning"].startswith("clock_offset_120s"), beat.text
+    with world.use():
+        alerts.evaluate(sid, _now())
+        got = {a["rule"]: a for a in alerts.listing("active", sid)}
+    assert got["edge_clock_unsynced"]["category"] == "Data", got.keys()
+
+
 def test_an_ack_is_stored_once_however_often_it_is_sent(world):
     sid, kh = world.site, world.key(["telemetry:write"])
     ack = _env(3, plan_id="p1", status="applied")

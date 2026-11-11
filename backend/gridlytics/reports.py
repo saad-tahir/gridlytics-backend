@@ -20,7 +20,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from . import plans, platform as platformdb, sites, store, telemetry, twin, verify
+from . import alerts, contract, plans, platform as platformdb, sites, store, telemetry, twin, verify
 
 PKT = timezone(timedelta(hours=5))
 KINDS = ("monthly_savings", "energy_only", "daily_operations", "company_rollup", "pilot")
@@ -440,8 +440,10 @@ def control_health(site_id: str, days: list[dict], d0: date, d1: date) -> dict:
     with store.connect() as con:
         scores = [r["fidelity"] for r in con.execute("SELECT fidelity FROM applied WHERE site_id = ? AND day_local >= ? AND day_local <= ? AND fidelity "
                                                      "IS NOT NULL", (site_id, d0.isoformat(), d1.isoformat()))]
-        rows = con.execute(f"SELECT type, ts FROM events WHERE site_id = ? AND source = 'edge' AND type IN ({','.join('?' * len(EDGE_WORDS))})",
-                           (site_id, *EDGE_WORDS)).fetchall()
+        # as the edge route stores them (alerts.EDGE_SOURCE_SQL, alerts.edge_event_types): a device's source and U3's names too
+        kinds = alerts.edge_event_types(EDGE_WORDS)
+        rows = con.execute(f"SELECT type, ts FROM events WHERE site_id = ? AND {alerts.EDGE_SOURCE_SQL} AND type IN ({','.join('?' * len(kinds))})",
+                           (site_id, *kinds)).fetchall()
     events: dict[str, int] = {}
     for r in rows:
         try:
@@ -449,7 +451,8 @@ def control_health(site_id: str, days: list[dict], d0: date, d1: date) -> dict:
         except ValueError:
             continue
         if t0 <= t < t1:
-            events[r["type"]] = events.get(r["type"], 0) + 1
+            kind = contract.event_meaning(r["type"])
+            events[kind] = events.get(kind, 0) + 1
     return {"days": counts, "score": (sum(scores) / len(scores)) if scores else None, "scored_applied": len(scores), "events": events}
 
 

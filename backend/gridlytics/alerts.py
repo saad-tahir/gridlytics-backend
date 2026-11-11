@@ -19,7 +19,7 @@ from pydantic import Field, StrictInt, ValidationError, field_validator
 
 from . import auth
 from . import battery as battery_service
-from . import plans, sites, store, store_members, tariffs, telemetry
+from . import contract, plans, sites, store, store_members, tariffs, telemetry
 from .schemas import Refusal, Strict, message
 
 PKT = timezone(timedelta(hours=5))
@@ -254,16 +254,29 @@ def _event_ts(v) -> int | None:
         return None
 
 
+#: The edge's events as POST /edge/:id/events stores them (control-edge): source "edge", or "edge:<device>" for an event that names its device (U3 5.5)
+EDGE_SOURCE_SQL = "(source = 'edge' OR source LIKE 'edge:%')"
+
+
+def edge_event_types(kinds) -> tuple[str, ...]:
+    """The stored type names of these events: this contract's and U3's for the same event (contract.EVENT_ALIASES: override_local is local_override),
+    since an event is stored as sent; read each back with contract.event_meaning."""
+    kinds = tuple(kinds)
+    return kinds + tuple(a for a, k in contract.EVENT_ALIASES.items() if k in kinds)
+
+
 def _edge_events(site_id: str, now: int, ready: bool) -> None:
-    kinds = tuple(EDGE_EVENTS) + ("fallback_cleared",)
+    kinds = edge_event_types(tuple(EDGE_EVENTS) + ("fallback_cleared",))
     with store.connect() as con:
-        rows = con.execute(f"SELECT type, ts, detail FROM events WHERE site_id = ? AND source = 'edge' AND type IN ({','.join('?' * len(kinds))}) "
-                           "ORDER BY id DESC LIMIT 500", (site_id, *kinds)).fetchall()
+        # and the cloud's own clock check of the edge's heartbeats (routes_edge._clock_update), which records clock_unsynced as source 'cloud'
+        rows = con.execute(f"SELECT type, ts, detail FROM events WHERE site_id = ? AND ({EDGE_SOURCE_SQL} OR (source = 'cloud' AND type = 'clock_unsynced')) "
+                           f"AND type IN ({','.join('?' * len(kinds))}) ORDER BY id DESC LIMIT 500", (site_id, *kinds)).fetchall()
     latest: dict[str, int] = {}
     for r in rows:
         t = _event_ts(r["ts"])
-        if t is not None and now - 86400 <= t <= now + 300 and t > latest.get(r["type"], -1):
-            latest[r["type"]] = t
+        kind = contract.event_meaning(r["type"])
+        if t is not None and now - 86400 <= t <= now + 300 and t > latest.get(kind, -1):
+            latest[kind] = t
     if latest.get("fallback_cleared", -1) >= latest.get("fallback_engaged", 0):
         latest.pop("fallback_engaged", None)
     for kind, (cat, sev, words) in EDGE_EVENTS.items():
