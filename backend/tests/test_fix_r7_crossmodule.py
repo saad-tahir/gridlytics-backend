@@ -16,6 +16,7 @@ stage-1 packages' code at once.
 - followup mdi-override (engine-tariffs-08 h): a site override's MDI block mode and scope reach the plan, the guard and the ledger.
 - followup native-bill (pages-D-10, the rest): the bill rebuilt for the native arm beside the actual arm's.
 - followup achieved (engine-delivery-12, the optimiser half): what the edge could apply re-enters the next solve.
+- followup compare-end-value (engine-plans-live-10): the compare drawer values the energy each arm leaves at the horizon's end.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -642,6 +643,40 @@ def test_what_the_edge_could_apply_re_enters_the_next_solve(company):
     assert "achieved" not in _problem_of(sid)
     sites.set_tier_allowed(sid, "closed_loop", "t")
     assert "achieved" not in _problem_of(sid, day=NOV + timedelta(days=3))
+
+
+# ------------------------------------------------------------------------------------------------ followup:compare-end-value (engine-plans-live-10)
+
+def test_compare_with_native_values_the_energy_each_arm_holds_at_the_end(world, monkeypatch):
+    """The drawer priced the energy each arm bought but not what it left in the battery, so a plan that keeps energy for later (a reserve, the next
+    day's peak) looked dearer than native by all of it (the Lahore demo). Each arm now carries what it holds at the horizon's end and its value at
+    the plan's own terminal price (eta_d x c_next less the wear of discharging it), as the ledger values end energy."""
+    from gridlytics import optimise
+    from test_fix_r7_delivery_twin import _compare_ready, _reserve_plan
+    steps, comp = _reserve_plan()
+    plan = {"id": "p1", "slots": comp, "steps": steps, "summary": {}}
+    monkeypatch.setattr(plans, "current", lambda site_id, *x, **k: plan)
+    _compare_ready(world)
+    r = world.c["admin"].get(f"/api/sites/{world.site}/plan/compare").json()
+    nat, arm = r["compare"]["native"], r["compare"]["plan"]
+    with world.use():
+        b = sites.full(world.site)["assets"]["battery"]
+    v_end = 0.95 * 30.0 - optimise.wear_cost(b)                                  # no end price stored: the horizon's dearest import price, Rs 30
+    assert r["end_value_rs_per_kwh"] == pytest.approx(v_end, abs=0.01)
+    assert arm["end_kwh"] == pytest.approx(120.0, abs=1.0) and arm["end_kwh"] > nat["end_kwh"]
+    assert arm["end_value_rs"] == pytest.approx(arm["end_kwh"] * v_end, abs=1.0)
+    # the plan bought 160 kWh at Rs 30 and kept 120 in the battery; native spent 80 of them on the load: the gap the drawer showed (all of it the
+    # plan's import) narrows by what the plan keeps at the end, and with the outage risk the plan is the cheaper
+    gap = arm["energy_rs"] - nat["energy_rs"]
+    net_gap = (arm["energy_rs"] - arm["end_value_rs"]) - (nat["energy_rs"] - nat["end_value_rs"])
+    assert gap > 0 and net_gap == pytest.approx(gap - (arm["end_kwh"] - nat["end_kwh"]) * v_end, abs=2.0) and net_gap < 0.5 * gap
+    assert (arm["energy_rs"] + arm["reserve_short_rs"] - arm["end_value_rs"]) < (nat["energy_rs"] + nat["reserve_short_rs"] - nat["end_value_rs"])
+    # the plan's own end price, where it stored one
+    plan["summary"] = {"end_price": {"c_next_rs_per_kwh": 50.0, "basis": "import"}}
+    r2 = world.c["admin"].get(f"/api/sites/{world.site}/plan/compare").json()
+    assert r2["end_value_rs_per_kwh"] == pytest.approx(0.95 * 50.0 - optimise.wear_cost(b), abs=0.01)
+    viewer = world.c["viewer"].get(f"/api/sites/{world.site}/plan/compare").json()
+    assert viewer["compare"]["plan"]["end_kwh"] == arm["end_kwh"] and "end_value" not in str(viewer)
 
 
 # ------------------------------------------------------------------------------------------------ engine-plans-live-18: charging from the genset

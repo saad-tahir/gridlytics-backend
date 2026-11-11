@@ -10,7 +10,7 @@ import numpy as np
 from fastapi import APIRouter, Body
 from pydantic import Field, field_validator
 
-from . import auth, delivery, plans, sites, store, twin, verify
+from . import auth, delivery, optimise, plans, sites, store, twin, verify
 from .routes_common import full_or_404, now_ts, out, site_or_404, today
 from .schemas import Refusal, Strict, check
 from .routes_common import bad
@@ -277,6 +277,14 @@ def plan_compare(site_id: str):
     risk = np.where(risk >= 0.01, risk, 0.0)
     reserve = np.array([float(st.get("reserve_pct") or 0.0) for st in steps])
     price, basis = _short_price(s, steps[0]["t"])
+    # what a kWh left in the battery at the horizon's end is worth, at the plan's own terminal price (round 7 stage 2, engine-plans-live-10: the
+    # drawer counted none, so a plan that keeps energy for later looked dearer than native by all of it): eta_d x c_next less the wear of
+    # discharging it, as the ledger's v_end; c_next the plan's (summary end_price), else the dearest import price of the horizon's last day
+    b_asset = s["assets"]["battery"]
+    c_next = ((p.get("summary") or {}).get("end_price") or {}).get("c_next_rs_per_kwh")
+    if c_next is None:
+        c_next = max((float(st.get("c_imp") or 0.0) for st in steps[-96:]), default=0.0)
+    v_end = max(0.0, float(b_asset["eta_d"]) * float(c_next) - optimise.wear_cost(b_asset))
     arms = {}
     # the plan arm runs what the site's inverter runs: a Mode B site's setpoints, else the compiled table (round 7 stage 2, engine-delivery-17)
     plan_pol = (twin.setpoints_policy(delivery.mode_b(steps, s), ts) if p.get("mode") == "b" and delivery.executes_mode_b(s)
@@ -290,9 +298,10 @@ def plan_compare(site_id: str):
                       "energy_rs": round(float((c_imp * sim["imp"] - c_exp * sim["exp"]).sum() / 60), 0), "litres": round(float(sim["fuel"].sum()), 1),
                       "unserved_kwh": round(float(sim["unserved"].sum() / 60), 1), "min_soc_pct": round(float(sim["soc"].min() * 100), 1),
                       "reserve_short_kwh": round(short, 1), "reserve_short_rs": round(short * price, 0),
+                      "end_kwh": round(float(sim["soc"][-1]) * plant.e_nom, 1), "end_value_rs": round(float(sim["soc"][-1]) * plant.e_nom * v_end, 0),
                       "soc": [round(float(x) * 100, 1) for x in sim["soc"][::15]]}
     return out({"compare": arms, "t": [st["t"] for st in steps], "native": {"version": s["native"]["version"], "captured_at": s["native"]["captured_at"]},
-                "short_rs_per_kwh": round(price, 1), "short_basis": basis})
+                "short_rs_per_kwh": round(price, 1), "short_basis": basis, "end_value_rs_per_kwh": round(v_end, 2)})
 
 
 # ------------------------------------------------------------------------------------------------ control (UI-15)

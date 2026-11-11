@@ -843,6 +843,10 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "battery_state": ({**p["battery_state"], "anchor_t": (res.get("anchor") or {}).get("t"),
                                   "anchor_short_kwh": (res.get("anchor") or {}).get("short_kwh")}
                                  if p.get("battery_state") and p["battery_state"].get("anchor_soc_pct") else p.get("battery_state")),
+               # the price the plan put on a kWh left in the battery at the horizon's end (its terminal value's c_next and what set it), which
+               # the compare drawer values both arms' end energy at (round 7 stage 2, engine-plans-live-10)
+               "end_price": ({"c_next_rs_per_kwh": round(float(p["terminal"]["c_next"]), 2), "basis": p["terminal"].get("c_next_basis")}
+                             if p.get("terminal") else None),
                "status_label": _status_label(res),
                "solver": {"status": res["status"], "variables": res.get("variables"), "rows": res.get("rows"), "binaries": res.get("binaries"),
                           "relaxed": res.get("relaxed"), "message": res.get("message"), "shed_rule_resolve": res.get("shed_rule_resolve"),
