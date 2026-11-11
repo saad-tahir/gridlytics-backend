@@ -345,7 +345,10 @@ def test_any_member_generates_the_energy_report_and_every_row_says_whether_it_is
     assert r.status_code == 200 and r.json()["preliminary"] is True, r.text
     assert v.post("/api/reports", json={"kind": "monthly_savings", "site_id": sid, "period": month}).status_code == 403
     assert v.post("/api/reports", json={"kind": "daily_operations", "site_id": sid, "period": month}).status_code == 403
-    assert a.post("/api/reports", json={"kind": "daily_operations", "site_id": sid, "period": month}).json()["preliminary"] is None
+    # the daily operations sheet is for a day since round 7 (audit pages-D-24): a month is refused
+    assert a.post("/api/reports", json={"kind": "daily_operations", "site_id": sid, "period": month}).status_code == 422
+    day = datetime.now(timezone(timedelta(hours=5))).date().isoformat()
+    assert a.post("/api/reports", json={"kind": "daily_operations", "site_id": sid, "period": day}).json()["preliminary"] is None
     rows = a.get("/api/reports").json()
     assert sorted((r["kind"], r["preliminary"]) for r in rows) == [("daily_operations", None), ("energy_only", True)]
     assert [r["preliminary"] for r in v.get("/api/reports").json()] == [True]

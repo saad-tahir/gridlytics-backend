@@ -225,9 +225,12 @@ def fleet_savings(month: str | None = None):
     for s in sites.listing():
         summ = verify.summary(s["id"], d0.isoformat(), d1.isoformat())
         n = summ["baselines"].get("native", {})
+        # chain_stale_days: the site's days out of step until recomputed, so its figures may not add up (audit pr-review-06)
         rows.append({"site_id": s["id"], "name": s["name"], "saving_rs": n.get("saving_rs"), "claimed_rs": n.get("claimed_rs"),
-                     "litres_saved": n.get("litres_saved"), "verified_days": n.get("verified_days"), "preliminary": summ["preliminary"]})
-    return out({"month": m, "sites": rows, "total_claimed_rs": round(sum(r["claimed_rs"] or 0 for r in rows), 0)})
+                     "litres_saved": n.get("litres_saved"), "verified_days": n.get("verified_days"), "preliminary": summ["preliminary"],
+                     "chain_stale_days": list(summ.get("chain_stale_days") or [])})
+    return out({"month": m, "sites": rows, "total_claimed_rs": round(sum(r["claimed_rs"] or 0 for r in rows), 0),
+                "stale_sites": sum(1 for r in rows if r["chain_stale_days"])})
 
 
 _ = full_or_404
