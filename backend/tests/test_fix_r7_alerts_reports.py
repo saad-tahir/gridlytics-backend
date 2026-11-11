@@ -1152,14 +1152,17 @@ def test_report_generation_is_bounded_per_person(world, monkeypatch):
     sid, month = world.site, _past_month()
     monkeypatch.setattr(routes_reports, "GENERATE_LIMIT", (2, 3600))
     body = {"kind": "energy_only", "site_id": sid, "period": month}
+    # three different reports (round 7, storage-perf: the same report asked again with nothing changed is the one already made, and not counted)
+    bodies = [{**body, "period": _past_month(k)} for k in (1, 2, 3)]
     v = world.c["viewer"]
-    assert [v.post("/api/reports", json=body).status_code for _ in range(2)] == [200, 200]
-    r = v.post("/api/reports", json=body)
+    assert [v.post("/api/reports", json=b).status_code for b in bodies[:2]] == [200, 200]
+    r = v.post("/api/reports", json=bodies[2])
     assert r.status_code == 429 and int(r.headers["retry-after"]) > 0, r.text
     assert "2 reports an hour" in r.json()["detail"], r.text
+    assert v.post("/api/reports", json=bodies[0]).status_code == 200                # the one already made: not rendered, not counted
     # a refused request (a bad period) is not counted, and another person is not held up by this one
     assert world.c["analyst"].post("/api/reports", json={**body, "period": "2026-13"}).status_code == 422
-    assert [world.c["analyst"].post("/api/reports", json=body).status_code for _ in range(2)] == [200, 200]
+    assert [world.c["analyst"].post("/api/reports", json=b).status_code for b in bodies[1:]] == [200, 200]
 
 
 def test_one_person_generates_one_report_at_a_time(world, monkeypatch):
@@ -1179,16 +1182,22 @@ def test_one_person_generates_one_report_at_a_time(world, monkeypatch):
     first: list = []
     t = threading.Thread(target=lambda: first.append(world.c["analyst"].post("/api/reports", json=body)))
     t.start()
+    joined: list = []
     try:
         assert entered.wait(10)
-        r = world.c["analyst"].post("/api/reports", json=body)
+        # another report while the first renders: refused (round 7, storage-perf: the same report asked again joins the one rendering)
+        r = world.c["analyst"].post("/api/reports", json={**body, "period": _past_month(2)})
         assert r.status_code == 429 and "still being generated" in r.json()["detail"], r.text
         assert r.headers.get("retry-after"), r.headers
+        same = threading.Thread(target=lambda: joined.append(world.c["viewer"].post("/api/reports", json=body)))
+        same.start()
     finally:
         release.set()
         t.join(30)
+    same.join(30)
     assert first and first[0].status_code == 200, first
-    assert world.c["analyst"].post("/api/reports", json=body).status_code == 200      # its turn is over
+    assert joined and joined[0].status_code == 200 and joined[0].json()["id"] == first[0].json()["id"]   # rendered once
+    assert world.c["analyst"].post("/api/reports", json={**body, "period": _past_month(2)}).status_code == 200      # its turn is over
 
 
 def test_only_the_newest_copies_of_a_report_are_kept(world, monkeypatch):

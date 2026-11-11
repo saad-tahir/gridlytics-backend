@@ -8,10 +8,12 @@ operator neither lists nor downloads the monthly savings report or the company r
 figures were `preliminary`. The company roll-up covers every site (no site_id; its row keeps an empty one). The pilot report carries the fee (its
 fee multiple), so a role without `see_fee` neither lists nor downloads it.
 
-Generating is bounded per person (audit security-roles-08): each report renders its PDF in the request and writes two files, so a script looping
-POST /api/reports filled the disk and loaded the one API process, whose solves degrade under CPU load (HANDOFF 8.A.3). One person generates at most
-GENERATE_LIMIT reports an hour and one at a time, at most RENDERING reports render at once on the server, and reports.generate keeps only the newest
-copies of a report (reports.KEEP_COPIES).
+Generating is bounded per person (audit security-roles-08): each report renders its PDF and writes two files, so a script looping POST /api/reports
+filled the disk and loaded the one API process, whose solves degrade under CPU load (HANDOFF 8.A.3). One person generates at most GENERATE_LIMIT
+reports an hour and one at a time, at most RENDERING reports render at once on the server, and reports.generate keeps only the newest copies of a
+report (reports.KEEP_COPIES). A report renders as a job (plan Part 10.6; jobs.py): the request waits REPORT_WAIT_S for it and answers the report, else
+202 with the job, read at GET /api/reports/jobs/:job_id; the same request asked again while nothing it reads has changed answers the report already
+made (the request-hash cache, `_basis`), and one asked while it renders joins it.
 """
 from __future__ import annotations
 
@@ -19,10 +21,10 @@ import os
 import threading
 from contextlib import contextmanager
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Response
 from fastapi.responses import FileResponse
 
-from . import auth, reports, store
+from . import auth, jobs, reports, store
 from .routes_common import bad, site_or_404, today
 from .schemas import Refusal
 
@@ -100,8 +102,51 @@ def listing(site_id: str | None = None):
     return [r for r in reports.listing(site_id) if _may_read(r["kind"])]
 
 
+def _org() -> str:
+    """The workspace a report job belongs to: the company (every member of it may read a report of a kind they may generate)."""
+    return "reports:" + str((auth.company.get() or {}).get("id") or "")
+
+
+#: how long POST /api/reports waits for its report before it answers 202 with the job (a report renders in a second or two; a company roll-up of
+#: many sites longer)
+REPORT_WAIT_S = 20.0
+
+
+#: what a report reads and the column that moves when a row of it is added or changed: the newest of each, for the site (of every site for a company
+#: report), is the request-hash cache's basis (_basis)
+_BASIS = (("savings_days", "MAX(computed)"), ("plans", "MAX(generated_at)"), ("table_issues", "MAX(rowid)"), ("applied", "MAX(rowid)"),
+          ("applied", "MAX(fidelity)"), ("overrides", "MAX(rowid)"), ("overrides", "MAX(cleared)"), ("bills", "MAX(rowid)"))
+
+
+def _basis(site_id: str) -> list:
+    """What a report's figures may change with, for the request-hash cache: the company's newest change of anything but a report (every settings,
+    tariff, bill, pilot and recompute action is audited), the newest savings day computed, plan made, table issued, table marked or confirmed,
+    override placed or cleared and bill of the site (of any site for a company report), its newest minute read, and the Pakistan day (a period's
+    preliminary flag and the daily sheet move with it)."""
+    from . import telemetry
+    where, args = ("WHERE site_id = ?", (site_id,)) if site_id else ("", ())
+    with store.connect() as con:
+        out = [con.execute("SELECT MAX(id) FROM audit WHERE action NOT LIKE '%report%'").fetchone()[0]]
+        out += [con.execute(f"SELECT {what} FROM {table} {where}", args).fetchone()[0] for table, what in _BASIS]
+    from . import sites
+    out.append([(telemetry.latest(sid) or {}).get("ts") for sid in ([site_id] if site_id else [x["id"] for x in sites.listing()])])
+    return [*out, today().isoformat()]
+
+
+def _report_answer(job: jobs.Job, response: Response) -> dict:
+    """The report once its job has made it (or the report the cache answered, while it is still kept), else 202 with `{status, job_id}`."""
+    if job.state == "done" and job.result is not None:
+        r = reports.get(job.result["id"])
+        if r is not None:
+            return {**r, "job_id": job.id}
+    if job.state in jobs.ACTIVE:
+        response.status_code = 202
+        return {"status": job.state, "job_id": job.id}
+    raise Refusal(500 if job.state == "failed" else 409, job.error or "The report could not be generated; try again", "report_failed")
+
+
 @router.post("/api/reports")
-def generate(inp: dict = Body(...)):
+def generate(response: Response, inp: dict = Body(...)):
     kind = str(inp.get("kind", "monthly_savings"))
     auth.need(REPORT_PERMISSION.get(kind, "run_jobs"), "Generating this report")
     site_id = ""
@@ -114,10 +159,46 @@ def generate(inp: dict = Body(...)):
         # a month as YYYY-MM (a day for the daily sheet), not in the future and not before the site's data (audit flow-reports-alerts-members-keys-13);
         # a request refused for its kind or period is not counted against the person
         reports.check_period(kind, site_id, period, today())
-        with _turn():
-            return reports.generate(kind, site_id, period, auth.actor())
     except ValueError as exc:
         raise bad(exc) from None
+    # the same report asked again with nothing it reads changed is the report already made, and one asked while it renders joins it: neither
+    # renders nor counts again (round 7, storage-perf follow-up of security-roles-08; plan Part 10.6's request-hash cache)
+    key = jobs.request_key("report", {"kind": kind, "site_id": site_id, "period": period}, _basis(site_id))
+    org = _org()
+    same = jobs.find(org, key)
+    if same is not None and (same.state in jobs.ACTIVE or (same.result and reports.get(same.result["id"]))):
+        jobs.get(same.id, org, None)
+        return _report_answer(jobs.wait(same, REPORT_WAIT_S), response)
+    who = auth.actor()
+    turn = _turn()
+    turn.__enter__()                       # the person's turn and the hourly count are taken now, so a refusal is the request's 429
+
+    def run(progress, stopped) -> dict:
+        try:
+            return reports.generate(kind, site_id, period, who)
+        finally:
+            turn.__exit__(None, None, None)
+    try:
+        job = jobs.start("report", org, "".join(_person()), key, run, cache=False, abandon=False)
+    except jobs.Refused as exc:
+        turn.__exit__(None, None, None)
+        raise Refusal(429, str(exc), "too_many_requests", headers={"Retry-After": "30"}) from None
+    except BaseException:
+        turn.__exit__(None, None, None)
+        raise
+    return _report_answer(jobs.wait(job, REPORT_WAIT_S), response)
+
+
+@router.get("/api/reports/jobs/{job_id}")
+def report_job(job_id: str, response: Response):
+    """A report that outlasted POST /api/reports' wait: `{status: queued | running, job_id}` (202) while it renders, then the report as the list shows
+    it. One the company does not have, or one forgotten (an hour after it ended, or after a restart), is a 404."""
+    job = jobs.get(job_id, _org(), None)
+    if job is None or job.kind != "report":
+        raise Refusal(404, "No such report job: it ended over an hour ago, or the server restarted since", "not_found")
+    if job.result is not None and not _may_read(job.result.get("kind", "")):
+        raise Refusal(404, "No such report job: it ended over an hour ago, or the server restarted since", "not_found")
+    return _report_answer(job, response)
 
 
 @router.get("/api/reports/{rid}/{which}")

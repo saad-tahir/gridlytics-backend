@@ -80,11 +80,14 @@ def walk(tmp_path_factory):
     edge_site = next(s["id"] for s in fleet if s["tier"] == "closed_loop")
     # money in places a page reads rarely: a fuel log's cost, a monthly savings report and an energy-only one, a draft
     assert client.post(f"/api/sites/{sids[0]}/genset/fuel", headers=h["operator"], json={"litres": 50, "cost_rs": 14321.5, "note": "tanker"}).status_code == 200
+    jobs_ = []
     for kind in ("monthly_savings", "energy_only"):
-        assert client.post("/api/reports", headers=h["admin"], json={"kind": kind, "site_id": sids[0]}).status_code == 200
+        r = client.post("/api/reports", headers=h["admin"], json={"kind": kind, "site_id": sids[0]})
+        assert r.status_code == 200, r.text
+        jobs_.append(r.json()["job_id"])                # a report is made as a job (round 7, storage-perf): GET /api/reports/jobs/{job_id}
     r = client.post(f"/api/sites/{sids[0]}/plan/solve", headers=h["admin"])
     assert r.status_code in (200, 202), r.text           # 202 while a slow solve still runs: its job is read all the same
-    jobs_ = [r.json()["job_id"]]                        # a re-solve is a job (round 7, storage-perf): GET /api/sites/{site_id}/jobs/{job_id}
+    jobs_.append(r.json()["job_id"])                    # and a re-solve (round 7, storage-perf): GET /api/sites/{site_id}/jobs/{job_id}
     assert client.put("/api/drafts/walk-draft", headers=h["admin"], json={"name": "Half a site"}).status_code == 200
     k = client.post("/api/platform/keys", headers=h["admin"], json={"name": "walk", "scopes": ["sites:read", "plans:read"], "site_id": edge_site,
                                                                     "kind": "edge"})

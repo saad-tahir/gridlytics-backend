@@ -845,3 +845,40 @@ def test_a_re_solve_and_a_resume_run_as_jobs_and_answer_202_when_the_solve_outla
     routes_plans._last_solve.clear()
     r = a.post(f"/api/sites/{sid}/plan/solve")
     assert r.status_code == 200 and r.json()["status"] == "active" and r.json()["plan_id"] and r.json()["job_id"]
+
+
+# ------------------------------------------------------------------------------------------------ follow-up: reports as jobs (security-roles-08's rest)
+
+def test_a_report_renders_as_a_job_and_the_same_report_asked_again_is_the_one_already_made(world, monkeypatch):
+    """Reports rendered in the request, and the same report asked again rendered and wrote its files again (plan Part 10.6: reports run in the job
+    pool, 202 and polling, with a request-hash cache). Now POST /reports answers the report when it is made within REPORT_WAIT_S, else 202 with the
+    job, read at GET /reports/jobs/:job_id by any member who may read that kind; the same report asked again while nothing it reads has changed is the
+    one already made, and a change (here a recompute's audit row) makes a new one."""
+    from gridlytics import routes_reports
+    release, calls = threading.Event(), []
+    real = reports.generate
+
+    def slow(*a, **k):
+        calls.append(a)
+        assert release.wait(10)
+        return real(*a, **k)
+    monkeypatch.setattr(reports, "generate", slow)
+    monkeypatch.setattr(routes_reports, "REPORT_WAIT_S", 0.2)
+    an, v = world.c["analyst"], world.c["viewer"]
+    body = {"kind": "monthly_savings", "site_id": world.site, "period": datetime.now(PKT).strftime("%Y-%m")}
+    r = an.post("/api/reports", json=body)
+    assert r.status_code == 202 and r.json()["status"] in ("queued", "running") and r.json()["job_id"], r.text
+    job = f"/api/reports/jobs/{r.json()['job_id']}"
+    assert an.get(job).status_code == 202
+    release.set()
+    assert _wait(lambda: an.get(job).status_code == 200, 30)
+    made = an.get(job).json()
+    assert made["kind"] == "monthly_savings" and made["period"] == body["period"] and made["id"]
+    assert v.get(job).status_code == 404                                          # a kind the viewer may not read: as good as absent
+    again = an.post("/api/reports", json=body)
+    assert again.status_code == 200 and again.json()["id"] == made["id"] and len(calls) == 1
+    with world.use():
+        store.audit("t", "recomputed the savings", world.site, {})
+    fresh = an.post("/api/reports", json=body)
+    assert _wait(lambda: len(calls) == 2, 10)
+    assert fresh.status_code in (200, 202) and (fresh.json().get("id") or fresh.json()["job_id"]) != made["id"]

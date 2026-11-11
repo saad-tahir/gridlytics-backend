@@ -221,14 +221,25 @@ def start(kind: str, org: str, owner: str, key: str, run, expected: int = 0, cac
     return job
 
 
-def get(job_id: str, org: str, owner: str) -> Job | None:
-    """A job of this user in this workspace, or None: another's is as good as absent. Reading it says someone still waits for it (`abandoned`)."""
+def get(job_id: str, org: str, owner: str | None) -> Job | None:
+    """A job of this user in this workspace (of anyone in it with `owner` None: a company's report), or None: another's is as good as absent. Reading
+    it says someone still waits for it (`abandoned`)."""
     with _lock:
         job = _jobs.get(job_id)
-    if job is None or job.company != _company() or job.org != org or job.owner != owner:
+    if job is None or job.company != _company() or job.org != org or (owner is not None and job.owner != owner):
         return None
     job.last_read = time.time()
     return job
+
+
+def find(org: str, key: str) -> Job | None:
+    """The newest job of this workspace asked with this request key, waiting, running or done and still kept, whoever started it (a report is the
+    company's: the same report asked again is the one already made or being made)."""
+    company = _company()
+    with _lock:
+        same = [j for j in _jobs.values() if j.company == company and j.org == org and j.key == key and j.state in (*ACTIVE, "done")
+                and not j.cancel.is_set()]
+    return max(same, key=lambda j: j.seq) if same else None
 
 
 def mine(org: str, owner: str) -> list[Job]:
