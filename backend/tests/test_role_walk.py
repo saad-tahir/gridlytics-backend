@@ -33,9 +33,10 @@ FILES = ("/export.csv", "/calendar.ics", "/api/reports/{rid}/{which}")
 #: The query a route needs to answer at all
 QUERY = {"/api/tariffs/card": "?category=B-2(b)"}
 #: The GET routes a key with sites:read and plans:read reaches (apikeys.RESOURCES; the signed plan message is an edge device's key's only, apikeys.EDGE_ONLY,
-#: at a closed-loop site): the control state is the read-back and the write log too (control-edge, audit role-operator-11), which carry no money
+#: at a closed-loop site): the control state is the read-back and the write log too (control-edge, audit role-operator-11), which carry no money; the
+#: plan table's past rows are the plan's (optimiser-plans, audit pages-B-07), their rupees stripped for a key
 KEY_READS = {"/api/sites/{site_id}", "/api/sites/{site_id}/native", "/api/sites/{site_id}/overrides", "/api/sites/{site_id}/plan",
-             "/api/sites/{site_id}/plan/compare", "/api/sites/{site_id}/plans", "/api/sites/{site_id}/plans/{plan_id}", "/api/sites/{site_id}/plans/current/message",
+             "/api/sites/{site_id}/plan/compare", "/api/sites/{site_id}/plan/past", "/api/sites/{site_id}/plans", "/api/sites/{site_id}/plans/{plan_id}", "/api/sites/{site_id}/plans/current/message",
              "/api/sites/{site_id}/control", "/api/sites/{site_id}/control/readback", "/api/sites/{site_id}/control/writes"}
 RUPEES = re.compile(r"\bRs\.?\s*-?\d|\bPKR\s*-?\d|\brupees?\b", re.IGNORECASE)
 
