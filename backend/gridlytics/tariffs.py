@@ -1420,17 +1420,34 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
             q -= (mtd_export or {}).get(p, 0.0) + (rest_net_export or {}).get(p, 0.0)
         return q
 
-    # ICP case per period (plan Part 4.3): above, below, or the uncertain middle that gets a month-level binary; the baseline is the billing month's
+    def q_gross(p: str) -> float:
+        """The current billing month's imports for a period, so far plus the forecast rest, before any netting."""
+        return (mtd_import or {}).get(p, 0.0) + (rest_net_import or {}).get(p, 0.0)
+
+    # ICP case per period (plan Part 4.3): above, below, or the uncertain middle that gets a month-level binary; the baseline is the billing month's.
+    # At a legacy net-metering site the reference is imported units, as the bill counts them (SRO 2409(I)/2025, R9 section 5; tariffs.rebuild step 4;
+    # round 7 stage 2, engine-tariffs-10's optimiser half, superseding round 3's "the ICP rows count net import"): a period's increment is its gross
+    # imports over the baseline, it is eligible only while the period ends the month as a net import, and the increments are capped at the month's
+    # imports less exports. `cap_kwh` (the month's net import so far and forecast) and `other_inc_kwh` (the other period's increment, settled or
+    # forecast) let the optimiser's uncertain-case rows keep that cap (optimise.solve), so importing and exporting at once never earns the ICP rate
+    bases = {p: icp_baseline(conn, bm0_day.month, bm0_day.year, p) if icp and data["tariff_category"] in icp["categories"] else None
+             for p in ("peak", "off_peak")}
+    gross_inc = {p: max(0.0, q_gross(p) - b) if b is not None and q_net(p) > 0 else 0.0 for p, b in bases.items()}
     for p in ("peak", "off_peak"):
-        base = icp_baseline(conn, bm0_day.month, bm0_day.year, p) if icp and data["tariff_category"] in icp["categories"] else None
+        base = bases[p]
         if base is None:
             continue
-        q = q_net(p)
+        q = q_gross(p) if legacy else q_net(p)
         steps_in_p = sum(1 for i, loc in enumerate(locs) if in_bm0[i] and is_peak_local(run_of[loc.date()]["cal"], loc) == (p == "peak"))
         swing = g_max_kw * steps_in_p * h
         case = "above" if q - base > swing else "below" if base - q > swing else "uncertain"
+        if legacy and q_net(p) < -swing:
+            case = "below"                            # the period ends the month in surplus: no increment on it
         out["icp"][p] = {"case": case, "baseline_kwh": base, "q_rest_kwh": q - (mtd_import or {}).get(p, 0.0) + (mtd_import or {}).get(p, 0.0),
                          "mtd_kwh": (mtd_import or {}).get(p, 0.0), "q_kwh": q, "rate": (icp["rate"] + add_icp[bm0]) * ef + unit}
+        if legacy:
+            other = "off_peak" if p == "peak" else "peak"
+            out["icp"][p].update(gross=True, cap_kwh=q_net("peak") + q_net("off_peak"), other_inc_kwh=gross_inc[other])
     # legacy net metering nets by period (rebuild step 3): a period that ends the month as a net import prices an exported kWh like an imported one,
     # with its adders, duty and taxes; one that ends in surplus moves only the credit, at the bare surplus rate (netted after taxes), both ways
     surplus: dict[str, bool] = {}

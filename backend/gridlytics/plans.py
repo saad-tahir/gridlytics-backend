@@ -95,8 +95,15 @@ def month_to_date(site_id: str, conn: dict | None, t0: int) -> dict:
         full = n_known >= interval * 0.8
         return uniq[full] * interval * 60, sums[full] / np.maximum(n_known[full], 1.0)
 
-    _, means = block_means(in_month)
-    m0 = float(means.max()) if len(means) else 0.0
+    # the month's peak so far as the bill reads it: its block mode and scope from the connection's site override (round 7 stage 2, engine-tariffs-08 h)
+    ov = tariffs.site_override(conn, _local(t0).date()) if conn else {}
+    only_peak = ov.get("mdi_scope", "all_hours") == "peak"
+    if ov.get("mdi_block", "fixed") == "sliding":
+        sel = in_month & k_imp
+        m0 = tariffs._mdi(g["ts"][sel], imp[sel], pk[sel] if only_peak else None, interval, "sliding") if sel.any() else 0.0
+    else:
+        _, means = block_means(in_month & pk if only_peak else in_month)
+        m0 = float(means.max()) if len(means) else 0.0
     # the month's expected peak (round 7, engine-optimiser-02, engine-plans-live-07): the second-highest local day's peak of the seven days
     # before t0, so one odd day does not set it. At a month's start M0 is near nothing, and every kW above the floor was priced as a whole
     # month's demand charge: the plan drained the battery off-peak on the 1st to hold a peak the month's weekdays then passed anyway (Karachi:
@@ -370,7 +377,10 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         p["mdi"] = {"rate": vec["mdi"]["rate_rs_per_kw"], "M0": mtd["M0"], "floor": vec["mdi"]["floor_kw"], "n_mdi": vec["mdi"]["interval_steps"],
                     "G_elapsed": mtd["G_elapsed"], "n_elapsed": mtd["n_elapsed"], "month_end_step": month_end,
                     # the month's expected peak (month_to_date): M and M2 are never bounded under it (round 7, engine-optimiser-02)
-                    "M_exp": mtd.get("M_exp", 0.0)}
+                    "M_exp": mtd.get("M_exp", 0.0),
+                    # the bill's MDI block mode and scope (the connection's site override; fixed and all hours by default), so the plan's MDI rows
+                    # read the demand the bill and the ledger read (round 7 stage 2, engine-tariffs-08 h; optimise.mdi_windows)
+                    "block": vec["mdi"].get("block", "fixed"), "scope": vec["mdi"].get("scope", "all_hours")}
     # overrides as bounds (Part 4.8)
     ovs = sites.overrides(site["id"])
     mask = {k: np.zeros(steps, dtype=bool) for k in ("genset_hold", "charge_block", "reserve", "pause_control", "force_native", "force_charge")}
@@ -613,10 +623,8 @@ def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict], res: dict
     if mdi and caps:
         n = max(1, int(mdi["n_mdi"]))
         draw = planned["grid_import_kw"] + shed_q
-        blocks = (np.asarray(p["ts"]) // (n * 900)).astype(np.int64)
         month_end = int(mdi.get("month_end_step", T))
-        for bid in np.unique(blocks):
-            st = np.flatnonzero(blocks == bid)
+        for st in optimise.mdi_windows(p):  # the bill's blocks: fixed or sliding, all hours or the peak only (round 7 stage 2, engine-tariffs-08 h)
             cap = caps[0] if st[0] < month_end else (caps[1] if len(caps) > 1 else None)
             if cap is None:
                 continue

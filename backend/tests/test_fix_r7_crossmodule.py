@@ -12,6 +12,8 @@ stage-1 packages' code at once.
   Mode B site; the schedule carries U3's primitives.
 - engine-plans-live-18: a Deye or Voltronic site's plan charges from the running genset, the table keys it and the twin executes it.
 - brief-vs-build-15: a genset start or stop, an intra-day forecast bust and an approved tariff version re-solve the plan.
+- followup icp-gross (engine-tariffs-10, the optimiser half): a legacy site's ICP case and rows count gross imports, capped at the net.
+- followup mdi-override (engine-tariffs-08 h): a site override's MDI block mode and scope reach the plan, the guard and the ledger.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -489,6 +491,94 @@ def test_approving_a_tariff_version_in_the_horizon_re_solves_the_plans(world, mo
     assert r.status_code == 200 and r.json()["re_solving"] == 1 and ticks == [world.site], r.text
     r = a.post(f"/api/tariffs/versions/{later['id']}/approve")
     assert r.status_code == 200 and r.json()["re_solving"] == 0 and ticks == [world.site], r.text
+
+
+# ------------------------------------------------------------------------------------------------ followup:icp-gross (engine-tariffs-10, the optimiser half)
+
+def _legacy_icp_conn():
+    from test_fix_tariffs import _conn
+    return _conn("B-2(b)", "net_metering_legacy", extra={"agreement_start": "2024-01-01", "agreement_end": None,
+                                                         "icp": {"eligible": True, "peak": {"11": 500.0}, "off_peak": {"11": 1000.0}}})
+
+
+def test_a_legacy_sites_icp_case_counts_gross_imports_capped_at_the_net(company):
+    """Golden (SRO 2409(I)/2025, R9 section 5; the bill since stage 1): the peak period imported 1,000 kWh and exported 600 against a 514 kWh
+    baseline (500 escalated 2.8 % for package year 1); off-peak 2,000 and 1,000 against 1,028. The bill's increments are the gross imports over the
+    baseline (486 and 972, each period ending as a net import), capped at the month's imports less exports (1,400). The vectors decided the case on
+    the net (400 kWh, under the baseline: 'below'), so the plan and the ledger priced the peak at the normal rate while the bill took the ICP rate."""
+    from datetime import datetime as _dt
+    conn = _legacy_icp_conn()
+    t0 = _dt(2026, 11, 20, tzinfo=PKT).astimezone(timezone.utc)
+    vec = tariffs.vectors(conn, t0, 96, {"peak": 1000.0, "off_peak": 2000.0}, None, 1e-6, {"peak": 600.0, "off_peak": 1000.0}, None)
+    pk, off = vec["icp"]["peak"], vec["icp"]["off_peak"]
+    assert pk["case"] == "above" and pk["q_kwh"] == pytest.approx(1000.0) and pk["gross"] is True
+    assert off["case"] == "above" and off["q_kwh"] == pytest.approx(2000.0)
+    assert pk["baseline_kwh"] == pytest.approx(514.0) and off["baseline_kwh"] == pytest.approx(1028.0)
+    assert pk["cap_kwh"] == pytest.approx(1400.0) and pk["other_inc_kwh"] == pytest.approx(972.0) and off["other_inc_kwh"] == pytest.approx(486.0)
+    icp_steps = np.asarray(vec["peak"], dtype=bool)
+    assert np.allclose(np.asarray(vec["c_imp"])[icp_steps], pk["rate"])                    # the peak steps at the ICP rate
+    # a period that ends the month in surplus has no increment, whatever its gross imports
+    surplus = tariffs.vectors(conn, t0, 96, {"peak": 1000.0, "off_peak": 2000.0}, None, 1e-6, {"peak": 1200.0, "off_peak": 0.0}, None)
+    assert surplus["icp"]["peak"]["case"] == "below" and surplus["icp"]["off_peak"]["other_inc_kwh"] == 0.0
+    # a net-billing site's case is unchanged: its imports are never netted
+    nb = dict(conn, data={**conn["data"], "regime": "net_billing"})
+    assert "gross" not in tariffs.vectors(nb, t0, 96, {"peak": 1000.0, "off_peak": 2000.0}, None, 1e-6)["icp"]["peak"]
+
+
+def test_the_uncertain_icp_rows_cap_a_legacy_increment_at_the_months_net_import():
+    """The optimiser's uncertain-case rows read gross imports at a legacy site, with the cap: importing and exporting at once moves the month's net
+    import by nothing, so circulating energy through the meter never earns the ICP rate, and an increment beyond the net import is not counted."""
+    from gridlytics import optimise
+    from test_fix_optimiser import _problem
+    p = _problem(T=96, battery=True)
+    p["X_max"], p["regime"] = 200.0, "net_metering_legacy"
+    p["c_exp"] = p["c_imp"] - 0.01
+    # the peak's gross imports so far sit 10 kWh under the baseline, and the month has exported 2,500 kWh more than it imported: no increment fits
+    p["icp"] = {"peak": {"case": "uncertain", "baseline_kwh": 1000.0, "q_kwh": 990.0, "rate": 30.0, "gross": True, "cap_kwh": -2500.0,
+                         "other_inc_kwh": 0.0}}
+    r = optimise.solve(p, time_limit=20.0)
+    assert r["status"] == "optimal"
+    G, X = r["sol"]["G"], r["sol"]["X"]
+    assert int(np.sum((G > 0.1) & (X > 0.1))) == 0
+    assert r["breakdown"].get("energy_rs") is not None
+    # with room under the cap the peak's imports above the baseline earn the ICP rate as before
+    q = dict(p, icp={"peak": {**p["icp"]["peak"], "cap_kwh": 50_000.0}})
+    r2 = optimise.solve(q, time_limit=20.0)
+    assert r2["status"] == "optimal" and r2["objective_rs"] < r["objective_rs"]
+
+
+# ------------------------------------------------------------------------------------------------ followup:mdi-override (engine-tariffs-08 h)
+
+def test_a_site_overrides_mdi_block_and_scope_reach_the_plan_the_guard_and_the_ledger(company):
+    """A site override's MDI block mode (fixed or sliding) and peak-only scope (R9 12.6 and 13) reached the bill only: the plan's MDI rows and the
+    ledger's arms read fixed blocks over all hours, so a peak-only meter's off-peak charging was priced as a month's demand charge."""
+    from gridlytics import optimise
+    from test_fix_r7_tariffs import _override
+    from test_fix_savings import make_site
+    sid = make_site(name="Peak MDI Mill", genset=False)
+    conn = sites.connections(sid)[0]
+    assert _problem_of(sid)["mdi"]["block"] == "fixed" and _problem_of(sid)["mdi"]["scope"] == "all_hours"
+    _override(conn, {"name": "From the October 2026 bill", "mdi_block": "sliding", "mdi_scope": "peak"}, start="2026-10-01")
+    p = _problem_of(sid)
+    assert p["mdi"]["block"] == "sliding" and p["mdi"]["scope"] == "peak"
+    wins = optimise.mdi_windows(p)
+    peak = np.asarray(p["peak"], dtype=bool)
+    assert wins and all(peak[w].all() and len(w) == p["mdi"]["n_mdi"] for w in wins)
+    assert len(wins) == int(peak.sum()) - (p["mdi"]["n_mdi"] - 1) * len(np.flatnonzero(np.diff(np.r_[0, peak.astype(int)]) == 1))  # one per step
+    # the ledger: an off-peak burst sets no MDI on a peak-only meter; a sliding window catches a peak half-hour that straddles two fixed blocks
+    pr = verify._minute_prices(conn, NOV, sid)
+    assert pr["mdi_block"] == "sliding" and pr["mdi_scope"] == "peak"
+    pk = np.flatnonzero(pr["peak"])
+    imp = np.full(1440, 100.0)
+    imp[180:210] = 400.0                                   # 03:00-03:30, off-peak
+    imp[pk[0] + 15:pk[0] + 45] = 250.0                     # half an hour inside the peak, across a block boundary
+    sim = {"imp": imp, "exp": np.zeros(1440), "bat": np.zeros(1440), "gen": np.zeros(1440), "gen_on": np.zeros(1440, dtype=bool),
+           "fuel": np.zeros(1440), "unserved": np.zeros(1440)}
+    site = sites.full(sid)
+    assert verify.price_arm(site, sim, pr, NOV, 0.0, 0.0)["peak_kw"] == pytest.approx(250.0)
+    fixed_all = verify.price_arm(site, sim, {**pr, "mdi_block": "fixed", "mdi_scope": "all_hours"}, NOV, 0.0, 0.0)["peak_kw"]
+    assert fixed_all == pytest.approx(400.0)                                                     # before
+    assert verify._price_basis(pr, None) != verify._price_basis({**pr, "mdi_block": "fixed", "mdi_scope": "all_hours"}, None)
 
 
 # ------------------------------------------------------------------------------------------------ engine-plans-live-18: charging from the genset

@@ -107,7 +107,9 @@ def _minute_prices(conn: dict | None, day: date, site_id: str, month_q: dict | N
             "mdi_rate": mdi.get("rate_rs_per_kw", 0.0), "mdi_floor": float(mdi.get("floor_kw", 0.0) or 0.0), "mdi_interval": iv,
             "icp": {p: info["case"] for p, info in (vec.get("icp") or {}).items()},
             # the schedule version the day's rates come from (round 7, audit engine-savings-05: a month's MDI is priced at its own version)
-            "tariff_version": tariffs.card_for(conn["data"]["tariff_category"], day)[1].get("id"), "k_energy": k_e, "k_mdi": k_m}
+            "tariff_version": tariffs.card_for(conn["data"]["tariff_category"], day)[1].get("id"), "k_energy": k_e, "k_mdi": k_m,
+            # the bill's MDI block mode and scope (the connection's site override; round 7 stage 2, engine-tariffs-08 h), as price_arm reads them
+            "mdi_block": mdi.get("block", "fixed"), "mdi_scope": mdi.get("scope", "all_hours")}
 
 
 def _genset_cost(site: dict, sim: dict, day: date, on_before: bool = False) -> tuple[float, float]:
@@ -144,11 +146,18 @@ def price_arm(site: dict, sim: dict, pr: dict, day: date, e_end_kwh: float, v_en
     iv = int(pr.get("mdi_interval", 30) or 30)
     if iv <= 0 or len(imp) % iv:
         iv = 30
-    blocks = raw_imp.reshape(len(imp) // iv, iv).mean(axis=1) * k_m  # the connection's MDI blocks, aligned to the hour as the bill engine aligns them
+    # the connection's MDI as the bill engine reads it (tariffs._mdi): blocks aligned to the hour, or a sliding window, over all hours or the peak
+    # only, by the connection's site override
+    only_peak = pr.get("mdi_scope") == "peak"
+    if pr.get("mdi_block", "fixed") == "sliding" or only_peak:
+        peak_kw = tariffs._mdi(np.arange(len(raw_imp)) * 60, raw_imp, np.asarray(peak, dtype=bool) if only_peak else None, iv,
+                               pr.get("mdi_block", "fixed")) * k_m
+    else:
+        peak_kw = float(raw_imp.reshape(len(imp) // iv, iv).mean(axis=1).max()) * k_m
     return {"peak_energy_rs": round(energy_peak, 2), "offpeak_energy_rs": round(energy_off, 2), "export_credit_rs": round(export_credit, 2),
             "genset_rs": round(gen_rs, 2), "wear_rs": round(wear, 2), "litres": round(litres, 2),
             "cost_rs": round(energy_peak + energy_off - export_credit + gen_rs + wear, 2), "import_kwh": round(float(imp.sum() / 60), 2),
-            "peak_import_kwh": round(float(imp[peak].sum() / 60), 2), "export_kwh": round(float(exp.sum() / 60), 2), "peak_kw": round(float(blocks.max()), 2),
+            "peak_import_kwh": round(float(imp[peak].sum() / 60), 2), "export_kwh": round(float(exp.sum() / 60), 2), "peak_kw": round(float(peak_kw), 2),
             "discharge_kwh": round(discharge, 2), "unserved_kwh": round(float(np.sum(sim["unserved"]) / 60), 2),
             "genset_hours": round(float(np.sum(sim["gen_on"]) / 60), 2), "e_end_kwh": round(e_end_kwh, 2), "v_end": round(v_end, 2)}
 
@@ -1504,6 +1513,8 @@ def _price_basis(pr: dict, fuel: float | None) -> str:
     h.update(np.asarray(pr["peak"], dtype=bool).tobytes())
     h.update(json.dumps([round(float(pr["mdi_rate"]), 6), round(float(pr["mdi_floor"]), 6), int(pr["mdi_interval"]), pr["icp"],
                          None if fuel is None else round(float(fuel), 6)], sort_keys=True).encode())
+    if (pr.get("mdi_block") or "fixed") != "fixed" or (pr.get("mdi_scope") or "all_hours") != "all_hours":
+        h.update(json.dumps({"mdi": [pr.get("mdi_block"), pr.get("mdi_scope")]}).encode())  # the bill's MDI mode (a site override); none, as before
     k = [round(float(pr.get("k_energy", 1.0)), 6), round(float(pr.get("k_mdi", 1.0)), 6)]
     if k != [1.0, 1.0]:
         h.update(json.dumps({"metering": k}).encode())  # a metering factor applied (fit_metering); none leaves a digest from before it unchanged
