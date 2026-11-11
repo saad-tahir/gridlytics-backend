@@ -941,3 +941,29 @@ def test_the_write_log_reads_the_days_events_through_the_index_and_finds_every_o
     assert sorted(r["at"] for r in log) == sorted(plans._iso_utc(plans._ts(t)) for t in inside)
     reads = [s for s in seen.sql if "FROM events" in s]
     assert reads and any("ts >= " in s for s in reads), reads
+
+
+# ------------------------------------------------------------------------------------------------ follow-up: fleet_row's month saving and gensets
+
+def test_the_fleet_reads_a_sites_month_saving_once_in_a_while_and_every_change_reads_it_again(world, monkeypatch):
+    """The fleet's 60-second poll ran verify.summary (the month's savings ledger) and read the assets for every site, every poll, as the overview
+    did every 30 seconds. The month's saving is now reused for a few minutes while no savings day was computed again and nothing was changed;
+    a change (an audited action) reads it again, and the fleet reads the gensets once."""
+    summaries = []
+    real = verify.summary
+    monkeypatch.setattr(verify, "summary", lambda *x, **k: (summaries.append(x[0]), real(*x, **k))[1])
+    a = world.c["admin"]
+    assert a.get("/api/fleet").status_code == 200
+    n = len(summaries)
+    assert n == 2                                                                  # the company's two sites
+    a.get("/api/fleet")
+    a.get(f"/api/sites/{world.site}/now")
+    assert len(summaries) == n
+    with world.use():
+        store.audit("t", "uploaded a bill", world.site, {})
+    a.get("/api/fleet")
+    assert len(summaries) == 2 * n
+    seen = _Statements(monkeypatch)
+    rows = a.get("/api/fleet").json()["sites"]
+    assert {r["id"]: r["has_genset"] for r in rows} == {world.site: True, world.other: False}
+    assert len([s for s in seen.sql if "FROM assets" in s]) == 1, [s for s in seen.sql if "FROM assets" in s]

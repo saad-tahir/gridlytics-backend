@@ -135,7 +135,37 @@ def _snapshot(last: dict | None) -> dict | None:
 MTD_SAVING_METHOD = "counterfactual"
 
 
+#: how long a site's month-to-date saving (verify.summary) is reused while no savings day was computed again and nothing was changed (the company's
+#: audit trail): the fleet's 60-second poll and the overview's 30-second one read it for every site (round 7, storage-perf follow-up)
+MTD_REUSE_S = 300
+_MTD_KEPT = 1024
+_mtd: "dict[tuple, tuple[float, tuple]]" = {}
+_mtd_lock = threading.Lock()
+
+
 def _mtd_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple[float | None, str | None, list, dict]:
+    """_month_saving, reused for MTD_REUSE_S while the site's newest computed savings day and the company's newest audited change are the same."""
+    import time as _time
+    with store.connect() as con:
+        computed = con.execute("SELECT MAX(computed) FROM savings_days WHERE site_id = ?", (site_id,)).fetchone()[0]
+        changed = con.execute("SELECT MAX(id) FROM audit").fetchone()[0]
+    key = (str(store.db_path()), site_id, today().isoformat(), grid, genset, computed, changed)
+    now = _time.monotonic()
+    with _mtd_lock:
+        hit = _mtd.get(key)
+    if hit is not None and now - hit[0] < MTD_REUSE_S:
+        mtd, comp, spark, energy = hit[1]
+        return mtd, comp, [dict(x) for x in spark], dict(energy)
+    got = _month_saving(site_id, grid, genset)
+    with _mtd_lock:
+        if len(_mtd) >= _MTD_KEPT:
+            _mtd.clear()
+        _mtd[key] = (now, got)
+    mtd, comp, spark, energy = got
+    return mtd, comp, [dict(x) for x in spark], dict(energy)
+
+
+def _month_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple[float | None, str | None, list, dict]:
     """The month's claimed saving against the native settings, exactly as the Savings page's "This month" reads it (verify.summary from the 1st to
     today: the claimed days plus the month's MDI lever), when its days were computed, and the last 7 scored days for the sparkline (each day's claimed
     saving and the replay's figure). The figure is None while no day of the month is scored, never a zero (audit flow-savings-pilot-bill-02: the
@@ -179,7 +209,7 @@ ON_PLAN = ("following", "hold", "force_charge")
 HANDED_BACK = ("native", "paused", "native_block")
 
 
-def fleet_row(s: dict, now: int, counts: dict) -> dict:
+def fleet_row(s: dict, now: int, counts: dict, gensets: set | None = None) -> dict:
     last = telemetry.latest(s["id"])
     first = telemetry.first_ts(s["id"])
     plan = plans.current(s["id"], slots=False)       # the row reads the next event from the steps, never the table (round 7, tests-and-perf-06)
@@ -189,7 +219,8 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
     # off-grid is the site's own fact, as tab C and POST /activate read it (_grid_settled): a connection of regime off_grid, or none at a farm or a
     # site whose data says off_grid. A grid site whose connection is not saved yet has no category yet (null), and its outages count (audit pages-A-03)
     off_grid = _off_grid(s, conn)
-    has_genset = "genset" in sites.assets(s["id"])
+    # the fleet reads which sites have a genset once for all of them (round 7, storage-perf follow-up)
+    has_genset = s["id"] in gensets if gensets is not None else "genset" in sites.assets(s["id"])
     mtd, computed, spark, energy = _mtd_saving(s["id"], grid=not off_grid, genset=has_genset)
     category = "Off-grid" if off_grid else conn["data"]["tariff_category"] if conn is not None else None
     control = control_state(s, last, now)
@@ -213,7 +244,9 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
 def fleet():
     now = now_ts()
     c = alerts.counts()
-    rows = [fleet_row(s, now, c["by_site"]) for s in sites.listing()]
+    with store.connect() as con:
+        gensets = {r[0] for r in con.execute("SELECT DISTINCT site_id FROM assets WHERE role = 'genset'")}
+    rows = [fleet_row(s, now, c["by_site"], gensets) for s in sites.listing()]
     online = sum(1 for r in rows if r["last_data"] and now - r["last_data"] < 1800)
     stamps = [r["mtd_saving_rs_computed"] for r in rows if r["mtd_saving_rs_computed"]]
     # the sum of the sites' figures; None while no site has a scored day this month, never Rs 0 (audit frontend-states-formats-14)
