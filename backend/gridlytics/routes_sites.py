@@ -563,7 +563,9 @@ def site_now(site_id: str):
                           "outage_hours": round(sum((d.get("outage_minutes") or 0) for d in tdays) / 60, 1),
                           "peak_kw": max([d.get("peak_kw") or 0 for d in tdays] or [0]), "saving_rs": mtd,
                           "saving_rs_method": MTD_SAVING_METHOD, "saving_rs_computed": computed},
-                "spark": spark, "battery": {k: (bs or {}).get(k) for k in ("soc_pct", "sigma_pct", "trust", "usable_kwh")} if bs else None,
+                # the Battery tile's SoC is battery.state's (the last minute with a reading), marked by its own source, not the newest row's (now.soc_source)
+                "spark": spark, "battery": {**{k: bs.get(k) for k in ("soc_pct", "sigma_pct", "trust", "usable_kwh")},
+                                            "soc_source": telemetry.soc_source(site_id, bs)} if bs else None,
                 "alerts": alerts.listing("active", site_id)[:5], "last_data": last["ts"] if last else None,
                 "first_data": telemetry.first_ts(site_id), "today_kpis": _today_kpis(s, td, bs, now, t),
                 "genset_requests": _waiting_genset_requests(site_id)})

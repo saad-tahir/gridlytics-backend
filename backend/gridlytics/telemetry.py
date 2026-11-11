@@ -990,6 +990,18 @@ def soc_reading(site_id: str, ts: int) -> dict | None:
     return {"est": _finite(r[0]), "bms": _finite(r[1])} if r else None
 
 
+def soc_source(site_id: str, state: dict | None) -> str | None:
+    """Where battery.state's soc_pct came from (round 7 pages-C-14): "estimate" where its minute holds the estimate, "bms" where only the BMS read
+    (a CSV history, a BMS-only source); the state service takes the estimate first and the BMS where it is missing, at the last minute with either,
+    which need not be the newest row. The Battery page and the Overview's Battery tile mark the figure by it."""
+    if not state or state.get("soc_pct") is None or not state.get("last_ts"):
+        return None
+    r = soc_reading(site_id, state["last_ts"])
+    if not r:
+        return None
+    return "estimate" if r["est"] is not None else "bms" if r["bms"] is not None else None
+
+
 def raw(site_id: str, t0: int, t1: int, columns: tuple = COLUMNS[3:]) -> dict:
     with reading() as con:
         rows = con.execute(f"SELECT ts, {', '.join(columns)} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",

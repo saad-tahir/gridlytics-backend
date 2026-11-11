@@ -930,6 +930,29 @@ def test_the_state_of_charge_names_its_source_and_the_chart_gets_the_outages(wor
     assert (b["soc_pct"], b["soc_source"]) == (58.0, "estimate")
 
 
+def test_the_overview_s_battery_tile_names_the_source_of_its_own_state_of_charge(world, monkeypatch):
+    """Integration (telemetry-genset-battery with fleet-overview): the Overview's Battery tile shows battery.state's SoC, the last minute with a reading,
+    and is marked by that minute's source (`battery.soc_source`), as the Battery page is; the snapshot's `now.soc_source` names the newest row's, which
+    may hold no SoC at all (an edge batch with the grid and the load only), and left the tile unmarked though it showed the BMS's 55 %."""
+    from gridlytics import routes_sites
+    monkeypatch.setattr(routes_sites, "now_ts", lambda: B_NOW)
+    monkeypatch.setattr(routes_sites, "today", lambda: datetime.fromtimestamp(B_NOW, PKT).date())
+    c = world.owner
+    sid = _battery_site(world, monkeypatch, "Tile battery")
+    with world.use():
+        _write(sid, B_NOW - 3 * 3600, 120, battery_soc_bms_pct=55.0, grid_present=1)
+        _write(sid, B_NOW - 600, 5, grid_present=1, load_power_w=20000.0)
+    n = c.get(f"/api/sites/{sid}/now").json()
+    assert n["now"]["soc_source"] is None
+    assert (n["battery"]["soc_pct"], n["battery"]["soc_source"]) == (55.0, "bms")
+    with world.use():
+        _write(sid, B_NOW - 300, 1, battery_soc_bms_pct=56.0, battery_soc_est_pct=58.0)
+    b = c.get(f"/api/sites/{sid}/now").json()["battery"]
+    assert (b["soc_pct"], b["soc_source"]) == (58.0, "estimate")
+    viewer = world.role("viewer")
+    assert viewer.get(f"/api/sites/{sid}/now").json()["battery"]["soc_source"] == "estimate"     # not money: a viewer reads it too
+
+
 # ------------------------------------------------------------------------------------------------ performance-live-03: reads never take the write lock
 
 def _traced(monkeypatch) -> list:
