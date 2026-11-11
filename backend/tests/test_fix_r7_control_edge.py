@@ -187,10 +187,14 @@ def test_the_guard_refuses_a_slot_floor_under_the_fallback(company):
 
 
 def test_the_guard_refuses_a_table_that_drains_the_battery_under_the_fallback_floor_with_the_grid_up(company):
-    # a slot whose grid cap is below the load: the device shaves the peak from the battery down to its own floor (10 %), through the 20 % fallback
+    # a slot the brand runs to a lower floor than the plan's (delivery.as_keyed: a global floor, here the battery's own 10 %): with the grid up the
+    # replay serves the 300 kW load from the battery through the 20 % fallback
     full, p = _guard_case(_site(genset=False), load=300.0, soc0=0.5)
-    table = _table(_slot(p, 0, T, "self_use", floor=20.0, cap_kw=200.0))
+    table = _table({**_slot(p, 0, T, "self_use", floor=20.0), "as_keyed": {"soc_floor_pct": 10.0}})
     assert plans._guard(full, p, table, _steps(p)) == "replayed_soc_below_floor"
+    # a grid cap below the load is no such table: the replay shaves the peak only down to the slot's floor (delivery-twin, engine-delivery-15; it
+    # shaved to the battery's own floor before)
+    assert plans._guard(full, p, _table(_slot(p, 0, T, "self_use", floor=20.0, cap_kw=200.0)), _steps(p)) is None
 
 
 def test_the_guard_refuses_a_table_that_leaves_critical_load_unserved_in_a_forecast_outage(company):
