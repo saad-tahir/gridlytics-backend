@@ -1393,7 +1393,8 @@ def test_the_scheduler_issues_the_days_table_after_its_tick_and_tomorrows_at_23_
     _tier(sid, "advisory_writes")
     sites.set_status(sid, "active")
     monkeypatch.setattr(alerts, "evaluate", lambda *a, **k: None)
-    assert scheduler.tick_company(company) == {"sites": 1, "failed": 0}
+    ticked = scheduler.tick_company(company)        # round 7, storage-perf: the answer also has the tick, its seconds and workers
+    assert (ticked["sites"], ticked["failed"]) == (1, 0)
     today = datetime.now(PKT).date()
     (first,) = plans.issued_tables(sid, today.isoformat())
     assert first["reason"] == "first" and first["plan_id"] == plans.current(sid)["id"]

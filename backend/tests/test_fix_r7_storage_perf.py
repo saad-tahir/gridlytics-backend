@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -323,3 +324,93 @@ def test_the_plan_answer_names_failing_solves_too_and_nothing_once_a_tick_plans(
     scheduler.tick_company(world.db)
     answer = world.c["admin"].get(f"/api/sites/{world.site}/plan").json()
     assert answer["plan"] is not None and "failing" not in answer
+
+
+# ------------------------------------------------------------------------------------------------ performance-live-09, performance-live-11
+
+def _fake_tick(log_: list | None = None, barrier=None):
+    """A stand-in for plans.tick that makes no plan row: it records the company file and the thread it ran on, and, given a barrier, waits there
+    until as many sites are inside it at once (a sequential tick never gets there)."""
+    def tick(site_id, *a, **k):
+        if log_ is not None:
+            log_.append((site_id, str(store.db_path()), threading.current_thread().name))
+        if barrier is not None:
+            barrier.wait()
+        return {"status": "active", "plan_id": None, "reason": None, "solve_seconds": 0.01, "objective_rs": 1.0, "solver_status": "optimal"}
+    return tick
+
+
+def test_a_re_solve_never_overwrites_the_scheduled_ticks_row_and_each_tick_is_timed_and_logged(company, monkeypatch, caplog):
+    """runs had one row per (site, quarter) that the solve route also wrote, so a re-solve in the quarter erased the tick's timing (a 07:45 tick read
+    841 s long); no tick or site duration was kept or logged. Now the scheduler alone writes runs, with the site's own seconds, and each tick has its
+    row in `ticks` and one log line."""
+    import logging
+    from gridlytics import scheduler
+    a, b = _site("A"), _site("B")
+    for sid in (a, b):
+        sites.set_status(sid, "active")
+    with caplog.at_level(logging.INFO, logger="gridlytics.scheduler"):
+        out = scheduler.tick_company(company, workers=2)
+    assert out["sites"] == 2 and out["failed"] == 0 and out["workers"] == 2
+    with store.connect() as con:
+        runs = {r["site_id"]: dict(r) for r in con.execute("SELECT * FROM runs")}
+        ticks = [dict(r) for r in con.execute("SELECT * FROM ticks")]
+    assert set(runs) == {a, b} and all(r["seconds"] > 0 and r["status"] in ("active", "held") and r["plan_id"] for r in runs.values())
+    assert len(ticks) == 1 and ticks[0]["tick"] == out["tick"] and ticks[0]["sites"] == 2 and ticks[0]["failed"] == 0 and ticks[0]["workers"] == 2
+    assert ticks[0]["seconds"] >= max(r["seconds"] for r in runs.values()) * 0.5 and ticks[0]["slowest_site"] in (a, b) and not ticks[0]["overran"]
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith(f"tick {out['tick']} of ")]
+    assert len(lines) == 1 and "2 sites, 0 made no plan" in lines[0] and "on 2 workers" in lines[0], lines
+    # a manual re-solve in the same quarter makes its plan, and leaves the tick's row as the tick wrote it
+    again = plans.tick(a)
+    with store.connect() as con:
+        after = dict(con.execute("SELECT * FROM runs WHERE site_id = ?", (a,)).fetchone())
+        n = con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    assert again["plan_id"] != runs[a]["plan_id"] and after == runs[a] and n == 2
+
+
+def test_the_tick_solves_sites_side_by_side_on_the_company_file(company, monkeypatch):
+    """The tick ran every site one after another in one thread, so its length grew with the fleet. Now a company's sites run on a pool of workers,
+    each on the company's own file: two sites are inside the solve at once (a barrier a sequential tick never passes)."""
+    from gridlytics import scheduler
+    ids = [_site(f"S{k}", battery=False) for k in range(4)]
+    for sid in ids:
+        sites.set_status(sid, "active")
+    seen = []
+    monkeypatch.setattr(plans, "tick", _fake_tick(seen, threading.Barrier(2, timeout=10)))
+    out = scheduler.tick_company(company, workers=2)
+    assert out["sites"] == 4 and out["failed"] == 0, out
+    assert sorted(s for s, _, _ in seen) == sorted(ids)
+    assert {f for _, f, _ in seen} == {str(company)} and len({t for _, _, t in seen}) == 2
+
+
+def test_the_worker_count_is_the_cores_less_one_up_to_four_or_the_setting(monkeypatch):
+    from gridlytics import scheduler
+    monkeypatch.delenv("GRIDLYTICS_TICK_WORKERS", raising=False)
+    for cores, want in ((1, 1), (2, 1), (4, 3), (16, 4), (None, 1)):
+        monkeypatch.setattr(scheduler.os, "cpu_count", lambda c=cores: c)
+        assert scheduler.tick_workers() == want, cores
+    monkeypatch.setattr(scheduler.os, "cpu_count", lambda: 16)
+    for asked, want in (("2", 2), ("12", 8), ("0", 4), ("many", 4)):
+        monkeypatch.setenv("GRIDLYTICS_TICK_WORKERS", asked)
+        assert scheduler.tick_workers() == want, asked
+
+
+def test_a_tick_that_runs_into_the_next_quarter_raises_an_alert_the_next_tick_in_time_clears(company, monkeypatch):
+    """With max_instances 1 and coalesce, a tick still running at the next quarter made APScheduler skip that tick with only a log line: sites were
+    planned every 30 minutes and nothing said so. Now the overrun is kept on the tick's row and raises tick_overrun on every active site."""
+    from gridlytics import alerts, scheduler
+    sid = _site()
+    sites.set_status(sid, "active")
+    monkeypatch.setattr(plans, "tick", _fake_tick())
+    q = forecast_align(_now()) - 3600
+    clock = iter([q + 20, q + 20 + 960, q + 920, q + 920 + 40])        # the first tick ends 16 minutes on, the second in 40 seconds
+    monkeypatch.setattr(scheduler, "_now_s", lambda: next(clock))
+    first = scheduler.tick_all([company])
+    assert first["overran"] and first["companies"] == 1
+    with store.connect() as con:
+        assert con.execute("SELECT overran FROM ticks WHERE tick = ?", (plans._iso(q),)).fetchone()[0] == 1
+    open_ = [a for a in alerts.listing("active", sid) if a["rule"] == "tick_overrun"]
+    assert len(open_) == 1 and "took 16 minutes" in open_[0]["title"] and "was skipped" in open_[0]["title"] and open_[0]["category"] == "Control"
+    second = scheduler.tick_all([company])
+    assert not second["overran"]
+    assert not [a for a in alerts.listing("active", sid) if a["rule"] == "tick_overrun"]

@@ -567,6 +567,16 @@ def _tick_error_words(failing: dict) -> str:
         TICK_ERROR_WORDS.get(str(failing.get("reason")), TICK_ERROR_WORDS["tick_error"])
 
 
+def tick_overrun(site_id: str, overran: bool, tick: int, seconds: float) -> None:
+    """Control: the scheduled tick of `tick` (epoch seconds of its quarter) ran into the next quarter's, which was skipped, so no plan was made
+    then (round 7, performance-live-11); cleared by the next tick that ends in time. Raised whatever the site's age: the server, not the site,
+    fell behind."""
+    nxt = datetime.fromtimestamp(int(tick) + 900, PKT)
+    _set(overran, site_id, "tick_overrun", "Control", "warning",
+         f"The planning run of {_when(tick)} took {max(1, round(seconds / 60))} minutes, so the {nxt:%H:%M} run was skipped" if overran else "",
+         {"at": int(tick), "seconds": int(seconds)})
+
+
 def evaluate(site_id: str, now: int | None = None) -> None:
     """Raises and clears the site's alerts. A Control or Savings condition counts only once the site is `settled`: before, it is not raised and an open
     one is closed."""

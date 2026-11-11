@@ -245,9 +245,14 @@ _V6 = [
     "CREATE INDEX IF NOT EXISTS plans_belief ON plans (site_id, belief_time)",
     "CREATE INDEX IF NOT EXISTS plan_messages_site ON plan_messages (site_id, sent_at)",
     "CREATE INDEX IF NOT EXISTS acks_site ON acks (site_id, received_at)",
+    # each scheduled tick of the company's file, apart from manual re-solves (audit performance-live-09, performance-live-11): its start, end and
+    # length, the active sites, those that made no plan, the worker threads, the slowest site, and whether it ran into the next quarter's tick
+    """CREATE TABLE IF NOT EXISTS ticks (tick TEXT PRIMARY KEY, started TEXT NOT NULL, finished TEXT NOT NULL, seconds REAL NOT NULL,
+        sites INTEGER NOT NULL, failed INTEGER NOT NULL, workers INTEGER NOT NULL, slowest_site TEXT, slowest_s REAL, overran INTEGER NOT NULL DEFAULT 0)""",
 ]
-#: and a scheduled tick that raised keeps the error's type and words in its runs row (audit parity-architecture-06: it left no row at all)
-_V6_COLUMNS = (("runs", "error", "TEXT NOT NULL DEFAULT ''"),)
+#: and a scheduled tick that raised keeps the error's type and words in its runs row (audit parity-architecture-06: it left no row at all), and each
+#: runs row the site's whole time in the tick, its alerts included (audit performance-live-09)
+_V6_COLUMNS = (("runs", "error", "TEXT NOT NULL DEFAULT ''"), ("runs", "seconds", "REAL"))
 
 
 def _migrate(con: sqlite3.Connection, version: int) -> None:
