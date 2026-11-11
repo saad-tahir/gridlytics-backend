@@ -11,6 +11,7 @@ stage-1 packages' code at once.
 - engine-delivery-17 (with brief-vs-build-08): the twin executes Mode B setpoints, and the guard, the compare drawer and the demo replay them at a
   Mode B site; the schedule carries U3's primitives.
 - engine-plans-live-18: a Deye or Voltronic site's plan charges from the running genset, the table keys it and the twin executes it.
+- brief-vs-build-15: a genset start or stop, an intra-day forecast bust and an approved tariff version re-solve the plan.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -400,6 +401,94 @@ def test_compare_with_native_replays_a_mode_b_plan_as_its_setpoints(world, monke
     plan = world.c["admin"].get(f"/api/sites/{world.site}/plan/compare").json()["compare"]["plan"]
     assert plan["soc"][4] == pytest.approx(60.0 - 40.0 / 0.95 * 1.0 / 200 * 100, abs=1.0)   # an hour at 40 kW from 60 % of 200 kWh
     assert plan["import_kwh"] == pytest.approx(40.0 + 80.0, abs=1.0)
+
+
+# ------------------------------------------------------------------------------------------------ brief-vs-build-15: event re-solves
+
+def test_a_genset_start_or_stop_re_solves_once_telemetry_shows_it(world, monkeypatch):
+    """OPT-15 lists the genset among the events that re-plan; only outages did. A genset start waits, as an outage does, until the telemetry a tick
+    reads shows the set running, then re-solves; a stop the same way."""
+    from gridlytics import routes_edge
+    from test_fix_api import _batch, _now
+    from test_fix_r2_api import _clock, _events, _iso
+    sid = world.site
+    kh = world.key(["telemetry:write"])
+    with world.use():
+        sites.set_status(sid, "active")
+    ticks = []
+    monkeypatch.setattr(plans, "tick", lambda site_id, *a, **k: ticks.append(site_id) or {"status": "active"})
+    minute = _now() // 60 * 60 - 1800
+    clock = _clock(monkeypatch, minute + 5)
+    cols = ("ts", "grid_present", "genset_running")
+    post_t = lambda seq, rows: world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_batch(seq, rows=rows, columns=cols))  # noqa: E731
+    post_e = lambda seq, ev: world.anon.post(f"/api/edge/{sid}/events", headers=kh, json=_events(seq, ev))  # noqa: E731
+    assert post_t(1, [[minute - 60, 1, 0]]).status_code == 200
+    r = post_e(1, [{"ts": _iso(minute + 5), "type": "genset_start"}])
+    assert r.status_code == 200 and r.json()["resolve"] == "waiting_for_telemetry" and ticks == [], r.text   # before: None, never re-solved
+    clock["now"] = minute + 65
+    r = post_t(2, [[minute, 1, 1]])
+    assert r.json()["resolve"] == "scheduled" and ticks == [sid], r.text
+    routes_edge._last_event_solve.clear()
+    clock["now"] = minute + 305
+    assert post_e(2, [{"ts": _iso(minute + 300), "type": "genset_stop"}]).json()["resolve"] == "waiting_for_telemetry"
+    clock["now"] = minute + 365
+    assert post_t(3, [[minute + 240, 1, 1]]).json()["resolve"] == "waiting_for_telemetry"          # still running in the rows a tick reads
+    r = post_t(4, [[minute + 300, 1, 0]])
+    assert r.json()["resolve"] == "scheduled" and ticks == [sid, sid], r.text
+
+
+def test_a_forecast_bust_re_solves_once_per_forecast_issue(world, monkeypatch):
+    """A busted PV forecast waited up to 15 minutes for the next tick. A telemetry batch whose last 30 minutes of PV miss the forecast the plan was
+    solved on by more than the site's bust threshold (of the clear-sky ceiling) re-solves the plan, once per forecast issue."""
+    from gridlytics import alerts, routes_edge
+    from test_fix_api import _batch, _now
+    from test_fix_r2_api import _clock
+    sid = world.site
+    kh = world.key(["telemetry:write"])
+    with world.use():
+        sites.set_status(sid, "active")
+        sites.put_asset(sid, "pv", {"kwp_dc": 300, "kw_ac": 250}, "t")
+    ticks = []
+    monkeypatch.setattr(plans, "tick", lambda site_id, *a, **k: ticks.append(site_id) or {"status": "active"})
+    q = (_now() // 900 - 4) * 900
+    clock = _clock(monkeypatch, q + 1800 + 5)
+    with world.use():
+        telemetry.save_forecast(sid, "pv", q, 1, "t", {"q50": [200.0] * 192, "cs": [240.0] * 192})
+    cols = ("ts", "grid_present", "pv_power_w")
+    rows = lambda kw: [[q + 60 * i, 1, kw * 1000] for i in range(30)]  # noqa: E731
+    with world.use():
+        assert alerts.intraday_bust(sid, q + 1800 + 5) is None                                         # nothing read yet
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_batch(1, rows=rows(190.0), columns=cols))
+    assert r.status_code == 200 and r.json().get("resolve") is None and ticks == [], r.text          # 10 kW off a 240 kW ceiling: no bust
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_batch(2, rows=rows(60.0), columns=cols))
+    assert r.json()["resolve"] == "scheduled" and r.json()["resolve_reason"] == "forecast_bust" and ticks == [sid], r.text
+    with world.use():
+        assert alerts.intraday_bust(sid, q + 1800 + 5)["err_pct"] == pytest.approx(140 / 240 * 100, abs=0.1)
+    routes_edge._last_event_solve.clear()
+    clock["now"] += 60
+    r = world.anon.post(f"/api/edge/{sid}/telemetry", headers=kh, json=_batch(3, rows=[[q + 1800, 1, 60_000]], columns=cols))
+    assert r.json().get("resolve") is None and ticks == [sid]                                        # the same issue re-solves once
+
+
+def test_approving_a_tariff_version_in_the_horizon_re_solves_the_plans(world, monkeypatch):
+    """A newly approved tariff version applied at the next scheduled tick; one starting within the plans' two days now re-solves every active grid
+    site's plan once the answer is sent. One starting later re-solves nothing."""
+    from datetime import date as _date
+    from test_fix_tariffs import SRC
+    with world.use():
+        sites.set_status(world.site, "active")
+        tax = tariffs.tax_rules(_date.today())
+    ticks = []
+    monkeypatch.setattr(plans, "tick", lambda site_id, *a, **k: ticks.append(site_id) or {"status": "active"})
+    a = world.c["admin"]
+    today = datetime.now(PKT).date()
+    with world.use():
+        soon = tariffs.propose("tax", "national", (today + timedelta(days=1)).isoformat(), {**tax, "punjab_selfgen_per_kwh": 0.05}, SRC, "t")
+        later = tariffs.propose("tax", "national", (today + timedelta(days=40)).isoformat(), {**tax, "punjab_selfgen_per_kwh": 0.06}, SRC, "t")
+    r = a.post(f"/api/tariffs/versions/{soon['id']}/approve")
+    assert r.status_code == 200 and r.json()["re_solving"] == 1 and ticks == [world.site], r.text
+    r = a.post(f"/api/tariffs/versions/{later['id']}/approve")
+    assert r.status_code == 200 and r.json()["re_solving"] == 0 and ticks == [world.site], r.text
 
 
 # ------------------------------------------------------------------------------------------------ engine-plans-live-18: charging from the genset

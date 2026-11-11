@@ -1152,6 +1152,41 @@ def forecast_bust(site: dict, day: date, bust_pct: float = 30.0) -> dict | None:
             "nrmse_pct": round(float(np.sqrt(np.mean((pred[ok] - act[ok]) ** 2)) / kw) * 100, 1) if ok.any() else None}
 
 
+#: The window an intra-day forecast bust is judged over (plan Part 2.4: a PV error above the threshold of the clear-sky ceiling over 30 minutes), and the
+#: least of it that must be read
+BUST_WINDOW_S = 1800
+BUST_MIN_READ_MIN = 20
+
+
+def intraday_bust(site_id: str, now: int, bust_pct: float = 30.0) -> dict | None:
+    """Whether the PV forecast the plan in force was solved on (the latest issue) has busted over the last 30 minutes (plan Part 2.4; round 7 stage 2,
+    audit brief-vs-build-15: a busted forecast waited for the next quarter's tick): the measured mean PV against the issue's median over the minutes it
+    covers, as a share of their clear-sky ceiling, above `bust_pct`. At least BUST_MIN_READ_MIN minutes must be covered and read, in daylight (a
+    ceiling above a tenth of the issue's highest), so an issue a few minutes old is not judged. {err_pct, belief_time} when it busted, else None."""
+    pv = (sites.assets(site_id) or {}).get("pv")
+    if not pv:
+        return None
+    end = int(now) // 60 * 60
+    f = telemetry.latest_forecast(site_id, "pv", end)
+    if f is None or not f.get("cs") or not f.get("q50"):
+        return None
+    start = max(end - BUST_WINDOW_S, int(f["belief_time"]))
+    if end - start < BUST_MIN_READ_MIN * 60:
+        return None
+    g = telemetry.minute_grid(site_id, start, end)
+    act = np.asarray(g["pv"], dtype=float)
+    idx = ((np.asarray(g["ts"]) - int(f["belief_time"])) // STEP_S).astype(int)
+    q50, cs = np.asarray(f["q50"], dtype=float), np.asarray(f["cs"], dtype=float)
+    ok = ~np.isnan(act) & (idx >= 0) & (idx < len(q50)) & (idx < len(cs))
+    if int(ok.sum()) < BUST_MIN_READ_MIN:
+        return None
+    ceiling = float(np.mean(cs[idx[ok]]))
+    if ceiling <= 0.1 * max(float(np.max(cs)), 1e-6):
+        return None
+    err = abs(float(np.mean(q50[idx[ok]])) - float(np.mean(act[ok]))) / ceiling
+    return {"err_pct": round(err * 100, 1), "belief_time": int(f["belief_time"])} if err > bust_pct / 100 else None
+
+
 def nightly(site_id: str, day: date) -> None:
     """The checks after the nightly jobs: the day's forecast scores (forecast.score_day stores them) and the forecast bust."""
     from . import forecast
