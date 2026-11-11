@@ -566,29 +566,44 @@ def _method(doc: _Doc, site: dict, summ: dict) -> None:
           "fuel curve where not; both arms carry the same battery wear charge." + _genset_assumption(site), lead="Assumptions:")
 
 
+#: A day row's grid figures, which an off-grid site has not got (_energy_and_days)
+GRID_DAY_KEYS = ("import_kwh", "export_kwh", "outage_minutes", "peak_kw", "peak_import_kwh")
+
+
 def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money: bool) -> None:
-    """The energy table and the daily rows (the PDF's annex) with the CSV's rows."""
+    """The energy table and the daily rows (the PDF's annex) with the CSV's rows. An off-grid site's report has no grid rows: its grid reads 0 on every
+    minute, so its day rows hold an import of 0 and a day-long "outage" (round 7 sweeps, audit role-operator-10, flow-reports-alerts-members-keys-30:
+    "Outage time 168.0 h" and "Outage h 24.0" every day); its CSV keeps the columns, blank."""
     site_id = site["id"]
+    grid = _on_grid(site)
+    if not grid:
+        tdays = [{**d, **dict.fromkeys(GRID_DAY_KEYS)} for d in tdays]
     doc.h2("Energy")
     tot = lambda k: sum(float(d.get(k) or 0) for d in tdays if num(d.get(k)) != "-")  # noqa: E731
-    doc.table([["Quantity", "Month"], ["Grid import", f"{tot('import_kwh'):,.0f} kWh"], ["Grid export", f"{tot('export_kwh'):,.0f} kWh"],
-               ["Solar", f"{tot('pv_kwh'):,.0f} kWh"], ["Load", f"{tot('load_kwh'):,.0f} kWh"], ["Genset", f"{tot('genset_kwh'):,.0f} kWh, "
-                                                                                                    f"{tot('genset_hours'):,.1f} h"],
-               ["Outage time", f"{tot('outage_minutes') / 60:,.1f} h"], ["Unserved critical load", f"{tot('unserved_kwh'):,.1f} kWh"],
-               ["Peak 30-minute import", f"{max([float(d.get('peak_kw') or 0) for d in tdays if num(d.get('peak_kw')) != '-'] or [0]):,.1f} kW"]],
+    peak = max([float(d.get("peak_kw") or 0) for d in tdays if num(d.get("peak_kw")) != "-"] or [0])
+    doc.table([["Quantity", "Month"]]
+              + ([["Grid import", f"{tot('import_kwh'):,.0f} kWh"], ["Grid export", f"{tot('export_kwh'):,.0f} kWh"]] if grid else [])
+              + [["Solar", f"{tot('pv_kwh'):,.0f} kWh"], ["Load", f"{tot('load_kwh'):,.0f} kWh"],
+                 ["Genset", f"{tot('genset_kwh'):,.0f} kWh, {tot('genset_hours'):,.1f} h"]]
+              + ([["Outage time", f"{tot('outage_minutes') / 60:,.1f} h"]] if grid else [])
+              + [["Unserved critical load", f"{tot('unserved_kwh'):,.1f} kWh"]]
+              + ([["Peak 30-minute import", f"{peak:,.1f} kW"]] if grid else []),
               [80 * mm, 50 * mm])
+    if not grid:
+        doc.p("No grid connection: there is no grid import, export, demand or outage to count.")
     doc.gap()
     doc.h2("Daily rows")
-    head = ["Day", "Import kWh", "Solar kWh", "Outage h", "Genset h"] + (["Saving vs native", "Fidelity"] if money else [])
+    head = (["Day"] + (["Import kWh"] if grid else []) + ["Solar kWh"] + (["Outage h"] if grid else []) + ["Genset h"]
+            + (["Saving vs native", "Fidelity"] if money else []))
     by_day = {d["day"]: d for d in summ["days"]}
     rows = [head]
     doc.csv.writerow(["day", "import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes", "peak_kw"] +
                      (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld"] if money else []))
     for d in tdays:
         s = by_day.get(d["day"], {})
-        rows.append([_short_day(d["day"]), num(d.get("import_kwh")), num(d.get("pv_kwh")), num(d.get("outage_minutes"), ".1f", scale=60),
-                     num(d.get("genset_hours"), ".1f")] +
-                    ([rs(s.get("saving_native_rs")), doc.cell(_day_fidelity(s))] if money else []))
+        rows.append([_short_day(d["day"])] + ([num(d.get("import_kwh"))] if grid else []) + [num(d.get("pv_kwh"))]
+                    + ([num(d.get("outage_minutes"), ".1f", scale=60)] if grid else []) + [num(d.get("genset_hours"), ".1f")]
+                    + ([rs(s.get("saving_native_rs")), doc.cell(_day_fidelity(s))] if money else []))
         ids = ""
         if money:
             with store.connect() as con:
@@ -598,7 +613,7 @@ def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money
                                                           "peak_kw")]
                          + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids,
                              s.get("claim_withheld") or ("import_unknown" if s.get("import_unknown") else None)] if money else []))
-    doc.table(rows, [22 * mm, 22 * mm, 22 * mm, 18 * mm, 18 * mm] + ([28 * mm, 50 * mm] if money else []))
+    doc.table(rows, [22 * mm] + ([22 * mm] if grid else []) + [22 * mm] + ([18 * mm] if grid else []) + [18 * mm] + ([28 * mm, 50 * mm] if money else []))
     if money and any(s.get("claim_withheld") or s.get("import_unknown") for s in summ["days"]):
         doc.p("A day marked “claim withheld” claims nothing: its saving is shown for reference and is not in the claimed total, nor is it a "
               "verified day.")
@@ -654,11 +669,12 @@ def _monthly(doc: _Doc, site: dict, kind: str, p0: date, p1: date, today: date, 
         doc.gap()
         doc.h2("Key figures")
         doc.table([["Figure", "This month"],
-                   [fuel, doc.cell(diesel_line(site, tdays, nat, scored, p0, end))],
-                   ["Peak (MDI)", doc.cell(peak_line(nat, True))],
-                   ["Outage coverage", doc.cell(outage_line(outage_cover(site, p0, end)))],
-                   ["Forecast skill", doc.cell(forecast_line(forecast_skill(site_id, p0, end)))],
-                   ["Control health", doc.cell(control_line(control_health(site_id, summ.get("days") or [], p0, end)))]],
+                   [fuel, doc.cell(diesel_line(site, tdays, nat, scored, p0, end))]]
+                  # an off-grid site has no maximum demand to bill (round 7 sweeps, role-operator-10); its outage line says it has no grid
+                  + ([["Peak (MDI)", doc.cell(peak_line(nat, True))]] if _on_grid(site) else [])
+                  + [["Outage coverage", doc.cell(outage_line(outage_cover(site, p0, end)))],
+                     ["Forecast skill", doc.cell(forecast_line(forecast_skill(site_id, p0, end)))],
+                     ["Control health", doc.cell(control_line(control_health(site_id, summ.get("days") or [], p0, end)))]],
                   [35 * mm, 145 * mm], right=False)
         doc.gap()
         doc.h2("Ledger by lever")
@@ -673,7 +689,7 @@ def _monthly(doc: _Doc, site: dict, kind: str, p0: date, p1: date, today: date, 
         _method(doc, site, summ)
         doc.story.append(PageBreak())
         doc.h2("Annex: energy and daily rows")
-    else:
+    elif _on_grid(site):  # an off-grid site has no grid outage: its energy table says so (_energy_and_days)
         doc.h2("Outages")
         doc.p(outage_line(outage_cover(site, p0, end)))
         doc.gap()

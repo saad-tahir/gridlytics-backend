@@ -62,6 +62,53 @@ def test_the_monthly_and_fleet_reports_count_a_gas_genset_s_fuel_in_mmbtu(world,
     assert "Fuel saved (Estimated)" in rollup and "1.9 MMBtu" in rollup and "Diesel" not in rollup, rollup
 
 
+# ------------------------------------------------------------------------------------------------ role-operator-10, flow-reports-alerts-members-keys-30
+
+def test_an_off_grid_site_s_energy_report_prints_no_grid_import_export_peak_or_outage_rows(world, monkeypatch):
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    days = [f"{month}-05", f"{month}-06"]
+    # the farm's day rows: its grid reads 0 on every minute, so the telemetry counts the whole day an outage
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(d) for d in days]),
+                  [_tday(d, import_kwh=0.0, export_kwh=0.0, outage_minutes=1440, peak_kw=0.0) for d in days])
+    built = _story(monkeypatch)
+    with world.use():
+        _data_from_last_year(sid)
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "regime": "off_grid"}, "test", conn_id=conn["id"])
+        rep = reports.generate("energy_only", sid, month, "test")
+        csv_text = reports.file_path(rep["id"], "csv").read_text(encoding="utf-8")
+    text = built[-1]
+    for row in ("Grid import", "Grid export", "Outage time", "Peak 30-minute import", "Import kWh", "Outage h"):
+        assert row not in text, (row, text)
+    assert "48.0" not in text and "24.0" not in text, text                 # before: "Outage time 48.0 h" and "Outage h 24.0" every day
+    assert "Solar" in text and "Load" in text and "no grid connection" in text.lower(), text
+    # the CSV keeps its columns, the grid's left blank rather than an import of 0 and a day-long outage
+    rows = csv_text.splitlines()
+    head = rows[0].split(",")
+    first = dict(zip(head, rows[1].split(",")))
+    assert first["outage_minutes"] == "" and first["import_kwh"] == "" and first["peak_kw"] == "", first
+
+
+def test_an_off_grid_site_s_savings_energy_counts_no_outage_hours_and_no_grid_peak(world, monkeypatch):
+    a, v, sid = world.c["admin"], world.c["viewer"], world.site
+    month = _past_month()
+    days = [f"{month}-05", f"{month}-06"]
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(d) for d in days]),
+                  [_tday(d, import_kwh=0.0, export_kwh=0.0, outage_minutes=1440, peak_kw=0.0) for d in days])
+    params = {"start": days[0], "end": days[1]}
+    on_grid = a.get(f"/api/sites/{sid}/savings", params=params).json()["energy"]
+    assert on_grid["outage_hours"] == 48.0 and on_grid["peak_kw"] == 0.0            # a grid site's day rows: its outages are real
+    with world.use():
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "regime": "off_grid"}, "test", conn_id=conn["id"])
+    for c in (a, v):
+        e = c.get(f"/api/sites/{sid}/savings", params=params).json()["energy"]
+        # before: "Outage time 48 h" (every minute of a grid that reads 0) and a grid peak of 0.0 kW
+        assert e["outage_hours"] is None and e["peak_kw"] is None, e
+        assert e["pv_kwh"] == 1600.0 and e["load_kwh"] == 4200.0, e                   # the site's own energy stays
+
+
 # ------------------------------------------------------------------------------------------------ frontend-states-formats-02
 
 def test_unmetered_genset_fuel_over_a_savings_period_of_more_than_62_days_is_the_curve_s_or_not_counted_never_zero(world):
