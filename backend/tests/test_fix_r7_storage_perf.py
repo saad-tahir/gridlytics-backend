@@ -882,3 +882,39 @@ def test_a_report_renders_as_a_job_and_the_same_report_asked_again_is_the_one_al
     fresh = an.post("/api/reports", json=body)
     assert _wait(lambda: len(calls) == 2, 10)
     assert fresh.status_code in (200, 202) and (fresh.json().get("id") or fresh.json()["job_id"]) != made["id"]
+
+
+# ------------------------------------------------------------------------------------------------ follow-up: GET /plan/compare (security-roles-08's rest)
+
+def test_the_compare_replays_a_plan_against_its_capture_once(world, monkeypatch):
+    """GET /plan/compare ran two 2,880-minute twin simulations a call, with no cache, and any member could loop it. The same plan against the same
+    capture (and plant, and price) is now replayed once; a new plan or a new capture is replayed afresh; a viewer still reads it without rupees."""
+    from gridlytics import routes_plans
+    a, v, sid = world.c["admin"], world.c["viewer"], world.site
+    with world.use():
+        sites.capture_native(sid, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 20}, "t")
+        now = _now() // 60 * 60
+        telemetry.ingest(sid, [{"ts": t, "grid_present": 1, "load_power_w": 60_000.0, "battery_soc_bms_pct": 50.0}
+                               for t in range(now - 2 * 86400, now, 600)], "edge", now=now)
+        plans.tick(sid)
+    replays = []
+    real = twin.simulate
+    monkeypatch.setattr(twin, "simulate", lambda *x, **k: (replays.append(1), real(*x, **k))[1])
+
+    def compare(client) -> tuple[dict, int]:
+        n = len(replays)
+        body = client.get(f"/api/sites/{sid}/plan/compare").json()
+        return body, len(replays) - n
+
+    first, n = compare(a)
+    assert first["compare"] and n == 2
+    assert compare(a) == (first, 0)
+    seen, n = compare(v)
+    assert n == 0 and "energy_rs" not in json.dumps(seen) and seen["compare"]["plan"]["import_kwh"] == first["compare"]["plan"]["import_kwh"]
+    with world.use():
+        sites.capture_native(sid, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 30}, "t")
+    body, n = compare(a)
+    assert body["native"]["version"] == 2 and n == 2
+    with world.use():
+        plans.tick(sid)
+    assert compare(a)[1] == 2

@@ -1,10 +1,13 @@
 """The plan (UI-09) and the control plane (UI-15): the current plan with its reasons, versions, re-solve, apply, compare, hold and release."""
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import math
 import threading
 import time
+from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
@@ -360,6 +363,33 @@ def plan_compare(site_id: str):
     if first is None or now_ts() - int(first) < COMPARE_MIN_DATA_S:
         return {"compare": None, "reason": "too_little_data"}
     steps = p["steps"]
+    price, basis = _short_price(s, steps[0]["t"])
+    # the same plan against the same capture, plant and price is replayed once (round 7, storage-perf follow-up of security-roles-08: two
+    # 2,880-minute twin simulations a call, which any member, a viewer included, could loop)
+    key = (str(store.db_path()), site_id, p["id"], s["native"]["version"], price,
+           json.dumps({"assets": s.get("assets"), "data": s.get("data"), "native": s["native"].get("body")}, sort_keys=True, default=str))
+    with _compares_lock:
+        hit = _compares.get(key)
+        if hit is not None:
+            _compares.move_to_end(key)
+    if hit is not None:
+        return out(copy.deepcopy(hit))
+    answer = _compare(s, p, steps, price, basis)
+    with _compares_lock:
+        _compares[key] = answer
+        while len(_compares) > COMPARES_KEPT:
+            _compares.popitem(last=False)
+    return out(copy.deepcopy(answer))
+
+
+#: the compare answers kept (GET /plan/compare): one a plan in force, for a few dozen sites
+COMPARES_KEPT = 64
+_compares: "OrderedDict[tuple, dict]" = OrderedDict()
+_compares_lock = threading.Lock()
+
+
+def _compare(s: dict, p: dict, steps: list, price: float, basis: str) -> dict:
+    """The two arms of GET /plan/compare, replayed through the twin (money in it: the caller filters it)."""
     ts = np.repeat([st["t"] for st in steps], 15) + np.tile(np.arange(15) * 60, len(steps))
     rep = lambda k: np.repeat([st[k] for st in steps], 15).astype(float)
     series = {"ts": ts, "pv": rep("pv_forecast_kw"), "load": rep("load_kw"), "crit": rep("critical_kw"), "grid": rep("grid_present"), "temp": np.full(len(ts), 30.0)}
@@ -369,7 +399,6 @@ def plan_compare(site_id: str):
     risk = np.array([float(st.get("p_start") or 0.0) if st.get("grid_present", 1.0) >= 0.5 else 0.0 for st in steps])
     risk = np.where(risk >= 0.01, risk, 0.0)
     reserve = np.array([float(st.get("reserve_pct") or 0.0) for st in steps])
-    price, basis = _short_price(s, steps[0]["t"])
     arms = {}
     for name, pol in (("native", twin.native_policy(s, ts)), ("plan", twin.slots_policy([x for d in p["slots"]["days"] for x in d["slots"]], ts))):
         sim = twin.simulate(series, pol, plant, soc0)
@@ -381,8 +410,8 @@ def plan_compare(site_id: str):
                       "unserved_kwh": round(float(sim["unserved"].sum() / 60), 1), "min_soc_pct": round(float(sim["soc"].min() * 100), 1),
                       "reserve_short_kwh": round(short, 1), "reserve_short_rs": round(short * price, 0),
                       "soc": [round(float(x) * 100, 1) for x in sim["soc"][::15]]}
-    return out({"compare": arms, "t": [st["t"] for st in steps], "native": {"version": s["native"]["version"], "captured_at": s["native"]["captured_at"]},
-                "short_rs_per_kwh": round(price, 1), "short_basis": basis})
+    return {"compare": arms, "t": [st["t"] for st in steps], "native": {"version": s["native"]["version"], "captured_at": s["native"]["captured_at"]},
+            "short_rs_per_kwh": round(price, 1), "short_basis": basis}
 
 
 # ------------------------------------------------------------------------------------------------ control (UI-15)
