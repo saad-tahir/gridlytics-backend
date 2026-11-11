@@ -482,6 +482,9 @@ def genset_page(site_id: str, days: int = 14, month: str | None = None):
         period = {"kind": "days", "month": None, "start": t0, "end": t1, "days": days}
     res = telemetry.genset_runs(site_id, t0, t1, g)
     runs = res["runs"]
+    if t1 < now:  # a period that ended before now (a past month) has no run still going: its last run is cut at the period's end (review r7)
+        for r in runs:
+            r.pop("ongoing", None)
     from . import tariffs
     kind = g.get("fuel_kind", "hsd")
     prices: dict[str, float] = {}

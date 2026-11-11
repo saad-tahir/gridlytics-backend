@@ -1262,3 +1262,21 @@ def test_a_minute_written_inside_a_run_between_the_page_s_two_reads_is_not_a_ser
     assert len(calls) == 2  # the run's own read, then the balance over its minutes
     assert [(r["start"], r["end"], r["hours"]) for r in runs] == [(t, t + 3600, 1.0)]
     assert runs[0]["kwh"] == pytest.approx(150.0) and runs[0]["kwh_estimated"] is True
+
+
+def test_a_past_month_s_last_run_is_cut_at_the_month_s_end_not_running(world):
+    """Review of pages-C-15: a run over last month's last midnight is cut at the month's end in last month's view. It was marked ongoing (nothing in the
+    period ended it, and its last reading was within the gap of the period's end), so the page showed "Running" in a month long past. Only a period that
+    ends now has a run still going; this month's view keeps one."""
+    c = world.owner
+    sid = _route_site(c, "Month end")
+    month0 = _pk_ts(datetime.now(PKT).date().replace(day=1), 0)
+    with world.use():
+        _write(sid, month0 - 1800, 60, grid_present=0, genset_running=1, genset_power_w=100000)
+    pm = datetime.fromtimestamp(month0 - 1, PKT).strftime("%Y-%m")
+    runs = c.get(f"/api/sites/{sid}/genset", params={"month": pm}).json()["runs"]
+    assert [(r["start"], r["end"], r.get("ongoing", False)) for r in runs] == [(month0 - 1800, month0, False)]
+    now = int(datetime.now(timezone.utc).timestamp())
+    if now - (month0 + 1800) < telemetry.RUN_GAP_S:  # the run's last reading is recent: in this month's view it is still going
+        this = c.get(f"/api/sites/{sid}/genset", params={"month": datetime.fromtimestamp(month0, PKT).strftime("%Y-%m")}).json()["runs"]
+        assert this and this[0].get("ongoing") is True
