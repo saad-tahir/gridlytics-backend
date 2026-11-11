@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 from fastapi import APIRouter, Body, Header, HTTPException
 
-from . import alerts, auth, battery, delivery, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, verify
+from . import alerts, auth, battery, delivery, demo, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, verify
 from .routes_common import PKT, bad, full_or_404, now_ts, out, put_state, site_or_404, today
 from .schemas import Refusal
 
@@ -74,7 +74,9 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
         # closed loop runs through an edge device: with none ever heard from nothing reaches the inverter, whatever the readings say (round 7, audit
         # role-operator-11: the Karachi demo site read "Following plan")
         return {"key": "edge_offline", "label": "No edge device yet"}
-    if tier == "closed_loop" and age is not None and age > 5:
+    # an edge reports every minute, so its readings are fresh for 5 minutes; a demo site's edge is the twin, which the 15-minute schedule runs, so
+    # for demo.EDGE_FRESH_S, as GET /edge says it is online (demo-seed): no data for longer reads "Edge offline" at a demo site too
+    if tier == "closed_loop" and age is not None and age > (demo.EDGE_FRESH_S / 60 if site.get("demo_link") else 5):
         return {"key": "edge_offline", "label": "Edge offline"}
     if tier == "closed_loop":
         clock = plans.clock_info(site["id"])

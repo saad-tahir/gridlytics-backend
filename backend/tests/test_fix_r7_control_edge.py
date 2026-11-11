@@ -1140,7 +1140,7 @@ def test_a_demo_site_says_its_control_state_as_a_customer_site_does(company):
     """A demo site's chip is no longer forced to "Following plan (table applied)": with no table marked for today it reads "Table not confirmed
     today", as its alert and applied log say, and a closed-loop demo site with no data for hours reads "Edge offline" (audit role-owner-08,
     role-viewer-01, role-operator-03, role-analyst-04, flow-telemetry-plan-control-27, flow-savings-pilot-bill-28)."""
-    from gridlytics import routes_sites
+    from gridlytics import demo, routes_sites
     now = _now()
     adv = sites.create({"name": "Faisalabad textile mill (demo)", "disco": "FESCO"}, "t", demo_link="demo")["id"]
     loop = sites.create({"name": "Karachi feed mill (demo)", "disco": "FESCO"}, "t", demo_link="demo")["id"]
@@ -1152,6 +1152,14 @@ def test_a_demo_site_says_its_control_state_as_a_customer_site_does(company):
     assert state(adv, {"ts": now}) == {"key": "unconfirmed", "label": "Table not confirmed today"}
     assert state(loop, {"ts": now - 4 * 3600}) == {"key": "edge_offline", "label": "Edge offline"}
     assert state(loop, {"ts": now - 60})["key"] == "following"
+    # a demo site's edge is the twin, which the 15-minute schedule runs: its readings are fresh for demo.EDGE_FRESH_S, as its edge card says
+    # (demo-seed)
+    assert state(loop, {"ts": now - 12 * 60})["key"] == "following"
+    assert state(loop, {"ts": now - demo.EDGE_FRESH_S - 60})["key"] == "edge_offline"
+    real = sites.create({"name": "Karachi feed mill", "disco": "FESCO"}, "t")["id"]
+    _tier(real, "closed_loop")
+    sites.put_state(real, edge_last_seen=now - 12 * 60)
+    assert state(real, {"ts": now - 12 * 60}) == {"key": "edge_offline", "label": "Edge offline"}   # a real edge reports every minute
     today = datetime.now(PKT).date()
     plans.mark_applied(adv, _today_plan(adv, today), today.isoformat(), "Installer", "installer_keyed")
     assert state(adv, {"ts": now}) == {"key": "following", "label": "Following plan (table applied)"}
