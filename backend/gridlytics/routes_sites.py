@@ -182,7 +182,7 @@ HANDED_BACK = ("native", "paused", "native_block")
 def fleet_row(s: dict, now: int, counts: dict) -> dict:
     last = telemetry.latest(s["id"])
     first = telemetry.first_ts(s["id"])
-    plan = plans.current(s["id"])
+    plan = plans.current(s["id"], slots=False)       # the row reads the next event from the steps, never the table (round 7, tests-and-perf-06)
     nn = plans.now_and_next(plan, now)
     days_data = (now - first) / 86400 if first else 0
     conn = (sites.connections(s["id"]) or [None])[0]

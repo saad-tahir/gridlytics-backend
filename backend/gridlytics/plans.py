@@ -913,13 +913,19 @@ def _plan_out(r, with_steps: bool = True) -> dict:
     return d
 
 
-def current(site_id: str, now: int | None = None) -> dict | None:
+#: A plan row without its steps and slots (about 130 KB of JSON a plan: round 7, tests-and-perf-06): what a list of plans reads
+LIGHT_COLUMNS = ("id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, reason, solver, solve_seconds, objective_rs, "
+                 "config_hash, summary, applied")
+
+
+def current(site_id: str, now: int | None = None, slots: bool = True) -> dict | None:
     """The plan in force: the latest active plan, while `now` (the clock by default) is before its valid_until. A plan past its valid_until is
     not in force (Part 2.4: a failed tick keeps the previous plan only until then), so it is neither served to the edge nor keyed in; held_info
-    names it (plan_expired)."""
+    names it (plan_expired). `slots=False` leaves the compiled table out (null), for a reader of the steps only (the fleet's next event)."""
     now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    cols = "*" if slots else f"{LIGHT_COLUMNS}, steps"
     with store.connect() as con:
-        r = con.execute("SELECT * FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
+        r = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
         last = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
     if r is None or _past_valid_until(r["valid_until"], now):
         return None
@@ -1059,8 +1065,10 @@ def past_steps(site_id: str, now: int, hours: int = 24) -> dict:
 
 
 def history(site_id: str, limit: int = 50) -> list[dict]:
+    """The site's latest plans, newest first, without their steps and slots (round 7, tests-and-perf-06: the list read every plan's blobs to drop
+    them)."""
     with store.connect() as con:
-        rows = con.execute("SELECT * FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT ?", (site_id, limit)).fetchall()
+        rows = con.execute(f"SELECT {LIGHT_COLUMNS} FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT ?", (site_id, limit)).fetchall()
     return [_plan_out(r, with_steps=False) for r in rows]
 
 
@@ -1119,6 +1127,105 @@ def now_and_next(plan: dict | None, now: int | None = None) -> dict | None:
         if len(nxt) == 3:
             break
     return {"current": cur, "next": nxt}
+
+
+# ------------------------------------------------------------------------------------------------ retention
+
+#: How long a plan keeps all its steps and its compiled table (plan Part 3.3)
+KEEP_WHOLE_DAYS = 90
+_TRIM_BATCH = 200
+
+
+def _in_force_windows(rows) -> dict[str, tuple[int, int]]:
+    """Each plan's span in force, [start, end) in epoch seconds, by active_at's rules over the stored ticks in their order (belief time, then made):
+    a plan made (active or superseded) is in force from its belief time until the next tick that decides (another plan made, or a held or failed
+    tick of a pause or a release to native) or its valid_until, whichever comes first; a guard hold or a failed solve leaves it in force. A pause
+    or release with no tick of its own (_released_at) is not taken off, so a span may be longer than active_at's, never shorter."""
+    spans: dict[str, tuple[int, int]] = {}
+    cur: tuple[str, int, int] | None = None              # (plan id, start, valid_until)
+    for r in rows:
+        made = r["status"] in ("active", "superseded")
+        ends = (r["status"] == "held" and r["reason"] in RELEASED_REASONS) or (r["status"] == "failed" and r["released"])
+        if not (made or ends):
+            continue
+        at = _ts(r["belief_time"]) or 0
+        if cur is not None:
+            spans[cur[0]] = (cur[1], min(at, cur[2]))
+        cur = (r["id"], at, _ts(r["valid_until"]) or at) if made else None
+    if cur is not None:
+        spans[cur[0]] = (cur[1], cur[2])
+    return spans
+
+
+def _covers_day_start(a: int, b: int) -> bool:
+    """Whether the span [a, b) holds a Pakistan-time midnight."""
+    d = _local(a).date()
+    t = twin.day_start_utc(d)
+    return (t if t >= a else twin.day_start_utc(d + timedelta(days=1))) < b
+
+
+def prune(site_id: str, now: int | None = None, keep_days: int = KEEP_WHOLE_DAYS) -> dict:
+    """Plan retention (plan Part 3.3; round 7, performance-live-01: every 15-minute plan kept its 192 steps and its table for good, about 12.5 MB a site
+    a day). Every plan row and its summary are kept forever; a plan whose belief time is more than `keep_days` before `now` (the clock by default),
+    other than the active one, keeps its steps and its compiled table whole only when it is:
+    - the first plan of its hour (the plans of the hour's first belief time);
+    - marked applied (the applied log and the advisory replay read it), issued as a day's table (table_issues: the issued view, the write log and the
+      demo's keyed table read it) or sent to an edge (plan_messages);
+    - in force at a Pakistan-time midnight (the daily sheet of a past day and the demo's keyed table read its table), through failed ticks too.
+    Any other keeps only the steps of its own span in force (_in_force_windows) and the step just after it (reserve.target_at reads an outage's own
+    step from the plan in force the instant before), so active_at answers every instant with the same plan and the same step as before (the past
+    plan table, the reports' reserve check, the genset page's planned runs, the alerts), and its table is dropped.
+    A trimmed plan has no table, so the next prune passes over it, and starts at the latest plan the last one trimmed rather than the site's first
+    plan. Each batch of trims is its own transaction, so a tick or a request never waits on the whole run. Run nightly (scheduler.nightly_company);
+    returns what it did."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    cutoff = _iso(now - int(keep_days) * 86400)
+    out = {"site_id": site_id, "trimmed": 0, "kept_whole": 0, "bytes_before": 0, "bytes_after": 0}
+    with store.connect() as con:
+        # where the last prune stopped: the latest plan it trimmed (no table, and not a failed tick, which never has one)
+        done = con.execute("SELECT MAX(belief_time) FROM plans WHERE site_id = ? AND belief_time < ? AND slots IS NULL AND status != 'failed'",
+                           (site_id, cutoff)).fetchone()[0]
+        first = con.execute("SELECT MIN(belief_time) FROM plans WHERE site_id = ? AND belief_time >= ? AND belief_time < ? AND status != 'active' "
+                            "AND slots IS NOT NULL", (site_id, done or "", cutoff)).fetchone()[0]
+        if first is None:
+            return out
+        # the light columns of every tick from the first plan to trim on, in active_at's order, for the spans in force (a span depends only on the
+        # ticks after it)
+        rows = con.execute("SELECT id, status, reason, belief_time, valid_until, slots IS NOT NULL AS has_slots, "
+                           "(status = 'failed' AND json_extract(summary, '$.control_release') IS NOT NULL) AS released "
+                           "FROM plans WHERE site_id = ? AND belief_time >= ? ORDER BY belief_time, generated_at, rowid", (site_id, first)).fetchall()
+        whole: set[str] = set()
+        for sql in ("SELECT plan_id FROM applied WHERE site_id = ? AND day_local >= ?", "SELECT plan_id FROM table_issues WHERE site_id = ? AND day_local >= ?",
+                    "SELECT DISTINCT plan_id FROM plan_messages WHERE site_id = ? AND sent_at >= ?"):
+            whole.update(r[0] for r in con.execute(sql, (site_id, _local(_ts(first) or 0).date().isoformat() if "day_local" in sql else first)))
+    spans = _in_force_windows(rows)
+    hour_first: dict[str, str] = {}
+    for r in rows:
+        if r["status"] != "failed":
+            hour = r["belief_time"][:13]
+            hour_first[hour] = min(hour_first.get(hour, r["belief_time"]), r["belief_time"])
+    trim = []
+    for r in rows:
+        if r["belief_time"] >= cutoff or r["status"] == "active" or not r["has_slots"]:
+            continue
+        span = spans.get(r["id"])
+        if r["id"] in whole or hour_first.get(r["belief_time"][:13]) == r["belief_time"] or (span and _covers_day_start(*span)):
+            out["kept_whole"] += 1
+        else:
+            trim.append(r["id"])
+    for k in range(0, len(trim), _TRIM_BATCH):
+        ids = trim[k:k + _TRIM_BATCH]
+        with store.connect() as con:
+            got = con.execute(f"SELECT id, steps, slots FROM plans WHERE id IN ({','.join('?' * len(ids))}) AND slots IS NOT NULL", ids).fetchall()
+            for r in got:
+                a, b = spans.get(r["id"], (0, 0))
+                steps = [s for s in (json.loads(r["steps"]) if r["steps"] else []) if b > a and a <= int(s["t"]) <= b]
+                kept = json.dumps(steps) if steps else None
+                out["bytes_before"] += len(r["steps"] or "") + len(r["slots"] or "")
+                out["bytes_after"] += len(kept or "")
+                con.execute("UPDATE plans SET steps = ?, slots = NULL WHERE id = ?", (kept, r["id"]))
+        out["trimmed"] += len(got)
+    return out
 
 
 def mark_applied(site_id: str, plan_id: str, day_local: str, by: str, method: str, photo: str = "") -> dict:

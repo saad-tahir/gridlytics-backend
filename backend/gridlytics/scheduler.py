@@ -64,6 +64,12 @@ def nightly_company(path) -> None:
                 alerts.nightly(s["id"], yesterday)
             except Exception:
                 log.exception("nightly job failed for site %s", s["id"])
+        # plan retention (plan Part 3.3; round 7, performance-live-01): every site's plans past 90 days keep only what the readers read
+        for s in sites.listing():
+            try:
+                plans.prune(s["id"])
+            except Exception:
+                log.exception("the plan retention failed for site %s", s["id"])
 
 
 def nightly_tables_company(path) -> None:

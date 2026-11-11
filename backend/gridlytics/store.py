@@ -28,7 +28,7 @@ DEFAULT_ORG = "default"
 _ORG: ContextVar[str] = ContextVar("gridlytics_org", default=DEFAULT_ORG)
 _DB: ContextVar[Path | None] = ContextVar("gridlytics_db", default=None)
 _ACTOR: ContextVar[dict | None] = ContextVar("gridlytics_actor", default=None)
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _lock = threading.Lock()
 
 
@@ -237,6 +237,16 @@ _V4 = [
 _V5_COLUMNS = (("reports", "generated_by", "TEXT NOT NULL DEFAULT ''"), ("alerts", "history", "TEXT NOT NULL DEFAULT '[]'"),
                ("alerts", "assigned_id", "TEXT NOT NULL DEFAULT ''"))
 
+#: Version 6 (round 7, storage-perf; renumbered at integration if another package took 6): the indexes the plan, message and ack reads use (audit
+#: performance-live-01, tests-and-perf-06). plans.active_at, the replays and the retention read plans by (site, belief time), which the (site,
+#: generated_at) index could not order, so every call scanned and sorted the site's whole history; the edge page, the write log and the control page
+#: read a site's messages and acks by time.
+_V6 = [
+    "CREATE INDEX IF NOT EXISTS plans_belief ON plans (site_id, belief_time)",
+    "CREATE INDEX IF NOT EXISTS plan_messages_site ON plan_messages (site_id, sent_at)",
+    "CREATE INDEX IF NOT EXISTS acks_site ON acks (site_id, received_at)",
+]
+
 
 def _migrate(con: sqlite3.Connection, version: int) -> None:
     if version < 1:
@@ -256,6 +266,9 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
         for table, column, kind in _V5_COLUMNS:
             if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    if version < 6:
+        for sql in _V6:
+            con.execute(sql)
 
 
 def backup(tag: str) -> Path | None:
