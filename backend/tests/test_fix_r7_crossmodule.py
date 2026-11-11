@@ -8,6 +8,9 @@ stage-1 packages' code at once.
 - engine-savings-09 (VER-13): the metering factor per connection, one energy and one MDI scalar fitted on two bills and tested on a held-out third,
   applied to both arms before pricing; outside 0.97 to 1.03 a data finding raised as an alert; the 2 % gate closed only by a held-out bill.
 - followup bound-mdi (engine-optimiser-14): the perfect-foresight bound prices both arms' demand charge from the solve's own lower bound.
+- engine-delivery-17 (with brief-vs-build-08): the twin executes Mode B setpoints, and the guard, the compare drawer and the demo replay them at a
+  Mode B site; the schedule carries U3's primitives.
+- engine-plans-live-18: a Deye or Voltronic site's plan charges from the running genset, the table keys it and the twin executes it.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -20,7 +23,7 @@ import pytest
 
 from test_fix_api import world  # noqa: F401  (world is a fixture)
 
-from gridlytics import forecast, plans, sites, store, tariffs, twin, verify
+from gridlytics import forecast, plans, sites, store, tariffs, telemetry, twin, verify
 
 PKT = timezone(timedelta(hours=5))
 NOV = date(2026, 11, 3)
@@ -289,3 +292,188 @@ def test_a_factor_outside_097_to_103_is_a_data_finding_not_a_calibration(company
     alerts.evaluate(sid)
     found = [a for a in alerts.listing(site_id=sid) if a["rule"] == "metering_factor"]
     assert found and found[0]["category"] == "Data" and "6.0 %" in found[0]["title"]
+
+
+# ------------------------------------------------------------------------------------------------ engine-delivery-17 (with brief-vs-build-08): Mode B
+
+def _flat_series(n_steps: int, load=100.0, pv=0.0, t0=None):
+    t0 = twin.day_start_utc(NOV) if t0 is None else t0
+    ts = t0 + np.arange(n_steps * 15) * 60
+    n = len(ts)
+    return {"ts": ts, "pv": np.full(n, pv), "load": np.full(n, load), "crit": np.full(n, 20.0), "grid": np.ones(n), "temp": np.full(n, 30.0)}
+
+
+def test_the_twin_executes_mode_b_setpoints_step_by_step():
+    """The twin had no Mode B executor: every replay ran the Mode A table. Each 15-minute step's battery power is followed within the battery's
+    power, the step's floor and target; a charge beyond the PV surplus draws on the grid only where the step allows it, and a discharge no load or
+    export cap takes is not made (the edge's 1-minute rule layer)."""
+    t0 = twin.day_start_utc(NOV)
+    steps = [{"t": t0, "battery_power_w": 50_000, "soc_floor_pct": 20.0, "grid_charge_allowed": False},
+             {"t": t0 + 900, "battery_power_w": -30_000, "soc_floor_pct": 20.0, "soc_target_pct": 95.0, "grid_charge_allowed": True},
+             {"t": t0 + 1800, "battery_power_w": -30_000, "soc_floor_pct": 20.0, "grid_charge_allowed": False},
+             {"t": t0 + 2700, "battery_power_w": 150_000, "soc_floor_pct": 20.0, "grid_charge_allowed": False, "export_limit_w": 0},
+             {"t": t0 + 3600, "battery_power_w": 0, "soc_floor_pct": 20.0, "genset_request": "prefer_start"}]
+    series = _flat_series(5)
+    plant = twin.Plant(e_nom=200.0, p_ch=100.0, p_dis=200.0, g_max=500.0)
+    pol = twin.setpoints_policy({"step_s": 900, "steps": steps}, series["ts"])
+    assert set(pol["mode"]) == {twin.MODE_CODE["setpoint"]} and pol["genset"][-1] == 1 and pol["genset"][0] == 0
+    sim = twin.simulate(series, pol, plant, 0.6)
+    q = lambda k: sim["bat"][15 * k:15 * k + 15]  # noqa: E731
+    assert np.allclose(q(0), 50.0)                       # discharge at the setpoint
+    assert np.allclose(q(1), -30.0)                      # a grid charge the step allows
+    assert np.allclose(q(2), 0.0)                        # no surplus, no grid charge allowed: no charge
+    assert np.allclose(q(3), 100.0)                      # 150 kW asked, the load takes 100 and nothing may be exported
+    assert np.allclose(q(4), 0.0)
+    assert np.allclose(sim["imp"][:15], 50.0) and np.allclose(sim["imp"][15:30], 130.0) and sim["exp"].max() == 0.0
+    # a floor stops the discharge
+    low = twin.simulate(series, pol, plant, 0.21)
+    assert low["soc"][14] >= 0.2 - 1e-6 and low["bat"][:15].sum() / 60 < 50.0 * 0.25
+
+
+def test_the_mode_b_schedule_carries_u3s_primitives():
+    """mode_b() left out battery_mode, soc_target_pct, export_limit_w and gen_charge_allowed, and sent genset_request as a bool, not U3's enum."""
+    from gridlytics import delivery
+    from test_fix_r3_optimiser import _steps_for
+    steps = _steps_for([("charge_from_grid", 40.0, 0.0), ("discharge_peak_window", 0.0, 30.0), ("hold_for_outage", 0.0, 0.0)])
+    for st, soc in zip(steps, (60.0, 50.0, 50.0)):
+        st["soc_pct"], st["reserve_pct"] = soc, 20.0
+    steps[1]["genset_on"] = True
+    site = {"connections": [{"data": {"regime": "net_billing", "export_cap_kw": 80}}]}
+    mb = delivery.mode_b(steps, site)
+    assert mb["refresh"] == {"heartbeat_s": 60, "revert_after_s": 1800, "residual_band_w": 300} and mb["step_s"] == 900
+    a, b, c = mb["steps"]
+    assert a["battery_mode"] == "charge" and a["soc_target_pct"] == 60.0 and a["battery_power_w"] == -40_000 and a["grid_charge_allowed"]
+    assert b["battery_mode"] == "discharge" and b["soc_target_pct"] is None and b["genset_request"] == "prefer_start"
+    assert c["battery_mode"] == "hold" and c["genset_request"] == "prefer_stop" and a["genset_request"] == "none"
+    assert {x["export_limit_w"] for x in mb["steps"]} == {80_000} and not any(x["gen_charge_allowed"] for x in mb["steps"])
+
+
+def _mode_b_site(name="Mode B Mill"):
+    from test_fix_savings import make_site
+    sid = make_site(name=name, genset=False)
+    with store.connect() as con:
+        r = con.execute("SELECT data FROM sites WHERE id = ?", (sid,)).fetchone()
+        con.execute("UPDATE sites SET data = ? WHERE id = ?", (json.dumps({**json.loads(r["data"]), "control_mode": "mode_b"}), sid))
+    sites.put_asset(sid, "inverter", {"brand": "sungrow", "model": "SH10RT", "kw_ac": 100}, "t")
+    return sid
+
+
+def test_a_mode_b_sites_guard_and_demo_replay_the_setpoints_not_the_table(company, monkeypatch):
+    """The guard, the compare drawer and the demo replayed the Sungrow 2-slot Mode A table at a Mode B site, whose edge never runs it."""
+    from gridlytics import delivery, demo
+    sid = _mode_b_site()
+    site = sites.full(sid)
+    assert site["tier"] == "closed_loop" and delivery.executes_mode_b(site)
+    used = []
+    real_sp, real_slots = twin.setpoints_policy, twin.slots_policy
+    monkeypatch.setattr(twin, "setpoints_policy", lambda *a, **k: used.append("setpoints") or real_sp(*a, **k))
+    monkeypatch.setattr(twin, "slots_policy", lambda *a, **k: used.append("slots") or real_slots(*a, **k))
+    p = _problem_of(sid)
+    res = __import__("gridlytics.optimise", fromlist=["solve"]).solve(p, time_limit=20.0)
+    steps = plans._steps_out(p, res, forecast.issue(site, p["ts"][0], save=False))
+    compiled = delivery.compile_mode_a(steps, "sungrow", p["battery"], 20.0, site=site)
+    used.clear()                                       # the compiler's own table check replays the table: it is the fallback for slot-only devices
+    plans._guard(site, p, compiled, steps, res)
+    assert used == ["setpoints"]
+    used.clear()
+    ts = twin.minutes_of(NOV)
+    pol, modes = demo._policy_for(site, NOV, ts, {"steps": steps, "slots": compiled})
+    assert "setpoints" in used and "slots" not in used and twin.MODE_CODE["setpoint"] in set(modes)
+    # a Mode B site at the advisory tier runs the table a person keys
+    assert not delivery.executes_mode_b({**site, "tier": "advisory_writes"})
+
+
+def test_compare_with_native_replays_a_mode_b_plan_as_its_setpoints(world, monkeypatch):
+    """At a Mode B site the drawer's plan arm ran the compiled table; it now follows the plan's own path on the plan's forecast."""
+    from test_fix_r7_delivery_twin import _compare_ready, _reserve_plan
+    steps, comp = _reserve_plan()
+    # the plan discharges 40 kW for the first hour, then holds: a table of one hold slot would not
+    for i, st in enumerate(steps):
+        st.update(discharge_kw=40.0 if i < 4 else 0.0, charge_kw=0.0, grid_import_kw=40.0 if i < 4 else 80.0, grid_export_kw=0.0, pv_kw=0.0,
+                  reason="discharge_peak_window" if i < 4 else "hold_for_outage", genset_on=False, reserve_pct=10.0)
+    monkeypatch.setattr(plans, "current", lambda site_id, *x, **k: {"id": "p1", "mode": "b", "slots": comp, "steps": steps, "summary": {}})
+    _compare_ready(world)
+    with world.use():
+        sites.set_tier_capable(world.site, "closed_loop")
+        sites.set_tier_allowed(world.site, "closed_loop", "t")
+        sites.update(world.site, {"control_mode": "mode_b"}, "t")
+    plan = world.c["admin"].get(f"/api/sites/{world.site}/plan/compare").json()["compare"]["plan"]
+    assert plan["soc"][4] == pytest.approx(60.0 - 40.0 / 0.95 * 1.0 / 200 * 100, abs=1.0)   # an hour at 40 kW from 60 % of 200 kWh
+    assert plan["import_kwh"] == pytest.approx(40.0 + 80.0, abs=1.0)
+
+
+# ------------------------------------------------------------------------------------------------ engine-plans-live-18: charging from the genset
+
+def _farm(brand="voltronic"):
+    s = sites.create({"name": f"Farm {brand}", "lat": 28.42, "lon": 70.3, "site_type": "farm", "genset_start_control": "manual",
+                      "outage_load_mode": 1, "critical_load_kw": [8.0] * 24, "off_grid": True}, "t")
+    sid = s["id"]
+    with store.connect() as con:
+        r = con.execute("SELECT data FROM sites WHERE id = ?", (sid,)).fetchone()
+        con.execute("UPDATE sites SET data = ? WHERE id = ?", (json.dumps({**json.loads(r["data"]), "load_peak_kw": 42}), sid))
+    sites.put_asset(sid, "pv", {"kwp_dc": 80, "kw_ac": 70}, "t")
+    sites.put_asset(sid, "inverter", {"brand": brand, "model": "test", "kw_ac": 66}, "t")
+    sites.put_asset(sid, "battery", {"nameplate_kwh": 120, "p_ch_kw": 40, "p_dis_kw": 40, "soc_min": 0.15}, "t")
+    sites.put_asset(sid, "genset", {"rated_kw": 48, "f_min": 0.3, "fuel_kind": "hsd", "min_up_h": 1.0, "tank_l": 400}, "t")
+    sites.set_tier_capable(sid, "advisory_writes")
+    sites.set_tier_allowed(sid, "advisory_writes", "t")
+    return sid
+
+
+def _farm_day(sid, brand):
+    """A day's plan at the farm from 40 %, its table compiled for `brand`, and the twin's replay of that table on the plan's own forecast."""
+    from gridlytics import delivery, optimise
+    site = sites.full(sid)
+    site["state"] = {**site.get("state", {}), "soc": 0.4}
+    t0 = twin.day_start_utc(NOV)
+    bundle = forecast.issue(site, t0, save=False)
+    p = plans.build_problem(site, t0, bundle, 96)
+    res = optimise.solve(p, time_limit=30.0)
+    steps = plans._steps_out(p, res, bundle)
+    comp = delivery.compile_mode_a(steps, brand, p["battery"], 20.0, site=site)
+    ts = np.repeat(p["ts"], 15) + np.tile(np.arange(15) * 60, p["T"])
+    series = {"pv": np.repeat(p["PV"], 15), "load": np.repeat(p["L"], 15), "crit": np.repeat(p["Lc"], 15), "grid": np.repeat(p["g"], 15), "ts": ts,
+              "temp": np.full(len(ts), 30.0)}
+    sim = twin.simulate(series, twin.slots_policy([x for d in comp["days"] for x in d["slots"]], ts), twin.plant_of(site), 0.4)
+    return p, steps, comp, sim
+
+
+def test_a_brand_that_can_charge_from_the_genset_is_planned_compiled_and_replayed_doing_it(company):
+    """The off-grid farm's set could only follow the load (GEN_CHARGE_SUPPORTED False for every brand): it ran 11 to 20 hours a day near 38 % load.
+    A Voltronic/Axpert's charger source priority (SNU) and a Deye program's Gen charge flag let the set charge the battery: the plan counts on it
+    for those brands only (a_gen), the compiled slot carries it, the vendor table keys it, and the twin runs the set to charge while it runs, so the
+    replayed table does what the plan planned, with fewer run hours than a set that only follows the load."""
+    from gridlytics import delivery
+    assert delivery.gen_charge_supported("voltronic") and delivery.gen_charge_supported("deye")
+    assert not delivery.gen_charge_supported("sungrow") and not delivery.gen_charge_supported("other") and delivery.GEN_CHARGE_SUPPORTED is False
+    volt = _farm("voltronic")
+    p, steps, comp, sim = _farm_day(volt, "voltronic")
+    assert p["battery"]["a_gen"] is True
+    assert any(delivery.gen_charging(st) for st in steps)
+    gen_slots = [s for d in comp["days"] for s in d["slots"] if s["gen_charge"]]
+    assert gen_slots
+    rows = delivery.vendor_table(comp)["rows"]
+    assert any(r["charger_priority"] == "SNU" for r in rows)                      # the AC input (the set) charges
+    plan_hours = sum(st["genset_on"] for st in steps) / 4
+    assert abs(float(sim["gen_on"].sum()) / 60 - plan_hours) <= 0.75                 # the replay runs the set as planned
+    other = _farm("other")
+    p2, steps2, comp2, sim2 = _farm_day(other, "other")
+    assert p2["battery"]["a_gen"] is False and not any(s["gen_charge"] for d in comp2["days"] for s in d["slots"])
+    assert float(sim["gen_on"].sum()) < float(sim2["gen_on"].sum())                  # fewer run hours than following the load
+    assert float(sim["unserved"].sum()) <= float(sim2["unserved"].sum()) + 1e-6
+
+
+def test_the_twin_charges_from_a_running_set_only_in_a_gen_charge_slot():
+    t0 = twin.day_start_utc(NOV)
+    n = 120
+    ts = t0 + np.arange(n) * 60
+    series = {"ts": ts, "pv": np.zeros(n), "load": np.full(n, 10.0), "crit": np.full(n, 10.0), "grid": np.zeros(n), "temp": np.full(n, 30.0)}
+    plant = twin.Plant(e_nom=120.0, p_ch=40.0, p_dis=40.0, soc_min=0.15, g_max=0.0, gen_kw=48.0, gen_fmin=0.3, gen_control="manual")
+    slot = {"start": "00:00", "end": "02:00", "start_ts": int(t0), "end_ts": int(t0) + 7200, "mode": "self_use", "soc_floor_pct": 20.0,
+            "soc_target_pct": 90.0, "max_discharge_w": None, "max_charge_w": None, "grid_charge": False, "grid_cap_w": None, "genset": True,
+            "genset_runs": [[int(t0), int(t0) + 7200]]}
+    follow = twin.simulate(series, twin.slots_policy([{**slot, "gen_charge": False}], ts), plant, 0.3)
+    charge = twin.simulate(series, twin.slots_policy([{**slot, "gen_charge": True}], ts), plant, 0.3)
+    assert follow["gen"][30:].max() == pytest.approx(48.0 * 0.3, abs=0.01)          # the set follows a 10 kW load at its minimum
+    assert charge["gen"][30:].max() == pytest.approx(48.0, abs=0.01)                # at its rating: 10 kW of load, 38 kW into the battery
+    assert charge["soc"][-1] > follow["soc"][-1] + 0.2

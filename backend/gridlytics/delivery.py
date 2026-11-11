@@ -130,14 +130,31 @@ def step_intents(steps: list[dict], battery: dict | None) -> list[dict]:
             mode = "hold"
         else:
             mode = "self_use"
-        out.append({"mode": mode, "floor": soc_end, "target": soc_end, "grid_charge": mode == "charge_grid", "gen_charge": False})
+        out.append({"mode": mode, "floor": soc_end, "target": soc_end, "grid_charge": mode == "charge_grid", "gen_charge": gen_charging(s)})
     return out
 
 
-#: No brand grammar has a charge-from-genset slot yet ("gen_charge" is always False), so the plan must not count on one: on site the genset input
-#: only follows the load. A plan that charged from the genset left the battery near its floor after every run and forced rescue starts
-#: (the off-grid demo farm: 42 starts against native's 22). Set True only with a compiled mode and a twin that executes it.
+#: A brand whose table cannot be told to charge from the genset: there the genset input only follows the load, so the plan must not count on more
+#: (a plan that charged from the genset left the battery near its floor after every run and forced rescue starts: the off-grid demo farm, 42
+#: starts against native's 22, round 5). The default for every brand outside GEN_CHARGE_BRANDS.
 GEN_CHARGE_SUPPORTED = False
+#: The brands whose table keys charging from the genset (round 7 stage 2, audit engine-plans-live-18; R6 3.1 and 3.5, U3 5.1 gen_charge_allowed):
+#: Deye's program "Gen charge" flag (the set charges the battery to the program's capacity), and Voltronic/Axpert's charger source priority
+#: "Solar and utility" (SNU), under which the AC input, the genset on an off-grid site, charges the battery at its AC charging current. A slot
+#: carries `gen_charge` where the plan charges from the set; twin.simulate runs the set to charge towards the slot's target while it runs.
+GEN_CHARGE_BRANDS = ("deye", "voltronic")
+
+
+def gen_charge_supported(brand: str | None) -> bool:
+    """Whether the brand's table can be told to charge the battery from the genset (GEN_CHARGE_BRANDS), so the plan may count on it (a_gen)."""
+    return GEN_CHARGE_SUPPORTED or (brand or "") in GEN_CHARGE_BRANDS
+
+
+def gen_charging(s: dict) -> bool:
+    """Whether a step charges the battery from the genset: the set runs with the grid down and the charge exceeds the PV left after the load."""
+    if not s.get("genset_on") or s.get("grid_present", 1.0) >= 0.5:
+        return False
+    return s.get("charge_kw", 0.0) > max(0.0, s.get("pv_kw", 0.0) - s.get("load_kw", 0.0)) + 0.1
 
 #: The slot modes in which the battery may discharge (the compiler never folds a hold or charge run into one of these when it can avoid it)
 DISCHARGING = ("discharge", "export", "self_use")
@@ -290,7 +307,8 @@ def compile_mode_a(steps: list[dict], brand: str, battery: dict | None, fallback
                           "grid_cap_w": None if not held else (
                               round((mdi_cap_kw if mode.startswith("charge") else max(grid_cap, mdi_cap_kw)) * 1000) if mdi_cap_kw
                               else (round(grid_cap * 1000) if mode == "charge_grid" else None)),
-                          "gen_charge": False, "export_allowed": mode == "export",
+                          # the plan charges from the genset in the slot (gen_charging; only where the brand's table can key it, as_keyed)
+                          "gen_charge": gen_charge_supported(brand) and any(gen_charging(st) for st in span), "export_allowed": mode == "export",
                           "genset": any(st["genset_on"] for st in steps[r["start"]:r["end"]]) or None,
                           # the plan's own genset runs inside the slot ([start_ts, end_ts], epoch s): a replay runs the set in these and not
                           # through the whole slot, as `genset` alone made it do (the off-grid farm's one self-use slot a day ran its set all day)
@@ -782,7 +800,8 @@ def _voltronic(slots: list[dict], compiled: dict) -> tuple[list, list, list]:
     are set (by a person, or by an edge device: the emulation the plan names), and the battery goes back to utility at one SoC."""
     rows = []
     for k, s in enumerate(slots):
-        pop, pcp = _POP.get(s["mode"], "SBU"), "SNU" if s["mode"] == "charge_grid" else "OSO"
+        # Solar and utility (SNU) lets the AC input charge: the grid's for a grid charge, the genset's where the slot charges from the set
+        pop, pcp = _POP.get(s["mode"], "SBU"), "SNU" if s["mode"] == "charge_grid" or s.get("gen_charge") else "OSO"
         if rows and (rows[-1]["output_priority"], rows[-1]["charger_priority"]) == (pop, pcp):
             rows[-1]["_slots"].append(k)
             continue
@@ -908,6 +927,8 @@ def as_keyed(brand: str, slots: list[dict], compiled: dict) -> list[dict]:
     for k, (o, s) in enumerate(zip(ov, slots)):
         if _inner_charge_end(s) and k not in keyed:
             o["charge_end_ts"] = None
+        if s.get("gen_charge") and not gen_charge_supported(brand):
+            o["gen_charge"] = False  # the brand's table cannot be told to charge from the set: its input follows the load
     return [{key: v for key, v in o.items() if key == "charge_end_ts" or s.get(key) != v} for o, s in zip(ov, slots)]
 
 
@@ -958,10 +979,45 @@ def _mode_b_floor(s: dict) -> float | None:
     return round(min(float(floor), float(soc)), 1)
 
 
-def mode_b(steps: list[dict]) -> dict:
-    return {"refresh": {"heartbeat_s": 60, "revert_after_s": 1800, "residual_band_w": 300},
-            "steps": [{"t": s["t"], "battery_power_w": round((s["discharge_kw"] - s["charge_kw"]) * 1000), "soc_floor_pct": _mode_b_floor(s),
-                       "grid_charge_allowed": grid_charging(s), "genset_request": bool(s["genset_on"])} for s in steps]}
+def executes_mode_b(site: dict | None) -> bool:
+    """Whether the site's edge runs the plan as Mode B setpoints (plan Part 7.2): a closed-loop site set to Mode B. At the advisory tier a person
+    keys the Mode A table, which is what runs (round 7 stage 2, audit engine-delivery-17)."""
+    return bool(site) and site.get("tier") == "closed_loop" and (site.get("data") or {}).get("control_mode") == "mode_b"
+
+
+def _battery_mode(s: dict) -> str:
+    """A step's coarse intent (U3 5.1 `battery_mode`): charge, discharge, hold (a step that keeps its state of charge for a reason) or self_use."""
+    if s.get("charge_kw", 0.0) > 0.1:
+        return "charge"
+    if s.get("discharge_kw", 0.0) > 0.1:
+        return "discharge"
+    if s.get("reason") in ("hold_for_outage", "wear_margin_too_small", "terminal_value", "idle", "operator_hold", "genset_off", "save_for_later"):
+        return "hold"
+    return "self_use"
+
+
+def _genset_request(steps: list[dict], k: int) -> str:
+    """U3 5.1's advisory `genset_request`: prefer_start in a planned run, prefer_stop at the step a planned run ends, else none."""
+    if steps[k].get("genset_on"):
+        return "prefer_start"
+    return "prefer_stop" if k > 0 and steps[k - 1].get("genset_on") else "none"
+
+
+def mode_b(steps: list[dict], site: dict | None = None) -> dict:
+    """The Mode B schedule (plan Part 7.2, U3 3.2 and 5.1; DLV-06): per 15-minute step the abstract primitives, `battery_power_w` (W, discharge
+    positive) with `battery_mode`, the floor it may discharge to (`soc_floor_pct`), the level a charge stops at (`soc_target_pct`, the plan's own
+    for the step, on charge steps), `grid_charge_allowed`, `gen_charge_allowed` (the plan charges from the genset in the step), `export_limit_w`
+    (the licensed export cap, R6 I3) and `genset_request` (none, prefer_start, prefer_stop); and the refresh block. twin.setpoints_policy executes
+    it, so the guard, the compare drawer and the demo replay what the edge runs (round 7 stage 2, audit engine-delivery-17)."""
+    cap = export_floor_w(site)
+    out = []
+    for k, s in enumerate(steps):
+        mode = _battery_mode(s)
+        out.append({"t": s["t"], "battery_mode": mode, "battery_power_w": round((s["discharge_kw"] - s["charge_kw"]) * 1000),
+                    "soc_floor_pct": _mode_b_floor(s), "soc_target_pct": s.get("soc_pct") if mode == "charge" else None,
+                    "grid_charge_allowed": grid_charging(s), "gen_charge_allowed": gen_charging(s),
+                    "export_limit_w": cap, "genset_request": _genset_request(steps, k)})
+    return {"step_s": 900, "refresh": {"heartbeat_s": 60, "revert_after_s": 1800, "residual_band_w": 300}, "steps": out}
 
 
 # ------------------------------------------------------------------------------------------------ signing (Ed25519, one key per site)

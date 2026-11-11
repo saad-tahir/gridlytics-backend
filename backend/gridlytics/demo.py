@@ -195,7 +195,7 @@ def _released(site_id: str, ts: np.ndarray) -> np.ndarray:
 def _merge_policy(plan_pol: dict, native_pol: dict, native_minutes: np.ndarray) -> dict:
     """A per-minute policy that follows the native one on `native_minutes` and the plan's elsewhere."""
     n = len(native_minutes)
-    defaults = {"grid_cap": np.full(n, np.inf), "export_first": np.zeros(n, dtype=bool)}
+    defaults = {"grid_cap": np.full(n, np.inf), "export_first": np.zeros(n, dtype=bool), "export_cap": np.full(n, np.inf), "bat_set": np.zeros(n)}
     out = {}
     for k in set(plan_pol) | set(native_pol):
         a = plan_pol.get(k, plan_pol["target"] if k == "grid_target" else defaults.get(k))
@@ -282,6 +282,14 @@ def _policy_for(site: dict, day: date, ts: np.ndarray, plan: dict | None) -> tup
     table = _keyed_plan(site, day) if keyed and arm != "native" else plan
     if table is None or arm == "native" or site.get("tier") == "monitor":  # monitor recommends; the inverter keeps its own settings
         pol = twin.native_policy(site, ts)
+    elif delivery.executes_mode_b(site):
+        # a Mode B site's edge follows the plan's setpoints step by step (round 7 stage 2, audit engine-delivery-17: the demo ran its Mode A table)
+        pol = twin.setpoints_policy(delivery.mode_b(table.get("steps") or [], site), ts)
+        released = _released(site["id"], ts)
+        if released.all():
+            pol = twin.native_policy(site, ts)
+        elif released.any():
+            pol = _merge_policy(pol, twin.native_policy(site, ts), released)
     else:
         slots = [s for d in (table.get("slots") or {}).get("days", []) for s in d["slots"]]
         pol = twin.slots_policy(slots, ts)

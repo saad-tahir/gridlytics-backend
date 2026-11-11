@@ -278,7 +278,10 @@ def plan_compare(site_id: str):
     reserve = np.array([float(st.get("reserve_pct") or 0.0) for st in steps])
     price, basis = _short_price(s, steps[0]["t"])
     arms = {}
-    for name, pol in (("native", twin.native_policy(s, ts)), ("plan", twin.slots_policy([x for d in p["slots"]["days"] for x in d["slots"]], ts))):
+    # the plan arm runs what the site's inverter runs: a Mode B site's setpoints, else the compiled table (round 7 stage 2, engine-delivery-17)
+    plan_pol = (twin.setpoints_policy(delivery.mode_b(steps, s), ts) if p.get("mode") == "b" and delivery.executes_mode_b(s)
+                else twin.slots_policy([x for d in p["slots"]["days"] for x in d["slots"]], ts))
+    for name, pol in (("native", twin.native_policy(s, ts)), ("plan", plan_pol)):
         sim = twin.simulate(series, pol, plant, soc0)
         c_imp = rep("c_imp")
         c_exp = rep("c_exp")

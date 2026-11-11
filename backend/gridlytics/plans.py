@@ -426,7 +426,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         temp = solar.air_temp(ts, solar.local_month(ts) - 1) + float(d.get("enclosure_temp_offset_c", 7.0))
         bat = {"E_nom": e_nom, "E0": soc * e_nom, "sigma0": min(0.15, (bs.get("sigma_pct") or 5.0) / 100.0), "P_ch": b_asset["p_ch_kw"],
                "P_dis": b_asset["p_dis_kw"], "eta_c": b_asset["eta_c"], "eta_d": b_asset["eta_d"], "soc_min": b_asset["soc_min"],
-               "soc_max": b_asset["soc_max"], "a_grid": bool(d.get("grid_charge_allowed", True)) and not off_grid, "a_gen": bool(d.get("gen_charge_allowed", True)) and delivery.GEN_CHARGE_SUPPORTED,
+               "soc_max": b_asset["soc_max"], "a_grid": bool(d.get("grid_charge_allowed", True)) and not off_grid, "a_gen": bool(d.get("gen_charge_allowed", True))
+               and delivery.gen_charge_supported((a.get("inverter") or {}).get("brand")),
                # with the grid down the set's output follows the load and its minimum-load surplus charges the battery on its own, with no slot
                # asking for it (twin.simulate's outage branch), so the plan counts on that much and no more (optimise.genset_surplus_steps)
                "a_gen_surplus": bool(d.get("gen_charge_allowed", True)),
@@ -587,7 +588,10 @@ def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict], res: dict
     ts = np.repeat(p["ts"], 15) + np.tile(np.arange(15) * 60, T)
     series = {"pv": np.repeat(p["PV"], 15), "load": np.repeat(p["L"], 15), "crit": np.repeat(p["Lc"], 15), "grid": np.repeat(p["g"], 15),
               "ts": ts, "temp": np.full(len(ts), 30.0)}
-    pol = twin.slots_policy(slots, ts)
+    # what the site will run: a Mode B site's edge follows the setpoints step by step, so those are replayed (round 7 stage 2, audit
+    # engine-delivery-17: the guard checked the Mode A table, which the edge never runs); the table's own rules above still hold, as a Mode B plan
+    # carries it for slot-only devices
+    pol = twin.setpoints_policy(delivery.mode_b(steps_out[:T], site), ts) if delivery.executes_mode_b(site) else twin.slots_policy(slots, ts)
     plant = twin.plant_of(site)
     soc0 = bat["E0"] / bat["E_nom"]
     sim = twin.simulate(series, pol, plant, soc0)
@@ -1248,7 +1252,7 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
             "valid_from": plan["valid_from"], "valid_until": plan["valid_until"], "timezone": "Asia/Karachi", "mode": plan["mode"],
             "fallback": (plan.get("slots") or {}).get("fallback"), "mode_a": {"days": days, "apply_policy": write_policy(full)[0]},
             "write_budget": write_policy(full)[1],
-            "mode_b": delivery.mode_b(plan["steps"]) if plan["mode"] == "b" else None,
+            "mode_b": delivery.mode_b(plan["steps"], full) if plan["mode"] == "b" else None,
             "notes": {"reason": plan["summary"].get("status_label")}, **_edge_envelope(site_id, plan["id"], caps)}
     if fit:
         body["capabilities_fit"] = fit
