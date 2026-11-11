@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 from datetime import date, datetime, timedelta, timezone
 
@@ -25,6 +26,7 @@ from . import forecast, optimise, plans, sites, solar, store, tariffs, telemetry
 from .schemas import Refusal
 
 PKT = timezone(timedelta(hours=5))
+log = logging.getLogger("gridlytics.verify")
 VERIFIED_DAYS_FOR_FINAL = 28
 SWITCHBACK_WEEKS_FOR_FINAL = 8
 #: the fidelity classes that claim their saving (plan 8.4: a partial day is reported with its fidelity beside it; a day not applied claims nothing)
@@ -2826,11 +2828,71 @@ def _unmetered(conn: dict, p0: date, p1: date, exclusive: bool) -> dict:
 
 
 def _rebuild_for(site_id: str, conn: dict, p0: date, p1: date, exclusive: bool, real: dict, carried: float) -> dict:
-    """A bill's rebuild for its connection: from the site's meter readings on the plant's connection, else not rebuilt (`_unmetered`)."""
+    """A bill's rebuild for its connection: from the site's meter readings on the plant's connection, else not rebuilt (`_unmetered`). The plant's
+    carries `native_arm`, the same bill rebuilt for the native arm (`native_bill`)."""
     if not conn.get("plant", True):
         return _unmetered(conn, p0, p1, exclusive)
-    return rebuild_bill(site_id, conn, p0, p1, period_start_exclusive=exclusive, power_factor_pct=real.get("power_factor_pct"),
-                        credit_brought_forward_rs=carried)
+    out = rebuild_bill(site_id, conn, p0, p1, period_start_exclusive=exclusive, power_factor_pct=real.get("power_factor_pct"),
+                       credit_brought_forward_rs=carried)
+    try:
+        out["native_arm"] = native_bill(site_id, conn, p0, p1, exclusive, real.get("power_factor_pct"), out)
+    except Exception:
+        log.exception("could not rebuild the native arm's bill for site %s", site_id)
+        out["native_arm"] = None
+    return out
+
+
+def _native_minutes(site_id: str, day: date) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """The native arm's grid import and export (kW) minute by minute on a scored day: the savings ledger's native replay (_score_day) run again from
+    the start state its stored row holds, on the day's replay inputs. None for a day the ledger has not scored."""
+    row = (_stored_rows(site_id, day).get("native") or (None,))[0]
+    if row is None:
+        return None
+    site = sites.full(site_id)
+    site["native"] = native_for_day(site_id, day) or site.get("native")
+    series, _ = _replay_inputs(site, day)
+    if series is None:
+        return None
+    st = ((row.get("chain") or {}).get("start") or {}).get("state") or {}
+    sim = twin.simulate(series, twin.native_policy(site, series["ts"]), twin.plant_of(site), float(st.get("soc", 0.5)), bool(st.get("gen_on")),
+                        gen_elapsed0=int(st.get("gen_elapsed") or 0), outage_min0=int(st.get("outage_min") or 0), gen_rescue0=bool(st.get("gen_rescue")))
+    return np.asarray(series["ts"]), np.asarray(sim["imp"], dtype=float), np.asarray(sim["exp"], dtype=float)
+
+
+def native_bill(site_id: str, conn: dict, p0: date, p1: date, exclusive: bool = False, power_factor_pct: float | None = None,
+                actual: dict | None = None) -> dict | None:
+    """The bill rebuilt for the native arm over the same billing period (R8 2.12: 'the rebuilt bill for both arms'; round 7 stage 2, the rest of audit
+    pages-D-10): the ledger's native replay of each scored day (`_native_minutes`), priced by the same bill engine with the same versions, blocks
+    and printed power factor as the actual arm's rebuild. A day the ledger has not scored takes the meter's own readings, so the two bills differ
+    only on the days replayed; `days_replayed` of `days` says how many those are. None when no day of the period was scored.
+
+    {total_rs, energy_rs, demand_rs, import_kwh, mdi_kw, lines, days, days_replayed, difference_rs}: `difference_rs` is the native bill less the
+    actual arm's rebuilt bill (`actual`), what the bill shows the site saved over the period."""
+    first = p0 + timedelta(days=1) if exclusive else p0
+    days = [first + timedelta(days=k) for k in range((p1 - first).days + 1)]
+    t0, t1 = twin.day_start_utc(first), twin.day_start_utc(p1) + 86400
+    g = telemetry.minute_grid(site_id, t0, t1)
+    covered = _grid_covered(g["imp"], g["exp"])
+    imp, _ = _profile_fill(g["ts"], g["imp"], covered)
+    exp, _ = _profile_fill(g["ts"], g["exp"], covered)
+    imp, exp = np.array(imp, dtype=float), np.array(exp, dtype=float)
+    replayed = 0
+    for d in days:
+        got = _native_minutes(site_id, d)
+        if got is None:
+            continue
+        ts_d, imp_d, exp_d = got
+        at = np.searchsorted(g["ts"], ts_d)
+        ok = (at < len(g["ts"])) & (g["ts"][np.minimum(at, len(g["ts"]) - 1)] == ts_d)
+        imp[at[ok]], exp[at[ok]] = imp_d[ok], exp_d[ok]
+        replayed += 1
+    if not replayed:
+        return None
+    nb = tariffs.rebuild(g["ts"], imp, exp, conn, p0, p1, period_start_exclusive=exclusive, power_factor_pct=power_factor_pct)
+    out = {k: nb.get(k) for k in ("total_rs", "energy_rs", "demand_rs", "import_kwh", "mdi_kw", "lines")}
+    out.update(days=len(days), days_replayed=replayed,
+               difference_rs=round(float(nb["total_rs"]) - float(actual["total_rs"]), 2) if actual and tariffs._num(actual.get("total_rs")) else None)
+    return out
 
 
 def add_bill(site_id: str, fields: dict, by: str) -> dict:

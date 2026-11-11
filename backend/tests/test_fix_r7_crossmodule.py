@@ -14,6 +14,7 @@ stage-1 packages' code at once.
 - brief-vs-build-15: a genset start or stop, an intra-day forecast bust and an approved tariff version re-solve the plan.
 - followup icp-gross (engine-tariffs-10, the optimiser half): a legacy site's ICP case and rows count gross imports, capped at the net.
 - followup mdi-override (engine-tariffs-08 h): a site override's MDI block mode and scope reach the plan, the guard and the ledger.
+- followup native-bill (pages-D-10, the rest): the bill rebuilt for the native arm beside the actual arm's.
 
 Each test fails on the code before its fix."""
 from __future__ import annotations
@@ -579,6 +580,35 @@ def test_a_site_overrides_mdi_block_and_scope_reach_the_plan_the_guard_and_the_l
     fixed_all = verify.price_arm(site, sim, {**pr, "mdi_block": "fixed", "mdi_scope": "all_hours"}, NOV, 0.0, 0.0)["peak_kw"]
     assert fixed_all == pytest.approx(400.0)                                                     # before
     assert verify._price_basis(pr, None) != verify._price_basis({**pr, "mdi_block": "fixed", "mdi_scope": "all_hours"}, None)
+
+
+# ------------------------------------------------------------------------------------------------ followup:native-bill (pages-D-10, the rest)
+
+def test_the_bill_is_rebuilt_for_the_native_arm_beside_the_actual(company):
+    """R8 2.12: 'the DISCO bill vs the rebuilt bill for both arms'. Only the actual arm's bill was rebuilt. The native arm's bill over the same period
+    is now rebuilt by the same engine from the ledger's native replay of each scored day, with how many days were replayed and the difference."""
+    from test_fix_savings import make_site, twin_day
+    sid = make_site(name="Native Bill Mill", genset=False)
+    days = [date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14)]
+    hold = lambda site, ts: twin.table_policy([{"start": "00:00", "mode": "hold", "soc_floor_pct": 20, "soc_target_pct": 60}], ts)  # noqa: E731
+    soc = 0.6
+    for k, d in enumerate(days):
+        _, sim, _ = twin_day(sid, d, soc, seed=k + 1, policy=hold)       # the site held its battery: native self-use would have spent it
+        soc = float(sim["soc"][-1])
+    for d in days:
+        assert verify.compute_day(sid, d, with_bound=False) is not None
+    b = verify.add_bill(sid, {"period_start": "2026-10-12", "period_end": "2026-10-14", "total_rs": 100_000}, "t")
+    nat = b["rebuilt"]["native_arm"]
+    assert nat["days"] == 3 and nat["days_replayed"] == 3
+    replay = [verify._native_minutes(sid, d) for d in days]
+    assert sum(float(x[1].sum()) / 60 for x in replay) == pytest.approx(sum(nat["import_kwh"].values()), rel=1e-3)
+    actual = b["rebuilt"]
+    assert sum(nat["import_kwh"].values()) < sum(actual["import_kwh"].values())                 # native discharged into the load
+    assert nat["difference_rs"] == pytest.approx(nat["total_rs"] - actual["total_rs"], abs=0.01) and nat["difference_rs"] < 0
+    assert {ln["line"] for ln in nat["lines"]} >= {"Energy peak", "Energy off-peak"}
+    # a period the ledger has not scored has no native bill
+    none = verify.add_bill(sid, {"period_start": "2026-09-01", "period_end": "2026-09-30", "total_rs": 100_000}, "t")
+    assert none["rebuilt"]["native_arm"] is None
 
 
 # ------------------------------------------------------------------------------------------------ engine-plans-live-18: charging from the genset
