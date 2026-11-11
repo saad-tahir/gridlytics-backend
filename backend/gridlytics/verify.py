@@ -268,12 +268,16 @@ def _actual_sim(f: dict, g: dict, plant: twin.Plant | None = None) -> dict:
             "unserved": f["unserved"], "soc": np.nan_to_num(_soc(g))}
 
 
-def litres_used(site_id: str, d0: str, d1: str) -> dict:
+def litres_used(site_id: str, d0: str, d1: str, simulate: bool = True) -> dict:
     """The genset's litres over the local days d0..d1 (YYYY-MM-DD, both included) as the actual arm reads them (plan 8.3: metered litres where a
     sensor exists, else the fitted fuel curve), and where they came from: `litres_source` is "meter" when the period has fuel readings and every
     running minute has one, "curve" when any running minute's litres come from the curve (the figure is then estimated, wholly or in part), and None
-    when there is nothing to name (no genset, no genset signal at all in the period, or neither a fuel reading nor a run)."""
-    out = {"litres": 0.0, "litres_source": None, "litres_metered": 0.0, "litres_curve": 0.0}
+    when there is nothing to name (no genset, no genset signal at all in the period, or neither a fuel reading nor a run).
+
+    A running minute with neither its power nor its fuel read takes its power from the site's balance, a minute-by-minute replay; with `simulate`
+    False (a long period, read for a label: round 7 sweeps, audit frontend-states-formats-02) no replay is run and `unread_minutes` counts such
+    minutes, whose litres are then left out of the figure."""
+    out = {"litres": 0.0, "litres_source": None, "litres_metered": 0.0, "litres_curve": 0.0, "unread_minutes": 0}
     site = sites.full(site_id)
     try:
         t0, t1 = twin.day_start_utc(date.fromisoformat(d0[:10])), twin.day_start_utc(date.fromisoformat(d1[:10])) + 86400
@@ -302,7 +306,10 @@ def litres_used(site_id: str, d0: str, d1: str) -> dict:
         from_curve_any = True
         powered = from_curve & ~np.isnan(p_meas)
         curve += float(np.sum((plant.gen_a * p_meas[powered] + plant.gen_b * plant.gen_kw) / 60.0))
-        if (from_curve & np.isnan(p_meas)).any():  # running with no power read: its power from the site's balance, as the actual arm takes it
+        unread = int((from_curve & np.isnan(p_meas)).sum())
+        if unread and not simulate:
+            out["unread_minutes"] += unread
+        elif unread:  # running with no power read: its power from the site's balance, as the actual arm takes it
             g = telemetry.minute_grid(site_id, a, b)
             sim = _actual_sim(telemetry.filled(g), g, plant)
             blind = np.asarray(sim["gen_on"], dtype=bool) & np.isnan(g["fuel"]) & np.isnan(g["gen"])
