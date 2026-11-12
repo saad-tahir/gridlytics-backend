@@ -1,13 +1,16 @@
-# Runtime pins, read on 6 November 2026 (plan Part 10.7). The solver pair stays at the measured scipy 1.17.1 / numpy 2.4.3.
-fastapi==0.141.1
-starlette==1.6.0
-pydantic==2.13.4
-uvicorn==0.52.3
+# Runtime pins (plan Part 10.7). The shared sign-in stack (fastapi, starlette, pydantic, uvicorn, PyJWT, cryptography) is pinned as solarlytics-backend pins
+# it (c853130), where the identity, founder and mfa modules lifted here were last tested, and is raised in both products together (round 7, audit
+# parity-architecture-20); CI's pip-audit scans every pin here. The solver pair stays at the measured scipy 1.17.1 / numpy 2.4.3 until the CI benchmark
+# passes on newer ones (plan Part 10.7). The whole backend suite passed on these pins on 12 November 2026 (Linux, Python 3.12).
+fastapi==0.150.0
+starlette==1.7.0
+pydantic==2.13.5
+uvicorn==0.54.0
 numpy==2.4.3
 scipy==1.17.1
 pandas==3.0.2
-PyJWT==2.10.1
-cryptography==46.0.3
+PyJWT==2.15.1
+cryptography==50.0.2
 APScheduler==3.11.0
 reportlab==4.4.4
 httpx==0.28.1

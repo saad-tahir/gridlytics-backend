@@ -269,3 +269,45 @@ def test_the_load_check_measures_a_server_of_its_own_on_throwaway_data(capsys):
     # its throwaway data folder went with its server
     folder = re.search(r"Seeding a throwaway data folder \((.+?)\)", out).group(1)
     assert Path(folder).name.startswith("gridlytics-load-") and not Path(folder).exists()
+
+
+# ------------------------------------------------------------------------------------------------ parity-architecture-20: the family's pins
+
+#: The shared sign-in stack as solarlytics-backend pins it (c853130: requirements.txt and requirements-dev.txt), where the identity, founder and mfa modules
+#: lifted here were last tested; raised in both products together
+FAMILY_PINS = {"fastapi": "0.150.0", "starlette": "1.7.0", "pydantic": "2.13.5", "uvicorn": "0.54.0", "PyJWT": "2.15.1", "cryptography": "50.0.2"}
+FAMILY_DEV_PINS = {"pytest": "9.1.1", "pytest-xdist": "3.8.0", "httpx2": "2.13.1"}
+
+
+def _pins(path: Path) -> dict[str, str]:
+    out = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or line.startswith("-r "):
+            continue
+        m = re.fullmatch(r"([A-Za-z0-9_.-]+)==([0-9][0-9A-Za-z.]*)", line)
+        assert m, f"{path.name}: {line!r} is not an exact pin"
+        out[m.group(1)] = m.group(2)
+    return out
+
+
+def test_every_dependency_is_pinned_exactly_and_the_sign_in_stack_is_the_familys():
+    runtime, dev = _pins(ROOT / "requirements.txt"), _pins(ROOT / "requirements-dev.txt")
+    assert {k: runtime.get(k) for k in FAMILY_PINS} == FAMILY_PINS
+    assert {k: dev.get(k) for k in FAMILY_DEV_PINS} == FAMILY_DEV_PINS
+    assert "-r requirements.txt" in (ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+    # the solver pair stays at the measured versions until the CI benchmark passes on newer ones (plan Part 10.7), with that reason written beside it
+    assert runtime["scipy"] == "1.17.1" and runtime["numpy"] == "2.4.3"
+    head = (ROOT / "requirements.txt").read_text(encoding="utf-8").split("\nfastapi==", 1)[0]
+    assert "scipy 1.17.1 / numpy 2.4.3" in head and "benchmark" in head and "pip-audit" in head
+
+
+def test_the_sign_in_stack_matches_a_solarlytics_checkout_beside_when_there_is_one():
+    # a read-only checkout of solarlytics-backend beside this repository (or GRIDLYTICS_SOLARLYTICS_DIR); none in CI, where the constants above hold
+    named = os.environ.get("GRIDLYTICS_SOLARLYTICS_DIR", "").strip()
+    other = Path(named) if named else ROOT.parent / "solarlytics-backend"
+    if not (other / "requirements.txt").is_file():
+        pytest.skip(f"no solarlytics-backend checkout at {other}: the family's pins are compared with FAMILY_PINS only")
+    theirs = {**_pins(other / "requirements.txt"), **_pins(other / "requirements-dev.txt")}
+    ours = {**_pins(ROOT / "requirements.txt"), **_pins(ROOT / "requirements-dev.txt")}
+    assert {k: ours[k] for k in [*FAMILY_PINS, *FAMILY_DEV_PINS]} == {k: theirs[k] for k in [*FAMILY_PINS, *FAMILY_DEV_PINS]}
