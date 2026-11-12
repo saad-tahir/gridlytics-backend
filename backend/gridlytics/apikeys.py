@@ -158,6 +158,14 @@ def revoke(key_id: str, by: str) -> dict | None:
     return _row(r) if r else None
 
 
+def revoke_site(site_id: str, by: str) -> list[dict]:
+    """Revoke every key of a site being removed (round 7, audit flow-reports-alerts-members-keys-14: a key is bound to one site, and a removed site's
+    key stayed active, its requests answered 404); the keys revoked."""
+    with store._connect() as con:
+        ids = [r["id"] for r in con.execute("SELECT id FROM api_keys WHERE org_id = ? AND site_id = ? AND revoked IS NULL", (store.org(), site_id))]
+    return [k for k in (revoke(i, by) for i in ids) if k is not None]
+
+
 def by_token(token: str) -> dict | None:
     """The key a request carries, with its organisation, when it is known and not revoked; its last use is recorded. A key is found by its hash in whatever
     organisation holds it: the key names the organisation, the request never does."""

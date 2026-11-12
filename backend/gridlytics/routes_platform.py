@@ -30,7 +30,12 @@ def org_mine():
 @router.get("/api/platform/keys")
 def keys_list():
     auth.need("manage_users", "Listing API keys")
-    return apikeys.listing()
+    # each key's site by name, a removed site's too, marked removed (round 7, audit flow-reports-alerts-members-keys-14: the page named a removed
+    # site's key by its raw id)
+    from . import sites
+    names = sites.names()
+    return [{**k, "site_name": (names.get(k["site_id"]) or {}).get("name", ""), "site_removed": bool((names.get(k["site_id"]) or {}).get("removed"))}
+            for k in apikeys.listing()]
 
 
 @router.post("/api/platform/keys")

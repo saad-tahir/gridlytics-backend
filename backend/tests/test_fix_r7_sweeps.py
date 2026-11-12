@@ -292,3 +292,41 @@ def test_the_key_errors_and_the_report_audit_line_carry_no_solarlytics_wording(w
         _data_from_last_year(sid)
         reports.generate("energy_only", sid, _past_month(), "test")
         assert store.list_audit()[0]["action"] == "generated an energy-only report"
+
+
+# ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-14: a removed site
+
+def test_removing_a_site_revokes_its_keys_resolves_its_alerts_and_its_reports_keep_its_name_marked_removed(world):
+    """Removing a site only marked the site: its API keys stayed active (bound to a site that answers 404), its open alerts stayed in the inbox and
+    its badge under the site's raw id, and its reports were listed with the raw id for a name."""
+    from gridlytics import alerts, reports
+    from test_fix_api import _batch
+    a, sid, two = world.c["admin"], world.site, world.other
+    gone = world.key(["telemetry:write"], site=two)
+    kept = world.key(["telemetry:write"])
+    with world.use():
+        _data_from_last_year(two)
+        rid = reports.generate("energy_only", two, _past_month(), "test")["id"]
+        alerts._open(two, "stale_data", "Data", "warning", "No data for 2 hours")
+        assert alerts.counts()["total"] == 1
+    assert a.delete(f"/api/sites/{two}").status_code == 200
+    keys = {k["site_id"]: k for k in a.get("/api/platform/keys").json()}
+    assert keys[two]["revoked"] and keys[two]["revoked_by"] and keys[sid]["revoked"] is None, keys
+    # the key list names each key's site, a removed one's too, marked removed (the page read the fleet, which no longer has it, and showed the raw id)
+    assert (keys[two]["site_name"], keys[two]["site_removed"]) == ("Secret Site Two", True)
+    assert (keys[sid]["site_name"], keys[sid]["site_removed"]) == ("Mill One", False)
+    assert world.anon.post(f"/api/edge/{two}/telemetry", headers=gone, json=_batch(1)).status_code == 401
+    assert world.anon.post(f"/api/edge/{sid}/telemetry", headers=kept, json=_batch(1)).status_code == 200
+    # the report is a record: still listed and downloadable, with the site's name, marked as removed
+    row = next(r for r in a.get("/api/reports").json() if r["id"] == rid)
+    assert (row["site_name"], row["site_removed"]) == ("Secret Site Two", True), row
+    assert a.get(f"/api/reports/{rid}/pdf").status_code == 200
+    assert all(r["site_removed"] is False for r in a.get("/api/reports").json() if r["id"] != rid)
+    with world.use():
+        # its open alert is resolved, out of the inbox and its badge, and names the site
+        assert alerts.counts()["total"] == 0
+        closed = alerts.listing(site_id=two)
+        assert [(x["state"], x["site_name"]) for x in closed] == [("resolved", "Secret Site Two")], closed
+        assert closed[0]["history"][-1]["note"] == "The site was removed"
+        line = next(x for x in store.list_audit() if x["action"] == "removed a site")
+    assert line["target"] == "Secret Site Two" and line["detail"]["site_id"] == two and len(line["detail"]["keys_revoked"]) == 1, line

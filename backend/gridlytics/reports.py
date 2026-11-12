@@ -1171,12 +1171,19 @@ def _row_out(r) -> dict:
     return d
 
 
+def _site_of(site_id: str, names: dict[str, dict]) -> dict:
+    """A report's site: its name, a removed site's too, and whether it was removed (round 7, audit flow-reports-alerts-members-keys-14: a removed
+    site's reports were listed with its raw id for a name). A company report has neither: "" and false."""
+    s = names.get(site_id) or {}
+    return {"site_name": s.get("name", ""), "site_removed": bool(s.get("removed"))}
+
+
 def listing(site_id: str | None = None) -> list[dict]:
     with store.connect() as con:
         rows = con.execute("SELECT * FROM reports" + (" WHERE site_id = ?" if site_id else "") + " ORDER BY generated_at DESC, rowid DESC LIMIT 200",
                            ((site_id,) if site_id else ())).fetchall()
-    names = {s["id"]: s["name"] for s in sites.listing()}
-    return [{**_row_out(r), "site_name": names.get(r["site_id"], "")} for r in rows]
+    names = sites.names()
+    return [{**_row_out(r), **_site_of(r["site_id"], names)} for r in rows]
 
 
 def get(rid: str) -> dict | None:
@@ -1185,8 +1192,7 @@ def get(rid: str) -> dict | None:
         r = con.execute("SELECT * FROM reports WHERE id = ?", (rid,)).fetchone()
     if r is None:
         return None
-    site = sites.get(r["site_id"]) if r["site_id"] else None
-    return {**_row_out(r), "site_name": (site or {}).get("name", "")}
+    return {**_row_out(r), **_site_of(r["site_id"], sites.names() if r["site_id"] else {})}
 
 
 def file_path(rid: str, which: str) -> Path | None:

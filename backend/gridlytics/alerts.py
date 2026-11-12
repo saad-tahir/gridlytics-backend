@@ -121,6 +121,15 @@ def _open(site_id: str, rule: str, category: str, severity: str, title: str, det
                     (store.new_id(), site_id, rule, category, severity, title, json.dumps(detail), store._now()))
 
 
+def site_removed(site_id: str) -> None:
+    """Resolve the open and acknowledged alerts of a site being removed (sites.delete; round 7, audit flow-reports-alerts-members-keys-14): nothing is
+    left to act on them, and they stayed in the inbox and its badge. Each one's history says why."""
+    note = "The site was removed"
+    with store.connect() as con:
+        con.execute(f"UPDATE alerts SET state = 'resolved', closed_at = ?, note = ?, {_HISTORY} WHERE site_id = ? AND state IN ('open','acknowledged')",
+                    (store._now(), note, _event("resolved", note=note), site_id))
+
+
 #: An alert a person closed while its condition held, whose condition has not cleared since (`_held_back`): its last event is that close
 _HELD = "state = 'closed' AND json_extract(history, '$[#-1].action') = 'closed' AND json_extract(history, '$[#-1].held') = 1"
 
@@ -817,8 +826,8 @@ def listing(state: str | None = None, site_id: str | None = None, category: str 
     args.append(limit)
     with store.connect() as con:
         rows = con.execute(q, args).fetchall()
-    names = {s["id"]: s["name"] for s in sites.listing()}
-    return [_row(r, names.get(r["site_id"], "")) for r in rows]
+    names = sites.names()  # a removed site's alerts keep its name (round 7, audit flow-reports-alerts-members-keys-14)
+    return [_row(r, (names.get(r["site_id"]) or {}).get("name", "")) for r in rows]
 
 
 def counts(followed_only: bool = False) -> dict:
