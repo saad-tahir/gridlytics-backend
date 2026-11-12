@@ -431,6 +431,36 @@ def test_a_report_records_its_engine_and_its_pdf_and_csv_print_it_with_the_engin
     assert energy_csv.splitlines()[0].split(",")[-1] == "report_engine" and all(ln.endswith(f",{stamp}") for ln in energy_csv.splitlines()[1:])
 
 
+def test_the_report_s_footer_fits_the_page_whatever_engines_computed_its_days(world, monkeypatch):
+    """Review (parity-architecture-12): every change of the code makes a new stamp, so a month's days are often computed by several engines. The footer
+    was drawn as one line whatever its length: with four engines and days computed before the stamp was kept it ran 237 mm across a page that has 180,
+    and it said "1 other engines". It is now wrapped to the page's width, inside the bottom margin, and counts the other engines in the singular too."""
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    from reportlab.pdfgen.canvas import Canvas
+
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    days = [f"{month}-{i:02d}" for i in range(1, 8)]
+    engines = ["0.1.0+0000000001", "0.1.0+0000000002", "0.1.0+0000000003", "0.1.0+0000000004", "0.1.0+0000000004", None, None]
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(d, engine=e) for d, e in zip(days, engines)]), [_tday(d) for d in days])
+    drawn: list[tuple[str, float, float]] = []
+    real = Canvas.drawString
+    monkeypatch.setattr(Canvas, "drawString", lambda self, x, y, text, *a, **k: (drawn.append((text, x, y)), real(self, x, y, text, *a, **k))[1])
+    with world.use():
+        _data_from_last_year(sid)
+        reports.generate("monthly_savings", sid, month, "test")
+    # the footer's lines, drawn on the page itself at its left margin (a table draws its cells at its own small offsets)
+    foot = [(t, x, y) for t, x, y in drawn if abs(x - 15 * mm) < 0.01 and y < 15 * mm]
+    assert foot, drawn
+    # every line inside the page's right margin, and inside the bottom margin's 15 mm, under the content
+    assert all(x + stringWidth(t, "Helvetica", 7) <= (210 - 15) * mm and y + 7 <= 15 * mm for t, x, y in foot), foot
+    # a page's footer, its lines read top first (drawn from the bottom up), the same on every page
+    said = " ".join(t for t, _, _ in sorted(dict.fromkeys(foot), key=lambda f: -f[2]))
+    assert ("The savings of its days were computed by engine 0.1.0+0000000004 (2 days), 0.1.0+0000000001 (1 day), 0.1.0+0000000002 (1 day) and "
+            "1 other engine (1 day); 2 days were computed before the engine was recorded.") in said, said
+
+
 def test_the_version_docstring_describes_gridlytics_not_solarlytics():
     from gridlytics import version
     doc = version.__doc__ or ""

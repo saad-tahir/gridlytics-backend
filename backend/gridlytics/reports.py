@@ -18,6 +18,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.lib.utils import simpleSplit
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from . import alerts, contract, plans, platform as platformdb, sites, store, telemetry, twin, verify
@@ -1080,7 +1081,7 @@ def engine_lines(stamp: str, days: dict[str, str | None] | None) -> list[str]:
     ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
     named = [f"{e} ({_plural(n, 'day')})" for e, n in ranked[:3]]
     if len(ranked) > 3:
-        named.append(f"{len(ranked) - 3} other engines ({_plural(sum(n for _, n in ranked[3:]), 'day')})")
+        named.append(f"{_plural(len(ranked) - 3, 'other engine')} ({_plural(sum(n for _, n in ranked[3:]), 'day')})")
     unknown = sum(1 for e in days.values() if not e)
     line = ""
     if named:
@@ -1092,13 +1093,16 @@ def engine_lines(stamp: str, days: dict[str, str | None] | None) -> list[str]:
 
 
 def _footer(lines: list[str]):
-    """A page callback that writes `lines` in small type at the foot of the page, inside its margin."""
-    def draw(canvas, _doc) -> None:
+    """A page callback that writes `lines` in small type at the foot of the page, inside its bottom margin, each wrapped to the width between the side
+    margins (review: a month's days computed by several engines made a line wider than the page, since every change of the code gives a new stamp)."""
+    def draw(canvas, doc) -> None:
         canvas.saveState()
         canvas.setFont("Helvetica", 7)
         canvas.setFillColor(colors.grey)
-        for i, text in enumerate(reversed(lines)):
-            canvas.drawString(15 * mm, 7 * mm + i * 3.2 * mm, text)
+        width = doc.pagesize[0] - doc.leftMargin - doc.rightMargin
+        wrapped = [part for text in lines for part in simpleSplit(text, "Helvetica", 7, width)]
+        for i, text in enumerate(reversed(wrapped)):
+            canvas.drawString(doc.leftMargin, 4 * mm + i * 3 * mm, text)
         canvas.restoreState()
     return draw
 
