@@ -274,10 +274,12 @@ def savings_csv(site_id: str, start: str | None = None, end: str | None = None):
     ids = savings_export.plan_ids(site_id, d0, d1) if summ["days"] else {}
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")
-    w.writerow([*CSV_COLUMNS, "claim_withheld", *savings_export.CLAIM_COLUMNS, "plan_ids"])
+    # the unit of litres_actual and litres_native, last: a gas genset's are MMBtu (round 7 integration, savings-page with sweeps)
+    unit = savings_export.fuel_unit(site_id)
+    w.writerow([*CSV_COLUMNS, "claim_withheld", *savings_export.CLAIM_COLUMNS, "plan_ids", "fuel_unit"])
     for d in summ["days"]:
         w.writerow([savings_export.cell(d.get(k)) for k in CSV_COLUMNS] + [savings_export.cell(savings_export.withheld(d))]
-                   + savings_export.claim_cells(d, dates) + [";".join(ids.get(d["day"], []))])
+                   + savings_export.claim_cells(d, dates) + [";".join(ids.get(d["day"], [])), unit])
     store.audit(auth.actor(), "exported savings", site_id, {"start": d0, "end": d1})
     return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{site_id}-savings.csv"'})
 

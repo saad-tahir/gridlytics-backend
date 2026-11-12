@@ -629,8 +629,12 @@ def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money
     # capture versions; and the plans in force over each Pakistan day (flow-reports-alerts-members-keys-04: the first four plans by UTC date)
     dates = savings_export.tariff_dates(summ["days"]) if money else {}
     in_force = savings_export.plan_ids(site_id, min(d["day"] for d in tdays), max(d["day"] for d in tdays)) if money and tdays else {}
+    # the unit of the litres column, after the columns of before: a gas genset's are MMBtu (round 7 integration, savings-page with sweeps'
+    # frontend-states-formats-01, as the company roll-up's fuel_unit)
+    unit = savings_export.fuel_unit(site_id)
     doc.csv.writerow(["day", "import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes", "peak_kw"] +
-                     (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld", *savings_export.CLAIM_COLUMNS] if money else []))
+                     (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld", *savings_export.CLAIM_COLUMNS] if money else [])
+                     + ["fuel_unit"])
     for d in tdays:
         s = by_day.get(d["day"], {})
         rows.append([_short_day(d["day"])] + ([num(d.get("import_kwh"))] if grid else []) + [num(d.get("pv_kwh"))]
@@ -642,7 +646,8 @@ def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money
         doc.csv.writerow([d["day"]] + [d.get(k) for k in ("import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes",
                                                           "peak_kw")]
                          + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids, savings_export.withheld(s),
-                             *(savings_export.claim_cells(s, dates) if s else [""] * len(savings_export.CLAIM_COLUMNS))] if money else []))
+                             *(savings_export.claim_cells(s, dates) if s else [""] * len(savings_export.CLAIM_COLUMNS))] if money else [])
+                         + [unit])
     doc.table(rows, [22 * mm] + ([22 * mm] if grid else []) + [22 * mm] + ([18 * mm] if grid else []) + [18 * mm] + ([28 * mm, 50 * mm] if money else []))
     if money and any(s.get("claim_withheld") or s.get("import_unknown") for s in summ["days"]):
         doc.p("A day marked “claim withheld” claims nothing: its saving is shown for reference and is not in the claimed total, nor is it a "

@@ -762,3 +762,38 @@ def test_fleet_and_overview_count_the_months_native_block_days_beside_its_saving
         assert month.get("native_block_days") == 3, role
     other = next(s for s in world.c["admin"].get("/api/fleet").json()["sites"] if s["id"] == world.other)
     assert other["mtd_native_block_days"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ integration (savings-page with sweeps): fuel units
+
+def test_the_savings_and_report_csvs_name_the_unit_of_their_litres_columns(world, monkeypatch):
+    """Integration follow-up (savings-page with sweeps' frontend-states-formats-01): a captive-gas genset's curve and price are per MMBtu, so its litres
+    columns hold MMBtu, while the Savings CSV and the monthly and energy reports' CSV gave them with no unit (the company roll-up's CSV already names
+    it). Each now ends its own columns with fuel_unit: L for diesel, MMBtu for gas, blank at a site without a genset."""
+    import csv
+    import io
+    from gridlytics import reports, savings_export
+    sid = world.site
+    with world.use():
+        days = _export_rows(sid, _tariff_version("2025-07-01"))
+        assert savings_export.fuel_unit(sid) == "L" and savings_export.fuel_unit(world.other) == ""
+
+    def savings_units() -> set[str]:
+        r = world.c["analyst"].get(f"/api/sites/{sid}/savings/export.csv", params={"start": days[0], "end": days[-1]})
+        assert r.status_code == 200, r.text
+        assert r.text.splitlines()[0].split(",")[-1] == "fuel_unit"                # after the columns of before
+        return {x["fuel_unit"] for x in csv.DictReader(io.StringIO(r.text))}
+    assert savings_units() == {"L"}
+    with world.use():
+        sites.put_asset(sid, "genset", {"rated_kw": 1000, "fuel_kind": "gas_captive"}, "test")
+    assert savings_units() == {"MMBtu"}
+    monkeypatch.setattr(telemetry, "days", lambda site_id, d0, d1: [_tday(d) for d in days])
+    _story(monkeypatch)
+    for kind, engines in (("monthly_savings", ["report_engine", "day_engine"]), ("energy_only", ["report_engine"])):
+        with world.use():
+            rep = reports.generate(kind, sid, "2025-11", "test")
+            text = reports.file_path(rep["id"], "csv").read_text(encoding="utf-8")
+        head = text.splitlines()[0].split(",")
+        assert head[-len(engines) - 1:] == ["fuel_unit", *engines], (kind, head)    # the report's own columns end with it; the engines follow
+        rows = list(csv.DictReader(io.StringIO(text)))
+        assert rows and {x["fuel_unit"] for x in rows} == {"MMBtu"}, kind
