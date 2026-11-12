@@ -301,6 +301,10 @@ def test_a_tick_that_raises_is_recorded_alerted_and_named_on_the_plan_answer(wor
     rows = got if isinstance(got, list) else got.get("alerts", got.get("items", []))
     failed = [a for a in rows if a["rule"] == "plan_failed"]
     assert len(failed) == 1 and "tariff" in failed[0]["title"] and failed[0]["detail"]["reason"] == "no_tariff_version", rows
+    # in words, as the plan page and the tick_overrun alert say it: a planning run, never the scheduler's "tick" (review r7 storage-perf)
+    assert failed[0]["title"].startswith("No plan was made at the last planning run: a grid connection's tariff") and "tick" not in failed[0]["title"]
+    assert alerts._tick_error_words({"ticks": 3, "since": "2026-11-09T02:45:00+00:00", "reason": "tick_error"}) == (
+        "No plan was made at the last 3 planning runs since 9 Nov 07:45: an error stopped the planning run; the server's log has the details")
     answer = world.c["admin"].get(f"/api/sites/{world.site}/plan").json()
     assert answer["plan"] is None and answer["held"] is None
     assert answer["failing"] == {"status": "error", "reason": "no_tariff_version", "since": run["tick"], "at": run["tick"], "ticks": 1}

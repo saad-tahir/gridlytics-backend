@@ -269,7 +269,8 @@ def cancel(job_id: str, org: str, owner: str) -> Job | None:
 
 
 def wait(job: Job, timeout: float = 60.0) -> Job:
-    """Block until the job has ended (for tests and scripts)."""
+    """Block until the job has ended or `timeout` seconds have passed: a request that answers a job's outcome when it ends in time (a re-solve, a
+    report, a recompute) and answers 202 otherwise, and tests."""
     end = time.time() + timeout
     while job.state in ACTIVE and time.time() < end:
         time.sleep(0.01)

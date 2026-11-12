@@ -560,11 +560,12 @@ TICK_ERROR_WORDS = {"no_tariff_version": "a grid connection's tariff has no vers
 
 
 def _tick_error_words(failing: dict) -> str:
-    """The plan_failed alert's words for scheduled ticks that raised: since when, how many, and why."""
+    """The plan_failed alert's words for scheduled ticks that raised: since when, how many, and why. A tick is a "planning run" in words, as the
+    tick_overrun alert and the plan page say it."""
     n = int(failing.get("ticks") or 1)
     since = _event_ts(failing.get("since"))
     when = f" since {_when(since)}" if since is not None and n > 1 else ""
-    return (f"No plan was made at the last {n} ticks{when}" if n > 1 else "No plan was made at the last tick") + ": " + \
+    return (f"No plan was made at the last {n} planning runs{when}" if n > 1 else "No plan was made at the last planning run") + ": " + \
         TICK_ERROR_WORDS.get(str(failing.get("reason")), TICK_ERROR_WORDS["tick_error"])
 
 
