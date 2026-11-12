@@ -535,9 +535,11 @@ def test_the_companies_list_carries_the_files_figures(fdb):
     assert list(rows) == ["Boxlytics Internal", "Development"]
     box = rows["Boxlytics Internal"]
     assert {"id", "name", "enabled", "seats", "disabled_reason", "created", "owner", "members", "seats_taken", "admins", "last_seen", "sites",
-            "sites_closed_loop", "plans_issued", "archived"} == set(box)
+            "sites_closed_loop", "sites_failing", "plans_issued", "archived"} == set(box)
     assert box["seats_taken"] == 1 and box["admins"] == 1 and box["last_seen"] and box["archived"] is False
-    assert (box["sites"], box["sites_closed_loop"], box["plans_issued"]) == (1, 0, 0)          # a deleted site is not counted
+    # a deleted site is not counted; nor is a site whose tick has not run (sites_failing: the active sites whose last tick made no plan, round 7
+    # storage-perf, parity-architecture-06)
+    assert (box["sites"], box["sites_closed_loop"], box["sites_failing"], box["plans_issued"]) == (1, 0, 0, 0)
     assert datetime.fromisoformat(box["last_seen"]).utcoffset() is not None
     dev = rows["Development"]
     assert dev["seats_taken"] == 0 and dev["admins"] == 0 and dev["last_seen"] is None and (dev["sites"], dev["plans_issued"]) == (0, 0)
