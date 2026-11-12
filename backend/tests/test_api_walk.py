@@ -47,6 +47,9 @@ PAGES = ["/api/sites/{s}", "/api/sites/{s}/now", "/api/sites/{s}/overview/chart"
          "/api/sites/{s}/switchback", "/api/sites/{s}/pilot", "/api/sites/{s}/edge", "/api/sites/{s}/native", "/api/sites/{s}/events", "/api/meta", "/api/fleet",
          "/api/sites", "/api/alerts", "/api/alerts/counts", "/api/reports", "/api/demo", "/api/fleet/savings", "/api/v1/fleet"]
 PAGES += ["/api/sites/{s}/plan/past"]  # the plan table's past rows (round 7, pages-B-07)
+# the Savings page's measures and dated periods, and the pilot's scorecard (round 7, savings-page: brief-vs-build-13, pages-D-23, pages-D-12); a
+# recompute's job is read by the role that started one (test_role_walk)
+PAGES += ["/api/sites/{s}/savings/kpis", "/api/sites/{s}/savings/periods", "/api/sites/{s}/pilot/scorecard"]
 
 
 @pytest.mark.parametrize("email", ["owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"])
@@ -66,8 +69,12 @@ def test_the_viewer_gets_no_rupees(world):
     h = _login(client, password, "viewer@onyxleaf.demo")
     sid = client.get("/api/fleet", headers=h).json()["sites"][0]["id"]
     blob = "".join(json.dumps(client.get(p.format(s=sid), headers=h).json()) for p in ("/api/sites/{s}/plan", "/api/fleet", "/api/sites/{s}/savings",
-                                                                                         "/api/sites/{s}/genset", "/api/sites/{s}"))
-    for key in ("c_imp", "cost_rs", "saving_rs", "objective_rs", "levers", "mtd_saving_rs", "c_fuel", "replacement_cost_per_kwh", "fuel_cost_rs"):
+                                                                                         "/api/sites/{s}/genset", "/api/sites/{s}",
+                                                                                         # round 7: the pilot (pages-D-26) and savings-page's routes
+                                                                                         "/api/sites/{s}/pilot", "/api/sites/{s}/pilot/scorecard",
+                                                                                         "/api/sites/{s}/savings/kpis"))
+    for key in ("c_imp", "cost_rs", "saving_rs", "objective_rs", "levers", "mtd_saving_rs", "c_fuel", "replacement_cost_per_kwh", "fuel_cost_rs",
+                "fee_multiple", "claimed_rs"):
         assert f'"{key}"' not in blob, key
     assert client.get("/api/tariffs", headers=h).status_code == 403
     assert client.post(f"/api/sites/{sid}/plan/solve", headers=h).status_code == 403
