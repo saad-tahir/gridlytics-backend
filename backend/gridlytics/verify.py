@@ -2159,6 +2159,10 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         months: dict[str, list] = {}
         mdi = mdi_claimed = mdi_prov = 0.0
         unserved_a = unserved_b = 0.0
+        # the claim of the verified days alone (followed in full, nothing withheld), by lever, on the claim's own terms: the figure the page shows
+        # when its reader ticks "verified days only" (R8 2.12; round 7, audit pages-D-22)
+        levers_verified: dict[str, float] = {}
+        claimed_verified = mdi_verified = 0.0
         for day, by in days.items():
             d = by.get(base)
             if not d:
@@ -2191,11 +2195,19 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             gen_unknown_days += int(bool(d.get("genset_unknown")))
             imp_unknown = bool(d.get("import_unknown"))
             imp_unknown_days += int(imp_unknown)
-            verified += int(d["fidelity"] == "confirmed" and not imp_unknown and not d.get("claim_withheld"))
+            is_verified = d["fidelity"] == "confirmed" and not imp_unknown and not d.get("claim_withheld")
+            verified += int(is_verified)
             # the day's share of its month's MDI lever goes where its saving goes: a withheld day's to no total, a day that claims nothing's not to the
             # claim (round 7, audit engine-savings-04: before, one claiming day claimed the whole month's lever, a withheld day's included)
             share = mdi_share(day, base)
             claim_by_day.setdefault(base, {})[day] = d["claimed_rs"] - prov + ho_adj + share if claims else 0.0
+            if claims and is_verified:
+                for k, v in d["levers"].items():
+                    if v is not None:
+                        levers_verified[k] = levers_verified.get(k, 0.0) + v
+                levers_verified["carry_over"] = levers_verified.get("carry_over", 0.0) - prov + ho_adj
+                claimed_verified += d["claimed_rs"] - prov + ho_adj
+                mdi_verified += share
             # the bound is held against the claim: the claiming days with a bound by the current method (_bound), each on the claim's own terms
             # (its provisional carry-over out, its hand-over's realised value in, its MDI share), beside what those days claim, so it is never
             # below it; a claiming day with none (the solve stopped at its limit, or scored before) is counted apart. Days that claim nothing (a
@@ -2244,7 +2256,10 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                                                      "claiming_days": v[2], "share_rs": round(v[3], 2), "claimed_rs": round(v[4], 2),
                                                      "provisional": not mdi_info[k]["closed"]} for k, v in months.items()},
                                   "unserved_kwh_actual": round(unserved_a, 1), "unserved_kwh_baseline": round(unserved_b, 1),
-                                  "genset_unknown_days": gen_unknown_days, "import_unknown_days": imp_unknown_days}
+                                  "genset_unknown_days": gen_unknown_days, "import_unknown_days": imp_unknown_days,
+                                  "verified": {"days": verified, "claimed_rs": round(claimed_verified + mdi_verified, 2),
+                                               "levers_claimed_rs": {**{k: round(v, 2) for k, v in levers_verified.items()},
+                                                                     "mdi": round(mdi_verified, 2)}}}
         if base == "tuned":
             # round 7 (audit engine-savings-03): the tuned rule of the period's last scored day, its cycle-charging set point None where it has none
             rule = next((by["tuned"].get("tuned_rule") for _, by in sorted(days.items(), reverse=True) if (by.get("tuned") or {}).get("tuned_rule")),

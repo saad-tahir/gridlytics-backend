@@ -637,3 +637,28 @@ def test_each_savings_day_carries_its_outage_hours_so_a_losing_day_can_be_explai
     for role in ("analyst", "viewer"):
         page = world.c[role].get(f"/api/sites/{sid}/savings", params={"start": "2026-10-03", "end": "2026-10-05"}).json()
         assert {d["day"]: d.get("outage_hours") for d in page["days"]} == {"2026-10-03": 0.0, "2026-10-04": 2.5, "2026-10-05": None}, role
+
+
+def test_the_summary_gives_the_claim_of_the_verified_days_only(company):
+    """pages-D-22 (R8 2.12): "Days with overrides or data gaps are flagged in the daily bars and excluded from the headline when the owner ticks
+    verified days only". The claim counts the partly followed days too, and nothing gave the figure over the verified days (followed in full, no
+    data withheld) alone. Each baseline now carries it, by lever, with the verified days' shares of the MDI lever and their carry-over on the
+    claim's own terms; a partly followed, withheld or native-block day adds nothing to it."""
+    sid = make_site(name="Verified only")
+    rows = {"2026-11-02": {"native": _row(1000.0, 1000.0), "tuned": _row(400.0, 400.0)},
+            "2026-11-03": {"native": _row(700.0, 700.0, fidelity="partial"), "tuned": _row(300.0, 300.0, fidelity="partial")},
+            "2026-11-04": {"native": {**_row(500.0, 0.0), "claim_withheld": "genset_unknown"}, "tuned": {**_row(200.0, 0.0), "claim_withheld": "genset_unknown"}},
+            "2026-11-05": {"native": _row(-300.0, 0.0, fidelity="native_block"), "tuned": _row(-900.0, 0.0, fidelity="native_block")},
+            "2026-11-06": {"native": _row(2000.0, 2000.0), "tuned": _row(600.0, 600.0)}}
+    _put_rows(sid, rows)
+    summ = verify.summary(sid, "2026-11-02", "2026-11-06")
+    nat, tun = summ["baselines"]["native"], summ["baselines"]["tuned"]
+    assert nat["claimed_rs"] == pytest.approx(3700.0) and tun["claimed_rs"] == pytest.approx(1300.0)    # the claim: the partial day in it
+    assert nat["verified"]["days"] == 2 and nat["verified_days"] == 2
+    assert nat["verified"]["claimed_rs"] == pytest.approx(3000.0)                                       # before: no such figure
+    assert tun["verified"]["claimed_rs"] == pytest.approx(1000.0)
+    assert nat["verified"]["levers_claimed_rs"]["peak_window"] == pytest.approx(3000.0)
+    assert sum(nat["verified"]["levers_claimed_rs"].values()) == pytest.approx(nat["verified"]["claimed_rs"])
+    # a viewer reads the count, never the rupees
+    from gridlytics import money
+    assert money._strip(summ, fee_ok=False, cost_ok=False)["baselines"]["native"]["verified"] == {"days": 2}
