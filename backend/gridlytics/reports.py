@@ -178,10 +178,12 @@ def num(x, fmt: str = ",.0f", unit: str = "", scale: float = 1.0) -> str:
 
 def file_name(r: dict, which: str) -> str:
     """The name a download is saved under: the site, the kind and the month ("gridlytics-faisalabad-textile-mill-monthly-savings-2026-11.pdf"), so
-    two sites' reports of a month never share a name; a site name with no Latin letters or digits gives the site's id instead."""
+    two sites' reports of a month never share a name; a site name with no Latin letters or digits gives the site's id instead. A report out of date
+    (a day of its month restated after it was made) is saved as "...-2026-11-out-of-date.pdf" (round 7, the reports' half of audit pr-review-02)."""
     slug = re.sub(r"[^a-z0-9]+", "-", str(r.get("site_name") or "").lower()).strip("-")[:60].strip("-") or str(r.get("site_id") or "")
     kind = str(r.get("kind") or "report").replace("_", "-")
-    return "-".join(x for x in ("gridlytics", slug, kind, str(r.get("period") or "")) if x) + f".{which}"
+    stale = "out-of-date" if r.get("out_of_date") else ""
+    return "-".join(x for x in ("gridlytics", slug, kind, str(r.get("period") or ""), stale) if x) + f".{which}"
 
 
 def _folder() -> str:
@@ -1172,12 +1174,60 @@ def _row_out(r) -> dict:
     return d
 
 
+#: The kinds whose figures are the savings days': a copy made before a day of its period was restated (a closed month's claim re-scored, verify's
+#: `restated[].at`) shows the old figures (round 7, the reports' half of audit pr-review-02)
+SAVINGS_KINDS = ("monthly_savings", "company_rollup", "pilot")
+
+
+def _restated_after(rows: list) -> dict[str, list[str]]:
+    """Per report row of a savings kind: the days of its period ("YYYY-MM-DD") whose claim was restated after it was generated, oldest first (the
+    pilot report's period runs from the pilot's start, so its days are every day to the month's end). The restated days are read once per site and
+    period."""
+    seen: dict[tuple[str, str, str], list[tuple[str, list[str]]]] = {}
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        if r["kind"] not in SAVINGS_KINDS:
+            continue
+        try:
+            p0, p1 = _period(str(r["period"]))
+            made = datetime.fromisoformat(str(r["generated_at"]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if r["kind"] == "pilot":
+            p0 = date(2000, 1, 1)
+        key = (str(r["site_id"] or ""), p0.isoformat(), p1.isoformat())
+        if key not in seen:
+            where, args = ("site_id = ? AND ", (key[0],)) if key[0] else ("", ())
+            with store.connect() as con:
+                hits = con.execute(f"SELECT day_local, data FROM savings_days WHERE {where}day_local >= ? AND day_local <= ? AND data LIKE ?",
+                                   (*args, key[1], key[2], '%"restated"%')).fetchall()
+            seen[key] = [(h["day_local"], [str(x.get("at") or "") for x in (json.loads(h["data"]).get("restated") or []) if isinstance(x, dict)])
+                         for h in hits]
+        days = set()
+        for day, ats in seen[key]:
+            for at in ats:
+                try:
+                    if datetime.fromisoformat(at) > made:
+                        days.add(day)
+                except ValueError:
+                    continue
+        out[r["id"]] = sorted(days)
+    return out
+
+
+def _with_restated(rows: list) -> list[dict]:
+    """The rows as the API answers them (_row_out), each with `out_of_date` (a day of its period was restated after it was made: generate it again)
+    and `restated_days` (those days)."""
+    after = _restated_after(rows)
+    return [{**_row_out(r), "out_of_date": bool(after.get(r["id"])), "restated_days": after.get(r["id"], [])} for r in rows]
+
+
 def listing(site_id: str | None = None) -> list[dict]:
     with store.connect() as con:
         rows = con.execute("SELECT * FROM reports" + (" WHERE site_id = ?" if site_id else "") + " ORDER BY generated_at DESC, rowid DESC LIMIT 200",
                            ((site_id,) if site_id else ())).fetchall()
     names = {s["id"]: s["name"] for s in sites.listing()}
-    return [{**_row_out(r), "site_name": names.get(r["site_id"], "")} for r in rows]
+    return [{**d, "site_name": names.get(r["site_id"], "")} for r, d in zip(rows, _with_restated(rows))]
 
 
 def get(rid: str) -> dict | None:
@@ -1187,7 +1237,7 @@ def get(rid: str) -> dict | None:
     if r is None:
         return None
     site = sites.get(r["site_id"]) if r["site_id"] else None
-    return {**_row_out(r), "site_name": (site or {}).get("name", "")}
+    return {**_with_restated([r])[0], "site_name": (site or {}).get("name", "")}
 
 
 def file_path(rid: str, which: str) -> Path | None:

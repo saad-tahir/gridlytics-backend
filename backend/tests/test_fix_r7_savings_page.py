@@ -545,3 +545,49 @@ def test_the_meta_says_in_words_which_roles_hold_each_permission(world):
         assert meta["who_can"]["run_jobs"] == "an administrator, an operator or an analyst", meta.get("who_can")
         assert meta["who_can"]["export"] == "an administrator or an analyst"
         assert set(meta["who_can"]) == set(auth.PERMISSIONS)
+
+
+# ------------------------------------------------------------------------------------------------ pr-review-02 (rest): a report made before a restatement
+
+def _report_row(sid: str, kind: str, period: str, made: str) -> str:
+    rid = store.new_id()
+    with store.connect() as con:
+        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary, generated_by) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rid, sid, kind, period, made, "h", f"reports/x/{rid}.pdf", f"reports/x/{rid}.csv", "done", 0, "test"))
+    return rid
+
+
+def test_a_stored_report_is_marked_out_of_date_once_a_day_of_its_month_is_restated_after_it(world):
+    """pr-review-02 (the reports' half): a recompute that changes a claim in a closed month restates it (verify keeps `restated[].at` on the day's rows,
+    and the Savings page lists the days), but the reports list served a monthly savings report made before as it was, its figures the old ones. A
+    report whose figures are the savings days' (the monthly savings report, the company roll-up, the pilot report) is now listed out of date, with
+    the days restated after it was made; one made after the restatement, and an energy report, are not."""
+    from gridlytics import reports
+    sid = world.site
+    with world.use():
+        restated = [{"at": "2026-11-10T09:00:00+00:00", "why": "recompute", "by": "analyst", "claimed_rs_before": 900.0, "claimed_rs_after": 700.0}]
+        _put_rows(sid, {"2026-10-14": {"native": {**_row(700.0, 700.0), "restated": restated}, "tuned": _row(500.0, 500.0)},
+                        "2026-10-15": {"native": _row(800.0, 800.0), "tuned": _row(500.0, 500.0)}})
+        before = _report_row(sid, "monthly_savings", "2026-10", "2026-11-05T12:00:00+00:00")
+        after = _report_row(sid, "monthly_savings", "2026-10", "2026-11-11T12:00:00+00:00")
+        energy = _report_row(sid, "energy_only", "2026-10", "2026-11-05T12:00:00+00:00")
+        rollup = _report_row("", "company_rollup", "2026-10", "2026-11-05T12:00:00+00:00")
+        other = _report_row(sid, "monthly_savings", "2026-09", "2026-11-05T12:00:00+00:00")
+        listed = {r["id"]: r for r in reports.listing()}
+        assert reports.get(before)["out_of_date"] is True
+    assert (listed[before]["out_of_date"], listed[before]["restated_days"]) == (True, ["2026-10-14"])     # before: listed as it was made
+    assert (listed[rollup]["out_of_date"], listed[rollup]["restated_days"]) == (True, ["2026-10-14"])
+    for rid in (after, energy, other):
+        assert (listed[rid]["out_of_date"], listed[rid]["restated_days"]) == (False, []), listed[rid]
+    # the route lists it so to a role that reads the kind
+    rows = {r["id"]: r for r in world.c["analyst"].get("/api/reports").json()}
+    assert rows[before]["out_of_date"] is True and rows[before]["restated_days"] == ["2026-10-14"]
+    # and its download is saved under a name that says so
+    with world.use():
+        made = reports.generate("monthly_savings", sid, "2026-10", "test")
+        with store.connect() as con:
+            con.execute("UPDATE reports SET generated_at = ? WHERE id = ?", ("2026-11-05T12:00:00+00:00", made["id"]))
+    r = world.c["analyst"].get(f"/api/reports/{made['id']}/pdf")
+    assert r.status_code == 200 and "monthly-savings-2026-10-out-of-date.pdf" in r.headers["content-disposition"], r.headers
+    assert reports.file_name({**made, "out_of_date": False}, "csv").endswith("monthly-savings-2026-10.csv")
+
