@@ -68,8 +68,10 @@ def _violations(site: dict, d0: date, d1: date, now: int) -> dict | None:
     on_grid = bool(conns) and regime != "off_grid"
     plant = twin.plant_of(site)
     gp = d["grid_power_w"] / 1000
-    imp = np.where(np.isnan(d["grid_import_wh"]), np.maximum(gp, 0.0), d["grid_import_wh"] * 60 / 1000)
-    exp = np.where(np.isnan(d["grid_export_wh"]), np.maximum(-gp, 0.0), d["grid_export_wh"] * 60 / 1000)
+    # a row's energy is over its own interval (`step` minutes: a coarse source's 5-minute rows hold five minutes of it), so its mean power is the
+    # energy over that interval, not over a minute (review of brief-vs-build-13)
+    imp = np.where(np.isnan(d["grid_import_wh"]), np.maximum(gp, 0.0), d["grid_import_wh"] * 60 / 1000 / step)
+    exp = np.where(np.isnan(d["grid_export_wh"]), np.maximum(-gp, 0.0), d["grid_export_wh"] * 60 / 1000 / step)
     out = {"minutes_read": minutes(np.ones(len(ts), dtype=bool)), "import_during_outage_min": None, "export_above_cap_min": None, "export_cap_kw": None,
            "genset_below_min_load_min": None, "genset_min_load_kw": None}
     if on_grid:

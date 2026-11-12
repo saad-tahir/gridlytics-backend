@@ -238,6 +238,26 @@ def test_the_kpis_give_reserve_adequacy_the_constraint_violations_control_health
     assert m["battery"]["bms_trust"] == {"trust": 0.82, "basis": "independent", "to": "2026-11-03"} and seen == [t0 + 2 * 86400]
 
 
+def test_the_minute_checks_read_a_coarse_sources_energy_as_power_over_its_own_interval(company):
+    """Review of brief-vs-build-13: the minute checks turned a row's import and export energy into power as if every row were one minute (Wh x 60 /
+    1000), while a coarse source's rows (an OEM cloud's 5 minutes) hold the energy of their whole interval. A 5-minute row importing 0.3 kW in an
+    outage (25 Wh, under the 0.5 kW margin) read as 1.5 kW, and 15 minutes of it counted as imported in an outage."""
+    from gridlytics import gonogo, telemetry, twin
+    sid = make_site(name="Coarse mill")
+    day = date(2026, 11, 2)
+    t0 = twin.day_start_utc(day)
+    cols = ("site_id", "ts", "source_id", "grid_present", "grid_import_wh", "grid_export_wh")
+    # an hour of 5-minute rows: the first three in an outage, importing 0.3 kW (a meter's creep), then 2 kW of import over 5 minutes each
+    rows = [(sid, t0 + 10 * 3600 + i * 300, "cloud", 0.0 if i < 3 else 1.0, (0.3 if i < 3 else 2.0) * 1000 * 5 / 60, 0.0) for i in range(12)]
+    telemetry.write_rows(rows, cols)
+    v = gonogo.measures(sid, day, day, now=t0 + 2 * 86400)["violations"]
+    assert v["minutes_read"] == 60
+    assert v["import_during_outage_min"] == 0                         # before: 15 (25 Wh a row read as 1.5 kW)
+    # the same outage importing 1 kW is counted, 15 minutes of it
+    telemetry.write_rows([(sid, t0 + 10 * 3600 + i * 300, "cloud", 0.0, 1.0 * 1000 * 5 / 60, 0.0) for i in range(3)], cols)
+    assert gonogo.measures(sid, day, day, now=t0 + 2 * 86400)["violations"]["import_during_outage_min"] == 15
+
+
 def test_the_ledger_counts_each_arms_genset_starts():
     """brief-vs-build-13: the ledger stored the genset's litres and hours per arm but not its starts (plan 8.3's diesel KPI: 'run hours, starts per
     day'). A run going on at midnight is not a start, as the genset's cost counts it."""
