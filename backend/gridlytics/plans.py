@@ -5,6 +5,7 @@ in force), so the demo history and a later re-score run the same code as the liv
 """
 from __future__ import annotations
 
+import bisect
 import json
 import math
 from datetime import date, datetime, timedelta, timezone
@@ -833,7 +834,6 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
         raise KeyError(site_id)
     now = int(at if at is not None else datetime.now(timezone.utc).timestamp())
     t0 = forecast.align(now)
-    started = store._now()
     # the observed grid state reads telemetry up to the actual tick time, so a grid loss inside the current quarter is planned for at once
     prior = _saved_outage(site_id, t0)
     bundle = forecast.issue(site, t0, save=save, now=now)
@@ -909,11 +909,12 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                 con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, reason, solver, summary) "
                             "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (pid, site_id, store._now() if at is None else _iso(now), _iso(t0), _iso(t0),
                                                              _iso(t0 + p["T"] * 900), "a", "failed", reason, "highs", json.dumps(summary)))
-                con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, plan_id) VALUES (?,?,?,?,?,?,?)",
-                            (site_id, _iso(t0), started, store._now(), "failed", reason, pid))
             if release:
                 sites.put_state(site_id, active_plan=None, last_tick=_iso(t0))
-        return {"status": "failed", "reason": reason, "control_release": release, "in_force": None if release else _in_force_id(site_id, now)}
+        # the scheduled tick's runs row is the scheduler's (round 7, performance-live-09: a re-solve in the same quarter overwrote it); `row_id` is
+        # the failed row written here, for that row
+        return {"status": "failed", "reason": reason, "control_release": release, "in_force": None if release else _in_force_id(site_id, now),
+                "row_id": pid if save else None}
     steps_out = _steps_out(p, res, bundle)
     # the slots' floors are delivery.fallback_floor: delivered_floor_pct, the floor the plan held on its grid-up steps. A horizon that
     # crosses the billing month's end compiles the new month's days with its own cap, M2 (round 7, engine-optimiser-02: every slot carried M,
@@ -949,8 +950,6 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                         (plan_id, site_id, store._now() if at is None else _iso(now), _iso(t0), _iso(t0), _iso(t0 + p["T"] * 900),
                          "b" if site["data"].get("control_mode") == "mode_b" else "a", status, reason or "", "highs", res["solve_seconds"], res["objective_rs"],
                          res["config_hash"], json.dumps(summary), json.dumps(steps_out), json.dumps(compiled)))
-            con.execute("INSERT OR REPLACE INTO runs (site_id, tick, started, finished, status, reason, solve_s, objective_rs, plan_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                        (site_id, _iso(t0), started, store._now(), status, reason or res["status"], res["solve_seconds"], res["objective_rs"], plan_id))
         active = plan_id if status == "active" else (None if release else site.get("state", {}).get("active_plan"))
         # the anchor charge's deadline (see _ask_anchor): set by the first active plan that schedules one, dropped once none is asked for
         anchor = {}
@@ -965,7 +964,7 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     # guard), so a re-solve says what stays in force (round 7, frontend-states-formats-07)
     in_force = plan_id if status == "active" else (None if release else _in_force_id(site_id, now))
     return {"status": status, "plan_id": plan_id, "reason": reason, "in_force": in_force, "objective_rs": res["objective_rs"],
-            "solve_seconds": res["solve_seconds"], "steps": steps_out, "slots": compiled, "summary": summary}
+            "solve_seconds": res["solve_seconds"], "steps": steps_out, "slots": compiled, "summary": summary, "solver_status": res["status"]}
 
 
 def _joined_tables(first: dict, nxt: dict) -> dict:
@@ -1023,13 +1022,19 @@ def _plan_out(r, with_steps: bool = True) -> dict:
     return d
 
 
-def current(site_id: str, now: int | None = None) -> dict | None:
+#: A plan row without its steps and slots (about 130 KB of JSON a plan: round 7, tests-and-perf-06): what a list of plans reads
+LIGHT_COLUMNS = ("id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status, reason, solver, solve_seconds, objective_rs, "
+                 "config_hash, summary, applied")
+
+
+def current(site_id: str, now: int | None = None, slots: bool = True) -> dict | None:
     """The plan in force: the latest active plan, while `now` (the clock by default) is before its valid_until. A plan past its valid_until is
     not in force (Part 2.4: a failed tick keeps the previous plan only until then), so it is neither served to the edge nor keyed in; held_info
-    names it (plan_expired)."""
+    names it (plan_expired). `slots=False` leaves the compiled table out (null), for a reader of the steps only (the fleet's next event)."""
     now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    cols = "*" if slots else f"{LIGHT_COLUMNS}, steps"
     with store.connect() as con:
-        r = con.execute("SELECT * FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
+        r = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
         last = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
     if r is None or _past_valid_until(r["valid_until"], now):
         return None
@@ -1066,6 +1071,25 @@ def held_info(site_id: str, now: int | None = None) -> dict | None:
     if active is not None and _past_valid_until(active["valid_until"], now):
         return {"reason": EXPIRED_REASON, "until": None, "plan_id": active["id"], "since": active["valid_until"]}
     return None
+
+
+#: The runs statuses of a scheduled tick that made no plan: `error`, the tick raised (a set-up fault such as a tariff with no version in force, or a
+#: bug); `failed`, its solve produced no plan
+FAILING_RUNS = ("error", "failed")
+
+
+def tick_failing(site_id: str, limit: int = 96) -> dict | None:
+    """The site's scheduled ticks failing now (round 7, parity-architecture-06: a tick that raised was only logged, so the plan page promised a first
+    plan within 15 minutes hours after the first failure): when its latest scheduled tick (the scheduler's runs row) made no plan, `{status, reason,
+    since, at, ticks}`: that tick's status (FAILING_RUNS) and reason code (no_tariff_version or tick_error for a tick that raised, failure_code's for
+    a solve), the tick the run of failures began at and the latest (ISO UTC quarters) and how many ticks in a row (up to `limit`). None when the
+    latest tick made or held a plan, or none ran yet."""
+    with store.connect() as con:
+        rows = con.execute("SELECT tick, status, reason FROM runs WHERE site_id = ? ORDER BY tick DESC LIMIT ?", (site_id, int(limit))).fetchall()
+    n = next((i for i, r in enumerate(rows) if r["status"] not in FAILING_RUNS), len(rows))
+    if n == 0:
+        return None
+    return {"status": rows[0]["status"], "reason": rows[0]["reason"], "since": rows[n - 1]["tick"], "at": rows[0]["tick"], "ticks": n}
 
 
 def get(site_id: str, plan_id: str) -> dict | None:
@@ -1148,8 +1172,9 @@ def past_steps(site_id: str, now: int, hours: int = 24) -> dict:
 
     steps_of: dict[str, dict[int, dict]] = {}
     rows = []
+    in_force = InForce(site_id, t0, t1)        # the plans of the range read once, not once a step (round 7, audit tests-and-perf-07)
     for t in range(t0, t1, 900):
-        plan = active_at(site_id, t)
+        plan = in_force.at(t)
         step = None
         if plan is not None:
             if plan["id"] not in steps_of:
@@ -1169,8 +1194,10 @@ def past_steps(site_id: str, now: int, hours: int = 24) -> dict:
 
 
 def history(site_id: str, limit: int = 50) -> list[dict]:
+    """The site's latest plans, newest first, without their steps and slots (round 7, tests-and-perf-06: the list read every plan's blobs to drop
+    them)."""
     with store.connect() as con:
-        rows = con.execute("SELECT * FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT ?", (site_id, limit)).fetchall()
+        rows = con.execute(f"SELECT {LIGHT_COLUMNS} FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT ?", (site_id, limit)).fetchall()
     return [_plan_out(r, with_steps=False) for r in rows]
 
 
@@ -1178,41 +1205,130 @@ def _released_at(site_id: str, ts: int) -> bool:
     """Whether a pause or a release to native was in force at the instant `ts`, from the override history: from its creation (from_ts) to its end,
     or to when it was cleared if that came first. The instant, not its quarter: a plan published after a pause was cleared mid-quarter is in force
     from then on. A day in a native block of the switchback calendar is released all day (switchback_release)."""
-    if switchback_release(site_id, ts) is not None:
-        return True
-    for o in sites.overrides(site_id, active_only=False):
-        if o.get("kind") not in RELEASE_REASONS:
-            continue
-        start, end, cleared = _ts(o.get("from_ts")), _ts(o.get("until_ts")), _ts(o.get("cleared"))
-        if cleared is not None and (end is None or cleared < end):
-            end = cleared
-        if end is not None and (start is None or start <= ts) and ts < end:
+    return InForce(site_id, ts, ts).released(ts)
+
+
+#: how many of the latest rows at or before an instant active_at walks for the row that decides it before it asks for the latest plan made
+_DECIDE_ROWS = 200
+
+
+class InForce:
+    """active_at at any instant of [t0, t1] from one read of the plan rows that decide the range (their light columns, newest first, down to the
+    row that decides t0), one read of the override history, the switchback calendar once per Pakistan day and each plan in force parsed once (round
+    7, audit tests-and-perf-07: active_at ran once per genset run, peak quarter, outage or past step, each call reading the overrides and up to 200
+    plan rows and parsing a 130 KB plan). An instant outside the range is asked of active_at."""
+
+    def __init__(self, site_id: str, t0: int, t1: int):
+        self.site_id, self.t0, self.t1 = site_id, int(min(t0, t1)), int(max(t0, t1))
+        self._switchback: dict[date, bool] = {}
+        self._windows: list[tuple[int | None, int]] | None = None
+        self._rows: list | None = None          # oldest first
+        self._times: list[str] = []
+        self._cut = False                       # the read stopped before the site's first row
+        self._plans: dict[str, dict] = {}
+        self._steps: dict[str, tuple[list[int], list[dict]]] = {}
+
+    def released(self, ts: int) -> bool:
+        """_released_at: a pause or a release to native in force at the instant, or a native block of the switchback calendar on its day."""
+        day = _local(ts).date()
+        if day not in self._switchback:
+            self._switchback[day] = switchback_release(self.site_id, ts) is not None
+        if self._switchback[day]:
             return True
-    return False
+        if self._windows is None:
+            self._windows = []
+            for o in sites.overrides(self.site_id, active_only=False):
+                if o.get("kind") not in RELEASE_REASONS:
+                    continue
+                start, end, cleared = _ts(o.get("from_ts")), _ts(o.get("until_ts")), _ts(o.get("cleared"))
+                if cleared is not None and (end is None or cleared < end):
+                    end = cleared
+                if end is not None:
+                    self._windows.append((start, end))
+        return any((start is None or start <= ts) and ts < end for start, end in self._windows)
+
+    @staticmethod
+    def _decides(r) -> bool:
+        if r["status"] in ("active", "superseded"):
+            return True
+        if r["status"] == "held":
+            return r["reason"] in RELEASED_REASONS
+        return r["status"] == "failed" and bool((json.loads(r["summary"] or "{}") or {}).get("control_release"))
+
+    def _load(self) -> None:
+        lo = _iso(self.t0)
+        rows, below = [], 0
+        with store.connect() as con:
+            # newest first (the (site_id, belief_time) index); a failed row's summary only, for its control_release
+            cur = con.execute("SELECT id, belief_time, status, reason, valid_until, CASE WHEN status = 'failed' THEN summary END AS summary FROM plans "
+                              "WHERE site_id = ? AND belief_time <= ? ORDER BY belief_time DESC, generated_at DESC, rowid DESC",
+                              (self.site_id, _iso(self.t1)))
+            for r in cur:
+                rows.append(r)
+                if r["belief_time"] <= lo:
+                    below += 1
+                    if self._decides(r) or below >= _DECIDE_ROWS:
+                        self._cut = True
+                        break
+        self._rows = rows[::-1]
+        self._times = [r["belief_time"] for r in self._rows]
+
+    def _deciding(self, ts: int) -> tuple[str, str | None] | None:
+        """The (id, valid_until) of the plan made that decides the instant, before its valid_until is checked; None when a release decides it."""
+        if self._rows is None:
+            self._load()
+        j = bisect.bisect_right(self._times, _iso(ts))
+        lo = j - _DECIDE_ROWS
+        for k in range(j - 1, max(lo, 0) - 1, -1):
+            r = self._rows[k]
+            if not self._decides(r):
+                continue                        # a guard hold or a failed solve leaves the plan before in force
+            return (r["id"], r["valid_until"]) if r["status"] in ("active", "superseded") else None
+        if lo < 0 and not self._cut:
+            return None                         # no plan made at or before it
+        with store.connect() as con:
+            r = con.execute("SELECT id, valid_until FROM plans WHERE site_id = ? AND status IN ('active','superseded') AND belief_time <= ? "
+                            "ORDER BY belief_time DESC LIMIT 1", (self.site_id, _iso(ts))).fetchone()
+        return (r["id"], r["valid_until"]) if r else None
+
+    def plan(self, plan_id: str) -> dict | None:
+        if plan_id not in self._plans:
+            with store.connect() as con:
+                r = con.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+            self._plans[plan_id] = _plan_out(r) if r else None
+        return self._plans[plan_id]
+
+    def at(self, ts: int) -> dict | None:
+        """The plan in force at the instant (active_at)."""
+        ts = int(ts)
+        if not self.t0 <= ts <= self.t1:
+            return active_at(self.site_id, ts)
+        if self.released(ts):
+            return None
+        d = self._deciding(ts)
+        if d is None or _past_valid_until(d[1], ts):
+            return None
+        return self.plan(d[0])
+
+    def step(self, ts: int) -> dict | None:
+        """The step of the plan in force at the instant that covers it (t <= ts < t + 900), else None."""
+        p = self.at(ts)
+        if p is None:
+            return None
+        if p["id"] not in self._steps:
+            steps = sorted(p.get("steps") or [], key=lambda x: int(x["t"]))
+            self._steps[p["id"]] = ([int(x["t"]) for x in steps], steps)
+        t, steps = self._steps[p["id"]]
+        k = bisect.bisect_right(t, int(ts)) - 1
+        return steps[k] if k >= 0 and int(ts) < t[k] + 900 else None
 
 
 def active_at(site_id: str, ts: int) -> dict | None:
     """The plan that was in force at an instant: the latest generated at or before it (belief time not after it). None while a pause or a release
     to native was in force: the tick then stores its plan as held (or, when the solve failed, a failed row noting the release), and no plan is in
-    force; a guard hold or a failed tick otherwise leaves the previous plan in force, up to its valid_until (after it, None)."""
-    if _released_at(site_id, ts):
-        return None
-    with store.connect() as con:
-        # the latest rows first (the light columns only): a held or failed row of a pause ends the search with no plan in force
-        rows = con.execute("SELECT id, status, reason, summary, valid_until FROM plans WHERE site_id = ? AND belief_time <= ? "
-                           "ORDER BY belief_time DESC, generated_at DESC, rowid DESC LIMIT 200", (site_id, _iso(ts))).fetchall()
-        for r in rows:
-            if r["status"] in ("active", "superseded"):
-                if _past_valid_until(r["valid_until"], ts):
-                    return None
-                return _plan_out(con.execute("SELECT * FROM plans WHERE id = ?", (r["id"],)).fetchone())
-            if r["status"] == "held" and r["reason"] in RELEASED_REASONS:
-                return None
-            if r["status"] == "failed" and (json.loads(r["summary"] or "{}") or {}).get("control_release"):
-                return None
-        r = con.execute("SELECT * FROM plans WHERE site_id = ? AND status IN ('active','superseded') AND belief_time <= ? ORDER BY belief_time DESC LIMIT 1",
-                        (site_id, _iso(ts))).fetchone()
-    return _plan_out(r) if r and not _past_valid_until(r["valid_until"], ts) else None
+    force; a guard hold or a failed tick otherwise leaves the previous plan in force, up to its valid_until (after it, None). A reader asking for
+    many instants of a range builds one InForce instead."""
+    return InForce(site_id, ts, ts).at(ts)
 
 
 def now_and_next(plan: dict | None, now: int | None = None) -> dict | None:
@@ -1229,6 +1345,105 @@ def now_and_next(plan: dict | None, now: int | None = None) -> dict | None:
         if len(nxt) == 3:
             break
     return {"current": cur, "next": nxt}
+
+
+# ------------------------------------------------------------------------------------------------ retention
+
+#: How long a plan keeps all its steps and its compiled table (plan Part 3.3)
+KEEP_WHOLE_DAYS = 90
+_TRIM_BATCH = 200
+
+
+def _in_force_windows(rows) -> dict[str, tuple[int, int]]:
+    """Each plan's span in force, [start, end) in epoch seconds, by active_at's rules over the stored ticks in their order (belief time, then made):
+    a plan made (active or superseded) is in force from its belief time until the next tick that decides (another plan made, or a held or failed
+    tick of a pause or a release to native) or its valid_until, whichever comes first; a guard hold or a failed solve leaves it in force. A pause
+    or release with no tick of its own (_released_at) is not taken off, so a span may be longer than active_at's, never shorter."""
+    spans: dict[str, tuple[int, int]] = {}
+    cur: tuple[str, int, int] | None = None              # (plan id, start, valid_until)
+    for r in rows:
+        made = r["status"] in ("active", "superseded")
+        ends = (r["status"] == "held" and r["reason"] in RELEASED_REASONS) or (r["status"] == "failed" and r["released"])
+        if not (made or ends):
+            continue
+        at = _ts(r["belief_time"]) or 0
+        if cur is not None:
+            spans[cur[0]] = (cur[1], min(at, cur[2]))
+        cur = (r["id"], at, _ts(r["valid_until"]) or at) if made else None
+    if cur is not None:
+        spans[cur[0]] = (cur[1], cur[2])
+    return spans
+
+
+def _covers_day_start(a: int, b: int) -> bool:
+    """Whether the span [a, b) holds a Pakistan-time midnight."""
+    d = _local(a).date()
+    t = twin.day_start_utc(d)
+    return (t if t >= a else twin.day_start_utc(d + timedelta(days=1))) < b
+
+
+def prune(site_id: str, now: int | None = None, keep_days: int = KEEP_WHOLE_DAYS) -> dict:
+    """Plan retention (plan Part 3.3; round 7, performance-live-01: every 15-minute plan kept its 192 steps and its table for good, about 12.5 MB a site
+    a day). Every plan row and its summary are kept forever; a plan whose belief time is more than `keep_days` before `now` (the clock by default),
+    other than the active one, keeps its steps and its compiled table whole only when it is:
+    - the first plan of its hour (the plans of the hour's first belief time);
+    - marked applied (the applied log and the advisory replay read it), issued as a day's table (table_issues: the issued view, the write log and the
+      demo's keyed table read it) or sent to an edge (plan_messages);
+    - in force at a Pakistan-time midnight (the daily sheet of a past day and the demo's keyed table read its table), through failed ticks too.
+    Any other keeps only the steps of its own span in force (_in_force_windows) and the step just after it (reserve.target_at reads an outage's own
+    step from the plan in force the instant before), so active_at answers every instant with the same plan and the same step as before (the past
+    plan table, the reports' reserve check, the genset page's planned runs, the alerts), and its table is dropped.
+    A trimmed plan has no table, so the next prune passes over it, and starts at the latest plan the last one trimmed rather than the site's first
+    plan. Each batch of trims is its own transaction, so a tick or a request never waits on the whole run. Run nightly (scheduler.nightly_company);
+    returns what it did."""
+    now = int(now if now is not None else datetime.now(timezone.utc).timestamp())
+    cutoff = _iso(now - int(keep_days) * 86400)
+    out = {"site_id": site_id, "trimmed": 0, "kept_whole": 0, "bytes_before": 0, "bytes_after": 0}
+    with store.connect() as con:
+        # where the last prune stopped: the latest plan it trimmed (no table, and not a failed tick, which never has one)
+        done = con.execute("SELECT MAX(belief_time) FROM plans WHERE site_id = ? AND belief_time < ? AND slots IS NULL AND status != 'failed'",
+                           (site_id, cutoff)).fetchone()[0]
+        first = con.execute("SELECT MIN(belief_time) FROM plans WHERE site_id = ? AND belief_time >= ? AND belief_time < ? AND status != 'active' "
+                            "AND slots IS NOT NULL", (site_id, done or "", cutoff)).fetchone()[0]
+        if first is None:
+            return out
+        # the light columns of every tick from the first plan to trim on, in active_at's order, for the spans in force (a span depends only on the
+        # ticks after it)
+        rows = con.execute("SELECT id, status, reason, belief_time, valid_until, slots IS NOT NULL AS has_slots, "
+                           "(status = 'failed' AND json_extract(summary, '$.control_release') IS NOT NULL) AS released "
+                           "FROM plans WHERE site_id = ? AND belief_time >= ? ORDER BY belief_time, generated_at, rowid", (site_id, first)).fetchall()
+        whole: set[str] = set()
+        for sql in ("SELECT plan_id FROM applied WHERE site_id = ? AND day_local >= ?", "SELECT plan_id FROM table_issues WHERE site_id = ? AND day_local >= ?",
+                    "SELECT DISTINCT plan_id FROM plan_messages WHERE site_id = ? AND sent_at >= ?"):
+            whole.update(r[0] for r in con.execute(sql, (site_id, _local(_ts(first) or 0).date().isoformat() if "day_local" in sql else first)))
+    spans = _in_force_windows(rows)
+    hour_first: dict[str, str] = {}
+    for r in rows:
+        if r["status"] != "failed":
+            hour = r["belief_time"][:13]
+            hour_first[hour] = min(hour_first.get(hour, r["belief_time"]), r["belief_time"])
+    trim = []
+    for r in rows:
+        if r["belief_time"] >= cutoff or r["status"] == "active" or not r["has_slots"]:
+            continue
+        span = spans.get(r["id"])
+        if r["id"] in whole or hour_first.get(r["belief_time"][:13]) == r["belief_time"] or (span and _covers_day_start(*span)):
+            out["kept_whole"] += 1
+        else:
+            trim.append(r["id"])
+    for k in range(0, len(trim), _TRIM_BATCH):
+        ids = trim[k:k + _TRIM_BATCH]
+        with store.connect() as con:
+            got = con.execute(f"SELECT id, steps, slots FROM plans WHERE id IN ({','.join('?' * len(ids))}) AND slots IS NOT NULL", ids).fetchall()
+            for r in got:
+                a, b = spans.get(r["id"], (0, 0))
+                steps = [s for s in (json.loads(r["steps"]) if r["steps"] else []) if b > a and a <= int(s["t"]) <= b]
+                kept = json.dumps(steps) if steps else None
+                out["bytes_before"] += len(r["steps"] or "") + len(r["slots"] or "")
+                out["bytes_after"] += len(kept or "")
+                con.execute("UPDATE plans SET steps = ?, slots = NULL WHERE id = ?", (kept, r["id"]))
+        out["trimmed"] += len(got)
+    return out
 
 
 def mark_applied(site_id: str, plan_id: str, day_local: str, by: str, method: str, photo: str = "") -> dict:
@@ -2033,8 +2248,13 @@ def write_log(site_id: str, day: date, primitive: str | None = None) -> list[dic
                            (site_id, lo, hi)).fetchall()
         acks = con.execute("SELECT plan_id, status, body, received_at FROM acks WHERE site_id = ? AND received_at >= ? AND received_at < ?",
                            (site_id, lo, hi)).fetchall()
-        evs = con.execute(f"SELECT ts, type, source, detail FROM events WHERE site_id = ? AND type IN ({','.join('?' * len(WRITE_LOG_EVENTS))})",
-                          (site_id, *WRITE_LOG_EVENTS)).fetchall()
+        # the edge's events of the day (round 7, storage-perf follow-up): their times are ISO texts in any offset, so the (site_id, ts) index reads
+        # the dates a day either side of the day's and the Karachi day is kept below; a time not written date first (none should be) is read too.
+        # Every write-log event of the site was read and parsed before, for any day asked
+        kinds = f"SELECT ts, type, source, detail FROM events WHERE site_id = ? AND type IN ({','.join('?' * len(WRITE_LOG_EVENTS))}) AND "
+        d_lo, d_hi = (date.fromisoformat(lo[:10]) - timedelta(days=1)).isoformat(), (date.fromisoformat(hi[:10]) + timedelta(days=2)).isoformat()
+        evs = con.execute(kinds + "ts >= ? AND ts < ?", (site_id, *WRITE_LOG_EVENTS, d_lo, d_hi)).fetchall()
+        evs += con.execute(kinds + "ts NOT GLOB '[0-9][0-9][0-9][0-9]-*'", (site_id, *WRITE_LOG_EVENTS)).fetchall()
     edge_who = (sites.state(site_id).get("edge_heartbeat") or {}).get("edge_id") or "Edge device"
     rows: list[dict] = []
 

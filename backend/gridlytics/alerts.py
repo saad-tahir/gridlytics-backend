@@ -218,9 +218,9 @@ def _peak_unconfirmed(site: dict, now: int, today: str) -> bool:
         peak = np.asarray(plans.peak_mask(conn, quarters), dtype=bool)
     except (LookupError, ValueError, TypeError):
         return False
+    in_force = plans.InForce(site["id"], t0, t0 + 86400)   # the day's plans read once, not once a peak quarter (audit tests-and-perf-07)
     for t in quarters[peak & (quarters <= now - 1800)]:
-        p = plans.active_at(site["id"], int(t))
-        st = next((s for s in (p or {}).get("steps", []) if s["t"] <= t < s["t"] + 900), None)
+        st = in_force.step(int(t))
         if st and st.get("peak") and (st.get("discharge_kw") or 0) > 0.1:
             return True
     return False
@@ -563,10 +563,11 @@ def _genset_condition(site: dict, now: int, rules_: dict) -> None:
     # unrequested: the step of the plan in force at each such minute did not run the set
     steps_on: dict[int, bool] = {}
     unasked = 0
+    in_force = plans.InForce(sid, now - 3600 - STEP_S, now + 1)   # the hour's plans read once (audit tests-and-perf-07)
     for t in d["ts"][on & grid_up]:
         q = int(t) // STEP_S * STEP_S
         if q not in steps_on:
-            p = plans.active_at(sid, q)
+            p = in_force.at(q)
             st = next((x for x in (p or {}).get("steps", []) if x["t"] <= q < x["t"] + STEP_S), None)
             steps_on[q] = p is None or st is None or bool(st.get("genset_on"))   # no plan in force at it: nothing to hold the run against
         unasked += int(not steps_on[q])
@@ -608,6 +609,31 @@ def _attempt_words(attempt: dict | None) -> str:
     return "The last solve did not produce a plan; the previous plan stays active"
 
 
+#: Why a scheduled tick raised, by its code (scheduler.error_code)
+TICK_ERROR_WORDS = {"no_tariff_version": "a grid connection's tariff has no version in force for the days planned; check the site's tariff",
+                    "tick_error": "an error stopped the planning run; the server's log has the details"}
+
+
+def _tick_error_words(failing: dict) -> str:
+    """The plan_failed alert's words for scheduled ticks that raised: since when, how many, and why. A tick is a "planning run" in words, as the
+    tick_overrun alert and the plan page say it."""
+    n = int(failing.get("ticks") or 1)
+    since = _event_ts(failing.get("since"))
+    when = f" since {_when(since)}" if since is not None and n > 1 else ""
+    return (f"No plan was made at the last {n} planning runs{when}" if n > 1 else "No plan was made at the last planning run") + ": " + \
+        TICK_ERROR_WORDS.get(str(failing.get("reason")), TICK_ERROR_WORDS["tick_error"])
+
+
+def tick_overrun(site_id: str, overran: bool, tick: int, seconds: float) -> None:
+    """Control: the scheduled tick of `tick` (epoch seconds of its quarter) ran into the next quarter's, which was skipped, so no plan was made
+    then (round 7, performance-live-11); cleared by the next tick that ends in time. Raised whatever the site's age: the server, not the site,
+    fell behind."""
+    nxt = datetime.fromtimestamp(int(tick) + 900, PKT)
+    _set(overran, site_id, "tick_overrun", "Control", "warning",
+         f"The planning run of {_when(tick)} took {max(1, round(seconds / 60))} minutes, so the {nxt:%H:%M} run was skipped" if overran else "",
+         {"at": int(tick), "seconds": int(seconds)})
+
+
 def evaluate(site_id: str, now: int | None = None) -> None:
     """Raises and clears the site's alerts. A Control or Savings condition counts only once the site is `settled`: before, it is not raised and an open
     one is closed."""
@@ -621,8 +647,15 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     plan = plans.current(site_id)
     ready = settled(site_id, plan, now)
     latest_attempt = (plan or {}).get("latest_attempt")
-    _set(ready and bool(latest_attempt), site_id, "plan_failed", "Control", "warning", _attempt_words(latest_attempt),
-         {"reason": (latest_attempt or {}).get("reason")})
+    failing = plans.tick_failing(site_id)
+    if failing and failing["status"] == "error":
+        # the scheduled tick raised (round 7, parity-architecture-06): a set-up fault or a bug that keeps every plan away, raised at once, not the
+        # noise of a new site's first days that `settled` waits out
+        _open(site_id, "plan_failed", "Control", "warning", _tick_error_words(failing),
+              {"reason": failing["reason"], "since": failing["since"], "ticks": failing["ticks"]})
+    else:
+        _set(ready and bool(latest_attempt), site_id, "plan_failed", "Control", "warning", _attempt_words(latest_attempt),
+             {"reason": (latest_attempt or {}).get("reason")})
     _gap(site_id, now, float(_th(rules_, "Data", "gap_hours")))
     _edge_events(site_id, now, ready)
     _plan_expired(site_id, plan, now, ready)
@@ -632,9 +665,9 @@ def evaluate(site_id: str, now: int | None = None) -> None:
     margin = float(_th(rules_, "Reserve", "reserve_margin_pct"))
     short = []
     if plan and (site.get("assets") or {}).get("battery"):
+        in_force = plans.InForce(site_id, now - 86400, now)   # the day's plans read once, not once an outage (audit tests-and-perf-07)
         for o in outs:
-            step = plans.active_at(site_id, o["start"])
-            st = next((s for s in (step or {}).get("steps", []) if s["t"] <= o["start"] < s["t"] + 900), None)
+            st = in_force.step(o["start"])
             if st and st.get("reserve_pct") and o["soc_start_pct"] is not None and o["soc_start_pct"] + margin < st["reserve_pct"]:
                 short.append({"start": o["start"], "soc": o["soc_start_pct"], "reserve": st["reserve_pct"]})
     _set(bool(short), site_id, "reserve_short", "Reserve", "warning", "An outage started with the battery below the planned reserve", {"outages": short[:5]})

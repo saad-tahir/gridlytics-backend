@@ -28,7 +28,7 @@ DEFAULT_ORG = "default"
 _ORG: ContextVar[str] = ContextVar("gridlytics_org", default=DEFAULT_ORG)
 _DB: ContextVar[Path | None] = ContextVar("gridlytics_db", default=None)
 _ACTOR: ContextVar[dict | None] = ContextVar("gridlytics_actor", default=None)
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _lock = threading.Lock()
 
 
@@ -237,10 +237,26 @@ _V4 = [
 _V5_COLUMNS = (("reports", "generated_by", "TEXT NOT NULL DEFAULT ''"), ("alerts", "history", "TEXT NOT NULL DEFAULT '[]'"),
                ("alerts", "assigned_id", "TEXT NOT NULL DEFAULT ''"))
 
-
 #: Version 6 (round 7 sweeps, audit parity-architecture-12): a report keeps the stamp of the engine that made it (version.stamp(); '' for a report made
 #: before). A plan's (summary), a savings day's (data) and a bill rebuild's (rebuilt) go in their JSON columns
 _V6_COLUMNS = (("reports", "engine", "TEXT NOT NULL DEFAULT ''"),)
+
+
+#: Version 7 (round 7, storage-perf; 6 is sweeps'): the indexes the plan, message and ack reads use (audit performance-live-01, tests-and-perf-06).
+#: plans.active_at, the replays and the retention read plans by (site, belief time), which the (site, generated_at) index could not order, so every
+#: call scanned and sorted the site's whole history; the edge page, the write log and the control page read a site's messages and acks by time.
+_V7 = [
+    "CREATE INDEX IF NOT EXISTS plans_belief ON plans (site_id, belief_time)",
+    "CREATE INDEX IF NOT EXISTS plan_messages_site ON plan_messages (site_id, sent_at)",
+    "CREATE INDEX IF NOT EXISTS acks_site ON acks (site_id, received_at)",
+    # each scheduled tick of the company's file, apart from manual re-solves (audit performance-live-09, performance-live-11): its start, end and
+    # length, the active sites, those that made no plan, the worker threads, the slowest site, and whether it ran into the next quarter's tick
+    """CREATE TABLE IF NOT EXISTS ticks (tick TEXT PRIMARY KEY, started TEXT NOT NULL, finished TEXT NOT NULL, seconds REAL NOT NULL,
+        sites INTEGER NOT NULL, failed INTEGER NOT NULL, workers INTEGER NOT NULL, slowest_site TEXT, slowest_s REAL, overran INTEGER NOT NULL DEFAULT 0)""",
+]
+#: and a scheduled tick that raised keeps the error's type and words in its runs row (audit parity-architecture-06: it left no row at all), and each
+#: runs row the site's whole time in the tick, its alerts included (audit performance-live-09)
+_V7_COLUMNS = (("runs", "error", "TEXT NOT NULL DEFAULT ''"), ("runs", "seconds", "REAL"))
 
 
 def _migrate(con: sqlite3.Connection, version: int) -> None:
@@ -265,6 +281,12 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
         for table, column, kind in _V6_COLUMNS:
             if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    if version < 7:
+        for sql in _V7:
+            con.execute(sql)
+        for table, column, kind in _V7_COLUMNS:
+            if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
 
 def backup(tag: str) -> Path | None:
@@ -286,9 +308,32 @@ def backup(tag: str) -> Path | None:
     return target
 
 
+#: The workspace files this process has seen in WAL mode at SCHEMA_VERSION, by path, device and inode: a later connection to one is opened without the
+#: two PRAGMA round trips (round 7, audit performance-live-08: a fleet answer opened about 8 connections a site, and their PRAGMAs were a good part of
+#: its time). Both settings live in the file, so they hold until another file takes its place: a restore forgets them (forget_ready).
+_ready: set[tuple[str, int, int]] = set()
+
+
+def _file_key(path: Path) -> tuple[str, int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (str(path), st.st_dev, st.st_ino)
+
+
+def forget_ready() -> None:
+    """Check every workspace file's journal mode and schema again on its next connection (backups.restore: a copy put back may be older)."""
+    _ready.clear()
+
+
 def _connect() -> sqlite3.Connection:
     """A connection to the current workspace file at the current schema; a file is migrated the first time it is opened, a copy first when it holds data."""
     path = db_path()
+    if _file_key(path) in _ready:
+        con = sqlite3.connect(path, timeout=30)
+        con.row_factory = sqlite3.Row
+        return con
     path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path, timeout=30)
     con.row_factory = sqlite3.Row
@@ -296,6 +341,7 @@ def _connect() -> sqlite3.Connection:
         with _lock:
             con.execute("PRAGMA journal_mode=WAL")
     if con.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+        _seen_ready(path)
         return con
     with _lock:
         version = con.execute("PRAGMA user_version").fetchone()[0]
@@ -315,12 +361,56 @@ def _connect() -> sqlite3.Connection:
                 con.execute("ROLLBACK")
                 raise
             con.isolation_level = ""
+    _seen_ready(path)
     return con
+
+
+def _seen_ready(path: Path) -> None:
+    key = _file_key(path)
+    if key is not None:
+        _ready.add(key)
+
+
+#: The connections a `shared()` block holds: the thread that opened it and one connection a workspace file (round 7, audit performance-live-08)
+_SHARED: ContextVar[dict | None] = ContextVar("gridlytics_shared_connections", default=None)
+
+
+@contextmanager
+def shared():
+    """Inside the block, every connect() of this thread on a workspace file uses one connection, opened at its first use and closed at the block's end,
+    instead of a connection a call (round 7, audit performance-live-08: GET /fleet opened about 8 connections a site, each loading the schema again).
+    Each connect() block still commits at its end, and rolls back what it wrote when it raises; write_transaction keeps a connection of its own, and
+    another thread (a job started inside) opens its own as before. A shared() inside another is the outer one. For a read-mostly request whose
+    connect() blocks do not sit inside each other's writes."""
+    if _SHARED.get() is not None:
+        yield
+        return
+    held: dict = {"thread": threading.get_ident(), "cons": {}}
+    token = _SHARED.set(held)
+    try:
+        yield
+    finally:
+        _SHARED.reset(token)
+        for con in held["cons"].values():
+            con.close()
 
 
 @contextmanager
 def connect():
-    """A connection closed at the end of the block; commits on success."""
+    """A connection closed at the end of the block; commits on success. Inside a `shared()` block of this thread, that block's connection."""
+    held = _SHARED.get()
+    if held is not None and held["thread"] == threading.get_ident():
+        key = str(db_path())
+        con = held["cons"].get(key)
+        if con is None:
+            con = held["cons"][key] = _connect()
+        try:
+            yield con
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+        return
     con = _connect()
     try:
         yield con

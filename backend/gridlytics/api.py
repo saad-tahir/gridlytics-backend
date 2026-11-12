@@ -23,10 +23,12 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES as _GZIP_SKIPPED
 
 from . import __version__, apikeys, auth, backups, companies, identity, money, store, store_members, telemetry, version
 from . import platform as platformdb
@@ -401,6 +403,53 @@ app.add_middleware(_BodyLimit)
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_origin_regex=CORS_ORIGIN_REGEX, allow_credentials=False,
                    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"], allow_headers=CORS_ALLOW_HEADERS, expose_headers=CORS_EXPOSE_HEADERS,
                    max_age=600)
+# An answer of GZIP_MIN_BYTES or more goes gzipped to a client that says it takes gzip (round 7, audit performance-live-10, tests-and-perf-22: the plan page
+# fetched about 170 KB of JSON that gzip makes about 14 KB, the overview's chart came again every minute, a 14-day CSV export was 2.2 MB). Outermost, so
+# it packs the answer as the guard made it (a viewer's without its money) with its headers; level 6, zlib's own, packs a 2 MB export in about a tenth of a
+# second where 9 takes twice that for under 1 % less. A PDF is compressed already, as are the images, which Starlette leaves alone.
+GZIP_MIN_BYTES = 1000
+#: An answer of known length up to this many bytes reaches the gzip layer whole (_WholeBody); a longer one, a report file, streams and is packed in parts
+WHOLE_BODY_MAX = 4 * 1024 * 1024
+
+
+class _WholeBody:
+    """An answer whose Content-Length is at most WHOLE_BODY_MAX goes on as one body message. The guard (an http middleware) passes every answer on in
+    parts, which GZipMiddleware packs whatever their size, without a Content-Length: whole, an answer under GZIP_MIN_BYTES is sent as it is and a
+    packed one keeps its length."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.inner(scope, receive, send)
+        held: dict = {}
+        parts: list[bytes] = []
+
+        async def whole(message):
+            kind = message["type"]
+            if kind == "http.response.start":
+                length = next((v for k, v in message.get("headers", []) if k.lower() == b"content-length"), b"")
+                if length.isdigit() and int(length) <= WHOLE_BODY_MAX and not message.get("trailers"):
+                    held["start"] = message
+                    return
+            elif "start" in held and kind == "http.response.body":
+                parts.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                await send(held.pop("start"))
+                await send({"type": "http.response.body", "body": b"".join(parts), "more_body": False})
+                return
+            elif "start" in held:                               # anything else (a path sent by the server) goes as it came, after the start
+                await send(held.pop("start"))
+            await send(message)
+
+        await self.inner(scope, receive, whole)
+
+
+app.add_middleware(_WholeBody)
+app.add_middleware(GZipMiddleware, minimum_size=GZIP_MIN_BYTES, compresslevel=6,
+                   exclude_content_types=(*_GZIP_SKIPPED, "application/pdf"))
 
 
 @app.exception_handler(StarletteHTTPException)

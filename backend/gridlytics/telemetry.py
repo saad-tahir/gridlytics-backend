@@ -5,6 +5,7 @@ of each minute's start. Blanks are missing, never zero; a missing genset signal 
 """
 from __future__ import annotations
 
+import contextvars
 import csv
 import hashlib
 import io
@@ -1008,6 +1009,16 @@ def latest(site_id: str) -> dict | None:
     return {k: _finite(v) for k, v in dict(r).items()} if r else None
 
 
+def last_ts(site_ids) -> dict[str, int | None]:
+    """Each site's newest minute (its ts, None with none) in one connection: the site list's last-data stamps (round 7, audit performance-live-08). One
+    MAX(ts) a site, which the (site_id, ts) key answers from its last entry, where a GROUP BY would read every stored minute."""
+    ids = list(dict.fromkeys(site_ids))
+    if not ids:
+        return {}
+    with reading() as con:
+        return {sid: con.execute("SELECT MAX(ts) FROM minute WHERE site_id = ?", (sid,)).fetchone()[0] for sid in ids}
+
+
 def first_ts(site_id: str) -> int | None:
     with reading() as con:
         r = con.execute("SELECT MIN(ts) FROM minute WHERE site_id = ?", (site_id,)).fetchone()
@@ -1054,19 +1065,100 @@ def soc_source(site_id: str, state: dict | None) -> str | None:
     return "estimate" if r["est"] is not None else "bms" if r["bms"] is not None else None
 
 
-def raw(site_id: str, t0: int, t1: int, columns: tuple = COLUMNS[3:]) -> dict:
+#: the minute columns that hold text, not numbers
+TEXT_COLUMNS = ("inverter_mode_active", "quality_flags")
+
+
+def _read(site_id: str, t0: int, t1: int, columns) -> dict:
+    """The minute rows of [t0, t1) of the named columns, as arrays: numbers as float (a blank or non-finite value NaN), text as lists. The numbers come
+    from the database as one float block (a blank read as infinity, then NaN): about twice as fast as a list comprehension per column, which cost
+    a tick about 0.05 s per 30 days per column set (round 7, audit tests-and-perf-09)."""
+    nums = [c for c in columns if c not in TEXT_COLUMNS]
+    text = [c for c in columns if c in TEXT_COLUMNS]
+    where = "FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts"
+    args = (site_id, int(t0), int(t1))
     with reading() as con:
-        rows = con.execute(f"SELECT ts, {', '.join(columns)} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
-                           (site_id, int(t0), int(t1))).fetchall()
-    out = {"ts": np.array([r[0] for r in rows], dtype=np.int64)}
-    for i, c in enumerate(columns):
-        if c in ("inverter_mode_active", "quality_flags"):
-            out[c] = [r[i + 1] for r in rows]
-        else:
-            a = np.array([np.nan if r[i + 1] is None else r[i + 1] for r in rows], dtype=float)
-            a[~np.isfinite(a)] = np.nan  # a non-finite value stored before ingest refused them is missing
-            out[c] = a
+        cur = con.cursor()
+        cur.row_factory = None
+        cur.execute(f"SELECT {', '.join(['ts'] + [f'IFNULL({c}, 9e999)' for c in nums])} {where}", args)
+        block = np.fromiter(cur, dtype=np.dtype((np.float64, 1 + len(nums))))
+        rows = con.execute(f"SELECT {', '.join(text)} {where}", args).fetchall() if text else []
+    out = {"ts": block[:, 0].astype(np.int64)}
+    for i, c in enumerate(nums):
+        a = np.ascontiguousarray(block[:, i + 1])
+        a[~np.isfinite(a)] = np.nan  # a blank, or a non-finite value stored before ingest refused them, is missing
+        out[c] = a
+    for i, c in enumerate(text):
+        out[c] = [r[i] for r in rows]
     return out
+
+
+def raw(site_id: str, t0: int, t1: int, columns: tuple = COLUMNS[3:]) -> dict:
+    """The minute rows of [t0, t1): `ts` and the named columns. Inside a `window` of the site that covers the range they come from the window's one
+    read, not the file."""
+    w = _window.get()
+    if w is not None and w.covers(site_id, t0, t1):
+        return w.raw(int(t0), int(t1), tuple(columns))
+    return _read(site_id, t0, t1, columns)
+
+
+class _Window:
+    """A site's minute rows over [t0, t1), read from the file once per column (round 7, audit tests-and-perf-09: each tick read about four months
+    of rows a site, 17 columns, in seven overlapping reads: the forecasters' 14, 21 and 28 days, the month to date and two 30-day battery
+    estimates, the tick's and the alerts'). Every raw and minute_grid read of the site inside the range is a slice of it."""
+
+    def __init__(self, site_id: str, t0: int, t1: int):
+        self.site_id, self.t0, self.t1, self.path = site_id, int(t0), int(t1), store.telemetry_path()
+        self.ts: np.ndarray | None = None
+        self.cols: dict = {}
+        self.reads = 0
+
+    def covers(self, site_id: str, t0: int, t1: int) -> bool:
+        return site_id == self.site_id and self.t0 <= int(t0) and int(t1) <= self.t1 and store.telemetry_path() == self.path
+
+    def raw(self, t0: int, t1: int, columns: tuple) -> dict:
+        missing = [c for c in columns if c not in self.cols]
+        if missing or self.ts is None:
+            # the columns asked for first, and the minute grid's with them: the forecasters, the battery and the bill all read those
+            want = list(dict.fromkeys([*missing, *(c for c in GRID_COLUMNS if c not in self.cols)])) if self.ts is None else missing
+            d = _read(self.site_id, self.t0, self.t1, want)
+            self.reads += 1
+            if self.ts is None:
+                self.ts = d["ts"]
+            elif len(d["ts"]) != len(self.ts) or not np.array_equal(d["ts"], self.ts):
+                # rows arrived since the first read: the window starts again from this read, so its columns share one set of minutes
+                self.ts, self.cols = d["ts"], {}
+                return self.raw(t0, t1, columns)
+            self.cols.update({c: d[c] for c in want})
+        i, j = np.searchsorted(self.ts, [t0, t1], side="left")
+        out = {"ts": self.ts[i:j].copy()}
+        for c in columns:
+            v = self.cols[c]
+            out[c] = v[i:j].copy() if isinstance(v, np.ndarray) else v[i:j]
+        return out
+
+
+_window: "contextvars.ContextVar[_Window | None]" = contextvars.ContextVar("telemetry_window", default=None)
+
+
+@contextmanager
+def window(site_id: str, t0: int, t1: int):
+    """Read the site's minute rows of [t0, t1) once (per column) for everything inside: the tick and the alerts after it (scheduler, the re-solve).
+    A window already open for the site over the range is kept; another site's reads, or a range it does not cover, go to the file. What arrives
+    while it is open is read only once a column not read yet is asked for (then the window reads again from the file)."""
+    w = _window.get()
+    if w is not None and w.covers(site_id, t0, t1):
+        yield w
+        return
+    token = _window.set(_Window(site_id, t0, t1))
+    try:
+        yield _window.get()
+    finally:
+        _window.reset(token)
+
+
+#: the columns a minute grid reads
+GRID_COLUMNS = COLUMNS[3:] + ("censored",)
 
 
 def minute_grid(site_id: str, t0: int, t1: int) -> dict:
@@ -1077,7 +1169,7 @@ def minute_grid(site_id: str, t0: int, t1: int) -> dict:
     back to the BMS reading where the estimate is missing (a CSV source never carries the estimate); `soc_est` keeps the estimate alone."""
     t0 = int(t0)
     t1 = t0 + max(0, (int(t1) - t0) // 60) * 60
-    d = raw(site_id, t0, t1, COLUMNS[3:] + ("censored",))
+    d = raw(site_id, t0, t1, GRID_COLUMNS)
     n = (t1 - t0) // 60
     ts = np.arange(t0, t1, 60, dtype=np.int64)
     idx = ((d["ts"] - t0) // 60).astype(int)
@@ -1399,7 +1491,9 @@ def aggregate_day(site_id: str, day: date, peak_flags: np.ndarray | None = None,
             "throughput_kwh": round(float(np.nansum(np.abs(np.minimum(g["bat"], 0))) / 60), 2),
             "discharge_kwh": round(float(np.nansum(np.maximum(g["bat"], 0)) / 60), 2),
             "outage_minutes": int(np.sum(g["grid"] == 0)), "unserved_kwh": round(float(f["unserved"].sum() / 60), 2),
-            "completeness": round(g["completeness"], 4), "import_completeness": round(g["imp_completeness"], 4)}
+            "completeness": round(g["completeness"], 4), "import_completeness": round(g["imp_completeness"], 4),
+            # the newest minute in the row, so a reader of today's row knows when a newer one has arrived (round 7, audit tests-and-perf-10)
+            "last_ts": int(g["ts"][np.flatnonzero(g["present"])[-1]])}
     if peak_flags is not None:
         data["peak_import_kwh"] = round(float(imp[peak_flags].sum() / 60), 2)
     if keep:

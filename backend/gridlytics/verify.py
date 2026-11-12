@@ -647,18 +647,15 @@ def native_for_day(site_id: str, day: date) -> dict | None:
     end = datetime.fromtimestamp(twin.day_start_utc(day) + 86400, timezone.utc).isoformat(timespec="seconds")
     with store.connect() as con:
         r = None
+        cols = sites.NATIVE_COLUMNS     # never the photograph (audit tests-and-perf-08)
         if pin is not None:
-            r = con.execute("SELECT * FROM native_settings WHERE site_id = ? AND version = ?", (site_id, pin["version"])).fetchone()
+            r = con.execute(f"SELECT {cols} FROM native_settings WHERE site_id = ? AND version = ?", (site_id, pin["version"])).fetchone()
         if r is None:
-            r = con.execute("SELECT * FROM native_settings WHERE site_id = ? AND captured_at <= ? ORDER BY version DESC LIMIT 1", (site_id, end)).fetchone()
+            r = con.execute(f"SELECT {cols} FROM native_settings WHERE site_id = ? AND captured_at <= ? ORDER BY version DESC LIMIT 1",
+                            (site_id, end)).fetchone()
         if r is None:
-            r = con.execute("SELECT * FROM native_settings WHERE site_id = ? ORDER BY version ASC LIMIT 1", (site_id,)).fetchone()
-    if r is None:
-        return None
-    d = dict(r)
-    d["body"] = json.loads(d["body"])
-    d["has_photo"] = bool(d.pop("photo", None))
-    return d
+            r = con.execute(f"SELECT {cols} FROM native_settings WHERE site_id = ? ORDER BY version ASC LIMIT 1", (site_id,)).fetchone()
+    return sites.native_row(r)
 
 
 #: a baseline day counts as complete when at least this share of its minutes was read: past the 5 % of unread minutes at which a replay withholds
@@ -1417,8 +1414,9 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
     projected = on_grid and int(datetime.now(timezone.utc).timestamp()) < _billing_bounds(conn, day)[1]
     basis = _price_basis(pr, _fuel_rs_per_l(gen_asset, day))
     with store.connect() as con:
-        applied = con.execute("SELECT * FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1",
-                              (site_id, day.isoformat())).fetchone()
+        # the mark's columns but its photograph, which nothing here reads (audit tests-and-perf-08)
+        applied = con.execute("SELECT id, site_id, plan_id, day_local, by, method, confirmation, fidelity, data, created FROM applied "
+                              "WHERE site_id = ? AND day_local = ? ORDER BY created DESC, rowid DESC LIMIT 1", (site_id, day.isoformat())).fetchone()
         r = con.execute("SELECT arm FROM switchback WHERE site_id = ? AND block_start <= ? AND block_end >= ? ORDER BY locked DESC, block_start DESC",
                         (site_id, day.isoformat(), day.isoformat())).fetchone()
     switch = r["arm"] if r else None

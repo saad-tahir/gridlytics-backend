@@ -6,11 +6,14 @@ estimate column when a source sends one and the BMS value otherwise, and grows s
 """
 from __future__ import annotations
 
+import json
+import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 import numpy as np
 
-from . import optimise, telemetry
+from . import optimise, store, telemetry
 
 #: R6 5.3's full-charge anchors (A1, A3) on cloud data: the estimate at 98 % or more
 FULL_CHARGE = 0.98
@@ -197,3 +200,34 @@ def state(site: dict, now: int | None = None) -> dict | None:
             "hot_full_hours_24h": round(float(hot), 1), "wear_30d_rs": round(float(disch * optimise.wear_cost(b)), 0), "last_ts": int(g["ts"][last]),
             "waiting_for_anchor": anchor_ts is None, "reading_age_min": round(age_min, 1), "stale": bool(age_min > STALE_MINUTES),
             "anchor_due": anchor_due, "anchor_soc_pct": round(target * 100, 1) if anchor_due else None}
+
+
+#: how long a page's battery estimate is reused (estimate): the overview's 30-second poll and the battery page's read share one per minute
+ESTIMATE_REUSE_S = 60
+_ESTIMATES_KEPT = 512
+_estimates: "OrderedDict[tuple, tuple[int, dict | None]]" = OrderedDict()
+_estimates_lock = threading.Lock()
+
+
+def estimate(site: dict, now: int | None = None, last_ts: int | None = None) -> dict | None:
+    """`state` for a page: reused for ESTIMATE_REUSE_S while the site's newest reading (`last_ts`, telemetry.latest's ts) and its battery are the
+    same, so a site's open tabs share one 30-day read a minute (round 7, audit performance-live-02: every 30-second /now poll of every open tab
+    re-read 30 days of minutes, about 0.1 s of the API's one worker; the battery page read it twice a refresh, /now and /battery). A new reading,
+    a changed battery or another company's file computes it again; the solve reads `state` itself."""
+    b = (site.get("assets") or {}).get("battery")
+    if not b:
+        return None
+    now = int(now or datetime.now(timezone.utc).timestamp())
+    key = (str(store.telemetry_path()), site["id"], json.dumps(b, sort_keys=True, default=str), last_ts)
+    with _estimates_lock:
+        hit = _estimates.get(key)
+        if hit is not None and 0 <= now - hit[0] < ESTIMATE_REUSE_S:
+            _estimates.move_to_end(key)
+            return dict(hit[1]) if hit[1] is not None else None
+    st = state(site, now)
+    with _estimates_lock:
+        _estimates[key] = (now, st)
+        _estimates.move_to_end(key)
+        while len(_estimates) > _ESTIMATES_KEPT:
+            _estimates.popitem(last=False)
+    return dict(st) if st is not None else None

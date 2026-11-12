@@ -80,8 +80,14 @@ def walk(tmp_path_factory):
     edge_site = next(s["id"] for s in fleet if s["tier"] == "closed_loop")
     # money in places a page reads rarely: a fuel log's cost, a monthly savings report and an energy-only one, a draft
     assert client.post(f"/api/sites/{sids[0]}/genset/fuel", headers=h["operator"], json={"litres": 50, "cost_rs": 14321.5, "note": "tanker"}).status_code == 200
+    jobs_ = []
     for kind in ("monthly_savings", "energy_only"):
-        assert client.post("/api/reports", headers=h["admin"], json={"kind": kind, "site_id": sids[0]}).status_code == 200
+        r = client.post("/api/reports", headers=h["admin"], json={"kind": kind, "site_id": sids[0]})
+        assert r.status_code == 200, r.text
+        jobs_.append(r.json()["job_id"])                # a report is made as a job (round 7, storage-perf): GET /api/reports/jobs/{job_id}
+    r = client.post(f"/api/sites/{sids[0]}/plan/solve", headers=h["admin"])
+    assert r.status_code in (200, 202), r.text           # 202 while a slow solve still runs: its job is read all the same
+    jobs_.append(r.json()["job_id"])                    # and a re-solve (round 7, storage-perf): GET /api/sites/{site_id}/jobs/{job_id}
     assert client.put("/api/drafts/walk-draft", headers=h["admin"], json={"name": "Half a site"}).status_code == 200
     k = client.post("/api/platform/keys", headers=h["admin"], json={"name": "walk", "scopes": ["sites:read", "plans:read"], "site_id": edge_site,
                                                                     "kind": "edge"})
@@ -93,7 +99,7 @@ def walk(tmp_path_factory):
         rows = client.get(f"/api/sites/{sid}/plans", headers=h["admin"]).json()
         rows = rows.get("plans", rows) if isinstance(rows, dict) else rows
         plan_ids[sid] = [rows[0]["id"]] if rows else []
-    fill = {"kind": ["pv", "load", "outage"], "draft_id": ["walk-draft"]}
+    fill = {"kind": ["pv", "load", "outage"], "draft_id": ["walk-draft"], "job_id": jobs_}
 
     answers: dict[str, dict[str, dict[str, tuple]]] = {}
     unfilled = []
@@ -269,7 +275,9 @@ def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]
     sid = walk["sites"][0]
-    r = client.get(f"/api/sites/{sid}/pilot/calendar.ics", headers=h["viewer"])
+    # unpacked (Accept-Encoding: identity): a file over a kilobyte goes gzipped to a client that takes it (audit R7 performance-live-10), so its length
+    # is then the packed one
+    r = client.get(f"/api/sites/{sid}/pilot/calendar.ics", headers={**h["viewer"], "Accept-Encoding": "identity"})
     assert r.status_code in (200, 404), r.text
     if r.status_code == 200:
         assert not r.headers["content-type"].startswith("application/json") and int(r.headers["content-length"]) == len(r.content)

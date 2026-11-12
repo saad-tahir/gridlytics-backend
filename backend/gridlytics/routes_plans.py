@@ -1,16 +1,20 @@
 """The plan (UI-09) and the control plane (UI-15): the current plan with its reasons, versions, re-solve, apply, compare, hold and release."""
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import math
+import threading
 import time
+from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Response
 from pydantic import Field, field_validator
 
-from . import auth, delivery, optimise, plans, sites, store, twin, verify
+from . import auth, delivery, jobs, optimise, plans, sites, store, twin, verify
 from .routes_common import full_or_404, now_ts, out, site_or_404, today
 from .schemas import Refusal, Strict, check
 from .routes_common import bad
@@ -113,48 +117,35 @@ RESUMED_KINDS = ("pause_control", "force_native", "reserve")
 def plan_current(site_id: str):
     """The plan in force, or `{plan: null, held}` when none is: `held` says why ({reason, until, plan_id}: control paused or released to native until
     a time, a native-block day of the switchback calendar until the block ends, the latest plan held by its guard, or the last plan past its
-    valid_until, with `since` its end), and is null when no plan was made yet (or the last solve failed).
+    valid_until, with `since` its end), and is null when no plan was made yet (or the last solve failed). Both answers carry `failing` while the
+    scheduled ticks make no plan (plans.tick_failing: how many in a row, since when and why), and leave it out otherwise.
     A pause or a release to native in force answers `{plan: null, held}` even while the plan of before it is still stored as active: no plan is in force
     under one (plans.active_at), and the tick stores its plan as held only at the next quarter."""
     site_or_404(site_id)
+    # the scheduled ticks failing now (round 7, parity-architecture-06): the empty page says why no plan comes, never "within 15 minutes"
+    failing = {"failing": f} if (f := plans.tick_failing(site_id)) else {}
     rel = plans.control_release(site_id, now_ts())
     if rel is not None:
         held = _held(site_id) or {"reason": rel.get("reason"), "until": rel.get("until"), "plan_id": None}
-        return {"plan": None, "held": held}
+        return {"plan": None, "held": held, **failing}
     p = plans.current(site_id)
     if p is None:
-        return {"plan": None, "held": _held(site_id)}
+        return {"plan": None, "held": _held(site_id), **failing}
     p["now_next"] = plans.now_and_next(p)
-    return out({"plan": p})
+    return out({"plan": p, **failing})
 
 
 def _held(site_id: str) -> dict | None:
-    """Why no plan is in force: plans.held_info where the optimiser provides it, else derived here from the pause or release in force (its reason and
-    end) and the latest plan row (held: its id, and its guard's reason when no pause or release is in force)."""
-    now = now_ts()
-    info = getattr(plans, "held_info", None)
-    if callable(info):
-        try:
-            try:
-                h = info(site_id, now)
-            except TypeError:
-                h = info(site_id)
-            if h is None:
-                return None
-            out_h = {"reason": h.get("reason"), "until": h.get("until"), "plan_id": h.get("plan_id")}
-            if h.get("since"):
-                out_h["since"] = h["since"]                 # an expired plan: when it ran out
-            return out_h
-        except Exception:
-            log.exception("plans.held_info failed for site %s; the held answer is derived here", site_id)
-    rel = plans.control_release(site_id, now)
-    last = (plans.history(site_id, 1) or [None])[0]
-    held_id = last["id"] if last and last.get("status") == "held" else None
-    if rel:
-        return {"reason": rel["reason"], "until": rel.get("until"), "plan_id": held_id if held_id and last.get("reason") == rel["reason"] else None}
-    if held_id:
-        return {"reason": last.get("reason") or "held", "until": None, "plan_id": held_id}
-    return None
+    """Why no plan is in force, as plans.held_info reads it at the request's time: `{reason, until, plan_id}`, with `since` for a plan that ran out.
+    A fault in held_info is the server's error (round 7, the product half of audit tests-and-perf-20: a fallback from before held_info existed
+    caught it and derived an answer of its own, so a fault was logged and hidden)."""
+    h = plans.held_info(site_id, now_ts())
+    if h is None:
+        return None
+    out_h = {"reason": h.get("reason"), "until": h.get("until"), "plan_id": h.get("plan_id")}
+    if h.get("since"):
+        out_h["since"] = h["since"]                 # an expired plan: when it ran out
+    return out_h
 
 
 @router.get("/api/sites/{site_id}/plans")
@@ -182,21 +173,110 @@ def plan_get(site_id: str, plan_id: str):
     return out({"plan": p})
 
 
+#: how long a request that re-solves waits for its job before it answers 202 with the job to read (round 7, audit performance-live-05): a solve
+#: takes seconds (3.6 s measured, up to three 10-second limits), so most answer at once, and none holds a request near a proxy's read timeout
+SOLVE_WAIT_S = 10.0
+
+
+def _owner() -> str:
+    """Whose job a re-solve is: the signed-in person's id (their name where there is none)."""
+    return str((auth.current.get() or {}).get("id") or auth.actor())
+
+
+_site_locks: dict[tuple[str, str], threading.Lock] = {}
+_site_locks_guard = threading.Lock()
+
+
+def _site_lock(site_id: str) -> threading.Lock:
+    """One re-solve of a site at a time: a second action's re-solve waits for the first, then solves with its own override in place."""
+    key = (str(store.db_path()), site_id)
+    with _site_locks_guard:
+        return _site_locks.setdefault(key, threading.Lock())
+
+
+def _start_resolve(site_id: str, action: str) -> jobs.Job:
+    """The re-solve after `action` ("solve" for POST /plan/solve) as a job on the job pool (jobs.py), in the request's company and with its person
+    for the audit: a demo site's twin first catches up to now, then plans.tick in the site's history window, today's table issued, and its outcome as
+    POST /plan/solve answers it. Each action has its own (one after another for a site); it runs to its end, its page open or not."""
+    def run(progress, stopped) -> dict:
+        from . import scheduler
+        with _site_lock(site_id):
+            return _resolve(site_id, action, scheduler)
+    try:
+        return jobs.start("resolve", site_id, _owner(), f"resolve:{site_id}:{action}:{time.time_ns()}", run, cache=False, abandon=False)
+    except jobs.Refused as exc:
+        raise Refusal(429, str(exc), "rate_limited") from None
+
+
+def _resolve(site_id: str, action: str, scheduler) -> dict:
+    """The tick after a control action or a re-solve. A failed tick is reported, not raised: the action itself stands (the next scheduled tick tries
+    again); its reason is the scheduled tick's code (no_tariff_version, tick_error) after a re-solve, a sentence naming the action after one."""
+    try:
+        if (sites.get(site_id) or {}).get("demo_link"):    # a demo site's twin first catches up to now
+            from . import demo
+            demo.advance(site_id)
+        with scheduler.history_window(site_id):
+            r = plans.tick(site_id)
+    except Exception as exc:
+        log.exception("the re-solve after %s failed for site %s", action, site_id)
+        reason = (scheduler.error_code(exc) if action == "solve"
+                  else f"The re-solve after {_AFTER[action]} failed ({type(exc).__name__}); the next scheduled tick tries again")
+        return {"status": "failed", "plan_id": None, "reason": reason, "in_force": None, "solve_seconds": None}
+    store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"], **({} if action == "solve" else {"after": action})})
+    # a hold of any kind (the battery's, the genset's, a charging block, a forced charge) and a resume issue today's table at once
+    _issue(site_id, force=None if action == "solve" else "hold" if action == "hold" or action in OVERRIDE_ACTIONS else "resume" if action == "resume"
+           else None)
+    reason = r.get("reason")
+    if action != "solve" and r["status"] == "held" and not reason:
+        # why the tick held its plan (it answers that only in the plan's row): the pause or release in force, else the wrong-plan guard's rule, and
+        # then the plan of before stays in force (a hold the site can keep only by shedding load with the grid up, say)
+        rel = plans.control_release(site_id)
+        reason = rel["reason"] if rel else (r.get("summary") or {}).get("guard")
+    # the plan in force after it (null: none), so the page says "the plan of before stays in force" only when one does; a failed solve's reason is a
+    # code (plans.failure_code)
+    return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": reason, "solve_seconds": r.get("solve_seconds"), "in_force": r.get("in_force")}
+
+
+def _job_outcome(job: jobs.Job, control: bool = False) -> dict:
+    """A re-solve job's answer: its outcome once done, as POST /plan/solve answered it before, with `job_id` (a control action's `resolve` as
+    before, without `solve_seconds` or `job_id`), else `{status: queued | running, job_id}` to read at GET /sites/:id/jobs/:job_id."""
+    if job.state in jobs.ACTIVE:
+        out_ = {"status": job.state, "plan_id": None, "reason": None, "solve_seconds": None, "in_force": None, "job_id": job.id}
+    elif job.state == "done" and job.result is not None:
+        out_ = {**job.result, "job_id": job.id}
+    else:
+        out_ = {"status": "failed", "plan_id": None, "reason": "tick_error", "solve_seconds": None, "in_force": None, "job_id": job.id}
+    if control:
+        out_.pop("solve_seconds", None)
+        if job.state not in jobs.ACTIVE:
+            out_.pop("job_id", None)
+    return out_
+
+
 @router.post("/api/sites/{site_id}/plan/solve")
-def plan_solve(site_id: str):
+def plan_solve(site_id: str, response: Response):
+    """Re-solve the plan now (run_jobs; one a site every 30 seconds). The solve runs as a job (jobs.py): the answer is its outcome when it ends within
+    SOLVE_WAIT_S, else 202 with `{status: queued | running, job_id}`, read at GET /sites/:id/jobs/:job_id (round 7, audit performance-live-05)."""
     auth.need("run_jobs", "Re-solving the plan")
-    s = site_or_404(site_id)
+    site_or_404(site_id)
     if time.monotonic() - _last_solve.get(site_id, -1e9) < 30:
         raise Refusal(429, "The plan was re-solved less than 30 seconds ago", "rate_limited")
     _last_solve[site_id] = time.monotonic()
-    if s.get("demo_link"):
-        from . import demo
-        demo.advance(site_id)
-    r = plans.tick(site_id)
-    store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"]})
-    _issue(site_id)
-    return out({"status": r["status"], "plan_id": r.get("plan_id"), "reason": r.get("reason"), "solve_seconds": r.get("solve_seconds"),
-                "in_force": r.get("in_force")})
+    job = jobs.wait(_start_resolve(site_id, "solve"), SOLVE_WAIT_S)
+    if job.state in jobs.ACTIVE:
+        response.status_code = 202
+    return out(_job_outcome(job))
+
+
+@router.get("/api/sites/{site_id}/jobs/{job_id}")
+def plan_solve_job(site_id: str, job_id: str):
+    """A re-solve job of the caller's (POST /plan/solve, or a control action's): `{status: queued | running, job_id}` while it runs, then its outcome
+    as POST /plan/solve answers it. Another person's job, another site's or one forgotten (an hour after it ended, or after a restart) is a 404."""
+    site_or_404(site_id)
+    job = jobs.get(job_id, site_id, _owner())
+    if job is None or job.kind != "resolve":
+        raise Refusal(404, "No such re-solve: it ended over an hour ago, or the server restarted since", "not_found")
+    return out(_job_outcome(job))
 
 
 def _issue(site_id: str, force: str | None = None) -> None:
@@ -267,6 +347,52 @@ def plan_compare(site_id: str):
     if first is None or now_ts() - int(first) < COMPARE_MIN_DATA_S:
         return {"compare": None, "reason": "too_little_data"}
     steps = p["steps"]
+    price, basis = _short_price(s, steps[0]["t"])
+    # the same plan against the same capture, plant (its assets, settings and grid connection: twin.plant_of) and price is replayed once, and
+    # members asking at once while it is being made wait for that one (round 7, storage-perf follow-up of security-roles-08: two 2,880-minute twin
+    # simulations a call, which any member, a viewer included, could loop)
+    key = (str(store.db_path()), site_id, p["id"], s["native"]["version"], price,
+           json.dumps({"assets": s.get("assets"), "data": s.get("data"), "connections": [c.get("data") for c in s.get("connections") or []],
+                       "native": s["native"].get("body")}, sort_keys=True, default=str))
+    return out(copy.deepcopy(_compare_once(key, lambda: _compare(s, p, steps, price, basis))))
+
+
+#: the compare answers kept (GET /plan/compare): one a plan in force, for a few dozen sites
+COMPARES_KEPT = 64
+_compares: "OrderedDict[tuple, dict]" = OrderedDict()
+_compares_making: dict[tuple, threading.Lock] = {}
+_compares_lock = threading.Lock()
+
+
+def _compare_once(key: tuple, make) -> dict:
+    """The compare answer kept for `key`, else made by `make()` once: a request asking while another makes it waits for it."""
+    with _compares_lock:
+        hit = _compares.get(key)
+        if hit is not None:
+            _compares.move_to_end(key)
+            return hit
+        gate = _compares_making.setdefault(key, threading.Lock())
+    with gate:
+        with _compares_lock:
+            hit = _compares.get(key)
+        if hit is not None:
+            return hit
+        try:
+            answer = make()
+        except BaseException:
+            with _compares_lock:
+                _compares_making.pop(key, None)
+            raise
+        with _compares_lock:
+            _compares[key] = answer
+            _compares_making.pop(key, None)
+            while len(_compares) > COMPARES_KEPT:
+                _compares.popitem(last=False)
+        return answer
+
+
+def _compare(s: dict, p: dict, steps: list, price: float, basis: str) -> dict:
+    """The two arms of GET /plan/compare, replayed through the twin (money in it: the caller filters it)."""
     ts = np.repeat([st["t"] for st in steps], 15) + np.tile(np.arange(15) * 60, len(steps))
     rep = lambda k: np.repeat([st[k] for st in steps], 15).astype(float)
     series = {"ts": ts, "pv": rep("pv_forecast_kw"), "load": rep("load_kw"), "crit": rep("critical_kw"), "grid": rep("grid_present"), "temp": np.full(len(ts), 30.0)}
@@ -276,7 +402,6 @@ def plan_compare(site_id: str):
     risk = np.array([float(st.get("p_start") or 0.0) if st.get("grid_present", 1.0) >= 0.5 else 0.0 for st in steps])
     risk = np.where(risk >= 0.01, risk, 0.0)
     reserve = np.array([float(st.get("reserve_pct") or 0.0) for st in steps])
-    price, basis = _short_price(s, steps[0]["t"])
     # what a kWh left in the battery at the horizon's end is worth, at the plan's own terminal price (round 7 stage 2, engine-plans-live-10: the
     # drawer counted none, so a plan that keeps energy for later looked dearer than native by all of it): eta_d x c_next less the wear of
     # discharging it, as the ledger's v_end; c_next the plan's (summary end_price), else the dearest import price of the horizon's last day
@@ -300,8 +425,8 @@ def plan_compare(site_id: str):
                       "reserve_short_kwh": round(short, 1), "reserve_short_rs": round(short * price, 0),
                       "end_kwh": round(float(sim["soc"][-1]) * plant.e_nom, 1), "end_value_rs": round(float(sim["soc"][-1]) * plant.e_nom * v_end, 0),
                       "soc": [round(float(x) * 100, 1) for x in sim["soc"][::15]]}
-    return out({"compare": arms, "t": [st["t"] for st in steps], "native": {"version": s["native"]["version"], "captured_at": s["native"]["captured_at"]},
-                "short_rs_per_kwh": round(price, 1), "short_basis": basis, "end_value_rs_per_kwh": round(v_end, 2)})
+    return {"compare": arms, "t": [st["t"] for st in steps], "native": {"version": s["native"]["version"], "captured_at": s["native"]["captured_at"]},
+            "short_rs_per_kwh": round(price, 1), "short_basis": basis, "end_value_rs_per_kwh": round(v_end, 2)}
 
 
 # ------------------------------------------------------------------------------------------------ control (UI-15)
@@ -362,7 +487,7 @@ def control_writes(site_id: str, day: str | None = None, primitive: str | None =
 
 
 @router.post("/api/sites/{site_id}/control/{action}")
-def control_action(site_id: str, action: str, inp: dict = Body(default={})):
+def control_action(site_id: str, action: str, response: Response, inp: dict = Body(default={})):
     """Hold, release, pause and resume, and the genset hold, the charging block and the forced charge. The action, then the permission, then the body
     are checked (a 404, a 403, then a 422 in one sentence), then that the site has the equipment the override bounds (a 409), before anything is
     written. Each takes effect at once: the plan is re-solved now (a resume only when it cleared something), so a hold is in the
@@ -385,7 +510,10 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
         raise Refusal(409, OVERRIDE_ACTIONS[action][2], "no_equipment")
     who = auth.actor()
     if action == "test_fallback":
-        return _test_fallback(site_id, who)
+        res = _test_fallback(site_id, who)
+        if res["resolve"]["status"] in jobs.ACTIVE:
+            response.status_code = 202
+        return res
     if action == "resume":
         cleared = 0
         for o in sites.overrides(site_id):
@@ -415,6 +543,8 @@ def control_action(site_id: str, action: str, inp: dict = Body(default={})):
     resolve = _resolve_now(site_id, action)
     res = control(site_id)
     res["resolve"] = resolve
+    if resolve["status"] in jobs.ACTIVE:
+        response.status_code = 202
     return res
 
 
@@ -447,30 +577,16 @@ _AFTER = {"hold": "the hold", "release": "the release", "pause": "the pause", "r
 
 
 def _resolve_now(site_id: str, action: str) -> dict:
-    """The tick after a control action, so it takes effect at once rather than at the next quarter. A failed tick is reported, not raised: the
-    action itself stands (the next scheduled tick tries again)."""
+    """The tick after a control action, so it takes effect at once rather than at the next quarter: a re-solve job (_start_resolve), answered here
+    when it ends within SOLVE_WAIT_S, else `{status: queued | running, job_id}` for the page to read at GET /sites/:id/jobs/:job_id (round 7, audit
+    performance-live-05). A failed tick is reported, not raised: the action itself stands."""
     _last_solve[site_id] = time.monotonic()
     try:
-        if (sites.get(site_id) or {}).get("demo_link"):    # as the manual re-solve: a demo site's twin first catches up to now
-            from . import demo
-            demo.advance(site_id)
-        r = plans.tick(site_id)
-    except Exception as exc:
-        log.exception("the re-solve after %s failed for site %s", action, site_id)
-        return {"status": "failed", "plan_id": None,
-                "reason": f"The re-solve after {_AFTER[action]} failed ({type(exc).__name__}); the next scheduled tick tries again"}
-    store.audit(auth.actor(), "re-solved the plan", site_id, {"status": r["status"], "after": action})
-    # a hold of any kind (the battery's, the genset's, a charging block, a forced charge) and a resume issue today's table at once
-    _issue(site_id, force="hold" if action == "hold" or action in OVERRIDE_ACTIONS else "resume" if action == "resume" else None)
-    reason = r.get("reason")
-    if r["status"] == "held" and not reason:
-        # why the tick held its plan (it answers that only in the plan's row): the pause or release in force, else the wrong-plan guard's rule, and
-        # then the plan of before stays in force (a hold the site can keep only by shedding load with the grid up, say)
-        rel = plans.control_release(site_id)
-        reason = rel["reason"] if rel else (r.get("summary") or {}).get("guard")
-    # the plan in force after it (null: none), as POST /plan/solve answers it, so the page says "the plan of before stays in force" only when one
-    # does; a failed solve's reason is a code (plans.failure_code), as there
-    return {"status": r["status"], "plan_id": r.get("plan_id"), "reason": reason, "in_force": r.get("in_force")}
+        job = jobs.wait(_start_resolve(site_id, action), SOLVE_WAIT_S)
+    except Refusal:
+        return {"status": "failed", "plan_id": None, "in_force": None,
+                "reason": f"The re-solve after {_AFTER[action]} waits for other tasks of the company; the next scheduled tick takes it in"}
+    return _job_outcome(job, control=True)
 
 
 _ = verify
