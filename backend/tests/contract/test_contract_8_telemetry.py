@@ -7,6 +7,8 @@ minute read platform.db once per key (the 60-second cache of key to company) and
 Round 7, audit tests-and-perf-15."""
 from __future__ import annotations
 
+import time
+import types
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -77,7 +79,11 @@ def test_fifty_twins_batches_in_a_minute_read_platform_db_once_per_key_and_trip_
     find = platformdb.index_find
     monkeypatch.setattr(platformdb, "index_find", lambda *a, **k: reads.append(a) or find(*a, **k))
     clock = {"t": 1000.0}
-    monkeypatch.setattr(api.time, "monotonic", lambda: clock["t"])
+    # the key cache's clock only: api's own `time`, with its monotonic clock set by hand (review, round 7: patching time.monotonic itself stopped the
+    # clock of every module in the process for the test, the event loop's, the telemetry file's lock wait and the sign-in secret's wait among them)
+    api_time = types.SimpleNamespace(**{name: getattr(time, name) for name in dir(time) if not name.startswith("_")})
+    api_time.monotonic = lambda: clock["t"]
+    monkeypatch.setattr(api, "time", api_time)
     api._KEY_CACHE.clear()
     m = now() // 60 * 60 - 120
 
