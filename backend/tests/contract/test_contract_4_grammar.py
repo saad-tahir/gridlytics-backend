@@ -24,9 +24,12 @@ from gridlytics import delivery, twin
 T0 = int(datetime(2026, 11, 16, tzinfo=PKT).timestamp())
 BATTERY = {"E_nom": 200.0, "soc_min": 0.1, "soc_max": 0.95, "P_ch": 50.0, "P_dis": 50.0}
 FLOOR = 20.0
+#: the modes a Mode A slot holds: the twin's, less Mode B's "setpoint" (a Mode B site's battery power step by step, never a slot's; round 7,
+#: crossmodule engine-delivery-17)
+MODE_A = set(twin.MODES) - {"setpoint"}
 #: what each brand's grammar can run in a slot a person keys (R6 3.1 to 3.4, R8 2.15; delivery.as_keyed's register facts)
 BRAND_MODES = {
-    "deye": set(twin.MODES), "other": set(twin.MODES),
+    "deye": MODE_A, "other": MODE_A,
     "huawei": {"charge_grid", "hold", "discharge", "export", "self_use"},
     "sungrow": {"charge_grid", "self_use"},
     "growatt": {"charge_grid", "charge_pv_only", "export", "self_use"},
@@ -69,7 +72,7 @@ def _site(tier: str) -> dict:
 def test_each_brands_table_fits_its_grammar_and_runs_only_the_modes_it_can_express(brand):
     g = delivery.BRANDS[brand]
     steps = _steps(EVERY_MODE)
-    assert {i["mode"] for i in delivery.step_intents(steps, BATTERY)} == set(twin.MODES)            # the day asks for every mode
+    assert {i["mode"] for i in delivery.step_intents(steps, BATTERY)} == MODE_A                     # the day asks for every mode
     keyed = delivery.compile_mode_a(steps, brand, BATTERY, FLOOR, 10.0, None, site=_site("advisory_writes"))
     edge = delivery.compile_mode_a(steps, brand, BATTERY, FLOOR, 10.0, None, site=_site("closed_loop"))
     for comp in (keyed, edge):

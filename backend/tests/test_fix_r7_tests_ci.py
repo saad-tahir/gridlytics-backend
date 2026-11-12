@@ -52,6 +52,11 @@ def _best(fn, runs: int = 7) -> tuple[float, object]:
 
 # ------------------------------------------------------------------------------------------------ TWN-01: 90 days per demo site, physically consistent
 
+#: the modes a Mode A slot holds: the twin's, less Mode B's "setpoint" (a Mode B site's battery power step by step, never a slot's; round 7,
+#: crossmodule engine-delivery-17)
+MODE_A = tuple(m for m in twin.MODES if m != "setpoint")
+
+
 def _random_slots(rng: np.random.Generator, t0: int) -> list[dict]:
     """A day of compiled slots drawn at random over the Mode A vocabulary (every mode, floors and targets, grid charging, power and grid caps, surplus
     PV to full, planned genset runs and none): the twin must stay physical whatever a plan asks of it."""
@@ -59,7 +64,7 @@ def _random_slots(rng: np.random.Generator, t0: int) -> list[dict]:
     out = []
     for a, b in zip([0] + cuts, cuts + [24]):
         floor = int(rng.integers(10, 60))
-        s = {"start_ts": t0 + a * 3600, "end_ts": t0 + b * 3600, "mode": str(rng.choice(twin.MODES)), "soc_floor_pct": floor,
+        s = {"start_ts": t0 + a * 3600, "end_ts": t0 + b * 3600, "mode": str(rng.choice(MODE_A)), "soc_floor_pct": floor,
              "soc_target_pct": int(rng.integers(max(floor, 50), 101)), "grid_charge": bool(rng.random() < 0.4), "pv_full": bool(rng.random() < 0.3)}
         if rng.random() < 0.3:
             s["max_charge_w"] = float(rng.integers(5, 200)) * 1000
