@@ -41,6 +41,10 @@ NUMERIC = tuple(c for c in ALL if c not in ("site_id", "ts", "source_id", "inver
 CSV_COLUMNS = ("ts", "grid_present", "grid_power_w", "grid_import_wh", "grid_export_wh", "grid_voltage_v", "pv_power_w", "load_power_w",
                "battery_power_w", "battery_voltage_v", "battery_current_a", "battery_temp_c", "battery_soc_bms_pct", "genset_running", "genset_power_w",
                "genset_fuel_l", "inverter_mode_active", "quality_flags")
+#: a column mapping may also read a column as the time of day (round 7 sweeps, telemetry review): many loggers write the date and the time in two columns,
+#: so the column read as ts holds the date, this one the time, and the import joins them ("06/11/2026" and "09:00" read as "06/11/2026 09:00")
+TS_TIME = "ts_time"
+MAPPING_KEYS = CSV_COLUMNS + (TS_TIME,)
 
 _DDL = [
     "CREATE TABLE IF NOT EXISTS minute (" + ", ".join(
@@ -194,6 +198,12 @@ TOO_LARGE = "The file is larger than 25 MB, the most one upload can carry; split
 #: reader can tell 06/11 from 11/06
 TS_FORMATS = ("auto", "dmy", "mdy")
 _SLASHED = re.compile(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?\s*([AaPp][Mm])?)?$")
+#: a year-first day with a time of day as a logger writes it beside it: an hour of one digit or a 12-hour clock ("2026-11-06 9:00 AM"), which ISO 8601
+#: does not read (round 7 sweeps: a date and a time joined from two columns)
+_ISO_DAY_TIME = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?\s*([AaPp][Mm])?$")
+#: a cell that holds a day only, and one that holds a time of day only: the two halves of a time the mapping step joins
+_DAY_ONLY = re.compile(r"^(\d{1,2}[/.-]\d{1,2}[/.-]\d{4}|\d{4}-\d{1,2}-\d{1,2})$")
+_TIME_ONLY = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?(\.\d+)?\s*([AaPp][Mm])?$")
 _NUMBER = re.compile(r"^\d+(\.\d+)?$")
 #: an epoch number at or above this is in milliseconds (1e11 seconds is the year 5138)
 _EPOCH_MS = 1e11
@@ -211,9 +221,14 @@ def csv_time(cell, tz_offset_h: float = 0.0, fmt: str = "auto") -> int | None:
         return int(x / 1000) if x >= _EPOCH_MS else int(x)
     tz = timezone(timedelta(hours=tz_offset_h))
     m = _SLASHED.match(text) if fmt in ("dmy", "mdy") else None
-    if m:
-        a, b, year, hh, mm, ss, half = m.groups()
-        day, month = (int(a), int(b)) if fmt == "dmy" else (int(b), int(a))
+    iso = None if m else _ISO_DAY_TIME.match(text)
+    if m or iso:
+        if m:
+            a, b, year, hh, mm, ss, half = m.groups()
+            day, month = (int(a), int(b)) if fmt == "dmy" else (int(b), int(a))
+        else:
+            year, mo, d, hh, mm, ss, half = iso.groups()
+            day, month = int(d), int(mo)
         hour = int(hh or 0)
         if half:
             if not 1 <= hour <= 12:
@@ -528,8 +543,8 @@ def mapping_of(mapping: dict | None) -> dict:
     for name, c in cols.items():
         c = c if isinstance(c, dict) else {"key": c}
         key, unit, reverse = c.get("key"), c.get("unit"), bool(c.get("reverse"))
-        if key is not None and key not in CSV_COLUMNS:
-            raise ValueError(f"Column {name} is mapped to {key}, which is not a key a CSV may carry ({', '.join(CSV_COLUMNS)})")
+        if key is not None and key not in MAPPING_KEYS:
+            raise ValueError(f"Column {name} is mapped to {key}, which is not a key a CSV may carry ({', '.join(MAPPING_KEYS)})")
         if unit is not None and unit not in UNITS.get(key, {}):
             units = UNITS.get(key)
             raise ValueError(f"Column {name} cannot be read in {unit}: "
@@ -545,7 +560,7 @@ def mapping_of(mapping: dict | None) -> dict:
 def _column_names(fields: list[str], m: dict) -> dict:
     """Each of a file's columns as the key it is read as (None: ignored), by the mapping, else by its own name; two columns read as one key are refused."""
     names = {f: (m["columns"][f]["key"] if f in m["columns"] else f) for f in fields}
-    twice = Counter(n for n in names.values() if n in CSV_COLUMNS)
+    twice = Counter(n for n in names.values() if n in MAPPING_KEYS)
     for key, n in twice.items():
         if n > 1:
             cols = [f for f, k in names.items() if k == key]
@@ -626,6 +641,8 @@ def guess_mapping(head: str, saved: dict | None = None) -> dict:
         if c["key"]:
             used.add(c["key"])
         cols.append({"name": name, **c, "from": src, "sample": cells[:5]})
+    _join_day_and_time(cols, body)
+    used = {c["key"] for c in cols if c["key"]}
     ts_cells = next(([r[i] for r in body if i < len(r)] for i, c in enumerate(cols) if c["key"] == "ts"), [])
     fmt, ambiguous = _ts_format_of(ts_cells)
     saved_fmt = mapping_of(saved)["ts_format"] if saved else "auto"
@@ -634,6 +651,32 @@ def guess_mapping(head: str, saved: dict | None = None) -> dict:
     missing = [k for k in ("ts",) if k not in used] + ([] if used & {"grid_present", "grid_voltage_v"} else ["grid_present"])
     return {"delimiter": delim, "decimal": decimal, "ts_format": fmt, "ts_ambiguous": ambiguous, "columns": cols, "missing": missing,
             "notes": [] if "inverter_mode_active" in used else [TIER1_NOTE], "saved": any(c["from"] == "saved" for c in cols)}
+
+
+def _join_day_and_time(cols: list[dict], body: list[list[str]]) -> None:
+    """A file that writes the day and the time of day in two columns ("Date" and "Time"): the column guessed as ts holds days only, so a column left unread
+    whose cells are all times of day is read as ts_time, and the import joins them; when the ts column holds the times, the unread column of days becomes
+    ts and the times ts_time (round 7 sweeps, telemetry review: the second column was left unread and every row read as midnight). A saved column is
+    left as the site's mapping reads it."""
+    def cells(i: int) -> list[str]:
+        return [r[i].strip() for r in body if i < len(r) and r[i].strip()]
+
+    def all_match(i: int, rx: re.Pattern) -> bool:
+        got = cells(i)
+        return bool(got) and all(rx.match(x) for x in got)
+    at = next((i for i, c in enumerate(cols) if c["key"] == "ts"), None)
+    if at is None or any(c["key"] == TS_TIME for c in cols):
+        return
+    unread = [i for i, c in enumerate(cols) if c["key"] is None and c["from"] != "saved"]
+    if all_match(at, _DAY_ONLY):
+        j = next((i for i in unread if all_match(i, _TIME_ONLY)), None)
+        if j is not None:
+            cols[j].update(key=TS_TIME, unit=None, reverse=False, **{"from": "guess"})
+    elif all_match(at, _TIME_ONLY) and cols[at]["from"] != "saved":
+        j = next((i for i in unread if all_match(i, _DAY_ONLY)), None)
+        if j is not None:
+            cols[j].update(key="ts", unit=None, reverse=False, **{"from": "guess"})
+            cols[at].update(key=TS_TIME, unit=None, reverse=False)
 
 
 def ts_column(fields: list[str], mapping: dict | None) -> str | None:
@@ -707,11 +750,13 @@ def _read_columns(content: bytes, delim: str, decimal: str, at: dict, scale: dic
     """The file's rows, read once, as _Columns: `at` gives each key's column (the last of two columns with one name, as a reader by name keeps), `scale`
     each mapped key's factor (its unit and sign). The text is decoded as it is read, never whole. Cells are read as import_csv documents (decimal commas,
     on/off words, blanks missing); a row without a readable time is skipped and counted. Returns (columns, rows skipped, the first unreadable time)."""
-    cols = _Columns([k for k in at if k != "ts"])
+    cols = _Columns([k for k in at if k not in ("ts", TS_TIME)])
     text = io.TextIOWrapper(io.BytesIO(content), encoding="utf-8-sig", errors="replace", newline="")
     reader = csv.reader(text, delimiter=delim)
     next(reader, None)  # the header, read by the caller
     t_at = at["ts"]
+    # the time of day in a column of its own (TS_TIME): joined to the day the ts column holds, "06/11/2026" and "09:00" read as "06/11/2026 09:00"
+    clock_at = at.get(TS_TIME)
     nums = [(k, i, cols.num[k].append, cols.bad[k].append, scale.get(k), k in ("grid_present", "genset_running")) for k, i in at.items() if k in cols.num]
     texts = [(k, i, cols.text[k].append) for k, i in at.items() if k in cols.text]
     words: dict[str, str] = {}  # one string per distinct text cell (an inverter mode repeats on every row)
@@ -722,6 +767,9 @@ def _read_columns(content: bytes, delim: str, decimal: str, at: dict, scale: dic
             continue  # a blank line
         n = len(row)
         cell = row[t_at] if t_at < n else None
+        if clock_at is not None:
+            clock = row[clock_at].strip() if clock_at < n else ""
+            cell = f"{cell.strip()} {clock}" if cell and cell.strip() and clock else None
         try:
             t = csv_time(cell, tz_offset_h, ts_format)
         except (ValueError, TypeError, OverflowError):
@@ -818,6 +866,10 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     if not fields:
         raise ValueError("The file needs a header row with a ts column (UTC, or set the timezone)")
     names = _column_names(fields, m)
+    if TS_TIME in names.values() and "ts" not in names.values():
+        clock = next(f for f, k in names.items() if k == TS_TIME)
+        raise ValueError(f"Column {clock} holds the time of day without its date: choose the column that holds the date as the time (ts) in the column "
+                         f"mapping, and the import joins the two")
     if "ts" not in names.values():
         raise ValueError(f"The file has no ts column (its columns are {_found(fields)}): choose the column that holds the time in the column "
                          f"mapping, or name the columns as the keys a file may carry: {', '.join(CSV_COLUMNS)}")
@@ -827,7 +879,7 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     mapped = _mapping_words(m)
     if mapped:
         log.append(mapped)
-    ignored = [f for f, n in names.items() if n not in CSV_COLUMNS]
+    ignored = [f for f, n in names.items() if n not in MAPPING_KEYS]
     if ignored:
         log.append(f"Ignored columns: {', '.join(ignored[:10])}")
     if "inverter_mode_active" not in names.values():
@@ -845,7 +897,7 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
                    "No grid_import_wh, grid_export_wh or grid_power_w column: grid import and export are missing for this file, not zero")
     at = {}
     for i, f in enumerate(fields):
-        if names.get(f) in CSV_COLUMNS:
+        if names.get(f) in MAPPING_KEYS:
             at[names[f]] = i  # a name given twice: its last column, as a reader by name keeps
     parsed, bad_ts, first_bad = _read_columns(content, delim, decimal, at, scale, tz_offset_h, ts_format)
     if not parsed.ts:

@@ -156,7 +156,8 @@ async def upload(site_id: str, request: Request, tz_offset_h: float = 0.0, file_
 # ------------------------------------------------------------------------------------------------ the CSV column mapping (plan Part 7.5, UI-06)
 
 class MappedColumn(Strict):
-    #: the key the column is read as (telemetry.CSV_COLUMNS); none: the column is not read
+    #: the key the column is read as (telemetry.MAPPING_KEYS: a CSV column, or ts_time, the time of day joined to the date the ts column holds); none:
+    #: the column is not read
     key: str | None = Field(None, max_length=40)
     #: the unit the column is written in (telemetry.UNITS); none: the key's stored unit
     unit: str | None = Field(None, max_length=12)
@@ -176,7 +177,7 @@ class GuessIn(Strict):
 
 def _mapping_answer(site_id: str, saved: dict | None) -> dict:
     keys = [{"key": k, "units": list(telemetry.UNITS.get(k, {})), "signed": k in telemetry.SIGNED, "required": k in telemetry.REQUIRED}
-            for k in telemetry.CSV_COLUMNS]
+            for k in telemetry.MAPPING_KEYS]
     return {"mapping": saved["mapping"] if saved else None, "updated": saved["updated"] if saved else None, "by": saved["by"] if saved else None,
             "keys": keys, "ts_formats": list(telemetry.TS_FORMATS)}
 

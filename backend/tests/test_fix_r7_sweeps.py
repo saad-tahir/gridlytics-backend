@@ -10,11 +10,15 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 
+import numpy as np
+import pytest
+
 from gridlytics import sites, store, telemetry
 from gridlytics.routes_common import PKT, today
 from test_fix_api import _now, world  # noqa: F401  (world is a fixture)
 from test_fix_r7_alerts_reports import _baseline, _day_row, _fake_summary, _past_month, _story, _tday, _with_summary
 from test_fix_r7_fleet_overview import _claimed_day, _put_days, _row
+from test_fix_r7_telemetry_genset_battery import NOW, T0, _file, _site, company  # noqa: F401  (company is a fixture)
 
 
 def _data_from_last_year(site_id: str) -> None:
@@ -227,3 +231,37 @@ def test_an_off_grid_site_activates_without_a_grid_presence_signal_and_a_grid_si
         conn = sites.connections(mill)[0]
         sites.put_connection(mill, {**conn["data"], "regime": "off_grid"}, "test", conn_id=conn["id"])
     assert a.post(f"/api/sites/{mill}/activate").status_code == 200
+
+
+# ------------------------------------------------------------------------------------------------ telemetry review leftover: separate Date and Time columns
+
+def test_a_csv_with_its_date_and_its_time_in_separate_columns_is_guessed_and_imported_as_one_time(company):  # noqa: F811
+    """Many loggers write the day and the time of day in two columns ("Date", "Time"): the mapping step guessed the first as the time and left the
+    second unread, so every row read as midnight and repeated. The guess now reads the date column as ts and the time column as ts_time, the import
+    joins them (in the file's date order, a 12-hour clock too), and the mapping's vocabulary offers ts_time."""
+    sid = _site("Date and time")
+    t = T0 + 9 * 3600  # 5 Nov 2026, 09:00 Karachi time
+    stamps = [datetime.fromtimestamp(t + 60 * i, PKT) for i in range(30)]
+    body = _file(("Date", "Time", "Grid", "Load (kW)"), [(x.strftime("%d/%m/%Y"), x.strftime("%H:%M"), 1, 40) for x in stamps])
+    g = telemetry.guess_mapping(body.decode())
+    assert {c["name"]: c["key"] for c in g["columns"]} == {"Date": "ts", "Time": "ts_time", "Grid": "grid_present", "Load (kW)": "load_power_w"}
+    assert g["missing"] == [] and g["ts_format"] == "dmy"
+    mapping = {"columns": {c["name"]: {"key": c["key"], "unit": c["unit"]} for c in g["columns"]}, "ts_format": g["ts_format"]}
+    res = telemetry.import_csv(sid, body, 5, mapping=mapping, now=NOW)
+    assert (res["rows"], res["from_ts"], res["to_ts"]) == (30, t, t + 29 * 60), res
+    assert np.all(telemetry.raw(sid, t, t + 1800, ("load_power_w",))["load_power_w"] == 40000)
+    # an ISO day with a 12-hour time of day, the columns the other way round, read through a saved mapping
+    later = _site("Time then date")
+    body = _file(("Clock", "Day", "grid_present"), [(x.strftime("%I:%M %p").lstrip("0"), x.strftime("%Y-%m-%d"), 1) for x in stamps])
+    res = telemetry.import_csv(later, body, 5, mapping={"columns": {"Clock": {"key": "ts_time"}, "Day": {"key": "ts"}}}, now=NOW)
+    assert (res["rows"], res["from_ts"], res["to_ts"]) == (30, t, t + 29 * 60), res
+    # a time of day without its date, or two of them, is refused in one sentence
+    with pytest.raises(ValueError, match="date"):
+        telemetry.import_csv(later, body, 5, mapping={"columns": {"Clock": {"key": "ts_time"}, "Day": {"key": None}}}, now=NOW)
+    with pytest.raises(ValueError, match="both read as ts_time"):
+        telemetry.import_csv(later, body, 5, mapping={"columns": {"Clock": {"key": "ts_time"}, "Day": {"key": "ts_time"}}}, now=NOW)
+
+
+def test_the_mapping_vocabulary_offers_a_time_of_day_column(world):  # noqa: F811
+    keys = {k["key"]: k for k in world.c["operator"].get(f"/api/sites/{world.site}/telemetry/mapping").json()["keys"]}
+    assert keys["ts_time"] == {"key": "ts_time", "units": [], "signed": False, "required": False}
