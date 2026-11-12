@@ -895,6 +895,7 @@ def test_a_report_renders_as_a_job_and_the_same_report_asked_again_is_the_one_al
         return real(*a, **k)
     monkeypatch.setattr(reports, "generate", slow)
     monkeypatch.setattr(routes_reports, "REPORT_WAIT_S", 0.2)
+    monkeypatch.setattr(reports, "REPORT_DAYS_NEEDED", 0)   # a site with no data yet (R8 2.14's week of data: test_fix_r7_savings_page)
     an, v = world.c["analyst"], world.c["viewer"]
     body = {"kind": "monthly_savings", "site_id": world.site, "period": datetime.now(PKT).strftime("%Y-%m")}
     r = an.post("/api/reports", json=body)
