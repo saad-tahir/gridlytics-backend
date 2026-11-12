@@ -797,6 +797,32 @@ def test_the_header_reads_no_history_and_the_overview_and_battery_page_share_one
     assert len(month()) == 2 * n
 
 
+def test_the_overviews_month_litres_are_reused_for_a_minute_and_read_again_after_it(world, monkeypatch):
+    """GET /now replayed the month's genset minutes (verify.litres_used) on every 30-second poll. They are reused for a minute while the newest reading
+    and the genset are the same, and read again after it, so minutes uploaded for earlier days (no newer reading) still reach the overview."""
+    from gridlytics import routes_sites
+    day, t0 = _pinned_day(world, monkeypatch, 12)
+    clock = {"now": t0 + 12 * 3600}
+    monkeypatch.setattr(routes_sites, "now_ts", lambda: clock["now"])
+    with world.use():
+        sites.put_asset(world.site, "genset", {"rated_kw": 150}, "t")
+        _minutes(world.site, t0 + 6 * 3600, t0 + 12 * 3600, 30_000.0)
+    calls = []
+    real = verify.litres_used
+    monkeypatch.setattr(verify, "litres_used", lambda *x, **k: (calls.append(x), real(*x, **k))[1])
+    a = world.c["admin"]
+    assert a.get(f"/api/sites/{world.site}/now").status_code == 200 and len(calls) == 1
+    clock["now"] += 30
+    a.get(f"/api/sites/{world.site}/now")
+    assert len(calls) == 1                                                           # the next poll reuses it
+    with world.use():                                                                # an earlier hour uploaded: no newer reading
+        telemetry.ingest(world.site, [{"ts": t, "grid_present": 1, "genset_running": 1, "genset_power_w": 90_000.0}
+                                      for t in range(t0 + 3600, t0 + 2 * 3600, 60)], "csv")
+    clock["now"] += 31
+    body = a.get(f"/api/sites/{world.site}/now").json()
+    assert len(calls) == 2 and body["month"]["litres"] > 0, body["month"]
+
+
 # ------------------------------------------------------------------------------------------------ performance-live-05
 
 def test_a_re_solve_and_a_resume_run_as_jobs_and_answer_202_when_the_solve_outlasts_the_wait(world, monkeypatch):

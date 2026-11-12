@@ -714,24 +714,26 @@ def _today_row(s: dict, day: date, last: dict | None, stored: dict | None) -> di
     return {"day": day.isoformat(), **row} if row else (stored if stored is not None else row)
 
 
-#: the month's litres a site's overview reads (verify.litres_used), reused while the site's newest reading and its genset are the same: an unmetered
-#: genset's litres replay the month's minutes, on every 30-second poll before (round 7, storage-perf follow-up of performance-live-02)
-_month_litres: "dict[tuple, dict]" = {}
+#: the month's litres a site's overview reads (verify.litres_used), reused for MONTH_LITRES_REUSE_S while the site's newest reading and its genset are
+#: the same: an unmetered genset's litres replay the month's minutes, on every 30-second poll before (round 7, storage-perf follow-up of
+#: performance-live-02); after it they are read again, so minutes uploaded for earlier days (no newer reading) reach the overview within a minute
+MONTH_LITRES_REUSE_S = 60
+_month_litres: "dict[tuple, tuple[int, dict]]" = {}
 _month_litres_lock = threading.Lock()
 _MONTH_LITRES_KEPT = 512
 
 
-def _litres_of_month(s: dict, d0: str, d1: str, last: dict | None) -> dict:
+def _litres_of_month(s: dict, d0: str, d1: str, last: dict | None, now: int) -> dict:
     key = (str(store.db_path()), s["id"], d0, d1, last["ts"] if last else None, json.dumps((s.get("assets") or {}).get("genset"), sort_keys=True, default=str))
     with _month_litres_lock:
         hit = _month_litres.get(key)
-    if hit is not None:
-        return dict(hit)
+    if hit is not None and 0 <= now - hit[0] < MONTH_LITRES_REUSE_S:
+        return dict(hit[1])
     got = verify.litres_used(s["id"], d0, d1)
     with _month_litres_lock:
         if len(_month_litres) >= _MONTH_LITRES_KEPT:
             _month_litres.clear()
-        _month_litres[key] = got
+        _month_litres[key] = (now, got)
     return dict(got)
 
 
@@ -768,7 +770,7 @@ def site_now(site_id: str):
     bs = battery.estimate(s, now, last["ts"] if last else None)
     sum_ = lambda k: round(sum((d.get(k) or 0) for d in tdays), 1)
     # the month's litres as the Savings page reads them, with their source (meter or curve; audit R7 pages-A-06: the overview said "estimated" always)
-    fuel = _litres_of_month(s, t.replace(day=1).isoformat(), t.isoformat(), last) if a.get("genset") else {"litres": 0.0, "litres_source": None}
+    fuel = _litres_of_month(s, t.replace(day=1).isoformat(), t.isoformat(), last, now) if a.get("genset") else {"litres": 0.0, "litres_source": None}
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "status", "demo_link")}, "control": control_state(s, last, now), "now": _snapshot(last),
                 "caps": caps, "now_next": plans.now_and_next(plan, now), "plan_status": (plan or {}).get("summary", {}).get("status_label"),
                 "stage": (plan or {}).get("summary", {}).get("stage"), "today": td,
