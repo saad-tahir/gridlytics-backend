@@ -188,9 +188,8 @@ def test_each_companys_signing_keys_and_report_files_stay_in_its_own_folders(wor
     with closing(sqlite3.connect(a.file)) as con:
         assert [r[0] for r in con.execute("SELECT DISTINCT site_id FROM site_keys")] == [a.site]
     # a report of Alpha's: in Alpha's reports folder, listed and downloaded by Alpha only
-    r = a.c.post("/api/reports", json={"kind": "energy_monthly", "site_id": a.site})
-    if r.status_code != 200:
-        r = a.c.post("/api/reports", json={"kind": "monthly_savings", "site_id": a.site})
+    # an energy-only report: the server makes a monthly savings report only for a site with a week of data (R8 2.14; round 7, savings-page)
+    r = a.c.post("/api/reports", json={"kind": "energy_only", "site_id": a.site})
     assert r.status_code == 200, r.text
     rid = r.json()["id"]
     reports = world.root / "reports"

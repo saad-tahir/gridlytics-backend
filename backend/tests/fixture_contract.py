@@ -290,7 +290,14 @@ def seeded(folder: Path, days: int = 4, id_seed: int = 9):
         mill = ids["mill"]
         assert client.post("/api/platform/keys", headers=headers["admin"],
                            json={"name": "fixtures", "scopes": ["sites:read", "plans:read"], "site_id": mill, "kind": "partner"}).status_code == 200
-        assert client.post("/api/reports", headers=headers["admin"], json={"kind": "monthly_savings", "site_id": mill}).status_code == 200
+        # a monthly savings report, which the server makes only for a site with a week of data (R8 2.14; round 7, savings-page): the seed's few days
+        # are let through here, as the fixtures were captured with one
+        from gridlytics import reports
+        week, reports.REPORT_DAYS_NEEDED = reports.REPORT_DAYS_NEEDED, 0
+        try:
+            assert client.post("/api/reports", headers=headers["admin"], json={"kind": "monthly_savings", "site_id": mill}).status_code == 200
+        finally:
+            reports.REPORT_DAYS_NEEDED = week
         until = datetime.now(timezone.utc) + timedelta(hours=4)
         assert client.post(f"/api/sites/{mill}/overrides", headers=headers["admin"],
                            json={"kind": "reserve", "value": 40, "until": until.isoformat(timespec="seconds"), "reason": "Operator hold"}).status_code == 200
