@@ -171,6 +171,20 @@ Independent checkers read K2 and K3; each finding was tried against the code and
   until the keeping removes them. Its number, and what a person is told past it, are the owner's call. A route to delete one request on demand (a
   privacy request) is still not asked by the plan.
 
+### Batches k1 and k2, the senior review (12 Nov 2026)
+
+The review of the whole lane so far ("UX K review" commits) found two faults in K1, both fixed with a test that fails without the fix:
+
+- **The tier rule's CSV check took the telemetry file's write lock.** `routes_sites._has_inverter_mode` read the minutes through `telemetry.connect()`
+  (BEGIN IMMEDIATE), harmless while only `PUT /tier` asked it. Since K1's check the track asks it on every site answer and every fleet row of an active
+  CSV site at the monitor tier, so the site's page and Fleet waited for a CSV import, an edge batch or the tick (up to the 30-second busy timeout, then
+  failed), and each page load held every writer off for the scan (about 40 ms for a year of minutes). It reads through `telemetry.reading()` now, as
+  every page read has since performance-live-03. The scan itself stays, as the line on each fact's cost above says.
+- **Recommending is not done before the first plan.** At a site allowed advisory or closed loop before any plan was made (`PUT /tier` needs the native
+  capture, not a plan), Recommending read "Done: the plan runs at the advisory tier". With no plan made it is now the current stage at every tier, in
+  the words the monitor tier has ("The first plan arrives within 15 minutes", "No plan yet: ..."); a tier above monitor makes it done once a plan
+  exists. This refines the k1 line "Recommending is done once the tier is above monitor".
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

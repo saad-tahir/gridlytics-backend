@@ -632,8 +632,10 @@ def asset_delete(site_id: str, role: str):
 
 def _has_inverter_mode(site_id: str) -> bool:
     """Whether any minute of the site carries the inverter's mode: a CSV source without the inverter_mode_active column is for monitor only (plan Part 7.5,
-    telemetry.import_csv says so on import), while one with it supports advisory writes (sites.SOURCE_CAPABLE; audit flow-onboarding-03)."""
-    with telemetry.connect() as con:
+    telemetry.import_csv says so on import), while one with it supports advisory writes (sites.SOURCE_CAPABLE; audit flow-onboarding-03). A read
+    (telemetry.reading: no write lock): the stage track asks it on every site answer and fleet row of an active CSV site at the monitor tier, and the
+    write lock made them wait for an import, an edge batch or the tick, and stopped those for the scan (UX K review)."""
+    with telemetry.reading() as con:
         return con.execute("SELECT 1 FROM minute WHERE site_id = ? AND inverter_mode_active IS NOT NULL LIMIT 1", (site_id,)).fetchone() is not None
 
 

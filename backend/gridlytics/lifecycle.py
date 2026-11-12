@@ -146,11 +146,13 @@ def _no_plan_words(f: dict, now: int) -> str:
 def _recommending(f: dict, now: int, can) -> dict:
     if not f["active"]:
         return _stage("recommending", "waiting", "Starts when the site is activated")
-    if f["tier"] != "monitor":
-        return _stage("recommending", "done", f"Done: the plan runs at the {TIER_WORDS.get(f['tier'], f['tier'])} tier")
     if f["first_plan_ts"] is None:
+        # no plan was ever made, whatever tier the site is allowed: nothing is recommended or delivered yet (UX K review: a site raised to advisory
+        # before its first plan read "Done: the plan runs at the advisory tier")
         words = _no_plan_words(f, now)
         return _stage("recommending", "now", words, None if words.startswith("The first plan") else "open_plan")
+    if f["tier"] != "monitor":
+        return _stage("recommending", "done", f"Done: the plan runs at the {TIER_WORDS.get(f['tier'], f['tier'])} tier")
     stage = f["forecast_stage"]
     words = "Recommendation" + ("" if stage is None else f" · forecasts at Stage {stage}") + (", Preliminary" if f["preliminary"] else "")
     if f["native"]:

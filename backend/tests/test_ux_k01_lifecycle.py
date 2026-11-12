@@ -453,3 +453,57 @@ def test_the_fleet_rows_collecting_day_is_the_tracks_day(world):
         _readings(world, t - int(days * 86400), t - 60)
         row = next(r for r in world.c["admin"].get("/api/fleet").json()["sites"] if r["id"] == world.site)
         assert (row["collecting_day"], _by(row["lifecycle"])["collecting"]["words"]) == (day, words), days
+
+
+def test_the_site_answer_reads_the_inverter_mode_without_waiting_for_the_telemetry_write_lock(world):
+    """UX K review: the track's tier rule (routes_sites._tier_refusal) reads whether any file of a CSV site carries the inverter's mode on every site
+    answer and every fleet row, where before only PUT /tier read it. The read took the telemetry file's one write lock (telemetry.connect, BEGIN
+    IMMEDIATE), so while an import, an edge batch or the tick held it the site's page and Fleet waited up to the 30-second busy timeout (and then
+    failed), and each page load stopped every writer for the length of the scan. It is a read (telemetry.reading, audit performance-live-03): with a
+    writer holding the lock, both answers come at once and still say monitor-only."""
+    import sqlite3
+    import threading
+
+    _active_csv_site(world)
+    now = int(datetime.now(timezone.utc).timestamp())
+    _readings(world, now - 3 * 86400, now - 60)
+    with world.use():
+        path = store.telemetry_path()
+    writer = sqlite3.connect(path, timeout=1, isolation_level=None)
+    got: dict = {}
+
+    def read():
+        got["site"] = world.c["admin"].get(f"/api/sites/{world.site}")
+        got["fleet"] = world.c["admin"].get("/api/fleet")
+
+    try:
+        writer.execute("BEGIN IMMEDIATE")                     # another writer holds the telemetry file's write lock, as a long CSV import does
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        reader.join(10)
+        answered = not reader.is_alive()
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+    reader.join(60)
+    assert answered, "the site answer waited for the telemetry file's write lock"
+    assert got["site"].status_code == 200 and got["fleet"].status_code == 200, (got["site"].text[:200], got["fleet"].text[:200])
+    words = "Monitor only until a file carries the inverter's mode"
+    assert _by(got["site"].json()["lifecycle"])["delivering"]["words"] == words
+    assert _by(next(r for r in got["fleet"].json()["sites"] if r["id"] == world.site)["lifecycle"])["delivering"]["words"] == words
+
+
+def test_a_site_allowed_a_higher_tier_before_its_first_plan_is_still_waiting_for_it():
+    """UX K review: Recommending read "Done: the plan runs at the advisory tier" at a site whose tier was raised before any plan was made (PUT /tier
+    asks for the native capture, not for a plan), so the track said a plan ran that never was. With no plan made, Recommending is the current stage at
+    every tier, in the same words as at the monitor tier; once a plan is made, the tier above monitor makes it done."""
+    for tier in ("advisory_writes", "closed_loop"):
+        lc = _assemble(_facts(tier=tier, first_plan_ts=None, activated_ts=NOW - 600, statement_made=False))
+        rec = _by(lc)["recommending"]
+        assert (rec["state"], rec["words"], rec["next"]) == ("now", "The first plan arrives within 15 minutes", None), tier
+        assert (lc["stage"], lc["words"], lc["all_done"]) == ("recommending", "Recommending", False), tier
+        assert _by(lc)["reporting"]["words"] == "First statement a month after the first plan"
+        rec = _by(_assemble(_facts(tier=tier, first_plan_ts=None, failing={"reason": "tick_error", "ticks": 3})))["recommending"]
+        assert (rec["state"], rec["words"], rec["next"]) == ("now", "No plan yet: the last 3 planning runs failed", "open_plan"), tier
+        rec = _by(_assemble(_facts(tier=tier)))["recommending"]
+        assert (rec["state"], rec["words"]) == ("done", f"Done: the plan runs at the {lifecycle.TIER_WORDS[tier]} tier"), tier
