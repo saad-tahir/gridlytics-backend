@@ -269,17 +269,18 @@ def test_dat01_a_site_year_is_written_and_read_back_a_day_reads_only_its_minutes
     back = telemetry.raw(sid, YEAR0, YEAR0 + 366 * 86400, ("pv_power_w", "battery_soc_bms_pct"))
     assert len(back["ts"]) == len(ts) and (back["ts"] == ts).all()
     assert np.array_equal(back["pv_power_w"], pv)
-    # a day read as the bill engine and the replays read it (the whole minute grid of one day, every column): one search of the key, in the key's
-    # order, that reads the day's 1,440 rows of the year's 525,600
+    # a day read as the bill engine and the replays read it (the whole minute grid of one day, every column): searches of the key, in the key's
+    # order, each of which reads the day's 1,440 rows of the year's 525,600: the numbers as one block, and the text columns (the inverter's mode)
+    # in one read of their own (telemetry._read; round 7, storage-perf, tests-and-perf-09)
     d0 = YEAR0 + 200 * 86400
     statements = _traced(monkeypatch)
     day = telemetry.minute_grid(sid, d0, d0 + 86400)
     assert day["completeness"] == 1.0 and len(day["ts"]) == 1440
     assert np.allclose(day["pv"], pv[200 * 1440:201 * 1440] / 1000.0)
     reads = _minute_reads(statements)
-    assert len(reads) == 1, reads
+    assert len(reads) == 1 + any(c in telemetry.TEXT_COLUMNS for c in telemetry.GRID_COLUMNS), reads
     with closing(sqlite3.connect(store.telemetry_path())) as con:
-        assert len(con.execute(reads[0][0]).fetchall()) == 1440
+        assert [len(con.execute(sql).fetchall()) for sql, _ in reads] == [1440] * len(reads)
     # the daily copy takes the telemetry file with the workspace file (store.backup), all of the year in it
     made = backups.daily()
     assert made is not None
