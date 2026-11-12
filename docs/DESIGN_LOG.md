@@ -13,6 +13,8 @@ question of the owner, the recommended answer ships and is logged here and in th
 
 - **K4, the role matrix** (plan G9 item 1): `GET /api/meta` answers `role_matrix`, `{permission: [roles]}` straight from `auth.PERMISSIONS`, the roles in
   `auth.ROLES` order, the same for every reader. No money.
+- **K25, the telemetry CSV in Karachi time** (plan E6 item 7): `ts_karachi` (ISO 8601 with +05:00) is the first column, `ts_utc` the second, then the
+  stored series as before. Owner's question Q58 (the telemetry CSV leads with Karachi time): the recommended yes ships.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
