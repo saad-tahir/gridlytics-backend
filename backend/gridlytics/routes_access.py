@@ -3,19 +3,22 @@ change (access_requests.py holds the rules and the store).
 
     POST  /api/public/access-requests                {topic, name, email, company?, phone?, city?, sites?, equipment?, inverter?, disco?, message?, website?}
                                                       -> 202 with no body, whatever the email; 429 with Retry-After past the rate
+    GET   /api/founder/access-requests?state=&offset= -> {requests, counts}
+    PATCH /api/founder/access-requests/{request_id}   {state?, note?}  -> {request}
 
 The send needs no sign-in (api.PUBLIC_POSTS) and takes at most 8 KB (api.BODY_CAPS). It makes a request to the founder, never an account, and never
-says whether an email has one.
+says whether an email has one. The founder's two routes check the founder's own session (routes_founder._session) before they read a field, as every
+/api/founder route does, and each change of a request is written to the founder's audit as it is made, before the answer is sent.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Body, Request
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import Response
 
-from . import access_requests, auth, schemas
+from . import access_requests, auth, routes_founder, schemas
 from . import api as _api
 from . import platform as platformdb
 
@@ -64,3 +67,31 @@ def access_request_new(request: Request, inp: Any = Body(None)):
     made = access_requests.add(sent, _sender())
     log.info("access request %s received (topic %s)", made, sent.topic)
     return Response(status_code=202)
+
+
+@router.get("/api/founder/access-requests", dependencies=[Depends(routes_founder._session)])
+def founder_access_requests(state: str = "all", offset: str = "0"):
+    """The requests, newest first, in one state or all, a page (access_requests.PAGE) at a time from `offset`, with how many there are in each state."""
+    if state not in (*access_requests.STATES, "all"):
+        _api._fail("Filter the requests by state: new, contacted, done, declined or all")
+    if not offset.isdigit() or len(offset) > 9:
+        _api._fail("The offset is a whole number from 0")
+    return access_requests.listing(state, int(offset))
+
+
+@router.patch("/api/founder/access-requests/{request_id}", dependencies=[Depends(routes_founder._session)])
+def founder_access_request_change(request_id: str, inp: Any = Body(None)):
+    """Set a request's state (new, contacted, done, declined), the founder's note, or both. A change is written to the founder's audit, with what it was
+    and what it is now; a change that changes nothing writes nothing."""
+    request_id = routes_founder._id(request_id, "access request")
+    if not isinstance(inp, dict):
+        _api._fail("Send the change as a set of named values: the request's state, its note, or both")
+    wanted = schemas.check(access_requests.AccessRequestChange, inp)
+    done = access_requests.change(request_id, wanted.state, wanted.note)
+    if done is None:
+        routes_founder._missing("access request")
+    before, after = done
+    changes = {k: {"from": before[k], "to": after[k]} for k in ("state", "note") if before[k] != after[k]}
+    if changes:
+        platformdb.founder_audit("changed an access request", after["email"], {"request": request_id, "topic": after["topic"], **changes})
+    return {"request": after}

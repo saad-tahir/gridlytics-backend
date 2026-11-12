@@ -84,6 +84,31 @@ def test_the_stage_track_and_the_role_matrix_reach_every_role(world):
                 assert [st["next"] for st in lc["stages"]][:5] == [None] * 5 and lc["next"] == "energy_report", (row["name"], lc)
 
 
+def test_a_request_for_access_reaches_the_founder_from_anyone_signed_in_or_not(world, monkeypatch):
+    """UX backend asks K2 and K3: the contact page's request for access is sent signed out, or signed in from People's "Ask OnyxLeaf to add someone"
+    (each role's session is recorded as `sent_by`), answered 202 with no body; the founder lists it and sets its state."""
+    from gridlytics import access_requests, founder
+    client, password, _ = world
+    monkeypatch.setattr(access_requests, "RATE_LIMIT", 100)
+    for name, value in (("GRIDLYTICS_FOUNDER_USERNAME", "founder"), ("GRIDLYTICS_FOUNDER_PASSWORD_HASH", founder.hash_password("a made-up walk password")),
+                        ("GRIDLYTICS_FOUNDER_TOTP_SECRET", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
+                        ("GRIDLYTICS_FOUNDER_SESSION_SECRET", "a made-up founder session secret of the api walk")):
+        monkeypatch.setenv(name, value)
+    body = {"topic": "access", "name": "Api Walk", "email": "api-walk@example.pk", "company": "Walk Mills", "sites": "1", "disco": "IESCO"}
+    r = client.post("/api/public/access-requests", json=body)
+    assert r.status_code == 202 and r.content == b"", r.text
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        r = client.post("/api/public/access-requests", json=body, headers=_login(client, password, email))
+        assert r.status_code == 202 and r.content == b"", (email, r.text)
+    founder_h = {"x-founder-session": founder.new_token()[0]}
+    got = client.get("/api/founder/access-requests?state=new", headers=founder_h).json()
+    mine = [r for r in got["requests"] if r["email"] == "api-walk@example.pk"]
+    assert sorted((r["sent_by"] or {}).get("role", "signed out") for r in mine) == ["admin", "analyst", "operator", "signed out", "viewer"]
+    assert {r["about"] for r in mine} == {"1 site · IESCO"} and got["counts"]["new"] >= 5
+    r = client.patch(f"/api/founder/access-requests/{mine[0]['id']}", json={"state": "contacted", "note": "Rang them"}, headers=founder_h)
+    assert r.status_code == 200 and r.json()["request"]["state"] == "contacted", r.text
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

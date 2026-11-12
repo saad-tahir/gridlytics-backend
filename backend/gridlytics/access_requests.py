@@ -180,6 +180,31 @@ class AccessRequestIn(Strict):
         return self
 
 
+class AccessRequestChange(Strict):
+    """`PATCH /api/founder/access-requests/{id}`: the request's new state, the founder's note (an empty one clears it), or both."""
+
+    state: str | None = Field(None, title="The state")
+    note: str | None = Field(None, title="The note")
+
+    @field_validator("state")
+    @classmethod
+    def _state(cls, v: str | None) -> str | None:
+        if v not in (None, *STATES):
+            raise ValueError("A request's state is new, contacted, done or declined")
+        return v
+
+    @field_validator("note")
+    @classmethod
+    def _note(cls, v: str | None) -> str | None:
+        return None if v is None else _text(v, "The note", MOST["note"])
+
+    @model_validator(mode="after")
+    def _something(self):
+        if self.state is None and self.note is None:
+            raise ValueError("Send the request's new state, its note, or both")
+        return self
+
+
 # ------------------------------------------------------------------------------------------------ times and words
 
 def _now() -> datetime:
@@ -265,3 +290,17 @@ def listing(state: str = "all", offset: int = 0) -> dict:
         where, args = ("", ()) if state == "all" else ("WHERE state = ?", (state,))
         rows = con.execute(f"SELECT * FROM access_requests {where} ORDER BY received_at DESC, rowid DESC LIMIT ? OFFSET ?", (*args, PAGE, offset)).fetchall()
     return {"requests": [view(r) for r in rows], "counts": {**counts, "all": sum(counts.values())}}
+
+
+def change(request_id: str, state: str | None, note: str | None) -> tuple[dict, dict] | None:
+    """Set a request's state, its note, or both: (before, after); None when there is no such request. Nothing is written when nothing changes."""
+    with platformdb._write() as con:
+        r = con.execute("SELECT * FROM access_requests WHERE id = ?", (request_id,)).fetchone()
+        if r is None:
+            return None
+        fields = {k: v for k, v in (("state", state), ("note", note)) if v is not None and v != r[k]}
+        if fields:
+            fields["updated_at"] = _now().isoformat(timespec="seconds")
+            con.execute(f"UPDATE access_requests SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), request_id))
+        after = con.execute("SELECT * FROM access_requests WHERE id = ?", (request_id,)).fetchone()
+    return view(r), view(after)

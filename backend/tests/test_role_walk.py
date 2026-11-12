@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import json
 import re
+import uuid
 
 import pytest
 from fastapi.routing import APIRoute
@@ -301,6 +302,31 @@ def test_the_stage_track_offers_a_viewer_only_the_energy_report_and_a_key_nothin
                     assert set(nexts) <= {"energy_report", None}, (url, reader, lc)
                     seen += 1
     assert seen >= 5 and keys >= 1
+
+
+def test_a_request_for_access_is_anyones_to_send_and_only_the_founders_to_read(walk, monkeypatch):
+    """UX backend asks K2 and K3: the contact page's request for access goes to the founder from anyone signed in (202 with no body: nothing to filter;
+    a site key is refused, as on every path that names no site), and none of the company's readers reaches the founder's Access requests, whose
+    session is the founder's own (401). The founder's answer holds no money key and no rupee: a request is no account and no company's data."""
+    from gridlytics import access_requests, founder, money
+    client, h = walk["client"], walk["headers"]
+    monkeypatch.setattr(access_requests, "RATE_LIMIT", 100)
+    for name, value in (("GRIDLYTICS_FOUNDER_USERNAME", "founder"), ("GRIDLYTICS_FOUNDER_PASSWORD_HASH", founder.hash_password("a made-up walk password")),
+                        ("GRIDLYTICS_FOUNDER_TOTP_SECRET", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
+                        ("GRIDLYTICS_FOUNDER_SESSION_SECRET", "a made-up founder session secret of the role walk")):
+        monkeypatch.setenv(name, value)
+    body = {"topic": "person", "name": "Walk", "email": "walk@onyxleaf.demo", "company": "OnyxLeaf demo", "message": "Add Bilal as an operator."}
+    for reader in READERS:
+        r = client.post("/api/public/access-requests", json=body, headers=h[reader])
+        assert (r.status_code, r.content) == ((403, r.content) if reader == "key" else (202, b"")), (reader, r.status_code, r.text[:200])
+        for method, path in (("GET", "/api/founder/access-requests"), ("PATCH", f"/api/founder/access-requests/{uuid.uuid4()}")):
+            r = client.request(method, path, headers=h[reader], json={"state": "done"} if method == "PATCH" else None)
+            assert r.status_code == 401 and r.json()["code"] == "founder_session_required", (reader, method, r.text[:200])
+    token, _ = founder.new_token()
+    got = client.get("/api/founder/access-requests", headers={"x-founder-session": token}).json()
+    sent = [r for r in got["requests"] if r["email"] == "walk@onyxleaf.demo"]
+    assert sorted(r["sent_by"]["role"] for r in sent) == ["admin", "operator", "viewer"]
+    assert not {k for _, k, _, _ in _items(got) if isinstance(k, str) and money.is_money(k)} and not any(RUPEES.search(s) for s in _strings(got))
 
 
 def test_answers_that_are_files_pass_unchanged(walk):

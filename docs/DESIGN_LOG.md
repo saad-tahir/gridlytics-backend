@@ -116,6 +116,15 @@ check" commits):
   - **A signed-in sender is recorded** (`sent_by`: email, name, company, Gridlytics role), which the plan does not ask: People's "Ask OnyxLeaf to add
     someone" (Q75) is the company's administrator asking for an account, and the founder must tell that request from anyone's before making one (G4.6).
     A token that is not good is a visitor's, as on every public path; a site key is refused (no site in the path).
+- **K2, the founder's Access requests** (plan B21.2 item 2, B20.4, G4.6): `GET /api/founder/access-requests?state=&offset=` (newest first, 300 a
+  page from `offset` as the founder's audit pages, and `counts` of every state for the filter, the menu's "n new" and the Overview's NEEDS YOU row) and
+  `PATCH /api/founder/access-requests/{id}` (`{state?, note?}`), behind `routes_founder._session` before a field is read, as every founder route.
+  - **The states are B20.4's: new, contacted, done, declined.** H5.1's table says "Set up" for the third; B20.4 is the page's own section, and "done"
+    fits a request for help with an account or something else, which is never set up.
+  - **Each change is in the founder's audit** ("changed an access request", the requester's email as its target, as an account's changes are
+    targeted by email; `{request, topic, state: {from, to}, note: {from, to}}`, only what changed); a change that changes nothing writes nothing.
+  - **Times** are kept in UTC (B21.2) and answered in Pakistan time (`received_at`, `updated_at`, ISO 8601 with +05:00). `about` is the table's
+    "About the site" made by the server from the facts ("2 to 5 sites · Deye · LESCO"), so the console holds no second list of their words.
 - **The store is schema 4 of the registry** (`platform.db`, `access_requests`, its state held by a CHECK), never a company's file: the requests come
   from no company. `platform._connect` copies the registry to `backup/` (`platform-...-schema-v3.db`) before the migration runs, as for schemas 2 and
   3; `platform.py` is a lifted file, and `backend/lift_manifest.json` records the change (Solarlytics has no contact form, so nothing to port back).

@@ -12,18 +12,20 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 import identities
 import pytest
-from test_founder import _audit, _client, _sentence, clock, fdb  # noqa: F401  (fixtures)
+from test_founder import _audit, _client, _console, _ok, _sentence, clock, fdb  # noqa: F401  (fixtures)
 
 from gridlytics import access_requests, api, auth
 from gridlytics import platform as platformdb
 
 PKT = timezone(timedelta(hours=5))
 URL = "/api/public/access-requests"
+FOUNDER = "/api/founder/access-requests"
 #: Plan B4's form, every field filled: access for a company, with the site facts
 AYESHA = {"topic": "access", "name": "Ayesha Rahim", "email": "ayesha@rahimtextiles.pk", "company": "Rahim Textiles", "phone": "+92 300 1234567",
           "city": "Faisalabad", "sites": "2-5", "equipment": ["solar_pv", "battery", "diesel_genset"], "inverter": "deye", "disco": "LESCO",
@@ -51,6 +53,10 @@ def _rows() -> list[dict]:
     with closing(sqlite3.connect(platformdb.db_path())) as con:
         con.row_factory = sqlite3.Row
         return [dict(r) for r in con.execute("SELECT * FROM access_requests ORDER BY rowid")]
+
+
+def _listed(c=None, query: str = "") -> dict:
+    return _ok((c or _console()).get(FOUNDER + query))
 
 
 # ================================================================== K3: the public send
@@ -265,3 +271,117 @@ def test_a_request_is_kept_twelve_months_then_removed_with_a_line_in_the_founder
     count = len(_audit())
     access_requests.listing()
     assert len(_audit()) == count
+
+
+# ================================================================== K2: the founder's list and change
+
+def test_the_founder_reads_every_field_newest_first_in_karachi_time(fdb, clock):
+    assert _send(AYESHA).status_code == 202
+    clock.step(3600)
+    assert _send({"topic": "support", "name": "Bilal Ahmed", "email": "bilal@kamalfoods.pk", "message": "Locked out"}, address="10.0.0.2").status_code == 202
+    got = _listed()
+    assert [r["name"] for r in got["requests"]] == ["Bilal Ahmed", "Ayesha Rahim"]
+    assert got["counts"] == {"new": 2, "contacted": 0, "done": 0, "declined": 0, "all": 2}
+    ayesha = got["requests"][1]
+    assert set(ayesha) == {"id", "received_at", "topic", "name", "email", "company", "phone", "city", "sites", "equipment", "inverter", "disco", "message",
+                           "about", "state", "note", "updated_at", "sent_by"}
+    assert uuid.UUID(ayesha["id"]) and ayesha["received_at"] == "2027-01-15T13:00:00+05:00" and ayesha["updated_at"] is None
+    assert ayesha["about"] == "2 to 5 sites · Deye · LESCO" and ayesha["equipment"] == ["solar_pv", "battery", "diesel_genset"]
+    assert ayesha["state"] == "new" and ayesha["note"] == "" and ayesha["message"] == AYESHA["message"]
+    bilal = got["requests"][0]
+    assert bilal["received_at"] == "2027-01-15T14:00:00+05:00" and bilal["about"] is None and bilal["company"] == "" and bilal["sites"] is None
+    assert access_requests.about("6+", "other", "off_grid") == "6 or more sites · Another brand · Off-grid"
+    assert access_requests.about("1", "not_sure", "not_sure") == "1 site" and access_requests.about(None, None, "K-Electric") == "K-Electric"
+
+
+def test_the_founder_sets_a_state_and_a_note_and_each_change_is_in_the_founders_audit(fdb, clock):
+    assert _send(AYESHA).status_code == 202
+    c = _console()
+    rid = _listed(c)["requests"][0]["id"]
+    clock.step(120)
+    got = _ok(c.patch(f"{FOUNDER}/{rid}", json={"state": "contacted", "note": "Called her; a pilot at Unit 2 first."}))["request"]
+    assert got["state"] == "contacted" and got["note"] == "Called her; a pilot at Unit 2 first." and got["updated_at"] == "2027-01-15T13:02:00+05:00"
+    line = _audit()[0]
+    assert line["action"] == "changed an access request" and line["actor"] == "founder" and line["target"] == "ayesha@rahimtextiles.pk"
+    assert line["detail"] == {"request": rid, "topic": "access", "state": {"from": "new", "to": "contacted"},
+                              "note": {"from": "", "to": "Called her; a pilot at Unit 2 first."}}
+    # one at a time; the same again writes nothing
+    _ok(c.patch(f"{FOUNDER}/{rid}", json={"state": "done"}))
+    assert _audit()[0]["detail"] == {"request": rid, "topic": "access", "state": {"from": "contacted", "to": "done"}}
+    count = len(_audit())
+    assert _ok(c.patch(f"{FOUNDER}/{rid}", json={"state": "done", "note": "Called her; a pilot at Unit 2 first."}))["request"]["state"] == "done"
+    assert len(_audit()) == count
+    # an empty note clears it; back to new is allowed
+    assert _ok(c.patch(f"{FOUNDER}/{rid}", json={"note": "", "state": "new"}))["request"]["note"] == ""
+    assert _listed(c)["counts"] == {"new": 1, "contacted": 0, "done": 0, "declined": 0, "all": 1}
+
+
+@pytest.mark.parametrize("body, status, words", [
+    ({}, 422, "Send the request's new state, its note, or both"),
+    ({"state": None, "note": None}, 422, "Send the request's new state, its note, or both"),
+    ({"state": "archived"}, 422, "A request's state is new, contacted, done or declined"),
+    ({"state": 1}, 422, "The state must be text"),
+    ({"note": "n" * 1001}, 422, "The note must be at most 1,000 characters"),
+    ({"state": "done", "email": "x@y.pk"}, 422, "Unknown field 'email'"),
+    ([], 422, "Send the change as a set of named values"),
+    ("done", 422, "Send the change as a set of named values"),
+])
+def test_a_change_of_the_wrong_shape_is_refused_in_a_sentence(fdb, clock, body, status, words):
+    assert _send(AYESHA).status_code == 202
+    c = _console()
+    rid = _listed(c)["requests"][0]["id"]
+    r = c.patch(f"{FOUNDER}/{rid}", json=body)
+    assert r.status_code == status and r.json()["detail"].startswith(words) and _sentence(r), r.text
+    assert _listed(c)["requests"][0]["state"] == "new" and not [e for e in _audit() if e["action"] == "changed an access request"]
+
+
+def test_an_unknown_request_is_not_found(fdb, clock):
+    c = _console()
+    for rid in (str(uuid.uuid4()), "12", "x" * 80):
+        r = c.patch(f"{FOUNDER}/{rid}", json={"state": "done"})
+        assert r.status_code == 404 and r.json()["detail"] == "No such access request", r.text
+
+
+def test_the_founder_filters_by_state_with_counts_and_pages(fdb, clock, monkeypatch):
+    for i in range(5):
+        assert _send({**AYESHA, "email": f"p{i}@rahimtextiles.pk"}, address=f"10.0.0.{i}").status_code == 202
+        clock.step(60)
+    c = _console()
+    ids = [r["id"] for r in _listed(c)["requests"]]                               # newest first: p4 .. p0
+    _ok(c.patch(f"{FOUNDER}/{ids[0]}", json={"state": "contacted"}))
+    _ok(c.patch(f"{FOUNDER}/{ids[1]}", json={"state": "declined"}))
+    _ok(c.patch(f"{FOUNDER}/{ids[2]}", json={"state": "done"}))
+    counts = {"new": 2, "contacted": 1, "done": 1, "declined": 1, "all": 5}
+    for state, want in (("new", ids[3:]), ("contacted", ids[:1]), ("declined", ids[1:2]), ("done", ids[2:3]), ("all", ids)):
+        got = _listed(c, f"?state={state}")
+        assert [r["id"] for r in got["requests"]] == want and got["counts"] == counts, state
+    assert [r["id"] for r in _listed(c)["requests"]] == ids
+    monkeypatch.setattr(access_requests, "PAGE", 2)
+    assert [r["id"] for r in _listed(c, "?offset=2")["requests"]] == ids[2:4]
+    assert [r["id"] for r in _listed(c, "?state=new&offset=1")["requests"]] == ids[4:]
+    for query, words in (("?state=archived", "Filter the requests by state"), ("?offset=-1", "The offset is a whole number from 0"),
+                         ("?offset=x", "The offset is a whole number from 0")):
+        r = c.get(FOUNDER + query)
+        assert r.status_code == 422 and r.json()["detail"].startswith(words) and _sentence(r), (query, r.text)
+
+
+def test_only_the_founder_reads_or_changes_the_requests(fdb, clock, monkeypatch):
+    """The founder's own session, whatever else the request carries: no session, a company member's token or a company header never stands in for it
+    (the guard lets /api/founder through; the route checks x-founder-session before it reads a field)."""
+    assert _send(AYESHA).status_code == 202
+    rid = _listed()["requests"][0]["id"]
+    member = identities.token("member@acme.test", "admin", company_role="owner")
+    for prefix in ("/api", "/api/v1"):
+        for headers in ({}, identities.headers(member, identities.company()), {"x-founder-session": "x.y"}):
+            want = "founder_session_invalid" if "x-founder-session" in headers else "founder_session_required"
+            for method, path, body in (("GET", "/founder/access-requests", None), ("PATCH", f"/founder/access-requests/{rid}", {"state": "done"}),
+                                       ("PATCH", "/founder/access-requests/x", [1])):
+                r = _client().request(method, prefix + path, headers=headers, json=body)
+                assert r.status_code == 401 and r.json()["code"] == want, (method, path, headers.keys(), r.text)
+    assert _listed()["requests"][0]["state"] == "new"
+    # until the console is set up its routes answer 503, a session made before too; the public send still takes a request
+    console = _console()
+    monkeypatch.setenv("GRIDLYTICS_FOUNDER_TOTP_SECRET", " ")
+    r = console.get(FOUNDER)
+    assert r.status_code == 503 and r.json()["code"] == "unavailable", r.text
+    assert _send({**AYESHA, "email": "late@rahimtextiles.pk"}).status_code == 202 and len(_rows()) == 2
