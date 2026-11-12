@@ -64,6 +64,26 @@ def test_every_page_answers_for_every_role(world, email):
             assert r.status_code == 200, (email, page, r.status_code, r.text[:200])
 
 
+def test_the_stage_track_and_the_role_matrix_reach_every_role(world):
+    """UX backend asks K1 and K4: every fleet row and every site answer carries the same `lifecycle` (six stages, a viewer's states only), and GET
+    /api/meta the role matrix, for each role."""
+    from gridlytics import auth, lifecycle
+    client, password, _ = world
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        meta = client.get("/api/meta", headers=h).json()
+        assert meta["role_matrix"] == {p: [r for r in auth.ROLES if r in who] for p, who in auth.PERMISSIONS.items()}, email
+        for row in client.get("/api/fleet", headers=h).json()["sites"]:
+            lc = row["lifecycle"]
+            assert [st["key"] for st in lc["stages"]] == list(lifecycle.STAGES) and lc["stage"] in lifecycle.STAGES, (email, lc)
+            assert {st["state"] for st in lc["stages"]} <= set(lifecycle.STATES) and lc["words"], (email, lc)
+            assert {st["next"] for st in lc["stages"]} <= set(lifecycle.NEXT) | {None}, (email, lc)
+            site = client.get(f"/api/sites/{row['id']}", headers=h).json()["lifecycle"]
+            assert [(st["key"], st["state"]) for st in site["stages"]] == [(st["key"], st["state"]) for st in lc["stages"]], (email, row["name"])
+            if email.startswith("viewer"):
+                assert [st["next"] for st in lc["stages"]][:5] == [None] * 5 and lc["next"] == "energy_report", (row["name"], lc)
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

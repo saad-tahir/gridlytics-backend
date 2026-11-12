@@ -281,6 +281,23 @@ def test_a_route_that_forgets_the_filter_is_filtered_all_the_same(walk):
         api.app.router.routes.remove(added)
 
 
+def test_the_stage_track_offers_a_viewer_only_the_energy_report_and_a_key_nothing(walk):
+    """UX backend ask K1: `lifecycle` on the site and on each fleet row holds no money (the walks above) and, for a viewer, states only: no stage offers
+    a next step but the energy report; a machine key is offered none (plan §0.3.1, D2.4)."""
+    seen = 0
+    for template in ("/api/fleet", "/api/sites/{site_id}"):
+        for url, got in walk["answers"][template].items():
+            for reader in ("viewer", "key"):
+                if reader not in got or got[reader][0] != 200:
+                    continue
+                body = got[reader][1]
+                for lc in ([r["lifecycle"] for r in body["sites"]] if template == "/api/fleet" else [body["lifecycle"]]):
+                    nexts = [st["next"] for st in lc["stages"]] + [lc["next"]]
+                    assert set(nexts) <= ({"energy_report", None} if reader == "viewer" else {None}), (url, reader, lc)
+                    seen += 1
+    assert seen >= 5
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

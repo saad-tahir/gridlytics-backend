@@ -9,7 +9,7 @@ import numpy as np
 from fastapi import APIRouter, Body, Header, HTTPException
 from pydantic import ValidationError
 
-from . import alerts, auth, battery, delivery, demo, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, twin, verify
+from . import alerts, auth, battery, delivery, demo, lifecycle, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, twin, verify
 from .routes_common import PKT, bad, full_or_404, now_ts, out, put_state, site_or_404, today
 from .schemas import Refusal
 
@@ -229,13 +229,16 @@ ON_PLAN = ("following", "hold", "force_charge")
 HANDED_BACK = ("native", "paused", "native_block")
 
 
-def fleet_row(s: dict, now: int, counts: dict, gensets: dict | None = None) -> dict:
+def fleet_row(s: dict, now: int, counts: dict, gensets: dict | None = None, equipment: dict | None = None) -> dict:
+    """A fleet row. `gensets` (site id to its genset's data) and `equipment` (site id to {role: data}) are the fleet's single read of every site's
+    assets; without them the row reads the site's own."""
     last = telemetry.latest(s["id"])
     first = telemetry.first_ts(s["id"])
     plan = plans.current(s["id"], slots=False)       # the row reads the next event from the steps, never the table (round 7, tests-and-perf-06)
     nn = plans.now_and_next(plan, now)
     days_data = (now - first) / 86400 if first else 0
-    conn = (sites.connections(s["id"]) or [None])[0]
+    conns = sites.connections(s["id"])
+    conn = (conns or [None])[0]
     # off-grid is the site's own fact, as tab C and POST /activate read it (_grid_settled): a connection of regime off_grid, or none at a farm or a
     # site whose data says off_grid. A grid site whose connection is not saved yet has no category yet (null), and its outages count (audit pages-A-03)
     off_grid = _off_grid(s, conn)
@@ -264,7 +267,10 @@ def fleet_row(s: dict, now: int, counts: dict, gensets: dict | None = None) -> d
             # frontend-states-formats-01); null without a genset
             "fuel_kind": (gen.get("fuel_kind") or "hsd") if gen is not None else None,
             # handed back to the native settings: the row says so, so the web app counts a fleet's real sites by the summary's own rule (review)
-            "on_native": control["key"] in HANDED_BACK}
+            "on_native": control["key"] in HANDED_BACK,
+            # the stage track's state, for Fleet's Stage column and filter and the site switcher (UX backend ask K1; no money)
+            "lifecycle": _lifecycle(s, now, last=last, first=first, plan=plan, control=control, connections=conns,
+                                    assets=None if equipment is None else equipment.get(s["id"], {}))}
 
 
 @router.get("/api/fleet")
@@ -278,10 +284,14 @@ def fleet():
 def _fleet():
     now = now_ts()
     c = alerts.counts()
+    equipment: dict = {}
     with store.connect() as con:
-        # each site's genset by site id, as sites.assets reads it (the latest of the role wins)
-        gensets = {d["site_id"]: d["data"] for d in map(store.row, con.execute("SELECT site_id, data FROM assets WHERE role = 'genset' ORDER BY created"))}
-    rows = [fleet_row(s, now, c["by_site"], gensets) for s in sites.listing()]
+        # every site's equipment by role, as sites.assets reads it (the latest of a role wins), read once for the whole fleet: the row's genset and
+        # its fuel kind, and the lifecycle's battery and a draft's inverter (round 7, storage-perf follow-up; UX backend ask K1)
+        for d in map(store.row, con.execute("SELECT site_id, role, data FROM assets ORDER BY created")):
+            equipment.setdefault(d["site_id"], {})[d["role"]] = d["data"]
+    gensets = {sid: held["genset"] for sid, held in equipment.items() if "genset" in held}
+    rows = [fleet_row(s, now, c["by_site"], gensets, equipment) for s in sites.listing()]
     online = sum(1 for r in rows if r["last_data"] and now - r["last_data"] < 1800)
     stamps = [r["mtd_saving_rs_computed"] for r in rows if r["mtd_saving_rs_computed"]]
     # the sum of the sites' figures; None while no site has a scored day this month, never Rs 0 (audit frontend-states-formats-14)
@@ -428,12 +438,9 @@ def site_source_test(site_id: str):
     return sites.source_test(site_id)
 
 
-@router.post("/api/sites/{site_id}/activate")
-def site_activate(site_id: str):
-    auth.need("manage_sites", "Activating a site")
-    s = sites.full(site_id) or {}
-    if not s:
-        raise HTTPException(status_code=404, detail="No such site")
+def _activation_missing(s: dict) -> list[tuple[str, str]]:
+    """What activation still asks for (`s` is full() of the site), each as (the Set-up step that holds it, its words in the refusal), in the steps'
+    order: the refusal of POST /activate and the lifecycle's "Draft: step C of 6" read the same rules (UX backend ask K1)."""
     missing = []
     src = (s.get("data") or {}).get("data_source") or {}
     # an off-grid site has no grid to report: its source needs no grid-presence signal (round 7 sweeps, a sites-onboarding review follow-up: the farm was
@@ -442,26 +449,55 @@ def site_activate(site_id: str):
     if not (isinstance(src, dict) and src.get("kind") in sites.DATA_SOURCE_KINDS and (src.get("grid_signal_confirmed") or off_grid)):
         # plan 9.3 tab A: without a grid-presence signal outages cannot be seen and the reserve cannot be planned (audit flow-onboarding-08: a site with no
         # source, or an unconfirmed one, was activated and planned)
-        missing.append("the data source (tab A)" if off_grid else "the data source, with its grid-presence signal confirmed (tab A)")
-    elif sites.grid_connected(s) and sites.source_test(site_id)["grid_signal"] == "missing":
+        missing.append(("a", "the data source (tab A)" if off_grid else "the data source, with its grid-presence signal confirmed (tab A)"))
+    elif sites.grid_connected(s) and sites.source_test(s["id"])["grid_signal"] == "missing":
         # the source's test (plan 9.3: "refuses a source without a grid-present signal"; audit flow-onboarding-22): data arrived, and none of it says
         # whether the grid is up, whatever the tick says
-        missing.append("the grid-presence signal to the data the source sends (the data received has neither grid_present nor the grid voltage; tab A)")
+        missing.append(("a", "the grid-presence signal to the data the source sends (the data received has neither grid_present nor the grid voltage; "
+                             "tab A)"))
     if not (s.get("assets") or {}).get("inverter"):
-        missing.append("the inverter (tab B)")
+        missing.append(("b", "the inverter (tab B)"))
     if not _grid_settled(s, s.get("connections") or []):
-        missing.append("the grid connection and tariff (tab C)")
+        missing.append(("c", "the grid connection and tariff (tab C)"))
     elif any((c.get("data") or {}).get("tariff_category") not in tariff_data.CARDS_279 for c in s.get("connections") or []):
         # a connection stored before the category was checked (audit flow-onboarding-07): the tick could price nothing and the site never planned
-        missing.append("the tariff category of each grid connection (tab C)")
+        missing.append(("c", "the tariff category of each grid connection (tab C)"))
     elif any(sites.group_problem((c.get("data") or {}).get("disco_group"), (s.get("data") or {}).get("disco")) for c in s.get("connections") or []):
         # the site's DISCO changed after its connection was saved: it would be priced with the other DISCO's peak windows (audit flow-onboarding-02)
-        missing.append("the DISCO group of each grid connection, to match the site's DISCO (tab C)")
+        missing.append(("c", "the DISCO group of each grid connection, to match the site's DISCO (tab C)"))
+    return missing
+
+
+@router.post("/api/sites/{site_id}/activate")
+def site_activate(site_id: str):
+    auth.need("manage_sites", "Activating a site")
+    s = sites.full(site_id) or {}
+    if not s:
+        raise HTTPException(status_code=404, detail="No such site")
+    missing = _activation_missing(s)
     if missing:
-        raise Refusal(422, "Add " + " and ".join(missing) + " before activating", "incomplete")
+        raise Refusal(422, "Add " + " and ".join(words for _, words in missing) + " before activating", "incomplete")
     sites.set_status(site_id, "active")
     store.audit(auth.actor(), "activated a site", site_id)
     return _site_answer(site_id)
+
+
+def _lifecycle(s: dict, now: int, *, last: dict | None, first: int | None, plan: dict | None, control: dict, connections: list | None = None,
+               assets: dict | None = None) -> dict:
+    """The site's lifecycle for the current reader (lifecycle.py; UX backend ask K1). A site not yet active says the first Set-up step activation
+    still asks for, read from the site as the activation reads it. `s` is full() of the site, or a site row with its `connections` and `assets` (by
+    role) given, as the fleet has them; without them they are read."""
+    if "connections" in s:
+        connections, assets = s.get("connections") or [], s.get("assets") or {}
+    elif connections is None or assets is None:
+        whole = sites.full(s["id"]) or {}
+        connections, assets = whole.get("connections") or [], whole.get("assets") or {}
+    step = None
+    if s.get("status") != "active":
+        missing = _activation_missing({**s, "connections": connections, "assets": assets})
+        step = missing[0][0] if missing else None
+    return lifecycle.build(s, now, first_ts=first, last_ts=last["ts"] if last else None, plan=plan, control=control, setup_step=step,
+                           battery="battery" in assets)
 
 
 #: A new connection's save is idempotent (a retried first save never inserts a second row): by the client's key when it sends one (the Idempotency-Key
@@ -644,6 +680,10 @@ def _site_answer(site_id: str) -> dict:
     s.pop("photo", None)
     s["tier_signoff"] = _tier_signoff(site_id, s.get("state"))
     s["setup_warnings"] = sites.setup_warnings(s)
+    # the stage track (UX backend ask K1): the Overview's track and the switcher read it here
+    now, last = now_ts(), telemetry.latest(site_id)
+    s["lifecycle"] = _lifecycle(s, now, last=last, first=telemetry.first_ts(site_id), plan=plans.current(site_id, now, slots=False),
+                                control=control_state(s, last, now))
     return out(s)
 
 

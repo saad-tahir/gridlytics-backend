@@ -11,6 +11,27 @@ question of the owner, the recommended answer ships and is logged here and in th
 
 ### Batch k1: K1, K4, K24, K25 (12 Nov 2026)
 
+- **K1, the lifecycle** (plan §0.3.1, B21.2 item 3, C19.2 item 8, D9.1): `lifecycle.py` works out the stage track (Set-up, Collecting data,
+  Recommending, Delivering, Verifying, Reporting; each done, now, waiting or not used, with its words and one next step's key) from a few indexed reads,
+  and every site answer and fleet row carry it. Decisions the plan left open:
+  - **Set-up's step** is the first of A to C that activation still asks for: the activation's refusal and the track read one rule
+    (`routes_sites._activation_missing`), so "Draft: step C of 6" and "Add the grid connection and tariff (tab C) before activating" never disagree. D
+    has a default for every field and E is not needed to activate, so neither holds a draft back; with A to C done the line is "Set-up: not activated".
+  - **Collecting data** counts 14 days from the first reading, as the fleet's `collecting_day` does; while collecting, no reading for 30 minutes (the
+    fleet's online rule) reads "No data since 09:10".
+  - **Recommending** is done once the tier is above monitor; at monitor it stays the current stage, so a monitor site's track never folds. The plan's
+    "only an administrator raises the tier" holds: the track only names the step (`raise_tier` for `change_tier`, once the native capture exists).
+  - **Delivering** is never "not used": an edge says what it can control when it connects and a CSV source supports advisory writes once a file
+    carries the inverter's mode, so a monitor-only source reads as waiting, in words that say for what.
+  - **Verifying** is the pilot: not used until it starts, then "Pilot week 3 of 8 · today runs the plan" from the switchback calendar (weeks from the
+    first block's first day), done once the last block has ended. The go/no-go decision is K28's.
+  - **Reporting** is reached when the whole previous calendar month (Pakistan time) ran on a plan, counted from the site's first plan made (every plan
+    row is kept for good: `plans.prune` trims steps and tables only); it is done once that month's monthly savings report (the statement) exists.
+  - **The current stage** is the first that is "now", else the furthest of the first four that is done, so a site whose every stage in use is done
+    reads "Delivering · advisory", as the plan's chip does. `all_done` (the track folds) is every stage done or not used.
+  - **Next steps by permission**, decided by the server: a viewer reads states only, with the energy report as the one action (plan §0.3.1, D2.4); a
+    machine key gets none. The site switcher's list (`GET /api/sites`) does not carry it: that answer is polled every minute on every page and was made
+    cheap on purpose (round 7, performance-live-08); the switcher's popover reads `GET /fleet` as it opens (plan B17.5), which carries it.
 - **K4, the role matrix** (plan G9 item 1): `GET /api/meta` answers `role_matrix`, `{permission: [roles]}` straight from `auth.PERMISSIONS`, the roles in
   `auth.ROLES` order, the same for every reader. No money.
 - **K24, a gas genset's fuel log** (plan E6 item 6, A8.5): `POST /genset/fuel` takes, for a captive-gas or RLNG genset, `mmbtu` as billed, or `hm3`
