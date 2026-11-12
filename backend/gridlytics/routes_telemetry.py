@@ -14,7 +14,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import Field, StringConstraints
 from starlette.concurrency import run_in_threadpool
 
-from . import alerts, auth, battery, forecast, optimise, plans, reserve, sites, store, telemetry
+from . import alerts, auth, battery, forecast, optimise, plans, reserve, savings_export, sites, store, telemetry
 from .routes_common import PKT, bad, full_or_404, now_ts, out, parse_day, parse_ts, site_or_404, today
 from .schemas import Refusal, Strict, check
 
@@ -683,11 +683,14 @@ def fuel_log(site_id: str, inp: dict = Body(...)):
     detail = {"day": day.isoformat(), "litres": litres, "note": str(inp.get("note", ""))[:200]}
     if cost is not None:
         detail["cost_rs"] = round(cost, 2)
+    # the audit line names the fuel's unit, "L" or "MMBtu" (a gas genset's fuel; round 7 integration, savings-page's line with sweeps'
+    # frontend-states-formats-01), so the trail does not read a gas genset's fuel as litres
+    unit = savings_export.fuel_unit(site_id)
     with store.write_transaction() as con:
         con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
                     (site_id, store._now(), "fuel_log", auth.actor(), json.dumps(detail)))
         # the litres feed the genset's ledger: the log is audited (round 7, audit security-roles-04); its cost is money, filtered by its name
-        store.audit(auth.actor(), "logged fuel", site_id, detail, con=con)
+        store.audit(auth.actor(), "logged fuel", site_id, {**detail, "fuel_unit": unit}, con=con)
     return {"logged": litres, "day": day.isoformat()}
 
 

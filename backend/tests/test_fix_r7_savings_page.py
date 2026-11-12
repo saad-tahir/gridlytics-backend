@@ -797,3 +797,17 @@ def test_the_savings_and_report_csvs_name_the_unit_of_their_litres_columns(world
         assert head[-len(engines) - 1:] == ["fuel_unit", *engines], (kind, head)    # the report's own columns end with it; the engines follow
         rows = list(csv.DictReader(io.StringIO(text)))
         assert rows and {x["fuel_unit"] for x in rows} == {"MMBtu"}, kind
+
+
+def test_the_fuel_logs_audit_line_names_the_unit_of_the_gensets_fuel(world):
+    """Integration follow-up (savings-page's audited fuel log with sweeps' frontend-states-formats-01): the audit trail read every fuel log as litres,
+    while a captive-gas genset's fuel is in MMBtu. The line now names the unit, so the trail reads "4.5 MMBtu"."""
+    sid = world.site
+    with world.use():
+        sites.put_asset(sid, "genset", {"rated_kw": 1000, "fuel_kind": "gas_captive"}, "test")
+    r = world.c["operator"].post(f"/api/sites/{sid}/genset/fuel", json={"litres": 4.5})
+    assert r.status_code == 200, r.text
+    with world.use():
+        line = next(a for a in store.list_audit() if a["action"] == "logged fuel")
+    detail = line["detail"] if isinstance(line["detail"], dict) else json.loads(line["detail"])
+    assert detail["litres"] == 4.5 and detail["fuel_unit"] == "MMBtu", detail

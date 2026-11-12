@@ -245,7 +245,8 @@ def test_the_walk_holds_every_walked_route_to_an_audit_line_and_money_settings_t
          action="answered a genset request", body={"outcome": "done"})
     walk("POST", "/api/sites/{site_id}/genset/fuel", f"/api/sites/{sid}/genset/fuel", who="operator", action="logged fuel",
          body={"litres": 50, "cost_rs": 14321.5, "note": "tanker"})
-    assert _detail(w, "logged fuel") == {"day": _detail(w, "logged fuel")["day"], "litres": 50.0, "cost_rs": 14321.5, "note": "tanker"}
+    assert _detail(w, "logged fuel") == {"day": _detail(w, "logged fuel")["day"], "litres": 50.0, "cost_rs": 14321.5, "note": "tanker",
+                                         "fuel_unit": "L"}    # the unit of the genset's fuel (round 7 integration: MMBtu at a gas genset)
 
     # ---- the edge reports the tier its source supports
     kh = w.key(["telemetry:write"])
