@@ -162,16 +162,16 @@ def test_the_release_build_refuses_a_one_folder_copy_and_a_folder_without_the_we
     with pytest.raises(SystemExit, match="No web app at"):
         release.web_folder(str(tmp_path / "nowhere"))
     both = tmp_path / "both"
-    (both / "frontend").mkdir(parents=True)
-    (both / "frontend" / "package.json").write_text("{}", encoding="utf-8")
+    both.joinpath("frontend").mkdir(parents=True)
+    both.joinpath("frontend", "package.json").write_text("{}", encoding="utf-8")
     (both / "backend" / "gridlytics").mkdir(parents=True)
     (both / "backend" / "gridlytics" / "api.py").write_text("", encoding="utf-8")
     with pytest.raises(SystemExit, match="holds the engine too"):
         release.web_folder(str(both))
-    web = tmp_path / "gridlytics-frontend"
-    (web / "frontend").mkdir(parents=True)
-    (web / "frontend" / "package.json").write_text("{}", encoding="utf-8")
-    assert release.web_folder(str(web)) == (web / "frontend").resolve()
+    web = tmp_path / "web-repository"
+    web.joinpath("frontend").mkdir(parents=True)
+    web.joinpath("frontend", "package.json").write_text("{}", encoding="utf-8")
+    assert release.web_folder(str(web)) == web.joinpath("frontend").resolve()
     # a built folder handed in must be a build
     with pytest.raises(SystemExit, match="no index.html"):
         release.main(["--dist", str(tmp_path / "nowhere"), "--out", str(tmp_path / "out")])
@@ -192,7 +192,7 @@ def test_the_release_folder_runs_the_api_and_the_page_on_one_port_with_its_own_d
     folder = out / f"gridlytics-{__version__}"
     assert (folder / "app" / "backend" / "gridlytics" / "api.py").is_file()
     assert not list((folder / "app").rglob("__pycache__")) and not list((folder / "app").rglob("*.pyc"))
-    assert (folder / "app" / "frontend" / "dist" / "index.html").is_file()
+    assert folder.joinpath("app", "frontend", "dist", "index.html").is_file()
     assert (folder / "requirements.txt").read_text(encoding="utf-8") == (ROOT / "requirements.txt").read_text(encoding="utf-8")
     assert (folder / "data").is_dir() and not any((folder / "data").iterdir()), "the release starts with an empty data folder of its own"
     for name in ("run.py", "restore_backup.py", "Start Gridlytics.cmd", "README.txt"):
