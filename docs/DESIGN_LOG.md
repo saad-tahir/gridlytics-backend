@@ -92,6 +92,40 @@ check" commits):
   pilot), and for a monitor site the tier's refusal, whose CSV check scans the site's minutes for the inverter's mode until it finds one, as `PUT
   /tier` always did.
 
+### Batch k2: K2, K3 (12 Nov 2026)
+
+- **K3, the contact page's request for access** (plan B21.2 item 1, B4): `POST /api/public/access-requests`, in `api.PUBLIC_POSTS`. It keeps a
+  request to the founder and answers 202 with no body whatever the email; it looks up no account and makes none (the owner's rule: preassigned
+  accounts only, no self-signup, no invitation). The rules and the store are `access_requests.py`, the routes `routes_access.py`, both Gridlytics' own;
+  the request is a strict model (`AccessRequestIn`) refused in one plain sentence per field. Decisions the plan left open:
+  - **The topics are B4's four** (`access`, `person`, `support`, `other`, the names of B2.1's `/contact?topic=`), not H5.2's shorthand of three: B4 is
+    the page's own section and People's "Ask OnyxLeaf to add someone" opens `?topic=person` (G2.2.1). The company is needed for `access` and `person`,
+    the message for `support` and `other` (B4: "for the first two topics", "for the last two"). The work email is checked for shape only, with a dot in
+    its domain (unlike an account's email, which takes the demo's `dev@localhost`).
+  - **The honeypot is the field `website`**: any value at all (text, a number, a list) is a machine's, answered the same 202 and kept nowhere, and
+    it is read before the model, so the rest of such a body is never judged.
+  - **8 KB is the body as sent, on this path only** (`api.BODY_CAPS`; a chunked body is counted as it arrives, `/api/v1/...` too); every other path
+    keeps `MAX_BODY`.
+  - **Five an hour per address** (`platform.client_address`, which believes a proxy's header only where the server says it runs behind one), in the
+    API's in-memory limiter. A send kept, and one with the honeypot filled, count; a 422 does not, so a person putting a field right does not use up the
+    hour. The 429 carries `Retry-After`, `retry_at` (when a send works again, rounded up to a whole minute, ISO 8601 with +05:00) and the sentence
+    "Too many requests from this connection; try again after 14:01" (" tomorrow" past midnight): B4 wants an absolute time, and the server's is the
+    one the limiter keeps. `GRIDLYTICS_RATE_ACCESS_REQUESTS` changes the five. Behind a proxy the server is not told of (`GRIDLYTICS_TRUST_PROXY`),
+    every visitor counts as the one address "forwarded", as for the sign-in lockout, and five an hour would be the whole site's: the deployment guide's
+    proxy step matters here too.
+  - **A signed-in sender is recorded** (`sent_by`: email, name, company, Gridlytics role), which the plan does not ask: People's "Ask OnyxLeaf to add
+    someone" (Q75) is the company's administrator asking for an account, and the founder must tell that request from anyone's before making one (G4.6).
+    A token that is not good is a visitor's, as on every public path; a site key is refused (no site in the path).
+- **The store is schema 4 of the registry** (`platform.db`, `access_requests`, its state held by a CHECK), never a company's file: the requests come
+  from no company. `platform._connect` copies the registry to `backup/` (`platform-...-schema-v3.db`) before the migration runs, as for schemas 2 and
+  3; `platform.py` is a lifted file, and `backend/lift_manifest.json` records the change (Solarlytics has no contact form, so nothing to port back).
+- **Keeping** (B21.2 item 4): the owner's question Q30 (how long access requests are kept) has no recommended answer in the plan. The privacy
+  notice's example, 12 months, ships (`KEEP_DAYS` = 365 from when a request came): a request past it is removed at the next send or the founder's next
+  read, with a line "removed access requests past their keeping time" (actor `server`) in the founder's audit. One number to change when the owner
+  decides; the privacy notice's section 6 should then say the same.
+- Owner's questions: Q25 (the form with a founder console inbox, not a `mailto:` only) and Q75 (People's request lands in Access requests as "Another
+  person") ship their recommended yes; Q30 as above.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

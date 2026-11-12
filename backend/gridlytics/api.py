@@ -30,7 +30,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES as _GZIP_SKIPPED
 
-from . import __version__, apikeys, auth, backups, companies, identity, money, store, store_members, telemetry, version
+from . import __version__, access_requests, apikeys, auth, backups, companies, identity, money, store, store_members, telemetry, version
 from . import platform as platformdb
 from .schemas import Refusal
 
@@ -119,6 +119,8 @@ SIGN_IN_CODES = {"token_invalid": 401, "token_expired": 401, "session_ended": 40
 SECURITY_HEADERS = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
                     "Content-Security-Policy": "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; script-src 'self'"}
 MAX_BODY = 25_000_000
+#: Paths that take less than MAX_BODY: the contact page's request for access, 8 KB (UX backend ask K3; plan B21.2 item 1)
+BODY_CAPS = {"/api/public/access-requests": access_requests.BODY_BYTES}
 _BODY_METHODS = ("POST", "PUT", "DELETE", "PATCH")
 _REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{8,64}")
 
@@ -135,13 +137,19 @@ def _too_many(rid: str, wait: int, who: str) -> JSONResponse:
     return _refusal(rid, 429, f"Too many requests {who}; try again in {wait} second{'s' if wait != 1 else ''}", "too_many_requests", {"Retry-After": str(wait)})
 
 
+def _body_cap(path: str) -> int:
+    """The most a request's body may hold on this path (`/api/v1/x` is `/api/x`): BODY_CAPS's, else MAX_BODY."""
+    return BODY_CAPS.get("/api" + path[len("/api/v1"):] if path.startswith("/api/v1/") else path, MAX_BODY)
+
+
 def _fail(message: str, code: str | None = None):
     """A 422 with the message a person reads (the lifted route modules raise through this)."""
     raise Refusal(422, message, code)
 
 
 PUBLIC_PATHS = {"/api/health", "/api/auth/state"}
-PUBLIC_POSTS: set[str] = set()
+#: The contact page's request for access is sent signed out (UX backend ask K3): a request to the founder, never an account
+PUBLIC_POSTS: set[str] = {"/api/public/access-requests"}
 LOCAL_POSTS = {"/api/local/session", "/api/local/refresh", "/api/local/logout"}
 if identity.MODE == "local":
     PUBLIC_POSTS |= LOCAL_POSTS
@@ -252,9 +260,10 @@ async def _guarded(request, call_next, rid: str):
         multipart = ctype in ("multipart/form-data", "text/csv", "application/octet-stream") and path.endswith("/upload")
         if ctype != "application/json" and not ctype.endswith("+json") and not bodiless and not multipart:
             return _refusal(rid, 415, "Requests that change anything must be JSON", "must_be_json")
-        if request.scope.get("body_too_large") or int(request.headers.get("content-length") or 0) > MAX_BODY:
+        if request.scope.get("body_too_large") or int(request.headers.get("content-length") or 0) > _body_cap(path):
             # a CSV upload over the cap is told the importer's own sentence (telemetry.UPLOAD_MAX_BYTES is this cap; flow-telemetry-plan-control-25)
-            return _refusal(rid, 413, telemetry.TOO_LARGE if path.endswith("/telemetry/upload") else "The request is too large")
+            return _refusal(rid, 413, telemetry.TOO_LARGE if path.endswith("/telemetry/upload") else
+                            "The request is too large: a request for access holds at most 8 KB" if path in BODY_CAPS else "The request is too large")
     address = request.client.host if request.client else ""
     api_call = path.startswith("/api/") and path != "/api/health"
     bearer = request.headers.get("authorization") or ""
@@ -380,7 +389,7 @@ class _VersionedPath:
 
 
 class _BodyLimit:
-    """A body over MAX_BODY is refused with 413 however it is sent (a chunked body is counted as it arrives)."""
+    """A body over MAX_BODY (or its path's cap, BODY_CAPS) is refused with 413 however it is sent (a chunked body is counted as it arrives)."""
 
     def __init__(self, inner):
         self.inner = inner
@@ -391,14 +400,14 @@ class _BodyLimit:
         names = {k.lower() for k, _ in scope["headers"]}
         if b"transfer-encoding" not in names and b"content-length" in names:
             return await self.inner(scope, receive, send)
-        held, seen, over = [], 0, False
+        held, seen, over, cap = [], 0, False, _body_cap(scope["path"])
         while True:
             message = await receive()
             if message["type"] != "http.request":
                 held.append(message)
                 break
             seen += len(message.get("body", b""))
-            if seen > MAX_BODY:
+            if seen > cap:
                 over, held = True, [{"type": "http.request", "body": b"", "more_body": False}]
                 scope = {**scope, "body_too_large": True}
                 break
@@ -751,12 +760,12 @@ def audit_list(offset: int = 0):
 
 # ------------------------------------------------------------------------------------------------ the feature routes
 
-from . import routes_founder, routes_local, routes_platform  # noqa: E402
+from . import routes_access, routes_founder, routes_local, routes_platform  # noqa: E402
 from . import (routes_sites, routes_tariffs, routes_telemetry, routes_edge, routes_forecasts, routes_plans, routes_savings, routes_reports,  # noqa: E402
                routes_alerts, routes_demo)
 
 FEATURE_ROUTES = (routes_platform, routes_sites, routes_tariffs, routes_telemetry, routes_edge, routes_forecasts, routes_plans, routes_savings, routes_reports,
-                  routes_alerts, routes_demo, routes_founder) + ((routes_local,) if identity.MODE == "local" else ())
+                  routes_alerts, routes_demo, routes_founder, routes_access) + ((routes_local,) if identity.MODE == "local" else ())
 for _routes in FEATURE_ROUTES:
     app.include_router(_routes.router)
 

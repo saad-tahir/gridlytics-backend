@@ -35,9 +35,9 @@
       "path": "backend/gridlytics/platform.py",
       "upstream": "backend/solarlytics/platform.py",
       "status": "adapted",
-      "why": "Gridlytics' roles (admin, operator, analyst, viewer) and permission table; sessions with their registry, sign-out everywhere and one-time passwords (platform.db schema 2 and 3), the account lockout per account, the founder console's company states: audit security-roles-09/-10, parity-supabase-auth-01/-02/-08, founder-console-08, role-analyst-32, pages-A-02.",
+      "why": "Gridlytics' roles (admin, operator, analyst, viewer) and permission table; sessions with their registry, sign-out everywhere and one-time passwords (platform.db schema 2 and 3), the account lockout per account, the founder console's company states: audit security-roles-09/-10, parity-supabase-auth-01/-02/-08, founder-console-08, role-analyst-32, pages-A-02. Schema 4: the access requests the contact page sends the founder (Gridlytics' UX backend asks K2 and K3; the rules and the store are access_requests.py, not lifted); Solarlytics has no contact form, so nothing to port back.",
       "upstream_sha256": "8aaaec3922c95d8945b5c0a0befd757dfc6a71e936975400089db773e7c328cb",
-      "sha256": "caebd77bb8a470e86edf82ca7d86645f6a850e9f76cb1161cf4b1ed38237acdc"
+      "sha256": "b5aa99090c9a36309291204521f858308eb9b42b53fb1337ca555893ea478a7d"
     },
     {
       "path": "backend/gridlytics/companies.py",

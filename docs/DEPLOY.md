@@ -76,8 +76,8 @@ docker compose -f deploy/docker-compose.yml logs -f api
   usually `172.17.0.1`), and with the API run on the host without Docker it is `127.0.0.1`. Never `*`. `GRIDLYTICS_TRUST_PROXY=1` tells the sign-in
   lockout to count tries by the address the proxy gives; without it, every try through the proxy counts under one address, and the log says so once.
 - **The volume.** `/data` holds everything the app keeps, and the app (user 10001) writes nowhere else:
-  - `platform.db`: the registry (the companies, each with its files, seats and whether Gridlytics is on; the founder's audit; in local mode the accounts,
-    the memberships, the sessions and the record of sign-ins);
+  - `platform.db`: the registry (the companies, each with its files, seats and whether Gridlytics is on; the founder's audit; the requests for access
+    sent from the contact page, kept 12 months; in local mode the accounts, the memberships, the sessions and the record of sign-ins);
   - `companies/<company id>.db` and `companies/<company id>-telemetry.db`: one company's workspace and its telemetry; a request opens its own company's
     files only; `companies/backup/` holds their copies;
   - `keys/<company id>/`: the signing keys of the company's sites (the edge checks each plan's signature with them);
@@ -130,6 +130,7 @@ the web app's settings (`frontend/.env.example` in the web repository: every `VI
 | `GRIDLYTICS_SCHEDULER`, `GRIDLYTICS_TICK_WORKERS` | both | `1` runs the 15-minute loop in this process (the image sets it; one process per data folder); how many sites a tick solves at once |
 | `GRIDLYTICS_RATE_USER`, `GRIDLYTICS_RATE_ADDRESS`, `GRIDLYTICS_RATE_PUBLIC` | both | Requests a minute per person, per address, and per address to the public paths |
 | `GRIDLYTICS_RATE_SIGN_IN`, `GRIDLYTICS_RATE_REPORTS` | both | Sign-ins from one address in 5 minutes; reports a company may generate in an hour |
+| `GRIDLYTICS_RATE_ACCESS_REQUESTS` | both | Requests for access the contact page may send from one address in an hour (5; `0` turns the limit off) |
 | `GRIDLYTICS_DOCS` | both | `1` opens the API pages at `/docs`; off on a hosted copy |
 | `GRIDLYTICS_DEMO_DAYS`, `GRIDLYTICS_DEMO_REPLAN_HOURS` | both | The demo sites' days of history and how often it re-plans, for a company's administrator who loads them from Fleet |
 
@@ -137,8 +138,9 @@ the web app's settings (`frontend/.env.example` in the web repository: every `VI
 
 The founder console is Gridlytics' own: its pages are the web app's `/admin` (`https://grid.example.com/admin`), and its calls go to the backend's
 `/api/founder/*`, with a login of its own. It makes the companies and the accounts: companies (make one with its owner, rename, seats, Gridlytics on or
-off, disable), users (make an account with a first password, reset a password, disable, add to a company, remove), backups (per company) and the audit.
-Every action is audited in `platform.db`. It answers 503 until its four settings are set:
+off, disable), users (make an account with a first password, reset a password, disable, add to a company, remove), backups (per company), the audit,
+and the access requests the contact page sends (read them and set their state; nothing there makes an account). Every action is audited in
+`platform.db`. It answers 503 until its four settings are set:
 
 1. **The username:** `GRIDLYTICS_FOUNDER_USERNAME`, for example `founder`.
 2. **The password's hash:** run `python -m gridlytics.founder hash` (it asks for the password twice and prints a PBKDF2 hash; in the container:

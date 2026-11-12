@@ -1,5 +1,6 @@
 """The platform's registry, `platform.db`: companies, the accounts of local sign-in, memberships, refresh tokens, the founder's audit and the record of sign-ins
-(the owner's decisions of 24 October 2026, sections 1, 2 and 5; stage P1 of the sign-in and split).
+(the owner's decisions of 24 October 2026, sections 1, 2 and 5; stage P1 of the sign-in and split), and the access requests sent to the founder from the
+contact page (schema 4; access_requests.py; UX backend asks K2 and K3).
 
 One server keeps a database per company (`companies/<id>.db`, a full workspace each) and this one registry beside them. The data folder is GRIDLYTICS_DATA_DIR
 when it is set, and otherwise the folder of `store.DB_PATH`, read at every call: a test or a scratch run that moves the workspace's file moves the registry
@@ -35,7 +36,7 @@ from pathlib import Path
 
 from . import auth, identity, store
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 #: An access token's life (Supabase's default, decisions-v2 section 1)
 ACCESS_MINUTES = 60
 #: A refresh token not used for this long has ended; a session ends this many days after its sign-in, however used (the cookie sessions' rules)
@@ -143,6 +144,17 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
         # of the sign-in, never shown to anyone but the person
         for column, kind in (("started", "REAL"), ("address", "TEXT NOT NULL DEFAULT ''"), ("agent", "TEXT NOT NULL DEFAULT ''")):
             con.execute(f"ALTER TABLE refresh_tokens ADD COLUMN {column} {kind}")
+    if version < 4:
+        # the access requests a visitor sends from the contact page to the founder (UX backend asks K2 and K3; plan B4, B20.4, B21.2): the platform's,
+        # never a company's file, and never an account. Each is kept KEEP_DAYS (access_requests.py) from when it came. _connect() has copied the file
+        con.execute("""CREATE TABLE IF NOT EXISTS access_requests (
+            id TEXT PRIMARY KEY, received_at TEXT NOT NULL, topic TEXT NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL,
+            company TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', sites TEXT, equipment TEXT NOT NULL DEFAULT '[]',
+            inverter TEXT, disco TEXT, message TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'new' CHECK (state IN ('new', 'contacted', 'done', 'declined')), note TEXT NOT NULL DEFAULT '', updated_at TEXT,
+            sent_by TEXT)""")
+        con.execute("CREATE INDEX IF NOT EXISTS access_requests_received ON access_requests(received_at)")
+        con.execute("CREATE INDEX IF NOT EXISTS access_requests_state ON access_requests(state, received_at)")
     con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
