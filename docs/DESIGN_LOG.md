@@ -13,6 +13,14 @@ question of the owner, the recommended answer ships and is logged here and in th
 
 - **K4, the role matrix** (plan G9 item 1): `GET /api/meta` answers `role_matrix`, `{permission: [roles]}` straight from `auth.PERMISSIONS`, the roles in
   `auth.ROLES` order, the same for every reader. No money.
+- **K24, a gas genset's fuel log** (plan E6 item 6, A8.5): `POST /genset/fuel` takes, for a captive-gas or RLNG genset, `mmbtu` as billed, or `hm3`
+  with `calorific_mmbtu_per_hm3` from the bill, stored as MMBtu (hm³ x the calorific value, to three decimals); never an assumed calorific value. The
+  calorific value is held to 2 to 5 MMBtu per hm³ (pipeline gas of about 950 BTU per cubic foot is 3.35, RLNG about 3.7, a lean captive field about
+  2.6), which refuses a figure typed in BTU per cubic foot or MJ per m³. A diesel genset's log stays in litres and refuses the gas forms. `litres` sent
+  for a gas genset is still read as MMBtu, as the web app of before sent it (round 7 sweeps' fuel unit). The stored amount stays under `litres`, as
+  every fuel figure of a gas genset does (`savings_export.fuel_unit`), with `unit` and `entry` beside it; `fuel_logged` adds only the logs in the
+  genset's unit. The request is a strict model (`FuelLogIn`): a yes or no, or text, for a number is refused. Owner's question Q9 (the fuel log in
+  MMBtu as billed or from a meter reading): the recommended yes ships.
 - **K25, the telemetry CSV in Karachi time** (plan E6 item 7): `ts_karachi` (ISO 8601 with +05:00) is the first column, `ts_utc` the second, then the
   stored series as before. Owner's question Q58 (the telemetry CSV leads with Karachi time): the recommended yes ships.
 

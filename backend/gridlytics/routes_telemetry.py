@@ -470,7 +470,9 @@ def _measured_points(runs: list[dict]) -> list[dict]:
 
 
 def _fuel_logged(site_id: str, d0: str, d1: str) -> dict:
-    """The fuel logged for the Karachi days d0..d1: {litres, entries}."""
+    """The fuel logged for the Karachi days d0..d1 in the genset's unit: {litres (the amount, kept under this name), entries, unit ("L" or "MMBtu")}.
+    A log stored in another unit (before the genset's fuel was changed) is not added to it (UX backend ask K24)."""
+    unit = savings_export.fuel_unit(site_id) or "L"
     with store.connect() as con:
         rows = con.execute("SELECT detail FROM events WHERE site_id = ? AND type = 'fuel_log'", (site_id,)).fetchall()
     litres, n = 0.0, 0
@@ -479,9 +481,9 @@ def _fuel_logged(site_id: str, d0: str, d1: str) -> dict:
             d = json.loads(r["detail"] or "{}")
         except ValueError:
             continue
-        if isinstance(d.get("litres"), (int, float)) and d0 <= str(d.get("day") or "") <= d1:
+        if isinstance(d.get("litres"), (int, float)) and d0 <= str(d.get("day") or "") <= d1 and _log_unit(d, unit) == unit:
             litres, n = litres + float(d["litres"]), n + 1
-    return {"litres": round(litres, 1), "entries": n}
+    return {"litres": round(litres, 1), "entries": n, "unit": unit}
 
 
 @router.get("/api/sites/{site_id}/genset")
@@ -536,7 +538,8 @@ def genset_page(site_id: str, days: int = 14, month: str | None = None):
                         "points": [{"load_ratio": lr, "litres_per_hour": round(g["a"] * lr * g["rated_kw"] + g["b"] * g["rated_kw"], 2)}
                                    for lr in (0.25, 0.5, 0.75, 1.0)],
                         "measured": _measured_points(runs)},
-              "fuel_logged": _fuel_logged(site_id, res["daily"][0]["day"], res["daily"][-1]["day"]) if res["daily"] else {"litres": 0.0, "entries": 0},
+              "fuel_logged": (_fuel_logged(site_id, res["daily"][0]["day"], res["daily"][-1]["day"]) if res["daily"]
+                              else {"litres": 0.0, "entries": 0, "unit": savings_export.fuel_unit(site_id) or "L"}),
               "requests": alerts.requests_for(site_id), "plan": [{"t": x["t"], "genset_kw": x["genset_kw"], "reason": x["reason"]}
                                                                   for x in (plans.current(site_id) or {}).get("steps", []) if x["genset_on"]][:96],
               "policy": "Gridlytics never starts or stops the genset itself: it asks, with a reason, and records whether the advice was followed."}
@@ -635,53 +638,126 @@ def genset_answer(site_id: str, nid: str, inp: dict = Body(...)):
         raise bad(exc) from None
 
 
+#: A fuel log's quantity is under this, whatever its unit (litres of diesel, MMBtu of gas)
+FUEL_LOG_MAX = 100_000
+#: A meter reading's hm³ (hundreds of cubic metres) is under this
+HM3_MAX = 100_000
+#: The calorific value a meter reading takes, in MMBtu per hm³ as a Pakistani gas bill prints it: pipeline gas of about 950 BTU per cubic foot is
+#: 3.35, RLNG about 3.7 and a lean captive field about 2.6. Outside this, the figure is in another unit (BTU per cubic foot, MJ per m³) or mistyped
+CALORIFIC_RANGE = (2.0, 5.0)
+
+
+class FuelLogIn(Strict):
+    """`POST /sites/:id/genset/fuel` (UX backend ask K24, plan E6 item 6): the fuel put in the genset, one way only. Litres for diesel; for a captive
+    gas or RLNG genset MMBtu as billed, or a meter reading in hm³ with the calorific value printed on the bill (never an assumed one). Numbers are
+    numbers: a yes or no, or text, is refused."""
+    litres: float | None = Field(None, strict=True)
+    mmbtu: float | None = Field(None, strict=True)
+    hm3: float | None = Field(None, strict=True)
+    calorific_mmbtu_per_hm3: float | None = Field(None, strict=True)
+    #: the Karachi day the fuel was put in (YYYY-MM-DD), today by default
+    day: str | None = None
+    #: what it cost, as billed (money: a viewer never reads it back)
+    cost_rs: float | None = Field(None, strict=True)
+    note: str = ""
+
+
+def _genset_fuel(site_id: str) -> tuple[bool, bool]:
+    """(the site has a genset, it burns gas: captive gas or RLNG)."""
+    gen = sites.assets(site_id).get("genset")
+    return gen is not None, gen is not None and (gen.get("fuel_kind") or "hsd") in sites.GAS_FUELS
+
+
+def _fuel_amount(body: FuelLogIn, has_genset: bool, gas: bool) -> tuple[float, str, dict]:
+    """The logged quantity in the genset's unit, how it was entered ("litres", "billed" or "meter") and, for a meter reading, the reading and the
+    calorific value it was converted with; a Refusal in one sentence when the log cannot be taken."""
+    sent = [k for k in ("litres", "mmbtu", "hm3") if getattr(body, k) is not None]
+    if not sent:
+        raise Refusal(422, "Log the fuel as litres, as MMBtu, or as a meter reading in hm³ with the bill's calorific value", "invalid")
+    if len(sent) > 1:
+        raise Refusal(422, "Log the fuel one way only: litres, MMBtu, or a meter reading in hm³", "invalid")
+    if body.calorific_mmbtu_per_hm3 is not None and sent != ["hm3"]:
+        raise Refusal(422, "The calorific value goes with a meter reading in hm³", "invalid")
+    if sent[0] != "litres" and not gas:
+        raise Refusal(422, "This genset burns diesel: log its fuel in litres" if has_genset else "This site has no gas genset: log its fuel in litres",
+                      "invalid")
+    if sent[0] == "litres":
+        # a gas genset's fuel sent as `litres` is its MMBtu, as the web app of before sent it (round 7 sweeps: the log's amount in the genset's unit)
+        if not 0 < body.litres < FUEL_LOG_MAX:
+            raise Refusal(422, "MMBtu must be a positive number under 100,000" if gas else "Litres must be a positive number", "invalid")
+        return float(body.litres), "billed" if gas else "litres", {}
+    if sent[0] == "mmbtu":
+        if not 0 < body.mmbtu < FUEL_LOG_MAX:
+            raise Refusal(422, "MMBtu must be a positive number under 100,000", "invalid")
+        return float(body.mmbtu), "billed", {}
+    cv = body.calorific_mmbtu_per_hm3
+    if cv is None:
+        raise Refusal(422, "A meter reading in hm³ needs the calorific value printed on the bill (MMBtu per hm³)", "invalid")
+    if not 0 < body.hm3 < HM3_MAX:
+        raise Refusal(422, "The meter reading must be a positive number of hm³ under 100,000", "invalid")
+    if not CALORIFIC_RANGE[0] <= cv <= CALORIFIC_RANGE[1]:
+        raise Refusal(422, "The calorific value is the bill's MMBtu per hm³, from 2 to 5", "invalid")
+    amount = round(body.hm3 * cv, 3)
+    if amount >= FUEL_LOG_MAX:
+        raise Refusal(422, f"That reading gives {amount:,.0f} MMBtu, more than one log takes (under 100,000): check the figures", "invalid")
+    return amount, "meter", {"hm3": body.hm3, "calorific_mmbtu_per_hm3": cv}
+
+
+def _log_unit(d: dict, unit_now: str) -> str:
+    """A fuel log's unit: as stored with it, or (a log stored before the unit was kept) the genset's unit now, "L" without a genset."""
+    return d.get("unit") or unit_now or "L"
+
+
 @router.get("/api/sites/{site_id}/genset/fuel")
 def fuel_logs(site_id: str, limit: int = 200):
-    """The fuel log, newest first: {id, ts (when it was logged), day, litres, cost_rs (when given; money, so a viewer does not see it), note, by}."""
+    """The fuel log, newest first: {id, ts (when it was logged), day, litres (the amount in its unit, kept under this name for the web app of before),
+    unit ("L" or "MMBtu"), entry ("litres", "billed": MMBtu as billed, or "meter": a meter reading), mmbtu (the amount at a gas genset, else null),
+    hm3 and calorific_mmbtu_per_hm3 (a meter reading's, else null), cost_rs (when given; money, so a viewer does not see it), note, by}."""
     site_or_404(site_id)
     with store.connect() as con:
         rows = con.execute("SELECT id, ts, source, detail FROM events WHERE site_id = ? AND type = 'fuel_log' ORDER BY ts DESC, id DESC LIMIT ?",
                            (site_id, max(1, min(int(limit), 1000)))).fetchall()
+    unit_now = savings_export.fuel_unit(site_id)
     logs = []
     for r in rows:
         try:
             d = json.loads(r["detail"] or "{}")
         except ValueError:
             d = {}
-        logs.append({"id": r["id"], "ts": r["ts"], "day": d.get("day"), "litres": d.get("litres"), "cost_rs": d.get("cost_rs"), "note": d.get("note", ""),
-                     "by": r["source"]})
+        unit = _log_unit(d, unit_now)
+        logs.append({"id": r["id"], "ts": r["ts"], "day": d.get("day"), "litres": d.get("litres"), "unit": unit,
+                     "entry": d.get("entry") or ("billed" if unit == "MMBtu" else "litres"), "mmbtu": d.get("litres") if unit == "MMBtu" else None,
+                     "hm3": d.get("hm3"), "calorific_mmbtu_per_hm3": d.get("calorific_mmbtu_per_hm3"), "cost_rs": d.get("cost_rs"),
+                     "note": d.get("note", ""), "by": r["source"]})
     return out({"logs": logs})
 
 
 @router.post("/api/sites/{site_id}/genset/fuel")
 def fuel_log(site_id: str, inp: dict = Body(...)):
-    """Logs fuel put in the genset: litres, the day (today by default), an optional cost_rs (what it cost, as billed) and a note."""
+    """Logs fuel put in the genset (FuelLogIn): litres of diesel; for a gas genset MMBtu as billed, or a meter reading in hm³ with the bill's calorific
+    value, stored as MMBtu (hm³ x the calorific value, to three decimals; UX backend ask K24). The day is today by default; an optional cost_rs (what
+    it cost, as billed) and a note. Answers {logged (the amount in the unit), unit, entry, day, hm3, calorific_mmbtu_per_hm3}."""
     auth.need("upload_data", "Logging fuel")
     site_or_404(site_id)
-    try:
-        litres = float(inp.get("litres", 0))
-        if not (0 < litres < 100000):
-            raise ValueError("Litres must be a positive number")
-        day = parse_day(inp.get("day"), today())
-        cost = inp.get("cost_rs")
-        if cost is not None:
-            cost = float(cost)
-            if not (0 <= cost < 1e9) or isinstance(inp.get("cost_rs"), bool):
-                raise ValueError("The cost is a number of rupees from 0")
-    except (TypeError, ValueError) as exc:
-        raise bad(exc) from None
-    detail = {"day": day.isoformat(), "litres": litres, "note": str(inp.get("note", ""))[:200]}
+    body = check(FuelLogIn, inp)
+    has_genset, gas = _genset_fuel(site_id)
+    amount, entry, reading = _fuel_amount(body, has_genset, gas)
+    day = parse_day(body.day, today())
+    cost = body.cost_rs
+    if cost is not None and not 0 <= cost < 1e9:
+        raise Refusal(422, "The cost is a number of rupees from 0", "invalid")
+    unit = "MMBtu" if gas else "L"
+    detail = {"day": day.isoformat(), "litres": amount, "unit": unit, "entry": entry, **reading, "note": body.note[:200]}
     if cost is not None:
         detail["cost_rs"] = round(cost, 2)
-    # the audit line names the fuel's unit, "L" or "MMBtu" (a gas genset's fuel; round 7 integration, savings-page's line with sweeps'
-    # frontend-states-formats-01), so the trail does not read a gas genset's fuel as litres
-    unit = savings_export.fuel_unit(site_id)
     with store.write_transaction() as con:
         con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
                     (site_id, store._now(), "fuel_log", auth.actor(), json.dumps(detail)))
-        # the litres feed the genset's ledger: the log is audited (round 7, audit security-roles-04); its cost is money, filtered by its name
-        store.audit(auth.actor(), "logged fuel", site_id, {**detail, "fuel_unit": unit}, con=con)
-    return {"logged": litres, "day": day.isoformat()}
+        # the litres feed the genset's ledger: the log is audited (round 7, audit security-roles-04); its cost is money, filtered by its name. The
+        # line names the fuel's unit, "L" or "MMBtu" (round 7 integration), so the trail does not read a gas genset's fuel as litres
+        store.audit(auth.actor(), "logged fuel", site_id, {**{k: v for k, v in detail.items() if k != "unit"}, "fuel_unit": unit}, con=con)
+    return {"logged": amount, "unit": unit, "entry": entry, "day": day.isoformat(), "hm3": reading.get("hm3"),
+            "calorific_mmbtu_per_hm3": reading.get("calorific_mmbtu_per_hm3")}
 
 
 _ = (sites, timezone)
