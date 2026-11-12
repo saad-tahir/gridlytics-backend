@@ -749,10 +749,6 @@ TIER_WORDS = {"monitor": "monitor (the plan only recommends)", "advisory_writes"
               "closed_loop": "closed loop (the edge writes the table)"}
 
 
-def _reading(ok: bool | None) -> str:
-    return "not measured yet" if ok is None else ("meets it" if ok else "falls short")
-
-
 def verified_bound(days: list[dict]) -> tuple[float | None, int]:
     """Plan 15.3's statistic: the lower 80 % confidence bound of the daily verified increment over the tuned baseline (the tuned saving of each verified
     day), times 30; None with fewer than two verified days."""
@@ -766,6 +762,62 @@ def verified_bound(days: list[dict]) -> tuple[float | None, int]:
     return (mean - float(stats.t.ppf(0.8, len(xs) - 1)) * sd / math.sqrt(len(xs))) * 30, len(xs)
 
 
+#: The pilot's gates in words (gonogo.scorecard's ids), as the Pilot page's go/no-go names them
+GATE_WORDS = {"saving": "Saving at least (of the native arm's cost, on the days that claim)",
+              "unserved": "Unserved critical energy at most (caused by the plan)",
+              "reserve": "Reserve adequacy at least (outages entered at or above the planned reserve)",
+              "fidelity": "Plan fidelity at least (plan days confirmed applied)",
+              "fee_multiple": "Verified saving at least (times the fee)",
+              "forecast_pv": "Solar forecast error at most (nRMSE)",
+              "genset_hours": "Genset run hours cut at least (against the tuned rule, on the days that claim)",
+              "cycles": "Battery cycles a day at most (times the tuned baseline's)",
+              "agreement": "Counterfactual and switchback agree (within 15 % of the switchback saving or Rs 300 a day)",
+              "whitelist": "Writes the edge refused as off its whitelist",
+              "statistic": "Lower 80 % bound of the daily verified saving over the tuned table, times 30"}
+READING = {"met": "meets it", "not_met": "falls short", "not_yet": "not measured yet", "not_applicable": "does not apply here"}
+VERDICT_WORDS = {"not_yet": "Verdict: not yet. Plan 15.3 reads the statistic once 8 weeks of switchback have run and the fee is set.",
+                 "go": "Verdict: go. The statistic is at least 3 times the fee and every gate measured is met.",
+                 "review": "Verdict: review. The statistic is at least 3 times the fee, but a gate is not met.",
+                 "extend": "Verdict: extend once, by 4 weeks. The statistic is between 1.5 and 3 times the fee.",
+                 "stop": "Verdict: stop. The statistic is under 1.5 times the fee after 8 weeks of switchback."}
+SO_FAR_WORDS = {"success": "at least 3 times the fee", "extend": "between 1.5 and 3 times the fee", "stop": "under 1.5 times the fee"}
+
+
+def _gate_row(g: dict, c: dict) -> list[str]:
+    """One gate of gonogo.scorecard as the write-up's row: what it asks, the pre-registered value, the result and the reading."""
+    gid, r, st = g["id"], g.get("result"), g["status"]
+    if gid == "saving":
+        cells = [_pct(c["min_saving_pct"], 1), _pct(r)]
+    elif gid == "unserved":
+        cells = [smart(c["max_unserved_kwh"], " kWh"), smart(r, " kWh")]
+    elif gid == "reserve":
+        cells = [_pct(c["reserve_adequacy_pct"], 0), _pct(r, 0) + (f" of {_plural(g['outages'], 'outage')}" if r is not None and g.get("outages") else "")]
+    elif gid == "fidelity":
+        cells = [_pct(c["fidelity_pct"], 0), _pct(r, 0)]
+    elif gid == "fee_multiple":
+        cells = [f"{c['fee_multiple']:g} times the fee", "no fee set" if not g.get("fee_set") else ("-" if r is None else f"{r:.1f} times the fee")]
+    elif gid == "forecast_pv":
+        cells = [_pct(c["forecast_pv_nrmse_max"] * 100, 0) + " of capacity", _pct(None if r is None else r * 100)]
+    elif gid == "genset_hours":
+        cells = [_pct(c["genset_hours_cut_pct"], 0), "-" if r is None else f"{_pct(r)} ({smart(g.get('hours_actual'), ' h')} against "
+                                                                           f"{smart(g.get('hours_tuned'), ' h')})"]
+    elif gid == "cycles":
+        cells = [f"{c['cycles_ratio_max']:g} times", "-" if r is None else f"{r:.2f} times"]
+    elif gid == "agreement":
+        cells = ["within the tolerance", "-" if r is None else ("they agree" if r else "they disagree: a finding to look into")]
+    elif gid == "whitelist":
+        cells = ["none", "-" if r is None else str(r)]
+    else:  # the decision statistic
+        bound = g.get("bound_rs_per_month")
+        cells = ["at least 3 times the fee to succeed; under 1.5 times the fee after 8 weeks stops the pilot",
+                 f"needs two verified days ({g.get('verified_days') or 0} so far)" if bound is None else
+                 (f"{rs(bound)} a month; no fee set to compare with" if not g.get("fee_set") else f"{rs(bound)} a month, {r:.1f} times the fee")]
+        reading = ("not measured yet" if r is None else "meets the success gate" if r >= 3 else
+                   "below the stop gate" if r < g.get("stop_below", 1.5) else "between the gates: extend once by 4 weeks")
+        return [GATE_WORDS[gid], *cells, reading]
+    return [GATE_WORDS.get(gid, gid), *cells, READING.get(st, st)]
+
+
 def _pilot(doc: _Doc, site: dict, p0: date, p1: date, today: date, inputs: dict) -> tuple[bool, date]:
     """Plan 8.5's pilot write-up: the pre-registered criteria (the Pilot page's, stored when it started) filled in with the results from the pilot's
     start to the end of the chosen month, the switchback table, forecast accuracy and control health. Below the advisory tier it is a
@@ -775,7 +827,6 @@ def _pilot(doc: _Doc, site: dict, p0: date, p1: date, today: date, inputs: dict)
     with store.connect() as con:
         r = con.execute("SELECT data, started FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
     pilot = json.loads(r["data"]) if r else dict(PILOT_DEFAULT)
-    criteria = {**PILOT_DEFAULT["criteria"], **(pilot.get("criteria") or {})}
     blocks = verify.switchback_blocks(site_id)
     start = p0
     try:
@@ -804,47 +855,16 @@ def _pilot(doc: _Doc, site: dict, p0: date, p1: date, today: date, inputs: dict)
         else ""))
     doc.gap()
     doc.h2("Pre-registered criteria against the results")
-    nat, tun = summ["baselines"].get("native", {}), summ["baselines"].get("tuned", {})
     days = summ.get("days") or []
-    cost = sum(_finite(d.get("native_cost_rs")) or 0.0 for d in days)
-    saving_pct = (_finite(nat.get("saving_rs")) or 0.0) / cost * 100 if cost > 0 else None
-    cover = outage_cover(site, start, end)
-    adequacy = (cover["entered_ok"] / cover["with_reserve"] * 100) if cover and cover["with_reserve"] else None
-    plan_days = sum(1 for d in days if d.get("fidelity") in ("confirmed", "partial", "not_applied", "pending"))
-    fidelity = sum(1 for d in days if d.get("fidelity") == "confirmed") / plan_days * 100 if plan_days else None
-    fee = summ.get("fee") or {}
-    fee_rs = _finite(fee.get("fee_rs_per_month")) or 0.0
-    multiple = (_finite(fee.get("verified_saving_rs_per_month")) or 0.0) / fee_rs if fee_rs > 0 else None
     fc = forecast_skill(site_id, start, end)
-    unserved = _finite(nat.get("unserved_kwh_actual"))
-    bound, n_verified = verified_bound(days)
-    c = criteria
-    rows = [["Criterion", "Pre-registered", "Result", "Reading"],
-            ["Saving at least (of the native arm's cost)", _pct(c["min_saving_pct"], 1), _pct(saving_pct),
-             _reading(None if saving_pct is None else saving_pct >= c["min_saving_pct"])],
-            ["Unserved critical energy at most", smart(c["max_unserved_kwh"], " kWh"), smart(unserved, " kWh"),
-             _reading(None if unserved is None or not days else unserved <= c["max_unserved_kwh"])],
-            ["Reserve adequacy at least (outages entered at or above the planned reserve)", _pct(c["reserve_adequacy_pct"], 0), _pct(adequacy, 0),
-             _reading(None if adequacy is None else adequacy >= c["reserve_adequacy_pct"])],
-            ["Plan fidelity at least (plan days confirmed applied)", _pct(c["fidelity_pct"], 0), _pct(fidelity, 0),
-             _reading(None if fidelity is None else fidelity >= c["fidelity_pct"])],
-            ["Verified saving at least (times the fee)", f"{c['fee_multiple']:g} times the fee",
-             "no fee set" if multiple is None else f"{multiple:.1f} times the fee ({rs(fee.get('verified_saving_rs_per_month'))} a month against "
-                                                    f"{rs(fee_rs)})", _reading(None if multiple is None else multiple >= c["fee_multiple"])],
-            ["Solar forecast error at most (nRMSE)", _pct(c["forecast_pv_nrmse_max"] * 100, 0) + " of capacity",
-             _pct(None if fc["pv_nrmse"] is None else fc["pv_nrmse"] * 100), _reading(None if fc["pv_nrmse"] is None else fc["pv_nrmse"] <=
-                                                                                     c["forecast_pv_nrmse_max"])]]
-    if bound is None:
-        stat, reading = f"needs two verified days ({n_verified} so far)", "not measured yet"
-    elif fee_rs <= 0:
-        stat, reading = f"{rs(bound)} a month; no fee set to compare with", "not measured yet"
-    else:
-        stat = f"{rs(bound)} a month, {bound / fee_rs:.1f} times the fee"
-        reading = "meets the success gate" if bound >= 3 * fee_rs else ("below the stop gate" if bound < 1.5 * fee_rs else
-                                                                         "between the gates: extend once by 4 weeks")
-    rows.append(["Lower 80 % bound of the daily verified saving over the tuned table, times 30",
-                 "at least 3 times the fee to succeed; under 1.5 times the fee after 8 weeks stops the pilot", stat, reading])
+    # round 7 (audit pages-D-12): the gates as the Pilot page reads them (gonogo.scorecard, one reading for the page and the write-up), plan 15.3's
+    # genset, cycling, agreement and whitelist gates with them
+    from . import gonogo
+    card = gonogo.scorecard(site_id, today, start=start, end=end)
+    rows = [["Criterion", "Pre-registered", "Result", "Reading"]] + [_gate_row(g, card["criteria"]) for g in card["gates"]]
     doc.table([[doc.cell(x) for x in row] for row in rows], [62 * mm, 45 * mm, 45 * mm, 28 * mm], right=False)
+    doc.p(VERDICT_WORDS.get(card.get("verdict") or "", "") + (
+        f" So far the statistic reads: {SO_FAR_WORDS[card['so_far']]}." if card.get("verdict") == "not_yet" and card.get("so_far") else ""))
     doc.p("A gate marked “not measured yet” has no figure in the period. The figures run from the pilot's start to the end of the month "
           "chosen; Preliminary marks carry through.")
     doc.gap()

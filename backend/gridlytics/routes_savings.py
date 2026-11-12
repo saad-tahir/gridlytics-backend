@@ -184,8 +184,11 @@ def fee_put(site_id: str, inp: dict = Body(...)):
 
 # ------------------------------------------------------------------------------------------------ pilot (UI-13)
 
+#: the criteria tab D prefills (R8 2.13): plan 15.3's gates, the genset's run hours cut against the tuned rule and the cycles a day against the tuned
+#: baseline's among them (round 7, audit pages-D-12: they were missing; a set-up stored before reads them at these values)
 PILOT_DEFAULT = {"baseline_start": None, "baseline_days": 14, "criteria": {"min_saving_pct": 8.0, "max_unserved_kwh": 0.0, "reserve_adequacy_pct": 90.0,
-                                                                          "fidelity_pct": 80.0, "fee_multiple": 3.0, "forecast_pv_nrmse_max": 0.35},
+                                                                          "fidelity_pct": 80.0, "fee_multiple": 3.0, "forecast_pv_nrmse_max": 0.35,
+                                                                          "genset_hours_cut_pct": 15.0, "cycles_ratio_max": 1.1},
                  "signoff": None, "amendments": [], "closures": []}
 
 
@@ -400,6 +403,16 @@ def _ics_fold(line: str) -> list[str]:
         cur += ch
         size += n
     return out + [cur]
+
+
+@router.get("/api/sites/{site_id}/pilot/scorecard")
+def pilot_scorecard(site_id: str):
+    """The pilot's pre-registered gates read against its results from its start (round 7, audit pages-D-12, brief-vs-build-02,
+    flow-savings-pilot-bill-13: the criteria were stored and never scored): each gate met, not met, not measured yet or not applying here, and plan
+    15.3's verdict once 8 weeks of switchback have run (gonogo.scorecard). A money gate's figures only to a role with costs, and a gate read against
+    the fee, with the verdict, only to a role that sees the fee (gonogo.for_reader)."""
+    site_or_404(site_id)
+    return out(gonogo.for_reader(gonogo.scorecard(site_id, today())))
 
 
 @router.get("/api/sites/{site_id}/pilot/calendar.ics")

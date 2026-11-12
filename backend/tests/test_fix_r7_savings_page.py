@@ -166,7 +166,7 @@ def test_the_reports_switchback_names_each_switch_both_ways_and_the_figures_befo
     assert "Carry-over credit: Rs 1,400 in all, Rs 100 a plan day, included in both." in text, text
 
 
-# ------------------------------------------------------------------------------------------------ brief-vs-build-13: the KPIs
+# ------------------------------------------------------------------------------------------------ brief-vs-build-13 and pages-D-12: the KPIs and the gates
 
 def _arm(hours=0.0, starts=0, discharge=0.0, unserved=0.0, cost=0.0) -> dict:
     return {"genset_hours": hours, "genset_starts": starts, "discharge_kwh": discharge, "unserved_kwh": unserved, "cost_rs": cost, "e_end_kwh": 0.0,
@@ -243,3 +243,85 @@ def test_the_ledger_counts_each_arms_genset_starts():
     day'). A run going on at midnight is not a start, as the genset's cost counts it."""
     assert verify._gen_starts({"gen_on": np.array([1, 1, 0, 1, 1, 0, 0, 1], dtype=bool)}, on_before=False) == 3
     assert verify._gen_starts({"gen_on": np.array([1, 1, 0, 1, 1, 0, 0, 1], dtype=bool)}, on_before=True) == 2
+
+
+def test_the_pilot_scorecard_reads_every_criterion_against_the_results_with_the_genset_and_cycling_gates(company, monkeypatch):
+    """pages-D-12 (and brief-vs-build-02, flow-savings-pilot-bill-13): the pilot's criteria were stored and listed but never read against a result,
+    and plan 15.3's genset run-hours and cycling gates did not exist. The scorecard reads each criterion from the pilot's start: met, not met, not
+    measured yet or not applying here."""
+    from gridlytics import gonogo
+    from gridlytics.routes_savings import PILOT_DEFAULT
+    assert PILOT_DEFAULT["criteria"]["genset_hours_cut_pct"] == 15.0 and PILOT_DEFAULT["criteria"]["cycles_ratio_max"] == 1.1
+    sid = make_site(name="Gate mill")
+    start = date(2026, 10, 1)
+    with store.connect() as con:
+        con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?)",
+                    (sid, json.dumps({**PILOT_DEFAULT, "criteria": {**PILOT_DEFAULT["criteria"], "min_saving_pct": 10.0}}),
+                     datetime(2026, 9, 30, 20, 0, tzinfo=timezone.utc).isoformat(), store._now()))   # 1 Oct 01:00 in Karachi
+    # 20 claiming days: Rs 1,000 claimed on Rs 5,000 of native cost (20 %); the genset ran 3 h against the tuned rule's 4 h (25 % less); the
+    # battery cycled 1.2 times the tuned baseline's
+    rows = {}
+    for d in _days(start, start + timedelta(days=19)):
+        nat = {**_row(1000.0, 1000.0, cost=4000.0), "actual": _arm(3.0, 1, 120.0, cost=4000.0), "baseline": _arm(5.0, 2, 90.0, cost=5000.0)}
+        tun = {**_row(600.0, 600.0, cost=4000.0), "actual": _arm(3.0, 1, 120.0, cost=4000.0), "baseline": _arm(4.0, 2, 100.0, cost=4600.0)}
+        rows[d.isoformat()] = {"native": nat, "tuned": tun}
+    _put_rows(sid, rows)
+    store.set_setting(f"fee:{sid}", 5000.0)
+    card = gonogo.scorecard(sid, start + timedelta(days=19))
+    gates = {g["id"]: g for g in card["gates"]}
+    assert card["started"] is True and card["from"] == "2026-10-01"
+    assert gates["saving"]["status"] == "met" and gates["saving"]["result"] == 20.0 and gates["saving"]["target"] == 10.0
+    assert gates["unserved"]["status"] == "met" and gates["unserved"]["result"] == 0.0
+    assert gates["fidelity"]["status"] == "met" and gates["fidelity"]["result"] == 100.0
+    assert gates["genset_hours"]["status"] == "met" and gates["genset_hours"]["result"] == 25.0
+    assert gates["cycles"]["status"] == "not_met" and gates["cycles"]["result"] == 1.2 and gates["cycles"]["target"] == 1.1
+    assert gates["reserve"]["status"] == "not_yet"                       # no outage judged yet
+    assert gates["agreement"]["status"] == "not_yet"                     # no switchback result
+    assert gates["forecast_pv"]["status"] == "not_yet"
+    assert gates["whitelist"]["status"] == "met"                         # a closed-loop site with no write refused
+    assert gates["fee_multiple"]["status"] in ("met", "not_met") and gates["fee_multiple"]["fee_gate"] is True
+    # plan 15.3's statistic: 20 verified days of Rs 600 over the tuned table is Rs 18,000 a month, 3.6 times the fee; but no switchback weeks yet
+    assert gates["statistic"]["result"] == 3.6 and gates["statistic"]["status"] == "met"
+    assert card["verdict"] == "not_yet" and "under_8_weeks" in card["verdict_reasons"] and card["so_far"] == "success"
+    monkeypatch.setattr(verify, "SWITCHBACK_WEEKS_FOR_FINAL", 0)
+    card = gonogo.scorecard(sid, start + timedelta(days=19))
+    assert card["verdict"] == "review" and card["failing"] == ["cycles"]   # the statistic clears the bar, but the cycling gate is not met
+    # the pilot write-up prints the same gates and the verdict (plan 8.5: "with the pre-registered success and kill criteria of Part 15.3 filled in")
+    from gridlytics import reports
+    built = _story(monkeypatch)
+    reports.generate("pilot", sid, "2026-10", "test")
+    lines = built[-1].splitlines()
+    row = {ln.split(" | ")[0]: ln for ln in lines if " | " in ln}
+    assert row["Genset run hours cut at least (against the tuned rule, on the days that claim)"].endswith("| meets it")
+    assert "25.0 %" in row["Genset run hours cut at least (against the tuned rule, on the days that claim)"]
+    assert row["Battery cycles a day at most (times the tuned baseline's)"].endswith("1.20 times | falls short")
+    assert any(ln.startswith("Verdict: review.") for ln in lines), lines
+    # a site without a genset or a battery: those gates do not apply (R8 2.13: "the genset gate hidden without a genset")
+    bare = make_site(name="Gate bare", battery=False, genset=False)
+    with store.connect() as con:
+        con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?)", (bare, json.dumps(PILOT_DEFAULT), store._now(), store._now()))
+    gates = {g["id"]: g for g in gonogo.scorecard(bare, datetime.now(PKT).date())["gates"]}
+    assert gates["genset_hours"]["status"] == gates["cycles"]["status"] == gates["reserve"]["status"] == "not_applicable"
+
+
+def test_the_scorecard_route_hides_money_gates_from_a_viewer_and_fee_gates_from_an_operator(world):
+    """pages-D-12 with the owner's rules: a viewer never reads a money figure or a money ratio, and an operator reads costs but not the fee."""
+    sid = world.site
+    with world.use():
+        from gridlytics.routes_savings import PILOT_DEFAULT
+        with store.connect() as con:
+            con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?)", (sid, json.dumps(PILOT_DEFAULT), store._now(), store._now()))
+        store.set_setting(f"fee:{sid}", 5000.0)
+    admin = world.c["admin"].get(f"/api/sites/{sid}/pilot/scorecard").json()
+    ids = [g["id"] for g in admin["gates"]]
+    assert {"saving", "unserved", "reserve", "fidelity", "fee_multiple", "forecast_pv", "genset_hours", "cycles", "agreement", "whitelist",
+            "statistic"} == set(ids)
+    assert admin["verdict"] == "not_yet" and "fee_multiple" in admin["criteria"]
+    op = world.c["operator"].get(f"/api/sites/{sid}/pilot/scorecard").json()
+    assert "fee_multiple" not in [g["id"] for g in op["gates"]] and "statistic" not in [g["id"] for g in op["gates"]]
+    assert op["verdict"] is None and op["fee_hidden"] is True and "fee_multiple" not in op["criteria"]
+    viewer = world.c["viewer"].get(f"/api/sites/{sid}/pilot/scorecard").json()
+    saving = next(g for g in viewer["gates"] if g["id"] == "saving")
+    assert saving == {"id": "saving", "money_gate": True, "hidden": True}
+    kpis = world.c["viewer"].get(f"/api/sites/{sid}/savings/kpis").json()
+    assert {"reserve", "violations", "control", "genset", "battery"} <= set(kpis)

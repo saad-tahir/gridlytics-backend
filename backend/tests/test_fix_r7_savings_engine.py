@@ -1170,8 +1170,9 @@ def test_a_day_beyond_the_forward_walk_is_listed_stale_until_recomputed(company,
 # ------------------------------------------------------------------------------------------------ pages-D-04 (security-roles-05,
 # ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-10): the pilot's request model
 
+# with plan 15.3's genset and cycling gates the defaults hold since round 7's audit pages-D-12
 CRITERIA = {"min_saving_pct": 8.0, "max_unserved_kwh": 0.0, "reserve_adequacy_pct": 90.0, "fidelity_pct": 80.0, "fee_multiple": 3.0,
-            "forecast_pv_nrmse_max": 0.35}
+            "forecast_pv_nrmse_max": 0.35, "genset_hours_cut_pct": 15.0, "cycles_ratio_max": 1.1}
 
 
 def _pilot_ready(w) -> str:
