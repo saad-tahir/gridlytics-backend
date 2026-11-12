@@ -1,0 +1,53 @@
+# Gridlytics' hosted API with docker compose (plan Part 2.7, DEP-06; round 7, audit parity-architecture-02): the image of ../Dockerfile, its settings from
+# ../.env.production (a filled-in copy of ../.env.production.example, never committed), its data folder on the volume gridlytics-data, and its port on this
+# machine's loopback address only, for the TLS proxy on the host (docs/DEPLOY.md, TLS). The web app is on Vercel, not here.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# One API per data folder: it runs the 15-minute scheduler (the image sets GRIDLYTICS_SCHEDULER=1), so never scale it past one or run a second copy on the
+# same volume. The network's gateway is fixed: it is the address the proxy's connections reach the API from, which FORWARDED_ALLOW_IPS names.
+name: gridlytics
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: gridlytics:0.1.0
+    container_name: gridlytics
+    restart: unless-stopped
+    env_file:
+      - ../.env.production
+    ports:
+      - "127.0.0.1:8061:8061"
+    volumes:
+      - gridlytics-data:/data
+    stop_grace_period: 30s
+
+  # Later services, written for when they are needed (plan Part 2.7 and 10.6), each commented out until then:
+  # mosquitto:            # the edge channel's MQTT broker when Product 2 ships (Mosquitto, mutual TLS; run unmodified as a service)
+  #   image: eclipse-mosquitto:2
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8883:8883"
+  #   volumes:
+  #     - ./mosquitto:/mosquitto/config:ro
+  # valkey:               # the job queue at 1,000 sites (Valkey, BSD; never Redis 8)
+  #   image: valkey/valkey:8
+  #   restart: unless-stopped
+  # worker:               # the solve workers that take the plans from the queue and post them to the API
+  #   image: gridlytics:0.1.0
+  #   restart: unless-stopped
+  #   env_file:
+  #     - ../.env.production
+  #   command: <the worker's command, once the queue is built>
+
+volumes:
+  gridlytics-data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.61.0/24
+          gateway: 172.30.61.1

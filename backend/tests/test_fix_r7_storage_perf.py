@@ -84,6 +84,9 @@ def test_a_prune_trims_old_plans_and_every_reader_answers_as_before(company):
     check and the savings' control health) answers exactly as before, and the old plans' blobs shrink to a fraction."""
     sid = _site()
     template = plans.get(sid, plans.tick(sid)["plan_id"])
+    # the planned reserve the outage below is entered against, 20 % at every step: a plan made now carries the reserve of the hour the test runs (46 % at
+    # 16:45 Pakistan time, ahead of the evening peak), which made the 40 % entry fail in the afternoon only
+    template["steps"] = [{**s, "reserve_pct": 20.0} for s in template["steps"]]
     with store.connect() as con:
         con.execute("DELETE FROM plans WHERE site_id = ?", (sid,))
     d0 = datetime.now(PKT).date() - timedelta(days=120)

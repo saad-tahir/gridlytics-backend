@@ -6,3 +6,14 @@ __pycache__/
 demo/DEMO_ACCOUNTS.local.md
 release/
 *.egg-info/
+# A filled-in server environment (.env.production) and any other .env file stay on their machine; the examples are committed
+.env
+.env.*
+!.env*.example
+# The family's rules (solarlytics-backend/.gitignore): the token-signing secret and the edge signing keys of a data folder kept anywhere in the repository,
+# not only data/ (keys/<company file>/<site>-<key>.pem and their copies beside the backups: no private key belongs in the repository), and every local
+# accounts list of the demo
+data/platform.secret
+platform.secret
+*.pem
+demo/*.local.md

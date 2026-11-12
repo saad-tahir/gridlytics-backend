@@ -5,8 +5,10 @@ The web app is in its own repository (`gridlytics-frontend` on GitHub) checked o
 page's (the permission names, the sign-in refusal codes, the headers the page sends, the money fields, the test fixtures) reads the page's file through
 `frontend_file(rel)`, with `rel` from the web repository's root (`frontend/src/types/api.ts`, `scripts/start_local.py`, `README.md`). The root is
 `GRIDLYTICS_FRONTEND_DIR` when it is set, else `gridlytics-frontend` beside this repository; never a folder that also holds the engine (a one-folder copy
-of both). A missing web repository fails the test and says what to do (`GRIDLYTICS_SKIP_SIBLING=1` skips it instead, for a quick run on a developer's
-machine only, never in CI); a file missing from the web repository always fails, so a scan of a folder that is not there never passes with nothing scanned."""
+of both). A missing web repository fails the test and says what to do (`GRIDLYTICS_SKIP_SIBLING=1` skips it instead: for a quick run on a developer's
+machine, and in CI only while the read-only token that checks the web repository out, FRONTEND_READ_TOKEN, is not set, which the run says in a warning
+and each skip says in its reason; round 7, deploy-ci); a file missing from the web repository always fails, so a scan of a folder that is not there never
+passes with nothing scanned."""
 import os
 from pathlib import Path
 
@@ -16,9 +18,14 @@ REPO = Path(__file__).resolve().parents[2]
 MISSING = "clone the web repository (gridlytics-frontend) beside this folder or set GRIDLYTICS_FRONTEND_DIR"
 
 
+#: Why a test that reads the web repository was skipped, said with each skip (pytest -rs lists them)
+SKIPPED = ("skipped with GRIDLYTICS_SKIP_SIBLING=1; in CI that means the read-only FRONTEND_READ_TOKEN that checks the web repository out is not set "
+           "(the owner's task in the web repository's docs/BACKEND_ASKS.md)")
+
+
 def _missing(what: str):
     if os.environ.get("GRIDLYTICS_SKIP_SIBLING") == "1":
-        pytest.skip(what)
+        pytest.skip(f"{what}: {SKIPPED}")
     raise FileNotFoundError(f"{what}: {MISSING}")
 
 

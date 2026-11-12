@@ -1,3 +1,6 @@
 -r requirements.txt
-pytest==8.4.2
+# The tests, and pytest-xdist for `-n auto` as CI runs them, at solarlytics-backend's pins (c853130)
+pytest==9.1.1
 pytest-xdist==3.8.0
+# The HTTP client starlette's TestClient takes where it is installed (with httpx alone it is deprecated there), as Solarlytics' tests run
+httpx2==2.13.1
