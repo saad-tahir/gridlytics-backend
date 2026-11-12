@@ -6,3 +6,7 @@ __pycache__/
 demo/DEMO_ACCOUNTS.local.md
 release/
 *.egg-info/
+# A filled-in server environment (.env.production) and any other .env file stay on their machine; the examples are committed
+.env
+.env.*
+!.env*.example

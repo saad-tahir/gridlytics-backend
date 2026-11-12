@@ -1,0 +1,17 @@
+# What the image's build never reads (Dockerfile; round 7, audit parity-architecture-02): the owner's data folder, builds, caches, the scratch area and
+# the tests
+data
+release
+.scratch
+.git
+backend/tests
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/node_modules
+# Settings and passwords that stay on their machine: a filled-in .env.production (the server's secrets), any other .env file (the demo seed's .env.founder),
+# and the demo seed's list of passwords. The image takes its settings from the server's environment only
+**/.env*
+demo/*.local.md
+# The web app is the gridlytics-frontend repository's; the image holds the API only, so a copy of it placed here is not sent either
+frontend
