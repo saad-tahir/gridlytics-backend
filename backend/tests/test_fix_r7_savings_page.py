@@ -532,3 +532,16 @@ def test_the_recompute_runs_below_the_ticks_priority(world, monkeypatch):
     assert seen["nice"] == max(base, routes_savings.RECOMPUTE_NICE)
     assert os.getpriority(os.PRIO_PROCESS, threading.get_native_id()) == base
 
+
+# ------------------------------------------------------------------------------------------------ pr-review-07: who may act, from the meta
+
+def test_the_meta_says_in_words_which_roles_hold_each_permission(world):
+    """pr-review-07: the Savings page wrote "An administrator, operator or analyst can recompute the period" into its own text, a list of roles that
+    goes stale the day the permissions change. GET /api/meta now says, for every permission, which roles hold it in the words of the 403 refusals
+    (auth.roles_words), so the page reads them from there."""
+    from gridlytics import auth
+    for role in ("admin", "viewer"):
+        meta = world.c[role].get("/api/meta").json()
+        assert meta["who_can"]["run_jobs"] == "an administrator, an operator or an analyst", meta.get("who_can")
+        assert meta["who_can"]["export"] == "an administrator or an analyst"
+        assert set(meta["who_can"]) == set(auth.PERMISSIONS)

@@ -32,7 +32,10 @@ def meta():
             # what every plan falls back to when no newer one arrives (delivery.fallback_block: no revert timer, as a keyed table stays and repeats each
             # day; an edge keeps the plan it holds through a lost link to its end, then the inverter returns to its native settings; the floor is at least
             # the site's reserve floor), for tab D to show (plan 9.3 tab D "fallback", Part 7.1 step 6; audit flow-onboarding-22, engine-delivery-14)
-            "fallback": {"on_expiry": "inverter_native", "on_link_loss_after_s": delivery.LINK_LOSS_AFTER_S}}
+            "fallback": {"on_expiry": "inverter_native", "on_link_loss_after_s": delivery.LINK_LOSS_AFTER_S},
+            # who holds each permission, in the refusals' words ("an administrator, an operator or an analyst"), so a page that says who may act reads
+            # it here rather than listing roles of its own (round 7, audit pr-review-07)
+            "who_can": {p: auth.roles_words(p) for p in auth.PERMISSIONS}}
 
 
 def _icp_categories() -> list[str]:
