@@ -2,6 +2,15 @@
 
 Newest first. Each entry says what was decided, why, and where the plan (`EMS_BUILD_PLAN.md`) says otherwise.
 
+## 2026-11-12 UX step 0: the fixture contract and a slot's reason detail (tests only)
+
+The web app's fixtures are held to the API's answers by `backend/tests/fixture_contract.py` (round 7, parity-architecture-09). Its full run failed at
+18:00 in Karachi: every demo site's current slot then charged for reserve, so `now_next.current.detail` carried `rs_per_kwh`, which the fixtures
+(captured on a slot that held for an outage) lack. A slot's detail follows its reason, not the route, so the contract asks a fixture for the `detail` of
+an object that carries a `reason` (a plan step, now_next's slots, a fleet site's next event) and never for that detail's fields. Every other `detail`
+(an alert's, an audit entry's) keeps its fields asked wherever every element carries them, so a renamed field the web app reads there still shows as
+missing from the fixtures (the step's check narrowed the first fix, which exempted every `detail`). No fixture, app or engine code changed.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

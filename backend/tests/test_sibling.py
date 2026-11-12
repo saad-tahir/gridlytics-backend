@@ -303,6 +303,19 @@ def test_the_fields_of_a_reason_detail_are_never_asked_of_a_fixture_whatever_the
     assert fc.differences(lacking, live, names) == ({"now_next.current.detail"}, set())
 
 
+def test_a_detail_that_does_not_follow_a_slots_reason_keeps_its_fields_asked():
+    # UX step 0 check: the first fix exempted the fields of every `detail` (an alert's, an audit entry's), so a backend rename of a field the web app reads
+    # there would no longer show as missing from the fixtures; only a detail beside a `reason` follows the hour
+    live = {"alerts": [{"kind": "outage_reserve", "detail": {"outages": [], "from_stage": 1}},
+                       {"kind": "outage_reserve", "detail": {"outages": [], "from_stage": 2}}],
+            "audit": {"detail": {"role_before": "viewer", "role": "analyst"}}}
+    fixture = {"alerts": [{"kind": "outage_reserve", "detail": {"outages": []}}], "audit": {"detail": {"role": "analyst"}}}
+    names = fc.backend_names()
+    assert fc.differences(fixture, live, names) == ({"alerts[].detail.from_stage", "audit.detail.role_before"}, set())
+    # beside a reason the same detail's fields are not asked
+    assert fc.required({"reason": "hold_for_outage", "detail": {"p": 0.03}}) == {"reason", "detail"}
+
+
 def test_a_re_capture_runs_on_a_scratch_database_whatever_the_shell_says(tmp_path):
     # review (round 7, tests-ci): `fixture_contract.py --write` seeds a demo; a shell that names the owner's database, another sign-in mode or a data
     # folder must not carry the seed there (before: setdefault kept a GRIDLYTICS_DB the shell already held)
