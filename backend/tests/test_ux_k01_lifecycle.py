@@ -11,7 +11,7 @@ import json
 import secrets
 from datetime import date, datetime, timedelta, timezone
 
-from gridlytics import lifecycle, money, sites, store, telemetry
+from gridlytics import lifecycle, money, routes_sites, sites, store, telemetry, verify
 from test_fix_api import ROLES, world  # noqa: F401  (world is a fixture)
 
 PKT = timezone(timedelta(hours=5))
@@ -20,6 +20,10 @@ KEYS = {"stage", "words", "next", "target", "all_done", "stages"}
 
 def _at(*args) -> int:
     return int(datetime(*args, tzinfo=PKT).timestamp())
+
+
+def _today() -> date:
+    return datetime.now(PKT).date()
 
 
 def _lc(world, role: str = "admin") -> dict:
@@ -156,28 +160,50 @@ def test_fourteen_days_of_data_and_a_plan_make_a_recommendation_and_the_tier_is_
     assert _by(_lc(world, "analyst"))["delivering"]["next"] is None   # marking a table applied is apply_plan's
 
 
-def test_the_lifecycle_carries_no_money_and_a_key_gets_no_next_step(world):
+def test_the_lifecycle_carries_no_money(world):
     _plan(world, int(datetime.now(timezone.utc).timestamp()) - 600)
     for role in ROLES:
         lc = _lc(world, role)
         assert not any(money.is_money(k) for k in json.dumps(lc).replace('"', " ").split() if k.isidentifier())
         assert "Rs" not in json.dumps(lc)
+
+
+def test_a_machine_key_reads_the_sites_settings_without_its_lifecycle(world):
+    """UX K1 check (audit security-roles-07): `sites:read` is the site's settings; the site's data, its pilot and its statements are in no scope. The
+    track speaks of all three ("Pilot week 2 of 6 · today runs your own settings", "October statement made", "No data since 19:41"), so a key's site
+    answer leaves it out, as it was before K1, while a person's carries it."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    with world.use(), store.connect() as con:
+        sites.update(world.site, {"data_source": {"kind": "edge", "grid_signal_confirmed": True}}, "test")
+        sites.put_asset(world.site, "inverter", {"brand": "deye", "kw_ac": 100}, "test")
+        sites.set_status(world.site, "active")
+        con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?)", (world.site, "{}", store._now(), store._now()))
+        con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm) VALUES (?,?,?,?)",
+                    (world.site, (_today() - timedelta(days=3)).isoformat(), (_today() + timedelta(days=3)).isoformat(), "native"))
+    _readings(world, now - 3 * 86400, now - 7200)
+    assert "Pilot week" in _by(_lc(world))["verifying"]["words"]
     kh = world.key(["sites:read"])
     r = world.anon.get(f"/api/sites/{world.site}", headers=kh)
     assert r.status_code == 200, r.text
-    lc = r.json()["lifecycle"]
-    assert lc["next"] is None and all(st["next"] is None for st in lc["stages"])
+    assert "lifecycle" not in r.json() and r.json()["id"] == world.site
+    assert "Pilot" not in r.text and "No data since" not in r.text
 
 
 # ------------------------------------------------------------------------------------------------ the stages' words, at a fixed time
 
 
 def _facts(**over) -> dict:
-    f = {"active": True, "setup_step": None, "native": True, "battery": True, "source_kind": "edge", "tier": "advisory_writes",
-         "tier_capable": "closed_loop", "first_ts": _at(2026, 9, 1), "last_ts": _at(2026, 11, 12, 9, 59), "first_plan_ts": _at(2026, 9, 2),
+    f = {"active": True, "setup_step": None, "native": True, "battery": True, "source_kind": "edge", "tier": "advisory_writes", "tier_block": None,
+         "first_ts": _at(2026, 9, 1), "last_ts": _at(2026, 11, 12, 9, 59), "first_plan_ts": _at(2026, 9, 2), "failing": None, "activated_ts": None,
          "forecast_stage": 1, "preliminary": False, "control_key": "following", "control_label": "Following plan (table applied)",
-         "pilot_started": False, "blocks": [], "arm_today": None, "statement_made": True}
+         "pilot_started": False, "pilot": None, "statement_made": True}
     return {**f, **over}
+
+
+def _pilot(blocks: list, arm: str | None = None, today: date = date(2026, 11, 12)) -> dict:
+    """The facts of a started pilot whose switchback blocks are `blocks` ((start, end) pairs), today's block running `arm`."""
+    rows = [{"block_start": a.isoformat(), "block_end": b.isoformat(), "arm": arm if a <= today <= b else "plan"} for a, b in blocks]
+    return {"pilot_started": True, "pilot": verify.pilot_progress_of(rows, today)}
 
 
 ALL = set(lifecycle.NEXT) | {"manage_sites", "edit_sites", "upload_data", "change_tier", "apply_plan", "start_pilot", "export", "energy_report"}
@@ -221,16 +247,16 @@ def test_reporting_waits_for_a_full_month_on_a_plan_then_asks_for_its_statement(
 
 def test_the_pilot_says_its_week_and_todays_arm():
     blocks = [(date(2026, 10, 26) + timedelta(days=7 * i), date(2026, 11, 1) + timedelta(days=7 * i)) for i in range(8)]
-    lc = _assemble(_facts(pilot_started=True, blocks=blocks, arm_today="plan"))
+    lc = _assemble(_facts(**_pilot(blocks, "plan")))
     ver = _by(lc)["verifying"]
     assert (ver["state"], ver["words"], ver["next"]) == ("now", "Pilot week 3 of 8 · today runs the plan", "open_pilot")
     assert (lc["stage"], lc["words"]) == ("verifying", "Pilot week 3 of 8")
-    assert _by(_assemble(_facts(pilot_started=True, blocks=blocks, arm_today="native")))["verifying"]["words"] == \
-        "Pilot week 3 of 8 · today runs your own settings"
+    assert _by(_assemble(_facts(**_pilot(blocks, "native"))))["verifying"]["words"] == "Pilot week 3 of 8 · today runs your own settings"
     later = [(date(2026, 11, 16), date(2026, 11, 22)), (date(2026, 11, 23), date(2026, 11, 29))]
-    assert _by(_assemble(_facts(pilot_started=True, blocks=later)))["verifying"]["words"] == "Pilot starts on Mon 16 Nov"
+    assert _by(_assemble(_facts(**_pilot(later))))["verifying"]["words"] == "Pilot starts on Mon 16 Nov"
     over = [(date(2026, 9, 1), date(2026, 10, 26))]
-    assert (_by(_assemble(_facts(pilot_started=True, blocks=over)))["verifying"]["state"]) == "done"
+    assert (_by(_assemble(_facts(**_pilot(over))))["verifying"]["state"]) == "done"
+    assert _by(_assemble(_facts(pilot_started=True, pilot=None)))["verifying"]["words"] == "Pilot started"
     # not started: optional, and offered to whoever may start one
     ver = _by(_assemble(_facts(), perms=ALL - {"start_pilot"}))["verifying"]
     assert (ver["state"], ver["words"], ver["next"]) == ("not_used", "No pilot (optional)", None)
@@ -248,9 +274,11 @@ def test_delivering_asks_for_the_table_and_an_offline_edge():
     # a tier allowed before the site is activated delivers nothing yet
     dl = _by(_assemble(_facts(active=False, setup_step="b", control_key="unconfirmed", control_label="Table not confirmed today")))["delivering"]
     assert (dl["state"], dl["words"], dl["next"]) == ("waiting", "Starts when the site is activated", None)
-    # a CSV source without the inverter's mode stays at monitor until a file carries it
-    dl = _by(_assemble(_facts(tier="monitor", tier_capable="monitor", source_kind="csv")))["delivering"]
-    assert (dl["state"], dl["words"], dl["next"]) == ("waiting", "Monitor only until a file carries the inverter's mode", None)
+    # a CSV source without the inverter's mode stays at monitor until a file carries it (PUT /tier's no_inverter_mode): the upload is the step
+    dl = _by(_assemble(_facts(tier="monitor", tier_block="no_inverter_mode", source_kind="csv")))["delivering"]
+    assert (dl["state"], dl["words"], dl["next"]) == ("waiting", "Monitor only until a file carries the inverter's mode", "upload_csv")
+    dl = _by(_assemble(_facts(tier="monitor", tier_block="above_capable", source_kind="edge")))["delivering"]
+    assert (dl["state"], dl["words"], dl["next"]) == ("waiting", "Waiting for the edge device to say what it can control", None)
 
 
 def test_a_viewer_reads_states_only_with_the_energy_report_as_its_one_action():
@@ -274,3 +302,154 @@ def test_collecting_counts_fourteen_days_from_the_first_reading():
     assert lc["words"] == "No data since Tue 10 Nov, 09:10"
     lc = _assemble(_facts(first_ts=NOW - 3 * 86400, last_ts=_at(2026, 11, 12, 9, 10), tier="monitor", first_plan_ts=None))
     assert lc["words"] == "No data since 09:10"
+
+
+# ------------------------------------------------------------------------------------------------ the check of batch k1
+
+
+def _active_csv_site(world) -> None:
+    """Mill One active on a CSV source (which sites._source_capable makes capable of advisory writes as it is chosen) with its inverter."""
+    with world.use():
+        sites.update(world.site, {"data_source": {"kind": "csv", "grid_signal_confirmed": True}}, "test")
+        sites.put_asset(world.site, "inverter", {"brand": "deye", "kw_ac": 100}, "test")
+        sites.set_status(world.site, "active")
+        assert sites.get(world.site)["tier_capable"] == "advisory_writes"
+
+
+def test_a_csv_site_is_offered_the_raise_of_its_tier_only_when_put_tier_takes_it(world):
+    """UX K1 check: the track offered `raise_tier` to an administrator at a CSV site none of whose files carries inverter_mode_active, which PUT /tier
+    refuses (no_inverter_mode). The track and the refusal now read one rule (routes_sites._tier_refusal): such a site says it is monitor-only until a
+    file carries the mode, and offers the upload; once one does, the raise is offered and PUT /tier takes it."""
+    _active_csv_site(world)
+    now = int(datetime.now(timezone.utc).timestamp())
+    _readings(world, now - 3 * 86400, now - 60)
+    r = world.c["operator"].post(f"/api/sites/{world.site}/native", json={"work_mode": "tou", "slots": [{"start": "00:00", "mode": "self_use"}]})
+    assert r.status_code == 200, r.text
+    dl = _by(_lc(world))["delivering"]
+    assert (dl["state"], dl["words"], dl["next"], dl["target"]) == ("waiting", "Monitor only until a file carries the inverter's mode", "upload_csv", None)
+    assert _by(_lc(world, "analyst"))["delivering"]["next"] is None            # uploading is upload_data's
+    assert _by(_row(world))["delivering"] == dl                               # the fleet row says the same
+    r = world.c["admin"].put(f"/api/sites/{world.site}/tier", json={"tier": "advisory_writes", "signoff": "Installer: A. Khan"})
+    assert (r.status_code, r.json()["code"]) == (422, "no_inverter_mode"), r.text
+    # a file carrying the inverter's mode: the raise is offered, and taken
+    with world.use():
+        telemetry.write_rows([(world.site, now - 120, "csv", 1.0, "self_use")], ("site_id", "ts", "source_id", "grid_present", "inverter_mode_active"))
+    dl = _by(_lc(world))["delivering"]
+    assert (dl["words"], dl["next"], dl["target"]) == ("Monitor tier: recommendations only", "raise_tier", "d")
+    r = world.c["admin"].put(f"/api/sites/{world.site}/tier", json={"tier": "advisory_writes", "signoff": "Installer: A. Khan"})
+    assert r.status_code == 200, r.text
+    assert _by(r.json()["lifecycle"])["delivering"]["state"] == "now"
+
+
+def test_the_raise_of_the_tier_waits_for_the_native_capture_as_put_tier_does(world):
+    """The same rule's no_capture: an edge site capable of closed loop without the inverter's native settings is sent to record them (step E)."""
+    with world.use(), store.connect() as con:
+        sites.update(world.site, {"data_source": {"kind": "edge", "grid_signal_confirmed": True}}, "test")
+        sites.put_asset(world.site, "inverter", {"brand": "deye", "kw_ac": 100}, "test")
+        sites.set_status(world.site, "active")
+        con.execute("UPDATE sites SET tier_capable = 'closed_loop' WHERE id = ?", (world.site,))
+    dl = _by(_lc(world))["delivering"]
+    assert (dl["next"], dl["target"]) == ("record_native", "e")
+    r = world.c["admin"].put(f"/api/sites/{world.site}/tier", json={"tier": "advisory_writes", "signoff": "x"})
+    assert (r.status_code, r.json()["code"]) == (422, "no_capture"), r.text
+    with world.use():
+        assert routes_sites._tier_refusal(sites.get(world.site), "advisory_writes").code == "no_capture"
+        assert routes_sites._tier_refusal(sites.get(world.site), "monitor") is None
+
+
+def test_recommending_promises_the_first_plan_only_just_after_activation(world):
+    """UX K1 check: "The first plan arrives within 15 minutes" was said for good at a monitor site with no plan, however long ago it was activated and
+    however many ticks had failed (plan §0.3.2 says it at the moment of activation). Now: within half an hour of the activation; while the planning
+    runs fail, what fails (as the Plan page's `failing`); after that, the Plan page says why, and the stage links to it."""
+    with world.use():
+        sites.update(world.site, {"data_source": {"kind": "edge", "grid_signal_confirmed": True}}, "test")
+        sites.put_asset(world.site, "inverter", {"brand": "deye", "kw_ac": 100}, "test")
+    r = world.c["admin"].post(f"/api/sites/{world.site}/activate")
+    assert r.status_code == 200, r.text
+    rec = _by(r.json()["lifecycle"])["recommending"]
+    assert (rec["state"], rec["words"], rec["next"]) == ("now", "The first plan arrives within 15 minutes", None)
+    # activated two hours ago, and no plan since
+    two_hours = datetime.fromtimestamp(int(datetime.now(timezone.utc).timestamp()) - 7200, timezone.utc).isoformat(timespec="seconds")
+    with world.use(), store.connect() as con:
+        con.execute("UPDATE audit SET at = ? WHERE action = 'activated a site' AND target = ?", (two_hours, world.site))
+    rec = _by(_lc(world))["recommending"]
+    assert (rec["words"], rec["next"]) == ("No plan yet: the Plan page says why", "open_plan")
+    assert _by(_lc(world, "viewer"))["recommending"]["words"] == rec["words"]
+    # the planning runs failing: what fails, as the Plan page's `failing` reads it
+    def runs(*rows):
+        with world.use(), store.connect() as con:
+            con.execute("DELETE FROM runs WHERE site_id = ?", (world.site,))
+            for tick, status, reason in rows:
+                con.execute("INSERT INTO runs (site_id, tick, started, status, reason) VALUES (?,?,?,?,?)", (world.site, tick, tick, status, reason))
+    runs(("2026-11-12T08:00:00+00:00", "failed", "solve_failed"), ("2026-11-12T08:15:00+00:00", "error", "tick_error"),
+         ("2026-11-12T08:30:00+00:00", "failed", "solve_failed"))
+    assert _by(_lc(world))["recommending"]["words"] == "No plan yet: the last 3 planning runs failed"
+    runs(("2026-11-12T08:00:00+00:00", "active", ""), ("2026-11-12T08:15:00+00:00", "error", "no_tariff_version"))
+    assert _by(_lc(world))["recommending"]["words"] == "No plan yet: a grid connection's tariff has no version in force"
+    runs(("2026-11-12T08:15:00+00:00", "error", "tick_error"))
+    assert _by(_lc(world))["recommending"]["words"] == "No plan yet: the last planning run failed"
+    # even within the half hour, a failing run is said, never the promise
+    with world.use(), store.connect() as con:
+        con.execute("UPDATE audit SET at = ? WHERE action = 'activated a site' AND target = ?", (store._now(), world.site))
+    assert _by(_lc(world))["recommending"]["words"] == "No plan yet: the last planning run failed"
+
+
+def test_delivering_is_not_done_while_the_plan_does_not_reach_the_inverter():
+    """UX K1 check: Delivering read done ("Delivering · closed loop") under a pause, a release to native, the clock demotion and the edge's own
+    reports, so the Overview folded the track into the chip while control was handed back. Those are now the current stage, in the control chip's
+    words, with the step that looks into them; the switchback's own native-block day, a forced charge and a hold stay done."""
+    for key, label, nxt in (("paused", "Control paused until 18:00", "open_plan"), ("native", "Released to native until Fri 13 Nov, 09:00", "open_plan"),
+                            ("clock_demoted", "Control demoted: the inverter clock is 6 min off", "open_plan"),
+                            ("edge_fallback", "Edge on fallback: the inverter runs its own settings", "check_source"),
+                            ("edge_disabled", "Edge disabled control", "check_source"), ("edge_refused", "Edge refused the plan", "check_source")):
+        lc = _assemble(_facts(tier="closed_loop", control_key=key, control_label=label))
+        dl = _by(lc)["delivering"]
+        assert (dl["state"], dl["words"], dl["next"]) == ("now", label, nxt), key
+        assert (lc["all_done"], lc["stage"]) == (False, "delivering"), key
+        # who may not check the source is sent to the plan, which says what the edge reports
+        assert _by(_assemble(_facts(tier="closed_loop", control_key=key, control_label=label), perms=ALL - {"edit_sites"}))["delivering"]["next"] == \
+            "open_plan", key
+    for key, label in (("native_block", "Switchback: native settings today"), ("force_charge", "Forced charge to 90 % until 18:00"),
+                       ("hold", "Hold until 18:00"), ("following", "Following plan")):
+        lc = _assemble(_facts(tier="closed_loop", control_key=key, control_label=label))
+        assert (_by(lc)["delivering"]["state"], lc["all_done"]) == ("done", True), key
+
+
+def test_the_tracks_pilot_week_is_the_one_function_the_pilot_band_reads(world):
+    """UX K1 check: "Pilot week N of M" was a formula of the track's own; it is verify.pilot_progress, which the Pilot band (K28) reads too, so the
+    two say the same week, block and arm."""
+    today = _today()
+    start = today - timedelta(days=today.weekday()) - timedelta(days=14)        # a Monday two weeks ago: week 3 of a 12-week calendar
+    with world.use(), store.connect() as con:
+        sites.update(world.site, {"data_source": {"kind": "edge", "grid_signal_confirmed": True}}, "test")
+        sites.put_asset(world.site, "inverter", {"brand": "deye", "kw_ac": 100}, "test")
+        sites.set_status(world.site, "active")
+        con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?)", (world.site, "{}", store._now(), store._now()))
+        for i in range(12):
+            a = start + timedelta(days=7 * i)
+            con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm) VALUES (?,?,?,?)",
+                        (world.site, a.isoformat(), (a + timedelta(days=6)).isoformat(), "native" if i % 2 else "plan"))
+    with world.use():
+        p = verify.pilot_progress(world.site, today)
+    assert (p["phase"], p["week"], p["weeks"], p["block"], p["blocks"], p["arm"]) == ("running", 3, 12, 3, 12, "plan")
+    ver = _by(_lc(world))["verifying"]
+    assert ver["words"] == f"Pilot week {p['week']} of {p['weeks']} · today runs the plan" == "Pilot week 3 of 12 · today runs the plan"
+    assert verify.pilot_progress_of([], today) is None
+
+
+def test_the_fleet_rows_collecting_day_is_the_tracks_day(world):
+    """UX K1 check: the fleet row's `collecting_day` and the track's "Collecting data: day N of 14" were worked out twice; both are now
+    lifecycle.collecting_day, and they agree on either side of the fourteenth day."""
+    now = 1_800_000_000
+    assert [lifecycle.collecting_day(f, now) for f in (None, now - 60, now - int(13.99 * 86400), now - 14 * 86400)] == [0, 1, 14, None]
+    with world.use():
+        sites.update(world.site, {"data_source": {"kind": "edge", "grid_signal_confirmed": True}}, "test")
+        sites.put_asset(world.site, "inverter", {"brand": "deye", "kw_ac": 100}, "test")
+        sites.set_status(world.site, "active")
+    t = int(datetime.now(timezone.utc).timestamp())
+    for days, day, words in ((13.99, 14, "Collecting data: day 14 of 14"), (14.01, None, "14 days of data")):
+        with world.use(), telemetry.connect() as con:
+            con.execute("DELETE FROM minute WHERE site_id = ?", (world.site,))
+        _readings(world, t - int(days * 86400), t - 60)
+        row = next(r for r in world.c["admin"].get("/api/fleet").json()["sites"] if r["id"] == world.site)
+        assert (row["collecting_day"], _by(row["lifecycle"])["collecting"]["words"]) == (day, words), days

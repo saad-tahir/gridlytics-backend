@@ -16,22 +16,25 @@ question of the owner, the recommended answer ships and is logged here and in th
   and every site answer and fleet row carry it. Decisions the plan left open:
   - **Set-up's step** is the first of A to C that activation still asks for: the activation's refusal and the track read one rule
     (`routes_sites._activation_missing`), so "Draft: step C of 6" and "Add the grid connection and tariff (tab C) before activating" never disagree. D
-    has a default for every field and E is not needed to activate, so neither holds a draft back; with A to C done the line is "Set-up: not activated".
+    has a default for every field and E is not needed to activate, so neither holds a draft back; with A to C done the line is "Set-up: not
+    activated" (see the check below on plan C2.3).
   - **Collecting data** counts 14 days from the first reading, as the fleet's `collecting_day` does; while collecting, no reading for 30 minutes (the
     fleet's online rule) reads "No data since 09:10".
   - **Recommending** is done once the tier is above monitor; at monitor it stays the current stage, so a monitor site's track never folds. The plan's
     "only an administrator raises the tier" holds: the track only names the step (`raise_tier` for `change_tier`, once the native capture exists).
   - **Delivering** is never "not used": an edge says what it can control when it connects and a CSV source supports advisory writes once a file
-    carries the inverter's mode, so a monitor-only source reads as waiting, in words that say for what.
+    carries the inverter's mode, so a monitor-only source reads as waiting, in words that say for what (read from `PUT /tier`'s own refusal: see the
+    check below).
   - **Verifying** is the pilot: not used until it starts, then "Pilot week 3 of 8 · today runs the plan" from the switchback calendar (weeks from the
-    first block's first day), done once the last block has ended. The go/no-go decision is K28's.
+    first block's first day, `verify.pilot_progress`), done once the last block has ended. The go/no-go decision is K28's.
   - **Reporting** is reached when the whole previous calendar month (Pakistan time) ran on a plan, counted from the site's first plan made (every plan
     row is kept for good: `plans.prune` trims steps and tables only); it is done once that month's monthly savings report (the statement) exists.
   - **The current stage** is the first that is "now", else the furthest of the first four that is done, so a site whose every stage in use is done
     reads "Delivering · advisory", as the plan's chip does. `all_done` (the track folds) is every stage done or not used.
   - **Next steps by permission**, decided by the server: a viewer reads states only, with the energy report as the one action (plan §0.3.1, D2.4); a
-    machine key gets none. The site switcher's list (`GET /api/sites`) does not carry it: that answer is polled every minute on every page and was made
-    cheap on purpose (round 7, performance-live-08); the switcher's popover reads `GET /fleet` as it opens (plan B17.5), which carries it.
+    machine key is not served the lifecycle (see the check below). The site switcher's list (`GET /api/sites`) does not carry it: that answer is
+    polled every minute on every page and was made cheap on purpose (round 7, performance-live-08); the switcher's popover reads `GET /fleet` as it
+    opens (plan B17.5), which carries it.
 - **K4, the role matrix** (plan G9 item 1): `GET /api/meta` answers `role_matrix`, `{permission: [roles]}` straight from `auth.PERMISSIONS`, the roles in
   `auth.ROLES` order, the same for every reader. No money.
 - **K24, a gas genset's fuel log** (plan E6 item 6, A8.5): `POST /genset/fuel` takes, for a captive-gas or RLNG genset, `mmbtu` as billed, or `hm3`
@@ -44,6 +47,42 @@ question of the owner, the recommended answer ships and is logged here and in th
   MMBtu as billed or from a meter reading): the recommended yes ships.
 - **K25, the telemetry CSV in Karachi time** (plan E6 item 7): `ts_karachi` (ISO 8601 with +05:00) is the first column, `ts_utc` the second, then the
   stored series as before. Owner's question Q58 (the telemetry CSV leads with Karachi time): the recommended yes ships.
+
+### Batch k1, the check (12 Nov 2026)
+
+Independent checkers read batch k1 against the plan, the rules and the code; what they found and how it was settled ("UX K01 check" and "UX K24
+check" commits):
+
+- **A machine key is not served the lifecycle.** `sites:read` is the site's settings (audit security-roles-07: the site's data, the pilot and the
+  savings are in no scope), and the track's words spoke of all three ("Pilot week 2 of 6 · today runs your own settings", "October statement made",
+  "No data since 19:41"). `_site_answer` leaves `lifecycle` out for a key, as before K1; a person's answer carries it. The role walk proves it.
+- **Delivering offers the raise of the tier only when `PUT /tier` takes it.** A CSV source is capable of advisory writes once chosen
+  (`sites._source_capable`), but `PUT /tier` refuses it until a file carries `inverter_mode_active` (`no_inverter_mode`), so the track offered
+  `raise_tier` to a refusal. The refusals moved into `routes_sites._tier_refusal(site, tier)` (`above_capable`, `no_inverter_mode`, `no_capture`),
+  which both `PUT /tier` and the track read (the advisory tier's code is the fact `tier_block`): such a site reads "Monitor only until a file carries
+  the inverter's mode" and offers the CSV upload. This replaces the line above that a monitor-only source is told apart by `tier_capable` alone.
+- **"The first plan arrives within 15 minutes" only in the half hour after activation** (plan §0.3.2 says it at that moment; the audit line
+  "activated a site", else the site's creation). While the planning runs fail, Recommending says so as the Plan page's `failing` does
+  (`plans.tick_failing`: "No plan yet: the last 3 planning runs failed", "No plan yet: a grid connection's tariff has no version in force"); after the
+  half hour with no failing run, "No plan yet: the Plan page says why". Each links to the plan.
+- **Delivering is the current stage while the plan does not reach the inverter for now,** though the tier allows it: a pause, a release to native,
+  the clock demotion and what the edge reports (`plans.edge_view`), in the control chip's own words, linking to the plan (or, for the edge's
+  reports, to Set-up › Data and devices for `edit_sites`). The track no longer folds into "Delivering · closed loop" while control is handed back. The
+  switchback's native-block day (the pilot's own), a forced charge and a hold stay done.
+- **One function for the pilot's week:** `verify.pilot_progress(site, today)` (week of weeks, block of blocks, today's arm, the phase), which the
+  track reads and the Pilot band (K28) will read, so the two never say different weeks. The week is the calendar week from the first block's first
+  day, as before; the weeks that count toward the 8 a final figure needs (`switchback_weeks`: blocks ended and painted before they began) stay a
+  separate figure, with its own words on the Pilot page.
+- **One function for the day of collection:** `lifecycle.collecting_day(first, now)` gives the fleet row's `collecting_day` and the track's
+  "Collecting data: day 6 of 14".
+- **`activate` once A to C pass, which departs from plan C2.3** ("Review opens when A to D are complete"). D has a default for every field,
+  stored when the site is made, so the server cannot tell whether D was saved from the form. The rule stays the form's: the web app's `activate`
+  link opens Review when its form has D complete, else the first step not complete (C2.5). Recorded in the web repository's API contract for lane
+  A. The line stays "Set-up: not activated", the plan's own words for a draft on Fleet (its state table: "Draft: step C of 6" or "Set-up: not
+  activated"), though a checker read them as not the plan's.
+- **Each fact's cost.** The fleet reads, per site in the track, at most: the tick failures (a site with no plan), its pilot's blocks (a started
+  pilot), and for a monitor site the tier's refusal, whose CSV check scans the site's minutes for the inverter's mode until it finds one, as `PUT
+  /tier` always did.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 

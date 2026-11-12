@@ -2561,6 +2561,38 @@ def arm_on(site_id: str, day: date) -> str | None:
     return r["arm"] if r else None
 
 
+def pilot_progress_of(blocks: list[dict], today: date) -> dict | None:
+    """Where a switchback calendar stands on `today` (a Karachi day), from its blocks ({block_start, block_end, arm}): `phase` "before" its first
+    block, "running" or "over" after its last; `week` of `weeks` (calendar weeks from the first block's first day, the last one possibly short; the
+    week today falls in, at most `weeks`), `block` of `blocks` (the block today falls in, by start, else null), `arm` (that block's, else null),
+    `first` and `last` (its first and last day, ISO). None without blocks. One function for every place that says it in words: the stage track's
+    "Pilot week 3 of 8 · today runs the plan" (lifecycle.py, UX backend ask K1) and the Pilot band's chip and line (K28). The weeks that count toward
+    the 8 a final figure needs (`switchback_weeks`, _switchback_weeks: blocks ended and painted before they began) are another figure."""
+    if not blocks:
+        return None
+    rows = sorted(blocks, key=lambda b: b["block_start"])
+    first = date.fromisoformat(rows[0]["block_start"])
+    last = max(date.fromisoformat(b["block_end"]) for b in rows)
+    weeks = -(-((last - first).days + 1) // 7)
+    phase = "before" if today < first else "over" if today > last else "running"
+    week = None if phase != "running" else min(weeks, (today - first).days // 7 + 1)
+    at = [i for i, b in enumerate(rows) if date.fromisoformat(b["block_start"]) <= today <= date.fromisoformat(b["block_end"])]
+    held = rows[at[-1]] if at else None
+    if len(at) > 1:
+        # two blocks over one day (a locked block kept beside a later paint): the locked one runs, as arm_on reads it
+        held = next((rows[i] for i in reversed(at) if rows[i].get("locked")), held)
+    return {"phase": phase, "week": week, "weeks": weeks, "block": rows.index(held) + 1 if held else None, "blocks": len(rows),
+            "arm": held["arm"] if held else None, "first": first.isoformat(), "last": last.isoformat()}
+
+
+def pilot_progress(site_id: str, today: date) -> dict | None:
+    """pilot_progress_of the site's switchback calendar as stored."""
+    with store.connect() as con:
+        rows = [dict(r) for r in con.execute("SELECT block_start, block_end, arm, locked FROM switchback WHERE site_id = ? ORDER BY block_start",
+                                             (site_id,))]
+    return pilot_progress_of(rows, today)
+
+
 def _carry_over_credits(blocks: list[dict], by_day: dict[str, dict]) -> list[dict]:
     """Plan 8.2: "at every block boundary the bill engine credits the arm that ends with more stored energy by (E_end_A - E_end_B) x v_end".
     `credit_rs` is the credit to the plan's saving at each boundary (negative where the native block handed over more):

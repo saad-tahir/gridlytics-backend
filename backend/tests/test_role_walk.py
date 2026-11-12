@@ -283,19 +283,24 @@ def test_a_route_that_forgets_the_filter_is_filtered_all_the_same(walk):
 
 def test_the_stage_track_offers_a_viewer_only_the_energy_report_and_a_key_nothing(walk):
     """UX backend ask K1: `lifecycle` on the site and on each fleet row holds no money (the walks above) and, for a viewer, states only: no stage offers
-    a next step but the energy report; a machine key is offered none (plan §0.3.1, D2.4)."""
-    seen = 0
+    a next step but the energy report (plan §0.3.1, D2.4). A machine key is not served it at all: its `sites:read` is the site's settings, and the
+    track speaks of the site's data, its pilot and its statements, which are in no scope (audit security-roles-07; UX K1 check)."""
+    seen = keys = 0
     for template in ("/api/fleet", "/api/sites/{site_id}"):
         for url, got in walk["answers"][template].items():
             for reader in ("viewer", "key"):
                 if reader not in got or got[reader][0] != 200:
                     continue
                 body = got[reader][1]
+                if reader == "key":
+                    assert "lifecycle" not in json.dumps(body), (url, body)
+                    keys += 1
+                    continue
                 for lc in ([r["lifecycle"] for r in body["sites"]] if template == "/api/fleet" else [body["lifecycle"]]):
                     nexts = [st["next"] for st in lc["stages"]] + [lc["next"]]
-                    assert set(nexts) <= ({"energy_report", None} if reader == "viewer" else {None}), (url, reader, lc)
+                    assert set(nexts) <= {"energy_report", None}, (url, reader, lc)
                     seen += 1
-    assert seen >= 5
+    assert seen >= 5 and keys >= 1
 
 
 def test_answers_that_are_files_pass_unchanged(walk):

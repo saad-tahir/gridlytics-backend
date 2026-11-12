@@ -236,7 +236,6 @@ def fleet_row(s: dict, now: int, counts: dict, gensets: dict | None = None, equi
     first = telemetry.first_ts(s["id"])
     plan = plans.current(s["id"], slots=False)       # the row reads the next event from the steps, never the table (round 7, tests-and-perf-06)
     nn = plans.now_and_next(plan, now)
-    days_data = (now - first) / 86400 if first else 0
     conns = sites.connections(s["id"])
     conn = (conns or [None])[0]
     # off-grid is the site's own fact, as tab C and POST /activate read it (_grid_settled): a connection of regime off_grid, or none at a farm or a
@@ -254,7 +253,8 @@ def fleet_row(s: dict, now: int, counts: dict, gensets: dict | None = None, equi
             "control": control, "last_data": last["ts"] if last else None, "now": _snapshot(last),
             "next_event": (nn or {}).get("next", [None])[0] if nn and nn.get("next") else None, "open_alerts": counts.get(s["id"], 0),
             "mtd_saving_rs": mtd, "mtd_saving_rs_method": MTD_SAVING_METHOD, "mtd_saving_rs_computed": computed, "spark": spark,
-            "collecting_day": None if days_data >= 14 else int(days_data) + 1 if first else 0,
+            # the stage track's day of collection, the one figure (lifecycle.collecting_day; UX K1 check)
+            "collecting_day": lifecycle.collecting_day(first, now),
             # the month's energy behind the claim: not money, so a viewer reads it in place of the rupees (R8 2.1; audit pages-A-11)
             "mtd_peak_kwh_avoided": energy["peak_kwh_avoided"], "mtd_litres_saved": energy["litres_saved"],
             # the month's native-block days, which claim nothing (not money; round 7, audit flow-savings-pilot-bill-18)
@@ -492,12 +492,16 @@ def _lifecycle(s: dict, now: int, *, last: dict | None, first: int | None, plan:
     elif connections is None or assets is None:
         whole = sites.full(s["id"]) or {}
         connections, assets = whole.get("connections") or [], whole.get("assets") or {}
-    step = None
+    step = block = None
     if s.get("status") != "active":
         missing = _activation_missing({**s, "connections": connections, "assets": assets})
         step = missing[0][0] if missing else None
+    elif (s.get("tier") or "monitor") == "monitor":
+        # Delivering offers the raise of the tier only when PUT /tier would take it: the refusal and the track read one rule (UX K1 check)
+        refusal = _tier_refusal(s, "advisory_writes")
+        block = refusal.code if refusal else None
     return lifecycle.build(s, now, first_ts=first, last_ts=last["ts"] if last else None, plan=plan, control=control, setup_step=step,
-                           battery="battery" in assets)
+                           battery="battery" in assets, tier_block=block)
 
 
 #: A new connection's save is idempotent (a retried first save never inserts a second row): by the client's key when it sends one (the Idempotency-Key
@@ -633,6 +637,20 @@ def _has_inverter_mode(site_id: str) -> bool:
         return con.execute("SELECT 1 FROM minute WHERE site_id = ? AND inverter_mode_active IS NOT NULL LIMIT 1", (site_id,)).fetchone() is not None
 
 
+def _tier_refusal(s: dict, tier: str) -> Refusal | None:
+    """Why the allowed tier of site `s` (a site row) cannot be set to `tier` (one of sites.TIERS), as the refusal PUT /tier answers, else None: one
+    rule for the refusal and the lifecycle's Delivering stage, which offers to raise the tier only when this lets it (UX backend ask K1, check)."""
+    capable = s.get("tier_capable") or "monitor"
+    if sites.TIERS.index(tier) > sites.TIERS.index(capable):
+        return Refusal(422, f"This site's data source supports {capable.replace('_', ' ')} at most", "above_capable")
+    if tier != "monitor" and ((s.get("data") or {}).get("data_source") or {}).get("kind") == "csv" and not _has_inverter_mode(s["id"]):
+        return Refusal(422, "No imported file of this site carries inverter_mode_active, the inverter's mode that the savings comparison needs: until one "
+                       "does, a CSV source supports monitor only", "no_inverter_mode")
+    if tier != "monitor" and not sites.native_latest(s["id"]):
+        return Refusal(422, "Capture the inverter's native settings before control is allowed: they are the fallback and the baseline", "no_capture")
+    return None
+
+
 @router.put("/api/sites/{site_id}/tier")
 def tier_put(site_id: str, inp: dict = Body(...)):
     auth.need("change_tier", "Changing the control tier")
@@ -640,13 +658,9 @@ def tier_put(site_id: str, inp: dict = Body(...)):
     tier = inp.get("tier")
     if tier not in sites.TIERS:
         raise Refusal(422, "The tier is monitor, advisory_writes or closed_loop", "invalid")
-    if sites.TIERS.index(tier) > sites.TIERS.index(s["tier_capable"]):
-        raise Refusal(422, f"This site's data source supports {s['tier_capable'].replace('_', ' ')} at most", "above_capable")
-    if tier != "monitor" and ((s.get("data") or {}).get("data_source") or {}).get("kind") == "csv" and not _has_inverter_mode(site_id):
-        raise Refusal(422, "No imported file of this site carries inverter_mode_active, the inverter's mode that the savings comparison needs: until one does, "
-                      "a CSV source supports monitor only", "no_inverter_mode")
-    if tier != "monitor" and not sites.native_latest(site_id):
-        raise Refusal(422, "Capture the inverter's native settings before control is allowed: they are the fallback and the baseline", "no_capture")
+    refusal = _tier_refusal(s, tier)
+    if refusal is not None:
+        raise refusal
     signoff = str(inp.get("signoff", "") or "")[:200]
     try:
         sites.set_tier_allowed(site_id, tier, auth.actor(), signoff)
@@ -680,10 +694,12 @@ def _site_answer(site_id: str) -> dict:
     s.pop("photo", None)
     s["tier_signoff"] = _tier_signoff(site_id, s.get("state"))
     s["setup_warnings"] = sites.setup_warnings(s)
-    # the stage track (UX backend ask K1): the Overview's track and the switcher read it here
-    now, last = now_ts(), telemetry.latest(site_id)
-    s["lifecycle"] = _lifecycle(s, now, last=last, first=telemetry.first_ts(site_id), plan=plans.current(site_id, now, slots=False),
-                                control=control_state(s, last, now))
+    # the stage track (UX backend ask K1): the Overview's track and the switcher read it here. Not for a machine key: its `sites:read` is the site's
+    # settings, and the track speaks of the site's data, its pilot and its statements, which are in no scope (audit security-roles-07; UX K1 check)
+    if not (auth.current.get() or {}).get("api_key"):
+        now, last = now_ts(), telemetry.latest(site_id)
+        s["lifecycle"] = _lifecycle(s, now, last=last, first=telemetry.first_ts(site_id), plan=plans.current(site_id, now, slots=False),
+                                    control=control_state(s, last, now))
     return out(s)
 
 
