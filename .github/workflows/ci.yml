@@ -1,0 +1,185 @@
+# Gridlytics backend checks (plan Part 10.9, DEP-01; round 7, audit parity-architecture-01), in the family's shape (solarlytics-backend at c853130,
+# .github/workflows/ci.yml). This repository holds the engine and the API; the web app is in gridlytics-frontend, which the test jobs check out beside this
+# one (gridlytics-backend and gridlytics-frontend side by side, as on a developer's machine): the tests that hold the server to the pages read its files
+# (backend/tests/sibling.py). Reading it needs the secret FRONTEND_READ_TOKEN, a read-only token for gridlytics-frontend, which the owner adds (agents never
+# push or add remotes). Without it (before the owner adds it, or on a pull request from a fork) those tests are skipped, and the run says so in a warning.
+# The web app's own checks and the browser check run in that repository's CI.
+# - on every push and pull request: the backend tests on Linux, the dependency scan (pip-audit) and the licence gate (pip-licenses);
+# - on a pull request into main, by hand (Actions > CI > Run workflow) and weekly: the backend tests on Windows, the owner's platform;
+# - on a push of v1-build, by hand and weekly: the solver benchmarks (the opt-in wall-clock tests, alone on a runner) and the Docker image, built and
+#   started, its health check answered.
+# Every job uses throwaway data (the tests make their own folders; the image a volume of its own), never the owner's data/ folder.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 1 * * 1"          # Mondays 01:23 UTC (06:23 Pakistan time)
+
+# A new push or pull request update cancels the run it replaces; a weekly or by-hand run has a group of its own and is never cancelled by a push
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  GRIDLYTICS_LOGS: "0"
+  PYTHONUTF8: "1"
+  GRIDLYTICS_FRONTEND_DIR: ${{ github.workspace }}/gridlytics-frontend
+
+jobs:
+  backend-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # whether the owner has added the read-only token; the token itself is given to the checkout step only
+      HAS_FRONTEND_TOKEN: ${{ secrets.FRONTEND_READ_TOKEN != '' }}
+    defaults:
+      run:
+        working-directory: gridlytics-backend
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: gridlytics-backend
+      - name: The web repository beside this one (read-only token)
+        if: env.HAS_FRONTEND_TOKEN == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/gridlytics-frontend
+          path: gridlytics-frontend
+          token: ${{ secrets.FRONTEND_READ_TOKEN }}
+      - name: Without the token, the tests that read the web repository are skipped
+        if: env.HAS_FRONTEND_TOKEN != 'true'
+        run: |
+          echo "::warning title=FRONTEND_READ_TOKEN is not set::The tests that read the web repository (gridlytics-frontend) are skipped in this run. The owner adds the secret FRONTEND_READ_TOKEN, a read-only token for gridlytics-frontend (docs/BACKEND_ASKS.md in the web repository)."
+          echo "GRIDLYTICS_SKIP_SIBLING=1" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: gridlytics-backend/requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Backend tests
+        working-directory: gridlytics-backend/backend
+        # -rs lists every skipped test with its reason (the opt-in benchmarks, and the web repository's tests when the token is missing)
+        run: python -m pytest tests -q -p no:cacheprovider -n auto -rs
+
+  backend-windows:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'pull_request' && github.base_ref == 'main')
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      HAS_FRONTEND_TOKEN: ${{ secrets.FRONTEND_READ_TOKEN != '' }}
+    defaults:
+      run:
+        working-directory: gridlytics-backend
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: gridlytics-backend
+      - name: The web repository beside this one (read-only token)
+        if: env.HAS_FRONTEND_TOKEN == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/gridlytics-frontend
+          path: gridlytics-frontend
+          token: ${{ secrets.FRONTEND_READ_TOKEN }}
+      - name: Without the token, the tests that read the web repository are skipped
+        if: env.HAS_FRONTEND_TOKEN != 'true'
+        run: |
+          echo "::warning title=FRONTEND_READ_TOKEN is not set::The tests that read the web repository (gridlytics-frontend) are skipped in this run. The owner adds the secret FRONTEND_READ_TOKEN, a read-only token for gridlytics-frontend (docs/BACKEND_ASKS.md in the web repository)."
+          echo "GRIDLYTICS_SKIP_SIBLING=1" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: gridlytics-backend/requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Backend tests
+        working-directory: gridlytics-backend/backend
+        run: python -m pytest tests -q -p no:cacheprovider -n auto -rs
+
+  # The dependency scan. pip-audit is a tool of this job only, installed here in its own environment and in neither requirements file, so nothing the
+  # app runs on changes. It reads requirements.txt, the app's pins, and resolves what they need to check those too; a known advisory fails the run. The
+  # web app's dependencies are scanned in the web repository's CI (npm audit).
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pip-audit
+      - name: Python dependencies (pip-audit)
+        run: pip-audit -r requirements.txt
+
+  # The licence gate (plan Part 14.3, item 4): every package the app installs (requirements.txt and what it pulls in) under a licence of the allow-list:
+  # MIT, BSD, Apache-2.0, ISC, PSF, an EPL-or-BSD dual licence taken under BSD; HPND (pillow) and MPL-2.0 (certifi, used unmodified) as the plan's named
+  # exceptions. Anything else (an LGPL or GPL package above all) fails the run. pip-licenses and its own packages are left out of the list it checks.
+  licences:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt pip-licenses
+      - name: Licences of the installed packages (pip-licenses)
+        run: >-
+          pip-licenses --from=mixed --partial-match
+          --ignore-packages pip-licenses prettytable wcwidth tomli
+          --allow-only="MIT;BSD;Apache;ISC;PSF;Python Software Foundation;HPND;Historical Permission Notice;MPL-2.0;Mozilla Public License 2.0;Unlicense;0BSD;Zlib"
+
+  # The solver benchmarks (DEP-02): the opt-in wall-clock tests (the `slow` marker, conftest.py: the 192-step plans inside the tick's 10 s, the reads of a
+  # day of telemetry), alone on a runner with nothing else running, as HANDOFF section 9 asks of them
+  bench:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/v1-build')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Solver and read benchmarks (pytest -m slow, one process)
+        working-directory: backend
+        run: python -m pytest tests -q -p no:cacheprovider -m slow -rs
+
+  # The hosted image (DEP-06; docs/DEPLOY.md): built from the Dockerfile, started on a volume of its own with a made-up signing key, and its health check
+  # waited for; the answer must carry no server header
+  image:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/v1-build')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image
+        run: docker build -t gridlytics:ci .
+      - name: Start it and wait for its health check
+        run: |
+          docker run -d --name gridlytics-ci -p 127.0.0.1:8061:8061 -v gridlytics-ci-data:/data \
+            -e GRIDLYTICS_HOSTS=api.ci.example.com -e GRIDLYTICS_LOCAL_JWT_SECRET="ci-$(openssl rand -hex 24)" gridlytics:ci
+          for _ in $(seq 1 60); do
+            state="$(docker inspect -f '{{.State.Health.Status}}' gridlytics-ci)"
+            [ "$state" = healthy ] && break
+            sleep 3
+          done
+          docker logs gridlytics-ci
+          [ "$state" = healthy ] || { echo "::error::The image's health check did not pass ($state)"; exit 1; }
+          headers="$(curl -sSI http://127.0.0.1:8061/api/health)"
+          echo "$headers"
+          if echo "$headers" | grep -qi '^server:'; then echo "::error::The API names its server"; exit 1; fi
+          docker exec gridlytics-ci id -u | grep -qx 10001
+      - name: Stop it
+        if: always()
+        run: docker rm -f gridlytics-ci || true

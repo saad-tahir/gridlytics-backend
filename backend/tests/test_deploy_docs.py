@@ -33,7 +33,7 @@ PACKAGE = ROOT / "backend" / "gridlytics"
 
 #: Read but not by the package: the port the image's command passes to uvicorn, and uvicorn's own list of the proxies it believes
 OTHERS = {"GRIDLYTICS_PORT", "FORWARDED_ALLOW_IPS"}
-#: The web app's build settings (gridlytics-frontend's frontend/.env.example), set in the Vercel project
+#: The web app's build settings (the web repository's frontend/.env.example), set in the Vercel project
 WEB = ("VITE_AUTH_MODE", "VITE_API_BASE_URL", "VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY")
 _LINE = re.compile(r"^(#\s*)?([A-Z][A-Z0-9_]*)=(.*)$")
 
