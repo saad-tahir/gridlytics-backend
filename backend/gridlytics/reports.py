@@ -20,7 +20,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from . import alerts, contract, plans, platform as platformdb, sites, store, telemetry, twin, verify
+from . import alerts, contract, plans, platform as platformdb, savings_export, sites, store, telemetry, twin, verify
 
 PKT = timezone(timedelta(hours=5))
 KINDS = ("monthly_savings", "energy_only", "daily_operations", "company_rollup", "pilot")
@@ -586,8 +586,12 @@ def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money
     head = ["Day", "Import kWh", "Solar kWh", "Outage h", "Genset h"] + (["Saving vs native", "Fidelity"] if money else [])
     by_day = {d["day"]: d for d in summ["days"]}
     rows = [head]
+    # the claim columns the savings CSV has (round 7, audit pages-D-06): the claim, why a day claims nothing, its levers and MDI share, its tariff and
+    # capture versions; and the plans in force over each Pakistan day (flow-reports-alerts-members-keys-04: the first four plans by UTC date)
+    dates = savings_export.tariff_dates(summ["days"]) if money else {}
+    in_force = savings_export.plan_ids(site_id, min(d["day"] for d in tdays), max(d["day"] for d in tdays)) if money and tdays else {}
     doc.csv.writerow(["day", "import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes", "peak_kw"] +
-                     (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld"] if money else []))
+                     (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld", *savings_export.CLAIM_COLUMNS] if money else []))
     for d in tdays:
         s = by_day.get(d["day"], {})
         rows.append([_short_day(d["day"]), num(d.get("import_kwh")), num(d.get("pv_kwh")), num(d.get("outage_minutes"), ".1f", scale=60),
@@ -595,22 +599,24 @@ def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money
                     ([rs(s.get("saving_native_rs")), doc.cell(_day_fidelity(s))] if money else []))
         ids = ""
         if money:
-            with store.connect() as con:
-                ids = ";".join(r[0] for r in con.execute("SELECT id FROM plans WHERE site_id = ? AND substr(belief_time,1,10) = ? AND status != 'failed'",
-                                                          (site_id, d["day"])).fetchall()[:4])
+            ids = ";".join(in_force.get(d["day"], []))
         doc.csv.writerow([d["day"]] + [d.get(k) for k in ("import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes",
                                                           "peak_kw")]
-                         + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids,
-                             s.get("claim_withheld") or ("import_unknown" if s.get("import_unknown") else None)] if money else []))
+                         + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids, savings_export.withheld(s),
+                             *(savings_export.claim_cells(s, dates) if s else [""] * len(savings_export.CLAIM_COLUMNS))] if money else []))
     doc.table(rows, [22 * mm, 22 * mm, 22 * mm, 18 * mm, 18 * mm] + ([28 * mm, 50 * mm] if money else []))
     if money and any(s.get("claim_withheld") or s.get("import_unknown") for s in summ["days"]):
         doc.p("A day marked “claim withheld” claims nothing: its saving is shown for reference and is not in the claimed total, nor is it a "
               "verified day.")
     cap = sites.native_latest(site_id)
     doc.gap()
-    doc.p(f"Native capture version {cap['version'] if cap else 'none'}; tariff versions as dated in the CSV annex." + (
-        " The savings are measured against a replay of the inverter's own settings on the same day's sun, load and outages (Method above)." if money
-        else " The energy figures are as measured."))
+    # the CSV says what each day was priced and replayed on (round 7, audit pages-D-06: this line said the tariff versions were "dated in the CSV
+    # annex", which had no such column)
+    doc.p(f"Native capture version {cap['version'] if cap else 'none'}." + (
+        " The CSV gives each day's tariff version and the day it took effect (tariff_version, tariff_version_from), its native capture version "
+        "(native_capture_version), the plans in force over the day (plan_ids) and its part of the claim (claimed_native_rs), so a figure can be "
+        "re-run. The savings are measured against a replay of the inverter's own settings on the same day's sun, load and outages (Method above)."
+        if money else " The energy figures are as measured."))
 
 
 def _prelim_and_stale(doc: _Doc, summ: dict, over: bool, money: bool) -> bool:

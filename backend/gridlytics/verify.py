@@ -2138,6 +2138,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
     #: per baseline and day: the provisional carry-over left out of the claim, and the hand-over to days the plan did not run
     prov_by_day: dict[str, dict[str, float]] = {}
     ho_by_day: dict[str, dict[str, dict | None]] = {}
+    #: per baseline and day: the day's part of the claim (its claim less its provisional carry-over, with its hand-over's change and its share of
+    #: the month's MDI lever), so the exports' claim column adds up to `claimed_rs` (round 7, audit pages-D-06)
+    claim_by_day: dict[str, dict[str, float]] = {}
     for base in ("native", "tuned"):
         levers: dict[str, float] = {}
         levers_claimed: dict[str, float] = {}
@@ -2188,6 +2191,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             # the day's share of its month's MDI lever goes where its saving goes: a withheld day's to no total, a day that claims nothing's not to the
             # claim (round 7, audit engine-savings-04: before, one claiming day claimed the whole month's lever, a withheld day's included)
             share = mdi_share(day, base)
+            claim_by_day.setdefault(base, {})[day] = d["claimed_rs"] - prov + ho_adj + share if claims else 0.0
             # the bound is held against the claim: the claiming days with a bound by the current method (_bound), each on the claim's own terms
             # (its provisional carry-over out, its hand-over's realised value in, its MDI share), beside what those days claim, so it is never
             # below it; a claiming day with none (the solve stopped at its limit, or scored before) is counted apart. Days that claim nothing (a
@@ -2275,7 +2279,12 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "mdi_month": bill_month(day), "mdi_share_native_rs": round(mdi_share(day, "native"), 2) if n else None,
                             "mdi_provisional": not mdi_info[bill_month(day)]["closed"],
                             # scored while its billing month was open: its ICP case rests on projected month totals until the month is settled
-                            "month_totals_projected": bool(n.get("month_totals_projected"))})
+                            "month_totals_projected": bool(n.get("month_totals_projected")),
+                            # round 7 (audit pages-D-06): the day's part of the claim (claimed_rs adds them up), the native settings' peak, and what
+                            # the day was priced and replayed on, so the exports let a dispute be re-run
+                            "claimed_in_total_native_rs": round((claim_by_day.get("native") or {}).get(day, 0.0), 2) if n else None,
+                            "peak_kw_native": n.get("peak_kw_baseline"),
+                            "tariff_version": n.get("tariff_version"), "native_capture_version": n.get("native_capture_version")})
     # round 7 (audit pr-review-02): the period's days whose claim was re-scored after their billing month closed, each with its latest change (a
     # report of that month made before `at` shows the old figures)
     out["restated_days"] = []

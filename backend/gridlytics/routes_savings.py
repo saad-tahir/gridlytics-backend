@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import copy
+import csv
+import io
 import json
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Body
 from fastapi.responses import PlainTextResponse
 
-from . import auth, gonogo, sites, store, telemetry, verify
+from . import auth, gonogo, savings_export, sites, store, telemetry, verify
 from .routes_common import bad, full_or_404, out, parse_day, site_or_404, today
 from .schemas import PilotEdit, PilotStart, Refusal, SwitchbackPaint, check
 
@@ -76,19 +78,32 @@ def savings_kpis(site_id: str, start: str | None = None, end: str | None = None)
     return out(gonogo.measures(site_id, d0, d1))
 
 
+#: The savings CSV's own columns, as before round 7; the claim columns (savings_export.CLAIM_COLUMNS) follow them
+CSV_COLUMNS = ("day", "saving_native_rs", "saving_tuned_rs", "fidelity", "actual_cost_rs", "native_cost_rs", "litres_actual", "litres_native", "peak_kw",
+               "peak_import_kwh")
+
+
 @router.get("/api/sites/{site_id}/savings/export.csv")
 def savings_csv(site_id: str, start: str | None = None, end: str | None = None):
+    """The period's days as CSV (export: administrator, analyst): each day's saving, costs, litres and peak, then whether it claims and its part of the
+    page's claim, the reason it claims nothing, its levers and MDI share, the native settings' peak, its tariff and capture versions and the plans in
+    force over its Pakistan day (savings_export; round 7, audit pages-D-06: the rows summed to a figure the page never showed, and a dispute could
+    not be re-run from them)."""
     auth.need("export", "Exporting savings")
     site_or_404(site_id)
     t = today()
     d0, d1 = parse_day(start, t.replace(day=1)).isoformat(), parse_day(end, t).isoformat()
     summ = verify.summary(site_id, d0, d1)
-    lines = ["day,saving_native_rs,saving_tuned_rs,fidelity,actual_cost_rs,native_cost_rs,litres_actual,litres_native,peak_kw,peak_import_kwh"]
+    dates = savings_export.tariff_dates(summ["days"])
+    ids = savings_export.plan_ids(site_id, d0, d1) if summ["days"] else {}
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow([*CSV_COLUMNS, "claim_withheld", *savings_export.CLAIM_COLUMNS, "plan_ids"])
     for d in summ["days"]:
-        lines.append(",".join("" if d.get(k) is None else str(d[k]) for k in ("day", "saving_native_rs", "saving_tuned_rs", "fidelity", "actual_cost_rs",
-                                                                               "native_cost_rs", "litres_actual", "litres_native", "peak_kw", "peak_import_kwh")))
+        w.writerow([savings_export.cell(d.get(k)) for k in CSV_COLUMNS] + [savings_export.cell(savings_export.withheld(d))]
+                   + savings_export.claim_cells(d, dates) + [";".join(ids.get(d["day"], []))])
     store.audit(auth.actor(), "exported savings", site_id, {"start": d0, "end": d1})
-    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{site_id}-savings.csv"'})
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{site_id}-savings.csv"'})
 
 
 @router.get("/api/sites/{site_id}/switchback")

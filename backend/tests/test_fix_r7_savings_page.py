@@ -14,7 +14,7 @@ from test_fix_api import world  # noqa: F401 (a fixture)
 from test_fix_r7_alerts_reports import _baseline, _day_row, _fake_summary, _past_month, _story, _tday, _with_summary
 from test_fix_savings import _days, _put_rows, _row, company, make_site  # noqa: F401 (company is a fixture)
 
-from gridlytics import sites, store, tariffs, verify
+from gridlytics import sites, store, tariffs, telemetry, verify
 
 PKT = timezone(timedelta(hours=5))
 
@@ -325,3 +325,131 @@ def test_the_scorecard_route_hides_money_gates_from_a_viewer_and_fee_gates_from_
     assert saving == {"id": "saving", "money_gate": True, "hidden": True}
     kpis = world.c["viewer"].get(f"/api/sites/{sid}/savings/kpis").json()
     assert {"reserve", "violations", "control", "genset", "battery"} <= set(kpis)
+
+
+# ------------------------------------------------------------------------------------------------ pages-D-06: the exports carry the claim
+
+def _export_rows(sid: str, version: str) -> list[str]:
+    """Five days of November 2025 (a closed month) at a site: three that claim (the last with a carry-over no later day has used yet), one withheld for
+    an unknown import (its grid levers unknown) and a native block that claims nothing; each priced at `version`, native capture version 3, and an
+    MDI lever (the native settings' peak 350 kW against the plan's 300, at Rs 1,000 a kW)."""
+    days = ["2025-11-03", "2025-11-04", "2025-11-05", "2025-11-06", "2025-11-07"]
+    rows = {}
+    for i, day in enumerate(days):
+        nat = {**_row(1000.0 + i, 1000.0 + i, peak_a=300.0, peak_b=350.0, rate=1000.0), "tariff_version": version, "native_capture_version": 3,
+               "levers": {"peak_window": 700.0 + i, "offpeak_energy": 200.0, "export": 0.0, "genset": 100.0, "wear": 0.0, "carry_over": 0.0}}
+        if day == "2025-11-05":
+            nat.update(fidelity="confirmed", claimed_rs=0.0, claim_withheld="import_unknown", import_unknown=True,
+                       levers={"peak_window": None, "offpeak_energy": None, "export": None, "genset": 100.0, "wear": 0.0, "carry_over": 0.0})
+        if day == "2025-11-06":
+            nat.update(fidelity="native_block", claimed_rs=0.0)
+        if day == "2025-11-07":
+            nat["levers"] = {**nat["levers"], "carry_over": 150.0}      # nothing scored after it: its carry-over is provisional
+        rows[day] = {"native": nat, "tuned": {**_row(500.0, 500.0), "tariff_version": version, "native_capture_version": 3}}
+    _put_rows(sid, rows)
+    return days
+
+
+def _plan(sid: str, belief: str, status: str = "superseded") -> str:
+    pid = store.new_id()
+    with store.connect() as con:
+        con.execute("INSERT INTO plans (id, site_id, generated_at, belief_time, valid_from, valid_until, mode, status) VALUES (?,?,?,?,?,?,?,?)",
+                    (pid, sid, belief, belief, belief, "2100-01-01T00:00:00+00:00", "a", status))
+    return pid
+
+
+def _tariff_version(effective_from: str = "2025-07-01") -> str:
+    vid = store.new_id()
+    with store.connect() as con:
+        con.execute("INSERT INTO tariff_versions (id, kind, key, effective_from, known_from, status, body, source, hash, created) VALUES "
+                    "(?,?,?,?,?,?,?,?,?,?)", (vid, "schedule", "national", effective_from, effective_from, "active", "{}", "test", vid, store._now()))
+    return vid
+
+
+def test_the_savings_csv_carries_the_claim_the_levers_the_mdi_and_the_tariff_capture_and_plan_ids_and_adds_up_to_the_page(world):
+    """pages-D-06 (with engine-savings-07, flow-savings-pilot-bill-16 and engine-money-live-13): the savings CSV gave each day's saving, costs, litres
+    and peak only, so its rows summed to Rs 1,956 while the page claimed Rs 43,594 (the MDI lever missing), a withheld or native-block day's saving
+    read like any other, and no tariff version, capture version or plan id let a dispute be re-run (plan 8.5). Each day now says whether it claims,
+    its part of the page's claim (the column adds up to it), why it claims nothing, the levers a withheld day keeps, each lever, its share of the
+    month's MDI lever and whether that month is still open, the native settings' peak, its tariff version and the day that version took effect, its
+    native capture version and the plans in force over its Pakistan day."""
+    import csv
+    import io
+    sid = world.site
+    with world.use():
+        version = _tariff_version()
+        days = _export_rows(sid, version)
+        before = _plan(sid, "2025-11-02T18:00:00+00:00")       # 23:00 PKT on 2 Nov: in force when 3 Nov begins
+        early = _plan(sid, "2025-11-02T19:30:00+00:00")        # 00:30 PKT on 3 Nov (a UTC date of 2 Nov)
+        late = _plan(sid, "2025-11-03T20:00:00+00:00")         # 01:00 PKT on 4 Nov (a UTC date of 3 Nov)
+        _plan(sid, "2025-11-03T10:00:00+00:00", status="failed")
+    page = world.c["analyst"].get(f"/api/sites/{sid}/savings", params={"start": days[0], "end": days[-1]}).json()
+    r = world.c["analyst"].get(f"/api/sites/{sid}/savings/export.csv", params={"start": days[0], "end": days[-1]})
+    assert r.status_code == 200, r.text
+    rows = list(csv.DictReader(io.StringIO(r.text)))
+    head = r.text.splitlines()[0].split(",")
+    # the columns of before keep their place; the claim, the levers, the MDI and the versions follow
+    assert head[:10] == ["day", "saving_native_rs", "saving_tuned_rs", "fidelity", "actual_cost_rs", "native_cost_rs", "litres_actual",
+                         "litres_native", "peak_kw", "peak_import_kwh"], head
+    for col in ("claims", "claimed_native_rs", "not_claimed_reason", "claim_withheld", "levers_kept", "carry_over_provisional_native_rs",
+                "mdi_month", "mdi_share_native_rs", "mdi_provisional", "peak_window_native_rs", "offpeak_energy_native_rs", "export_native_rs",
+                "genset_native_rs", "wear_native_rs", "carry_over_native_rs", "peak_kw_native", "tariff_version", "tariff_version_from",
+                "native_capture_version", "plan_ids"):
+        assert col in head, col
+    by = {x["day"]: x for x in rows}
+    assert [x["day"] for x in rows] == days
+    # the claim column adds up to the page's claim, the MDI shares included and the provisional carry-over left out
+    nat = page["baselines"]["native"]
+    assert nat["levers"]["mdi"] > 0
+    assert sum(float(x["claimed_native_rs"] or 0) for x in rows) == pytest.approx(nat["claimed_rs"], abs=0.05)
+    # and the saving column with the MDI shares of the days whose saving is known adds up to the page's saving of every day
+    known = [x for x in rows if x["saving_native_rs"] != ""]
+    assert sum(float(x["saving_native_rs"]) + float(x["mdi_share_native_rs"]) for x in known) == pytest.approx(nat["saving_rs"], abs=0.05)
+    assert by["2025-11-03"]["claims"] == "true" and by["2025-11-03"]["not_claimed_reason"] == ""
+    withheld = by["2025-11-05"]
+    assert withheld["claims"] == "false" and withheld["claim_withheld"] == "import_unknown" and withheld["not_claimed_reason"] == "import_unknown"
+    assert withheld["saving_native_rs"] == "" and withheld["claimed_native_rs"] == "0.0"
+    assert withheld["levers_kept"] == "genset;wear;carry_over" and withheld["peak_window_native_rs"] == ""
+    block = by["2025-11-06"]
+    assert block["claims"] == "false" and block["not_claimed_reason"] == "native_block" and block["claim_withheld"] == ""
+    assert by["2025-11-07"]["carry_over_provisional_native_rs"] == "150.0"
+    assert by["2025-11-03"]["mdi_month"] == "2025-11" and by["2025-11-03"]["mdi_provisional"] == "false"
+    assert by["2025-11-03"]["peak_kw_native"] == "350.0" and by["2025-11-03"]["peak_window_native_rs"] == "700.0"
+    assert {x["tariff_version"] for x in rows} == {version} and {x["tariff_version_from"] for x in rows} == {"2025-07-01"}
+    assert {x["native_capture_version"] for x in rows} == {"3"}
+    # the plans in force over each Pakistan day: the one in force at its midnight and those made during it (never a failed one), by Karachi day
+    assert by["2025-11-03"]["plan_ids"].split(";") == [before, early]
+    assert by["2025-11-04"]["plan_ids"].split(";") == [early, late]
+    assert by["2025-11-05"]["plan_ids"].split(";") == [late]
+
+
+def test_the_monthly_report_csv_carries_the_claim_columns_and_its_plan_ids_by_karachi_day(world, monkeypatch):
+    """pages-D-06 (with flow-reports-alerts-members-keys-04 and the rest of engine-savings-06): the report's CSV had no claim, no tariff or capture
+    version, while the PDF said the tariff versions were 'dated in the CSV annex', and its plan_ids were the first four plans whose UTC date was the
+    day. Its rows now carry the savings CSV's claim columns, the plans in force over each Pakistan day, and the PDF names the columns it means."""
+    import csv
+    import io
+    from gridlytics import reports
+    sid = world.site
+    with world.use():
+        version = _tariff_version("2025-07-01")
+        days = _export_rows(sid, version)
+        before = _plan(sid, "2025-11-02T18:00:00+00:00")
+        early = _plan(sid, "2025-11-02T19:30:00+00:00")
+        mids = [_plan(sid, f"2025-11-03T{h:02d}:00:00+00:00") for h in range(0, 19, 3)]   # seven plans made on 3 Nov
+    monkeypatch.setattr(telemetry, "days", lambda site_id, d0, d1: [_tday(d) for d in days])
+    built = _story(monkeypatch)
+    with world.use():
+        rep = reports.generate("monthly_savings", sid, "2025-11", "test")
+        text = reports.file_path(rep["id"], "csv").read_text(encoding="utf-8")
+        summ = verify.summary(sid, "2025-11-01", "2025-11-30")
+    rows = {x["day"]: x for x in csv.DictReader(io.StringIO(text))}
+    assert rows["2025-11-03"]["plan_ids"].split(";") == [before, early, *mids]       # before: the first four by UTC date
+    assert rows["2025-11-05"]["claim_withheld"] == "import_unknown" and rows["2025-11-05"]["levers_kept"] == "genset;wear;carry_over"
+    assert rows["2025-11-06"]["not_claimed_reason"] == "native_block"
+    assert rows["2025-11-03"]["tariff_version"] == version and rows["2025-11-03"]["tariff_version_from"] == "2025-07-01"
+    assert rows["2025-11-03"]["native_capture_version"] == "3" and rows["2025-11-03"]["mdi_month"] == "2025-11"
+    assert sum(float(x["claimed_native_rs"] or 0) for x in rows.values()) == pytest.approx(summ["baselines"]["native"]["claimed_rs"], abs=0.05)
+    pdf = built[-1]
+    assert "as dated in the CSV annex" not in pdf
+    assert "tariff_version" in pdf and "native_capture_version" in pdf and "plan_ids" in pdf, pdf
