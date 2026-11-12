@@ -2,6 +2,18 @@
 
 Newest first. Each entry says what was decided, why, and where the plan (`EMS_BUILD_PLAN.md`) says otherwise.
 
+## 2026-11-12 Round 7 UX backend asks
+
+The owner approved the UI/UX redesign (the web repository's `docs/UI_UX_MASTER_PLAN.md`); its Part H11 lists the backend asks K1 to K35 the redesigned
+pages use, each with a fallback. They are built on branch `audit/ux-k`, one or more commits per ask ("UX K<nn>: ..."), each answer recorded in the web
+repository's `docs/API_CONTRACT.md` under "UX backend asks (plan H11)" and typed at the end of `frontend/src/types/api.ts`. Where an ask needs an open
+question of the owner, the recommended answer ships and is logged here and in the web repository's `docs/BUILD_NOTES.md`.
+
+### Batch k1: K1, K4, K24, K25 (12 Nov 2026)
+
+- **K4, the role matrix** (plan G9 item 1): `GET /api/meta` answers `role_matrix`, `{permission: [roles]}` straight from `auth.PERMISSIONS`, the roles in
+  `auth.ROLES` order, the same for every reader. No money.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

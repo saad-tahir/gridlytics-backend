@@ -35,7 +35,10 @@ def meta():
             "fallback": {"on_expiry": "inverter_native", "on_link_loss_after_s": delivery.LINK_LOSS_AFTER_S},
             # who holds each permission, in the refusals' words ("an administrator, an operator or an analyst"), so a page that says who may act reads
             # it here rather than listing roles of its own (round 7, audit pr-review-07)
-            "who_can": {p: auth.roles_words(p) for p in auth.PERMISSIONS}}
+            "who_can": {p: auth.roles_words(p) for p in auth.PERMISSIONS},
+            # who holds each permission, as a list of roles in auth.ROLES order, straight from auth.PERMISSIONS: the role guide and People's
+            # consequence line draw it, so neither can drift from what the server allows (UX backend ask K4, plan G9 item 1). No money; every reader
+            "role_matrix": {p: [r for r in auth.ROLES if r in who] for p, who in auth.PERMISSIONS.items()}}
 
 
 def _icp_categories() -> list[str]:
