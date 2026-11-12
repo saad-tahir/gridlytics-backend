@@ -900,6 +900,13 @@ def _end_state(sim: dict) -> dict:
             "gen_rescue": bool(sim.get("gen_rescue_end", False))}
 
 
+def _gen_starts(sim: dict, on_before: bool) -> int:
+    """The genset's starts in an arm's day, as _genset_cost counts them (a run going on at midnight is not a start): plan 8.3's diesel KPI ("run
+    hours, starts per day") per arm (round 7, audit brief-vs-build-13: the ledger kept the litres and hours only)."""
+    on = np.asarray(sim["gen_on"], dtype=bool)
+    return int(np.sum(on[1:] & ~on[:-1]) + (1 if len(on) and on[0] and not on_before else 0))
+
+
 def _gen_running_before(site_id: str, t0: int) -> bool:
     """Whether the genset was running in the minute before t0, as the actual arm reads its state (the flag, else its power, else its litres);
     False where that minute has no genset reading."""
@@ -1352,6 +1359,7 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
     # a run going on at midnight is not a start: the actual arm's state before 00:00 from the minute before it
     gen_before = _gen_running_before(site_id, twin.day_start_utc(day)) if gen_asset else False
     arms = {"actual": price_arm(site, masked_actual, pr, day, e_end_actual, v_end, gen_before=gen_before)}
+    arms["actual"]["genset_starts"] = _gen_starts(masked_actual, gen_before)
     # each baseline's replay starts from its own end state of the day before (its chain), or from the actual arm's state where the chain restarts
     starts = _chain_starts(site_id, day)
     tuned_rule = fit_tuned(site, day)
@@ -1379,6 +1387,7 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
         e_end_base = float(sim["soc"][-1]) * plant.e_nom
         arms[k] = price_arm(site, _grid_masked(sim, unresolved, series["pv"], known=charge_known, load=load_read), pr, day, e_end_base, v_end,
                             gen_before=on_before)
+        arms[k]["genset_starts"] = _gen_starts(sim, on_before)
         gap_start = (e_start_actual - soc_start * plant.e_nom) if st["from"] == "previous_day" else 0.0
         gap_end = e_end_actual - e_end_base
         # the gap in stored energy is valued at the day's v_end at its end, and was valued at the day before's at its start: the days telescope
@@ -1884,14 +1893,16 @@ def confirm_applied(site: dict, day: date, applied: dict, act: dict, plant: twin
     return {"class": cls, "fidelity": score, **detail}
 
 
-def compute_range_detail(site_id: str, d0: date, d1: date, by: str = "system") -> dict:
+def compute_range_detail(site_id: str, d0: date, d1: date, by: str = "system", progress=None) -> dict:
     """Score the days d0..d1 in order, each baseline's chain carried from one to the next, then re-score the stored days after d1 whose chain the
     range moved (_walk_forward). One audit line (RECOMPUTED) lists every day re-scored, why ("recompute", "chain"), and its claim before and
     after; a closed month's changed claims are marked (_restate). Returns {"days": the days d0..d1 scored, "rescored_days": the later days the
     walk re-scored, "restated_days": the days whose claim changed in a closed month} (round 7, audit pr-review-02: before, the answer counted the
-    range only, and nothing recorded what the walk rewrote)."""
+    range only, and nothing recorded what the walk rewrote). `progress(done, total)`, when given, is told after each day of the range (round 7,
+    audit pr-review-05: the recompute runs as a job whose page shows how far it is)."""
     n = 0
     entries: list[dict] = []
+    total = max((d1 - d0).days + 1, 0)
     d = d0
     while d <= d1:
         before = _stored_rows(site_id, d)
@@ -1900,6 +1911,8 @@ def compute_range_detail(site_id: str, d0: date, d1: date, by: str = "system") -
             n += 1
             entries.append(_rescored(d, "recompute", before, new, _restate(site_id, d, before, "recompute", by)))
         d += timedelta(days=1)
+        if progress is not None:
+            progress((d - d0).days, total)
     walked = _walk_forward(site_id, d1, by) if d1 >= d0 else []
     entries += walked
     if entries:
@@ -2172,11 +2185,15 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         info = mdi_info[bill_month(day)]
         return info["by_base"][base]["lever"] / info["days_in_month"]
 
-    #: per baseline and month: (claimed rupees of the days, their MDI shares included; days whose saving is known), for the fee check
-    per_month: dict[str, dict[str, tuple[float, int]]] = {}
+    #: per baseline and month: (claimed rupees of the days, their MDI shares included; days whose saving is known; days that claim), for the fee
+    #: check
+    per_month: dict[str, dict[str, tuple[float, int, int]]] = {}
     #: per baseline and day: the provisional carry-over left out of the claim, and the hand-over to days the plan did not run
     prov_by_day: dict[str, dict[str, float]] = {}
     ho_by_day: dict[str, dict[str, dict | None]] = {}
+    #: per baseline and day: the day's part of the claim (its claim less its provisional carry-over, with its hand-over's change and its share of
+    #: the month's MDI lever), so the exports' claim column adds up to `claimed_rs` (round 7, audit pages-D-06)
+    claim_by_day: dict[str, dict[str, float]] = {}
     for base in ("native", "tuned"):
         levers: dict[str, float] = {}
         levers_claimed: dict[str, float] = {}
@@ -2191,6 +2208,10 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         months: dict[str, list] = {}
         mdi = mdi_claimed = mdi_prov = 0.0
         unserved_a = unserved_b = 0.0
+        # the claim of the verified days alone (followed in full, nothing withheld), by lever, on the claim's own terms: the figure the page shows
+        # when its reader ticks "verified days only" (R8 2.12; round 7, audit pages-D-22)
+        levers_verified: dict[str, float] = {}
+        claimed_verified = mdi_verified = 0.0
         for day, by in days.items():
             d = by.get(base)
             if not d:
@@ -2223,10 +2244,19 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             gen_unknown_days += int(bool(d.get("genset_unknown")))
             imp_unknown = bool(d.get("import_unknown"))
             imp_unknown_days += int(imp_unknown)
-            verified += int(d["fidelity"] == "confirmed" and not imp_unknown and not d.get("claim_withheld"))
+            is_verified = d["fidelity"] == "confirmed" and not imp_unknown and not d.get("claim_withheld")
+            verified += int(is_verified)
             # the day's share of its month's MDI lever goes where its saving goes: a withheld day's to no total, a day that claims nothing's not to the
             # claim (round 7, audit engine-savings-04: before, one claiming day claimed the whole month's lever, a withheld day's included)
             share = mdi_share(day, base)
+            claim_by_day.setdefault(base, {})[day] = d["claimed_rs"] - prov + ho_adj + share if claims else 0.0
+            if claims and is_verified:
+                for k, v in d["levers"].items():
+                    if v is not None:
+                        levers_verified[k] = levers_verified.get(k, 0.0) + v
+                levers_verified["carry_over"] = levers_verified.get("carry_over", 0.0) - prov + ho_adj
+                claimed_verified += d["claimed_rs"] - prov + ho_adj
+                mdi_verified += share
             # the bound is held against the claim: the claiming days with a bound by the current method (_bound), each on the claim's own terms
             # (its provisional carry-over out, its hand-over's realised value in, its MDI share), beside what those days claim, so it is never
             # below it; a claiming day with none (the solve stopped at its limit, or scored before) is counted apart. Days that claim nothing (a
@@ -2251,7 +2281,7 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
             mdi_prov += share if claims and not closed else 0.0
             unserved_a += d["unserved_kwh_actual"]
             unserved_b += d["unserved_kwh_baseline"]
-        per_month[base] = {k: (v[0], v[1]) for k, v in months.items()}
+        per_month[base] = {k: (v[0], v[1], v[2]) for k, v in months.items()}
         levers["mdi"] = round(mdi, 2)
         levers_claimed = {k: levers_claimed.get(k, 0.0) for k in levers if k != "mdi"} | {k: v for k, v in levers_claimed.items() if k not in levers}
         levers_claimed["mdi"] = round(mdi_claimed, 2)
@@ -2275,7 +2305,10 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                                                      "claiming_days": v[2], "share_rs": round(v[3], 2), "claimed_rs": round(v[4], 2),
                                                      "provisional": not mdi_info[k]["closed"]} for k, v in months.items()},
                                   "unserved_kwh_actual": round(unserved_a, 1), "unserved_kwh_baseline": round(unserved_b, 1),
-                                  "genset_unknown_days": gen_unknown_days, "import_unknown_days": imp_unknown_days}
+                                  "genset_unknown_days": gen_unknown_days, "import_unknown_days": imp_unknown_days,
+                                  "verified": {"days": verified, "claimed_rs": round(claimed_verified + mdi_verified, 2),
+                                               "levers_claimed_rs": {**{k: round(v, 2) for k, v in levers_verified.items()},
+                                                                     "mdi": round(mdi_verified, 2)}}}
         if base == "tuned":
             # round 7 (audit engine-savings-03): the tuned rule of the period's last scored day, its cycle-charging set point None where it has none
             rule = next((by["tuned"].get("tuned_rule") for _, by in sorted(days.items(), reverse=True) if (by.get("tuned") or {}).get("tuned_rule")),
@@ -2314,7 +2347,12 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "mdi_month": bill_month(day), "mdi_share_native_rs": round(mdi_share(day, "native"), 2) if n else None,
                             "mdi_provisional": not mdi_info[bill_month(day)]["closed"],
                             # scored while its billing month was open: its ICP case rests on projected month totals until the month is settled
-                            "month_totals_projected": bool(n.get("month_totals_projected"))})
+                            "month_totals_projected": bool(n.get("month_totals_projected")),
+                            # round 7 (audit pages-D-06): the day's part of the claim (claimed_rs adds them up), the native settings' peak, and what
+                            # the day was priced and replayed on, so the exports let a dispute be re-run
+                            "claimed_in_total_native_rs": round((claim_by_day.get("native") or {}).get(day, 0.0), 2) if n else None,
+                            "peak_kw_native": n.get("peak_kw_baseline"),
+                            "tariff_version": n.get("tariff_version"), "native_capture_version": n.get("native_capture_version")})
     # the engine that computed each day (round 7, audit parity-architecture-12), as recorded with the day; null for a day stored before it was recorded
     for entry in out["days"]:
         entry["engine"] = (days[entry["day"]].get("native") or days[entry["day"]].get("tuned") or {}).get("engine")
@@ -2341,18 +2379,32 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
         fee = float(store.get_setting(f"fee:{site_id}", 0) or 0)
         # each month's claimed rate, the days' MDI shares included, scaled to the whole billing month (a part month is not a month; a month whose
         # every day claims scales to its whole MDI lever); the smaller of the two baselines (plan 8.1: claims must beat the tuned baseline); the
-        # months averaged
-        monthly = []
+        # months averaged. Round 7 (audit pages-D-01): each month says which baseline it took and the claim and days its rate rests on, so the
+        # fee card names them; a month scaled from part of it is a projection, so the figure is preliminary until whole months are scored and the
+        # period's own conditions (28 verified days, the capture, the switchback weeks, the FCA billed) are met
+        monthly, used = [], []
         for mk in sorted({bill_month(d) for d in days}):
             dim = mdi_info[mk]["days_in_month"]
-            cands = [c / n * dim for (c, n) in (per_month.get(base, {}).get(mk, (0.0, 0)) for base in ("native", "tuned")) if n]
+            cands = [(c / n * dim, base, c, n, k) for base in ("native", "tuned")
+                     for (c, n, k) in [per_month.get(base, {}).get(mk, (0.0, 0, 0))] if n]
             if cands:
-                monthly.append(min(cands))
+                rate, base, c, n, k = min(cands, key=lambda x: x[0])
+                monthly.append(rate)
+                used.append({"month": mk, "baseline": base, "claimed_rs": round(c, 2), "scored_days": n, "claiming_days": k, "days_in_month": dim,
+                             "rs_per_month": round(rate, 0)})
         saving_pm = sum(monthly) / len(monthly) if monthly else 0.0
+        bases = {m["baseline"] for m in used}
+        scaled = any(m["scored_days"] < m["days_in_month"] for m in used)
         out["fee"] = {"fee_rs_per_month": fee, "verified_saving_rs_per_month": round(saving_pm, 0),
-                      "within_one_third": fee <= saving_pm / 3 if fee else None,
-                      "basis": ("claimed saving per scored day, each day's share of its month's MDI lever included, x days in the month; the smaller "
-                                "of the native and tuned baselines")}
+                      # no verdict without a fee, nor without a scored day to rest on (a zero saving is not a measured one)
+                      "within_one_third": fee <= saving_pm / 3 if fee and used else None,
+                      "basis": ("each billing month's claim (the claiming days, each day's share of its month's MDI lever included) per day whose "
+                                "saving is known, x days in the month; the smaller of the native and tuned baselines, month by month; the months "
+                                "averaged"),
+                      "baseline": (next(iter(bases)) if len(bases) == 1 else "both") if bases else None,
+                      "claimed_rs": round(sum(m["claimed_rs"] for m in used), 2), "scored_days": sum(m["scored_days"] for m in used),
+                      "claiming_days": sum(m["claiming_days"] for m in used), "scaled": scaled,
+                      "preliminary": bool(out["preliminary"] or scaled or not used), "months": used}
     return out
 
 

@@ -342,9 +342,17 @@ def outage_cause(site_id: str, start: int, inp: dict = Body(...)):
     auth.need("ack_alerts", "Recording an outage cause")
     site_or_404(site_id)
     cause = str(inp.get("cause", ""))[:80]
-    with store.connect() as con:
+    with store.write_transaction() as con:
+        # the cause recorded before for this outage, if any, for the audit line (round 7, audit security-roles-04)
+        held = None
+        for r in con.execute("SELECT detail FROM events WHERE site_id = ? AND type = 'outage_cause' ORDER BY id DESC", (site_id,)):
+            d = json.loads(r["detail"] or "{}")
+            if d.get("start") == start:
+                held = d.get("cause")
+                break
         con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
                     (site_id, store._now(), "outage_cause", auth.actor(), json.dumps({"start": start, "cause": cause})))
+        store.audit(auth.actor(), "recorded an outage's cause", site_id, {"start": start, "cause": cause, "before": held}, con=con)
     return {"start": start, "cause": cause}
 
 
@@ -675,9 +683,11 @@ def fuel_log(site_id: str, inp: dict = Body(...)):
     detail = {"day": day.isoformat(), "litres": litres, "note": str(inp.get("note", ""))[:200]}
     if cost is not None:
         detail["cost_rs"] = round(cost, 2)
-    with store.connect() as con:
+    with store.write_transaction() as con:
         con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)",
                     (site_id, store._now(), "fuel_log", auth.actor(), json.dumps(detail)))
+        # the litres feed the genset's ledger: the log is audited (round 7, audit security-roles-04); its cost is money, filtered by its name
+        store.audit(auth.actor(), "logged fuel", site_id, detail, con=con)
     return {"logged": litres, "day": day.isoformat()}
 
 

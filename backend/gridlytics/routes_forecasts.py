@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from . import auth, forecast, plans
+from . import auth, forecast, plans, store
 from .routes_common import full_or_404, now_ts
 from .schemas import Refusal
 
@@ -36,4 +36,7 @@ def refresh(site_id: str):
     prior = plans._saved_outage(site_id, t0)
     b = plans._keep_observed_outage(site_id, t0, now, forecast.issue(s, now), prior, True)
     # a kind that does not apply (no PV, an off-grid site's outages) has no stage: null
-    return {"belief_time": b["t0"], "stages": {"pv": b["pv"]["stage"], "load": b["load"]["stage"], "outage": b["outage"]["stage"]}}
+    stages = {"pv": b["pv"]["stage"], "load": b["load"]["stage"], "outage": b["outage"]["stage"]}
+    # a refresh replaces the forecasts the next plan reads: audited (round 7, audit security-roles-04)
+    store.audit(auth.actor(), "refreshed the forecasts", site_id, {"belief_time": b["t0"], "stages": stages})
+    return {"belief_time": b["t0"], "stages": stages}

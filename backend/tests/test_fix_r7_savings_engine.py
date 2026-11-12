@@ -791,13 +791,15 @@ def test_a_rescore_in_a_month_not_over_is_no_restatement(company, monkeypatch):
 def test_the_recompute_route_answers_the_later_days_it_rescored(world, monkeypatch):
     seen = {}
 
-    def detail(site_id, d0, d1, by="system"):
+    def detail(site_id, d0, d1, by="system", progress=None):
         seen["by"] = by
         return {"days": 2, "rescored_days": ["2026-10-14"], "restated_days": ["2026-10-14"]}
 
     monkeypatch.setattr(verify, "compute_range_detail", detail)
     r = world.c["analyst"].post(f"/api/sites/{world.site}/savings/recompute", json={"start": "2026-10-12", "end": "2026-10-13"})
-    assert r.status_code == 200 and r.json() == {"days": 2, "rescored_days": ["2026-10-14"], "restated_days": ["2026-10-14"]}
+    # round 7 (savings-page, audit pr-review-05): the recompute runs as a job, whose finished answer adds its status, id and period
+    assert r.status_code == 200 and {k: r.json()[k] for k in ("days", "rescored_days", "restated_days", "status")} == {
+        "days": 2, "rescored_days": ["2026-10-14"], "restated_days": ["2026-10-14"], "status": "done"}
     assert seen["by"] and seen["by"] != "system"
 
 
@@ -1170,8 +1172,9 @@ def test_a_day_beyond_the_forward_walk_is_listed_stale_until_recomputed(company,
 # ------------------------------------------------------------------------------------------------ pages-D-04 (security-roles-05,
 # ------------------------------------------------------------------------------------------------ flow-savings-pilot-bill-10): the pilot's request model
 
+# with plan 15.3's genset and cycling gates the defaults hold since round 7's audit pages-D-12
 CRITERIA = {"min_saving_pct": 8.0, "max_unserved_kwh": 0.0, "reserve_adequacy_pct": 90.0, "fidelity_pct": 80.0, "fee_multiple": 3.0,
-            "forecast_pv_nrmse_max": 0.35}
+            "forecast_pv_nrmse_max": 0.35, "genset_hours_cut_pct": 15.0, "cycles_ratio_max": 1.1}
 
 
 def _pilot_ready(w) -> str:

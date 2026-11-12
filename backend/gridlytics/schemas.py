@@ -96,6 +96,9 @@ class PilotCriteriaEdit(Strict):
     fidelity_pct: float = Field(None, ge=0, le=100)
     fee_multiple: float = Field(None, ge=0, le=100)
     forecast_pv_nrmse_max: float = Field(None, ge=0, le=1)
+    # plan 15.3's gates (round 7, audit pages-D-12): the genset's run hours cut against the tuned rule, and the cycles a day against the tuned baseline's
+    genset_hours_cut_pct: float = Field(None, ge=0, le=100)
+    cycles_ratio_max: float = Field(None, ge=0, le=10)
 
 
 class PilotClosure(Strict):

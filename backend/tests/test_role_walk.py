@@ -57,6 +57,11 @@ def walk(tmp_path_factory):
     from gridlytics import api, seed_demo
     seed_demo.seed(out=folder / "ACCOUNTS.md")
     seed_demo.load_demo_sites(4)
+    # four days of demo history: the walk reads a monthly savings report all the same, which R8 2.14 refuses under a week of data (round 7,
+    # savings-page; that rule is tested in test_fix_r7_savings_page)
+    week = pytest.MonkeyPatch()
+    from gridlytics import reports
+    week.setattr(reports, "REPORT_DAYS_NEEDED", 0)
     text = (folder / "ACCOUNTS.md").read_text(encoding="utf-8")
 
     def password(email):
@@ -103,6 +108,10 @@ def walk(tmp_path_factory):
 
     answers: dict[str, dict[str, dict[str, tuple]]] = {}
     unfilled = []
+    # a recompute runs as a job (round 7, savings-page, audit pr-review-05): GET /api/sites/{site_id}/savings/recompute/{job_id}, over a day with no data
+    r = client.post(f"/api/sites/{sids[0]}/savings/recompute", headers=h["admin"], json={"start": "2020-01-01", "end": "2020-01-01"})
+    assert r.status_code == 200, r.text
+    fill.setdefault("job_id", []).append(r.json()["job_id"])
     for template in get_routes():
         if any(f in template for f in FILES):
             continue
@@ -134,6 +143,7 @@ def walk(tmp_path_factory):
                 body = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
                 got[reader] = (r.status_code, body)
     yield {"answers": answers, "unfilled": unfilled, "sites": sids, "edge_site": edge_site, "client": client, "headers": h}
+    week.undo()
     if old is None:
         os.environ.pop("GRIDLYTICS_DATA_DIR", None)
     else:

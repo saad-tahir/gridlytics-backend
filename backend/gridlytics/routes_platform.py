@@ -102,6 +102,7 @@ def notifications_put(inp=Body(...)):
     if extra:
         raise Refusal(422, f"Unknown field '{extra[0]}': the choices are follow (the kinds of alert) and email", "invalid")
     now = _notify_out(store.get_setting(_notify_key(me)))
+    before = dict(now)
     if "follow" in inp:
         follow = inp["follow"]
         if not isinstance(follow, list) or any(not isinstance(c, str) or c not in alerts.CATEGORIES for c in follow):
@@ -112,4 +113,6 @@ def notifications_put(inp=Body(...)):
             raise Refusal(422, "Say whether you want alerts by email too: true or false", "invalid")
         now["email"] = inp["email"]
     store.set_setting(_notify_key(me), {"follow": now["follow"], "email": now["email"]})
+    # a person's own choices, audited as every change is (round 7, audit security-roles-04)
+    store.audit(auth.actor(), "changed their notification choices", "", {"changes": store.changes(before, now, ("follow", "email"))})
     return now

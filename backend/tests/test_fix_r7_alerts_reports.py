@@ -1120,9 +1120,11 @@ def test_a_daily_sheet_is_asked_for_a_day_today_or_before_and_says_when_no_plan_
 
 # ------------------------------------------------------------------------------------------------ role-operator-20 (and flow-reports-alerts-members-keys-18)
 
-def test_a_report_is_listed_and_downloaded_by_the_roles_that_may_generate_its_kind(world):
+def test_a_report_is_listed_and_downloaded_by_the_roles_that_may_generate_its_kind(world, monkeypatch):
     """The monthly savings CSV was a savings export the operator was refused on the Savings page (export: an administrator or an analyst), but its
     download checked only see_costs. One rule now: who may generate a kind lists and downloads it."""
+    from gridlytics import reports
+    monkeypatch.setattr(reports, "REPORT_DAYS_NEEDED", 0)   # a site with no data yet (R8 2.14's week of data: test_fix_r7_savings_page)
     sid, month = world.site, _past_month()
     today = datetime.now(PKT).date().isoformat()
     a = world.c["admin"]
@@ -1639,6 +1641,7 @@ def test_report_files_are_kept_inside_the_data_folder_and_still_served_after_it_
     part (a Windows path included), and a path that leads out of the reports folder is never served."""
     import shutil
     from gridlytics import reports
+    monkeypatch.setattr(reports, "REPORT_DAYS_NEEDED", 0)   # a site with no data yet (R8 2.14's week of data: test_fix_r7_savings_page)
     sid, month = world.site, _past_month()
     a = world.c["admin"]
     new, old, win = (a.post("/api/reports", json={"kind": kind, "site_id": sid, "period": period}).json()

@@ -21,7 +21,7 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import simpleSplit
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from . import alerts, contract, plans, platform as platformdb, sites, store, telemetry, twin, verify
+from . import alerts, contract, plans, platform as platformdb, savings_export, sites, store, telemetry, twin, verify
 
 PKT = timezone(timedelta(hours=5))
 KINDS = ("monthly_savings", "energy_only", "daily_operations", "company_rollup", "pilot")
@@ -192,10 +192,12 @@ def num(x, fmt: str = ",.0f", unit: str = "", scale: float = 1.0) -> str:
 
 def file_name(r: dict, which: str) -> str:
     """The name a download is saved under: the site, the kind and the month ("gridlytics-faisalabad-textile-mill-monthly-savings-2026-11.pdf"), so
-    two sites' reports of a month never share a name; a site name with no Latin letters or digits gives the site's id instead."""
+    two sites' reports of a month never share a name; a site name with no Latin letters or digits gives the site's id instead. A report out of date
+    (a day of its month restated after it was made) is saved as "...-2026-11-out-of-date.pdf" (round 7, the reports' half of audit pr-review-02)."""
     slug = re.sub(r"[^a-z0-9]+", "-", str(r.get("site_name") or "").lower()).strip("-")[:60].strip("-") or str(r.get("site_id") or "")
     kind = str(r.get("kind") or "report").replace("_", "-")
-    return "-".join(x for x in ("gridlytics", slug, kind, str(r.get("period") or "")) if x) + f".{which}"
+    stale = "out-of-date" if r.get("out_of_date") else ""
+    return "-".join(x for x in ("gridlytics", slug, kind, str(r.get("period") or ""), stale) if x) + f".{which}"
 
 
 def _folder() -> str:
@@ -488,6 +490,9 @@ def control_line(c: dict) -> str:
 # ------------------------------------------------------------------------------------------------ sections
 
 ARM_WORDS = {"plan": "The plan", "native": "The native settings"}
+#: The claim's row (round 7, audit pages-D-21): the days that claim are those whose plan was followed in full or in part (verify.CLAIMING), a
+#: verified day only one followed in full, so the claim is never said to count "the verified days only"
+CLAIMED_ROW = "Claimed (plan followed in full or in part)"
 
 
 def _ledger(doc: _Doc, nat: dict, tun: dict, scored: int) -> None:
@@ -505,12 +510,13 @@ def _ledger(doc: _Doc, nat: dict, tun: dict, scored: int) -> None:
     rows = [["Lever", "Against the native settings", "Against a tuned table"]]
     rows += [[LEVER_NAMES.get(k, k.replace("_", " ").capitalize()), cell(nat, k), cell(tun, k)] for k in keys]
     rows += [["Saving, all days", rs(nat.get("saving_rs")), rs(tun.get("saving_rs"))],
-             ["Claimed (verified days only)", rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))]]
+             [CLAIMED_ROW, rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))]]
     if nat.get("perfect_foresight_rs") is not None:
         rows.append(["Perfect foresight (not achievable, for reference)", rs(nat["perfect_foresight_rs"]), "-"])
     doc.table(rows, [95 * mm, 42 * mm, 42 * mm])
     doc.p("The ledger sums every scored day of the period, the days that claim nothing included (a table not applied, a native block, a withheld "
-          "claim); the claimed figures count the verified days only.")
+          "claim); the claimed figures count the days whose plan was followed in full or in part, less the carry-over still provisional. A "
+          "verified day is one whose plan was followed in full, so a partly followed day claims without being a verified day.")
 
 
 def _switchback(doc: _Doc, site_id: str, d0: date, d1: date, whole: bool = False) -> None:
@@ -529,17 +535,27 @@ def _switchback(doc: _Doc, site_id: str, d0: date, d1: date, whole: bool = False
     credits = [c for c in sb.get("carry_over_credits") or [] if whole or d0.isoformat() <= str(c.get("boundary")) <= d1.isoformat()]
     if credits:
         doc.gap(2)
-        doc.table([["Switch to native on", "Plan arm ended with", "Native arm ended with", "Valued at", "Carry-over credit to the plan"]]
-                  + [[_short_day(c["boundary"]), smart(c.get("e_end_plan_kwh"), " kWh"), smart(c.get("e_end_native_kwh"), " kWh"),
-                      f"Rs {_round(_finite(c.get('v_end')) or 0.0, 2):.2f}/kWh", rs(c.get("credit_rs"))] for c in credits],
-                  [35 * mm, 35 * mm, 35 * mm, 30 * mm, 45 * mm])
+        # round 7 (audit pages-D-05): a switch either way carries a credit (a native block hands its stored energy to the plan block too), so each
+        # row says which way it went; a plan arm's end energy on a native-to-plan switch is the plan days' mean (verify._carry_over_credits)
+        doc.table([["Switch on", "From and to", "Plan arm ended with", "Native arm ended with", "Valued at", "Carry-over credit to the plan"]]
+                  + [[_short_day(c["boundary"]), f"{ARM_WORDS.get(c.get('from_arm'), str(c.get('from_arm')))} to "
+                                                 f"{ARM_WORDS.get(c.get('to_arm'), str(c.get('to_arm'))).lower()}",
+                      smart(c.get("e_end_plan_kwh"), " kWh") + (" (mean of the plan days)" if c.get("e_end_plan_basis") == "plan_days_mean" else ""),
+                      smart(c.get("e_end_native_kwh"), " kWh"), f"Rs {_round(_finite(c.get('v_end')) or 0.0, 2):.2f}/kWh", rs(c.get("credit_rs"))]
+                     for c in credits],
+                  [25 * mm, 35 * mm, 32 * mm, 28 * mm, 25 * mm, 35 * mm])
     res = sb.get("result")
     doc.gap(2)
     if res:
         doc.p(f"Over the calendar so far ({_plural(int(res.get('plan_days') or 0), 'plan day')}, {_plural(int(res.get('native_days') or 0), 'native day')}): "
               f"the plan saves {rs(res.get('saving_rs_per_day_adjusted'))} a day adjusted for sun, load and outages "
-              f"({rs(res.get('saving_rs_per_day_unadjusted'))} a day unadjusted). Carry-over credit: {rs(res.get('carry_over_credit_rs'))} in all, "
-              f"{rs(res.get('carry_over_rs_per_plan_day'))} a plan day, included in both.")
+              f"({rs(res.get('saving_rs_per_day_unadjusted'))} a day unadjusted)"
+              # round 7 (audit pages-D-05): the figures before the credit, beside it
+              + (f"; {rs(res['saving_rs_per_day_adjusted_before_carry_over'])} a day adjusted and "
+                 f"{rs(res['saving_rs_per_day_unadjusted_before_carry_over'])} unadjusted before the carry-over credit"
+                 if _finite(res.get("saving_rs_per_day_adjusted_before_carry_over")) is not None
+                 and _finite(res.get("saving_rs_per_day_unadjusted_before_carry_over")) is not None else "")
+              + f". Carry-over credit: {rs(res.get('carry_over_credit_rs'))} in all, {rs(res.get('carry_over_rs_per_plan_day'))} a plan day, included in both.")
     else:
         doc.p(f"No switchback result yet: it needs at least six scored days on both arms ({_plural(int(sb.get('days') or 0), 'day')} scored so far).")
 
@@ -609,8 +625,12 @@ def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money
             + (["Saving vs native", "Fidelity"] if money else []))
     by_day = {d["day"]: d for d in summ["days"]}
     rows = [head]
+    # the claim columns the savings CSV has (round 7, audit pages-D-06): the claim, why a day claims nothing, its levers and MDI share, its tariff and
+    # capture versions; and the plans in force over each Pakistan day (flow-reports-alerts-members-keys-04: the first four plans by UTC date)
+    dates = savings_export.tariff_dates(summ["days"]) if money else {}
+    in_force = savings_export.plan_ids(site_id, min(d["day"] for d in tdays), max(d["day"] for d in tdays)) if money and tdays else {}
     doc.csv.writerow(["day", "import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes", "peak_kw"] +
-                     (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld"] if money else []))
+                     (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld", *savings_export.CLAIM_COLUMNS] if money else []))
     for d in tdays:
         s = by_day.get(d["day"], {})
         rows.append([_short_day(d["day"])] + ([num(d.get("import_kwh"))] if grid else []) + [num(d.get("pv_kwh"))]
@@ -618,22 +638,24 @@ def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money
                     + ([rs(s.get("saving_native_rs")), doc.cell(_day_fidelity(s))] if money else []))
         ids = ""
         if money:
-            with store.connect() as con:
-                ids = ";".join(r[0] for r in con.execute("SELECT id FROM plans WHERE site_id = ? AND substr(belief_time,1,10) = ? AND status != 'failed'",
-                                                          (site_id, d["day"])).fetchall()[:4])
+            ids = ";".join(in_force.get(d["day"], []))
         doc.csv.writerow([d["day"]] + [d.get(k) for k in ("import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes",
                                                           "peak_kw")]
-                         + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids,
-                             s.get("claim_withheld") or ("import_unknown" if s.get("import_unknown") else None)] if money else []))
+                         + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids, savings_export.withheld(s),
+                             *(savings_export.claim_cells(s, dates) if s else [""] * len(savings_export.CLAIM_COLUMNS))] if money else []))
     doc.table(rows, [22 * mm] + ([22 * mm] if grid else []) + [22 * mm] + ([18 * mm] if grid else []) + [18 * mm] + ([28 * mm, 50 * mm] if money else []))
     if money and any(s.get("claim_withheld") or s.get("import_unknown") for s in summ["days"]):
         doc.p("A day marked “claim withheld” claims nothing: its saving is shown for reference and is not in the claimed total, nor is it a "
               "verified day.")
     cap = sites.native_latest(site_id)
     doc.gap()
-    doc.p(f"Native capture version {cap['version'] if cap else 'none'}; tariff versions as dated in the CSV annex." + (
-        " The savings are measured against a replay of the inverter's own settings on the same day's sun, load and outages (Method above)." if money
-        else " The energy figures are as measured."))
+    # the CSV says what each day was priced and replayed on (round 7, audit pages-D-06: this line said the tariff versions were "dated in the CSV
+    # annex", which had no such column)
+    doc.p(f"Native capture version {cap['version'] if cap else 'none'}." + (
+        " The CSV gives each day's tariff version and the day it took effect (tariff_version, tariff_version_from), its native capture version "
+        "(native_capture_version), the plans in force over the day (plan_ids) and its part of the claim (claimed_native_rs), so a figure can be "
+        "re-run. The savings are measured against a replay of the inverter's own settings on the same day's sun, load and outages (Method above)."
+        if money else " The energy figures are as measured."))
 
 
 def _prelim_and_stale(doc: _Doc, summ: dict, over: bool, money: bool) -> bool:
@@ -674,9 +696,11 @@ def _monthly(doc: _Doc, site: dict, kind: str, p0: date, p1: date, today: date, 
         doc.p("The headline against both baselines: the inverter's own settings as captured (native) and the best static table of its brand (tuned).")
         doc.table([["Headline", "Against the native settings", "Against a tuned table"],
                    ["Saving, all days", rs(nat.get("saving_rs")), rs(tun.get("saving_rs"))],
-                   ["Claimed (verified days only)", rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))],
+                   [CLAIMED_ROW, rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))],
                    [f"{fuel} saved (Estimated)", _litres_saved(nat, scored, has_genset, unit), _litres_saved(tun, scored, has_genset, unit)],
-                   ["Verified days", str(nat.get("verified_days", 0)), str(tun.get("verified_days", 0))]], [95 * mm, 42 * mm, 42 * mm])
+                   ["Days that claim (plan followed in full or in part)", str(nat.get("claiming_days", 0)), str(tun.get("claiming_days", 0))],
+                   ["Verified days (plan followed in full)", str(nat.get("verified_days", 0)), str(tun.get("verified_days", 0))]],
+                  [95 * mm, 42 * mm, 42 * mm])
         unmetered = max(int(nat.get("genset_unknown_days") or 0), int(tun.get("genset_unknown_days") or 0))
         if has_genset and 0 < unmetered:
             doc.p(f"The genset's fuel was not metered on {unmetered} of {scored} days: those days add nothing to the fuel saved or the genset lever.")
@@ -771,18 +795,14 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
               [45 * mm, 23 * mm, 23 * mm, 23 * mm, 22 * mm, 15 * mm, 29 * mm])
     doc.gap()
     doc.p("Each site is measured against a replay of its own inverter settings (native) and the best static table of its brand (tuned), on the same "
-          "day's sun, load and outages; the claimed figure counts the verified days only. The totals add the sites' figures as each site's report "
-          "states them.")
+          "day's sun, load and outages; the claimed figure counts the days whose plan was followed in full or in part, and a verified day is one "
+          "whose plan was followed in full. The totals add the sites' figures as each site's report states them.")
     return prelim
 
 
 #: The pilot's pre-registered gates in words (the Pilot page's criteria-tab.tsx), with how each reads
 TIER_WORDS = {"monitor": "monitor (the plan only recommends)", "advisory_writes": "advisory (a person applies each day's table)",
               "closed_loop": "closed loop (the edge writes the table)"}
-
-
-def _reading(ok: bool | None) -> str:
-    return "not measured yet" if ok is None else ("meets it" if ok else "falls short")
 
 
 def verified_bound(days: list[dict]) -> tuple[float | None, int]:
@@ -798,6 +818,62 @@ def verified_bound(days: list[dict]) -> tuple[float | None, int]:
     return (mean - float(stats.t.ppf(0.8, len(xs) - 1)) * sd / math.sqrt(len(xs))) * 30, len(xs)
 
 
+#: The pilot's gates in words (gonogo.scorecard's ids), as the Pilot page's go/no-go names them
+GATE_WORDS = {"saving": "Saving at least (of the native arm's cost, on the days that claim)",
+              "unserved": "Unserved critical energy at most (caused by the plan)",
+              "reserve": "Reserve adequacy at least (outages entered at or above the planned reserve)",
+              "fidelity": "Plan fidelity at least (plan days confirmed applied)",
+              "fee_multiple": "Verified saving at least (times the fee)",
+              "forecast_pv": "Solar forecast error at most (nRMSE)",
+              "genset_hours": "Genset run hours cut at least (against the tuned rule, on the days that claim)",
+              "cycles": "Battery cycles a day at most (times the tuned baseline's)",
+              "agreement": "Counterfactual and switchback agree (within 15 % of the switchback saving or Rs 300 a day)",
+              "whitelist": "Writes the edge refused as off its whitelist",
+              "statistic": "Lower 80 % bound of the daily verified saving over the tuned table, times 30"}
+READING = {"met": "meets it", "not_met": "falls short", "not_yet": "not measured yet", "not_applicable": "does not apply here"}
+VERDICT_WORDS = {"not_yet": "Verdict: not yet. Plan 15.3 reads the statistic once 8 weeks of switchback have run and the fee is set.",
+                 "go": "Verdict: go. The statistic is at least 3 times the fee and every gate measured is met.",
+                 "review": "Verdict: review. The statistic is at least 3 times the fee, but a gate is not met.",
+                 "extend": "Verdict: extend once, by 4 weeks. The statistic is between 1.5 and 3 times the fee.",
+                 "stop": "Verdict: stop. The statistic is under 1.5 times the fee after 8 weeks of switchback."}
+SO_FAR_WORDS = {"success": "at least 3 times the fee", "extend": "between 1.5 and 3 times the fee", "stop": "under 1.5 times the fee"}
+
+
+def _gate_row(g: dict, c: dict) -> list[str]:
+    """One gate of gonogo.scorecard as the write-up's row: what it asks, the pre-registered value, the result and the reading."""
+    gid, r, st = g["id"], g.get("result"), g["status"]
+    if gid == "saving":
+        cells = [_pct(c["min_saving_pct"], 1), _pct(r)]
+    elif gid == "unserved":
+        cells = [smart(c["max_unserved_kwh"], " kWh"), smart(r, " kWh")]
+    elif gid == "reserve":
+        cells = [_pct(c["reserve_adequacy_pct"], 0), _pct(r, 0) + (f" of {_plural(g['outages'], 'outage')}" if r is not None and g.get("outages") else "")]
+    elif gid == "fidelity":
+        cells = [_pct(c["fidelity_pct"], 0), _pct(r, 0)]
+    elif gid == "fee_multiple":
+        cells = [f"{c['fee_multiple']:g} times the fee", "no fee set" if not g.get("fee_set") else ("-" if r is None else f"{r:.1f} times the fee")]
+    elif gid == "forecast_pv":
+        cells = [_pct(c["forecast_pv_nrmse_max"] * 100, 0) + " of capacity", _pct(None if r is None else r * 100)]
+    elif gid == "genset_hours":
+        cells = [_pct(c["genset_hours_cut_pct"], 0), "-" if r is None else f"{_pct(r)} ({smart(g.get('hours_actual'), ' h')} against "
+                                                                           f"{smart(g.get('hours_tuned'), ' h')})"]
+    elif gid == "cycles":
+        cells = [f"{c['cycles_ratio_max']:g} times", "-" if r is None else f"{r:.2f} times"]
+    elif gid == "agreement":
+        cells = ["within the tolerance", "-" if r is None else ("they agree" if r else "they disagree: a finding to look into")]
+    elif gid == "whitelist":
+        cells = ["none", "-" if r is None else str(r)]
+    else:  # the decision statistic
+        bound = g.get("bound_rs_per_month")
+        cells = ["at least 3 times the fee to succeed; under 1.5 times the fee after 8 weeks stops the pilot",
+                 f"needs two verified days ({g.get('verified_days') or 0} so far)" if bound is None else
+                 (f"{rs(bound)} a month; no fee set to compare with" if not g.get("fee_set") else f"{rs(bound)} a month, {r:.1f} times the fee")]
+        reading = ("not measured yet" if r is None else "meets the success gate" if r >= 3 else
+                   "below the stop gate" if r < g.get("stop_below", 1.5) else "between the gates: extend once by 4 weeks")
+        return [GATE_WORDS[gid], *cells, reading]
+    return [GATE_WORDS.get(gid, gid), *cells, READING.get(st, st)]
+
+
 def _pilot(doc: _Doc, site: dict, p0: date, p1: date, today: date, inputs: dict) -> tuple[bool, date]:
     """Plan 8.5's pilot write-up: the pre-registered criteria (the Pilot page's, stored when it started) filled in with the results from the pilot's
     start to the end of the chosen month, the switchback table, forecast accuracy and control health. Below the advisory tier it is a
@@ -807,7 +883,6 @@ def _pilot(doc: _Doc, site: dict, p0: date, p1: date, today: date, inputs: dict)
     with store.connect() as con:
         r = con.execute("SELECT data, started FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
     pilot = json.loads(r["data"]) if r else dict(PILOT_DEFAULT)
-    criteria = {**PILOT_DEFAULT["criteria"], **(pilot.get("criteria") or {})}
     blocks = verify.switchback_blocks(site_id)
     start = p0
     try:
@@ -837,47 +912,16 @@ def _pilot(doc: _Doc, site: dict, p0: date, p1: date, today: date, inputs: dict)
         else ""))
     doc.gap()
     doc.h2("Pre-registered criteria against the results")
-    nat, tun = summ["baselines"].get("native", {}), summ["baselines"].get("tuned", {})
     days = summ.get("days") or []
-    cost = sum(_finite(d.get("native_cost_rs")) or 0.0 for d in days)
-    saving_pct = (_finite(nat.get("saving_rs")) or 0.0) / cost * 100 if cost > 0 else None
-    cover = outage_cover(site, start, end)
-    adequacy = (cover["entered_ok"] / cover["with_reserve"] * 100) if cover and cover["with_reserve"] else None
-    plan_days = sum(1 for d in days if d.get("fidelity") in ("confirmed", "partial", "not_applied", "pending"))
-    fidelity = sum(1 for d in days if d.get("fidelity") == "confirmed") / plan_days * 100 if plan_days else None
-    fee = summ.get("fee") or {}
-    fee_rs = _finite(fee.get("fee_rs_per_month")) or 0.0
-    multiple = (_finite(fee.get("verified_saving_rs_per_month")) or 0.0) / fee_rs if fee_rs > 0 else None
     fc = forecast_skill(site_id, start, end)
-    unserved = _finite(nat.get("unserved_kwh_actual"))
-    bound, n_verified = verified_bound(days)
-    c = criteria
-    rows = [["Criterion", "Pre-registered", "Result", "Reading"],
-            ["Saving at least (of the native arm's cost)", _pct(c["min_saving_pct"], 1), _pct(saving_pct),
-             _reading(None if saving_pct is None else saving_pct >= c["min_saving_pct"])],
-            ["Unserved critical energy at most", smart(c["max_unserved_kwh"], " kWh"), smart(unserved, " kWh"),
-             _reading(None if unserved is None or not days else unserved <= c["max_unserved_kwh"])],
-            ["Reserve adequacy at least (outages entered at or above the planned reserve)", _pct(c["reserve_adequacy_pct"], 0), _pct(adequacy, 0),
-             _reading(None if adequacy is None else adequacy >= c["reserve_adequacy_pct"])],
-            ["Plan fidelity at least (plan days confirmed applied)", _pct(c["fidelity_pct"], 0), _pct(fidelity, 0),
-             _reading(None if fidelity is None else fidelity >= c["fidelity_pct"])],
-            ["Verified saving at least (times the fee)", f"{c['fee_multiple']:g} times the fee",
-             "no fee set" if multiple is None else f"{multiple:.1f} times the fee ({rs(fee.get('verified_saving_rs_per_month'))} a month against "
-                                                    f"{rs(fee_rs)})", _reading(None if multiple is None else multiple >= c["fee_multiple"])],
-            ["Solar forecast error at most (nRMSE)", _pct(c["forecast_pv_nrmse_max"] * 100, 0) + " of capacity",
-             _pct(None if fc["pv_nrmse"] is None else fc["pv_nrmse"] * 100), _reading(None if fc["pv_nrmse"] is None else fc["pv_nrmse"] <=
-                                                                                     c["forecast_pv_nrmse_max"])]]
-    if bound is None:
-        stat, reading = f"needs two verified days ({n_verified} so far)", "not measured yet"
-    elif fee_rs <= 0:
-        stat, reading = f"{rs(bound)} a month; no fee set to compare with", "not measured yet"
-    else:
-        stat = f"{rs(bound)} a month, {bound / fee_rs:.1f} times the fee"
-        reading = "meets the success gate" if bound >= 3 * fee_rs else ("below the stop gate" if bound < 1.5 * fee_rs else
-                                                                         "between the gates: extend once by 4 weeks")
-    rows.append(["Lower 80 % bound of the daily verified saving over the tuned table, times 30",
-                 "at least 3 times the fee to succeed; under 1.5 times the fee after 8 weeks stops the pilot", stat, reading])
+    # round 7 (audit pages-D-12): the gates as the Pilot page reads them (gonogo.scorecard, one reading for the page and the write-up), plan 15.3's
+    # genset, cycling, agreement and whitelist gates with them
+    from . import gonogo
+    card = gonogo.scorecard(site_id, today, start=start, end=end)
+    rows = [["Criterion", "Pre-registered", "Result", "Reading"]] + [_gate_row(g, card["criteria"]) for g in card["gates"]]
     doc.table([[doc.cell(x) for x in row] for row in rows], [62 * mm, 45 * mm, 45 * mm, 28 * mm], right=False)
+    doc.p(VERDICT_WORDS.get(card.get("verdict") or "", "") + (
+        f" So far the statistic reads: {SO_FAR_WORDS[card['so_far']]}." if card.get("verdict") == "not_yet" and card.get("so_far") else ""))
     doc.p("A gate marked “not measured yet” has no figure in the period. The figures run from the pilot's start to the end of the month "
           "chosen; Preliminary marks carry through.")
     doc.gap()
@@ -974,11 +1018,27 @@ def data_since(site_id: str | None) -> date | None:
     return min(days) if days else None
 
 
+#: The days of data a site needs before its monthly savings report is made (R8 2.14: "Fewer than 7 days of data: Generate offers only the Daily
+#: operations sheet"), counted from its first reading as the fleet's `collecting_day` counts them, the web dialog's rule (round 7, alerts-reports
+#: review: only the dialog kept to it)
+REPORT_DAYS_NEEDED = 7
+
+
+def days_of_data(site_id: str, now: float | None = None) -> float:
+    """The days since a site's first reading (0 with none)."""
+    first = telemetry.first_ts(site_id)
+    return 0.0 if first is None else max(0.0, ((now if now is not None else datetime.now(timezone.utc).timestamp()) - int(first)) / 86400)
+
+
 def check_period(kind: str, site_id: str | None, period: str, today: date) -> tuple[date, date]:
     """What POST /api/reports accepts: period_bounds, and a period that does not end before the site's data starts (data_since; the company's for a
-    company kind, this month for a company with no sites), so '1999-01' is refused, not kept as an empty report. Raises ValueError with the sentence."""
+    company kind, this month for a company with no sites), so '1999-01' is refused, not kept as an empty report; and a monthly savings report only
+    of a site with REPORT_DAYS_NEEDED days of data. Raises ValueError with the sentence."""
     p0, p1 = period_bounds(kind, period, today)
     site = sites.get(site_id) if site_id else None
+    if kind == "monthly_savings" and site and days_of_data(site_id) < REPORT_DAYS_NEEDED:
+        raise ValueError(f"{site['name']} has fewer than {REPORT_DAYS_NEEDED} days of data: its monthly savings report can be generated once it has "
+                         "a week of data, and the daily operations sheet now")
     since = min(data_since(site_id or None) or today, today)
     if p1 < since:
         who = site["name"] if site else "The company"
@@ -1257,12 +1317,60 @@ def _site_of(site_id: str, names: dict[str, dict]) -> dict:
     return {"site_name": s.get("name", ""), "site_removed": bool(s.get("removed"))}
 
 
+#: The kinds whose figures are the savings days': a copy made before a day of its period was restated (a closed month's claim re-scored, verify's
+#: `restated[].at`) shows the old figures (round 7, the reports' half of audit pr-review-02)
+SAVINGS_KINDS = ("monthly_savings", "company_rollup", "pilot")
+
+
+def _restated_after(rows: list) -> dict[str, list[str]]:
+    """Per report row of a savings kind: the days of its period ("YYYY-MM-DD") whose claim was restated after it was generated, oldest first (the
+    pilot report's period runs from the pilot's start, so its days are every day to the month's end). The restated days are read once per site and
+    period."""
+    seen: dict[tuple[str, str, str], list[tuple[str, list[str]]]] = {}
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        if r["kind"] not in SAVINGS_KINDS:
+            continue
+        try:
+            p0, p1 = _period(str(r["period"]))
+            made = datetime.fromisoformat(str(r["generated_at"]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if r["kind"] == "pilot":
+            p0 = date(2000, 1, 1)
+        key = (str(r["site_id"] or ""), p0.isoformat(), p1.isoformat())
+        if key not in seen:
+            where, args = ("site_id = ? AND ", (key[0],)) if key[0] else ("", ())
+            with store.connect() as con:
+                hits = con.execute(f"SELECT day_local, data FROM savings_days WHERE {where}day_local >= ? AND day_local <= ? AND data LIKE ?",
+                                   (*args, key[1], key[2], '%"restated"%')).fetchall()
+            seen[key] = [(h["day_local"], [str(x.get("at") or "") for x in (json.loads(h["data"]).get("restated") or []) if isinstance(x, dict)])
+                         for h in hits]
+        days = set()
+        for day, ats in seen[key]:
+            for at in ats:
+                try:
+                    if datetime.fromisoformat(at) > made:
+                        days.add(day)
+                except ValueError:
+                    continue
+        out[r["id"]] = sorted(days)
+    return out
+
+
+def _with_restated(rows: list) -> list[dict]:
+    """The rows as the API answers them (_row_out), each with `out_of_date` (a day of its period was restated after it was made: generate it again)
+    and `restated_days` (those days)."""
+    after = _restated_after(rows)
+    return [{**_row_out(r), "out_of_date": bool(after.get(r["id"])), "restated_days": after.get(r["id"], [])} for r in rows]
+
+
 def listing(site_id: str | None = None) -> list[dict]:
     with store.connect() as con:
         rows = con.execute("SELECT * FROM reports" + (" WHERE site_id = ?" if site_id else "") + " ORDER BY generated_at DESC, rowid DESC LIMIT 200",
                            ((site_id,) if site_id else ())).fetchall()
     names = sites.names()
-    return [{**_row_out(r), **_site_of(r["site_id"], names)} for r in rows]
+    return [{**d, **_site_of(r["site_id"], names)} for r, d in zip(rows, _with_restated(rows))]
 
 
 def get(rid: str) -> dict | None:
@@ -1271,7 +1379,7 @@ def get(rid: str) -> dict | None:
         r = con.execute("SELECT * FROM reports WHERE id = ?", (rid,)).fetchone()
     if r is None:
         return None
-    return {**_row_out(r), **_site_of(r["site_id"], sites.names() if r["site_id"] else {})}
+    return {**_with_restated([r])[0], **_site_of(r["site_id"], sites.names() if r["site_id"] else {})}
 
 
 def file_path(rid: str, which: str) -> Path | None:

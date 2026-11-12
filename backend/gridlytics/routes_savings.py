@@ -1,14 +1,20 @@
 """Savings (UI-12), the pilot set-up (UI-13), switchback, bills and the fee check; the fleet roll-up."""
 from __future__ import annotations
 
+import contextvars
 import copy
+import csv
+import io
 import json
+import os
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Response
 from fastapi.responses import PlainTextResponse
 
-from . import auth, forecast, sites, store, telemetry, verify
+from . import auth, forecast, gonogo, jobs, savings_export, sites, store, tariffs, telemetry, verify
 from .routes_common import bad, full_or_404, out, parse_day, site_or_404, today
 from .schemas import PilotEdit, PilotStart, Refusal, SwitchbackPaint, check
 
@@ -27,10 +33,20 @@ def savings(site_id: str, start: str | None = None, end: str | None = None):
                                                                                   "genset_hours", "throughput_kwh", "unserved_kwh")}
     summ["energy"]["outage_hours"] = round(sum((d.get("outage_minutes") or 0) for d in tdays) / 60, 1)
     summ["energy"]["peak_kw"] = max([d.get("peak_kw") or 0 for d in tdays] or [0])
-    if forecast.off_grid(sites.full(site_id) or {}):
+    off_grid = forecast.off_grid(sites.full(site_id) or {})
+    if off_grid:
         # a site without a grid has no outage and no grid demand: its grid reads 0 on every minute, which the day rows count a day-long outage (round 7
         # sweeps, audit role-operator-10: "Outage time 199 h" and "Peak import 0.0 kW" at the farm), so both are null, never the whole period
         summ["energy"].update(outage_hours=None, peak_kw=None)
+    # each day's outage hours (energy, not money), so the page can say which losing days had no outage: such a day pays for holding the outage
+    # reserve, which the outage days repay (round 7, audit flow-savings-pilot-bill-17); null where the day has no telemetry row, and on every day of
+    # an off-grid site, which has no outage (sweeps' rule above)
+    outages = {} if off_grid else {d["day"]: round((d.get("outage_minutes") or 0) / 60, 1) for d in tdays}
+    for d in summ["days"]:
+        d["outage_hours"] = outages.get(d["day"])
+    # the baseline the page is priced against: the native captures its days were replayed on (round 7, audit flow-savings-pilot-bill-19)
+    summ["native_captures"] = _native_captures(site_id, summ["days"], d1)
+    summ["native_latest_version"] = (sites.native_latest(site_id) or {}).get("version")
     # the genset's litres as the actual arm reads them (metered, else the fitted curve) and where they came from, so the page can mark curve litres
     # "Estimated"; the day rows hold metered litres only, a blank reading summed as 0. Over a range of more than about two months the minutes the
     # genset ran with neither its power nor its fuel read are not replayed: such a range says its litres are "not_counted" (null), never the day rows'
@@ -52,8 +68,126 @@ def savings(site_id: str, start: str | None = None, end: str | None = None):
     return out(summ)
 
 
+def _native_captures(site_id: str, days: list[dict], d1: date) -> list[dict]:
+    """Each native capture the period's days were replayed on (the version each scored day stores), with its settings (work mode, backup state of
+    charge, grid charging, slots), who recorded it, how and when, and the first and last day and the number of days it priced, oldest first. A
+    period whose days carry no version (rows stored before round 7) names the capture in force at its end, with no days. Settings, not money: every
+    role reads them, as on Devices and data (round 7, audit flow-savings-pilot-bill-19)."""
+    by_version: dict[int, list[str]] = {}
+    for d in days:
+        v = d.get("native_capture_version")
+        if isinstance(v, int) and not isinstance(v, bool):
+            by_version.setdefault(v, []).append(d["day"])
+    out = []
+    if by_version:
+        with store.connect() as con:
+            rows = {r["version"]: r for r in con.execute(
+                f"SELECT version, captured_at, by, source, body, photo IS NOT NULL AND photo != '' AS has_photo FROM native_settings "
+                f"WHERE site_id = ? AND version IN ({','.join('?' * len(by_version))})", (site_id, *by_version))}
+        for v in sorted(by_version):
+            r = rows.get(v)
+            if r is None:
+                continue
+            ds = sorted(by_version[v])
+            out.append({"version": v, "captured_at": r["captured_at"], "by": r["by"], "source": r["source"], "body": json.loads(r["body"]),
+                        "has_photo": bool(r["has_photo"]), "first_day": ds[0], "last_day": ds[-1], "days": len(ds)})
+        return out
+    cap = verify.native_for_day(site_id, d1)
+    if cap is not None:
+        out.append({**{k: cap.get(k) for k in ("version", "captured_at", "by", "source", "body", "has_photo")}, "first_day": None, "last_day": None,
+                    "days": None})
+    return out
+
+
+@router.get("/api/sites/{site_id}/savings/periods")
+def savings_periods(site_id: str):
+    """The Savings page's periods only the server can date (R8 2.12: "day, month, billing period, pilot window"; round 7, audit pages-D-23): the
+    billing period today falls in (from the day after the last meter reading to today, with the reading that will close it) and the last whole one,
+    each with its bill's month, from the first grid connection's reading day as the ledger's MDI months are (tariffs.billing_period_for: the
+    calendar month without one), none at an off-grid site or one with no connection saved; and the pilot window, from the start's Pakistan day to
+    the switchback calendar's last day (today at the latest), none before the pilot starts. No money: every role reads it."""
+    site_or_404(site_id)
+    t = today()
+    conns = sites.connections(site_id)
+    conn = conns[0] if conns and conns[0]["data"].get("regime") != "off_grid" else None
+    billing = last = None
+    if conn is not None:
+        a, reading = tariffs.billing_period_for(conn, t)
+        pa, pb = tariffs.billing_period_for(conn, a - timedelta(days=1))
+        billing = {"start": a.isoformat(), "end": t.isoformat(), "reading": reading.isoformat(), "month": tariffs.billing_month_for(conn, t),
+                   "reading_day": tariffs._reading_day(conn)}
+        last = {"start": pa.isoformat(), "end": pb.isoformat(), "month": tariffs.billing_month_for(conn, pb)}
+    pilot = None
+    with store.connect() as con:
+        r = con.execute("SELECT started FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
+    if r is not None and r["started"]:
+        start = verify.local_day(r["started"])
+        blocks = verify.switchback_blocks(site_id)
+        cal_end = max((date.fromisoformat(b["block_end"]) for b in blocks), default=None)
+        end = min(t, cal_end) if cal_end else t
+        pilot = {"start": start.isoformat(), "end": max(start, end).isoformat(), "calendar_end": cal_end.isoformat() if cal_end else None}
+    return {"billing": billing, "last_billing": last, "pilot": pilot}
+
+
+#: How long POST /savings/recompute waits for its job before it answers 202 with the job to read (round 7, audit pr-review-05 with tests-and-perf-11):
+#: a few days recompute within it; a month of replays and bound solves, with the later days the walk re-scores, runs on as a job
+RECOMPUTE_WAIT_S = 10.0
+#: The CPU niceness the recompute runs at where the system has one (Linux, macOS): the scheduler's ticks, whose solves are limited by the wall
+#: clock (HANDOFF 8.A.3), take the processor before it
+RECOMPUTE_NICE = 10
+#: The recompute of each site waiting or running, by (company file, site id): one at a time per site
+_recomputes: dict[tuple[str, str], tuple[jobs.Job, date, date]] = {}
+_recomputes_lock = threading.Lock()
+
+
+def _owner() -> str:
+    """Whose job a recompute is: the signed-in person's id (their name where there is none)."""
+    return str((auth.current.get() or {}).get("id") or auth.actor())
+
+
+def _low_priority(fn):
+    """fn() in a thread of its own at RECOMPUTE_NICE (a Linux thread has its own nice value; a pool worker keeps its own for the next job), in the
+    caller's context (its company), its answer or its exception passed back."""
+    got: dict = {}
+
+    def body() -> None:
+        if hasattr(os, "setpriority") and hasattr(threading, "get_native_id"):
+            try:
+                os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), RECOMPUTE_NICE)
+            except OSError:  # not allowed here: it runs at the pool's own priority
+                pass
+        try:
+            got["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001  (raised again in the job's thread, which reports it)
+            got["error"] = exc
+    t = threading.Thread(target=contextvars.copy_context().run, args=(body,), name="gridlytics-recompute", daemon=True)
+    t.start()
+    t.join()
+    if "error" in got:
+        raise got["error"]
+    return got["value"]
+
+
+def _recompute_answer(job: jobs.Job, d0: date, d1: date) -> dict:
+    """A recompute job's answer: once done, what it did (`days`, `rescored_days`, `restated_days`) with `status` done; while it waits or runs,
+    `{status: queued | running, done, total}` (days of the range scored so far); failed, `{status: failed, error}`. Each with `job_id`, `start`
+    and `end`."""
+    base = {"job_id": job.id, "start": d0.isoformat(), "end": d1.isoformat()}
+    if job.state == "done" and job.result is not None:
+        return {**job.result, "status": "done", **base}
+    if job.state in jobs.ACTIVE:
+        return {"status": job.state, "done": job.done, "total": job.total, **base}
+    error = job.error if job.error and job.error != jobs.FAILED else "The recompute could not be completed; the server's log has the cause"
+    return {"status": "failed", "error": error, **base}
+
+
 @router.post("/api/sites/{site_id}/savings/recompute")
-def recompute(site_id: str, inp: dict = Body(default={})):
+def recompute(site_id: str, response: Response, inp: dict = Body(default={})):
+    """Score the period's finished days again (run_jobs; at most 62 days), then the later days whose chain they moved. It runs as a job (jobs.py), one
+    at a time per site, in a thread of lower priority than the scheduler's ticks (round 7, audit pr-review-05 and tests-and-perf-11: up to 62 days of
+    replays and bound solves, and as many later days, ran inside the request). The answer is the job's outcome when it ends within RECOMPUTE_WAIT_S,
+    else 202 with `{status: queued | running, job_id, done, total}`, read at GET /sites/:id/savings/recompute/:job_id. A second recompute of the site
+    while one runs is refused (409), unless it is the same person's same period, which answers that job."""
     auth.need("run_jobs", "Recomputing savings")
     site_or_404(site_id)
     t = today()
@@ -61,23 +195,91 @@ def recompute(site_id: str, inp: dict = Body(default={})):
     d1 = parse_day(inp.get("end"), t - timedelta(days=1))
     if (d1 - d0).days > 62:
         raise Refusal(422, "Recompute at most 62 days at a time", "invalid")
-    # round 7 (audit pr-review-02): the later days the forward walk re-scored, and those whose claim changed in a closed month, beside the count
-    return verify.compute_range_detail(site_id, d0, d1, by=auth.actor())
+    who, owner, place = auth.actor(), _owner(), (str(store.db_path()), site_id)
+
+    def run(progress, stopped) -> dict:
+        # round 7 (audit pr-review-02): the later days the forward walk re-scored, and those whose claim changed in a closed month, beside the count
+        done = _low_priority(lambda: verify.compute_range_detail(site_id, d0, d1, by=who, progress=progress))
+        if not done["days"] and not done["rescored_days"]:
+            # a recompute that scored no day (no data in the range) writes no line of its own: the request is audited all the same (round 7, audit
+            # security-roles-04)
+            store.audit(who, verify.RECOMPUTED, site_id, {"start": d0.isoformat(), "end": d1.isoformat(), "days": []})
+        return done
+    with _recomputes_lock:
+        running = _recomputes.get(place)
+        if running is not None and running[0].state in jobs.ACTIVE:
+            job, r0, r1 = running
+            if job.owner != owner or (r0, r1) != (d0, d1):
+                raise Refusal(409, f"A recompute of this site from {r0:%d %b %Y} to {r1:%d %b %Y} is running; try again when it ends", "busy")
+        else:
+            try:
+                job = jobs.start("recompute", site_id, owner, f"recompute:{site_id}:{d0}:{d1}:{time.time_ns()}", run,
+                                 expected=max((d1 - d0).days + 1, 0), cache=False, abandon=False)
+            except jobs.Refused as exc:
+                raise Refusal(429, str(exc), "rate_limited") from None
+            _recomputes[place] = (job, d0, d1)
+    job = jobs.wait(job, RECOMPUTE_WAIT_S)
+    if job.state in jobs.ACTIVE:
+        response.status_code = 202
+    return _recompute_answer(job, d0, d1)
+
+
+@router.get("/api/sites/{site_id}/savings/recompute/{job_id}")
+def recompute_job(site_id: str, job_id: str):
+    """A recompute of the caller's (POST /savings/recompute): `{status: queued | running, done, total}` while it runs, then its outcome. Another
+    person's, another site's or one forgotten (an hour after it ended, or after a restart) is a 404."""
+    auth.need("run_jobs", "Recomputing savings")
+    site_or_404(site_id)
+    job = jobs.get(job_id, site_id, _owner())
+    place = _recomputes.get((str(store.db_path()), site_id))
+    if job is None or job.kind != "recompute":
+        raise Refusal(404, "No such recompute: it ended over an hour ago, or the server restarted since", "not_found")
+    d0, d1 = (place[1], place[2]) if place and place[0] is job else (None, None)
+    ans = _recompute_answer(job, d0 or date.min, d1 or date.min)
+    if d0 is None:
+        ans.update(start=None, end=None)
+    return ans
+
+
+@router.get("/api/sites/{site_id}/savings/kpis")
+def savings_kpis(site_id: str, start: str | None = None, end: str | None = None):
+    """Plan Part 8.3's measures the money figures leave out, over the Savings page's period (round 7, audit brief-vs-build-13): reserve adequacy, the
+    constraint violations (the minutes read over at most gonogo.VIOLATION_DAYS_MAX days), control health, the genset's run hours and starts and the
+    battery's cycles on each arm, and the BMS trust score (gonogo.measures). No money: every role reads them."""
+    site_or_404(site_id)
+    t = today()
+    d0, d1 = parse_day(start, t.replace(day=1)), parse_day(end, t)
+    if d1 < d0:
+        raise Refusal(422, "The period's last day must be on or after its first", "invalid")
+    return out(gonogo.measures(site_id, d0, d1))
+
+
+#: The savings CSV's own columns, as before round 7; the claim columns (savings_export.CLAIM_COLUMNS) follow them
+CSV_COLUMNS = ("day", "saving_native_rs", "saving_tuned_rs", "fidelity", "actual_cost_rs", "native_cost_rs", "litres_actual", "litres_native", "peak_kw",
+               "peak_import_kwh")
 
 
 @router.get("/api/sites/{site_id}/savings/export.csv")
 def savings_csv(site_id: str, start: str | None = None, end: str | None = None):
+    """The period's days as CSV (export: administrator, analyst): each day's saving, costs, litres and peak, then whether it claims and its part of the
+    page's claim, the reason it claims nothing, its levers and MDI share, the native settings' peak, its tariff and capture versions and the plans in
+    force over its Pakistan day (savings_export; round 7, audit pages-D-06: the rows summed to a figure the page never showed, and a dispute could
+    not be re-run from them)."""
     auth.need("export", "Exporting savings")
     site_or_404(site_id)
     t = today()
     d0, d1 = parse_day(start, t.replace(day=1)).isoformat(), parse_day(end, t).isoformat()
     summ = verify.summary(site_id, d0, d1)
-    lines = ["day,saving_native_rs,saving_tuned_rs,fidelity,actual_cost_rs,native_cost_rs,litres_actual,litres_native,peak_kw,peak_import_kwh"]
+    dates = savings_export.tariff_dates(summ["days"])
+    ids = savings_export.plan_ids(site_id, d0, d1) if summ["days"] else {}
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow([*CSV_COLUMNS, "claim_withheld", *savings_export.CLAIM_COLUMNS, "plan_ids"])
     for d in summ["days"]:
-        lines.append(",".join("" if d.get(k) is None else str(d[k]) for k in ("day", "saving_native_rs", "saving_tuned_rs", "fidelity", "actual_cost_rs",
-                                                                               "native_cost_rs", "litres_actual", "litres_native", "peak_kw", "peak_import_kwh")))
+        w.writerow([savings_export.cell(d.get(k)) for k in CSV_COLUMNS] + [savings_export.cell(savings_export.withheld(d))]
+                   + savings_export.claim_cells(d, dates) + [";".join(ids.get(d["day"], []))])
     store.audit(auth.actor(), "exported savings", site_id, {"start": d0, "end": d1})
-    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{site_id}-savings.csv"'})
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{site_id}-savings.csv"'})
 
 
 @router.get("/api/sites/{site_id}/switchback")
@@ -163,15 +365,21 @@ def fee_put(site_id: str, inp: dict = Body(...)):
             raise ValueError("The fee cannot be negative")
     except (TypeError, ValueError) as exc:
         raise bad(exc) from None
+    held = store.get_setting(f"fee:{site_id}", None)
     store.set_setting(f"fee:{site_id}", fee)
-    store.audit(auth.actor(), "set the fee", site_id, {"fee_rs_per_month": fee})
+    # the fee before and after (round 7, audit security-roles-04: a money setting's line says what it was)
+    store.audit(auth.actor(), "set the fee", site_id, {"fee_rs_per_month": fee, "changes": store.changes(
+        {"fee_rs_per_month": None if held is None else float(held)}, {"fee_rs_per_month": fee})})
     return {"fee_rs_per_month": fee}
 
 
 # ------------------------------------------------------------------------------------------------ pilot (UI-13)
 
+#: the criteria tab D prefills (R8 2.13): plan 15.3's gates, the genset's run hours cut against the tuned rule and the cycles a day against the tuned
+#: baseline's among them (round 7, audit pages-D-12: they were missing; a set-up stored before reads them at these values)
 PILOT_DEFAULT = {"baseline_start": None, "baseline_days": 14, "criteria": {"min_saving_pct": 8.0, "max_unserved_kwh": 0.0, "reserve_adequacy_pct": 90.0,
-                                                                          "fidelity_pct": 80.0, "fee_multiple": 3.0, "forecast_pv_nrmse_max": 0.35},
+                                                                          "fidelity_pct": 80.0, "fee_multiple": 3.0, "forecast_pv_nrmse_max": 0.35,
+                                                                          "genset_hours_cut_pct": 15.0, "cycles_ratio_max": 1.1},
                  "signoff": None, "amendments": [], "closures": []}
 
 
@@ -386,6 +594,16 @@ def _ics_fold(line: str) -> list[str]:
         cur += ch
         size += n
     return out + [cur]
+
+
+@router.get("/api/sites/{site_id}/pilot/scorecard")
+def pilot_scorecard(site_id: str):
+    """The pilot's pre-registered gates read against its results from its start (round 7, audit pages-D-12, brief-vs-build-02,
+    flow-savings-pilot-bill-13: the criteria were stored and never scored): each gate met, not met, not measured yet or not applying here, and plan
+    15.3's verdict once 8 weeks of switchback have run (gonogo.scorecard). A money gate's figures only to a role with costs, and a gate read against
+    the fee, with the verdict, only to a role that sees the fee (gonogo.for_reader)."""
+    site_or_404(site_id)
+    return out(gonogo.for_reader(gonogo.scorecard(site_id, today())))
 
 
 @router.get("/api/sites/{site_id}/pilot/calendar.ics")

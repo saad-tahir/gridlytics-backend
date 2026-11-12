@@ -580,7 +580,7 @@ def edge_caps(site_id: str, inp: dict = Depends(_edge_body)):
         # older message is kept for the record and sets nothing
         newer = con.execute("SELECT 1 FROM capabilities WHERE site_id = ? AND sent_ts > ? LIMIT 1", (site_id, sent)).fetchone()
     if newer is None:
-        sites.set_tier_capable(site_id, msg.control_tier)
+        sites.set_tier_capable(site_id, msg.control_tier, by="edge")
     return {"ack": msg.seq, "tier_capable": (sites.get(site_id) or {}).get("tier_capable", msg.control_tier)}
 
 

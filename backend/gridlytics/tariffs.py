@@ -565,10 +565,14 @@ def add_fuel_price(kind: str, valid_from: str, price: float, by: str) -> None:
         raise ValueError("A fuel price needs a kind (hsd, gas_captive, lng_captive) and a positive price")
     valid_from = _canonical_day(valid_from, "A fuel price's start")
     _seeded()
-    with store.connect() as con:
+    with store.write_transaction() as con:
+        held = con.execute("SELECT price FROM fuel_prices WHERE kind = ? AND valid_from = ?", (kind, valid_from)).fetchone()
         con.execute("INSERT INTO fuel_prices (kind, valid_from, price, source) VALUES (?,?,?,?) ON CONFLICT(kind, valid_from) DO UPDATE SET "
                     "price = excluded.price, source = excluded.source", (kind, valid_from, price, json.dumps({"kind": "manual", "ref": by, "verified": "primary"})))
-    store.audit(by, "set a fuel price", kind, {"valid_from": valid_from, "price": price})
+        # a day already priced: the price it had (round 7, audit security-roles-04)
+        store.audit(by, "set a fuel price", kind, {"valid_from": valid_from, "price": price,
+                                                   "changes": store.changes({"price": None if held is None else float(held["price"])}, {"price": price})},
+                    con=con)
 
 
 def fuel_prices(kind: str | None = None) -> list[dict]:
