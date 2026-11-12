@@ -28,7 +28,7 @@ DEFAULT_ORG = "default"
 _ORG: ContextVar[str] = ContextVar("gridlytics_org", default=DEFAULT_ORG)
 _DB: ContextVar[Path | None] = ContextVar("gridlytics_db", default=None)
 _ACTOR: ContextVar[dict | None] = ContextVar("gridlytics_actor", default=None)
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _lock = threading.Lock()
 
 
@@ -238,6 +238,11 @@ _V5_COLUMNS = (("reports", "generated_by", "TEXT NOT NULL DEFAULT ''"), ("alerts
                ("alerts", "assigned_id", "TEXT NOT NULL DEFAULT ''"))
 
 
+#: Version 6 (round 7 sweeps, audit parity-architecture-12): a report keeps the stamp of the engine that made it (version.stamp(); '' for a report made
+#: before). A plan's (summary), a savings day's (data) and a bill rebuild's (rebuilt) go in their JSON columns
+_V6_COLUMNS = (("reports", "engine", "TEXT NOT NULL DEFAULT ''"),)
+
+
 def _migrate(con: sqlite3.Connection, version: int) -> None:
     if version < 1:
         for sql in _V1:
@@ -254,6 +259,10 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
             con.execute(sql)
     if version < 5:
         for table, column, kind in _V5_COLUMNS:
+            if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    if version < 6:
+        for table, column, kind in _V6_COLUMNS:
             if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 

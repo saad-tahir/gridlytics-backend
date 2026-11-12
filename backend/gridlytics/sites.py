@@ -570,9 +570,27 @@ def set_tier_allowed(site_id: str, tier: str, by: str, signoff: str = "") -> dic
 
 
 def delete(site_id: str, by: str) -> None:
+    """Remove a site: its row is marked removed and kept, for the records that name it (its reports keep its name, `names`). What acts on it goes
+    with it (round 7, audit flow-reports-alerts-members-keys-14): its API keys are revoked (a key is bound to one site, and a removed site's key stayed
+    active, its requests answered 404) and its open alerts are resolved (nothing is left to act on them; they stayed in the inbox and its badge). The
+    audit line names the site and the keys revoked."""
+    from . import alerts, apikeys  # imported here: both import this module, or what imports it
     with store.connect() as con:
-        con.execute("UPDATE sites SET deleted = ? WHERE id = ?", (_now(), site_id))
-    store.audit(by, "removed a site", site_id)
+        r = con.execute("SELECT name FROM sites WHERE id = ? AND deleted IS NULL", (site_id,)).fetchone()
+        con.execute("UPDATE sites SET deleted = ? WHERE id = ? AND deleted IS NULL", (_now(), site_id))
+    if r is None:
+        return
+    revoked = apikeys.revoke_site(site_id, by)
+    alerts.site_removed(site_id)
+    store.audit(by, "removed a site", r["name"], {"site_id": site_id, "keys_revoked": [k["name"] for k in revoked]})
+
+
+def names() -> dict[str, dict]:
+    """Every site's name by id, a removed site's too, each {"name", "removed"}: for the records that outlive a site (a report names the site it was
+    made for, marked removed; round 7, audit flow-reports-alerts-members-keys-14)."""
+    with store.connect() as con:
+        rows = con.execute("SELECT id, name, deleted FROM sites").fetchall()
+    return {r["id"]: {"name": r["name"], "removed": r["deleted"] is not None} for r in rows}
 
 
 # ------------------------------------------------------------------------------------------------ connections and assets

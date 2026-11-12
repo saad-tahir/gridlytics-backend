@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 
-from . import forecast, optimise, plans, sites, solar, store, tariffs, telemetry, twin
+from . import forecast, optimise, plans, sites, solar, store, tariffs, telemetry, twin, version
 from .schemas import Refusal
 
 PKT = timezone(timedelta(hours=5))
@@ -291,12 +291,16 @@ def _actual_sim(f: dict, g: dict, plant: twin.Plant | None = None) -> dict:
             "unserved": f["unserved"], "soc": np.nan_to_num(_soc(g))}
 
 
-def litres_used(site_id: str, d0: str, d1: str) -> dict:
+def litres_used(site_id: str, d0: str, d1: str, simulate: bool = True) -> dict:
     """The genset's litres over the local days d0..d1 (YYYY-MM-DD, both included) as the actual arm reads them (plan 8.3: metered litres where a
     sensor exists, else the fitted fuel curve), and where they came from: `litres_source` is "meter" when the period has fuel readings and every
     running minute has one, "curve" when any running minute's litres come from the curve (the figure is then estimated, wholly or in part), and None
-    when there is nothing to name (no genset, no genset signal at all in the period, or neither a fuel reading nor a run)."""
-    out = {"litres": 0.0, "litres_source": None, "litres_metered": 0.0, "litres_curve": 0.0}
+    when there is nothing to name (no genset, no genset signal at all in the period, or neither a fuel reading nor a run).
+
+    A running minute with neither its power nor its fuel read takes its power from the site's balance, a minute-by-minute replay; with `simulate`
+    False (a long period, read for a label: round 7 sweeps, audit frontend-states-formats-02) no replay is run and `unread_minutes` counts such
+    minutes, whose litres are then left out of the figure."""
+    out = {"litres": 0.0, "litres_source": None, "litres_metered": 0.0, "litres_curve": 0.0, "unread_minutes": 0}
     site = sites.full(site_id)
     try:
         t0, t1 = twin.day_start_utc(date.fromisoformat(d0[:10])), twin.day_start_utc(date.fromisoformat(d1[:10])) + 86400
@@ -325,7 +329,10 @@ def litres_used(site_id: str, d0: str, d1: str) -> dict:
         from_curve_any = True
         powered = from_curve & ~np.isnan(p_meas)
         curve += float(np.sum((plant.gen_a * p_meas[powered] + plant.gen_b * plant.gen_kw) / 60.0))
-        if (from_curve & np.isnan(p_meas)).any():  # running with no power read: its power from the site's balance, as the actual arm takes it
+        unread = int((from_curve & np.isnan(p_meas)).sum())
+        if unread and not simulate:
+            out["unread_minutes"] += unread
+        elif unread:  # running with no power read: its power from the site's balance, as the actual arm takes it
             g = telemetry.minute_grid(site_id, a, b)
             sim = _actual_sim(telemetry.filled(g), g, plant)
             blind = np.asarray(sim["gen_on"], dtype=bool) & np.isnan(g["fuel"]) & np.isnan(g["gen"])
@@ -1493,6 +1500,10 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
         pf = _bound(site, day, series, pr, soc0, arms["actual"], e_end_actual, rows["native"]["saving_rs"], c_next=c_next, v_end=v_end)
         rows["native"]["perfect_foresight_rs"] = pf["bound_rs"]
         rows["native"]["perfect_foresight"] = pf
+    # the engine that computed the day, on each baseline's row (round 7, audit parity-architecture-12): a saving recomputed after a change of the code
+    # is told apart from one computed before it, and the reports print it
+    for data in rows.values():
+        data["engine"] = version.stamp()
     now = store._now()
     with store.connect() as con:
         for base, data in rows.items():
@@ -2306,6 +2317,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                             "mdi_provisional": not mdi_info[bill_month(day)]["closed"],
                             # scored while its billing month was open: its ICP case rests on projected month totals until the month is settled
                             "month_totals_projected": bool(n.get("month_totals_projected"))})
+    # the engine that computed each day (round 7, audit parity-architecture-12), as recorded with the day; null for a day stored before it was recorded
+    for entry in out["days"]:
+        entry["engine"] = (days[entry["day"]].get("native") or days[entry["day"]].get("tuned") or {}).get("engine")
     # round 7 (audit pr-review-02): the period's days whose claim was re-scored after their billing month closed, each with its latest change (a
     # report of that month made before `at` shows the old figures)
     out["restated_days"] = []
@@ -2755,7 +2769,9 @@ def _rechain(connection_id: str, after: date, carried: float) -> None:
             return  # unchanged, or a bill rebuilt before credits were carried (kept as entered)
         lines, total, nxt = tariffs.settle(rebuilt["lines"], rebuilt["charges_rs"], rebuilt["credits_rs"] - rebuilt.get("credit_before_tax_rs", 0.0),
                                            carried)
-        rebuilt.update(lines=lines, total_rs=round(total, 2), credit_brought_forward_rs=round(carried, 2), credit_carried_rs=round(nxt, 2))
+        # settled again by this engine (round 7, audit parity-architecture-12)
+        rebuilt.update(lines=lines, total_rs=round(total, 2), credit_brought_forward_rs=round(carried, 2), credit_carried_rs=round(nxt, 2),
+                       engine=version.stamp())
         diff = _difference(rebuilt, float(json.loads(r["real"]).get("total_rs") or 0.0))
         with store.connect() as con:
             con.execute("UPDATE bills SET rebuilt = ?, difference_pct = ? WHERE id = ?", (json.dumps(rebuilt), diff, r["id"]))
@@ -3023,6 +3039,7 @@ def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_excl
                           credit_brought_forward_rs=credit_brought_forward_rs)
     out["completeness"] = round(float(covered.mean()) if len(covered) else 0.0, 4)
     out["filled_kwh"] = {"import": round(filled_imp, 3), "export": round(filled_exp, 3)}
+    out["engine"] = version.stamp()  # the engine that rebuilt it (round 7, audit parity-architecture-12)
     return out
 
 

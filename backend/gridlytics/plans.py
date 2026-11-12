@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 
 from . import battery as battery_service
-from . import delivery, forecast, optimise, sites, solar, store, tariffs, telemetry, twin
+from . import delivery, forecast, optimise, sites, solar, store, tariffs, telemetry, twin, version
 
 PKT = timezone(timedelta(hours=5))
 H = 0.25
@@ -895,6 +895,8 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
     solved = res["status"] not in ("not_solved", "refused")
     summary["time_limits_24h"] = {"hours": 24.0, "plans": recent["plans"] + 1,
                                   "time_limited": recent["time_limited"] + int(solved and _plan_time_limited(summary))}
+    # the engine that made the plan, solved or failed (round 7, audit parity-architecture-12): a plan stored before a change of the code is told apart
+    summary["engine"] = version.stamp()
     if res["status"] in ("not_solved", "refused"):
         # a code the web app words, never the solver's own text (round 7, frontend-states-formats-07); the message stays in summary.solver
         reason = failure_code(res)

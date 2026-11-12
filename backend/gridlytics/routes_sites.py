@@ -189,7 +189,8 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
     # off-grid is the site's own fact, as tab C and POST /activate read it (_grid_settled): a connection of regime off_grid, or none at a farm or a
     # site whose data says off_grid. A grid site whose connection is not saved yet has no category yet (null), and its outages count (audit pages-A-03)
     off_grid = _off_grid(s, conn)
-    has_genset = "genset" in sites.assets(s["id"])
+    gen = sites.assets(s["id"]).get("genset")
+    has_genset = gen is not None
     mtd, computed, spark, energy = _mtd_saving(s["id"], grid=not off_grid, genset=has_genset)
     category = "Off-grid" if off_grid else conn["data"]["tariff_category"] if conn is not None else None
     control = control_state(s, last, now)
@@ -205,6 +206,9 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
             # recommendation, a table not confirmed today, a release, a pause or an offline edge), and a genset on site. control_state names a hold
             # before the tier, so the tier is read here too: a hold at the monitor tier reaches no inverter
             "on_plan": plan is not None and control["key"] in ON_PLAN and s["tier"] != "monitor", "has_genset": has_genset,
+            # the genset's fuel, whose unit mtd_litres_saved is in: litres of diesel, MMBtu of captive gas or RLNG (round 7 sweeps, audit
+            # frontend-states-formats-01); null without a genset
+            "fuel_kind": (gen.get("fuel_kind") or "hsd") if gen is not None else None,
             # handed back to the native settings: the row says so, so the web app counts a fleet's real sites by the summary's own rule (review)
             "on_native": control["key"] in HANDED_BACK}
 
@@ -219,11 +223,16 @@ def fleet():
     # the sum of the sites' figures; None while no site has a scored day this month, never Rs 0 (audit frontend-states-formats-14)
     figures = [r["mtd_saving_rs"] for r in rows if r["mtd_saving_rs"] is not None]
     total = lambda k: (round(sum(r[k] for r in rows if r[k] is not None), 1) if any(r[k] is not None for r in rows) else None)  # noqa: E731
+    # the fuel avoided in each unit apart: litres of diesel, MMBtu of captive gas or RLNG, never added together (round 7 sweeps, audit
+    # frontend-states-formats-01: the gas engine's MMBtu were summed into the litres of "diesel avoided")
+    fuel = lambda gas: [r["mtd_litres_saved"] for r in rows  # noqa: E731
+                        if r["mtd_litres_saved"] is not None and (r["fuel_kind"] in sites.GAS_FUELS) == gas]
+    by_unit = lambda gas: round(sum(fuel(gas)), 1) if fuel(gas) else None  # noqa: E731
     return out({"summary": {"sites": len(rows), "online": online, "alerts": c["total"], "critical": c["by_severity"].get("critical", 0),
                             "mtd_saving_rs": round(sum(figures), 0) if figures else None, "mtd_saving_rs_method": MTD_SAVING_METHOD,
                             "mtd_saving_rs_computed": max(stamps) if stamps else None,
                             "in_outage": sum(1 for r in rows if r["now"] and r["now"]["grid_present"] == 0 and r["category"] != "Off-grid"),
-                            "mtd_peak_kwh_avoided": total("mtd_peak_kwh_avoided"), "mtd_litres_saved": total("mtd_litres_saved"),
+                            "mtd_peak_kwh_avoided": total("mtd_peak_kwh_avoided"), "mtd_litres_saved": by_unit(False), "mtd_mmbtu_saved": by_unit(True),
                             "on_plan": sum(1 for r in rows if r["on_plan"]), "on_native": sum(1 for r in rows if r["on_native"])},
                 "sites": rows})
 
@@ -358,10 +367,13 @@ def site_activate(site_id: str):
         raise HTTPException(status_code=404, detail="No such site")
     missing = []
     src = (s.get("data") or {}).get("data_source") or {}
-    if not (isinstance(src, dict) and src.get("kind") in sites.DATA_SOURCE_KINDS and src.get("grid_signal_confirmed")):
+    # an off-grid site has no grid to report: its source needs no grid-presence signal (round 7 sweeps, a sites-onboarding review follow-up: the farm was
+    # asked to confirm one)
+    off_grid = _off_grid(s, (s.get("connections") or [None])[0])
+    if not (isinstance(src, dict) and src.get("kind") in sites.DATA_SOURCE_KINDS and (src.get("grid_signal_confirmed") or off_grid)):
         # plan 9.3 tab A: without a grid-presence signal outages cannot be seen and the reserve cannot be planned (audit flow-onboarding-08: a site with no
         # source, or an unconfirmed one, was activated and planned)
-        missing.append("the data source, with its grid-presence signal confirmed (tab A)")
+        missing.append("the data source (tab A)" if off_grid else "the data source, with its grid-presence signal confirmed (tab A)")
     elif sites.grid_connected(s) and sites.source_test(site_id)["grid_signal"] == "missing":
         # the source's test (plan 9.3: "refuses a source without a grid-present signal"; audit flow-onboarding-22): data arrived, and none of it says
         # whether the grid is up, whatever the tick says

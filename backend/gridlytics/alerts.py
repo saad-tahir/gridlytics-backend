@@ -42,6 +42,30 @@ def reader_categories() -> tuple[str, ...]:
     return tuple(c for c in CATEGORIES if c not in CATEGORY_NEEDS or auth.can(CATEGORY_NEEDS[c]))
 
 
+def notify_key(user_id: str) -> str:
+    """The company-file setting that holds a person's notification choices (routes_platform, My account; audit role-analyst-32)."""
+    return f"notify:{user_id}"
+
+
+def followed_categories() -> tuple[str, ...] | None:
+    """The kinds of alert the signed-in person follows (My account's notification choices: `follow` under `notify:<user_id>` in the company's file;
+    round 7 sweeps, the rest of role-analyst-32), or None where every kind is read: nobody signed in (the scheduler, a job, an API key), or a person
+    who has not chosen yet. The inbox and its badge count only these (`listing` and `counts` with `followed_only`)."""
+    me = auth.current.get()
+    if not me or me.get("api_key") or not me.get("id"):
+        return None
+    kept = store.get_setting(notify_key(me["id"]))
+    follow = kept.get("follow") if isinstance(kept, dict) else None
+    return tuple(c for c in CATEGORIES if c in follow) if isinstance(follow, list) else None
+
+
+def _categories(followed_only: bool) -> tuple[str, ...]:
+    """The categories read: the reader's role's (`reader_categories`), and with `followed_only` only those the person follows."""
+    cats = reader_categories()
+    follow = followed_categories() if followed_only else None
+    return cats if follow is None else tuple(c for c in cats if c in follow)
+
+
 #: The SQL that adds one event (`_event`) at the end of an alert's history (audit pages-D-28)
 _HISTORY = "history = json_insert(history, '$[#]', json(?))"
 
@@ -95,6 +119,15 @@ def _open(site_id: str, rule: str, category: str, severity: str, title: str, det
             return
         con.execute("INSERT INTO alerts (id, site_id, rule, category, severity, title, detail, opened_at) VALUES (?,?,?,?,?,?,?,?)",
                     (store.new_id(), site_id, rule, category, severity, title, json.dumps(detail), store._now()))
+
+
+def site_removed(site_id: str) -> None:
+    """Resolve the open and acknowledged alerts of a site being removed (sites.delete; round 7, audit flow-reports-alerts-members-keys-14): nothing is
+    left to act on them, and they stayed in the inbox and its badge. Each one's history says why."""
+    note = "The site was removed"
+    with store.connect() as con:
+        con.execute(f"UPDATE alerts SET state = 'resolved', closed_at = ?, note = ?, {_HISTORY} WHERE site_id = ? AND state IN ('open','acknowledged')",
+                    (store._now(), note, _event("resolved", note=note), site_id))
 
 
 #: An alert a person closed while its condition held, whose condition has not cleared since (`_held_back`): its last event is that close
@@ -360,7 +393,7 @@ def _forecast_stages(site_id: str, now: int) -> None:
 #: The tariff library's kinds in words, for the staleness rule's titles
 KIND_WORDS = {"schedule": "tariff schedule", "tou": "time-of-use calendar", "tax": "tax rules", "prosumer": "net billing or net metering rules",
               "icp": "incremental consumption package", "adder": "adjustment"}
-FUEL_WORDS = {"hsd": "diesel (HSD)", "gas_captive": "captive gas", "lng_captive": "captive LNG"}
+FUEL_WORDS = {"hsd": "diesel (HSD)", "gas_captive": "captive gas", "lng_captive": "captive RLNG"}  # as the pages name them (round 7 sweeps)
 #: From this day of the month an FCA or QTA for the month's bills is looked for: NEPRA notifies them during the month they are billed in
 ADDER_FROM_DAY = 15
 
@@ -624,10 +657,12 @@ def evaluate(site_id: str, now: int | None = None) -> None:
         # the demo mill's story (plan Part 9.6): its installer marks a day's table the next morning, so it stays raised until today's is marked
         with store.connect() as con:
             unconfirmed = con.execute("SELECT 1 FROM applied WHERE site_id = ? AND day_local = ?", (site_id, today)).fetchone() is None
-    # the title names the day (audit role-operator-31: "Today's slot table" was still read the next day)
+    # the title names the day (audit role-operator-31: "Today's slot table" was still read the next day), and says why in plain words (round 7
+    # sweeps, audit role-owner-37: "tier 2 has no read-back")
     day = datetime.fromtimestamp(now, PKT).date()
     _set(ready and unconfirmed, site_id, "apply_unconfirmed", "Control", "warning",
-         f"The slot table for {day:%A} {_long(day)} is not marked as applied: tier 2 has no read-back, so the saving is not claimed until it is",
+         f"The slot table for {day:%A} {_long(day)} is not marked as applied: at the advisory tier nothing reads the inverter's settings back, so "
+         "the day's saving is not claimed until the table is marked applied on the Control page",
          {"day": today})
     _agreements(site, now, rules_)
     _bill_residual(site_id, float(_th(rules_, "Tariff", "bill_difference_pct")))
@@ -793,9 +828,11 @@ def _in(cats: tuple[str, ...]) -> tuple[str, list]:
     return f" AND category IN ({','.join('?' * len(cats))})", list(cats)
 
 
-def listing(state: str | None = None, site_id: str | None = None, category: str | None = None, limit: int = 300) -> list[dict]:
-    """The inbox, most severe first: only the categories the reader receives (`reader_categories`)."""
-    cond, args = _in(reader_categories())
+def listing(state: str | None = None, site_id: str | None = None, category: str | None = None, limit: int = 300,
+            followed_only: bool = False) -> list[dict]:
+    """The inbox, most severe first: only the categories the reader receives (`reader_categories`), and with `followed_only` the kinds the person
+    follows (`followed_categories`)."""
+    cond, args = _in(_categories(followed_only))
     q = "SELECT * FROM alerts WHERE 1=1" + cond
     if state == "active":
         q += " AND state IN ('open','acknowledged')"
@@ -812,19 +849,22 @@ def listing(state: str | None = None, site_id: str | None = None, category: str 
     args.append(limit)
     with store.connect() as con:
         rows = con.execute(q, args).fetchall()
-    names = {s["id"]: s["name"] for s in sites.listing()}
-    return [_row(r, names.get(r["site_id"], "")) for r in rows]
+    names = sites.names()  # a removed site's alerts keep its name (round 7, audit flow-reports-alerts-members-keys-14)
+    return [_row(r, (names.get(r["site_id"]) or {}).get("name", "")) for r in rows]
 
 
-def counts() -> dict:
-    """The open and acknowledged alerts by severity and by site, of the categories the reader receives (named in `categories`)."""
-    cats = reader_categories()
+def counts(followed_only: bool = False) -> dict:
+    """The open and acknowledged alerts by severity and by site, of the categories the reader receives (named in `categories`), and with
+    `followed_only` of the kinds the person follows (the inbox's badge; named in `following`, None while they follow every kind)."""
+    cats = _categories(followed_only)
+    following = list(cats) if followed_only and followed_categories() is not None else None
     cond, args = _in(cats)
     with store.connect() as con:
         rows = con.execute("SELECT severity, COUNT(*) n FROM alerts WHERE state IN ('open','acknowledged')" + cond + " GROUP BY severity", args).fetchall()
         by_site = con.execute("SELECT site_id, COUNT(*) n FROM alerts WHERE state IN ('open','acknowledged')" + cond + " GROUP BY site_id", args).fetchall()
     out = {r["severity"]: r["n"] for r in rows}
-    return {"total": sum(out.values()), "by_severity": out, "by_site": {r["site_id"]: r["n"] for r in by_site}, "categories": list(cats)}
+    return {"total": sum(out.values()), "by_severity": out, "by_site": {r["site_id"]: r["n"] for r in by_site}, "categories": list(reader_categories()),
+            "following": following}
 
 
 ASSIGNEE_WORDS = "Assign the alert to a member who acts on alerts (an administrator or an operator), picked from the list"

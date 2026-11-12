@@ -13,13 +13,16 @@ router = APIRouter()
 
 
 @router.get("/api/alerts")
-def inbox(state: str | None = "active", site_id: str | None = None, category: str | None = None):
-    return out(alerts.listing(state or None, site_id, category))
+def inbox(state: str | None = "active", site_id: str | None = None, category: str | None = None, every: bool = False):
+    """The inbox: the kinds of alert the person follows (My account's notification choices; round 7 sweeps, the rest of role-analyst-32), or with
+    `every` every kind their role receives."""
+    return out(alerts.listing(state or None, site_id, category, followed_only=not every))
 
 
 @router.get("/api/alerts/counts")
 def counts():
-    c = alerts.counts()
+    """The badge's counts: the kinds the person follows (`following`, null while they follow every kind)."""
+    c = alerts.counts(followed_only=True)
     c["tariff_pending"] = alerts.tariff_pending_count() if auth.can("see_costs") else 0
     return c
 

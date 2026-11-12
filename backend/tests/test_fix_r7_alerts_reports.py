@@ -1788,7 +1788,8 @@ def test_a_grid_site_with_no_connection_saved_is_not_called_off_grid_and_an_empt
         reports.generate("daily_operations", unsaved, today.isoformat(), "test")
         assert "MEPCO grid connection, not saved yet." in built[-1].splitlines()[1] and "No plan was in force now" in built[-1], built[-1]
         reports.generate("energy_only", farm, month, "test")
-        assert "Off-grid." in built[-1].splitlines()[1] and "No grid connection: there are no grid outages to carry." in built[-1], built[-1]
+        # the farm's energy report says it has no grid once, in its energy table, with no outage section (round 7 sweeps, role-operator-10)
+        assert "Off-grid." in built[-1].splitlines()[1] and "No grid connection: there is no grid import, export, demand or outage to count." in built[-1], built[-1]
         reports.generate("energy_only", world.site, month, "test")
         head = built[-1].splitlines()[1]
         assert "FESCO B-2(b), no export (no net metering)." in head and "none." not in head, head

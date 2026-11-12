@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Body
 from fastapi.responses import PlainTextResponse
 
-from . import auth, sites, store, telemetry, verify
+from . import auth, forecast, sites, store, telemetry, verify
 from .routes_common import bad, full_or_404, out, parse_day, site_or_404, today
 from .schemas import PilotEdit, PilotStart, Refusal, SwitchbackPaint, check
 
@@ -27,14 +27,21 @@ def savings(site_id: str, start: str | None = None, end: str | None = None):
                                                                                   "genset_hours", "throughput_kwh", "unserved_kwh")}
     summ["energy"]["outage_hours"] = round(sum((d.get("outage_minutes") or 0) for d in tdays) / 60, 1)
     summ["energy"]["peak_kw"] = max([d.get("peak_kw") or 0 for d in tdays] or [0])
+    if forecast.off_grid(sites.full(site_id) or {}):
+        # a site without a grid has no outage and no grid demand: its grid reads 0 on every minute, which the day rows count a day-long outage (round 7
+        # sweeps, audit role-operator-10: "Outage time 199 h" and "Peak import 0.0 kW" at the farm), so both are null, never the whole period
+        summ["energy"].update(outage_hours=None, peak_kw=None)
     # the genset's litres as the actual arm reads them (metered, else the fitted curve) and where they came from, so the page can mark curve litres
-    # "Estimated"; the day rows hold metered litres only. Read per minute, so capped at about two months (a longer range keeps the metered sum and
-    # names no source)
+    # "Estimated"; the day rows hold metered litres only, a blank reading summed as 0. Over a range of more than about two months the minutes the
+    # genset ran with neither its power nor its fuel read are not replayed: such a range says its litres are "not_counted" (null), never the day rows'
+    # zero (round 7 sweeps, audit frontend-states-formats-02: "Diesel burned 0.0 L" with no source over 62 days)
     summ["energy"]["litres_source"] = None
-    if 0 <= (d1 - d0).days <= 62:
+    if (d1 - d0).days >= 0:
         try:
-            lu = verify.litres_used(site_id, d0.isoformat(), d1.isoformat())
-            if lu.get("litres_source"):
+            lu = verify.litres_used(site_id, d0.isoformat(), d1.isoformat(), simulate=(d1 - d0).days <= 62)
+            if lu.get("unread_minutes"):
+                summ["energy"].update(litres=None, litres_source="not_counted")
+            elif lu.get("litres_source"):
                 summ["energy"].update(litres=round(float(lu["litres"]), 1), litres_source=lu["litres_source"])
         except Exception:  # noqa: BLE001  (the figure is a label; never fail the page for it)
             pass

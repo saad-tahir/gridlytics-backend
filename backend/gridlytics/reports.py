@@ -18,6 +18,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.lib.utils import simpleSplit
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from . import alerts, contract, plans, platform as platformdb, sites, store, telemetry, twin, verify
@@ -28,6 +29,10 @@ KINDS = ("monthly_savings", "energy_only", "daily_operations", "company_rollup",
 COMPANY_KINDS = ("company_rollup",)
 TITLES = {"monthly_savings": "Monthly savings report", "energy_only": "Monthly energy report", "daily_operations": "Daily operations sheet",
           "company_rollup": "Company roll-up", "pilot": "Pilot report"}
+#: Each kind as the audit trail names a report generated of it, with its own article (round 7, audit flow-reports-alerts-members-keys-27: the kind's
+#: key with its underscores dropped read "generated a energy only report")
+MADE_WORDS = {"monthly_savings": "a monthly savings report", "energy_only": "an energy-only report", "daily_operations": "a daily operations sheet",
+              "company_rollup": "a company roll-up", "pilot": "a pilot report"}
 LEVER_NAMES = {"peak_window": "Peak-window import avoided", "offpeak_energy": "Off-peak energy (charging)", "export": "Export credit",
                "genset": "Genset fuel and running cost", "wear": "Battery wear", "carry_over": "Carry-over (change in stored energy)",
                "mdi": "Maximum demand (MDI)"}
@@ -96,15 +101,24 @@ def _day_fidelity(s: dict) -> str:
     return words
 
 
-def _litres_saved(b: dict, scored: int, has_genset: bool) -> str:
-    """The diesel a baseline's ledger saved, as the page's ledger says it (savings-ledger.tsx): "not metered" when the genset's fuel was unknown on
-    every scored day (verify.summary sums such days as nothing, so its 0.0 is no figure), else the litres; "no genset" at a site without one."""
+def _fuel(site: dict | None) -> tuple[str, str]:
+    """The genset's fuel by name and its unit, as the pages say them (lib/format.ts fuelName, fuelUnit; round 7 sweeps, audit frontend-states-formats-01:
+    a captive-gas engine's MMBtu were printed as litres of diesel): ("Diesel", " L"), or ("Gas", " MMBtu") and ("RLNG", " MMBtu"), the unit their
+    curve and price are in (sites.GAS_FUELS); diesel at a site without a genset."""
+    kind = (((site or {}).get("assets") or {}).get("genset") or {}).get("fuel_kind") or "hsd"
+    return {"gas_captive": ("Gas", " MMBtu"), "lng_captive": ("RLNG", " MMBtu")}.get(kind, ("Diesel", " L"))
+
+
+def _litres_saved(b: dict, scored: int, has_genset: bool, unit: str = " L") -> str:
+    """The fuel a baseline's ledger saved, as the page's ledger says it (savings-ledger.tsx): "not metered" when the genset's fuel was unknown on
+    every scored day (verify.summary sums such days as nothing, so its 0.0 is no figure), else the figure in the fuel's `unit` (_fuel); "no genset" at
+    a site without one."""
     if not has_genset:
         return "no genset"
     unmetered = int(b.get("genset_unknown_days") or 0)
     if b.get("litres_saved") is None or (scored > 0 and unmetered >= scored):
         return "not metered"
-    return smart(b.get("litres_saved"), " L")
+    return smart(b.get("litres_saved"), unit)
 
 
 def _weeks(x) -> str:
@@ -220,6 +234,8 @@ class _Doc:
         self.story: list = []
         self.buf = io.StringIO()
         self.csv = csv.writer(self.buf)
+        #: each day's engine, the one that computed its savings (verify.summary's days[].engine), for a report that prints savings figures; None else
+        self.day_engines: dict[str, str | None] | None = None
 
     def title(self, text: str) -> None:
         self.story.append(Paragraph(_text(text), self.styles["Title"]))
@@ -314,10 +330,11 @@ def _on_grid(site: dict) -> bool:
 # ------------------------------------------------------------------------------------------------ the key figures (plan 8.3, the report's KPI grid)
 
 def diesel_line(site: dict, tdays: list[dict], nat: dict, scored: int, d0: date, d1: date) -> str:
-    """The genset's running hours, the litres it used (metered, or Estimated from the fuel curve, as verify.litres_used reads them for the page) and
-    the litres saved against the native settings."""
+    """The genset's running hours, the fuel it used (metered, or Estimated from the fuel curve, as verify.litres_used reads them for the page) and
+    the fuel saved against the native settings, in the fuel's own unit (_fuel)."""
     if not (site.get("assets") or {}).get("genset"):
         return "No genset at this site."
+    name, unit = _fuel(site)
     hours = sum(_finite(d.get("genset_hours")) or 0.0 for d in tdays)
     parts = [f"{smart(hours, ' h')} of running"]
     if 0 <= (d1 - d0).days <= 62:
@@ -326,9 +343,9 @@ def diesel_line(site: dict, tdays: list[dict], nat: dict, scored: int, d0: date,
         except Exception:  # noqa: BLE001  (a label beside the figures; never fail the report for it)
             lu = {}
         if lu.get("litres_source"):
-            parts.append(f"{smart(lu.get('litres'), ' L')} used ({'metered' if lu['litres_source'] == 'meter' else 'Estimated from the fuel curve'})")
-    saved = _litres_saved(nat, scored, True)
-    parts.append("litres saved not metered" if saved == "not metered" else f"{saved} saved against the native settings (Estimated)")
+            parts.append(f"{smart(lu.get('litres'), unit)} used ({'metered' if lu['litres_source'] == 'meter' else 'Estimated from the fuel curve'})")
+    saved = _litres_saved(nat, scored, True, unit)
+    parts.append(f"{name.lower()} saved not metered" if saved == "not metered" else f"{saved} saved against the native settings (Estimated)")
     return "; ".join(parts) + "."
 
 
@@ -561,29 +578,44 @@ def _method(doc: _Doc, site: dict, summ: dict) -> None:
           "fuel curve where not; both arms carry the same battery wear charge." + _genset_assumption(site), lead="Assumptions:")
 
 
+#: A day row's grid figures, which an off-grid site has not got (_energy_and_days)
+GRID_DAY_KEYS = ("import_kwh", "export_kwh", "outage_minutes", "peak_kw", "peak_import_kwh")
+
+
 def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money: bool) -> None:
-    """The energy table and the daily rows (the PDF's annex) with the CSV's rows."""
+    """The energy table and the daily rows (the PDF's annex) with the CSV's rows. An off-grid site's report has no grid rows: its grid reads 0 on every
+    minute, so its day rows hold an import of 0 and a day-long "outage" (round 7 sweeps, audit role-operator-10, flow-reports-alerts-members-keys-30:
+    "Outage time 168.0 h" and "Outage h 24.0" every day); its CSV keeps the columns, blank."""
     site_id = site["id"]
+    grid = _on_grid(site)
+    if not grid:
+        tdays = [{**d, **dict.fromkeys(GRID_DAY_KEYS)} for d in tdays]
     doc.h2("Energy")
     tot = lambda k: sum(float(d.get(k) or 0) for d in tdays if num(d.get(k)) != "-")  # noqa: E731
-    doc.table([["Quantity", "Month"], ["Grid import", f"{tot('import_kwh'):,.0f} kWh"], ["Grid export", f"{tot('export_kwh'):,.0f} kWh"],
-               ["Solar", f"{tot('pv_kwh'):,.0f} kWh"], ["Load", f"{tot('load_kwh'):,.0f} kWh"], ["Genset", f"{tot('genset_kwh'):,.0f} kWh, "
-                                                                                                    f"{tot('genset_hours'):,.1f} h"],
-               ["Outage time", f"{tot('outage_minutes') / 60:,.1f} h"], ["Unserved critical load", f"{tot('unserved_kwh'):,.1f} kWh"],
-               ["Peak 30-minute import", f"{max([float(d.get('peak_kw') or 0) for d in tdays if num(d.get('peak_kw')) != '-'] or [0]):,.1f} kW"]],
+    peak = max([float(d.get("peak_kw") or 0) for d in tdays if num(d.get("peak_kw")) != "-"] or [0])
+    doc.table([["Quantity", "Month"]]
+              + ([["Grid import", f"{tot('import_kwh'):,.0f} kWh"], ["Grid export", f"{tot('export_kwh'):,.0f} kWh"]] if grid else [])
+              + [["Solar", f"{tot('pv_kwh'):,.0f} kWh"], ["Load", f"{tot('load_kwh'):,.0f} kWh"],
+                 ["Genset", f"{tot('genset_kwh'):,.0f} kWh, {tot('genset_hours'):,.1f} h"]]
+              + ([["Outage time", f"{tot('outage_minutes') / 60:,.1f} h"]] if grid else [])
+              + [["Unserved critical load", f"{tot('unserved_kwh'):,.1f} kWh"]]
+              + ([["Peak 30-minute import", f"{peak:,.1f} kW"]] if grid else []),
               [80 * mm, 50 * mm])
+    if not grid:
+        doc.p("No grid connection: there is no grid import, export, demand or outage to count.")
     doc.gap()
     doc.h2("Daily rows")
-    head = ["Day", "Import kWh", "Solar kWh", "Outage h", "Genset h"] + (["Saving vs native", "Fidelity"] if money else [])
+    head = (["Day"] + (["Import kWh"] if grid else []) + ["Solar kWh"] + (["Outage h"] if grid else []) + ["Genset h"]
+            + (["Saving vs native", "Fidelity"] if money else []))
     by_day = {d["day"]: d for d in summ["days"]}
     rows = [head]
     doc.csv.writerow(["day", "import_kwh", "export_kwh", "pv_kwh", "load_kwh", "genset_hours", "litres", "outage_minutes", "peak_kw"] +
                      (["saving_native_rs", "saving_tuned_rs", "fidelity", "plan_ids", "claim_withheld"] if money else []))
     for d in tdays:
         s = by_day.get(d["day"], {})
-        rows.append([_short_day(d["day"]), num(d.get("import_kwh")), num(d.get("pv_kwh")), num(d.get("outage_minutes"), ".1f", scale=60),
-                     num(d.get("genset_hours"), ".1f")] +
-                    ([rs(s.get("saving_native_rs")), doc.cell(_day_fidelity(s))] if money else []))
+        rows.append([_short_day(d["day"])] + ([num(d.get("import_kwh"))] if grid else []) + [num(d.get("pv_kwh"))]
+                    + ([num(d.get("outage_minutes"), ".1f", scale=60)] if grid else []) + [num(d.get("genset_hours"), ".1f")]
+                    + ([rs(s.get("saving_native_rs")), doc.cell(_day_fidelity(s))] if money else []))
         ids = ""
         if money:
             with store.connect() as con:
@@ -593,7 +625,7 @@ def _energy_and_days(doc: _Doc, site: dict, summ: dict, tdays: list[dict], money
                                                           "peak_kw")]
                          + ([s.get("saving_native_rs"), s.get("saving_tuned_rs"), s.get("fidelity"), ids,
                              s.get("claim_withheld") or ("import_unknown" if s.get("import_unknown") else None)] if money else []))
-    doc.table(rows, [22 * mm, 22 * mm, 22 * mm, 18 * mm, 18 * mm] + ([28 * mm, 50 * mm] if money else []))
+    doc.table(rows, [22 * mm] + ([22 * mm] if grid else []) + [22 * mm] + ([18 * mm] if grid else []) + [18 * mm] + ([28 * mm, 50 * mm] if money else []))
     if money and any(s.get("claim_withheld") or s.get("import_unknown") for s in summ["days"]):
         doc.p("A day marked “claim withheld” claims nothing: its saving is shown for reference and is not in the claimed total, nor is it a "
               "verified day.")
@@ -629,30 +661,34 @@ def _monthly(doc: _Doc, site: dict, kind: str, p0: date, p1: date, today: date, 
         doc.gap()
     summ = verify.summary(site_id, p0.isoformat(), p1.isoformat(), see_fee=False)
     inputs["computed"] = summ.get("computed")
+    if money:
+        doc.day_engines = day_engines(summ)
     prelim = _prelim_and_stale(doc, summ, p1 < today, money)
     nat, tun = summ["baselines"].get("native", {}), summ["baselines"].get("tuned", {})
     scored = len(summ.get("days") or [])
     end = min(p1, today)
     if money:
         has_genset = bool((site.get("assets") or {}).get("genset"))
+        fuel, unit = _fuel(site)
         doc.h2("Summary")
         doc.p("The headline against both baselines: the inverter's own settings as captured (native) and the best static table of its brand (tuned).")
         doc.table([["Headline", "Against the native settings", "Against a tuned table"],
                    ["Saving, all days", rs(nat.get("saving_rs")), rs(tun.get("saving_rs"))],
                    ["Claimed (verified days only)", rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))],
-                   ["Diesel saved (Estimated)", _litres_saved(nat, scored, has_genset), _litres_saved(tun, scored, has_genset)],
+                   [f"{fuel} saved (Estimated)", _litres_saved(nat, scored, has_genset, unit), _litres_saved(tun, scored, has_genset, unit)],
                    ["Verified days", str(nat.get("verified_days", 0)), str(tun.get("verified_days", 0))]], [95 * mm, 42 * mm, 42 * mm])
         unmetered = max(int(nat.get("genset_unknown_days") or 0), int(tun.get("genset_unknown_days") or 0))
         if has_genset and 0 < unmetered:
-            doc.p(f"The genset's fuel was not metered on {unmetered} of {scored} days: those days add nothing to the litres or the genset lever.")
+            doc.p(f"The genset's fuel was not metered on {unmetered} of {scored} days: those days add nothing to the fuel saved or the genset lever.")
         doc.gap()
         doc.h2("Key figures")
         doc.table([["Figure", "This month"],
-                   ["Diesel", doc.cell(diesel_line(site, tdays, nat, scored, p0, end))],
-                   ["Peak (MDI)", doc.cell(peak_line(nat, True))],
-                   ["Outage coverage", doc.cell(outage_line(outage_cover(site, p0, end)))],
-                   ["Forecast skill", doc.cell(forecast_line(forecast_skill(site_id, p0, end)))],
-                   ["Control health", doc.cell(control_line(control_health(site_id, summ.get("days") or [], p0, end)))]],
+                   [fuel, doc.cell(diesel_line(site, tdays, nat, scored, p0, end))]]
+                  # an off-grid site has no maximum demand to bill (round 7 sweeps, role-operator-10); its outage line says it has no grid
+                  + ([["Peak (MDI)", doc.cell(peak_line(nat, True))]] if _on_grid(site) else [])
+                  + [["Outage coverage", doc.cell(outage_line(outage_cover(site, p0, end)))],
+                     ["Forecast skill", doc.cell(forecast_line(forecast_skill(site_id, p0, end)))],
+                     ["Control health", doc.cell(control_line(control_health(site_id, summ.get("days") or [], p0, end)))]],
                   [35 * mm, 145 * mm], right=False)
         doc.gap()
         doc.h2("Ledger by lever")
@@ -667,7 +703,7 @@ def _monthly(doc: _Doc, site: dict, kind: str, p0: date, p1: date, today: date, 
         _method(doc, site, summ)
         doc.story.append(PageBreak())
         doc.h2("Annex: energy and daily rows")
-    else:
+    elif _on_grid(site):  # an off-grid site has no grid outage: its energy table says so (_energy_and_days)
         doc.h2("Outages")
         doc.p(outage_line(outage_cover(site, p0, end)))
         doc.gap()
@@ -679,8 +715,11 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
     """Plan 8.5's roll-up per company: each site's saving against both baselines, its claim, litres and verified days, and the company's totals, all
     from verify.summary as the fleet roll-up (GET /api/fleet/savings) reads them."""
     rows, out_rows, prelim_names, stale_names = [], [], [], []
-    tot = {"nat": 0.0, "tun": 0.0, "claimed": 0.0, "litres": 0.0, "verified": 0}
-    doc.csv.writerow(["site_id", "site", "saving_native_rs", "saving_tuned_rs", "claimed_rs", "litres_saved", "verified_days", "preliminary",
+    # the fuel saved in each unit apart, litres of diesel and MMBtu of gas, never added together (round 7 sweeps, frontend-states-formats-01)
+    tot = {"nat": 0.0, "tun": 0.0, "claimed": 0.0, "litres": 0.0, "mmbtu": 0.0, "verified": 0}
+    # each row names its fuel's unit beside the figure, "L" or "MMBtu" (blank without a genset): a gas genset's litres_saved are MMBtu (round 7 sweeps,
+    # review of frontend-states-formats-01)
+    doc.csv.writerow(["site_id", "site", "saving_native_rs", "saving_tuned_rs", "claimed_rs", "litres_saved", "fuel_unit", "verified_days", "preliminary",
                       "chain_stale_days"])
     computed = []
     for s in sites.listing():
@@ -688,7 +727,9 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
         computed.append(summ.get("computed") or "")
         nat, tun = summ["baselines"].get("native", {}), summ["baselines"].get("tuned", {})
         scored = len(summ.get("days") or [])
-        has_genset = bool(sites.assets(s["id"]).get("genset"))
+        gen = sites.assets(s["id"]).get("genset")
+        has_genset = bool(gen)
+        _, unit = _fuel({"assets": {"genset": gen}})
         stale = list(summ.get("chain_stale_days") or [])
         if summ.get("preliminary"):
             prelim_names.append(s["name"])
@@ -696,15 +737,15 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
             stale_names.append(s["name"])
         status = "No scored days" if not scored else ("Preliminary" if summ.get("preliminary") else "Final") + ("; recompute needed" if stale else "")
         rows.append([doc.cell(s["name"]), rs(nat.get("saving_rs")), rs(tun.get("saving_rs")), rs(nat.get("claimed_rs")),
-                     _litres_saved(nat, scored, has_genset), str(nat.get("verified_days", 0)), doc.cell(status)])
+                     _litres_saved(nat, scored, has_genset, unit), str(nat.get("verified_days", 0)), doc.cell(status)])
         doc.csv.writerow([s["id"], s["name"], nat.get("saving_rs"), tun.get("saving_rs"), nat.get("claimed_rs"), nat.get("litres_saved"),
-                          nat.get("verified_days"), bool(summ.get("preliminary")), ";".join(stale)])
+                          unit.strip() if has_genset else "", nat.get("verified_days"), bool(summ.get("preliminary")), ";".join(stale)])
         tot["nat"] += _finite(nat.get("saving_rs")) or 0.0
         tot["tun"] += _finite(tun.get("saving_rs")) or 0.0
         tot["claimed"] += _finite(nat.get("claimed_rs")) or 0.0
         tot["verified"] += int(nat.get("verified_days") or 0)
         if has_genset and _litres_saved(nat, scored, True) != "not metered":
-            tot["litres"] += _finite(nat.get("litres_saved")) or 0.0
+            tot["litres" if unit == " L" else "mmbtu"] += _finite(nat.get("litres_saved")) or 0.0
         out_rows.append(s["id"])
     inputs["computed"] = max(computed) if computed else None
     over = p1 < today
@@ -723,8 +764,10 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
     if not out_rows:
         doc.p("The company has no sites yet.")
         return prelim
-    doc.table([doc.head("Site", "Saving vs native", "Saving vs tuned", "Claimed", "Diesel saved (Estimated)", "Verified days", "Status")] + rows
-              + [["All sites", rs(tot["nat"]), rs(tot["tun"]), rs(tot["claimed"]), smart(tot["litres"], " L"), str(tot["verified"]), ""]],
+    fuel_total = [smart(tot["litres"], " L")] if tot["litres"] or not tot["mmbtu"] else []
+    fuel_total = "; ".join(fuel_total + ([smart(tot["mmbtu"], " MMBtu")] if tot["mmbtu"] else []))
+    doc.table([doc.head("Site", "Saving vs native", "Saving vs tuned", "Claimed", "Fuel saved (Estimated)", "Verified days", "Status")] + rows
+              + [["All sites", rs(tot["nat"]), rs(tot["tun"]), rs(tot["claimed"]), fuel_total, str(tot["verified"]), ""]],
               [45 * mm, 23 * mm, 23 * mm, 23 * mm, 22 * mm, 15 * mm, 29 * mm])
     doc.gap()
     doc.p("Each site is measured against a replay of its own inverter settings (native) and the best static table of its brand (tuned), on the same "
@@ -779,6 +822,7 @@ def _pilot(doc: _Doc, site: dict, p0: date, p1: date, today: date, inputs: dict)
     end = min(p1, today)
     summ = verify.summary(site_id, start.isoformat(), p1.isoformat(), see_fee=True)
     inputs.update(computed=summ.get("computed"), start=start.isoformat())
+    doc.day_engines = day_engines(summ)
     prelim = _prelim_and_stale(doc, summ, p1 < today, True)
     doc.h2("Set-up")
     sign = pilot.get("signoff") or {}
@@ -1023,6 +1067,71 @@ def _daily_sheet(doc: _Doc, site: dict, day: date, today: date, now_ts: int) -> 
         _what_happened(doc, site, day)
 
 
+def day_engines(summ: dict) -> dict[str, str | None]:
+    """Each day of a summary's period with the engine that computed its savings (None for a day stored before it was recorded)."""
+    return {d["day"]: d.get("engine") for d in summ.get("days") or []}
+
+
+def engine_lines(stamp: str, days: dict[str, str | None] | None) -> list[str]:
+    """The foot of every page of a report (round 7, audit parity-architecture-12): the engine that made it, and for a report of savings the engines
+    that computed its days' savings, the most days first ("... by engine 0.1.0+3f2a (20 days) and 0.1.0+9c1e (3 days); 1 day was computed before
+    the engine was recorded."), so a figure shown to a customer, and the fee based on it, can be traced to the code that made it."""
+    out = [f"Made with Gridlytics engine {stamp}."]
+    if not days:
+        return out
+    counts: dict[str, int] = {}
+    for e in days.values():
+        if e:
+            counts[e] = counts.get(e, 0) + 1
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    named = [f"{e} ({_plural(n, 'day')})" for e, n in ranked[:3]]
+    if len(ranked) > 3:
+        named.append(f"{_plural(len(ranked) - 3, 'other engine')} ({_plural(sum(n for _, n in ranked[3:]), 'day')})")
+    unknown = sum(1 for e in days.values() if not e)
+    line = ""
+    if named:
+        line = "The savings of its days were computed by engine " + (named[0] if len(named) == 1 else ", ".join(named[:-1]) + " and " + named[-1])
+    if unknown:
+        before = f"{_plural(unknown, 'day')} {'was' if unknown == 1 else 'were'} computed before the engine was recorded"
+        line = f"{line}; {before}" if line else before[0].upper() + before[1:]
+    return out + [line + "."]
+
+
+def _footer(lines: list[str]):
+    """A page callback that writes `lines` in small type at the foot of the page, inside its bottom margin, each wrapped to the width between the side
+    margins (review: a month's days computed by several engines made a line wider than the page, since every change of the code gives a new stamp)."""
+    def draw(canvas, doc) -> None:
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.grey)
+        width = doc.pagesize[0] - doc.leftMargin - doc.rightMargin
+        wrapped = [part for text in lines for part in simpleSplit(text, "Helvetica", 7, width)]
+        for i, text in enumerate(reversed(wrapped)):
+            canvas.drawString(doc.leftMargin, 4 * mm + i * 3 * mm, text)
+        canvas.restoreState()
+    return draw
+
+
+def _engine_columns(text: str, stamp: str, days: dict[str, str | None] | None) -> str:
+    """The CSV with the engine on every row (round 7, audit parity-architecture-12): `report_engine`, the engine that made the file, and for a report
+    of savings `day_engine`, the engine that computed the row's day ("" for a day stored before it was recorded). Each report's CSV is one table keyed
+    by its first column, so the columns go at the end of each row."""
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return text
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(rows[0] + ["report_engine"] + (["day_engine"] if days is not None else []))
+    for r in rows[1:]:
+        w.writerow(r + [stamp] + ([(days.get(r[0]) if r else None) or ""] if days is not None else []))
+    return out.getvalue()
+
+
+def made_words(kind: str) -> str:
+    """The audit trail's action for a report of `kind` generated: "generated an energy-only report"."""
+    return f"generated {MADE_WORDS.get(kind, 'a report')}"
+
+
 def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     """Render a report as PDF and CSV and keep its row. A company kind (COMPANY_KINDS) covers every site and is kept with an empty site_id."""
     now = datetime.now(PKT)
@@ -1062,18 +1171,23 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
         doc.story[sub_at:sub_at] = [Paragraph(_text(f"{span} {_connection_words(site)} {made}"), doc.styles["Normal"]), Spacer(1, 4 * mm)]
     folder = _dir()
     pdf_path, csv_path = folder / f"{rid}.pdf", folder / f"{rid}.csv"
+    from . import version  # the engine that makes the report, at the foot of each page and on each CSV row (round 7, audit parity-architecture-12)
+    stamp = version.stamp()
+    foot = _footer(engine_lines(stamp, doc.day_engines))
     SimpleDocTemplate(str(pdf_path), pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
-                      title=title, author="Gridlytics").build(doc.story)
-    csv_path.write_text(doc.buf.getvalue(), encoding="utf-8", newline="")  # the csv writer ends rows with CRLF already: no blank line between rows
+                      title=title, author="Gridlytics").build(doc.story, onFirstPage=foot, onLaterPages=foot)
+    # the csv writer ends rows with CRLF already: no blank line between rows
+    csv_path.write_text(_engine_columns(doc.buf.getvalue(), stamp, doc.day_engines), encoding="utf-8", newline="")
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()[:16]
     with store.connect() as con:
         # who generated it, for the list's "By" column (audit pages-D-25); the files by their path inside the data folder, never an absolute one
         # (audit parity-architecture-11: a moved or restored data folder still serves every stored download)
-        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary, generated_by) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rid, site_id, kind, period, store._now(), h, f"{_folder()}/{rid}.pdf", f"{_folder()}/{rid}.csv",
-                                                       "done", None if prelim is None else int(prelim), str(by or "")[:120]))
+        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary, generated_by, "
+                    "engine) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (rid, site_id, kind, period, store._now(), h, f"{_folder()}/{rid}.pdf", f"{_folder()}/{rid}.csv", "done",
+                     None if prelim is None else int(prelim), str(by or "")[:120], stamp))
     replaced = _prune(kind, site_id, period)
-    store.audit(by, f"generated a {kind.replace('_', ' ')} report", site_id, {"period": period, "report": rid, **({"replaced": replaced} if replaced else {})})
+    store.audit(by, made_words(kind), site_id, {"period": period, "report": rid, **({"replaced": replaced} if replaced else {})})
     return get(rid)
 
 
@@ -1121,6 +1235,7 @@ def _row_out(r) -> dict:
     null (not known). `generated_by` is who generated it, "" for a report made before it was kept (schema version 5)."""
     d = {k: v for k, v in dict(r).items() if k not in ("pdf_path", "csv_path")}
     d["generated_by"] = d.get("generated_by") or ""
+    d["engine"] = d.get("engine") or ""  # the engine that made it; "" for a report made before it was kept (schema version 6)
     p = d.get("preliminary")
     if p is not None:
         d["preliminary"] = bool(p)
@@ -1135,12 +1250,19 @@ def _row_out(r) -> dict:
     return d
 
 
+def _site_of(site_id: str, names: dict[str, dict]) -> dict:
+    """A report's site: its name, a removed site's too, and whether it was removed (round 7, audit flow-reports-alerts-members-keys-14: a removed
+    site's reports were listed with its raw id for a name). A company report has neither: "" and false."""
+    s = names.get(site_id) or {}
+    return {"site_name": s.get("name", ""), "site_removed": bool(s.get("removed"))}
+
+
 def listing(site_id: str | None = None) -> list[dict]:
     with store.connect() as con:
         rows = con.execute("SELECT * FROM reports" + (" WHERE site_id = ?" if site_id else "") + " ORDER BY generated_at DESC, rowid DESC LIMIT 200",
                            ((site_id,) if site_id else ())).fetchall()
-    names = {s["id"]: s["name"] for s in sites.listing()}
-    return [{**_row_out(r), "site_name": names.get(r["site_id"], "")} for r in rows]
+    names = sites.names()
+    return [{**_row_out(r), **_site_of(r["site_id"], names)} for r in rows]
 
 
 def get(rid: str) -> dict | None:
@@ -1149,8 +1271,7 @@ def get(rid: str) -> dict | None:
         r = con.execute("SELECT * FROM reports WHERE id = ?", (rid,)).fetchone()
     if r is None:
         return None
-    site = sites.get(r["site_id"]) if r["site_id"] else None
-    return {**_row_out(r), "site_name": (site or {}).get("name", "")}
+    return {**_row_out(r), **_site_of(r["site_id"], sites.names() if r["site_id"] else {})}
 
 
 def file_path(rid: str, which: str) -> Path | None:
