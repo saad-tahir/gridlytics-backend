@@ -129,7 +129,19 @@ def test_the_guide_names_every_setting_of_the_server_and_of_the_web_app():
     guide = _read("docs/DEPLOY.md")
     missing = [name for name in [*_example(), *WEB] if name not in guide]
     assert not missing, f"not named in docs/DEPLOY.md: {missing}"
-    assert ".env.production.example" in guide and "frontend/.env.example" in guide
+    assert ".env.production.example" in guide and "frontend/.env.example" in guide and "frontend/vercel.json" in guide
+
+
+def test_the_guide_has_the_vercel_steps_and_names_each_host_everywhere_it_is_named():
+    # round 7, audit parity-architecture-03: the web repository's frontend/vercel.json and scripts/deploy_check.mjs
+    guide = _read("docs/DEPLOY.md")
+    vercel = _section(guide, "## The web app on Vercel")
+    for words in ("Root Directory", "`frontend`", "connect-src", "https://api-host.invalid", "VITE_AUTH_MODE", "VITE_API_BASE_URL", "Preview",
+                  "GRIDLYTICS_CORS_ORIGIN_REGEX", "node scripts/deploy_check.mjs", "--built dist", "deep link"):
+        assert words in vercel, words
+    dns = _section(guide, "## DNS")
+    for words in ("CNAME", "GRIDLYTICS_HOSTS", "GRIDLYTICS_CORS_ORIGINS", "VITE_API_BASE_URL", "connect-src"):
+        assert words in dns, words
 
 
 def test_the_guide_has_the_owners_hand_steps():

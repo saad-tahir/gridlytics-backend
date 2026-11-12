@@ -6,7 +6,7 @@ How a hosted copy of Gridlytics is run (plan Part 2.7, 10.1 and 10.3, DEP-06 and
 | Delivery | What it is | Who it suits |
 |---|---|---|
 | The container | `Dockerfile` at the root: the API only, its data folder on a volume; `deploy/docker-compose.yml` runs it | The API of a hosted copy |
-| The web app on Vercel and the API in the container | The web repository's (`gridlytics-frontend`) `frontend/` on Vercel at the app's host; the container at the API's host | A hosted copy on two host names: the hosted delivery |
+| The web app on Vercel and the API in the container | The web repository's (`gridlytics-frontend`) `frontend/` on Vercel at the app's host (its `frontend/vercel.json`); the container at the API's host | A hosted copy on two host names: the hosted delivery |
 
 All run the same code at the same pinned versions (`requirements.txt` here, `frontend/package-lock.json` in the web repository), on SQLite in write-ahead
 mode. What only the owner can do (a Linux host, the domain names, certificates, the server's secrets, the Vercel project, and for supabase mode the Supabase
@@ -77,8 +77,8 @@ docker compose -f deploy/docker-compose.yml logs -f api
 - **No `server` header.** The image's command adds `--no-server-header`, so the answers do not say `server: uvicorn`. The app sets its own security headers
   (no sniffing, no framing, no referrer, and a content security policy for scripts, frames, forms and the base address).
 - **GRIDLYTICS_DOCS=1** opens the interactive API pages at `/docs`; leave it unset on a hosted copy.
-- **No web app inside the image.** The image holds the API only and builds no page; the web app is the `gridlytics-frontend` repository's (The web app,
-  below). To serve a web build from the container's own host instead, in local mode, build it in the web repository (`VITE_AUTH_MODE=local npm run build`
+- **No web app inside the image.** The image holds the API only and builds no page; the web app is the `gridlytics-frontend` repository's (The web app on
+  Vercel, below). To serve a web build from the container's own host instead, in local mode, build it in the web repository (`VITE_AUTH_MODE=local npm run build`
   in `frontend/`), mount its `dist/` read only and name it: `-v /srv/gridlytics-web/dist:/web:ro -e GRIDLYTICS_WEB_DIST=/web`. Unset, the API answers
   `/api` only.
 - **Building the image.** `docker build` reads this repository only (`.dockerignore` leaves out the data folder, `.scratch/`, the tests, every `.env` file
@@ -222,18 +222,42 @@ docker compose -f deploy/docker-compose.yml run --rm api python /app/scripts/res
 docker compose -f deploy/docker-compose.yml start api
 ```
 
-## The web app
+## The web app on Vercel
 
-The web app is the `gridlytics-frontend` repository's `frontend/`, a static page that calls the API at the API's host. Its build settings are in
-`frontend/.env.example` there, and every one of them is written into the page, so none is a secret:
+The web app is the `gridlytics-frontend` repository's `frontend/`, a static page: Vercel serves it at the app's host, and it calls the API at the API's host.
+`frontend/vercel.json` there holds what Vercel needs; the steps are the owner's.
 
-| Variable | Value |
-|---|---|
-| `VITE_AUTH_MODE` | `local` or `supabase`, as the server's `GRIDLYTICS_AUTH_MODE` |
-| `VITE_API_BASE_URL` | `https://api.grid.example.com/api` |
-| `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` | supabase mode only: the project's address and its anon (publishable) key, the same as the server's |
+1. **The project.** In Vercel, add a project from the web repository. Set the **Root Directory** to `frontend` and leave the framework as Vite:
+   `frontend/vercel.json` sets the install command (`npm ci`), the build command and the output folder (`dist`). Set the **Node.js Version** (Settings,
+   Build and Deployment) to 22.x, as the web repository's `.nvmrc` and its CI use.
+2. **The variables** (Settings, Environment Variables), for Production, and for Preview if previews are used. They are listed in `frontend/.env.example`
+   there. Every one of them is written into the page, so none is a secret:
 
-On the server, `GRIDLYTICS_CORS_ORIGINS` names the web app's origin (`https://grid.example.com`) so the page may call the API from the browser.
+   | Variable | Value |
+   |---|---|
+   | `VITE_AUTH_MODE` | `local` or `supabase`, as the server's `GRIDLYTICS_AUTH_MODE` |
+   | `VITE_API_BASE_URL` | `https://api.grid.example.com/api` (for Preview: the staging API's) |
+   | `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` | supabase mode only: the project's address and its anon (publishable) key, the same as the server's |
+
+3. **The content security policy.** `frontend/vercel.json` sends it with every page, and its `connect-src` must name the hosts the page calls. As shipped
+   it names a placeholder: write the API's origin (`https://api.grid.example.com`) in place of `https://api-host.invalid`, and in supabase mode the
+   project's too (`https://<project ref>.supabase.co`). A staging API's origin may stand beside the live one, for the previews. Commit the change in the
+   web repository.
+4. **What the build checks.** The build command runs `node scripts/deploy_check.mjs` first: it stops the build when `VITE_AUTH_MODE` is not `local` or
+   `supabase`, when `VITE_API_BASE_URL` is not an https address ending in `/api`, when supabase mode lacks its address or key, when a key is a secret one
+   or a `VITE_` variable is named like a secret, and when `connect-src` lacks a host this build calls, still names the placeholder, or names a wildcard or
+   plain http; it prints the line to write. After `npm run build`, `node scripts/deploy_check.mjs --built dist` stops the deployment when the build is not
+   the one checked: another API address, a secret key written into it, or the other sign-in mode's code in it.
+5. **What vercel.json sends.** Every address that is not a built asset (`/`, `/login`, `/fleet`, `/sites/<id>/plan`, the founder console's `/admin/*`,
+   `/reset-password` in supabase mode) is the page itself, so a deep link or a refresh works; a missing file under `/assets/` stays a 404. Every answer
+   carries the policy (scripts from the page's own host only, no framing, no plugins), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+   `Referrer-Policy: no-referrer` (the API's own values); the hashed assets under `/assets/` are kept for a year. Vercel sends HSTS for its own hosts.
+6. **The domain.** Settings, Domains: add the app's host (`grid.example.com`); the DNS record is below. Vercel makes its certificate.
+7. **Previews.** Each branch gets a preview address. Build the previews against the staging API (the Preview variables), whose
+   `GRIDLYTICS_CORS_ORIGIN_REGEX` matches them, for example `https://gridlytics-[a-z0-9-]+-<team slug>\.vercel\.app`; a `vercel.app` name can be taken by
+   anyone, so keep the pattern off the live API. In supabase mode add the previews' reset address to the project's Redirect URLs.
+
+On the server, `GRIDLYTICS_CORS_ORIGINS` names the app's origin (`https://grid.example.com`) so the page may call the API from the browser.
 
 ## Gridlytics' own Supabase project
 
@@ -256,12 +280,13 @@ Companies and people are then added only through the founder console, which writ
 
 The domain names are the owner's decision; these examples use `grid.example.com` for the web app and `api.grid.example.com` for the API.
 
-1. **The app's host:** a `CNAME` to the web host's target (Vercel's, `cname.vercel-dns.com`, for a subdomain).
+1. **The app's host:** add it in Vercel (Settings, Domains), then at the DNS provider make the record Vercel shows: a `CNAME` to Vercel's target for a
+   subdomain (`cname.vercel-dns.com`), or Vercel's `A` record for a bare domain.
 2. **The API's host:** an `A` record (and `AAAA` for IPv6) to the server's public address. The TLS proxy above takes its certificate once the name
    resolves.
 3. **Then name the hosts everywhere they are named:** on the server `GRIDLYTICS_HOSTS=api.grid.example.com` and
-   `GRIDLYTICS_CORS_ORIGINS=https://grid.example.com`, then restart the container; in the web app's build `VITE_API_BASE_URL=https://api.grid.example.com/api`;
-   in supabase mode, the project's Site URL and Redirect URLs.
+   `GRIDLYTICS_CORS_ORIGINS=https://grid.example.com`, then restart the container; on Vercel `VITE_API_BASE_URL=https://api.grid.example.com/api` and
+   `connect-src` in `frontend/vercel.json`, then redeploy; in supabase mode, the project's Site URL and Redirect URLs.
 
 ## Updates and monitoring
 
@@ -284,7 +309,7 @@ Nothing below is built or bought by the code; each is the owner's, in this order
 - [ ] The founder console's settings, with the code's secret in an authenticator app on the founder's phone.
 - [ ] TLS: a reverse proxy with a certificate (Caddy, or nginx with certbot, as above), and `FORWARDED_ALLOW_IPS` set to where its connections come from.
 - [ ] The container running, and `GET /api/health` answering through the proxy.
-- [ ] The web app built for the same sign-in mode and the API's address, and its host.
+- [ ] The Vercel project: root `frontend`, its variables, `connect-src` in `frontend/vercel.json`, the domain.
 - [ ] DNS: the app's host and the API's host.
 - [ ] The first company made in the founder console with its owner, Gridlytics switched on for it; the other accounts made and their first passwords given.
 - [ ] Off-machine backups: object storage with versioning, a nightly copy, and a restore tested on staging.
