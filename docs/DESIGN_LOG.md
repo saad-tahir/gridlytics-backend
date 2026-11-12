@@ -202,6 +202,13 @@ when the answer is.
     named; `tariff_notices` says so, as before.
   - **Null off-grid** (no connection is priced: the vectors are zeros); absent from a plan stored before (the page leaves the line out, the plan's
     fallback). Words, ids and dates, no rate: a viewer and a machine key read it whole (its test and the role walk prove it).
+- **K17, the control answer for a viewer** (plan D9.7, D3.0): confirmed, no code changed. `GET /control` needs no permission, and its one money, the
+  gain of each issued table (`issued[].gain_rs`) and of a held re-issue (`reissue.gain_rs`), is stripped by name (the `_rs` suffix) by the API's filter
+  for every reader without `see_costs` and every machine key. `test_ux_k17_control_viewer` proves on a real plan, with a table issued for a gain and a
+  re-issue held back, that the viewer's and a key's answers are the administrator's with every money key removed and nothing else changed
+  (`money.for_key`), with no rupee in words and none of the administrator's figures; the role walk checks the same at every demo site. Owner's
+  question Q20 (the viewer reads Plan and the Inverter table, energy only, no actions): the recommended yes ships; a viewer's mark, re-solve and every
+  control action are refused (403), as before.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 

@@ -304,6 +304,24 @@ def test_the_stage_track_offers_a_viewer_only_the_energy_report_and_a_key_nothin
     assert seen >= 5 and keys >= 1
 
 
+def test_the_control_answer_is_the_administrators_without_its_money_for_a_viewer_and_a_key(walk):
+    """UX backend ask K17 (plan D9.7, D3.0; owner's question Q20): the Inverter table is listed for a viewer, read only and in energy, from GET /control,
+    which needs no permission. At every walked site the viewer's answer, and the edge key's at its own site, are the administrator's with every money key
+    removed at any depth (the issued tables' and the held re-issue's `gain_rs` among them) and nothing else changed. test_ux_k17_control_viewer proves it
+    with gains in the answer."""
+    from gridlytics import money
+    seen = 0
+    for url, got in walk["answers"]["/api/sites/{site_id}/control"].items():
+        a_status, admin = got["admin"]
+        assert a_status == 200, url
+        for reader in ("viewer", "key"):
+            if reader in got:
+                status, body = got[reader]
+                assert status == 200 and body == money.for_key(admin), (url, reader)
+                seen += 1
+    assert seen == 5                                        # four sites read by the viewer, the key's own site by the key
+
+
 def test_a_request_for_access_is_anyones_to_send_and_only_the_founders_to_read(walk, monkeypatch):
     """UX backend asks K2 and K3: the contact page's request for access goes to the founder from anyone signed in (202 with no body: nothing to filter;
     a site key is refused, as on every path that names no site), and none of the company's readers reaches the founder's Access requests, whose
