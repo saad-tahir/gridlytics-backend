@@ -15,7 +15,7 @@ from test_fix_optimiser import _problem
 from test_fix_r2_savings import D, P
 from test_fix_savings import company, twin_day  # noqa: F401 (company is a fixture)
 
-from gridlytics import demo, forecast, optimise, plans, sites, tariffs, twin, verify
+from gridlytics import delivery, demo, forecast, optimise, plans, sites, tariffs, twin, verify
 
 H = 0.25
 S, F_MIN = 48.0, 0.3
@@ -105,18 +105,41 @@ def test_the_demo_farms_192_step_plans_run_the_set_at_night_and_start_the_second
     # the only test of the real farm's 192-step plans and of the second day's hour-mark rows, whose deletion failed nothing): no shed, the set run
     # under a night load below its minimum, optimal inside the tick's work budget (audit tests-and-perf-12: a node budget and this process's CPU
     # time, budget.py, not the wall clock, which `pytest -n 4` or a busy machine stretches past the tick's 10 s), and on the horizon's second day
-    # every start and stop on an hour mark
+    # every start and stop on an hour mark. The farm planned as a brand that cannot be told to charge from the set, every brand but Deye and
+    # Voltronic (delivery.GEN_CHARGE_BRANDS; round 7, crossmodule engine-plans-live-18), whose plans count on the minimum-load surplus and its rows
+    # as round 5 made them; the farm's own Voltronic charges from the set (the test below)
+    monkeypatch.setattr(delivery, "GEN_CHARGE_BRANDS", ())
     b = budget.use(monkeypatch)
     sid, day0 = _demo_farm()
     t0, p, r = _farm_plan(sid, day0, soc, h)
+    assert p["battery"]["a_gen"] is False and optimise.genset_surplus_steps(p).any()
     assert b.solves and all(x["limit_s"] == 10.0 for x in b.solves) and b.cpu_ok(), b.solves
     flips, changes = _check_farm_plan(t0, p, r, soc, h)
     assert changes >= 1, (soc, h, changes)                                            # the second day has a start or a stop to check
     assert not flips, flips
 
 
+@pytest.mark.parametrize("soc,h", FARM_DEFAULT_MARKS, ids=["soc20_from_18h", "soc50_from_00h"])
+def test_the_demo_farms_voltronic_plans_charge_from_the_set_and_are_kept_inside_the_work_budget(company, soc, h, monkeypatch):
+    # the farm's Voltronic keys charging from the set (charger priority SNU; round 7, crossmodule engine-plans-live-18), so its plan may charge the
+    # battery from a running set at full power (a_gen) and has no minimum-load surplus rows. Such a 192-step solve runs to the tick's limit (the
+    # crossmodule review measured a gap of 1 to 4 %), which plans.KEEP_GAP keeps: inside the tick's work budget the plan is optimal or within that
+    # gap, not relaxed, sheds (almost) nothing and runs the set at night
+    b = budget.use(monkeypatch)
+    sid, day0 = _demo_farm()
+    t0, p, r = _farm_plan(sid, day0, soc, h)
+    assert p["battery"]["a_gen"] is True and not optimise.genset_surplus_steps(p).any()
+    assert b.solves and all(x["limit_s"] == 10.0 for x in b.solves) and b.cpu_ok(), b.solves
+    assert r["status"] in ("optimal", "feasible") and r["relaxed"] is False, (soc, h, r["status"])
+    assert r["status"] == "optimal" or (r["mip_gap"] is not None and r["mip_gap"] <= plans.KEEP_GAP), (soc, h, r["status"], r["mip_gap"])
+    s = r["sol"]
+    assert float(s["U"].sum()) * H < 0.5, (soc, h, float(s["U"].sum()) * H)
+    night = np.asarray(p["L"]) - np.asarray(p["PV"]) < MIN_KW
+    assert (s["u"][night] > 0.5).any(), (soc, h)
+
+
 @pytest.mark.slow
-def test_the_demo_farms_plans_from_every_three_hour_mark_run_the_set_and_solve_about_as_fast_as_without_the_surplus(company):
+def test_the_demo_farms_plans_from_every_three_hour_mark_run_the_set_and_solve_about_as_fast_as_without_the_surplus(company, monkeypatch):
     # the demo farm (192 steps, a manual start, 400 L in the tank) planned from each 3-hour mark of 5 November at two states of charge. Before:
     # the plans shed the nights' load with the set off (1 to 88 kWh in every plan). The night runs this change allows doubled or tripled the
     # solve time until the surplus rows and the second day's hour marks. These 16 problems, each solved by every version in turn (mean and
@@ -125,7 +148,9 @@ def test_the_demo_farms_plans_from_every_three_hour_mark_run_the_set_and_solve_a
     # against the model without the surplus (`a_gen_surplus` off, row for row HEAD's) solved here on the same machine, and each solve must
     # finish inside the limit. One easy instance hid the slowdown, so this times a set. An opt-in benchmark (the `slow` marker, conftest.py: about a
     # minute on an idle machine on mains power, many minutes and a timing failure when the machine is busy or throttled on battery); the test above
-    # keeps its correctness in the default suite
+    # keeps its correctness in the default suite. The farm is planned as a brand that cannot be told to charge from the set, as there (round 7,
+    # crossmodule engine-plans-live-18: the farm's own Voltronic charges from the set and has no surplus rows to time)
+    monkeypatch.setattr(delivery, "GEN_CHARGE_BRANDS", ())
     sid, day0 = _demo_farm()
     secs, ref, flips = [], [], []
     for soc, h in FARM_MARKS:
