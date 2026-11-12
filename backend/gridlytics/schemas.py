@@ -34,12 +34,15 @@ _WORDS = {"string_type": "{label} must be text", "string_too_long": "{label} mus
           "enum": "{label} must be one of {expected}"}
 
 
-def _label(loc: tuple) -> str:
-    head = "The " + str(loc[0]).replace("_", " ")
+def _label(loc: tuple, titles: dict | None = None) -> str:
+    """The field a refusal names: "The cycle cap per day" from its key, or its own words where the model gives a top-level field a title (`Field(title=
+    "The meter reading (hm³)")`), so a field whose key is a unit or a code reads as people say it (UX K24 check)."""
+    head = (titles or {}).get(loc[0]) or "The " + str(loc[0]).replace("_", " ")
     return head + "".join(f"'s {str(p).replace('_', ' ')}" for p in loc[1:] if not isinstance(p, int))
 
 
-def message(exc: ValidationError) -> str:
+def message(exc: ValidationError, model: type[BaseModel] | None = None) -> str:
+    titles = {k: f.title for k, f in (model.model_fields if model is not None else {}).items() if f.title}
     parts = []
     for e in exc.errors()[:4]:
         loc = tuple(e["loc"])
@@ -50,11 +53,11 @@ def message(exc: ValidationError) -> str:
             parts.append(f"Unknown field '{'.'.join(str(p) for p in loc)}'")
         elif e["type"] == "string_too_short":
             n = (e.get("ctx") or {}).get("min_length", 1)
-            parts.append(f"{_label(loc)} is needed" if n <= 1 else f"{_label(loc)} must be at least {n} characters")
+            parts.append(f"{_label(loc, titles)} is needed" if n <= 1 else f"{_label(loc, titles)} must be at least {n} characters")
         elif e["type"] in _WORDS:
-            parts.append(_WORDS[e["type"]].format(label=_label(loc), **(e.get("ctx") or {})))
+            parts.append(_WORDS[e["type"]].format(label=_label(loc, titles), **(e.get("ctx") or {})))
         else:
-            parts.append(f"{_label(loc)}: {text}")
+            parts.append(f"{_label(loc, titles)}: {text}")
     more = len(exc.errors()) - 4
     return "; ".join(parts) + (f"; and {more} more" if more > 0 else "")
 
@@ -64,7 +67,7 @@ def check(model: type[BaseModel], body: Any, **context) -> Any:
     try:
         return model.model_validate(body, context=context)
     except ValidationError as exc:
-        raise Refusal(422, message(exc), "invalid") from exc
+        raise Refusal(422, message(exc, model), "invalid") from exc
 
 
 # ------------------------------------------------------------------------------------------------ the pilot set-up (UI-13; round 7, audit pages-D-04)

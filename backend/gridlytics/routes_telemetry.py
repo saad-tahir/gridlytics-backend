@@ -4,13 +4,13 @@ from __future__ import annotations
 import json
 import math
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal
 
 import numpy as np
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import PlainTextResponse
-from pydantic import Field, StringConstraints
+from pydantic import Field, StringConstraints, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from . import alerts, auth, battery, forecast, optimise, plans, reserve, savings_export, sites, store, telemetry
@@ -645,21 +645,41 @@ HM3_MAX = 100_000
 #: The calorific value a meter reading takes, in MMBtu per hm³ as a Pakistani gas bill prints it: pipeline gas of about 950 BTU per cubic foot is
 #: 3.35, RLNG about 3.7 and a lean captive field about 2.6. Outside this, the figure is in another unit (BTU per cubic foot, MJ per m³) or mistyped
 CALORIFIC_RANGE = (2.0, 5.0)
+#: The earliest day a fuel log takes: the telemetry's own earliest (telemetry.py refuses a reading before 2015)
+FUEL_LOG_EARLIEST = date(2015, 1, 1)
 
 
 class FuelLogIn(Strict):
     """`POST /sites/:id/genset/fuel` (UX backend ask K24, plan E6 item 6): the fuel put in the genset, one way only. Litres for diesel; for a captive
     gas or RLNG genset MMBtu as billed, or a meter reading in hm³ with the calorific value printed on the bill (never an assumed one). Numbers are
     numbers: a yes or no, or text, is refused."""
-    litres: float | None = Field(None, strict=True)
-    mmbtu: float | None = Field(None, strict=True)
-    hm3: float | None = Field(None, strict=True)
-    calorific_mmbtu_per_hm3: float | None = Field(None, strict=True)
-    #: the Karachi day the fuel was put in (YYYY-MM-DD), today by default
+    # each field's title is the words a refusal names it with ("The meter reading (hm³) must be a number"; UX K24 check)
+    litres: float | None = Field(None, strict=True, title="Litres")
+    mmbtu: float | None = Field(None, strict=True, title="MMBtu")
+    hm3: float | None = Field(None, strict=True, title="The meter reading (hm³)")
+    calorific_mmbtu_per_hm3: float | None = Field(None, strict=True, title="The calorific value")
+    #: the Karachi day the fuel was put in (YYYY-MM-DD), today by default; never after today (Karachi) nor before 2015 (plan E2.2.7; UX K24 check)
     day: str | None = None
     #: what it cost, as billed (money: a viewer never reads it back)
-    cost_rs: float | None = Field(None, strict=True)
+    cost_rs: float | None = Field(None, strict=True, title="The cost")
     note: str = ""
+
+    @field_validator("day")
+    @classmethod
+    def _day(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        try:
+            if len(v) != 10:
+                raise ValueError
+            d = date.fromisoformat(v)
+        except ValueError:
+            raise ValueError("The day must be a real date written YYYY-MM-DD") from None
+        if d > today():
+            raise ValueError("The day cannot be after today")
+        if d < FUEL_LOG_EARLIEST:
+            raise ValueError("The day cannot be before 2015")
+        return v
 
 
 def _genset_fuel(site_id: str) -> tuple[bool, bool]:
@@ -684,7 +704,7 @@ def _fuel_amount(body: FuelLogIn, has_genset: bool, gas: bool) -> tuple[float, s
     if sent[0] == "litres":
         # a gas genset's fuel sent as `litres` is its MMBtu, as the web app of before sent it (round 7 sweeps: the log's amount in the genset's unit)
         if not 0 < body.litres < FUEL_LOG_MAX:
-            raise Refusal(422, "MMBtu must be a positive number under 100,000" if gas else "Litres must be a positive number", "invalid")
+            raise Refusal(422, "MMBtu must be a positive number under 100,000" if gas else "Litres must be a positive number under 100,000", "invalid")
         return float(body.litres), "billed" if gas else "litres", {}
     if sent[0] == "mmbtu":
         if not 0 < body.mmbtu < FUEL_LOG_MAX:
@@ -698,6 +718,9 @@ def _fuel_amount(body: FuelLogIn, has_genset: bool, gas: bool) -> tuple[float, s
     if not CALORIFIC_RANGE[0] <= cv <= CALORIFIC_RANGE[1]:
         raise Refusal(422, "The calorific value is the bill's MMBtu per hm³, from 2 to 5", "invalid")
     amount = round(body.hm3 * cv, 3)
+    if amount <= 0:
+        # a reading too small to give a thousandth of an MMBtu would be logged as nothing (UX K24 check)
+        raise Refusal(422, "That reading gives 0 MMBtu: check the figures", "invalid")
     if amount >= FUEL_LOG_MAX:
         raise Refusal(422, f"That reading gives {amount:,.0f} MMBtu, more than one log takes (under 100,000): check the figures", "invalid")
     return amount, "meter", {"hm3": body.hm3, "calorific_mmbtu_per_hm3": cv}
@@ -733,10 +756,12 @@ def fuel_logs(site_id: str, limit: int = 200):
 
 
 @router.post("/api/sites/{site_id}/genset/fuel")
-def fuel_log(site_id: str, inp: dict = Body(...)):
+def fuel_log(site_id: str, inp: dict = Body(...), dry_run: bool = False):
     """Logs fuel put in the genset (FuelLogIn): litres of diesel; for a gas genset MMBtu as billed, or a meter reading in hm³ with the bill's calorific
     value, stored as MMBtu (hm³ x the calorific value, to three decimals; UX backend ask K24). The day is today by default; an optional cost_rs (what
-    it cost, as billed) and a note. Answers {logged (the amount in the unit), unit, entry, day, hm3, calorific_mmbtu_per_hm3}."""
+    it cost, as billed) and a note. Answers {logged (the amount in the unit), unit, entry, day, hm3, calorific_mmbtu_per_hm3}.
+    With `?dry_run=true` the same checks and the same answer, with `dry_run: true`, and nothing is logged or audited: the Log fuel dialog's "= 413.39
+    MMBtu (derived)" line is the server's figure while the person types (plan C1.4: a derived figure is the server's; H12 risk 9; UX K24 check)."""
     auth.need("upload_data", "Logging fuel")
     site_or_404(site_id)
     body = check(FuelLogIn, inp)
@@ -747,6 +772,10 @@ def fuel_log(site_id: str, inp: dict = Body(...)):
     if cost is not None and not 0 <= cost < 1e9:
         raise Refusal(422, "The cost is a number of rupees from 0", "invalid")
     unit = "MMBtu" if gas else "L"
+    answer = {"logged": amount, "unit": unit, "entry": entry, "day": day.isoformat(), "hm3": reading.get("hm3"),
+              "calorific_mmbtu_per_hm3": reading.get("calorific_mmbtu_per_hm3")}
+    if dry_run:
+        return {**answer, "dry_run": True}
     detail = {"day": day.isoformat(), "litres": amount, "unit": unit, "entry": entry, **reading, "note": body.note[:200]}
     if cost is not None:
         detail["cost_rs"] = round(cost, 2)
@@ -756,8 +785,7 @@ def fuel_log(site_id: str, inp: dict = Body(...)):
         # the litres feed the genset's ledger: the log is audited (round 7, audit security-roles-04); its cost is money, filtered by its name. The
         # line names the fuel's unit, "L" or "MMBtu" (round 7 integration), so the trail does not read a gas genset's fuel as litres
         store.audit(auth.actor(), "logged fuel", site_id, {**{k: v for k, v in detail.items() if k != "unit"}, "fuel_unit": unit}, con=con)
-    return {"logged": amount, "unit": unit, "entry": entry, "day": day.isoformat(), "hm3": reading.get("hm3"),
-            "calorific_mmbtu_per_hm3": reading.get("calorific_mmbtu_per_hm3")}
+    return answer
 
 
 _ = (sites, timezone)

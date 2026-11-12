@@ -80,6 +80,14 @@ check" commits):
   link opens Review when its form has D complete, else the first step not complete (C2.5). Recorded in the web repository's API contract for lane
   A. The line stays "Set-up: not activated", the plan's own words for a draft on Fleet (its state table: "Draft: step C of 6" or "Set-up: not
   activated"), though a checker read them as not the plan's.
+- **K24's refusals and the day.** A meter reading that gives 0 MMBtu after rounding to three decimals is refused ("That reading gives 0 MMBtu: check
+  the figures"); the diesel sentence names its limit ("Litres must be a positive number under 100,000"); a field of the wrong type is named in words
+  (`Field(title=...)`, which `schemas.message` now honours for a top-level field: "The meter reading (hm³) must be a number"); the day is a real
+  YYYY-MM-DD, never after today in Karachi (plan E2.2.7, with the server as the authority) nor before 2015 (the telemetry's earliest), where text after
+  the date was cut off and stored before.
+- **The derived MMBtu while typing.** `POST /genset/fuel?dry_run=true` runs the same checks and answers as the save would, with `dry_run: true`, and
+  logs and audits nothing, so the dialog's "= 413.39 MMBtu (derived)" is the server's figure (plan C1.4, A8.5; H12 risk 9: preview figures only
+  from API routes). A query on the existing route, not a new route.
 - **Each fact's cost.** The fleet reads, per site in the track, at most: the tick failures (a site with no plan), its pilot's blocks (a started
   pilot), and for a monitor site the tier's refusal, whose CSV check scans the site's minutes for the inverter's mode until it finds one, as `PUT
   /tier` always did.
