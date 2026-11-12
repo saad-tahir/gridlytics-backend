@@ -3,7 +3,10 @@ OPT-04 and OPT-07 were [x] with none of their acceptance in a test. Each test be
 it; nothing reads the network or the owner's data folder (each test's company is a file of its own in a temporary folder).
 
 Timed acceptances (DAT-01's 10 ms day read, DAT-08's 200 ms range) take the best of several runs, as `timeit` does: the best run is the work itself,
-the others add what a busy machine adds (the suite runs four workers on four CPUs)."""
+the others add what a busy machine adds (the suite runs four workers on four CPUs).
+
+Batch 3 adds the outage forecaster's outputs for an announced window (p_start, dur_steps and g) and its unscheduled hazard, the DISCO prior shrunk
+towards the site's own counts (audit tests-and-perf-24), and the activation gate of a grid-connected site (audit tests-and-perf-19)."""
 from __future__ import annotations
 
 import inspect
@@ -514,3 +517,95 @@ def test_opt07_no_big_m_constant_anywhere_in_the_builder_and_no_coefficient_beyo
         if p.get("genset"):
             sizes += [p["genset"]["S"], *([p["genset"]["fuel_available"]] if p["genset"]["fuel_available"] < 1e8 else [])]
         assert max(seen) <= max(sizes) + 1e-6, (name, max(seen), max(sizes))
+
+
+# ------------------------------------------------------------------------------------------------ round 7 batch 3: the outage forecaster's outputs
+# (audit tests-and-perf-24). The optimiser's outage reserve reads forecast.outage's p_start, dur_steps and g for an announced window, and its
+# unscheduled hazard is a DISCO prior shrunk towards the site's own counts; the suite asserted none of them, so an off-by-one or a sign error passed.
+
+def _outage_site(sid: str, disco: str = "LESCO") -> dict:
+    """A grid-connected site (no outage unit, so nothing is pooled) on `disco`."""
+    return {"id": sid, "data": {"disco": disco, "lat": 31.5, "lon": 74.3}, "connections": [{"id": "c1", "data": {"regime": "none"}}], "assets": {}}
+
+
+def _grid_history(sid: str, t0: int, down) -> None:
+    """28 days of 1-minute grid readings before t0 (a local midnight): down where down(minute of the local day) is true."""
+    h0 = t0 - 28 * 86400
+    telemetry.write_rows([(sid, h0 + 60 * i, "edge", 0.0 if down(i % 1440) else 1.0) for i in range(28 * 1440)],
+                         ("site_id", "ts", "source_id", "grid_present"))
+
+
+def _step(hh: int, mm: int = 0, day: int = 0) -> int:
+    """The index of the 15-minute step at local hh:mm on day `day` of a horizon that starts at a local midnight."""
+    return day * 96 + hh * 4 + mm // 15
+
+
+def test_an_announced_window_gives_its_start_at_the_step_before_its_length_and_g_only_above_90_percent_adherence(company):
+    from gridlytics import forecast
+    t0 = int(datetime(2026, 11, 2, tzinfo=PKT).timestamp())
+    forecast.set_schedule("kept", [["14:00", "16:00", "daily"]], "manual", "t")
+    _grid_history("kept", t0, lambda m: 14 * 60 <= m < 16 * 60)               # 28 days, every window kept, no other outage
+    o = forecast.outage(_outage_site("kept"), t0)
+    adherence = (8 + 28) / (10 + 28)                                          # Beta(8, 2) and 28 kept windows in 28
+    assert o["adherence"] == round(adherence, 3) and o["adherence_windows"] == 28
+    # the window's shedding is scheduled: it is no unscheduled trip, so the hazard is the DISCO prior shrunk to 7 days' weight in 35
+    prior = forecast.DISCO_TRIPS["LESCO"]
+    assert o["lam_day"] == pytest.approx(prior * 7 / 35, abs=1e-3)
+    for day in (0, 1):
+        before, first, last = _step(13, 45, day), _step(14, 0, day), _step(15, 45, day)
+        unscheduled = 1 - np.exp(-prior * 7 / 35 / 24 * 0.25 * 5)              # an upper bound on any step's unscheduled start (the evening's 2.5x)
+        # p_start at a step is the chance an outage starts at its end: the window's start is at the step before it, at the adherence
+        assert adherence <= o["p_start"][before] <= adherence + unscheduled, (day, o["p_start"][before - 1:before + 2])
+        assert o["p_start"][first] < unscheduled and o["p_start"][before - 1] < unscheduled
+        assert o["dur_steps"][before] == 8                                    # 14:00 to 16:00
+        assert np.all(o["p_down"][first:last + 1] >= adherence) and o["p_down"][last + 1] < 0.1 and o["p_down"][before] < 0.1
+        # g (the grid may be counted on) is 0 only inside a window kept more than 90 % of the time
+        assert np.all(o["g"][first:last + 1] == 0.0) and o["g"][before] == 1.0 and o["g"][last + 1] == 1.0
+    assert int((o["g"] == 0).sum()) == 16
+    # a new site: the same window at the prior's 80 %, so the grid is never written off; and a feeder that kept none of 28 windows
+    forecast.set_schedule("new", [["14:00", "16:00", "daily"]], "manual", "t")
+    n = forecast.outage(_outage_site("new"), t0)
+    assert n["adherence"] == 0.8 and n["adherence_windows"] == 0 and np.all(n["g"] == 1.0)
+    assert 0.8 <= n["p_start"][_step(13, 45)] < 0.8 + 0.01 and n["dur_steps"][_step(13, 45)] == 8
+    forecast.set_schedule("ignored", [["14:00", "16:00", "daily"]], "manual", "t")
+    _grid_history("ignored", t0, lambda m: False)
+    i = forecast.outage(_outage_site("ignored"), t0)
+    assert i["adherence"] == round(8 / 38, 3) and np.all(i["g"] == 1.0)
+    assert i["p_start"][_step(13, 45)] == pytest.approx(8 / 38, abs=0.01) and i["p_down"][_step(14)] == pytest.approx(8 / 38, abs=0.01)
+
+
+def test_the_unscheduled_hazard_is_the_disco_prior_with_no_history_and_moves_to_the_counts_after_28_days(company):
+    from gridlytics import forecast
+    t0 = int(datetime(2026, 11, 2, tzinfo=PKT).timestamp())
+    for disco in ("LESCO", "QESCO"):
+        cold = forecast.outage(_outage_site(f"cold-{disco}", disco), t0)
+        prior = forecast.DISCO_TRIPS[disco]
+        assert cold["stage"] == 0 and cold["lam_day"] == pytest.approx(prior, abs=1e-3) and cold["median_minutes"] == 75.0
+        # the prior's shape: the evening hours (17:00 to 23:00) at 2.5 times the others, per step 1 - exp(-rate x 15 minutes)
+        per_h = prior / (18 + 6 * 2.5)
+        p_u = lambda rate: 1 - np.exp(-rate * 0.25)  # noqa: E731
+        p_c = 0.0
+        if disco in forecast.COLD_START_DOWN_HOURS:                         # a rural feeder's cold start adds its shedding prior, flagged
+            assert cold["shed_prior"] == {"down_hours_day": 10.0, "weight": 1.0}
+            p_c = (1 - (1 - 10 / 24) / (1 - prior * 75 / 1440)) / forecast.SHED_BLOCK_STEPS
+        else:
+            assert cold["shed_prior"] is None
+        # the step before 10:00 holds the start at 10:00, the step before 18:00 the start at 18:00
+        assert cold["p_start"][_step(9, 45)] == pytest.approx(1 - (1 - p_u(per_h)) * (1 - p_c), rel=1e-6)
+        assert cold["p_start"][_step(17, 45)] == pytest.approx(1 - (1 - p_u(per_h * 2.5)) * (1 - p_c), rel=1e-6)
+        assert cold["dur_steps"][_step(9, 45)] == (forecast.SHED_BLOCK_STEPS if p_c > p_u(per_h) else 5)    # 75 minutes
+    # 28 days with a 30-minute trip at 10:00 every day: the hazard moves from the prior towards a start a day (weight 28 in 35), at 10:00
+    _grid_history("trips", t0, lambda m: 10 * 60 <= m < 10 * 60 + 30)
+    warm = forecast.outage(_outage_site("trips"), t0)
+    prior = forecast.DISCO_TRIPS["LESCO"]
+    assert warm["stage"] == 1 and warm["days_known"] == 28.0 and warm["median_minutes"] == 30.0
+    assert warm["lam_day"] == pytest.approx((28 + 7 * prior) / 35, abs=1e-3)
+    per_h = prior / (18 + 6 * 2.5)
+    rate_10 = (28 + per_h * 7) / 35                                            # the 10:00 hour: 28 starts and the prior's 7 days
+    rate_other = per_h * 7 / 35                                                # another morning hour: no start in 28 days
+    assert warm["p_start"][_step(9, 45)] == pytest.approx(1 - np.exp(-rate_10 * 0.25), rel=1e-6)
+    assert warm["p_start"][_step(7, 45)] == pytest.approx(1 - np.exp(-rate_other * 0.25), rel=1e-6)
+    assert warm["p_start"][_step(9, 45)] > 10 * warm["p_start"][_step(7, 45)]
+    assert warm["dur_steps"][_step(9, 45)] == 2                                # the median 30 minutes, not the prior's 75
+    # the chance of being down follows the starts over the trip's two steps: from the 10:00 hour's starts, and not an hour after it
+    assert warm["p_down"][_step(10)] > 0.1 and warm["p_down"][_step(10, 45)] > 0.1 and warm["p_down"][_step(11, 15)] < 0.01
