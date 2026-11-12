@@ -609,3 +609,42 @@ def test_the_unscheduled_hazard_is_the_disco_prior_with_no_history_and_moves_to_
     assert warm["dur_steps"][_step(9, 45)] == 2                                # the median 30 minutes, not the prior's 75
     # the chance of being down follows the starts over the trip's two steps: from the 10:00 hour's starts, and not an hour after it
     assert warm["p_down"][_step(10)] > 0.1 and warm["p_down"][_step(10, 45)] > 0.1 and warm["p_down"][_step(11, 15)] < 0.01
+
+
+# ------------------------------------------------------------------------------------------------ round 7 batch 3: activating a grid-connected site
+# (audit tests-and-perf-19). Activation was tested for an off-grid site and for its data source; nothing built a grid-connected site through the
+# routes, tab by tab, and showed what the gate asks of it (the inverter, the connection and its tariff) and what it does not (a battery, PV).
+
+def test_a_grid_connected_site_is_activated_once_its_source_inverter_and_connection_are_saved_with_no_battery_asked(world):
+    from gridlytics import plans
+    a = world.owner
+    r = a.post("/api/sites", json={"name": "Grid mill", "disco": "FESCO", "site_type": "industrial_2_shift",
+                                   "data_source": {"kind": "edge", "grid_signal_confirmed": True}})
+    assert r.status_code == 200, r.text
+    sid = r.json()["id"]
+
+    def refused() -> str:
+        r = a.post(f"/api/sites/{sid}/activate")
+        assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
+        assert a.get(f"/api/sites/{sid}").json()["status"] != "active"
+        return r.json()["detail"]
+
+    # tab A alone: tabs B and C are asked for, in tab order
+    assert refused() == "Add the inverter (tab B) and the grid connection and tariff (tab C) before activating"
+    assert a.put(f"/api/sites/{sid}/assets/inverter", json={"brand": "deye", "kw_ac": 100}).status_code == 200
+    assert refused() == "Add the grid connection and tariff (tab C) before activating"
+    r = a.put(f"/api/sites/{sid}/connection", json={"tariff_category": "B-2(b)", "sanctioned_load_kw": 400})
+    assert r.status_code == 200, r.text
+    # the DISCO changed after the connection was saved: its group no longer matches, and the site is not activated with the other DISCO's windows
+    assert a.put(f"/api/sites/{sid}", json={"disco": "K-Electric"}).status_code == 200
+    assert refused() == "Add the DISCO group of each grid connection, to match the site's DISCO (tab C) before activating"
+    assert a.put(f"/api/sites/{sid}", json={"disco": "FESCO"}).status_code == 200
+    # the source, the inverter and the connection: activated, with no battery, PV or genset (the plan then runs on the grid and the inverter alone)
+    r = a.post(f"/api/sites/{sid}/activate")
+    assert r.status_code == 200 and r.json()["status"] == "active", r.text
+    assert sorted((r.json().get("assets") or {})) == ["inverter"]
+    # a second activation changes nothing, and the first plan follows from the next tick (Review's "within 15 minutes")
+    assert a.post(f"/api/sites/{sid}/activate").json()["status"] == "active"
+    with world.use():
+        assert plans.tick(sid)["status"] == "active"
+    assert a.get(f"/api/sites/{sid}/plan").json()["plan"] is not None
