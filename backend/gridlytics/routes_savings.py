@@ -38,6 +38,9 @@ def savings(site_id: str, start: str | None = None, end: str | None = None):
     outages = {d["day"]: round((d.get("outage_minutes") or 0) / 60, 1) for d in tdays}
     for d in summ["days"]:
         d["outage_hours"] = outages.get(d["day"])
+    # the baseline the page is priced against: the native captures its days were replayed on (round 7, audit flow-savings-pilot-bill-19)
+    summ["native_captures"] = _native_captures(site_id, summ["days"], d1)
+    summ["native_latest_version"] = (sites.native_latest(site_id) or {}).get("version")
     # the genset's litres as the actual arm reads them (metered, else the fitted curve) and where they came from, so the page can mark curve litres
     # "Estimated"; the day rows hold metered litres only. Read per minute, so capped at about two months (a longer range keeps the metered sum and
     # names no source)
@@ -54,6 +57,37 @@ def savings(site_id: str, start: str | None = None, end: str | None = None):
         # levers and the fee (audit role-viewer-19)
         summ["hidden_for_role"] = True
     return out(summ)
+
+
+def _native_captures(site_id: str, days: list[dict], d1: date) -> list[dict]:
+    """Each native capture the period's days were replayed on (the version each scored day stores), with its settings (work mode, backup state of
+    charge, grid charging, slots), who recorded it, how and when, and the first and last day and the number of days it priced, oldest first. A
+    period whose days carry no version (rows stored before round 7) names the capture in force at its end, with no days. Settings, not money: every
+    role reads them, as on Devices and data (round 7, audit flow-savings-pilot-bill-19)."""
+    by_version: dict[int, list[str]] = {}
+    for d in days:
+        v = d.get("native_capture_version")
+        if isinstance(v, int) and not isinstance(v, bool):
+            by_version.setdefault(v, []).append(d["day"])
+    out = []
+    if by_version:
+        with store.connect() as con:
+            rows = {r["version"]: r for r in con.execute(
+                f"SELECT version, captured_at, by, source, body, photo IS NOT NULL AND photo != '' AS has_photo FROM native_settings "
+                f"WHERE site_id = ? AND version IN ({','.join('?' * len(by_version))})", (site_id, *by_version))}
+        for v in sorted(by_version):
+            r = rows.get(v)
+            if r is None:
+                continue
+            ds = sorted(by_version[v])
+            out.append({"version": v, "captured_at": r["captured_at"], "by": r["by"], "source": r["source"], "body": json.loads(r["body"]),
+                        "has_photo": bool(r["has_photo"]), "first_day": ds[0], "last_day": ds[-1], "days": len(ds)})
+        return out
+    cap = verify.native_for_day(site_id, d1)
+    if cap is not None:
+        out.append({**{k: cap.get(k) for k in ("version", "captured_at", "by", "source", "body", "has_photo")}, "first_day": None, "last_day": None,
+                    "days": None})
+    return out
 
 
 #: How long POST /savings/recompute waits for its job before it answers 202 with the job to read (round 7, audit pr-review-05 with tests-and-perf-11):

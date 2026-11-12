@@ -662,3 +662,31 @@ def test_the_summary_gives_the_claim_of_the_verified_days_only(company):
     # a viewer reads the count, never the rupees
     from gridlytics import money
     assert money._strip(summ, fee_ok=False, cost_ok=False)["baselines"]["native"]["verified"] == {"days": 2}
+
+
+def test_the_savings_answer_says_which_native_captures_its_days_were_replayed_on(world):
+    """flow-savings-pilot-bill-19: the proof page said only "against the native capture"; the settings it is priced against (work mode, backup
+    state of charge, slots, version) were on Devices and data or the pilot's tab B alone, though each scored day stores its capture version. The
+    answer now gives each capture the period's days were replayed on, with its settings and the days it priced, and the latest version (not money:
+    every role reads it). A period whose days carry no version (stored before) names the capture in force at its end, with no days."""
+    sid = world.site
+    with world.use():
+        sites.capture_native(sid, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 20}, "installer@fix.test")
+        sites.capture_native(sid, {"source": "photo", "work_mode": "tou", "backup_soc_pct": 30, "grid_charge_allowed": True,
+                                   "slots": [{"start": "00:00", "mode": "charge_grid", "soc_floor_pct": 30, "soc_target_pct": 90, "grid_charge": True}]},
+                             "installer@fix.test")
+        sites.capture_native(sid, {"source": "entered", "work_mode": "self_use", "backup_soc_pct": 40}, "installer@fix.test")
+        _put_rows(sid, {"2026-10-03": {"native": {**_row(10.0, 10.0), "native_capture_version": 1}, "tuned": _row(5.0, 5.0)},
+                        "2026-10-04": {"native": {**_row(10.0, 10.0), "native_capture_version": 2}, "tuned": _row(5.0, 5.0)},
+                        "2026-10-05": {"native": {**_row(10.0, 10.0), "native_capture_version": 2}, "tuned": _row(5.0, 5.0)},
+                        "2026-09-03": {"native": _row(10.0, 10.0), "tuned": _row(5.0, 5.0)}})
+    for role in ("analyst", "viewer"):
+        page = world.c[role].get(f"/api/sites/{sid}/savings", params={"start": "2026-10-03", "end": "2026-10-05"}).json()
+        caps = page["native_captures"]                              # before: no such field
+        assert [(c["version"], c["first_day"], c["last_day"], c["days"]) for c in caps] == [(1, "2026-10-03", "2026-10-03", 1),
+                                                                                            (2, "2026-10-04", "2026-10-05", 2)], role
+        assert caps[1]["body"]["work_mode"] == "tou" and caps[1]["body"]["backup_soc_pct"] == 30
+        assert caps[1]["body"]["slots"][0]["soc_target_pct"] == 90 and caps[1]["source"] == "photo" and caps[1]["by"] == "installer@fix.test"
+        assert caps[1]["captured_at"] and page["native_latest_version"] == 3
+    old = world.c["analyst"].get(f"/api/sites/{sid}/savings", params={"start": "2026-09-03", "end": "2026-09-03"}).json()
+    assert [(c["version"], c["days"]) for c in old["native_captures"]] == [(1, None)]
