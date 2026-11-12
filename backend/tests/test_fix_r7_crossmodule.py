@@ -675,8 +675,9 @@ def test_compare_with_native_values_the_energy_each_arm_holds_at_the_end(world, 
     net_gap = (arm["energy_rs"] - arm["end_value_rs"]) - (nat["energy_rs"] - nat["end_value_rs"])
     assert gap > 0 and net_gap == pytest.approx(gap - (arm["end_kwh"] - nat["end_kwh"]) * v_end, abs=2.0) and net_gap < 0.5 * gap
     assert (arm["energy_rs"] + arm["reserve_short_rs"] - arm["end_value_rs"]) < (nat["energy_rs"] + nat["reserve_short_rs"] - nat["end_value_rs"])
-    # the plan's own end price, where it stored one
-    plan["summary"] = {"end_price": {"c_next_rs_per_kwh": 50.0, "basis": "import"}}
+    # the plan's own end price, where it stored one: a plan made with it (a stored plan's summary never changes, and the compare answer is kept per
+    # plan: round 7 storage-perf)
+    plan["id"], plan["summary"] = "p2", {"end_price": {"c_next_rs_per_kwh": 50.0, "basis": "import"}}
     r2 = world.c["admin"].get(f"/api/sites/{world.site}/plan/compare").json()
     assert r2["end_value_rs_per_kwh"] == pytest.approx(0.95 * 50.0 - optimise.wear_cost(b), abs=0.01)
     viewer = world.c["viewer"].get(f"/api/sites/{world.site}/plan/compare").json()
