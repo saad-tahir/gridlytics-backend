@@ -275,7 +275,9 @@ def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]
     sid = walk["sites"][0]
-    r = client.get(f"/api/sites/{sid}/pilot/calendar.ics", headers=h["viewer"])
+    # unpacked (Accept-Encoding: identity): a file over a kilobyte goes gzipped to a client that takes it (audit R7 performance-live-10), so its length
+    # is then the packed one
+    r = client.get(f"/api/sites/{sid}/pilot/calendar.ics", headers={**h["viewer"], "Accept-Encoding": "identity"})
     assert r.status_code in (200, 404), r.text
     if r.status_code == 200:
         assert not r.headers["content-type"].startswith("application/json") and int(r.headers["content-length"]) == len(r.content)

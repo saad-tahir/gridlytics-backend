@@ -1031,3 +1031,40 @@ def test_the_fleet_reads_a_sites_month_saving_once_in_a_while_and_every_change_r
     rows = a.get("/api/fleet").json()["sites"]
     assert {r["id"]: r["has_genset"] for r in rows} == {world.site: True, world.other: False}
     assert len([s for s in seen.sql if "FROM assets" in s]) == 1, [s for s in seen.sql if "FROM assets" in s]
+
+
+# ------------------------------------------------------------------------------------------------ performance-live-10 (tests-and-perf-22)
+
+def _raw(client, url: str, encoding: str) -> tuple[dict, bytes]:
+    """The answer's headers and its bytes as sent (before the client unpacks them)."""
+    with client.stream("GET", url, headers={"Accept-Encoding": encoding}) as r:
+        assert r.status_code == 200, url
+        return dict(r.headers), b"".join(r.iter_raw())
+
+
+def test_an_answer_over_a_kilobyte_is_gzipped_for_a_client_that_takes_it_and_reads_the_same(world):
+    """No answer was compressed: the plan page fetched about 170 KB of JSON that gzip makes about 14 KB, and the overview's chart came again every
+    minute. An answer of over 1,000 bytes to a client that says it takes gzip is sent gzipped (Vary: Accept-Encoding), and unpacks to the very bytes
+    sent to a client that does not; a viewer's is the money-filtered answer, compressed after the filter; a short answer is sent as it is."""
+    import gzip
+    for role, url in (("admin", f"/api/sites/{world.site}"), ("viewer", f"/api/sites/{world.site}"), ("admin", "/api/meta")):
+        c = world.c[role]
+        packed_headers, packed = _raw(c, url, "gzip, deflate, br")
+        plain_headers, plain = _raw(c, url, "identity")
+        assert len(plain) > 1000, (url, len(plain))
+        assert packed_headers.get("content-encoding") == "gzip" and "accept-encoding" in packed_headers.get("vary", "").lower(), packed_headers
+        assert "content-encoding" not in plain_headers and int(plain_headers["content-length"]) == len(plain)
+        assert gzip.decompress(packed) == plain and len(packed) < len(plain) / 2, (url, len(packed), len(plain))
+        assert int(packed_headers["content-length"]) == len(packed)            # handed to gzip whole, so it keeps its length
+        assert packed_headers["x-request-id"] and packed_headers["content-type"].startswith("application/json")
+    viewer = json.loads(_raw(world.c["viewer"], f"/api/sites/{world.site}", "identity")[1])
+    admin = json.loads(_raw(world.c["admin"], f"/api/sites/{world.site}", "identity")[1])
+    assert viewer != admin                                                  # the viewer's is the filtered one, gzipped or not
+    headers, body = _raw(world.c["admin"], "/api/health", "gzip")
+    assert len(body) < 1000 and "content-encoding" not in headers           # a short answer is not worth packing
+    with world.use():
+        _minutes(world.site, _now() // 60 * 60 - 3 * 3600, _now() // 60 * 60, 30_000.0)
+    headers, body = _raw(world.c["admin"], f"/api/sites/{world.site}/telemetry/export.csv", "gzip")
+    assert headers["content-type"].startswith("text/csv") and headers.get("content-encoding") == "gzip"     # the CSV export too
+    assert gzip.decompress(body).count(b"\n") > 170
+
