@@ -330,3 +330,86 @@ def test_removing_a_site_revokes_its_keys_resolves_its_alerts_and_its_reports_ke
         assert closed[0]["history"][-1]["note"] == "The site was removed"
         line = next(x for x in store.list_audit() if x["action"] == "removed a site")
     assert line["target"] == "Secret Site Two" and line["detail"]["site_id"] == two and len(line["detail"]["keys_revoked"]) == 1, line
+
+
+# ------------------------------------------------------------------------------------------------ parity-architecture-12: the engine on stored results
+
+def test_a_plan_a_savings_day_and_a_bill_rebuild_record_the_engine_that_computed_them(company, monkeypatch):  # noqa: F811
+    """The engine's stamp went only on the API's answers as a header: a saving recomputed after a change of the code could not be told from one
+    computed before it. Each stored result now records the stamp of the engine that computed it (Solarlytics PS-27)."""
+    from datetime import date
+
+    from test_fix_savings import make_site, twin_day
+
+    from gridlytics import optimise, plans, twin, verify, version
+    stamp = version.stamp()
+    sid = make_site(name="Engine stamp")
+    day = date(2026, 10, 14)
+    twin_day(sid, day, 0.9, seed=1)
+    verify.compute_day(sid, day, with_bound=False)
+    with store.connect() as con:
+        stored = {r["baseline"]: json.loads(r["data"]) for r in con.execute("SELECT baseline, data FROM savings_days WHERE site_id = ?", (sid,))}
+    assert {b: r.get("engine") for b, r in stored.items()} == {"native": stamp, "tuned": stamp}
+    # the Savings answer says which engine computed each day (null for a day stored before the engine was recorded)
+    with store.connect() as con:
+        old = {**stored["native"]}
+        old.pop("engine")
+        con.execute("UPDATE savings_days SET data = ? WHERE site_id = ? AND baseline = 'native'", (json.dumps(old), sid))
+    assert [d["engine"] for d in verify.summary(sid, day.isoformat(), day.isoformat())["days"]] == [None]
+    verify.compute_day(sid, day, with_bound=False)
+    assert [d["engine"] for d in verify.summary(sid, day.isoformat(), day.isoformat())["days"]] == [stamp]
+    # a plan, solved or failed, stored with the engine that made it
+    p = plans.tick(sid, at=twin.day_start_utc(day) + 86400, steps=16)
+    assert p["summary"]["engine"] == stamp
+    monkeypatch.setattr(optimise, "solve", lambda *a, **k: {"status": "not_solved", "message": "test", "solve_seconds": 0.0})
+    failed = plans.tick(sid, at=twin.day_start_utc(day) + 86400 + 900, steps=16)
+    assert failed["status"] == "failed"
+    with store.connect() as con:
+        summaries = [json.loads(r["summary"]) for r in con.execute("SELECT summary FROM plans WHERE site_id = ? AND summary != '{}'", (sid,))]
+    assert len(summaries) == 2 and all(s["engine"] == stamp for s in summaries), summaries
+    # a bill rebuilt from the data
+    bill = verify.add_bill(sid, {"period_start": "2026-10-01", "period_end": "2026-10-20", "total_rs": 1_000_000}, "t")
+    assert bill["rebuilt"]["engine"] == stamp
+
+
+def test_a_report_records_its_engine_and_its_pdf_and_csv_print_it_with_the_engines_of_its_days(world, monkeypatch):
+    """The monthly report printed no engine: a figure shown to a customer, and the fee based on it, could not be traced to the code that made it.
+    The report's row keeps the engine that made it; every page of the PDF says it in its foot, with the engines that computed the savings of its
+    days; the CSV gives both on every row."""
+    from reportlab.pdfgen.canvas import Canvas
+
+    from gridlytics import reports, version
+    stamp, sid, month = version.stamp(), world.site, _past_month()
+    days = [f"{month}-0{i}" for i in range(1, 5)]
+    rows = [_day_row(days[0], engine=stamp), _day_row(days[1], engine=stamp), _day_row(days[2], engine="0.1.0+0123456789"), _day_row(days[3])]
+    _with_summary(monkeypatch, _fake_summary(month, rows), [_tday(d) for d in days])
+    drawn: list[str] = []
+    real = Canvas.drawString
+    monkeypatch.setattr(Canvas, "drawString", lambda self, x, y, text, *a, **k: (drawn.append(text), real(self, x, y, text, *a, **k))[1])
+    with world.use():
+        _data_from_last_year(sid)
+        rep = reports.generate("monthly_savings", sid, month, "test")
+        csv_text = reports.file_path(rep["id"], "csv").read_text(encoding="utf-8")
+        energy = reports.generate("energy_only", sid, month, "test")
+        energy_csv = reports.file_path(energy["id"], "csv").read_text(encoding="utf-8")
+    assert rep["engine"] == stamp and energy["engine"] == stamp
+    row = next(r for r in world.c["admin"].get("/api/reports").json() if r["id"] == rep["id"])
+    assert row["engine"] == stamp
+    assert drawn.count(f"Made with Gridlytics engine {stamp}.") >= 2, drawn          # on every page of both reports
+    assert (f"The savings of its days were computed by engine {stamp} (2 days) and 0.1.0+0123456789 (1 day); 1 day was computed before the "
+            "engine was recorded.") in drawn, drawn
+    lines = csv_text.splitlines()
+    head = lines[0].split(",")
+    assert head[-2:] == ["report_engine", "day_engine"], head
+    by_day = {ln.split(",")[0]: ln.split(",")[-2:] for ln in lines[1:]}
+    assert by_day == {days[0]: [stamp, stamp], days[1]: [stamp, stamp], days[2]: [stamp, "0.1.0+0123456789"], days[3]: [stamp, ""]}, by_day
+    # the energy report shows no savings: its rows carry the report's engine alone
+    assert energy_csv.splitlines()[0].split(",")[-1] == "report_engine" and all(ln.endswith(f",{stamp}") for ln in energy_csv.splitlines()[1:])
+
+
+def test_the_version_docstring_describes_gridlytics_not_solarlytics():
+    from gridlytics import version
+    doc = version.__doc__ or ""
+    for word in ("climate", "market", "calculation package", "Printed with"):
+        assert word not in doc, word
+    assert "savings day" in doc and "plan" in doc and "report" in doc

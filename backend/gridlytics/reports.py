@@ -233,6 +233,8 @@ class _Doc:
         self.story: list = []
         self.buf = io.StringIO()
         self.csv = csv.writer(self.buf)
+        #: each day's engine, the one that computed its savings (verify.summary's days[].engine), for a report that prints savings figures; None else
+        self.day_engines: dict[str, str | None] | None = None
 
     def title(self, text: str) -> None:
         self.story.append(Paragraph(_text(text), self.styles["Title"]))
@@ -653,6 +655,8 @@ def _monthly(doc: _Doc, site: dict, kind: str, p0: date, p1: date, today: date, 
         doc.gap()
     summ = verify.summary(site_id, p0.isoformat(), p1.isoformat(), see_fee=False)
     inputs["computed"] = summ.get("computed")
+    if money:
+        doc.day_engines = day_engines(summ)
     prelim = _prelim_and_stale(doc, summ, p1 < today, money)
     nat, tun = summ["baselines"].get("native", {}), summ["baselines"].get("tuned", {})
     scored = len(summ.get("days") or [])
@@ -810,6 +814,7 @@ def _pilot(doc: _Doc, site: dict, p0: date, p1: date, today: date, inputs: dict)
     end = min(p1, today)
     summ = verify.summary(site_id, start.isoformat(), p1.isoformat(), see_fee=True)
     inputs.update(computed=summ.get("computed"), start=start.isoformat())
+    doc.day_engines = day_engines(summ)
     prelim = _prelim_and_stale(doc, summ, p1 < today, True)
     doc.h2("Set-up")
     sign = pilot.get("signoff") or {}
@@ -1054,6 +1059,63 @@ def _daily_sheet(doc: _Doc, site: dict, day: date, today: date, now_ts: int) -> 
         _what_happened(doc, site, day)
 
 
+def day_engines(summ: dict) -> dict[str, str | None]:
+    """Each day of a summary's period with the engine that computed its savings (None for a day stored before it was recorded)."""
+    return {d["day"]: d.get("engine") for d in summ.get("days") or []}
+
+
+def engine_lines(stamp: str, days: dict[str, str | None] | None) -> list[str]:
+    """The foot of every page of a report (round 7, audit parity-architecture-12): the engine that made it, and for a report of savings the engines
+    that computed its days' savings, the most days first ("... by engine 0.1.0+3f2a (20 days) and 0.1.0+9c1e (3 days); 1 day was computed before
+    the engine was recorded."), so a figure shown to a customer, and the fee based on it, can be traced to the code that made it."""
+    out = [f"Made with Gridlytics engine {stamp}."]
+    if not days:
+        return out
+    counts: dict[str, int] = {}
+    for e in days.values():
+        if e:
+            counts[e] = counts.get(e, 0) + 1
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    named = [f"{e} ({_plural(n, 'day')})" for e, n in ranked[:3]]
+    if len(ranked) > 3:
+        named.append(f"{len(ranked) - 3} other engines ({_plural(sum(n for _, n in ranked[3:]), 'day')})")
+    unknown = sum(1 for e in days.values() if not e)
+    line = ""
+    if named:
+        line = "The savings of its days were computed by engine " + (named[0] if len(named) == 1 else ", ".join(named[:-1]) + " and " + named[-1])
+    if unknown:
+        before = f"{_plural(unknown, 'day')} {'was' if unknown == 1 else 'were'} computed before the engine was recorded"
+        line = f"{line}; {before}" if line else before[0].upper() + before[1:]
+    return out + [line + "."]
+
+
+def _footer(lines: list[str]):
+    """A page callback that writes `lines` in small type at the foot of the page, inside its margin."""
+    def draw(canvas, _doc) -> None:
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.grey)
+        for i, text in enumerate(reversed(lines)):
+            canvas.drawString(15 * mm, 7 * mm + i * 3.2 * mm, text)
+        canvas.restoreState()
+    return draw
+
+
+def _engine_columns(text: str, stamp: str, days: dict[str, str | None] | None) -> str:
+    """The CSV with the engine on every row (round 7, audit parity-architecture-12): `report_engine`, the engine that made the file, and for a report
+    of savings `day_engine`, the engine that computed the row's day ("" for a day stored before it was recorded). Each report's CSV is one table keyed
+    by its first column, so the columns go at the end of each row."""
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return text
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(rows[0] + ["report_engine"] + (["day_engine"] if days is not None else []))
+    for r in rows[1:]:
+        w.writerow(r + [stamp] + ([(days.get(r[0]) if r else None) or ""] if days is not None else []))
+    return out.getvalue()
+
+
 def made_words(kind: str) -> str:
     """The audit trail's action for a report of `kind` generated: "generated an energy-only report"."""
     return f"generated {MADE_WORDS.get(kind, 'a report')}"
@@ -1098,16 +1160,21 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
         doc.story[sub_at:sub_at] = [Paragraph(_text(f"{span} {_connection_words(site)} {made}"), doc.styles["Normal"]), Spacer(1, 4 * mm)]
     folder = _dir()
     pdf_path, csv_path = folder / f"{rid}.pdf", folder / f"{rid}.csv"
+    from . import version  # the engine that makes the report, at the foot of each page and on each CSV row (round 7, audit parity-architecture-12)
+    stamp = version.stamp()
+    foot = _footer(engine_lines(stamp, doc.day_engines))
     SimpleDocTemplate(str(pdf_path), pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
-                      title=title, author="Gridlytics").build(doc.story)
-    csv_path.write_text(doc.buf.getvalue(), encoding="utf-8", newline="")  # the csv writer ends rows with CRLF already: no blank line between rows
+                      title=title, author="Gridlytics").build(doc.story, onFirstPage=foot, onLaterPages=foot)
+    # the csv writer ends rows with CRLF already: no blank line between rows
+    csv_path.write_text(_engine_columns(doc.buf.getvalue(), stamp, doc.day_engines), encoding="utf-8", newline="")
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()[:16]
     with store.connect() as con:
         # who generated it, for the list's "By" column (audit pages-D-25); the files by their path inside the data folder, never an absolute one
         # (audit parity-architecture-11: a moved or restored data folder still serves every stored download)
-        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary, generated_by) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rid, site_id, kind, period, store._now(), h, f"{_folder()}/{rid}.pdf", f"{_folder()}/{rid}.csv",
-                                                       "done", None if prelim is None else int(prelim), str(by or "")[:120]))
+        con.execute("INSERT INTO reports (id, site_id, kind, period, generated_at, inputs_hash, pdf_path, csv_path, status, preliminary, generated_by, "
+                    "engine) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (rid, site_id, kind, period, store._now(), h, f"{_folder()}/{rid}.pdf", f"{_folder()}/{rid}.csv", "done",
+                     None if prelim is None else int(prelim), str(by or "")[:120], stamp))
     replaced = _prune(kind, site_id, period)
     store.audit(by, made_words(kind), site_id, {"period": period, "report": rid, **({"replaced": replaced} if replaced else {})})
     return get(rid)
@@ -1157,6 +1224,7 @@ def _row_out(r) -> dict:
     null (not known). `generated_by` is who generated it, "" for a report made before it was kept (schema version 5)."""
     d = {k: v for k, v in dict(r).items() if k not in ("pdf_path", "csv_path")}
     d["generated_by"] = d.get("generated_by") or ""
+    d["engine"] = d.get("engine") or ""  # the engine that made it; "" for a report made before it was kept (schema version 6)
     p = d.get("preliminary")
     if p is not None:
         d["preliminary"] = bool(p)

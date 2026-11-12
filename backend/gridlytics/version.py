@@ -1,17 +1,26 @@
-"""The engine's version stamp (master PS-27, wave 2, 20 October 2026).
+"""The engine's version stamp (lifted from solarlytics-backend at c853130, version.py, Solarlytics' PS-27; its docstring rewritten for Gridlytics in
+round 7, audit parity-architecture-12).
 
-The stamp is the release's version and a fingerprint of the engine itself: the SHA-256 of every Python and data file of the package, in the order of their paths, cut
-to ten hexadecimal digits. It is worked once, when the package is imported, from the package's files as they are then (review of wave 2: it was worked at the first
-request, from the files on disk then). The Python modules the server loads as it starts are what it runs, so an edit of one of them on disk while the server runs
-changes neither what it does nor its stamp. Two things are read later: the climate of the shipped cities (climate.json) is read again each time the settings are
-built, which most requests do, and a module first imported when it is first used (market) is read then. An edit of either while the server runs can change its
-answers without changing its stamp, until the next start. Any change to the code or to its shipped data (a catalogue, the climate of the shipped cities) gives a new
-stamp at the next start, even where the version number was not raised.
+The stamp is the release's version and a fingerprint of the engine itself, "<version>+<fingerprint>": the SHA-256 of every Python and data (.json)
+file of the package, in the order of their paths, cut to ten hexadecimal digits. It is worked once, when the package is imported, from the package's
+files as they are then. The modules the server loads as it starts are what it runs, so an edit of one of them on disk while the server runs changes
+neither what it does nor its stamp; a module first imported when it is first used is read then, so an edit of it while the server runs can change its
+answers without changing the stamp, until the next start. Any change to the code gives a new stamp at the next start, even where the version number
+was not raised. What a company's own data holds (its tariff versions, its fuel prices, its sites' settings) is not code and is not in the stamp: the
+stored results record the versions of those they used themselves (a savings day's tariff_version and native_capture_version, say).
 
-It goes on every answer of the API as the header `X-Gridlytics-Engine`, the health route's included. The pages keep the latest stamp they were sent and print it on
-the foot of every PDF as "Printed with Gridlytics <stamp>": the engine that served the print, which is not always the one that computed a result stored earlier and
-printed now. A calculation package's Engine row carries the stored result's own version, the one recorded with it when it was computed. The stamp is never put in an
-answer's body: the replayed answers are compared whole, and a stamp there would change with every edit of the code.
+It goes on every answer of the API as the header `X-Gridlytics-Engine` (api.py), the health route's included. Each stored result also records the
+stamp of the engine that computed it, at the time it was computed, so a figure computed after a change of the code is told apart from one computed
+before it, and a saving shown to a customer, and the fee based on it, can be traced to the code that made it:
+
+* a plan, solved or failed: `summary.engine` (plans.tick);
+* a savings day, each baseline's row: `engine` in its data (verify's scoring); the Savings answer gives each day's (`days[].engine`, null for a day
+  stored before it was recorded);
+* a bill rebuilt from the data: `rebuilt.engine` (verify.rebuild_bill, and again when a credit carried from the bill before settles it anew);
+* a report: its row's `engine` (schema version 6). Every page of its PDF says in its foot the engine that made it and, for a report of savings (the
+  monthly savings report, the pilot report), the engines that computed its days' savings; its CSV gives `report_engine` on every row and, for a
+  report of savings, `day_engine`, the engine of the row's day. The engine that made a report is not always the one that computed the stored days
+  it prints, so both are given.
 """
 from __future__ import annotations
 
