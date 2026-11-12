@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 import pytest
 
+import budget
 from gridlytics import delivery, forecast, optimise, plans, sites, store, tariffs, telemetry, twin
 from test_fix_optimiser import _genset_invariants, _problem, _site, _until  # noqa: F401  (the round-1 fixtures and helpers)
 
@@ -258,9 +259,8 @@ def test_a_shed_in_a_grid_outage_never_lands_the_battery_on_its_threshold_to_spa
 
 # ------------------------------------------------------------------------------------------------ regression-threshold-offgrid-solve-time
 
-@pytest.mark.parametrize("fuel", [120.0, 25.0])
-def test_an_off_grid_threshold_site_with_a_part_full_tank_solves_to_optimal_inside_the_ticks_limit(company, fuel):
-    # the farm's sizes, 192 steps (a 60 L tank solves too, in 4-10 s here, too near the limit for a test run beside others)
+def _threshold_farm(fuel: float) -> dict:
+    """The farm's sizes, 192 steps from 18:00 in Pakistan on 3 November, a soc_threshold set and `fuel` litres in its 400 L tank."""
     s = sites.create({"name": "Farm", "critical_load_kw": [8.0] * 24, "genset_start_control": "soc_threshold", "outage_load_mode": 1, "site_type": "farm"}, "t")
     sid = s["id"]
     sites.put_asset(sid, "pv", {"kwp_dc": 80, "kw_ac": 70}, "t")
@@ -271,33 +271,68 @@ def test_an_off_grid_threshold_site_with_a_part_full_tank_solves_to_optimal_insi
     t0 = forecast.align(datetime(2026, 11, 3, 13, 0, tzinfo=timezone.utc).timestamp())  # 18:00 in Pakistan
     p = plans.build_problem(full, t0, forecast.issue(full, t0, save=False), 192)
     assert p["off_grid"] and p["genset"]["control"] == "soc_threshold" and p["T"] == 192
-    r = optimise.solve(p, time_limit=10.0)
-    # (it stopped at the limit with VoLL threshold slack in the plan.) Since round 4 (HANDOFF 8.A.3) an optimum that sheds with the set off
-    # while the tank still covers a step (here it rations the tank: 102 such steps at 120 L) is repaired to the threshold controller: the
-    # first solve still finishes inside the limit (at 25 L; at 120 L see below), and the published plan is the repair's
-    rep = r.get("threshold_repair") or {}
-    first = rep.get("first_status", r["status"])
-    if fuel == 120.0:
-        # A known limit since round 5 (HANDOFF 8.A.1): the set may now run under a load below its minimum, its surplus charging the battery
-        # (optimise.genset_surplus_steps), so a rationed tank has a real choice of night runs, and this first solve no longer proves its 0.1 %
-        # gap inside the limit (HEAD: optimal in 7.4-9.2 s; now stopped at 10 s, on an idle machine on mains power; the incumbent found by 2 s
-        # was the 20 s one when round 5 measured it). The threshold controller's steps keep their 15-minute starts (no hour rows, no surplus
-        # rows there, which only slowed these solves). The published plan is the repair's either way. What this checks: the first solve stopped
-        # at the limit, not later, with a plan within 0.5 % of its bound, and the tick stayed within one limit plus the repair (no shed-rule
-        # re-solve: the plan burns the tank)
-        assert first in ("optimal", "feasible") and rep and rep["first_mip_gap"] < 0.005
-        assert rep["first_solve_seconds"] < 10.0 + 0.5 and rep["shed_rule_resolve_failed"] is False
-        assert r["solve_seconds"] < 10.0 + 2.0 and r["time_limited"] is (rep["first_status"] != "optimal")
-    else:
-        assert first == "optimal" and r["time_limited"] is False
+    return p
+
+
+def _burns_the_tank_before_it_sheds(p: dict, r: dict) -> None:
     assert r["status"] in ("optimal", "feasible")
-    assert rep.get("status", "optimal") != "not_solved"
+    assert (r.get("threshold_repair") or {}).get("status", "optimal") != "not_solved"
     sol, gen = r["sol"], p["genset"]
     thr = gen["soc_on"] * p["battery"]["E_nom"]
     under_off = [t for t in range(1, 192) if sol["E"][t] < thr - 1e-3 and sol["u"][t] < 0.5]
     burn = 0.25 * (gen["a"] * gen["f_min"] * gen["S"] + gen["b"] * gen["S"])
     # the set is off under its threshold only once the tank cannot cover another step at minimum load
     assert all(float(sol["F"][:t].sum()) >= gen["fuel_available"] - burn - 1e-6 for t in under_off)
+
+
+#: The 120 L solve's node budget: its root finds the incumbent (0.20 % from its bound, 6 s of the tick's 10 s on an idle machine) and the
+#: branching that follows does not prove the 0.1 % gap within 20 nodes or within 178 (what the tick's 10 s explore idle), so its first solve
+#: stops at its limit, as the tick's does, on any machine
+LIMITED_NODES = 20
+
+
+@pytest.mark.parametrize("fuel", [120.0, 25.0])
+def test_an_off_grid_threshold_site_with_a_part_full_tank_solves_to_optimal_inside_the_ticks_limit(company, fuel, monkeypatch):
+    # the farm's sizes, 192 steps (a 60 L tank solves too, in 4-10 s here, too near the limit for a test run beside others). Round 7 (audit
+    # tests-and-perf-12): a work budget, not the wall clock (budget.py): the same plan on an idle machine and under `pytest -n 4`; the wall-clock
+    # half is the opt-in benchmark below
+    b = budget.use(monkeypatch, LIMITED_NODES if fuel == 120.0 else budget.TICK_NODES)
+    p = _threshold_farm(fuel)
+    r = optimise.solve(p, time_limit=10.0)
+    # (it stopped at the limit with VoLL threshold slack in the plan.) Since round 4 (HANDOFF 8.A.3) an optimum that sheds with the set off
+    # while the tank still covers a step (here it rations the tank: 102 such steps at 120 L) is repaired to the threshold controller: the
+    # first solve still finishes inside the limit (at 25 L; at 120 L see below), and the published plan is the repair's
+    rep = r.get("threshold_repair") or {}
+    first = rep.get("first_status", r["status"])
+    assert all(s["limit_s"] == 10.0 for s in b.solves) and b.cpu_ok(), b.solves
+    if fuel == 120.0:
+        # A known limit since round 5 (HANDOFF 8.A.1): the set may now run under a load below its minimum, its surplus charging the battery
+        # (optimise.genset_surplus_steps), so a rationed tank has a real choice of night runs, and the first solve does not prove its 0.1 % gap
+        # inside the tick's limit. The published plan is the repair's. What this checks: the first solve stopped at its limit with a plan within
+        # 0.5 % of its bound, and the tick made that solve and the repair only (no shed-rule re-solve: the plan burns the tank)
+        assert first == "feasible" and rep and rep["first_time_limited"] is True and rep["first_mip_gap"] < 0.005, rep
+        assert rep["shed_rule_resolve_failed"] is False and r["time_limited"] is True
+        assert [s["spent"] for s in b.solves] == [True, False], b.solves
+    else:
+        assert first == "optimal" and r["time_limited"] is False and not any(s["spent"] for s in b.solves), b.solves
+    _burns_the_tank_before_it_sheds(p, r)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fuel", [120.0, 25.0])
+def test_the_part_full_tank_solves_keep_to_the_ticks_wall_clock_limit(company, fuel):
+    # the wall-clock half of the test above, as it stood before round 7: an opt-in benchmark (conftest.py), run alone on an idle machine
+    # (HANDOFF section 9). At 120 L the first solve stops at the limit, not later, and the tick stays within one limit plus the repair
+    p = _threshold_farm(fuel)
+    r = optimise.solve(p, time_limit=10.0)
+    rep = r.get("threshold_repair") or {}
+    if fuel == 120.0:
+        assert rep["first_status"] in ("optimal", "feasible") and rep["first_mip_gap"] < 0.005
+        assert rep["first_solve_seconds"] < 10.0 + 0.5 and rep["shed_rule_resolve_failed"] is False
+        assert r["solve_seconds"] < 10.0 + 2.0 and r["time_limited"] is (rep["first_status"] != "optimal")
+    else:
+        assert rep.get("first_status", r["status"]) == "optimal" and r["time_limited"] is False
+    _burns_the_tank_before_it_sheds(p, r)
 
 
 # ------------------------------------------------------------------------------------------------ data-override-pause-native-noop

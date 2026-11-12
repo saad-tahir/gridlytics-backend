@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pytest
+import budget
 from test_fix_optimiser import _problem
 from test_fix_r2_savings import D, P
 from test_fix_savings import company, twin_day  # noqa: F401 (company is a fixture)
@@ -86,8 +87,8 @@ def _farm_plan(sid: str, day0: int, soc: float, h: int) -> tuple[int, dict, dict
 
 
 def _check_farm_plan(t0: int, p: dict, r: dict, soc: float, h: int) -> tuple[list[tuple], int]:
-    """What every farm plan must do (round 5): solve to optimality inside the tick's 10 s, shed (almost) nothing, run the set under a night load below
-    its minimum. Returns the second day's starts and stops that fall off the clock's hour marks (the second_day_hour rows), with the number of
+    """What every farm plan must do (round 5): solve to optimality inside the tick's limit (the default suite's test: inside its work budget,
+    budget.py; the opt-in benchmark: inside its 10 s), shed (almost) nothing, run the set under a night load below its minimum. Returns the second day's starts and stops that fall off the clock's hour marks (the second_day_hour rows), with the number of
     starts and stops there, so a caller can see the check was not empty."""
     assert r["status"] == "optimal" and r["time_limited"] is False and r["relaxed"] is False, (soc, h, r["status"], r.get("mip_gap"))
     s = r["sol"]
@@ -99,12 +100,16 @@ def _check_farm_plan(t0: int, p: dict, r: dict, soc: float, h: int) -> tuple[lis
 
 
 @pytest.mark.parametrize("soc,h", FARM_DEFAULT_MARKS, ids=["soc20_from_18h", "soc50_from_00h"])
-def test_the_demo_farms_192_step_plans_run_the_set_at_night_and_start_the_second_days_runs_on_hour_marks(company, soc, h):
+def test_the_demo_farms_192_step_plans_run_the_set_at_night_and_start_the_second_days_runs_on_hour_marks(company, soc, h, monkeypatch):
     # the default suite's check of what the opt-in benchmark below asserts besides its timing (round 7, audit pr-review-01: skipped by default, it was
     # the only test of the real farm's 192-step plans and of the second day's hour-mark rows, whose deletion failed nothing): no shed, the set run
-    # under a night load below its minimum, inside the tick's 10 s, and on the horizon's second day every start and stop on an hour mark
+    # under a night load below its minimum, optimal inside the tick's work budget (audit tests-and-perf-12: a node budget and this process's CPU
+    # time, budget.py, not the wall clock, which `pytest -n 4` or a busy machine stretches past the tick's 10 s), and on the horizon's second day
+    # every start and stop on an hour mark
+    b = budget.use(monkeypatch)
     sid, day0 = _demo_farm()
     t0, p, r = _farm_plan(sid, day0, soc, h)
+    assert b.solves and all(x["limit_s"] == 10.0 for x in b.solves) and b.cpu_ok(), b.solves
     flips, changes = _check_farm_plan(t0, p, r, soc, h)
     assert changes >= 1, (soc, h, changes)                                            # the second day has a start or a stop to check
     assert not flips, flips

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
+import budget
 from gridlytics import delivery, optimise, plans, sites, store, twin
 from test_fix_optimiser import _problem, _site
 from test_fix_r3_optimiser import _as_if_time_limited, _dodges, _offgrid_threshold, _steps_for
@@ -67,6 +68,7 @@ def _poor_incumbent(monkeypatch, off: range, shed_kw: float, report: int = 1, bu
 
 
 def test_a_time_limited_plan_that_dodges_a_start_and_burns_its_whole_tank_is_repaired_by_the_threshold_controller(monkeypatch):
+    b = budget.use(monkeypatch)                                          # round 7 (tests-and-perf-12): the same plans under any load
     clean = optimise.solve(_offgrid_toy(155.0))
     assert clean["status"] in ("optimal", "feasible") and float(clean["sol"]["U"].sum()) * 0.25 < 1e-3  # solved properly, nothing is shed
     seen = _poor_incumbent(monkeypatch, range(10, 14), 20.0)
@@ -85,7 +87,8 @@ def test_a_time_limited_plan_that_dodges_a_start_and_burns_its_whole_tank_is_rep
     assert float(r["sol"]["F"].sum()) <= 155.0 + 1e-6
     assert r["status"] == "feasible" and r["time_limited"] is True        # the schedule is the controller's, not proven by the solver
     assert r["mip_gap"] is not None and 0.0 <= r["mip_gap"] < 1.0
-    assert rep["repair_seconds"] < 2.0                                     # the genset fixed: close to a linear programme
+    # the genset fixed: close to a linear programme, proven at its root node (the wall clock's 2 s before round 7)
+    assert b.solves[-1]["nodes"] <= 1 and b.solves[-1]["status"] == 0 and b.cpu_ok(), b.solves
 
 
 def _spy(monkeypatch) -> list[int]:
@@ -102,6 +105,7 @@ def _spy(monkeypatch) -> list[int]:
 
 
 def test_an_optimal_first_plan_that_dodges_with_fuel_left_is_solved_again_with_the_shed_rule(monkeypatch):
+    budget.use(monkeypatch)                                              # round 7 (tests-and-perf-12): "inside its limit" on any machine
     # verifier, round 4 (8.A.3 GAP 1): the check ran only on a plan that stopped at its limit, so the first problem's own optimum, which dodges
     # here (VoLL under the set's cost), was published as it stood: 40 kW load held on the threshold by shedding, the set off, the tank unlimited
     p = _offgrid_threshold(1e9, 50.0)
@@ -115,6 +119,7 @@ def test_an_optimal_first_plan_that_dodges_with_fuel_left_is_solved_again_with_t
 
 
 def test_an_optimal_first_plan_that_dodges_and_burns_its_whole_tank_is_repaired_without_counting_as_time_limited(monkeypatch):
+    budget.use(monkeypatch)                                              # round 7 (tests-and-perf-12): "inside its limit" on any machine
     p = _offgrid_threshold(6.0, 500.0)
     seen = _spy(monkeypatch)
     r = optimise.solve(p)
@@ -128,6 +133,7 @@ def test_an_optimal_first_plan_that_dodges_and_burns_its_whole_tank_is_repaired_
 
 
 def test_a_poor_first_plan_reported_optimal_is_repaired_as_one_that_stopped_at_its_limit(monkeypatch):
+    budget.use(monkeypatch)                                              # round 7 (tests-and-perf-12): "inside its limit" on any machine
     seen = _poor_incumbent(monkeypatch, range(10, 14), 20.0, report=0)
     p = _offgrid_toy(155.0)
     r = optimise.solve(p)
@@ -183,9 +189,11 @@ def _farm(fuel: float) -> str:
     return sid
 
 
-def test_the_400_l_farm_at_300_l_publishes_no_plan_that_sheds_with_the_set_off_and_fuel_in_the_tank(company):
+def test_the_400_l_farm_at_300_l_publishes_no_plan_that_sheds_with_the_set_off_and_fuel_in_the_tank(company, monkeypatch):
     # HANDOFF 8.A.3: at t0 = 2026-11-04 22:00 UTC the 10 s solve's incumbent burnt the whole 300 L and shed 4.6 kWh with the set off (steps 99
-    # and 100), so no re-solve ran; solved to optimality (75 to 90 s) it sheds nothing
+    # and 100), so no re-solve ran; solved to optimality (75 to 90 s) it sheds nothing. Round 7 (audit tests-and-perf-12): on a work budget
+    # (budget.py), the same plan on any machine
+    b = budget.use(monkeypatch)
     sid = _farm(300.0)
     at = int(datetime(2026, 11, 4, 22, 0, tzinfo=timezone.utc).timestamp())
     r = plans.tick(sid, at=at, time_limit=10.0)
@@ -200,7 +208,8 @@ def test_the_400_l_farm_at_300_l_publishes_no_plan_that_sheds_with_the_set_off_a
               and litres[t] < 300.0 - burn]                                                                         # fuel in the tank
     assert dodged == [], (dodged, r["summary"]["solver"])
     sv = r["summary"]["solver"]
-    assert r["solve_seconds"] < 30.0                                       # under three solver limits
+    # under three solver limits: at most three solves, each given the tick's limit (the wall clock's 30 s before round 7)
+    assert 1 <= len(b.solves) <= 3 and all(x["limit_s"] == 10.0 for x in b.solves) and b.cpu_ok(), b.solves
     assert isinstance(sv["time_limited"], bool) and sv["time_limit_s"] == 10.0 and sv["mip_gap"] is not None
     assert sv["time_limited"] == (r["summary"]["status_label"] == "Solved within the time limit")
     recent = plans.time_limited_recent(sid, 1, now=at)
@@ -216,6 +225,7 @@ def _farm_dodges(steps: list[dict], fuel: float) -> list[int]:
 
 
 def test_the_400_l_farm_at_300_l_publishes_no_dodge_when_its_first_solve_finishes_inside_its_limit(company, monkeypatch):
+    b = budget.use(monkeypatch)                                          # round 7 (tests-and-perf-12): the same plans under any load
     # verifier, round 4 (8.A.3 GAP 1): with a 60 s limit the first solve was optimal in 14.7 s and the tick published its dodge at steps 99
     # and 100 (4.6 kWh shed with the set off, the battery at 30 to 31 kWh over an 18 kWh cut-off, 149 L left), with no re-solve and no repair,
     # because the check ran only on a plan that stopped at its limit. Here the first solve returns that plan and reports it optimal, whatever
@@ -229,7 +239,8 @@ def test_the_400_l_farm_at_300_l_publishes_no_dodge_when_its_first_solve_finishe
     fixed = sv.get("shed_rule_resolve") or sv.get("threshold_repair")
     assert fixed and fixed["first_status"] == "optimal" and fixed["first_time_limited"] is False and fixed["shed_steps"] >= 1, sv
     assert _farm_dodges(r["steps"], 300.0) == [], sv
-    assert len(seen) >= 2 and r["solve_seconds"] < 30.0                    # under three solver limits
+    # under three solver limits: at most three solves, each given the tick's limit (the wall clock's 30 s before round 7)
+    assert len(seen) >= 2 and len(b.solves) <= 3 and all(x["limit_s"] == 10.0 for x in b.solves) and b.cpu_ok(), b.solves
 
 
 # ------------------------------------------------------------------------------------------------ 8.A.4 the merged charge slot's rate
@@ -286,6 +297,7 @@ def test_a_charge_slot_without_folded_steps_keeps_its_mean_rate():
 # ------------------------------------------------------------------------------------------------ 8.A.5 time-limited plans made visible
 
 def test_a_solve_says_whether_it_stopped_at_its_limit_and_the_gap_it_reached(monkeypatch):
+    budget.use(monkeypatch)                                              # round 7 (tests-and-perf-12): "not time-limited" on any machine
     r = optimise.solve(_problem(T=48, genset=True, outage=(8, 16)))
     assert r["status"] == "optimal" and r["time_limited"] is False and r["time_limit_s"] == 10.0
     assert r["mip_gap"] is not None and 0.0 <= r["mip_gap"] <= 1e-3 and r["dual_bound_rs"] is not None
