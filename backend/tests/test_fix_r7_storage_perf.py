@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
@@ -935,6 +936,26 @@ def test_the_compare_replays_a_plan_against_its_capture_once(world, monkeypatch)
     with world.use():
         plans.tick(sid)
     assert compare(a)[1] == 2
+    # the grid connection is the plant's too (its sanctioned load and export cap): a change of it is replayed afresh
+    with world.use():
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "sanctioned_load_kw": float(conn["data"].get("sanctioned_load_kw") or 100) + 50}, "t", conn["id"])
+    assert compare(a)[1] == 2
+    # two members asking at once while it is not yet made: one pair of replays, both answered from it
+    with world.use():
+        plans.tick(sid)
+    gate, slow = threading.Event(), twin.simulate
+    monkeypatch.setattr(twin, "simulate", lambda *x, **k: (gate.wait(5), slow(*x, **k))[1])
+    n = len(replays)
+    answers: list = []
+    both = [threading.Thread(target=lambda c=c: answers.append(c.get(f"/api/sites/{sid}/plan/compare").json())) for c in (a, v)]
+    for t in both:
+        t.start()
+    time.sleep(0.3)
+    gate.set()
+    for t in both:
+        t.join(30)
+    assert len(answers) == 2 and all(x["compare"] for x in answers) and len(replays) - n == 2
 
 
 # ------------------------------------------------------------------------------------------------ follow-up: plans.write_log's day of events

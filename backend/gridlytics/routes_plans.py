@@ -364,28 +364,47 @@ def plan_compare(site_id: str):
         return {"compare": None, "reason": "too_little_data"}
     steps = p["steps"]
     price, basis = _short_price(s, steps[0]["t"])
-    # the same plan against the same capture, plant and price is replayed once (round 7, storage-perf follow-up of security-roles-08: two
-    # 2,880-minute twin simulations a call, which any member, a viewer included, could loop)
+    # the same plan against the same capture, plant (its assets, settings and grid connection: twin.plant_of) and price is replayed once, and
+    # members asking at once while it is being made wait for that one (round 7, storage-perf follow-up of security-roles-08: two 2,880-minute twin
+    # simulations a call, which any member, a viewer included, could loop)
     key = (str(store.db_path()), site_id, p["id"], s["native"]["version"], price,
-           json.dumps({"assets": s.get("assets"), "data": s.get("data"), "native": s["native"].get("body")}, sort_keys=True, default=str))
-    with _compares_lock:
-        hit = _compares.get(key)
-        if hit is not None:
-            _compares.move_to_end(key)
-    if hit is not None:
-        return out(copy.deepcopy(hit))
-    answer = _compare(s, p, steps, price, basis)
-    with _compares_lock:
-        _compares[key] = answer
-        while len(_compares) > COMPARES_KEPT:
-            _compares.popitem(last=False)
-    return out(copy.deepcopy(answer))
+           json.dumps({"assets": s.get("assets"), "data": s.get("data"), "connections": [c.get("data") for c in s.get("connections") or []],
+                       "native": s["native"].get("body")}, sort_keys=True, default=str))
+    return out(copy.deepcopy(_compare_once(key, lambda: _compare(s, p, steps, price, basis))))
 
 
 #: the compare answers kept (GET /plan/compare): one a plan in force, for a few dozen sites
 COMPARES_KEPT = 64
 _compares: "OrderedDict[tuple, dict]" = OrderedDict()
+_compares_making: dict[tuple, threading.Lock] = {}
 _compares_lock = threading.Lock()
+
+
+def _compare_once(key: tuple, make) -> dict:
+    """The compare answer kept for `key`, else made by `make()` once: a request asking while another makes it waits for it."""
+    with _compares_lock:
+        hit = _compares.get(key)
+        if hit is not None:
+            _compares.move_to_end(key)
+            return hit
+        gate = _compares_making.setdefault(key, threading.Lock())
+    with gate:
+        with _compares_lock:
+            hit = _compares.get(key)
+        if hit is not None:
+            return hit
+        try:
+            answer = make()
+        except BaseException:
+            with _compares_lock:
+                _compares_making.pop(key, None)
+            raise
+        with _compares_lock:
+            _compares[key] = answer
+            _compares_making.pop(key, None)
+            while len(_compares) > COMPARES_KEPT:
+                _compares.popitem(last=False)
+        return answer
 
 
 def _compare(s: dict, p: dict, steps: list, price: float, basis: str) -> dict:
