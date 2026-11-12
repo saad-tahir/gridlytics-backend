@@ -25,5 +25,5 @@ Not used anywhere: Predbat (GPL), the AGPL Huawei library, python-microgrid in t
 
 ## Runtime dependencies
 
-FastAPI, Starlette, Pydantic, Uvicorn (MIT/BSD); NumPy, SciPy with HiGHS (BSD/MIT); pandas (BSD); PyJWT (MIT); cryptography (Apache-2.0/BSD);
-APScheduler (MIT); ReportLab (BSD); httpx (BSD).
+FastAPI, Starlette, Pydantic, Uvicorn (MIT/BSD); NumPy, SciPy with HiGHS (BSD/MIT); PyJWT (MIT); cryptography (Apache-2.0/BSD); APScheduler (MIT);
+ReportLab (BSD); httpx (BSD). These are the pins of `requirements.txt`, each imported or run by the app (`test_fix_r7_deploy_ci`).

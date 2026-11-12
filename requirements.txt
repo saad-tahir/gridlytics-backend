@@ -8,7 +8,6 @@ pydantic==2.13.5
 uvicorn==0.54.0
 numpy==2.4.3
 scipy==1.17.1
-pandas==3.0.2
 PyJWT==2.15.1
 cryptography==50.0.2
 APScheduler==3.11.0

@@ -334,3 +334,43 @@ def test_every_secret_file_a_deployer_or_the_seed_may_make_is_ignored_and_the_ex
         assert _ignored(path), f"{path} is not ignored: git add -A would commit it"
     for path in (".env.production.example", ".env.example", "demo/companies.template.csv", "backend/gridlytics/identity.py", "docs/DEPLOY.md"):
         assert not _ignored(path), f"{path} is ignored, but it belongs in the repository"
+
+
+# ------------------------------------------------------------------------------------------------ parity-architecture-19: only what ships is a dependency
+
+#: A pin's import name where it differs from the package's (lower-cased otherwise)
+_IMPORT_NAME = {"PyJWT": "jwt", "APScheduler": "apscheduler"}
+#: Pins the app runs as a command rather than imports: the server (the Dockerfile's CMD, the launcher, build_release)
+_RUN_AS_COMMAND = {"uvicorn"}
+
+
+def _imports(*folders: Path) -> set[str]:
+    """The top-level packages the files under these folders import, the standard library's and the app's own left out."""
+    import ast
+    import sys
+    found = set()
+    for folder in folders:
+        for path in folder.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Import):
+                    found |= {a.name.split(".")[0] for a in node.names}
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    found.add(node.module.split(".")[0])
+    return {name for name in found if name not in sys.stdlib_module_names and name != "gridlytics"}
+
+
+def test_every_runtime_pin_is_imported_or_run_by_the_app_and_every_import_is_pinned():
+    # plan Part 11.3 leaves unused dependencies behind; Solarlytics' test_requirements_w2 checks the import side, this the converse too: pandas was pinned
+    # (a large wheel in the image and the pip-audit surface) and listed as shipped in THIRD_PARTY_NOTICES, though nothing imports it
+    pinned = {_IMPORT_NAME.get(name, name.lower()) for name in _pins(ROOT / "requirements.txt")}
+    used = _imports(ROOT / "backend" / "gridlytics", ROOT / "scripts") | _RUN_AS_COMMAND
+    assert pinned - used == set(), f"pinned but neither imported nor run: {sorted(pinned - used)}"
+    assert used - pinned == set(), f"imported but not pinned: {sorted(used - pinned)}"
+
+
+def test_the_notices_list_the_runtime_dependencies_that_ship_and_no_other():
+    text = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    listed = text.split("## Runtime dependencies", 1)[1].split("\n## ", 1)[0].lower()
+    for name in _pins(ROOT / "requirements.txt"):
+        assert name.lower() in listed, f"{name} ships but THIRD_PARTY_NOTICES does not list it"
+    assert "pandas" not in listed
