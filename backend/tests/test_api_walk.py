@@ -73,7 +73,10 @@ def test_the_viewer_gets_no_rupees(world):
     assert client.post(f"/api/sites/{sid}/plan/solve", headers=h).status_code == 403
 
 
-def test_the_owner_solves_reports_holds_and_resumes(world):
+def test_the_owner_solves_reports_holds_and_resumes(world, monkeypatch):
+    from gridlytics import reports
+    # four days of demo history: R8 2.14 refuses a monthly savings report under a week of data (round 7, savings-page), which this walk is not about
+    monkeypatch.setattr(reports, "REPORT_DAYS_NEEDED", 0)
     client, password, _ = world
     h = _login(client, password, "owner@onyxleaf.demo")
     sid = client.get("/api/fleet", headers=h).json()["sites"][0]["id"]

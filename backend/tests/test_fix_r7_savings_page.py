@@ -591,3 +591,25 @@ def test_a_stored_report_is_marked_out_of_date_once_a_day_of_its_month_is_restat
     assert r.status_code == 200 and "monthly-savings-2026-10-out-of-date.pdf" in r.headers["content-disposition"], r.headers
     assert reports.file_name({**made, "out_of_date": False}, "csv").endswith("monthly-savings-2026-10.csv")
 
+
+# ------------------------------------------------------------------------------------------------ alerts-reports review: R8 2.14 on the server
+
+def test_a_monthly_savings_report_is_refused_for_a_site_with_fewer_than_seven_days_of_data(world):
+    """R8 2.14: "Fewer than 7 days of data: Generate offers only the Daily operations sheet". The web dialog kept to it (pages-D-25), but POST
+    /api/reports made a monthly savings report of a site with a day of data. The server now refuses it in one sentence; the daily operations sheet
+    is still made, and so is the savings report once the site has a week of data (its first reading, as the fleet's collecting day counts it)."""
+    import time
+    from gridlytics import reports
+    sid, a = world.site, world.c["analyst"]
+    this = datetime.now(PKT).strftime("%Y-%m")
+    now = int(time.time()) // 60 * 60
+    with world.use():
+        telemetry.write_rows([(sid, now - 2 * 86400, "csv", 1.0, 1000.0)], ("site_id", "ts", "source_id", "grid_present", "grid_import_wh"))
+    r = a.post("/api/reports", json={"kind": "monthly_savings", "site_id": sid, "period": this})
+    assert r.status_code == 422, r.text                                          # before: 200, a savings report on two days of data
+    assert r.json()["detail"] == (f"Mill One has fewer than {reports.REPORT_DAYS_NEEDED} days of data: its monthly savings report can be generated once "
+                                  "it has a week of data, and the daily operations sheet now"), r.text
+    assert a.post("/api/reports", json={"kind": "daily_operations", "site_id": sid}).status_code == 200
+    with world.use():
+        telemetry.write_rows([(sid, now - 8 * 86400, "csv", 1.0, 1000.0)], ("site_id", "ts", "source_id", "grid_present", "grid_import_wh"))
+    assert a.post("/api/reports", json={"kind": "monthly_savings", "site_id": sid, "period": this}).status_code == 200

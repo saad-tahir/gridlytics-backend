@@ -969,11 +969,27 @@ def data_since(site_id: str | None) -> date | None:
     return min(days) if days else None
 
 
+#: The days of data a site needs before its monthly savings report is made (R8 2.14: "Fewer than 7 days of data: Generate offers only the Daily
+#: operations sheet"), counted from its first reading as the fleet's `collecting_day` counts them, the web dialog's rule (round 7, alerts-reports
+#: review: only the dialog kept to it)
+REPORT_DAYS_NEEDED = 7
+
+
+def days_of_data(site_id: str, now: float | None = None) -> float:
+    """The days since a site's first reading (0 with none)."""
+    first = telemetry.first_ts(site_id)
+    return 0.0 if first is None else max(0.0, ((now if now is not None else datetime.now(timezone.utc).timestamp()) - int(first)) / 86400)
+
+
 def check_period(kind: str, site_id: str | None, period: str, today: date) -> tuple[date, date]:
     """What POST /api/reports accepts: period_bounds, and a period that does not end before the site's data starts (data_since; the company's for a
-    company kind, this month for a company with no sites), so '1999-01' is refused, not kept as an empty report. Raises ValueError with the sentence."""
+    company kind, this month for a company with no sites), so '1999-01' is refused, not kept as an empty report; and a monthly savings report only
+    of a site with REPORT_DAYS_NEEDED days of data. Raises ValueError with the sentence."""
     p0, p1 = period_bounds(kind, period, today)
     site = sites.get(site_id) if site_id else None
+    if kind == "monthly_savings" and site and days_of_data(site_id) < REPORT_DAYS_NEEDED:
+        raise ValueError(f"{site['name']} has fewer than {REPORT_DAYS_NEEDED} days of data: its monthly savings report can be generated once it has "
+                         "a week of data, and the daily operations sheet now")
     since = min(data_since(site_id or None) or today, today)
     if p1 < since:
         who = site["name"] if site else "The company"
