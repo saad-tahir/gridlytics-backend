@@ -3,8 +3,10 @@
 A captive-gas or RLNG genset's curve and price are per MMBtu, so every fuel figure of such a site is MMBtu, kept under the name `litres` (round 7
 sweeps, `savings_export.fuel_unit`). Neither the Overview's snapshot nor a plan said so, so the redesigned tiles could show a gas site's fuel only as
 hours (the plan's fallback). `GET /sites/:id/now` and a plan's `summary` now carry `fuel_unit`: "L" for diesel, "MMBtu" for captive gas and RLNG,
-null without a genset. The plan's is stored when it is made (the genset's fuel then); a plan stored before reads it from the fuel it planned on
-(`summary.fuel`, whose basis is "piped" for a gas genset and only for one). Not money: every reader reads it."""
+null without a genset. The plan's is stored when it is made (the genset's fuel then), null where the plan planned no genset: none at the site, or one
+whose start control is "none", which the plan cannot start (every fuel figure of it is 0). A plan stored before reads it from the fuel it planned on
+(`summary.fuel`, whose basis is "piped" for a gas genset and only for one, and which is null exactly where the plan planned no genset), so the two
+rules agree. `/now`'s is the genset's own, whoever starts it: its day and month figures are what it burnt. Not money: every reader reads it."""
 from __future__ import annotations
 
 import json
@@ -49,6 +51,24 @@ def test_a_plan_says_the_unit_of_its_genset_fuel(company, kind, unit):
     assert plans.get(sid, r["plan_id"])["summary"]["fuel_unit"] == unit   # stored with the plan
 
 
+@pytest.mark.parametrize("kind", ["hsd", "gas_captive"])
+def test_a_genset_the_plan_cannot_start_gives_no_unit_as_a_plan_stored_before_reads_it(company, kind):
+    """A genset whose start control is "none" (the SiteFields default) is not in the plan: its fuel figures are 0, `summary.fuel` is null, and the
+    plan says no unit, as the plan stored before K19 reads it from that null fuel (the page shows the plan's no-genset tile, never "Genset fuel 0 L").
+    A plan with a genset it can start reads back as stored, too: the stored rule and the fill-in give one answer (UX K19 check)."""
+    sid = _site(kind)
+    for control, unit in (("none", None), ("manual", sites.genset_fuel_unit({"fuel_kind": kind}))):
+        sites.update(sid, {"genset_start_control": control}, "t")
+        r = plans.tick(sid, at=T, steps=96)
+        assert r["status"] in ("active", "held"), r.get("reason")
+        s = r["summary"]
+        assert s["fuel_unit"] == unit, control
+        if control == "none":
+            assert s["fuel"] is None and s["breakdown"]["litres"] == 0
+        before = plans.get(sid, _stored(sid, {k: v for k, v in s.items() if k != "fuel_unit"}))["summary"]
+        assert "fuel_unit" in before and before["fuel_unit"] == unit, control
+
+
 def test_a_failed_solve_says_the_unit_too(company, monkeypatch):
     from gridlytics import optimise
     sid = _site("gas_captive")
@@ -73,8 +93,9 @@ def _stored(sid: str, summary: dict) -> str:
 
 def test_a_plan_stored_before_reads_its_unit_from_the_fuel_it_planned_on(company):
     """`summary.fuel` was stored by every plan since round 7 (engine-optimiser-05): "piped" is a gas genset's basis (plans.PIPED_FUELS is
-    sites.GAS_FUELS), any other a diesel tank's, null no genset. A plan older than that says nothing (left out: the page falls back to hours)."""
-    assert plans.PIPED_FUELS == sites.GAS_FUELS
+    sites.GAS_FUELS), any other a diesel tank's, null where the plan planned no genset (none at the site, or start control "none"). A plan older than
+    that says nothing (left out: the page falls back to hours)."""
+    assert plans.PIPED_FUELS is sites.GAS_FUELS
     sid = _site("hsd")
     cases = {"piped": ({"fuel": {"basis": "piped", "litres": None, "tank_l": None}}, "MMBtu"),
              "carried": ({"fuel": {"basis": "carried", "litres": 120.0, "tank_l": 400.0}}, "L"),
@@ -106,3 +127,17 @@ def test_now_says_the_unit_of_its_fuel_figures_to_every_reader(world):
         assert world.c[role].get(f"/api/sites/{world.site}/now").json()["fuel_unit"] == "MMBtu", role
     other = world.c["admin"].get(f"/api/sites/{world.other}/now").json()    # no genset
     assert "fuel_unit" in other and other["fuel_unit"] is None
+
+
+def test_the_fuel_log_takes_its_unit_from_the_one_rule(world, monkeypatch):
+    """The fuel log (K24) worked out its unit with its own copy of the rule (`fuel_kind in GAS_FUELS`): it now reads sites.genset_fuel_unit, as /now,
+    the plan, the genset page and the CSVs do, so a change of the rule reaches every answer at once (UX K19 check)."""
+    monkeypatch.setattr(sites, "genset_fuel_unit", lambda genset: "MMBtu" if genset else None)    # the world's mill burns diesel
+    r = world.c["operator"].post(f"/api/sites/{world.site}/genset/fuel?dry_run=true", json={"mmbtu": 5})
+    assert r.status_code == 200, r.text
+    assert (r.json()["unit"], r.json()["entry"]) == ("MMBtu", "billed")
+    r = world.c["operator"].post(f"/api/sites/{world.site}/genset/fuel?dry_run=true", json={"litres": 5})
+    assert r.status_code == 200 and r.json()["unit"] == "MMBtu", r.text
+    monkeypatch.setattr(sites, "genset_fuel_unit", lambda genset: "L" if genset else None)
+    r = world.c["operator"].post(f"/api/sites/{world.site}/genset/fuel?dry_run=true", json={"litres": 5})
+    assert r.status_code == 200 and r.json()["unit"] == "L", r.text

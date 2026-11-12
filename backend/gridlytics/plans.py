@@ -151,8 +151,9 @@ def _carried_genset(site_id: str, t0: int) -> dict:
     return {"u_prev": int(last), "elapsed": int(elapsed_steps), "hours_today": hours_today, "unknown": False}
 
 
-#: the fuel kinds that come by pipe: no tank to run dry, so the plan does not ration them (an explicit kind, never a tank of 0 litres)
-PIPED_FUELS = ("gas_captive", "lng_captive")
+#: the fuel kinds that come by pipe: no tank to run dry, so the plan does not ration them (an explicit kind, never a tank of 0 litres). The gas fuels,
+#: one list (sites.GAS_FUELS): a plan's fuel basis "piped" is how a plan stored before UX K19 tells its unit
+PIPED_FUELS = sites.GAS_FUELS
 
 
 def fuel_level(site: dict, t0: int) -> dict | None:
@@ -917,9 +918,10 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "tariff_notices": p.get("tariff_notices", []),
                # the tariff the plan is priced on (plan_tariff, over the steps it holds; UX backend ask K14), null off-grid
                "tariff": tariff_over(p.get("tariff"), p.get("ts")),
-               # the unit of the plan's fuel figures (breakdown.litres, each step's litres): "L", "MMBtu" for a gas genset, null without a genset
-               # (UX backend ask K19), the genset's fuel as the plan was made
-               "fuel_unit": sites.genset_fuel_unit((site.get("assets") or {}).get("genset"))}
+               # the unit of the plan's fuel figures (breakdown.litres, each step's litres): "L", "MMBtu" for a gas genset (UX backend ask K19), the
+               # genset's fuel as the plan was made; null where the plan planned no genset, as its `fuel` is: none at the site, or one whose start
+               # control is "none", which the plan cannot start (all its fuel figures 0), so a plan stored before reads the same (_stored_fuel_unit)
+               "fuel_unit": sites.genset_fuel_unit((site.get("assets") or {}).get("genset")) if fuel else None}
     # how many of the plans made in the 24 hours to this one, this one included, stopped at their time limit (round 7, engine-plans-live-19:
     # time_limited_recent counted them and nothing read it), for the plan page; a failed solve counts as a plan, never as time-limited
     recent = time_limited_recent(site_id, 24.0, now)
@@ -1044,7 +1046,8 @@ def _iso(ts: int) -> str:
 def _stored_fuel_unit(summary: dict) -> None:
     """A plan stored before its summary carried `fuel_unit` (UX backend ask K19) reads it from the fuel it planned on, which every plan since round 7
     (engine-optimiser-05) stored: "piped" is a gas genset's basis and only a gas genset's (PIPED_FUELS is sites.GAS_FUELS), any other a diesel
-    tank's, null no genset. A plan older than that is left without it (the page falls back to hours)."""
+    tank's; null where the plan planned no genset (none at the site, or start control "none"), as tick stores it now. A plan older than that is left
+    without it (the page falls back to hours)."""
     if not isinstance(summary, dict) or "fuel_unit" in summary or "fuel" not in summary:
         return
     fuel = summary["fuel"]

@@ -211,7 +211,8 @@ when the answer is.
   question Q20 (the viewer reads Plan and the Inverter table, energy only, no actions): the recommended yes ships; a viewer's mark, re-solve and every
   control action are refused (403), as before.
 - **K19, the fuel unit** (plan D9.9, D2.9, D3.1.3): `GET /now` and every plan's `summary` carry `fuel_unit` ("L", "MMBtu" for captive gas and RLNG,
-  null without a genset; `sites.genset_fuel_unit`, which `savings_export.fuel_unit` now reads too, so the CSVs and the answers follow one rule). The
+  null without a genset, and in a plan null too where the genset's start control is "none": see the check below; `sites.genset_fuel_unit`, which
+  `savings_export.fuel_unit` and the fuel log now read too, so the CSVs and the answers follow one rule). The
   figures stay under `litres`, as the K24 log's and every gas figure before them do. Two decisions:
   - **Beside `breakdown`, not in it.** The plan says "the plan breakdown"; `summary.breakdown` holds the solver's figures, every one a number, which the
     web app types `Record<string, number>` and sums by name. `summary.fuel_unit` is the unit of `breakdown.litres` and of each step's `litres`.
@@ -221,6 +222,27 @@ when the answer is.
     run hours only, the plan's fallback. Never the genset's fuel now, which may have changed since (the K24 rule: a figure keeps its own unit).
   - Owner's question Q8 (no unit switch anywhere; fuel follows the fuel): the recommended yes ships. The unit is the site's genset's, the same for
     every reader; nothing asks a reader for a unit.
+
+### Batch k3, the check (12 Nov 2026)
+
+Independent checkers read K14, K17 and K19; each finding was tried against the code and every one held ("UX K14 check", "UX K17 check" and "UX K19
+check" commits). No answer the page reads changed shape. What changed:
+
+- **A genset the plan cannot start.** A plan's `summary.fuel` is null not only without a genset but where its start control is "none" (the SiteFields
+  default): build_problem leaves such a genset out, and every fuel figure of the plan is 0. A plan stored before K19 at such a site read back
+  `fuel_unit: null` from that null fuel, while a plan made now said "L", so one site's plan versions would have taken the no-genset tile and "Genset
+  fuel 0 L" by turns. A plan's `fuel_unit` is now null wherever the plan planned no genset, as its `fuel` is: the stored rule and the fill-in give one
+  answer (the test reads a fresh plan back with its unit taken off), and the page's no-genset tile ("Grid import or Export", D3.1.3) serves a genset
+  the plan cannot start, never "Genset fuel 0 L". `/now`'s `fuel_unit` stays the genset's own whoever starts it: its day and month figures are what
+  the genset burnt.
+- **Up to three tariff versions.** A 48-hour horizon from any time but midnight touches three Karachi days, so with a new schedule from each of the
+  next two midnights `versions` holds three. The backend was right; the contract, the type's comment and `plan_tariff`'s docstring said one or two,
+  and a page built to them would have dropped the third. The page draws a line "From <first day>: <name>" for each version after the first.
+- **One rule for the fuel's unit.** The fuel log (K24) worked its unit out with its own copy of the rule; it now reads `sites.genset_fuel_unit`, and
+  `plans.PIPED_FUELS` is `sites.GAS_FUELS` itself, not a second list that must equal it.
+- **The role walk's K17 check** compared the viewer's and the key's answers with the administrator's filtered one, which still holds when a gain is
+  named so that the filter leaves it. It now also requires the administrator's gains to be named `gain_rs`, the walk to have seen one, and the
+  viewer's and the key's issued rows and held re-issue to hold no number at all.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 

@@ -682,10 +682,12 @@ class FuelLogIn(Strict):
         return v
 
 
-def _genset_fuel(site_id: str) -> tuple[bool, bool]:
-    """(the site has a genset, it burns gas: captive gas or RLNG)."""
+def _genset_fuel(site_id: str) -> tuple[bool, bool, str]:
+    """(the site has a genset, it burns gas: captive gas or RLNG, the unit of its fuel: "MMBtu" for gas, else "L"), by the one rule every fuel figure's
+    unit follows (sites.genset_fuel_unit; UX K19 check: the log had its own copy of it)."""
     gen = sites.assets(site_id).get("genset")
-    return gen is not None, gen is not None and (gen.get("fuel_kind") or "hsd") in sites.GAS_FUELS
+    unit = sites.genset_fuel_unit(gen) or "L"
+    return gen is not None, unit == "MMBtu", unit
 
 
 def _fuel_amount(body: FuelLogIn, has_genset: bool, gas: bool) -> tuple[float, str, dict]:
@@ -765,13 +767,12 @@ def fuel_log(site_id: str, inp: dict = Body(...), dry_run: bool = False):
     auth.need("upload_data", "Logging fuel")
     site_or_404(site_id)
     body = check(FuelLogIn, inp)
-    has_genset, gas = _genset_fuel(site_id)
+    has_genset, gas, unit = _genset_fuel(site_id)
     amount, entry, reading = _fuel_amount(body, has_genset, gas)
     day = parse_day(body.day, today())
     cost = body.cost_rs
     if cost is not None and not 0 <= cost < 1e9:
         raise Refusal(422, "The cost is a number of rupees from 0", "invalid")
-    unit = "MMBtu" if gas else "L"
     answer = {"logged": amount, "unit": unit, "entry": entry, "day": day.isoformat(), "hm3": reading.get("hm3"),
               "calorific_mmbtu_per_hm3": reading.get("calorific_mmbtu_per_hm3")}
     if dry_run:
