@@ -68,6 +68,8 @@ def _send(base: str, method: str, path: str, body=None, token: str | None = None
 
 def _password(accounts: Path, email: str) -> str:
     """The password the seed gave `email`: the cell after the email in the accounts list (never printed)."""
+    if not accounts.is_file():
+        raise SystemExit(f"The seed wrote no accounts list at {accounts}")
     for line in accounts.read_text(encoding="utf-8").splitlines():
         if f"`{email}`" in line:
             cells = [c.strip().strip("`") for c in line.split("|")]
@@ -116,7 +118,11 @@ def main(argv: list[str] | None = None) -> int:
     if done.returncode != 0:
         shutil.rmtree(data, ignore_errors=True)
         raise SystemExit(f"The seed stopped (exit code {done.returncode}): {done.stderr[-2000:]}")
-    password = _password(accounts, OWNER)
+    try:
+        password = _password(accounts, OWNER)
+    except SystemExit:
+        shutil.rmtree(data, ignore_errors=True)
+        raise
     server = subprocess.Popen([sys.executable, "-m", "uvicorn", "gridlytics.api:app", "--host", "127.0.0.1", "--port", str(args.port), "--log-level",
                                "warning", "--no-proxy-headers", "--no-server-header"], cwd=ROOT / "backend", env=env)
     base = f"http://127.0.0.1:{args.port}"

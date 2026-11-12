@@ -243,6 +243,14 @@ def test_the_release_folder_runs_the_api_and_the_page_on_one_port_with_its_own_d
     finally:
         server.terminate()
         server.wait(timeout=15)
+    # the release's restore script, run as its README says with the app stopped, from another folder: it takes the package from the release's app (an
+    # import that fails ends with status 1 and a traceback) and reads the release's own data folder, never the repository's. With no company made yet it
+    # answers with its own sentence: the list, or (no registry until a first sign-in makes one) its refusal, status 2
+    listed = subprocess.run([sys.executable, str(folder / "restore_backup.py")], cwd=tmp_path, env={k: v for k, v in env.items() if k != "GRIDLYTICS_PORT"},
+                            capture_output=True, text=True, timeout=120)
+    said = listed.stdout + listed.stderr
+    assert listed.returncode in (0, 2) and "Traceback" not in said, said
+    assert str((folder / "data").resolve()) in said, said
 
 
 def test_the_load_check_refuses_the_owners_ports_and_a_busy_one(capsys):
@@ -256,6 +264,18 @@ def test_the_load_check_refuses_the_owners_ports_and_a_busy_one(capsys):
         busy.listen(1)
         with pytest.raises(SystemExit, match="already in use"):
             load.main(["--port", str(busy.getsockname()[1])])
+
+
+def test_the_load_check_says_why_and_removes_its_folder_when_the_seed_leaves_no_accounts(tmp_path, monkeypatch):
+    # round 7 review: a seed that ended well but wrote no accounts list stopped the check with a FileNotFoundError traceback, its throwaway folder left
+    load = _script("load_check")
+    made = tmp_path / "gridlytics-load-test"
+    made.mkdir()
+    monkeypatch.setattr(load.tempfile, "mkdtemp", lambda prefix: str(made))
+    monkeypatch.setattr(load.subprocess, "run", lambda args, **kw: load.subprocess.CompletedProcess(args, 0, "", ""))
+    with pytest.raises(SystemExit, match="wrote no accounts list"):
+        load.main(["--port", str(_free_port()), "--demo-days", "0"])
+    assert not made.exists()
 
 
 def test_the_load_check_measures_a_server_of_its_own_on_throwaway_data(capsys):
