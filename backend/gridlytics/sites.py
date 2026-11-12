@@ -349,6 +349,16 @@ FUEL_CURVES = {"hsd": {"a": 0.273, "b": 0.033, "tank_l": 2000.0},
                "gas_captive": {"a": 0.0085, "b": 0.0010, "tank_l": 0.0},
                "lng_captive": {"a": 0.0085, "b": 0.0010, "tank_l": 0.0}}
 GAS_FUELS = ("gas_captive", "lng_captive")
+
+
+def genset_fuel_unit(genset: dict | None) -> str | None:
+    """The unit of a genset's fuel figures (every `litres` of its plan, its day rows and its month): "L" for diesel, "MMBtu" for captive gas or RLNG,
+    whose curve and price are per MMBtu (GAS_FUELS); None without a genset (UX backend ask K19)."""
+    if not genset:
+        return None
+    return "MMBtu" if (genset.get("fuel_kind") or "hsd") in GAS_FUELS else "L"
+
+
 #: A curve in the other fuel's unit: a diesel slope under 0.1 L a kWh would burn under one kWh of diesel for a kWh out, and a gas slope over 0.05 MMBtu
 #: a kWh (under 7 % efficient) or a no-load term over 0.01 MMBtu an hour per rated kW is a diesel curve in litres
 HSD_A_MIN, GAS_A_MAX, GAS_B_MAX = 0.1, 0.05, 0.01

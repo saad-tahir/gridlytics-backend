@@ -114,6 +114,30 @@ def test_a_request_for_access_reaches_the_founder_from_anyone_signed_in_or_not(w
     assert r.status_code == 200 and r.json()["request"]["state"] == "contacted", r.text
 
 
+def test_the_plan_section_reads_alike_for_every_role_in_energy(world):
+    """UX backend asks K14, K17 and K19 (plan step 7): every role reads the latest plan's tariff (`summary.tariff`) and fuel unit
+    (`summary.fuel_unit`), the Overview's `fuel_unit` and the control answer (the Inverter table), the tariff and the units the same for each; the
+    viewer's control answer carries no gain. The Karachi feed mill's genset burns captive gas, the others' diesel; the Rahim Yar Khan farm is off-grid."""
+    client, password, _ = world
+    seen: dict[str, dict] = {}
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        for row in client.get("/api/fleet", headers=h).json()["sites"]:
+            sid = row["id"]
+            summary = client.get(f"/api/sites/{sid}/plans?limit=1", headers=h).json()[0]["summary"]
+            now = client.get(f"/api/sites/{sid}/now", headers=h).json()
+            control = client.get(f"/api/sites/{sid}/control", headers=h)
+            assert control.status_code == 200, (email, row["name"], control.text[:200])
+            if email.startswith("viewer"):
+                assert "gain_rs" not in control.text, row["name"]
+            got = {"tariff": summary["tariff"], "plan_unit": summary["fuel_unit"], "now_unit": now["fuel_unit"]}
+            assert seen.setdefault(row["name"], got) == got, (email, row["name"])
+    assert {n: (g["plan_unit"], g["now_unit"]) for n, g in seen.items()} == {
+        "Faisalabad textile mill (demo)": ("L", "L"), "Lahore mall (demo)": ("L", "L"), "Karachi feed mill (demo)": ("MMBtu", "MMBtu"),
+        "Rahim Yar Khan farm (demo)": ("L", "L")}
+    assert [n for n, g in seen.items() if g["tariff"] is None] == ["Rahim Yar Khan farm (demo)"]
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

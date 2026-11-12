@@ -857,7 +857,8 @@ def site_header(site_id: str):
 
 @router.get("/api/sites/{site_id}/now")
 def site_now(site_id: str):
-    """The overview's snapshot: the energy flow now, the plan's current step and the next three reasons, today's and the month's figures."""
+    """The overview's snapshot: the energy flow now, the plan's current step and the next three reasons, today's and the month's figures, and the unit
+    of their fuel figures (`fuel_unit`, UX backend ask K19: a gas genset's are MMBtu, kept under `litres`)."""
     s = full_or_404(site_id)
     now = now_ts()
     last = telemetry.latest(site_id)
@@ -892,7 +893,9 @@ def site_now(site_id: str):
                                             "soc_source": telemetry.soc_source(site_id, bs)} if bs else None,
                 "alerts": alerts.listing("active", site_id)[:5], "last_data": last["ts"] if last else None,
                 "first_data": telemetry.first_ts(site_id), "today_kpis": _today_kpis(s, td, bs, now, t),
-                "genset_requests": _waiting_genset_requests(site_id)})
+                "genset_requests": _waiting_genset_requests(site_id),
+                # the unit of today.litres and month.litres: "L", "MMBtu" for a captive-gas or RLNG genset, null without a genset (UX K19)
+                "fuel_unit": sites.genset_fuel_unit(a.get("genset"))})
 
 
 @router.get("/api/sites/{site_id}/overview/chart")

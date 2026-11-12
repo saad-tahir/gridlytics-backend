@@ -209,6 +209,17 @@ when the answer is.
   (`money.for_key`), with no rupee in words and none of the administrator's figures; the role walk checks the same at every demo site. Owner's
   question Q20 (the viewer reads Plan and the Inverter table, energy only, no actions): the recommended yes ships; a viewer's mark, re-solve and every
   control action are refused (403), as before.
+- **K19, the fuel unit** (plan D9.9, D2.9, D3.1.3): `GET /now` and every plan's `summary` carry `fuel_unit` ("L", "MMBtu" for captive gas and RLNG,
+  null without a genset; `sites.genset_fuel_unit`, which `savings_export.fuel_unit` now reads too, so the CSVs and the answers follow one rule). The
+  figures stay under `litres`, as the K24 log's and every gas figure before them do. Two decisions:
+  - **Beside `breakdown`, not in it.** The plan says "the plan breakdown"; `summary.breakdown` holds the solver's figures, every one a number, which the
+    web app types `Record<string, number>` and sums by name. `summary.fuel_unit` is the unit of `breakdown.litres` and of each step's `litres`.
+  - **A plan's unit is its genset's fuel when it was made**, stored with it; a plan stored before reads it from the fuel it planned on
+    (`summary.fuel.basis` "piped" is a gas genset's and only a gas genset's: `plans.PIPED_FUELS` is `sites.GAS_FUELS`), so the plan in force when this
+    ships, and the versions under it, read right at once. A plan older than the stored fuel (round 7, engine-optimiser-05) has none: the tile shows
+    run hours only, the plan's fallback. Never the genset's fuel now, which may have changed since (the K24 rule: a figure keeps its own unit).
+  - Owner's question Q8 (no unit switch anywhere; fuel follows the fuel): the recommended yes ships. The unit is the site's genset's, the same for
+    every reader; nothing asks a reader for a unit.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 

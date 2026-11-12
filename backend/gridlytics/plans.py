@@ -915,7 +915,10 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                # a tariff version awaiting its notification the horizon reaches: the plan is priced with the one still in force (engine-tariffs-06)
                "tariff_notices": p.get("tariff_notices", []),
                # the tariff the plan is priced on (plan_tariff, over the steps it holds; UX backend ask K14), null off-grid
-               "tariff": tariff_over(p.get("tariff"), p.get("ts"))}
+               "tariff": tariff_over(p.get("tariff"), p.get("ts")),
+               # the unit of the plan's fuel figures (breakdown.litres, each step's litres): "L", "MMBtu" for a gas genset, null without a genset
+               # (UX backend ask K19), the genset's fuel as the plan was made
+               "fuel_unit": sites.genset_fuel_unit((site.get("assets") or {}).get("genset"))}
     # how many of the plans made in the 24 hours to this one, this one included, stopped at their time limit (round 7, engine-plans-live-19:
     # time_limited_recent counted them and nothing read it), for the plan page; a failed solve counts as a plan, never as time-limited
     recent = time_limited_recent(site_id, 24.0, now)
@@ -1037,9 +1040,20 @@ def _iso(ts: int) -> str:
 
 # ------------------------------------------------------------------------------------------------ reading
 
+def _stored_fuel_unit(summary: dict) -> None:
+    """A plan stored before its summary carried `fuel_unit` (UX backend ask K19) reads it from the fuel it planned on, which every plan since round 7
+    (engine-optimiser-05) stored: "piped" is a gas genset's basis and only a gas genset's (PIPED_FUELS is sites.GAS_FUELS), any other a diesel
+    tank's, null no genset. A plan older than that is left without it (the page falls back to hours)."""
+    if not isinstance(summary, dict) or "fuel_unit" in summary or "fuel" not in summary:
+        return
+    fuel = summary["fuel"]
+    summary["fuel_unit"] = None if not isinstance(fuel, dict) else "MMBtu" if fuel.get("basis") == "piped" else "L"
+
+
 def _plan_out(r, with_steps: bool = True) -> dict:
     d = dict(r)
     d["summary"] = json.loads(d["summary"] or "{}")
+    _stored_fuel_unit(d["summary"])
     if with_steps:
         d["steps"] = json.loads(d["steps"]) if d.get("steps") else []
         d["slots"] = json.loads(d["slots"]) if d.get("slots") else None

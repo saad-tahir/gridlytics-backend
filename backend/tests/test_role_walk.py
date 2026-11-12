@@ -322,6 +322,32 @@ def test_the_control_answer_is_the_administrators_without_its_money_for_a_viewer
     assert seen == 5                                        # four sites read by the viewer, the key's own site by the key
 
 
+def test_the_plan_names_its_tariff_and_its_fuel_unit_to_every_reader(walk):
+    """UX backend asks K14 and K19 (plan D9.4, D9.9): the plan's `summary.tariff` (the schedule version it was priced on) and `summary.fuel_unit`, and
+    the Overview's `fuel_unit`, are words, ids and dates: the money filter leaves them whole for a viewer and a key. The Karachi feed mill's genset
+    burns captive gas (MMBtu), the others' diesel (L); the Rahim Yar Khan farm is off-grid, priced on no tariff."""
+    fleet = {s["id"]: s for s in walk["client"].get("/api/fleet", headers=walk["headers"]["admin"]).json()["sites"]}
+    units, offgrid = {}, []
+    # the latest plan made at each site (the plan list: a site whose plan is held for the moment has none in force)
+    for url, got in walk["answers"]["/api/sites/{site_id}/plans"].items():
+        sid = url.split("/")[3]
+        summary = got["admin"][1][0]["summary"]
+        for reader in ("viewer", "key"):
+            if reader in got:
+                other = got[reader][1][0]["summary"]
+                assert (other["tariff"], other["fuel_unit"]) == (summary["tariff"], summary["fuel_unit"]), (url, reader)
+        units[fleet[sid]["name"]] = summary["fuel_unit"]
+        if summary["tariff"] is None:
+            offgrid.append(fleet[sid]["name"])
+        else:
+            assert summary["tariff"]["disco"] and summary["tariff"]["category"] and summary["tariff"]["versions"], url
+    assert units == {"Faisalabad textile mill (demo)": "L", "Lahore mall (demo)": "L", "Karachi feed mill (demo)": "MMBtu",
+                     "Rahim Yar Khan farm (demo)": "L"}
+    assert offgrid == ["Rahim Yar Khan farm (demo)"]
+    for url, got in walk["answers"]["/api/sites/{site_id}/now"].items():
+        assert got["viewer"][1]["fuel_unit"] == got["admin"][1]["fuel_unit"] == units[fleet[url.split("/")[3]]["name"]], url
+
+
 def test_a_request_for_access_is_anyones_to_send_and_only_the_founders_to_read(walk, monkeypatch):
     """UX backend asks K2 and K3: the contact page's request for access goes to the founder from anyone signed in (202 with no body: nothing to filter;
     a site key is refused, as on every path that names no site), and none of the company's readers reaches the founder's Access requests, whose
