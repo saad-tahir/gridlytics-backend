@@ -811,3 +811,22 @@ def test_the_fuel_logs_audit_line_names_the_unit_of_the_gensets_fuel(world):
         line = next(a for a in store.list_audit() if a["action"] == "logged fuel")
     detail = line["detail"] if isinstance(line["detail"], dict) else json.loads(line["detail"])
     assert detail["litres"] == 4.5 and detail["fuel_unit"] == "MMBtu", detail
+
+
+def test_an_off_grid_sites_savings_days_carry_no_outage_hours(world):
+    """Integration (savings-page's per-day outage hours with sweeps' role-operator-10): an off-grid site's grid reads 0 on every minute, so its day rows
+    count the whole day an outage. The period's outage time is null at such a site; each day's outage hours are null too, so the page never explains a
+    losing day by an outage the site cannot have."""
+    sid = world.site
+    with world.use():
+        _put_rows(sid, {"2026-10-03": {"native": _row(-50.0, -50.0), "tuned": _row(-10.0, -10.0)},
+                        "2026-10-04": {"native": _row(80.0, 80.0), "tuned": _row(20.0, 20.0)}})
+        _put_tdays(sid, {"2026-10-03": {"outage_minutes": 1440}, "2026-10-04": {"outage_minutes": 1440}})
+    page = world.c["analyst"].get(f"/api/sites/{sid}/savings", params={"start": "2026-10-03", "end": "2026-10-04"}).json()
+    assert [d["outage_hours"] for d in page["days"]] == [24.0, 24.0]               # a grid site in a day-long outage
+    with world.use():
+        conn = sites.connections(sid)[0]
+        sites.put_connection(sid, {**conn["data"], "regime": "off_grid"}, "test", conn_id=conn["id"])
+    page = world.c["analyst"].get(f"/api/sites/{sid}/savings", params={"start": "2026-10-03", "end": "2026-10-04"}).json()
+    assert page["energy"]["outage_hours"] is None
+    assert [d["outage_hours"] for d in page["days"]] == [None, None]
