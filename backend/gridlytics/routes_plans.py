@@ -136,32 +136,16 @@ def plan_current(site_id: str):
 
 
 def _held(site_id: str) -> dict | None:
-    """Why no plan is in force: plans.held_info where the optimiser provides it, else derived here from the pause or release in force (its reason and
-    end) and the latest plan row (held: its id, and its guard's reason when no pause or release is in force)."""
-    now = now_ts()
-    info = getattr(plans, "held_info", None)
-    if callable(info):
-        try:
-            try:
-                h = info(site_id, now)
-            except TypeError:
-                h = info(site_id)
-            if h is None:
-                return None
-            out_h = {"reason": h.get("reason"), "until": h.get("until"), "plan_id": h.get("plan_id")}
-            if h.get("since"):
-                out_h["since"] = h["since"]                 # an expired plan: when it ran out
-            return out_h
-        except Exception:
-            log.exception("plans.held_info failed for site %s; the held answer is derived here", site_id)
-    rel = plans.control_release(site_id, now)
-    last = (plans.history(site_id, 1) or [None])[0]
-    held_id = last["id"] if last and last.get("status") == "held" else None
-    if rel:
-        return {"reason": rel["reason"], "until": rel.get("until"), "plan_id": held_id if held_id and last.get("reason") == rel["reason"] else None}
-    if held_id:
-        return {"reason": last.get("reason") or "held", "until": None, "plan_id": held_id}
-    return None
+    """Why no plan is in force, as plans.held_info reads it at the request's time: `{reason, until, plan_id}`, with `since` for a plan that ran out.
+    A fault in held_info is the server's error (round 7, the product half of audit tests-and-perf-20: a fallback from before held_info existed
+    caught it and derived an answer of its own, so a fault was logged and hidden)."""
+    h = plans.held_info(site_id, now_ts())
+    if h is None:
+        return None
+    out_h = {"reason": h.get("reason"), "until": h.get("until"), "plan_id": h.get("plan_id")}
+    if h.get("since"):
+        out_h["since"] = h["since"]                 # an expired plan: when it ran out
+    return out_h
 
 
 @router.get("/api/sites/{site_id}/plans")

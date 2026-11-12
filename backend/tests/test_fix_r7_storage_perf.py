@@ -1127,3 +1127,28 @@ def test_a_connection_to_a_workspace_file_this_process_made_ready_runs_no_pragma
     with store.connect() as con:
         con.execute("SELECT COUNT(*) FROM sites").fetchone()
     assert any("PRAGMA USER_VERSION" in s.upper() for s in statements)          # checked again after the restore
+
+
+# ------------------------------------------------------------------------------------------------ tests-and-perf-20 (the product half)
+
+def test_the_plan_answer_reads_why_no_plan_is_in_force_from_held_info_alone(world, monkeypatch):
+    """routes_plans._held wrapped plans.held_info in a broad except, asked it again without the time on a TypeError and otherwise derived the answer
+    itself, a fallback from before held_info existed: a fault in held_info was logged and hidden behind an answer of _held's own (round 7, the
+    product half of audit tests-and-perf-20, whose test half removed the tests that forced the fallback). GET /plan now answers held_info's reading,
+    asked once with the request's time, and a fault in it is the server's error."""
+    from gridlytics import routes_plans
+    calls = []
+
+    def held(site_id, now=None):
+        calls.append((site_id, now))
+        return {"reason": "control_paused", "until": "u", "plan_id": "p", "kind": "pause_control"}
+    monkeypatch.setattr(plans, "held_info", held)
+    monkeypatch.setattr(routes_plans, "now_ts", lambda: 1_800_000_000)
+    v = world.c["viewer"]
+    assert v.get(f"/api/sites/{world.site}/plan").json() == {"plan": None, "held": {"reason": "control_paused", "until": "u", "plan_id": "p"}}
+    assert calls == [(world.site, 1_800_000_000)]
+
+    def broken(site_id, now=None):
+        raise RuntimeError("a fault in held_info")
+    monkeypatch.setattr(plans, "held_info", broken)
+    assert v.get(f"/api/sites/{world.site}/plan").status_code == 500
