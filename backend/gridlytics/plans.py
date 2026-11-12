@@ -16,7 +16,6 @@ from . import delivery, forecast, optimise, sites, solar, store, tariffs, teleme
 
 PKT = timezone(timedelta(hours=5))
 H = 0.25
-SELFGEN_DUTY_RS_PER_KWH = 0.04  # Punjab, above 500 kVA (plan Part 4.1)
 
 
 def _local(ts: int) -> datetime:
@@ -96,8 +95,15 @@ def month_to_date(site_id: str, conn: dict | None, t0: int) -> dict:
         full = n_known >= interval * 0.8
         return uniq[full] * interval * 60, sums[full] / np.maximum(n_known[full], 1.0)
 
-    _, means = block_means(in_month)
-    m0 = float(means.max()) if len(means) else 0.0
+    # the month's peak so far as the bill reads it: its block mode and scope from the connection's site override (round 7 stage 2, engine-tariffs-08 h)
+    ov = tariffs.site_override(conn, _local(t0).date()) if conn else {}
+    only_peak = ov.get("mdi_scope", "all_hours") == "peak"
+    if ov.get("mdi_block", "fixed") == "sliding":
+        sel = in_month & k_imp
+        m0 = tariffs._mdi(g["ts"][sel], imp[sel], pk[sel] if only_peak else None, interval, "sliding") if sel.any() else 0.0
+    else:
+        _, means = block_means(in_month & pk if only_peak else in_month)
+        m0 = float(means.max()) if len(means) else 0.0
     # the month's expected peak (round 7, engine-optimiser-02, engine-plans-live-07): the second-highest local day's peak of the seven days
     # before t0, so one odd day does not set it. At a month's start M0 is near nothing, and every kW above the floor was priced as a whole
     # month's demand charge: the plan drained the battery off-peak on the 1st to hold a peak the month's weekdays then passed anyway (Karachi:
@@ -266,16 +272,16 @@ def control_release(site_id: str, at: int | None = None) -> dict | None:
     return switchback_release(site_id, forecast.align(at))
 
 
-def offgrid_c_next(g_asset: dict, fuel_price: float, load: np.ndarray, pv: np.ndarray) -> float:
+def offgrid_c_next(g_asset: dict, fuel_price: float, load: np.ndarray, pv: np.ndarray, duty: float = 0.0) -> float:
     """The off-grid terminal value's price of a kWh left in the battery at the horizon's end: the ledger's rule (verify.compute_day's v_end), the
     genset's all-in cost per kWh at its after-dark load ratio (verify.night_load_ratio), here on the forecast load and PV of the horizon's last
     day. Not at 75 % load: after dark the set carries a small load near its minimum, where its no-load burn and run-hour cost weigh on every kWh,
-    so the plan and the savings ledger value stored energy alike."""
+    so the plan and the savings ledger value stored energy alike. `duty`: the self-generation duty per kWh (tariffs.selfgen_duty), as the ledger."""
     from . import verify  # verify imports plans at module load
 
     ratio = verify.night_load_ratio(g_asset, {"pv": np.asarray(pv, dtype=float), "load": np.asarray(load, dtype=float)})
     return optimise._gen_marginal({"S": g_asset["rated_kw"], "a": g_asset["a"], "b": g_asset["b"], "c_fuel": float(fuel_price),
-                                   "c_om": g_asset["c_om_rs_per_kwh"], "c_runhr": g_asset["c_runhr_rs"]}, ratio)
+                                   "c_om": g_asset["c_om_rs_per_kwh"] + float(duty), "c_runhr": g_asset["c_runhr_rs"]}, ratio)
 
 
 def fallback_floor_pct(site: dict) -> float:
@@ -315,7 +321,9 @@ def terminal_cal_hold(b_cal: np.ndarray, c_imp: np.ndarray, load: np.ndarray, pv
 
 
 def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
-    conn = (site.get("connections") or [None])[0]
+    # the connection the plant and the site's meter readings are on (round 7 stage 2, tracker-and-docs-01): the plan's import and export are its; a
+    # site's other connections carry loads the plan neither meters nor changes, so their bills are the same whatever it does
+    conn = sites.plant_connection(site)
     a = site.get("assets") or {}
     b_asset, g_asset = a.get("battery"), a.get("genset")
     d = site["data"]
@@ -369,7 +377,10 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         p["mdi"] = {"rate": vec["mdi"]["rate_rs_per_kw"], "M0": mtd["M0"], "floor": vec["mdi"]["floor_kw"], "n_mdi": vec["mdi"]["interval_steps"],
                     "G_elapsed": mtd["G_elapsed"], "n_elapsed": mtd["n_elapsed"], "month_end_step": month_end,
                     # the month's expected peak (month_to_date): M and M2 are never bounded under it (round 7, engine-optimiser-02)
-                    "M_exp": mtd.get("M_exp", 0.0)}
+                    "M_exp": mtd.get("M_exp", 0.0),
+                    # the bill's MDI block mode and scope (the connection's site override; fixed and all hours by default), so the plan's MDI rows
+                    # read the demand the bill and the ledger read (round 7 stage 2, engine-tariffs-08 h; optimise.mdi_windows)
+                    "block": vec["mdi"].get("block", "fixed"), "scope": vec["mdi"].get("scope", "all_hours")}
     # overrides as bounds (Part 4.8)
     ovs = sites.overrides(site["id"])
     mask = {k: np.zeros(steps, dtype=bool) for k in ("genset_hold", "charge_block", "reserve", "pause_control", "force_native", "force_charge")}
@@ -405,7 +416,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         control = d.get("genset_start_control", "manual")
         if carried["unknown"] and control == "auto_on_grid_loss" and len(g) and g[0] < 0.5:
             carried = {**carried, "u_prev": 1, "elapsed": 99}  # in an outage the panel has already started the set; this fixes nothing
-        c_om = g_asset["c_om_rs_per_kwh"] + (SELFGEN_DUTY_RS_PER_KWH if g_asset["rated_kw"] > 400 and (d.get("lat", 31) > 28) else 0.0)
+        # Punjab's self-generation duty from the connection's province and the tax version in force (round 7, engine-tariffs-09), as the ledger
+        c_om = g_asset["c_om_rs_per_kwh"] + tariffs.selfgen_duty(site, _local(t0).date(), conn)
         gen = {"S": g_asset["rated_kw"], "f_min": g_asset["f_min"], "a": g_asset["a"], "b": g_asset["b"], "c_fuel": price, "c_start": g_asset["c_start_rs"],
                "c_runhr": g_asset["c_runhr_rs"], "c_om": c_om, "UT": max(1, int(math.ceil(g_asset["min_up_h"] * 4))),
                "DT": max(1, int(math.ceil(g_asset["min_down_h"] * 4))), "u_prev": carried["u_prev"], "elapsed": carried["elapsed"],
@@ -424,7 +436,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         temp = solar.air_temp(ts, solar.local_month(ts) - 1) + float(d.get("enclosure_temp_offset_c", 7.0))
         bat = {"E_nom": e_nom, "E0": soc * e_nom, "sigma0": min(0.15, (bs.get("sigma_pct") or 5.0) / 100.0), "P_ch": b_asset["p_ch_kw"],
                "P_dis": b_asset["p_dis_kw"], "eta_c": b_asset["eta_c"], "eta_d": b_asset["eta_d"], "soc_min": b_asset["soc_min"],
-               "soc_max": b_asset["soc_max"], "a_grid": bool(d.get("grid_charge_allowed", True)) and not off_grid, "a_gen": bool(d.get("gen_charge_allowed", True)) and delivery.GEN_CHARGE_SUPPORTED,
+               "soc_max": b_asset["soc_max"], "a_grid": bool(d.get("grid_charge_allowed", True)) and not off_grid, "a_gen": bool(d.get("gen_charge_allowed", True))
+               and delivery.gen_charge_supported((a.get("inverter") or {}).get("brand")),
                # with the grid down the set's output follows the load and its minimum-load surplus charges the battery on its own, with no slot
                # asking for it (twin.simulate's outage branch), so the plan counts on that much and no more (optimise.genset_surplus_steps)
                "a_gen_surplus": bool(d.get("gen_charge_allowed", True)),
@@ -460,7 +473,7 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
             p["reserve_manual_force"] = force_pct / 100.0 * e_nom
         c_next = float(np.max(vec["c_imp"][-96:])) if not off_grid else p["c_short"]
         if off_grid and gen:
-            c_next = offgrid_c_next(g_asset, gen["c_fuel"], L[-96:], PV[-96:])
+            c_next = offgrid_c_next(g_asset, gen["c_fuel"], L[-96:], PV[-96:], gen["c_om"] - g_asset["c_om_rs_per_kwh"])
         # the reserve for the first outage beyond the horizon, held where the site's reserve policy asks for it: the chance that an outage starts
         # on the horizon's last day (the forecast for the day after) at or above its threshold (round 7, engine-plans-live-12: a hard-coded
         # 0.5 outages a day decided it, and the site's setting did nothing). Two hours of the critical load, never above what the battery and the
@@ -482,7 +495,94 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
         r_next = float(np.mean(kw_next)) * 2.0 / b_asset["eta_d"] if (off_grid or p_next >= p["reserve_threshold"]) and len(kw_next) else 0.0
         p["terminal"] = {"c_next": c_next, "c_next_basis": c_next_basis, "H_peak": 4.0, "R_next": r_next,
                          "c_cal_hold": terminal_cal_hold(bat["b_cal"], vec["c_imp"], L, PV, off_grid), "p_next": p_next}
+    _apply_achieved(site, t0, p)
     return p
+
+
+#: How long an edge's ack of what it applied stands for the next solves: a plan's horizon (the edge acks each plan it is sent, so a newer one
+#: replaces it well before then)
+ACHIEVED_WINDOW_S = 2 * 86400
+#: A value written within this much of the one asked was rounded to the register's step (U3 3.3, STEP_ROUNDED), not clamped to a limit: watts
+#: (the larger of these and ROUNDED_SHARE of the value asked) for a power or export primitive, points for a state of charge
+ROUNDED_W = 100.0
+ROUNDED_SHARE = 0.01
+ROUNDED_PCT = 1.0
+
+
+def _not_a_limit(ln: dict) -> bool:
+    """Whether an ack line the edge marks clamped (ack_lines: also any value written that differs from the one asked) says nothing about what the
+    device can do: the value was only rounded to its register's step (its codes say STEP_ROUNDED and not RANGE_CLAMPED, or the value written is
+    within rounding of the one asked), or a power or export value was written above the one asked (a register's least value, never its most).
+    Such a line is no limit for the next solve (round 7 stage 2 review: a charge of -40,003 W written as -40,000 W capped every next solve's
+    charge power at 40 kW)."""
+    codes = set(ln.get("codes") or [])
+    if "STEP_ROUNDED" in codes and "RANGE_CLAMPED" not in codes:
+        return True
+    req, w = ln.get("requested"), ln.get("written")
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (req, w)):
+        return False
+    if str(ln.get("primitive", "")).endswith("_pct"):
+        return abs(float(w) - float(req)) <= ROUNDED_PCT
+    return abs(float(w)) >= abs(float(req)) or abs(float(w) - float(req)) <= max(ROUNDED_W, ROUNDED_SHARE * abs(float(req)))
+
+
+def achieved(site_id: str, t0: int) -> dict:
+    """What the edge reported it could not apply as planned, in its latest ack before `t0` of a plan sent to it (R6 C5: partial or rejected acks
+    re-enter the optimiser; round 7 stage 2, the optimiser half of audit engine-delivery-12): per primitive the value it wrote where it clamped
+    the one asked, and the primitives it refused. {} without such an ack within ACHIEVED_WINDOW_S, or at a site whose edge applied everything."""
+    lo = datetime.fromtimestamp(int(t0) - ACHIEVED_WINDOW_S, timezone.utc).isoformat(timespec="seconds")
+    hi = datetime.fromtimestamp(int(t0) + 900, timezone.utc).isoformat(timespec="seconds")
+    with store.connect() as con:
+        r = con.execute("SELECT plan_id, body, received_at FROM acks WHERE site_id = ? AND plan_id != 'release' AND received_at >= ? AND received_at < ? "
+                        "ORDER BY received_at DESC, rowid DESC LIMIT 1", (site_id, lo, hi)).fetchone()
+    if r is None:
+        return {}
+    out: dict = {"plan_id": r["plan_id"], "received_at": r["received_at"], "clamped": {}, "refused": []}
+    for ln in ack_lines(json.loads(r["body"])):
+        prim = ln.get("primitive")
+        if not prim:
+            continue
+        if ln["status"] in ("rejected", "failed") and ln.get("written") is None:
+            out["refused"].append(prim)
+        elif (ln["status"] == "clamped" and isinstance(ln.get("written"), (int, float)) and not isinstance(ln.get("written"), bool)
+              and not _not_a_limit(ln)):
+            out["clamped"].setdefault(prim, []).append(float(ln["written"]))
+    out["refused"] = sorted(set(out["refused"]))
+    return out if out["clamped"] or out["refused"] else {}
+
+
+def _apply_achieved(site: dict, t0: int, p: dict) -> None:
+    """The next solve plans with what the edge could apply (`achieved`), at a closed-loop site: a refused grid or genset charging permission is
+    planned as off; a clamped battery power caps the charge or discharge power at what was written; a floor clamped upwards raises the grid-up floor
+    to it; a clamped export limit caps the export. The adjustments are kept on the problem (`achieved`) and the stored plan's summary, so the plan
+    says what it planned within."""
+    if site.get("tier") != "closed_loop" or not site.get("id"):
+        return
+    got = achieved(site["id"], t0)
+    if not got:
+        return
+    bat, used = p.get("battery"), {}
+    if bat:
+        if "grid_charge_allowed" in got["refused"] and bat.get("a_grid"):
+            bat["a_grid"], used["grid_charge_allowed"] = False, "refused"
+        if "gen_charge_allowed" in got["refused"] and bat.get("a_gen"):
+            bat["a_gen"], used["gen_charge_allowed"] = False, "refused"
+        power = got["clamped"].get("battery_power_w") or []
+        ch = [-w / 1000.0 for w in power if w < 0]
+        dis = [w / 1000.0 for w in power if w > 0]
+        if ch and max(ch) < bat["P_ch"]:
+            bat["P_ch"] = used["charge_kw"] = round(max(ch), 3)
+        if dis and max(dis) < bat["P_dis"]:
+            bat["P_dis"] = used["discharge_kw"] = round(max(dis), 3)
+        floors = got["clamped"].get("soc_floor_pct") or []
+        if floors and bat.get("soc_floor_grid") is not None and max(floors) / 100.0 > float(bat["soc_floor_grid"]):
+            bat["soc_floor_grid"] = min(float(bat["soc_max"]), max(floors) / 100.0)
+            used["soc_floor_pct"] = round(max(floors), 1)
+    exports = got["clamped"].get("export_limit_w") or []
+    if exports and p.get("X_max", 0.0) > max(0.0, min(exports) / 1000.0):
+        p["X_max"] = used["export_kw"] = max(0.0, min(exports) / 1000.0)
+    if used:
+        p["achieved"] = {"plan_id": got["plan_id"], "received_at": got["received_at"], **used}
 
 
 def _steps_out(p: dict, res: dict, bundle: dict) -> list[dict]:
@@ -585,7 +685,10 @@ def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict], res: dict
     ts = np.repeat(p["ts"], 15) + np.tile(np.arange(15) * 60, T)
     series = {"pv": np.repeat(p["PV"], 15), "load": np.repeat(p["L"], 15), "crit": np.repeat(p["Lc"], 15), "grid": np.repeat(p["g"], 15),
               "ts": ts, "temp": np.full(len(ts), 30.0)}
-    pol = twin.slots_policy(slots, ts)
+    # what the site will run: a Mode B site's edge follows the setpoints step by step, so those are replayed (round 7 stage 2, audit
+    # engine-delivery-17: the guard checked the Mode A table, which the edge never runs); the table's own rules above still hold, as a Mode B plan
+    # carries it for slot-only devices
+    pol = twin.setpoints_policy(delivery.mode_b(steps_out[:T], site), ts) if delivery.executes_mode_b(site) else twin.slots_policy(slots, ts)
     plant = twin.plant_of(site)
     soc0 = bat["E0"] / bat["E_nom"]
     sim = twin.simulate(series, pol, plant, soc0)
@@ -607,10 +710,8 @@ def _guard(site: dict, p: dict, compiled: dict, steps_out: list[dict], res: dict
     if mdi and caps:
         n = max(1, int(mdi["n_mdi"]))
         draw = planned["grid_import_kw"] + shed_q
-        blocks = (np.asarray(p["ts"]) // (n * 900)).astype(np.int64)
         month_end = int(mdi.get("month_end_step", T))
-        for bid in np.unique(blocks):
-            st = np.flatnonzero(blocks == bid)
+        for st in optimise.mdi_windows(p):  # the bill's blocks: fixed or sliding, all hours or the peak only (round 7 stage 2, engine-tariffs-08 h)
             cap = caps[0] if st[0] < month_end else (caps[1] if len(caps) > 1 else None)
             if cap is None:
                 continue
@@ -766,6 +867,13 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                "battery_state": ({**p["battery_state"], "anchor_t": (res.get("anchor") or {}).get("t"),
                                   "anchor_short_kwh": (res.get("anchor") or {}).get("short_kwh")}
                                  if p.get("battery_state") and p["battery_state"].get("anchor_soc_pct") else p.get("battery_state")),
+               # the price the plan put on a kWh left in the battery at the horizon's end (its terminal value's c_next and what set it), which
+               # the compare drawer values both arms' end energy at (round 7 stage 2, engine-plans-live-10)
+               "end_price": ({"c_next_rs_per_kwh": round(float(p["terminal"]["c_next"]), 2), "basis": p["terminal"].get("c_next_basis")}
+                             if p.get("terminal") else None),
+               # what the edge last reported it could apply, which this solve planned within (_apply_achieved; R6 C5): absent where nothing was
+               # refused or clamped (round 7 stage 2 review, engine-delivery-12)
+               **({"achieved": p["achieved"]} if p.get("achieved") else {}),
                "status_label": _status_label(res),
                "solver": {"status": res["status"], "variables": res.get("variables"), "rows": res.get("rows"), "binaries": res.get("binaries"),
                           "relaxed": res.get("relaxed"), "message": res.get("message"), "shed_rule_resolve": res.get("shed_rule_resolve"),
@@ -1246,7 +1354,7 @@ def signed_message(site_id: str, record: bool = True) -> dict | None:
             "valid_from": plan["valid_from"], "valid_until": plan["valid_until"], "timezone": "Asia/Karachi", "mode": plan["mode"],
             "fallback": (plan.get("slots") or {}).get("fallback"), "mode_a": {"days": days, "apply_policy": write_policy(full)[0]},
             "write_budget": write_policy(full)[1],
-            "mode_b": delivery.mode_b(plan["steps"]) if plan["mode"] == "b" else None,
+            "mode_b": delivery.mode_b(plan["steps"], full) if plan["mode"] == "b" else None,
             "notes": {"reason": plan["summary"].get("status_label")}, **_edge_envelope(site_id, plan["id"], caps)}
     if fit:
         body["capabilities_fit"] = fit

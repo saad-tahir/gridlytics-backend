@@ -307,8 +307,9 @@ def _bill_residual(site_id: str, pct: float) -> None:
     'not_comparable'), so it raises nothing."""
     from .verify import BILL_COMPLETENESS_MIN
     with store.connect() as con:
-        r = con.execute("SELECT id, period_start, period_end, difference_pct, rebuilt FROM bills WHERE site_id = ? ORDER BY period_end DESC, created DESC "
-                        "LIMIT 1", (site_id,)).fetchone()
+        # a bill of a connection the site's readings do not meter is kept, not rebuilt (verify._unmetered; round 7 stage 2, tracker-and-docs-01)
+        r = con.execute("SELECT id, period_start, period_end, difference_pct, rebuilt FROM bills WHERE site_id = ? "
+                        "AND COALESCE(json_extract(rebuilt, '$.metered'), 1) = 1 ORDER BY period_end DESC, created DESC LIMIT 1", (site_id,)).fetchone()
     diff = r["difference_pct"] if r else None
     try:
         comp = (json.loads(r["rebuilt"] or "{}") or {}).get("completeness") if r else None
@@ -322,6 +323,27 @@ def _bill_residual(site_id: str, pct: float) -> None:
         title = f"The bill for {a.day} {a:%b} to {b.day} {b:%b %Y}, rebuilt from the data, differs from the printed bill by {abs(diff):.1f} %"
     _set(on, site_id, "bill_residual", "Tariff", "warning", title,
          {"period_start": r["period_start"], "period_end": r["period_end"], "difference_pct": diff} if on else {})
+
+
+def _metering_factor(site: dict) -> None:
+    """Data: the plant connection's metering factor, fitted on its bills, lies outside verify.METERING_BAND (round 7 stage 2, audit engine-savings-09;
+    plan 6.3: a data finding, not a calibration): the site's meter reads apart from the DISCO's register by more than 3 %, a load the inverter does
+    not see or a second meter, and the ledger stays on the meter's own scale until it is found."""
+    from .verify import METERING_BAND, metering_of
+    conn = sites.plant_connection(site)
+    m = metering_of(site["id"], conn["id"]) if conn else {}
+    on = m.get("status") == "out_of_band"
+    title, detail = "", {}
+    if on:
+        parts = []
+        for key, more, less in (("energy", "more units", "fewer units"), ("mdi", "a higher MDI", "a lower MDI")):
+            k = m.get(key)
+            if isinstance(k, (int, float)) and not METERING_BAND[0] <= k <= METERING_BAND[1]:
+                parts.append(f"{abs(k - 1) * 100:.1f} % {more if k > 1 else less}")
+        title = (f"The DISCO's bills show {' and '.join(parts)} than the site's meter reads: a load the meter does not see, or a second meter. "
+                 "The savings stay on the meter's own readings until this is found")
+        detail = {"energy": m.get("energy"), "mdi": m.get("mdi"), "band": list(METERING_BAND), "connection_id": conn["id"]}
+    _set(on, site["id"], "metering_factor", "Data", "warning", title, detail)
 
 
 def _forecast_stages(site_id: str, now: int) -> None:
@@ -609,6 +631,7 @@ def evaluate(site_id: str, now: int | None = None) -> None:
          {"day": today})
     _agreements(site, now, rules_)
     _bill_residual(site_id, float(_th(rules_, "Tariff", "bill_difference_pct")))
+    _metering_factor(site)
     tariff_staleness(site, now, rules_)
     _forecast_stages(site_id, now)
     _genset_condition(site, now, rules_)
@@ -1127,6 +1150,72 @@ def forecast_bust(site: dict, day: date, bust_pct: float = 30.0) -> dict | None:
     return {"day": day.isoformat(), "hours": round(float(busted.sum()) * 0.5, 1),
             "worst_at": t0 + worst * 1800 if busted.any() else None, "worst_pct": round(float(err[worst]) * 100) if busted.any() else None,
             "nrmse_pct": round(float(np.sqrt(np.mean((pred[ok] - act[ok]) ** 2)) / kw) * 100, 1) if ok.any() else None}
+
+
+#: The window an intra-day forecast bust is judged over (plan Part 2.4: a PV error above the threshold of the clear-sky ceiling over 30 minutes), the
+#: least of it that must be read, and the least of the latest issue (the one the plan in force was solved on) that must be read and miss too
+BUST_WINDOW_S = 1800
+BUST_MIN_READ_MIN = 20
+BUST_LATEST_MIN = 5
+
+
+def _pv_issues_in_force(site_id: str, start: int, end: int) -> list[tuple[int, np.ndarray, np.ndarray]]:
+    """The PV forecast issues in force over [start, end): the latest issued at or before `start` and every later one before `end`, oldest first, as
+    (belief time, q50, clear-sky ceiling)."""
+    first = telemetry.latest_forecast(site_id, "pv", start)
+    lo = int(first["belief_time"]) if first else int(start)
+    with telemetry.reading() as con:
+        rows = con.execute("SELECT belief_time, body FROM forecast_issues WHERE site_id = ? AND kind = 'pv' AND belief_time >= ? AND belief_time < ? "
+                           "ORDER BY belief_time", (site_id, lo, int(end))).fetchall()
+    out = []
+    for r in rows:
+        body = json.loads(r["body"])
+        q50, cs = body.get("q50"), body.get("cs")
+        if isinstance(q50, list) and isinstance(cs, list) and q50 and cs:
+            out.append((int(r["belief_time"]), np.array([np.nan if x is None else float(x) for x in q50], dtype=float),
+                        np.array([np.nan if x is None else float(x) for x in cs], dtype=float)))
+    return out
+
+
+def intraday_bust(site_id: str, now: int, bust_pct: float = 30.0) -> dict | None:
+    """Whether the PV forecast has busted over the last 30 minutes (plan Part 2.4; round 7 stage 2, audit brief-vs-build-15: a busted forecast waited
+    for the next quarter's tick): the measured mean PV against the median of the issue in force at each minute (a tick saves an issue every quarter),
+    as a share of their clear-sky ceiling, above `bust_pct`. At least BUST_MIN_READ_MIN minutes must be read, in daylight (a ceiling above a tenth
+    of the latest issue's highest), and the latest issue, the one the plan in force was solved on, must be read for BUST_LATEST_MIN minutes and
+    miss as much, so a plan a tick has just solved on a new issue is not re-solved before that issue is seen to miss. {err_pct, belief_time (the
+    latest issue's)} when it busted, else None."""
+    pv = (sites.assets(site_id) or {}).get("pv")
+    if not pv:
+        return None
+    end = int(now) // 60 * 60
+    start = end - BUST_WINDOW_S
+    issues = _pv_issues_in_force(site_id, start, end)
+    if not issues:
+        return None
+    g = telemetry.minute_grid(site_id, start, end)
+    ts = np.asarray(g["ts"], dtype=np.int64)
+    act = np.asarray(g["pv"], dtype=float)
+    pred, ceil = np.full(len(ts), np.nan), np.full(len(ts), np.nan)
+    for bt, q50, cs in issues:                           # oldest first: a later issue takes over from its belief time
+        idx = (ts - bt) // STEP_S
+        m = (ts >= bt) & (idx < min(len(q50), len(cs)))
+        pred[m], ceil[m] = q50[idx[m]], cs[idx[m]]
+    ok = ~np.isnan(act) & ~np.isnan(pred) & ~np.isnan(ceil)
+    latest_bt, _, latest_cs = issues[-1]
+    mine = ok & (ts >= latest_bt)
+    if int(ok.sum()) < BUST_MIN_READ_MIN or int(mine.sum()) < BUST_LATEST_MIN:
+        return None
+
+    def err(sel: np.ndarray) -> float | None:
+        ceiling = float(np.mean(ceil[sel]))
+        if ceiling <= 0.1 * max(float(np.nanmax(latest_cs)), 1e-6):
+            return None                                  # night or dusk: no ceiling to judge against
+        return abs(float(np.mean(pred[sel])) - float(np.mean(act[sel]))) / ceiling
+
+    e, e_latest = err(ok), err(mine)
+    if e is None or e_latest is None or e <= bust_pct / 100 or e_latest <= bust_pct / 100:
+        return None
+    return {"err_pct": round(e * 100, 1), "belief_time": int(latest_bt)}
 
 
 def nightly(site_id: str, day: date) -> None:

@@ -18,7 +18,7 @@ import numpy as np
 from . import solar
 
 PKT = timezone(timedelta(hours=5))
-MODES = ("self_use", "discharge", "hold", "charge_grid", "charge_pv_only", "export")
+MODES = ("self_use", "discharge", "hold", "charge_grid", "charge_pv_only", "export", "setpoint")
 MODE_CODE = {m: i for i, m in enumerate(MODES)}
 
 #: hour-of-day load shapes (share of the site's peak) by site type, working day and off day
@@ -247,7 +247,7 @@ def slots_policy(slots: list[dict], ts: np.ndarray) -> dict:
     n = len(ts)
     pol = {"mode": np.full(n, MODE_CODE["self_use"]), "floor": np.full(n, 0.2), "target": np.full(n, 1.0), "max_dis": np.full(n, np.inf),
            "max_ch": np.full(n, np.inf), "grid_charge": np.zeros(n, dtype=bool), "genset": np.full(n, -1), "grid_cap": np.full(n, np.inf),
-           "pv_full": np.zeros(n, dtype=bool)}
+           "pv_full": np.zeros(n, dtype=bool), "gen_charge": np.zeros(n, dtype=bool)}
     for s0 in slots:
         m = (ts >= s0["start_ts"]) & (ts < s0["end_ts"])
         if not m.any():
@@ -261,6 +261,7 @@ def slots_policy(slots: list[dict], ts: np.ndarray) -> dict:
         if s.get("max_charge_w") is not None:
             pol["max_ch"][m] = s["max_charge_w"] / 1000.0
         pol["grid_charge"][m] = bool(s.get("grid_charge"))
+        pol["gen_charge"][m] = bool(s.get("gen_charge"))
         pol["pv_full"][m] = bool(s.get("pv_full"))
         if s.get("grid_cap_w"):
             pol["grid_cap"][m] = s["grid_cap_w"] / 1000.0
@@ -303,8 +304,8 @@ FALLBACK_STATES = ("plan", "unattended", "native", "repeat")
 def _merged(a: dict, b: dict, use_b: np.ndarray) -> dict:
     """Policy `b` where `use_b`, else `a`, over the keys of both (a key one side lacks takes its neutral value)."""
     n = len(use_b)
-    neutral = {"grid_cap": np.full(n, np.inf), "export_first": np.zeros(n, dtype=bool), "export_cap": np.full(n, np.inf),
-               "pv_full": np.zeros(n, dtype=bool)}
+    neutral = {"grid_cap": np.full(n, np.inf), "export_first": np.zeros(n, dtype=bool), "export_cap": np.full(n, np.inf), "bat_set": np.zeros(n),
+               "pv_full": np.zeros(n, dtype=bool), "gen_charge": np.zeros(n, dtype=bool)}
     pick = lambda pol, k: pol.get(k, pol["target"] if k == "grid_target" else neutral.get(k))
     return {k: np.where(use_b, pick(b, k), pick(a, k)) for k in set(a) | set(b) if pick(a, k) is not None and pick(b, k) is not None}
 
@@ -319,7 +320,8 @@ def _whole_day(days: list[dict]) -> dict:
 
 
 def fallback_policy(site: dict, compiled: dict, ts: np.ndarray, *, valid_until: int, executor: str = "edge", mode: str = "a",
-                    link_lost_at: int | None = None, revert_after_s: int = 1800, keyed_day: int | None = None) -> tuple[dict, np.ndarray]:
+                    link_lost_at: int | None = None, revert_after_s: int = 1800, keyed_day: int | None = None,
+                    mode_b: dict | None = None) -> tuple[dict, np.ndarray]:
     """The per-minute policy a site runs when a plan's messages stop, and its state (an index into FALLBACK_STATES), so the twin can replay an
     expiry or a lost link (plan Part 7.1 step 6 and 7.2, U3 3.3 and 3.4, R6 I2, I3, I5 and I6; tracker DLV-04):
 
@@ -327,13 +329,13 @@ def fallback_policy(site: dict, compiled: dict, ts: np.ndarray, *, valid_until: 
       executing the cached plan to `valid_until`; from then on it runs `fallback.on_expiry`, the inverter's native settings, with the block's
       `min_soc_floor_pct` as the floor everywhere and `max_export_w_floor` as the export cap (`export_cap`, kW).
     * Mode B (`mode` "b"): the volatile setpoints revert `revert_after_s` (mode_b's refresh) after the link drops, to the same native fallback,
-      or at `valid_until` if that comes first. The minutes before run the compiled slots (the twin has no Mode B executor yet).
+      or at `valid_until` if that comes first. The minutes before run the setpoints (`mode_b`, setpoints_policy), else the compiled slots.
     * A table a person keyed (`executor` "keyed", the advisory tier): no edge, so nothing expires; from `valid_until` the keyed day's table
       (`keyed_day`, by default the last whole day) repeats by clock time, the case delivery.table_safety checks."""
     fb = compiled.get("fallback") or {}
     days = [d for d in compiled.get("days") or [] if d.get("slots")]
     n = len(ts)
-    pol = slots_policy([s for d in days for s in d["slots"]], ts)
+    pol = setpoints_policy(mode_b, ts) if mode == "b" and mode_b else slots_policy([s for d in days for s in d["slots"]], ts)
     state = np.zeros(n, dtype=int)
     if executor == "keyed":
         rep = ts >= int(valid_until)
@@ -361,6 +363,40 @@ def fallback_policy(site: dict, compiled: dict, ts: np.ndarray, *, valid_until: 
 def state_changes(ts: np.ndarray, state: np.ndarray) -> list[dict]:
     """The minutes a fallback_policy state begins, as {t, state}: the fallback events a replay counts."""
     return [{"t": int(ts[i]), "state": FALLBACK_STATES[int(state[i])]} for i in range(len(state)) if i == 0 or state[i] != state[i - 1]]
+
+
+#: Mode B's genset requests (U3 5.1, advisory): the twin's operator starts the set on "prefer_start" and treats the rest as no planned run
+GENSET_REQUEST_CODE = {"prefer_start": 1, "prefer_stop": 0, "none": 0}
+
+
+def setpoints_policy(mode_b: dict | None, ts: np.ndarray) -> dict:
+    """The per-minute policy an edge runs from a Mode B schedule (plan Part 7.2, DLV-06; round 7 stage 2, audit engine-delivery-17): in each
+    15-minute step the battery follows its `battery_power_w` (W, discharge positive), down to the step's `soc_floor_pct` and up to its
+    `soc_target_pct`, charging from the grid only where `grid_charge_allowed` (else from the PV surplus only) and never discharging into
+    curtailment or above `export_limit_w` (the edge's 1-minute rule layer corrects those residuals, U3 2.4); the genset follows `genset_request`.
+    Minutes outside every step run self-use (the setpoints have reverted)."""
+    n = len(ts)
+    pol = {"mode": np.full(n, MODE_CODE["self_use"]), "floor": np.full(n, 0.2), "target": np.full(n, 1.0), "max_dis": np.full(n, np.inf),
+           "max_ch": np.full(n, np.inf), "grid_charge": np.zeros(n, dtype=bool), "genset": np.full(n, -1), "export_cap": np.full(n, np.inf),
+           "bat_set": np.zeros(n), "gen_charge": np.zeros(n, dtype=bool)}
+    step_s = int((mode_b or {}).get("step_s") or 900)
+    for st in (mode_b or {}).get("steps") or []:
+        m = (ts >= int(st["t"])) & (ts < int(st["t"]) + step_s)
+        if not m.any():
+            continue
+        pol["mode"][m] = MODE_CODE["setpoint"]
+        pol["bat_set"][m] = float(st.get("battery_power_w") or 0.0) / 1000.0
+        if st.get("soc_floor_pct") is not None:
+            pol["floor"][m] = float(st["soc_floor_pct"]) / 100.0
+        if st.get("soc_target_pct") is not None:
+            pol["target"][m] = float(st["soc_target_pct"]) / 100.0
+        pol["grid_charge"][m] = bool(st.get("grid_charge_allowed"))
+        pol["gen_charge"][m] = bool(st.get("gen_charge_allowed"))
+        if st.get("export_limit_w") is not None:
+            pol["export_cap"][m] = float(st["export_limit_w"]) / 1000.0
+        req = st.get("genset_request")
+        pol["genset"][m] = GENSET_REQUEST_CODE.get(req, 1 if req is True else 0)
+    return pol
 
 
 def table_policy(table: list[dict], ts: np.ndarray) -> dict:
@@ -456,6 +492,13 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
     cyc = policy.get("cycle_soc")
     if cyc is None or not has_bat:
         cyc = np.full(n, np.nan)
+    bat_set = policy.get("bat_set")  # Mode B's battery power per minute (kW, discharge positive), where the mode is "setpoint"
+    if bat_set is None:
+        bat_set = np.zeros(n)
+    gen_ch = policy.get("gen_charge")  # the slot charges from the genset (delivery.GEN_CHARGE_BRANDS): the running set charges towards its target
+    if gen_ch is None or not has_bat:
+        gen_ch = np.zeros(n, dtype=bool)
+    SETPOINT = MODE_CODE["setpoint"]
     for i in range(n):
         g = grid[i] > 0.5
         pv = pv_av[i]
@@ -488,7 +531,17 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
             if grid_ch:
                 dis_room_m = max(0.0, (e - max(e_min, max(floor[i], grid_target[i]) * plant.e_nom))) * plant.eta_d / dt
                 ch_room_g = max(0.0, (min(e_max, grid_target[i] * plant.e_nom) - e)) / plant.eta_c / dt
-            if m == 3 or (grid_ch and ch_room_g > 1e-9):  # charge_grid, never above the slot's grid import cap (the peak-shaving setting)
+            if m == SETPOINT:
+                # Mode B: the step's battery power, within the battery's power and the step's floor and target; a discharge no load or export
+                # cap takes is not made, and a charge beyond the PV surplus draws on the grid only where the step allows it
+                sp = float(bat_set[i])
+                if sp > 0:
+                    room = net + min(plant.x_max, xcap[i])
+                    bat = max(0.0, min(sp, pdis, dis_room, room))
+                elif sp < 0:
+                    want = min(-sp, pch, ch_room)
+                    bat = -(want if gch[i] else min(want, max(0.0, -net)))
+            elif m == 3 or (grid_ch and ch_room_g > 1e-9):  # charge_grid, never above the slot's grid import cap (the peak-shaving setting)
                 bat = -max(0.0, min(pch, ch_room if m == 3 else ch_room_g, gcap[i] - net if net > 0 else gcap[i] + (-net)))
                 if m != 3 and net < 0:  # surplus PV beyond the grid-charge level still charges, up to the target
                     bat = -max(-bat, min(-net, pch, ch_room_abs if pv_full[i] else ch_room))
@@ -578,6 +631,10 @@ def simulate(series: dict, policy: dict, plant: Plant, soc0: float, gen_on0: boo
                 need = served - pv
                 if not np.isnan(cyc[i]):  # cycle charging: the set also charges the battery towards the set point, up to its rating
                     need += min(plant.p_ch, max(0.0, cyc[i] * plant.e_nom - e) / plant.eta_c / dt)
+                elif gen_ch[i]:
+                    # a slot that charges from the genset (Deye's Gen charge, Voltronic's SNU; round 7 stage 2, audit engine-plans-live-18): the set
+                    # also charges the battery towards the slot's target, at the slot's charge power, up to its rating
+                    need += min(plant.p_ch, max_ch[i], max(0.0, min(target[i], plant.soc_max) * plant.e_nom - e) / plant.eta_c / dt)
                 gen = min(plant.gen_kw, max(plant.gen_fmin * plant.gen_kw, need))
                 surplus = gen + pv - served
                 if surplus > 0:

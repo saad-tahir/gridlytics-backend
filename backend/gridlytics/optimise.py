@@ -664,15 +664,14 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
         M_idx.append(Mv)
         M_lb.append(lb_M)
         M2 = None
-        blocks = (np.asarray(p["ts"]) // (n_blk * 900)).astype(np.int64)
         month_end = mdi.get("month_end_step", T)
         if month_end < T:
             M2 = m.var("M2", 1, lb_M2, np.inf, mdi["rate"])[0]
             M_idx.append(M2)
             M_lb.append(lb_M2)
         extra = np.where(g > 0.5, np.maximum(0.0, Lhi - L), 0.0)
-        for bid in np.unique(blocks):
-            steps = np.where(blocks == bid)[0]
+        capped: set[int] = set()  # a sliding window shares its steps with its neighbours: one step row each
+        for bid, steps in enumerate(mdi_windows(p)):
             target = Mv if steps[0] < month_end else M2
             if target is None:
                 continue
@@ -683,32 +682,55 @@ def solve(p: dict, time_limit: float = 10.0, gap: float = 1e-3, relaxed: bool = 
             # the cap while its block's mean stays under it (0 / full / 0 / full charging, or one step of each block discharging for both) is a
             # plan the device throttles. Under the upper load quantile as the block rows are (round 7, engine-plans-live-17)
             for t in steps:
-                if g[t] > 0.5:
+                if g[t] > 0.5 and int(t) not in capped:
+                    capped.add(int(t))
                     m.row([G[t], target], [1.0, -1.0], ub=-float(extra[t]), name=f"mdi_step[{t}]")
     # ---------------------------------------------------------------- ICP, the uncertain middle case
     icp = p.get("icp") or {}
-    # legacy net metering nets each period's exports against its imports before the ICP case is decided (tariffs.vectors decides it on the net), so
-    # the rows read net import per step: on gross import, an import above the baseline earned the ICP rate while the export it fed was credited at
-    # the full import price, and the plan circulated energy through the meter both ways at once
-    icp_net = p.get("regime") == "net_metering_legacy"
+    # at a legacy net-metering site the reference is imported units (SRO 2409(I)/2025, R9 section 5; round 7 stage 2, engine-tariffs-10's optimiser
+    # half, as the bill counts them): the rows read the period's gross imports, and the increment is capped at the month's imports less exports
+    # (`cap_kwh` so far and forecast, the horizon's own imports less exports, less the other period's increment): importing and exporting at once
+    # moves the cap by nothing, so circulating energy through the meter both ways never earns the ICP rate (round 3 read net import per step instead)
+    month_up = np.asarray(p["in_month"]) & (g > 0.5)
+    capped_icp = False  # a gross period whose increment the net-import cap may cut (the ICP rate the cheaper): one direction a step, below
     for per, info in icp.items():
         if info.get("case") != "uncertain":
             continue
-        steps = np.where((np.asarray(p["peak"]) == (per == "peak")) & np.asarray(p["in_month"]) & (g > 0.5))[0]
+        steps = np.where((np.asarray(p["peak"]) == (per == "peak")) & month_up)[0]
         if not len(steps):
             continue
         Q, base = info["q_kwh"], info["baseline_kwh"]
-        Mp = (p["G_max"] + (p["X_max"] if icp_net else 0.0)) * len(steps) * H + abs(Q - base) + 1.0
+        Mp = p["G_max"] * len(steps) * H + abs(Q - base) + 1.0
         coef = info["rate"] - float(c_imp[steps[0]])
         Z = m.var(f"Z_{per}", 1, 0, np.inf, coef)[0]
         b = m.var(f"b_{per}", 1, 0, 1, 0.0, integer=True)[0]
         q_cols, q_vals = list(G[steps]), [-H] * len(steps)
-        if icp_net:
-            q_cols += list(X[steps])
-            q_vals += [H] * len(steps)
-        m.row([Z] + q_cols, [1] + q_vals, lb=Q - base, name=f"icp_lo[{per}]")
+        gross = bool(info.get("gross"))
+        if not (gross and coef < 0):
+            # the increment is at least the imports over the baseline; where the cap may cut it (gross) and the ICP rate is the cheaper, the
+            # solve takes all the increment it may anyway, so the floor is left to the caps below
+            m.row([Z] + q_cols, [1] + q_vals, lb=Q - base, name=f"icp_lo[{per}]")
         m.row([Z, b], [1, -Mp], ub=0, name=f"icp_b[{per}]")
         m.row([Z] + q_cols + [b], [1] + q_vals + [Mp], ub=Q - base + Mp, name=f"icp_hi[{per}]")
+        if gross and coef < 0:
+            # with an increment (b = 1), at most the month's net import (so far and forecast, plus the horizon's imports less exports) less the other
+            # period's increment; with none (b = 0) the row is idle. Only where the ICP rate is the cheaper: where it is the dearer (a negative FCA
+            # the ICP units do not get) the floor row above stays, and beside it the cap could ask for less increment than the floor, so no plan
+            # (round 7 stage 2 review); there the plan prices the whole gross increment at the dearer rate, never less than the bill
+            capped_icp = True
+            all_up = np.where(month_up)[0]
+            room = float(info.get("cap_kwh", 0.0)) - float(info.get("other_inc_kwh", 0.0))
+            Mc = Mp + p["X_max"] * len(all_up) * H + abs(room) + 1.0
+            m.row([Z, b] + list(G[all_up]) + list(X[all_up]), [1, Mc] + [-H] * len(all_up) + [H] * len(all_up), ub=room + Mc, name=f"icp_cap[{per}]")
+    if capped_icp and float(p.get("X_max") or 0.0) > 0:
+        # counted on gross imports, an import and an export in the same step would add to the increment while leaving the net, and so the bill's
+        # cap, as it was: the meter reads one direction at a time, so a step imports or exports, never both (one binary per in-month grid-up step,
+        # at the rare legacy ICP site in its uncertain case only)
+        up = np.where(month_up)[0]
+        y = m.var("imp_dir", len(up), 0, 1, 0.0, integer=True)
+        for k, t in enumerate(up):
+            m.row([G[t], y[k]], [1.0, -float(p["G_max"])], ub=0.0, name=f"imp_dir_g[{t}]")
+            m.row([X[t], y[k]], [1.0, float(p["X_max"])], ub=float(p["X_max"]), name=f"imp_dir_x[{t}]")
     # ---------------------------------------------------------------- solve
     t_start = time.perf_counter()
     res, A = m.solve(time_limit, gap)
@@ -1445,6 +1467,30 @@ def power_caps(bat: dict, T: int) -> tuple[np.ndarray, np.ndarray]:
             a[:len(v)] = np.minimum(a[:len(v)], v)
         caps.append(a)
     return caps[0], caps[1]
+
+
+def mdi_windows(p: dict) -> list[np.ndarray]:
+    """The plan's MDI windows, each the steps whose mean import the meter reads as one demand: fixed blocks of the connection's interval aligned to
+    the hour (the default), or a window sliding step by step (`mdi["block"]` "sliding"); with `mdi["scope"]` "peak" only the peak steps count, a
+    fixed block by its peak steps and a sliding window only where all its steps are peak (tariffs._mdi, the bill's rule). The site's own bill sets
+    both (a versioned site override, R9 12.6 and 13; round 7 stage 2, engine-tariffs-08 h: the bill read them and the plan did not)."""
+    mdi = p.get("mdi") or {}
+    T = int(p["T"])
+    n_blk = max(1, int(mdi.get("n_mdi", 2)))
+    peak = np.asarray(p.get("peak", np.zeros(T, dtype=bool)), dtype=bool)
+    only_peak = mdi.get("scope") == "peak"
+    if mdi.get("block") == "sliding":
+        wins = [np.arange(t, t + n_blk) for t in range(0, max(0, T - n_blk + 1))]
+        return [w for w in wins if not only_peak or bool(peak[w].all())]
+    blocks = (np.asarray(p["ts"]) // (n_blk * 900)).astype(np.int64)
+    out = []
+    for bid in np.unique(blocks):
+        w = np.where(blocks == bid)[0]
+        if only_peak:
+            w = w[peak[w]]
+        if len(w):
+            out.append(w)
+    return out
 
 
 def mdi_floors(mdi: dict) -> tuple[float, float]:

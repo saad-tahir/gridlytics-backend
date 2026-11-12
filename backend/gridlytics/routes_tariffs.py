@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
-from datetime import date
+from datetime import date, timedelta
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, BackgroundTasks, Body
 
 from . import auth, sites, store, tariff_data, tariffs
 from .routes_common import bad, out, parse_day, today
@@ -84,15 +85,40 @@ def propose(inp: dict = Body(...)):
         raise bad(exc) from None
 
 
+log = logging.getLogger("gridlytics.tariffs")
+#: A version starting within this many days of today reaches the plans in force (a 192-step horizon is two days), so approving it re-solves them
+RESOLVE_HORIZON_DAYS = 2
+
+
+def _resolve_sites(site_ids: list[str]) -> None:
+    """The re-solve after a tariff version is approved, site by site (a failure is logged; the version is approved either way)."""
+    from . import plans  # plans imports the routes' helpers at module load
+    for sid in site_ids:
+        try:
+            plans.tick(sid)
+        except Exception:
+            log.exception("re-solve after a tariff approval failed for site %s", sid)
+
+
 @router.post("/api/tariffs/versions/{version_id}/approve")
-def approve(version_id: str):
+def approve(version_id: str, background: BackgroundTasks):
+    """Approve a pending version. One that starts by the end of the plans' horizon re-solves every active grid site's plan once the answer is sent
+    (round 7 stage 2, audit brief-vs-build-15; OPT-15 lists a tariff version among the events that re-plan): a plan priced on the version it replaces
+    waited for the next quarter's tick. `re_solving`: the sites re-solved."""
     auth.need("approve_tariff", "Approving a tariff version")
     try:
-        return tariffs.approve(version_id, auth.actor())
+        v = tariffs.approve(version_id, auth.actor())
     except KeyError:
         raise bad(ValueError("No such tariff version")) from None
     except ValueError as exc:
         raise bad(exc) from None
+    start = str((v or {}).get("effective_from") or "")[:10]
+    ids: list[str] = []
+    if start and start <= (today() + timedelta(days=RESOLVE_HORIZON_DAYS)).isoformat():
+        ids = [x["id"] for x in sites.listing() if x.get("status") == "active" and sites.grid_connected(sites.full(x["id"]) or {})]
+        if ids:
+            background.add_task(_resolve_sites, ids)
+    return {**v, "re_solving": len(ids)} if isinstance(v, dict) else v
 
 
 @router.get("/api/tariffs/fuel")

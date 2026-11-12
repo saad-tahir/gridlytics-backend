@@ -857,6 +857,45 @@ def _unit_duty(conn: dict, tax: dict) -> float:
     return float(rate) if _num(kva) and float(kva) > 500 else 0.0
 
 
+#: Punjab's duty on self-generated units applies to sets above 500 kVA (R9 section 7, Electricity Duty Rules 2026); a set's kVA is its rated kW over
+#: its power factor (0.8 where none is entered) where no kVA is entered
+SELFGEN_KVA_MIN = 500.0
+SELFGEN_PF = 0.8
+
+
+def selfgen_duty(site: dict, on, conn: dict | None = None) -> float:
+    """Punjab's duty on self-generated units, Rs per kWh the genset generates (R9 section 7: 4 paisa a unit for industrial and commercial consumers
+    above 500 kVA, collected by the electric inspector, not on the DISCO bill): the tax version in force's `punjab_selfgen_per_kwh`, where the site
+    is in Punjab (its connection's tax province, else its DISCO's), on an industrial or commercial footing (its connection's category; a site
+    without one by its type, a farm being agricultural) and its genset is above 500 kVA. 0 elsewhere. The plan's genset cost (plans.build_problem)
+    and the ledger's (verify._genset_cost) both read it (round 7, engine-tariffs-09: latitude > 28 stood for Punjab, from a constant in plans.py,
+    and the ledger left the duty out)."""
+    from . import sites as sites_mod  # sites imports tariffs at module load
+
+    g = ((site or {}).get("assets") or {}).get("genset")
+    if not g:
+        return 0.0
+    pf = g.get("power_factor") if _num(g.get("power_factor")) and g.get("power_factor") > 0 else SELFGEN_PF
+    kva = g.get("rated_kva") if _num(g.get("rated_kva")) else float(g.get("rated_kw") or 0.0) / pf
+    if not kva > SELFGEN_KVA_MIN:
+        return 0.0
+    if conn is None:
+        conn = sites_mod.plant_connection(site)  # the plant's connection, as build_problem reads it
+    data = (conn or {}).get("data") or {}
+    prov = (data.get("tax") or {}).get("province")
+    if not prov:
+        disco = ((site or {}).get("data") or {}).get("disco")
+        prov = (sites_mod.DISCO_PROVINCES.get(disco) or (None,))[0]
+    if data.get("tariff_category"):
+        cls = tariff_data.category_class(data["tariff_category"])
+    else:
+        cls = "agricultural" if ((site or {}).get("data") or {}).get("site_type") == "farm" else "industrial"
+    if prov != "punjab" or cls not in ("industrial", "commercial"):
+        return 0.0
+    rate = tax_rules(on).get("punjab_selfgen_per_kwh")
+    return float(rate) if _num(rate) and rate > 0 else 0.0
+
+
 def _extra_tax_rate(conn: dict, tax: dict, amount: float) -> float | None:
     """Extra tax for an industrial or commercial connection not on the FBR's Active Taxpayer List (R9 section 7: 5 to 17 percent by bill-amount slab):
     the rate of the slab the amount falls in, from the tax version's `extra_tax_non_atl` ([{"upto": rupees or null, "rate": fraction}], ascending
@@ -1381,17 +1420,34 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
             q -= (mtd_export or {}).get(p, 0.0) + (rest_net_export or {}).get(p, 0.0)
         return q
 
-    # ICP case per period (plan Part 4.3): above, below, or the uncertain middle that gets a month-level binary; the baseline is the billing month's
+    def q_gross(p: str) -> float:
+        """The current billing month's imports for a period, so far plus the forecast rest, before any netting."""
+        return (mtd_import or {}).get(p, 0.0) + (rest_net_import or {}).get(p, 0.0)
+
+    # ICP case per period (plan Part 4.3): above, below, or the uncertain middle that gets a month-level binary; the baseline is the billing month's.
+    # At a legacy net-metering site the reference is imported units, as the bill counts them (SRO 2409(I)/2025, R9 section 5; tariffs.rebuild step 4;
+    # round 7 stage 2, engine-tariffs-10's optimiser half, superseding round 3's "the ICP rows count net import"): a period's increment is its gross
+    # imports over the baseline, it is eligible only while the period ends the month as a net import, and the increments are capped at the month's
+    # imports less exports. `cap_kwh` (the month's net import so far and forecast) and `other_inc_kwh` (the other period's increment, settled or
+    # forecast) let the optimiser's uncertain-case rows keep that cap (optimise.solve), so importing and exporting at once never earns the ICP rate
+    bases = {p: icp_baseline(conn, bm0_day.month, bm0_day.year, p) if icp and data["tariff_category"] in icp["categories"] else None
+             for p in ("peak", "off_peak")}
+    gross_inc = {p: max(0.0, q_gross(p) - b) if b is not None and q_net(p) > 0 else 0.0 for p, b in bases.items()}
     for p in ("peak", "off_peak"):
-        base = icp_baseline(conn, bm0_day.month, bm0_day.year, p) if icp and data["tariff_category"] in icp["categories"] else None
+        base = bases[p]
         if base is None:
             continue
-        q = q_net(p)
+        q = q_gross(p) if legacy else q_net(p)
         steps_in_p = sum(1 for i, loc in enumerate(locs) if in_bm0[i] and is_peak_local(run_of[loc.date()]["cal"], loc) == (p == "peak"))
         swing = g_max_kw * steps_in_p * h
         case = "above" if q - base > swing else "below" if base - q > swing else "uncertain"
+        if legacy and q_net(p) < -swing:
+            case = "below"                            # the period ends the month in surplus: no increment on it
         out["icp"][p] = {"case": case, "baseline_kwh": base, "q_rest_kwh": q - (mtd_import or {}).get(p, 0.0) + (mtd_import or {}).get(p, 0.0),
                          "mtd_kwh": (mtd_import or {}).get(p, 0.0), "q_kwh": q, "rate": (icp["rate"] + add_icp[bm0]) * ef + unit}
+        if legacy:
+            other = "off_peak" if p == "peak" else "peak"
+            out["icp"][p].update(gross=True, cap_kwh=q_net("peak") + q_net("off_peak"), other_inc_kwh=gross_inc[other])
     # legacy net metering nets by period (rebuild step 3): a period that ends the month as a net import prices an exported kWh like an imported one,
     # with its adders, duty and taxes; one that ends in surplus moves only the credit, at the bare surplus rate (netted after taxes), both ways
     surplus: dict[str, bool] = {}

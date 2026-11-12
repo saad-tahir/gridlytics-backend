@@ -58,7 +58,11 @@ PAUSE_REASON = "Edge reported an unknown device state"
 #: transaction on the site's state (`_state_change`):
 #: a batch clears only the pending re-solve it ran, never one an event stored meanwhile. It runs after the answer is sent, and a failed tick is
 #: logged, never answered to the edge.
-RESOLVE_EVENTS = ("outage_start", "outage_end")
+#: Round 7 stage 2 (audit brief-vs-build-15; OPT-15 lists the genset too): a genset start or stop re-solves the same way, once the telemetry a tick
+#: reads shows the set running or stopped (its `genset_running` column), as the plan reads its carried run state from there
+RESOLVE_EVENTS = ("outage_start", "outage_end", "genset_start", "genset_stop")
+#: What each event re-solve waits to see in the telemetry a tick reads: the column and the value that shows it
+RESOLVE_SHOWS = {"outage_start": ("grid", 0.0), "outage_end": ("grid", 1.0), "genset_start": ("gen_on", 1.0), "genset_stop": ("gen_on", 0.0)}
 RESOLVE_GAP_S = 30
 RESOLVE_WAIT_S = 120
 RESOLVE_STALE_S = 900
@@ -230,7 +234,8 @@ def _event_minute(e) -> int:
 
 
 def _event_resolve(site_id: str) -> None:
-    """The out-of-cycle tick after an outage event; the events are stored and acknowledged already, so a failure is logged, not answered."""
+    """The out-of-cycle tick after an outage or genset event, or a forecast that missed (`_bust_check`); the events are stored and acknowledged
+    already, so a failure is logged, not answered."""
     try:
         r = plans.tick(site_id)
         log.info("event re-solve for site %s: %s", site_id, r.get("status"))
@@ -242,29 +247,38 @@ def _shown(site_id: str, pend: dict, now: int) -> bool:
     """True when a tick at `now` reads what the pending event says. The tick reads telemetry only up to the last whole minute before now, so the event's
     minute must have ended; and the last minute with a grid reading, from the event's minute on, must read the grid down after outage_start (recent
     enough for the tick to take it as the state now) or present after outage_end. A row that still reads the grid present in the minute it was lost (lost
-    50 seconds in, the minute's reading taken before) does not show the outage: the next minute's row does."""
+    50 seconds in, the minute's reading taken before) does not show the outage: the next minute's row does. A genset event reads the set's running
+    column the same way (RESOLVE_SHOWS): running after genset_start (recently), stopped after genset_stop."""
     got = _readings(site_id, pend, now)
     if got is None:
         return False                                  # the event's minute has not ended: a tick now would not read it
-    grid, known, _ = got
-    if not len(known):
+    col, _known = got[0], got[1]
+    if not len(_known):
         return False
-    down = float(grid[known[-1]]) == 0.0
-    if pend.get("event") == "outage_start":
-        return down and len(grid) - 1 - int(known[-1]) <= OBSERVED_LAG_MIN
-    return not down
+    value = float(col[_known[-1]])
+    event = pend.get("event")
+    recent = len(col) - 1 - int(_known[-1]) <= OBSERVED_LAG_MIN
+    if event == "outage_start":
+        return value == 0.0 and recent
+    if event == "genset_start":
+        return value > 0.5 and recent
+    if event == "genset_stop":
+        return value < 0.5
+    return value != 0.0
 
 
 def _readings(site_id: str, pend: dict, now: int) -> tuple[np.ndarray, np.ndarray, bool] | None:
-    """The minute grid a tick at `now` reads from the pending event's minute on (at most SHOWN_WINDOW_S of it), the indexes of its minutes with a grid
-    reading, and whether the first of those minutes comes after the event's own minute; None while the event's minute has not ended."""
+    """The minute grid a tick at `now` reads from the pending event's minute on (at most SHOWN_WINDOW_S of it), the indexes of its minutes with a
+    reading of the column the event shows in (RESOLVE_SHOWS: the grid, or the genset's running flag), and whether the first of those minutes comes after
+    the event's own minute; None while the event's minute has not ended."""
     minute = int(pend.get("minute", 0))
     cut = now // 60 * 60
     if cut <= minute:
         return None
     start = max(minute, cut - SHOWN_WINDOW_S)
-    grid = telemetry.minute_grid(site_id, start, cut)["grid"]
-    return grid, np.flatnonzero(~np.isnan(grid)), start > minute
+    key = RESOLVE_SHOWS.get(pend.get("event"), ("grid", 0.0))[0]
+    col = np.asarray(telemetry.minute_grid(site_id, start, cut)[key], dtype=float)
+    return col, np.flatnonzero(~np.isnan(col)), start > minute
 
 
 def _caught_up(site_id: str, pend: dict, now: int) -> bool:
@@ -363,9 +377,37 @@ def edge_telemetry(site_id: str, background: BackgroundTasks, inp: dict = Depend
     except Exception:
         log.exception("could not start the event re-solve for site %s", site_id)
         resolve = "failed"
+    if resolve is None and site.get("status") == "active":
+        try:
+            resolve = _bust_resolve(site_id, background)
+        except Exception:
+            log.exception("could not check the forecast for site %s", site_id)
+        if resolve is not None:
+            answer["resolve_reason"] = "forecast_bust"
     if resolve is not None:
         answer["resolve"] = resolve
     return answer
+
+
+def _bust_resolve(site_id: str, background: BackgroundTasks) -> str | None:
+    """An intra-day forecast bust re-solves the plan (round 7 stage 2, audit brief-vs-build-15; plan Part 2.4 and OPT-15): once a telemetry batch is
+    stored, the last 30 minutes' PV against the forecast issue in force at each minute, the latest (the one the plan in force was solved on) missing
+    too (alerts.intraday_bust, at the site's Forecast bust threshold). One re-solve per latest issue (a re-solve within the quarter replaces it, and the
+    next tick's issue is judged once five minutes of it are read), and at most one event re-solve per site every RESOLVE_GAP_S. 'scheduled',
+    'rate_limited' or None."""
+    pct = float(alerts._th(alerts.site_rules(site_id), "Forecast", "bust_pct"))
+    bust = alerts.intraday_bust(site_id, now_ts(), pct)
+    if bust is None or sites.state(site_id).get("bust_resolved_issue") == bust["belief_time"]:
+        return None
+    with _solve_lock:
+        before = _last_event_solve.get(site_id)
+        if before is not None and time.monotonic() - before < RESOLVE_GAP_S:
+            return "rate_limited"
+        _last_event_solve[site_id] = time.monotonic()
+    _put_state(site_id, bust_resolved_issue=bust["belief_time"])
+    log.info("forecast bust at site %s (%.0f %% of the clear-sky ceiling): re-solving", site_id, bust["err_pct"])
+    background.add_task(_event_resolve, site_id)
+    return "scheduled"
 
 
 @router.post("/api/edge/{site_id}/heartbeat", openapi_extra=_JSON_BODY)

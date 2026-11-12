@@ -289,7 +289,8 @@ def test_the_off_grid_terminal_value_prices_a_stored_kwh_as_the_savings_ledger_d
     gm = {"S": g["rated_kw"], "a": g["a"], "b": g["b"], "c_fuel": p["genset"]["c_fuel"], "c_om": g["c_om_rs_per_kwh"], "c_runhr": g["c_runhr_rs"]}
     assert 0.3 <= ratio < 0.5 and c_next == pytest.approx(optimise._gen_marginal(gm, ratio), abs=1e-9)
     assert c_next > p["c_short"] + 15.0
-    assert p["battery"]["a_gen"] is False and p["battery"]["a_gen_surplus"] is True
+    # the farm's Voltronic keys charging from the set (charger priority SNU; round 7 stage 2, audit engine-plans-live-18), so the plan counts on it
+    assert p["battery"]["a_gen"] is True and p["battery"]["a_gen_surplus"] is True
     r = optimise.solve(optimise.shorten(p, 8))                                       # the terminal value, on a short solve
     assert r["v_end"] == pytest.approx(max(0.0, b["eta_d"] * c_next - p["battery"]["c_cyc"] - p["terminal"]["c_cal_hold"]), abs=1e-9)
     # one rule for both: the ledger's v_end on a twin day is plans.offgrid_c_next applied to that day's load and PV
