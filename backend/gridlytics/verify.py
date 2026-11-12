@@ -873,6 +873,13 @@ def _end_state(sim: dict) -> dict:
             "gen_rescue": bool(sim.get("gen_rescue_end", False))}
 
 
+def _gen_starts(sim: dict, on_before: bool) -> int:
+    """The genset's starts in an arm's day, as _genset_cost counts them (a run going on at midnight is not a start): plan 8.3's diesel KPI ("run
+    hours, starts per day") per arm (round 7, audit brief-vs-build-13: the ledger kept the litres and hours only)."""
+    on = np.asarray(sim["gen_on"], dtype=bool)
+    return int(np.sum(on[1:] & ~on[:-1]) + (1 if len(on) and on[0] and not on_before else 0))
+
+
 def _gen_running_before(site_id: str, t0: int) -> bool:
     """Whether the genset was running in the minute before t0, as the actual arm reads its state (the flag, else its power, else its litres);
     False where that minute has no genset reading."""
@@ -1325,6 +1332,7 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
     # a run going on at midnight is not a start: the actual arm's state before 00:00 from the minute before it
     gen_before = _gen_running_before(site_id, twin.day_start_utc(day)) if gen_asset else False
     arms = {"actual": price_arm(site, masked_actual, pr, day, e_end_actual, v_end, gen_before=gen_before)}
+    arms["actual"]["genset_starts"] = _gen_starts(masked_actual, gen_before)
     # each baseline's replay starts from its own end state of the day before (its chain), or from the actual arm's state where the chain restarts
     starts = _chain_starts(site_id, day)
     tuned_rule = fit_tuned(site, day)
@@ -1352,6 +1360,7 @@ def _score_day(site_id: str, day: date, with_bound: bool = True) -> dict | None:
         e_end_base = float(sim["soc"][-1]) * plant.e_nom
         arms[k] = price_arm(site, _grid_masked(sim, unresolved, series["pv"], known=charge_known, load=load_read), pr, day, e_end_base, v_end,
                             gen_before=on_before)
+        arms[k]["genset_starts"] = _gen_starts(sim, on_before)
         gap_start = (e_start_actual - soc_start * plant.e_nom) if st["from"] == "previous_day" else 0.0
         gap_end = e_end_actual - e_end_base
         # the gap in stored energy is valued at the day's v_end at its end, and was valued at the day before's at its start: the days telescope

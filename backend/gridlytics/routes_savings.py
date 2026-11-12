@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Body
 from fastapi.responses import PlainTextResponse
 
-from . import auth, sites, store, telemetry, verify
+from . import auth, gonogo, sites, store, telemetry, verify
 from .routes_common import bad, full_or_404, out, parse_day, site_or_404, today
 from .schemas import PilotEdit, PilotStart, Refusal, SwitchbackPaint, check
 
@@ -61,6 +61,19 @@ def recompute(site_id: str, inp: dict = Body(default={})):
         # security-roles-04)
         store.audit(auth.actor(), verify.RECOMPUTED, site_id, {"start": d0.isoformat(), "end": d1.isoformat(), "days": []})
     return done
+
+
+@router.get("/api/sites/{site_id}/savings/kpis")
+def savings_kpis(site_id: str, start: str | None = None, end: str | None = None):
+    """Plan Part 8.3's measures the money figures leave out, over the Savings page's period (round 7, audit brief-vs-build-13): reserve adequacy, the
+    constraint violations (the minutes read over at most gonogo.VIOLATION_DAYS_MAX days), control health, the genset's run hours and starts and the
+    battery's cycles on each arm, and the BMS trust score (gonogo.measures). No money: every role reads them."""
+    site_or_404(site_id)
+    t = today()
+    d0, d1 = parse_day(start, t.replace(day=1)), parse_day(end, t)
+    if d1 < d0:
+        raise Refusal(422, "The period's last day must be on or after its first", "invalid")
+    return out(gonogo.measures(site_id, d0, d1))
 
 
 @router.get("/api/sites/{site_id}/savings/export.csv")

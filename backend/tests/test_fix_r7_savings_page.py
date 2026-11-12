@@ -4,14 +4,17 @@ wording of the reports, from the end-to-end audit.
 Each test fails on the code before its fix. Test data: hand-made day rows and a stubbed summary only; nothing here calls the network."""
 from __future__ import annotations
 
+import json
+
 from datetime import date, datetime, timedelta, timezone
 
+import numpy as np
 import pytest
 from test_fix_api import world  # noqa: F401 (a fixture)
 from test_fix_r7_alerts_reports import _baseline, _day_row, _fake_summary, _past_month, _story, _tday, _with_summary
 from test_fix_savings import _days, _put_rows, _row, company, make_site  # noqa: F401 (company is a fixture)
 
-from gridlytics import store, tariffs, verify
+from gridlytics import sites, store, tariffs, verify
 
 PKT = timezone(timedelta(hours=5))
 
@@ -161,3 +164,82 @@ def test_the_reports_switchback_names_each_switch_both_ways_and_the_figures_befo
     text = " ".join(doc.paras)
     assert "Rs 1,100 a day adjusted and Rs 1,200 unadjusted before the carry-over credit" in text, text
     assert "Carry-over credit: Rs 1,400 in all, Rs 100 a plan day, included in both." in text, text
+
+
+# ------------------------------------------------------------------------------------------------ brief-vs-build-13: the KPIs
+
+def _arm(hours=0.0, starts=0, discharge=0.0, unserved=0.0, cost=0.0) -> dict:
+    return {"genset_hours": hours, "genset_starts": starts, "discharge_kwh": discharge, "unserved_kwh": unserved, "cost_rs": cost, "e_end_kwh": 0.0,
+            "v_end": 0.0}
+
+
+def _gate_rows(sid: str, d0: date, n: int, actual: dict, native: dict, tuned: dict, saving=1000.0, fidelity="confirmed") -> None:
+    rows = {}
+    for d in _days(d0, d0 + timedelta(days=n - 1)):
+        nat = {**_row(saving, saving, fidelity=fidelity), "actual": {**_arm(**actual)}, "baseline": {**_arm(**native)}}
+        tun = {**_row(saving / 2, saving / 2, fidelity=fidelity), "actual": {**_arm(**actual)}, "baseline": {**_arm(**tuned)}}
+        rows[d.isoformat()] = {"native": nat, "tuned": tun}
+    _put_rows(sid, rows)
+
+
+def _ack(sid: str, at: datetime, body: dict) -> None:
+    with store.connect() as con:
+        con.execute("INSERT INTO acks (id, site_id, plan_id, status, body, received_at) VALUES (?,?,?,?,?,?)",
+                    (store.new_id(), sid, "p1", "applied", json.dumps(body), at.isoformat(timespec="seconds")))
+
+
+def test_the_kpis_give_reserve_adequacy_the_constraint_violations_control_health_and_each_arms_genset_and_cycles(company, monkeypatch):
+    """brief-vs-build-13: the brief's KPI table has reserve adequacy over a period, the constraint violations (genset under its minimum load, export
+    above the cap, import during an outage), control health (writes per register per day, read-back failures, fallback events) and the genset's run
+    hours and starts against the baselines; none of them was computed anywhere. gonogo.measures gives them for a period."""
+    from gridlytics import gonogo, telemetry, twin
+    sid = make_site(name="KPI mill")                                    # battery 215 kWh, genset 200 kW at f_min 0.3, a grid site without export
+    day = date(2026, 11, 2)
+    t0 = twin.day_start_utc(day)
+    cols = ("site_id", "ts", "source_id", "grid_present", "grid_import_wh", "grid_export_wh", "genset_running", "genset_power_w")
+    rows = []
+    for i in range(120):
+        t = t0 + 10 * 3600 + i * 60
+        down = i < 30                                                    # 30 minutes of outage, 10 of them importing 5 kW (a meter's back-feed)
+        imp = 5.0 if down and i < 10 else (0.0 if down else 50.0)
+        exp = 3.0 if 60 <= i < 80 else 0.0                               # 20 minutes exporting 3 kW where no export is allowed
+        gen_kw = 30.0 if down else 0.0                                   # the genset carries the outage at 30 kW, under its 60 kW minimum
+        rows.append((sid, t, "csv", 0.0 if down else 1.0, imp * 1000 / 60, exp * 1000 / 60, 1.0 if down else 0.0, gen_kw * 1000))
+    telemetry.write_rows(rows, cols)
+    at = datetime.fromtimestamp(t0 + 11 * 3600, timezone.utc)
+    _ack(sid, at, {"items": [{"device": "inv", "primitive": "tou_slots", "written": 1, "read_back": 1, "status": "ok"},
+                             {"device": "inv", "primitive": "tou_slots", "written": 2, "read_back": 3, "status": "ok"},
+                             {"device": "inv", "primitive": "max_charge_a", "written": 50, "read_back": None, "status": "failed", "codes": ["OFF_WHITELIST"]}]})
+    _ack(sid, at + timedelta(days=1), {"per_device": [{"device_id": "inv", "status": "applied", "applied": [{"primitive": "tou_slots", "readback_ok": False}],
+                                                       "rejected": [{"primitive": "grid_charge", "reason": "OFF_WHITELIST"}]}]})
+    _ack(sid, at + timedelta(hours=1), {"status": "rejected", "reason": "OFF_WHITELIST", "items": []})   # a whole plan refused off the whitelist
+    with store.connect() as con:
+        con.execute("INSERT INTO events (site_id, ts, type, source, detail) VALUES (?,?,?,?,?)", (sid, at.isoformat(), "fallback_engaged", "edge", "{}"))
+    from gridlytics import battery
+    seen = []
+    monkeypatch.setattr(battery, "state", lambda site, now=None: seen.append(now) or {"trust": 0.82, "trust_basis": "independent", "c_cyc": 9.0})
+    _gate_rows(sid, day, 2, actual={"hours": 2.0, "starts": 1, "discharge": 150.0, "unserved": 1.5}, native={"hours": 3.0, "starts": 2, "unserved": 1.0},
+               tuned={"hours": 4.0, "starts": 3, "discharge": 100.0})
+    m = gonogo.measures(sid, day, day + timedelta(days=1), now=t0 + 3 * 86400)
+    v = m["violations"]
+    assert v["minutes_checked"] is True and v["minutes_read"] == 120
+    assert v["import_during_outage_min"] == 10 and v["export_above_cap_min"] == 20 and v["export_cap_kw"] == 0.0
+    assert v["genset_below_min_load_min"] == 30 and v["genset_min_load_kw"] == 60.0
+    assert v["unserved_caused_by_plan_kwh"] == 1.0                     # 1.5 - 1.0 on each of two claiming days
+    c = m["control"]
+    assert c["writes"] == 3 and c["writes_per_register_per_day"] == {"tou_slots": 1.5} and c["writes_per_register_per_day_max"] == 2
+    assert c["readback_failures"] == 2 and c["write_failures"] == 1 and c["off_whitelist"] == 3 and c["fallback_events"] == 1
+    assert c["fidelity_pct"] == 100.0 and c["plan_days"] == 2
+    assert m["genset"]["hours"] == {"actual": 4.0, "native": 6.0, "tuned": 8.0} and m["genset"]["starts"] == {"actual": 2.0, "native": 4.0, "tuned": 6.0}
+    e_nom = twin.plant_of(sites.full(sid)).e_nom
+    assert m["battery"]["efc_per_day"]["actual"] == pytest.approx(150.0 / e_nom, abs=1e-3)
+    assert m["battery"]["efc_per_day"]["tuned"] == pytest.approx(100.0 / e_nom, abs=1e-3)
+    # the brief's BMS trust (the gap between the BMS and the independent estimate) over the 30 days to the period's end, no money with it
+    assert m["battery"]["bms_trust"] == {"trust": 0.82, "basis": "independent", "to": "2026-11-03"} and seen == [t0 + 2 * 86400]
+
+
+def test_the_ledger_counts_each_arms_genset_starts():
+    """brief-vs-build-13: the ledger stored the genset's litres and hours per arm but not its starts (plan 8.3's diesel KPI: 'run hours, starts per
+    day'). A run going on at midnight is not a start, as the genset's cost counts it."""
+    assert verify._gen_starts({"gen_on": np.array([1, 1, 0, 1, 1, 0, 0, 1], dtype=bool)}, on_before=False) == 3
+    assert verify._gen_starts({"gen_on": np.array([1, 1, 0, 1, 1, 0, 0, 1], dtype=bool)}, on_before=True) == 2
