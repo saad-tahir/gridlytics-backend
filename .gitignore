@@ -11,8 +11,9 @@ release/
 .env.*
 !.env*.example
 # The family's rules (solarlytics-backend/.gitignore): the token-signing secret and the edge signing keys of a data folder kept anywhere in the repository,
-# not only data/, and every local accounts list of the demo
+# not only data/ (keys/<company file>/<site>-<key>.pem and their copies beside the backups: no private key belongs in the repository), and every local
+# accounts list of the demo
 data/platform.secret
 platform.secret
-**/keys/*.pem
+*.pem
 demo/*.local.md

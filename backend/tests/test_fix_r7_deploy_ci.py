@@ -349,7 +349,10 @@ def test_every_secret_file_a_deployer_or_the_seed_may_make_is_ignored_and_the_ex
     # the founder console's settings wherever they are written, the token-signing secret and the signing keys of a data folder kept anywhere in the
     # repository (not only data/), the demo accounts' passwords, and Python's caches
     for path in (".env", ".env.production", ".env.founder", ".env.local", "backend/.env", "data/.env.founder", "platform.secret",
-                 "data/platform.secret", "scratch-data/platform.secret", "scratch-data/keys/site-1-k1.pem", "demo/DEMO_ACCOUNTS.local.md",
+                 "data/platform.secret", "scratch-data/platform.secret", "scratch-data/keys/site-1-k1.pem",
+                 # the layout delivery and backups really write: keys/<the company file's stem>/<site>-<key>.pem, and its copies beside the backups
+                 "scratch-data/keys/c-1/site-1-k1.pem", "scratch-data/keys/gridlytics/site-1-k1.pem",
+                 "scratch-data/companies/backup/c-1-keys-20261112-0100-daily/site-1-k1.pem", "demo/DEMO_ACCOUNTS.local.md",
                  "demo/other.local.md", "backend/gridlytics/__pycache__/api.cpython-312.pyc", "backend/x.pyc", ".pytest_cache/v/cache/lastfailed"):
         assert _ignored(path), f"{path} is not ignored: git add -A would commit it"
     for path in (".env.production.example", ".env.example", "demo/companies.template.csv", "backend/gridlytics/identity.py", "docs/DEPLOY.md"):
