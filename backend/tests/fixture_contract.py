@@ -117,9 +117,19 @@ def paths(obj, prefix: str = "") -> set[str]:
     return out
 
 
+#: Objects whose fields depend on the data's kind, not the route's shape: a step's reason detail (`rs_per_kwh` while the slot charges from the grid, `p`
+#: and `hours` while it holds for an outage) and an alert's detail of its kind. The fixture is asked for the object, never for its fields, so the contract
+#: does not fail at the hours every demo site's current slot happens to carry one more of them (UX step 0: it failed at 18:00 in Karachi, when all four
+#: sites charged for reserve).
+KIND_SHAPED = re.compile(r"(^|\.)detail$")
+
+
 def required(obj, prefix: str = "") -> set[str]:
     """The key paths an answer carries wherever it can: every key of an object, and under a list (or a map whose keys are data) only what every one
-    of its elements carries. A field only some elements carry (an alert's detail of its kind, a step's flags) is served where the data has it."""
+    of its elements carries. A field only some elements carry (an alert's detail of its kind, a step's flags) is served where the data has it; the
+    fields of an object shaped by the data's kind (KIND_SHAPED) are never asked."""
+    if prefix and KIND_SHAPED.search(prefix):
+        return set()
     if isinstance(obj, dict):
         if _is_map(obj, prefix):
             subs = [required(v, f"{prefix}{{}}") for v in obj.values()]

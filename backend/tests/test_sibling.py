@@ -291,6 +291,18 @@ def test_the_fixture_contract_sees_a_missing_and_a_stale_field_and_re_captures_w
     assert fc.differences(merged, live, names) == (set(), set())
 
 
+def test_the_fields_of_a_reason_detail_are_never_asked_of_a_fixture_whatever_the_hour():
+    # UX step 0: at 18:00 in Karachi every demo site's current slot charged for reserve, so now_next.current.detail carried rs_per_kwh at all four,
+    # and the contract asked the fixtures (captured on a slot that held for an outage) for it; a detail's fields follow the slot's reason, not the route
+    live = {"now_next": {"current": {"reason": "charge_for_reserve", "detail": {"kwh": 78.0, "rs_per_kwh": 26.98}}, "next": [{"detail": {"p": 0.9}}]}}
+    fixture = {"now_next": {"current": {"reason": "hold_for_outage", "detail": {"p": 0.03, "hours": 1}}, "next": [{"detail": {"p": 0.1}}]}}
+    names = fc.backend_names()
+    assert fc.differences(fixture, live, names, [live]) == (set(), set())
+    # the detail itself is still asked for
+    lacking = {"now_next": {"current": {"reason": "hold_for_outage"}, "next": [{"detail": {"p": 0.1}}]}}
+    assert fc.differences(lacking, live, names) == ({"now_next.current.detail"}, set())
+
+
 def test_a_re_capture_runs_on_a_scratch_database_whatever_the_shell_says(tmp_path):
     # review (round 7, tests-ci): `fixture_contract.py --write` seeds a demo; a shell that names the owner's database, another sign-in mode or a data
     # folder must not carry the seed there (before: setdefault kept a GRIDLYTICS_DB the shell already held)
