@@ -242,6 +242,13 @@ def fleet_row(s: dict, now: int, counts: dict, gensets: set | None = None) -> di
 
 @router.get("/api/fleet")
 def fleet():
+    # the fleet's reads share one connection to the company's file (round 7, audit performance-live-08: about 8 connections a site, each loading the
+    # schema again)
+    with store.shared():
+        return _fleet()
+
+
+def _fleet():
     now = now_ts()
     c = alerts.counts()
     with store.connect() as con:

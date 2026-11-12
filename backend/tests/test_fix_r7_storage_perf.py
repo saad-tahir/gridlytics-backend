@@ -1152,3 +1152,51 @@ def test_the_plan_answer_reads_why_no_plan_is_in_force_from_held_info_alone(worl
         raise RuntimeError("a fault in held_info")
     monkeypatch.setattr(plans, "held_info", broken)
     assert v.get(f"/api/sites/{world.site}/plan").status_code == 500
+
+
+# ------------------------------------------------------------------------------------------------ performance-live-08 (one connection a request)
+
+def test_the_fleet_answer_reads_the_company_file_through_one_connection_whatever_its_sites(world, monkeypatch):
+    """GET /fleet opened about 8 connections to the company's file a site (each loading the schema again: about 0.3 ms), so its cost grew with the fleet
+    beyond the reads themselves. The fleet's reads now share one connection for the request (store.shared): adding sites adds no connection, every
+    connect() block still commits at its end, and a block that raises rolls back what it wrote; outside the request each block has its own as before."""
+    from gridlytics import routes_sites
+    opened = []
+    real = store._connect
+    monkeypatch.setattr(store, "_connect", lambda: (opened.append(threading.current_thread().name), real())[1])
+    a = world.c["admin"]
+
+    def fleet() -> tuple[int, dict]:
+        routes_sites._mtd.clear()                                                  # the same work on every call: no reused saving
+        opened.clear()
+        r = a.get("/api/fleet")
+        assert r.status_code == 200, r.text
+        return len(opened), r.json()
+    few, before = fleet()
+    with world.use():
+        for k in range(4):
+            _site(f"Extra {k}")
+    many, after = fleet()
+    assert len(after["sites"]) == len(before["sites"]) + 4
+    assert many <= few <= 3, (few, many)                                         # 30 and 80 before (a once-a-process check may add one)
+    assert {r["id"]: r for r in after["sites"] if r["id"] in {s["id"] for s in before["sites"]}} == {r["id"]: r for r in before["sites"]}
+    # inside a shared block: one connection, each block committed at its end, a block that raised rolled back, and a block of another thread its own
+    with world.use():
+        opened.clear()
+        with store.shared():
+            with store.connect() as con:
+                con.execute("INSERT INTO audit (org_id, at, actor, action) VALUES ('default', 'x', 't', 'kept')")
+            with pytest.raises(RuntimeError):
+                with store.connect() as con:
+                    con.execute("INSERT INTO audit (org_id, at, actor, action) VALUES ('default', 'x', 't', 'rolled back')")
+                    raise RuntimeError
+            done = []
+            t = threading.Thread(target=lambda: done.append(store.list_audit(5)))
+            t.start()
+            t.join()
+            with store.connect() as con:
+                actions = [r[0] for r in con.execute("SELECT action FROM audit WHERE actor = 't' AND at = 'x'")]
+        assert actions == ["kept"] and done and len(opened) == 2                  # the block's one, and the other thread's own
+        opened.clear()
+        with store.connect() as con, store.connect() as again:
+            assert con is not again                                                # outside a shared block, a connection a block

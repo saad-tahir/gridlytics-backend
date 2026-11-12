@@ -363,9 +363,46 @@ def _seen_ready(path: Path) -> None:
         _ready.add(key)
 
 
+#: The connections a `shared()` block holds: the thread that opened it and one connection a workspace file (round 7, audit performance-live-08)
+_SHARED: ContextVar[dict | None] = ContextVar("gridlytics_shared_connections", default=None)
+
+
+@contextmanager
+def shared():
+    """Inside the block, every connect() of this thread on a workspace file uses one connection, opened at its first use and closed at the block's end,
+    instead of a connection a call (round 7, audit performance-live-08: GET /fleet opened about 8 connections a site, each loading the schema again).
+    Each connect() block still commits at its end, and rolls back what it wrote when it raises; write_transaction keeps a connection of its own, and
+    another thread (a job started inside) opens its own as before. A shared() inside another is the outer one. For a read-mostly request whose
+    connect() blocks do not sit inside each other's writes."""
+    if _SHARED.get() is not None:
+        yield
+        return
+    held: dict = {"thread": threading.get_ident(), "cons": {}}
+    token = _SHARED.set(held)
+    try:
+        yield
+    finally:
+        _SHARED.reset(token)
+        for con in held["cons"].values():
+            con.close()
+
+
 @contextmanager
 def connect():
-    """A connection closed at the end of the block; commits on success."""
+    """A connection closed at the end of the block; commits on success. Inside a `shared()` block of this thread, that block's connection."""
+    held = _SHARED.get()
+    if held is not None and held["thread"] == threading.get_ident():
+        key = str(db_path())
+        con = held["cons"].get(key)
+        if con is None:
+            con = held["cons"][key] = _connect()
+        try:
+            yield con
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+        return
     con = _connect()
     try:
         yield con
