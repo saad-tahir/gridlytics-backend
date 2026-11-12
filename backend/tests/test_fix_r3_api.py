@@ -190,10 +190,11 @@ def _plan_row(w, sid, pid, status, reason, generated):
                     (pid, sid, generated, generated, generated, until, "a", status, reason))
 
 
-def test_the_plan_answer_says_why_no_plan_is_in_force(world, monkeypatch):
+def test_the_plan_answer_says_why_no_plan_is_in_force(world):
+    """Through plans.held_info, the code that runs: the fallback this file's tests once forced by deleting it is gone from what they cover (round 7,
+    audit tests-and-perf-20)."""
     sid = world.site
     c = world.c["viewer"]
-    monkeypatch.delattr(plans, "held_info", raising=False)                     # the fallback of this file first
     assert c.get(f"/api/sites/{sid}/plan").json() == {"plan": None, "held": None}
     until = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat(timespec="seconds")
     with world.use():
@@ -206,18 +207,10 @@ def test_the_plan_answer_says_why_no_plan_is_in_force(world, monkeypatch):
         sites.clear_override(sid, o["id"], "test")
     _plan_row(world, sid, "p-guard", "held", "The plan would discharge below the reserve", "2026-11-07T10:15:00+00:00")
     assert c.get(f"/api/sites/{sid}/plan").json()["held"] == {"reason": "The plan would discharge below the reserve", "until": None, "plan_id": "p-guard"}
-    # the optimiser's helper decides where it exists
-    monkeypatch.setattr(plans, "held_info", lambda site_id, now=None: {"reason": "control_paused", "until": "u", "plan_id": "p", "more": 1}, raising=False)
-    assert c.get(f"/api/sites/{sid}/plan").json() == {"plan": None, "held": {"reason": "control_paused", "until": "u", "plan_id": "p"}}
 
 
-@pytest.mark.parametrize("helper", ["fallback", "plans.held_info"])
-def test_a_pause_before_its_first_tick_is_held_with_no_plan_id(world, monkeypatch, helper):
+def test_a_pause_before_its_first_tick_is_held_with_no_plan_id(world):
     sid = world.site
-    if helper == "fallback":
-        monkeypatch.delattr(plans, "held_info", raising=False)
-    elif not hasattr(plans, "held_info"):
-        pytest.skip("the optimiser group's plans.held_info is not there yet")
     until = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(timespec="seconds")
     with world.use():
         o = sites.add_override(sid, {"kind": "force_native", "until": until, "reason": "test"}, "test")
@@ -449,7 +442,9 @@ def test_the_fuel_log_is_listed(world):
     assert all("cost_rs" not in x for x in world.c["viewer"].get(f"/api/sites/{sid}/genset/fuel").json()["logs"])
 
 
-def test_an_upload_passes_its_file_name_where_the_import_takes_one(world, monkeypatch):
+def test_an_upload_passes_its_file_name_to_the_import(world, monkeypatch):
+    """The uploaded file's name always goes with the import (round 7, audit tests-and-perf-20): routes_telemetry no longer asks import_csv's
+    signature whether it takes one, a shim that dropped the name silently when the import changed, and that this test kept alive by covering it."""
     sid = world.site
     a = world.c["admin"]
     seen = []
@@ -458,17 +453,20 @@ def test_an_upload_passes_its_file_name_where_the_import_takes_one(world, monkey
         seen.append(file_name)
         return {"rows": 1, "gaps": 0}
 
-    def without_name(site_id, content, tz_offset_h=0.0, mapping=None, now=None):
-        seen.append("called")
-        return {"rows": 1, "gaps": 0}
-
     csv = b"ts,grid_present\n2026-11-01T00:00:00Z,1\n"
     monkeypatch.setattr(telemetry, "import_csv", with_name)
     assert a.post(f"/api/sites/{sid}/telemetry/upload", files={"file": ("march.csv", csv, "text/csv")}).status_code == 200
     r = a.post(f"/api/sites/{sid}/telemetry/upload", params={"file_name": "C:\\logs\\april.csv"}, content=csv, headers={"Content-Type": "text/csv"})
     assert r.status_code == 200 and seen == ["march.csv", "april.csv"], (r.text, seen)
+
+    def without_name(site_id, content, tz_offset_h=0.0, mapping=None, now=None):
+        seen.append("stored without its name")
+        return {"rows": 1, "gaps": 0}
+
+    # an import that no longer takes the name is an error, not an upload stored with its name dropped (the shim answered 200 here)
     monkeypatch.setattr(telemetry, "import_csv", without_name)
-    assert a.post(f"/api/sites/{sid}/telemetry/upload", files={"file": ("may.csv", csv, "text/csv")}).status_code == 200 and seen[-1] == "called"
+    assert a.post(f"/api/sites/{sid}/telemetry/upload", files={"file": ("may.csv", csv, "text/csv")}).status_code == 500
+    assert seen[-1] == "april.csv"
 
 
 # ------------------------------------------------------------------------------------------------ alerts
@@ -548,16 +546,11 @@ def test_the_wait_runs_a_re_solve_only_once_telemetry_reaches_past_the_events_mi
 
 # ------------------------------------------------------------------------------------------------ ask-plan-held: a pause with a plan still stored as active
 
-@pytest.mark.parametrize("helper", ["fallback", "plans.held_info"])
-def test_a_pause_or_release_answers_no_plan_while_the_plan_of_before_is_still_active(world, monkeypatch, helper):
+def test_a_pause_or_release_answers_no_plan_while_the_plan_of_before_is_still_active(world, monkeypatch):
     """The verifier's probe: with an active plan, a pause (and a release) left GET /plan serving that plan as in force, with no held, until the next tick
     stored a held plan; plans.active_at(now) was already None."""
     sid = world.site
     admin, viewer = world.c["admin"], world.c["viewer"]
-    if helper == "fallback":
-        monkeypatch.delattr(plans, "held_info", raising=False)
-    elif not hasattr(plans, "held_info"):
-        pytest.skip("the optimiser group's plans.held_info is not there yet")
     monkeypatch.setattr(plans, "tick", lambda site_id, *a, **k: {"status": "active", "plan_id": "p-active"})
     _plan_row(world, sid, "p-active", "active", "", (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds"))
     assert viewer.get(f"/api/sites/{sid}/plan").json()["plan"]["id"] == "p-active"

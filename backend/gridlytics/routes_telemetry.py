@@ -1,7 +1,6 @@
 """Telemetry, outages, battery and genset pages (UI-05, 06, 07, 10, 11), the CSV import and export, and the event log."""
 from __future__ import annotations
 
-import inspect
 import json
 import math
 import re
@@ -74,22 +73,13 @@ def _upload_head(content: bytes) -> None:
         raise ValueError(f"The header names {', '.join(twice[:5])} more than once: give each column once and upload again")
 
 
-def _takes_file_name() -> bool:
-    try:
-        return "file_name" in inspect.signature(telemetry.import_csv).parameters
-    except (TypeError, ValueError):
-        return False
-
-
 def _import(site_id: str, body: bytes, tz_offset_h: float, file_name: str | None = None, mapping: dict | None = None) -> dict:
     m = telemetry.mapping_of(mapping) if mapping else None
     _upload_head(body)
     extra = {"mapping": m} if m else {}
     try:
-        # the uploaded file's name goes with the import (the quality page's imports rows) where telemetry.import_csv takes it
-        if file_name and _takes_file_name():
-            return telemetry.import_csv(site_id, body, tz_offset_h, file_name=file_name, **extra)
-        return telemetry.import_csv(site_id, body, tz_offset_h, **extra)
+        # the uploaded file's name goes with the import (the quality page's imports rows)
+        return telemetry.import_csv(site_id, body, tz_offset_h, file_name=file_name, **extra)
     except (OverflowError, OSError) as exc:
         raise ValueError(f"A row's time cannot be read: {exc}") from None
 

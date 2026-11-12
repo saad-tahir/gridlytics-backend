@@ -2,8 +2,13 @@
 cross-origin."""
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
+
 from gridlytics import api
 from test_fix_api import world  # noqa: F401  (world is a fixture)
+
+#: the web app's origin the tests serve (conftest.py's GRIDLYTICS_CORS_ORIGINS)
+APP = "https://app.example.test"
 
 
 def test_a_person_discards_their_own_draft_and_nobody_else_s(world):
@@ -31,4 +36,15 @@ def test_every_site_answer_carries_the_tier_sign_off(world):
 
 
 def test_the_idempotency_key_header_is_allowed_cross_origin():
-    assert "Idempotency-Key" in api.CORS_ALLOW_HEADERS
+    """The browser's own question, not the constant (round 7, audit tests-and-perf-20): the web app on its origin asks in a preflight to send an
+    Idempotency-Key with a POST and is let, and the POST it then sends is answered to that origin. Asserting api.CORS_ALLOW_HEADERS stayed green
+    whatever the middleware was given."""
+    c = TestClient(api.app, raise_server_exceptions=False)
+    asked = {"origin": APP, "access-control-request-method": "POST", "access-control-request-headers": "content-type, idempotency-key"}
+    pre = c.options("/api/local/logout", headers=asked)
+    assert pre.status_code == 200 and pre.headers["access-control-allow-origin"] == APP, pre.text
+    assert "idempotency-key" in {h.strip().lower() for h in pre.headers["access-control-allow-headers"].split(",")}
+    r = c.post("/api/local/logout", json={}, headers={"origin": APP, "Idempotency-Key": "logout-1"})
+    assert r.status_code == 200 and r.headers["access-control-allow-origin"] == APP, r.text
+    # another origin asking the same is not let
+    assert c.options("/api/local/logout", headers={**asked, "origin": "https://evil.example"}).status_code == 400

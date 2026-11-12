@@ -135,8 +135,7 @@ def fuel_add(inp: dict = Body(...)):
     except (ValueError, TypeError) as exc:
         raise bad(exc) from None
     if source is not None:
-        canonical = getattr(tariffs, "_canonical_day", None)
-        day = canonical(valid_from, "A fuel price's start") if callable(canonical) else valid_from[:10]
+        day = tariffs._canonical_day(valid_from, "A fuel price's start")
         with store.connect() as con:
             con.execute("UPDATE fuel_prices SET source = ? WHERE kind = ? AND valid_from = ?", (json.dumps(source), kind, day))
         store.audit(auth.actor(), "recorded a fuel price's source", kind, {"valid_from": day, "ref": source["ref"], "url": source["url"]})
