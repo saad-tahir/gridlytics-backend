@@ -300,9 +300,32 @@ def backup(tag: str) -> Path | None:
     return target
 
 
+#: The workspace files this process has seen in WAL mode at SCHEMA_VERSION, by path, device and inode: a later connection to one is opened without the
+#: two PRAGMA round trips (round 7, audit performance-live-08: a fleet answer opened about 8 connections a site, and their PRAGMAs were a good part of
+#: its time). Both settings live in the file, so they hold until another file takes its place: a restore forgets them (forget_ready).
+_ready: set[tuple[str, int, int]] = set()
+
+
+def _file_key(path: Path) -> tuple[str, int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (str(path), st.st_dev, st.st_ino)
+
+
+def forget_ready() -> None:
+    """Check every workspace file's journal mode and schema again on its next connection (backups.restore: a copy put back may be older)."""
+    _ready.clear()
+
+
 def _connect() -> sqlite3.Connection:
     """A connection to the current workspace file at the current schema; a file is migrated the first time it is opened, a copy first when it holds data."""
     path = db_path()
+    if _file_key(path) in _ready:
+        con = sqlite3.connect(path, timeout=30)
+        con.row_factory = sqlite3.Row
+        return con
     path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(path, timeout=30)
     con.row_factory = sqlite3.Row
@@ -310,6 +333,7 @@ def _connect() -> sqlite3.Connection:
         with _lock:
             con.execute("PRAGMA journal_mode=WAL")
     if con.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+        _seen_ready(path)
         return con
     with _lock:
         version = con.execute("PRAGMA user_version").fetchone()[0]
@@ -329,7 +353,14 @@ def _connect() -> sqlite3.Connection:
                 con.execute("ROLLBACK")
                 raise
             con.isolation_level = ""
+    _seen_ready(path)
     return con
+
+
+def _seen_ready(path: Path) -> None:
+    key = _file_key(path)
+    if key is not None:
+        _ready.add(key)
 
 
 @contextmanager

@@ -301,7 +301,12 @@ def _need_money_settings(inp: dict, before: dict, names, doing: str) -> None:
 
 @router.get("/api/sites")
 def sites_list():
-    return out(sites.listing())
+    """The company's sites, each with `last_data` (its newest minute's time, null with none): what the app shell's site switcher polls for its names,
+    state dots and last-data ages, in two connections whatever the number of sites (round 7, audit performance-live-08: it polled the whole fleet answer,
+    about 4 ms a site, every minute on every page)."""
+    rows = sites.listing()
+    last = telemetry.last_ts([s["id"] for s in rows])
+    return out([{**s, "last_data": last.get(s["id"])} for s in rows])
 
 
 @router.post("/api/sites")

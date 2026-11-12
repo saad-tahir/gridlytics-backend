@@ -242,6 +242,7 @@ def restore(name: str) -> dict:
     aside = store.backup("restore-point")
     with closing(sqlite3.connect(source)) as src, closing(sqlite3.connect(store.db_path())) as dst:
         src.backup(dst)
+    store.forget_ready()                                # the copy may be of an older schema: the next connection checks it again
     live = store.telemetry_path()
     if telemetry_copy.exists() or live.exists():
         with closing(sqlite3.connect(telemetry_copy if telemetry_copy.exists() else ":memory:")) as src, closing(sqlite3.connect(live)) as dst:

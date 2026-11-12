@@ -957,6 +957,16 @@ def latest(site_id: str) -> dict | None:
     return {k: _finite(v) for k, v in dict(r).items()} if r else None
 
 
+def last_ts(site_ids) -> dict[str, int | None]:
+    """Each site's newest minute (its ts, None with none) in one connection: the site list's last-data stamps (round 7, audit performance-live-08). One
+    MAX(ts) a site, which the (site_id, ts) key answers from its last entry, where a GROUP BY would read every stored minute."""
+    ids = list(dict.fromkeys(site_ids))
+    if not ids:
+        return {}
+    with reading() as con:
+        return {sid: con.execute("SELECT MAX(ts) FROM minute WHERE site_id = ?", (sid,)).fetchone()[0] for sid in ids}
+
+
 def first_ts(site_id: str) -> int | None:
     with reading() as con:
         r = con.execute("SELECT MIN(ts) FROM minute WHERE site_id = ?", (site_id,)).fetchone()

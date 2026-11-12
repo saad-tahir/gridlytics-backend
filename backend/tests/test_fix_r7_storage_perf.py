@@ -1068,3 +1068,62 @@ def test_an_answer_over_a_kilobyte_is_gzipped_for_a_client_that_takes_it_and_rea
     assert headers["content-type"].startswith("text/csv") and headers.get("content-encoding") == "gzip"     # the CSV export too
     assert gzip.decompress(body).count(b"\n") > 170
 
+
+# ------------------------------------------------------------------------------------------------ performance-live-08
+
+def test_the_site_list_carries_each_sites_last_data_from_one_read_of_the_telemetry_file(world, monkeypatch):
+    """The app shell polled the whole fleet answer every minute on every page (about 4 ms a site: the plan, the month's saving, the control state of each)
+    only for the site switcher's names, state dots and last-data ages. The site list now carries each site's last_data, the newest minute's time or
+    null, from one connection to the telemetry file whatever the number of sites, and works out no fleet row."""
+    from gridlytics import routes_sites
+    end = _now() // 60 * 60
+    with world.use():
+        more = [sites.create({"name": f"Extra {i}"}, "t")["id"] for i in range(3)]
+        _minutes(world.site, end - 600, end, 30_000.0)
+        _minutes(more[0], end - 7200, end - 3600, 10_000.0)
+    opened: list[int] = []
+    real = telemetry._open
+    monkeypatch.setattr(telemetry, "_open", lambda: (opened.append(1), real())[1])
+    real_row = routes_sites.fleet_row
+    monkeypatch.setattr(routes_sites, "fleet_row", lambda *a, **k: pytest.fail("the site list works out no fleet row"))
+    for role in ("viewer", "admin"):
+        rows = world.c[role].get("/api/sites").json()
+        assert {r["id"]: r["last_data"] for r in rows} == {world.site: end - 60, world.other: None, more[0]: end - 3660, more[1]: None, more[2]: None}
+    assert len(opened) == 2                                                      # one connection a request, for five sites
+    monkeypatch.setattr(routes_sites, "fleet_row", real_row)
+    fleet = world.c["viewer"].get("/api/fleet").json()["sites"]                 # the fleet answer says the same
+    assert {r["id"]: r["last_data"] for r in fleet} == {r["id"]: r["last_data"] for r in rows}
+
+
+def test_a_connection_to_a_workspace_file_this_process_made_ready_runs_no_pragma(company, monkeypatch):
+    """Every connection to the workspace file ran PRAGMA journal_mode and PRAGMA user_version first (store._connect): a fleet answer opened about 8
+    connections a site, and the 148 of 18 sites took 29 of its 63 ms in the profile. A file this process has seen in WAL mode at the current schema is
+    opened without them; a file not seen yet is still set up, and a restore (which may put an older file in its place) forgets what was seen."""
+    from gridlytics import backups
+    with store.connect() as con:
+        con.execute("SELECT COUNT(*) FROM sites").fetchone()
+    statements: list[str] = []
+    real = sqlite3.connect
+
+    def traced(*a, **k):
+        con = real(*a, **k)
+        con.set_trace_callback(statements.append)
+        return con
+    monkeypatch.setattr(sqlite3, "connect", traced)
+    for _ in range(3):
+        with store.connect() as con:
+            con.execute("SELECT COUNT(*) FROM sites").fetchone()
+    assert len([s for s in statements if "FROM sites" in s]) == 3
+    assert not [s for s in statements if "PRAGMA" in s.upper()], statements
+    other = company.parent / "d.db"                                              # a new file is made ready as before
+    with store.use_company(other):
+        with store.connect() as con:
+            assert con.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
+            assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    sites.create({"name": "Kept"}, "t")
+    copy = store.backup("manual")
+    statements.clear()
+    backups.restore(copy.name)
+    with store.connect() as con:
+        con.execute("SELECT COUNT(*) FROM sites").fetchone()
+    assert any("PRAGMA USER_VERSION" in s.upper() for s in statements)          # checked again after the restore
