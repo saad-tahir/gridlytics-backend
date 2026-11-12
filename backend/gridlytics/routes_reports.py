@@ -142,7 +142,13 @@ def _report_answer(job: jobs.Job, response: Response) -> dict:
     if job.state in jobs.ACTIVE:
         response.status_code = 202
         return {"status": job.state, "job_id": job.id}
-    raise Refusal(500 if job.state == "failed" else 409, job.error or "The report could not be generated; try again", "report_failed")
+    if job.state != "failed":                # cancelled (or a report already made that is no longer kept)
+        raise Refusal(409, job.error or "The report could not be generated; try again", "report_failed")
+    # a report refused in words (a ValueError of reports.generate, its sentence kept by the job) is a 422, as it was in the request; any other
+    # failure is the server's
+    if job.error and job.error != jobs.FAILED:
+        raise Refusal(422, job.error, "invalid")
+    raise Refusal(500, "The report could not be generated; try again", "report_failed")
 
 
 @router.post("/api/reports")

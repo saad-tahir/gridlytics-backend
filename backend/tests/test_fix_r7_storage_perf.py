@@ -882,6 +882,23 @@ def test_a_report_renders_as_a_job_and_the_same_report_asked_again_is_the_one_al
     fresh = an.post("/api/reports", json=body)
     assert _wait(lambda: len(calls) == 2, 10)
     assert fresh.status_code in (200, 202) and (fresh.json().get("id") or fresh.json()["job_id"]) != made["id"]
+    # a report refused in words is a 422 with its sentence, as it was in the request
+    monkeypatch.setattr(routes_reports, "REPORT_WAIT_S", 10.0)
+
+    def refused(*a, **k):
+        raise ValueError("The month has no readings to report on")
+    monkeypatch.setattr(reports, "generate", refused)
+    with world.use():
+        store.audit("t", "uploaded a bill", world.site, {})
+    r = an.post("/api/reports", json={**body, "kind": "energy_only"})
+    assert r.status_code == 422 and r.json()["detail"] == "The month has no readings to report on", r.text
+    # any other failure is the server's, in a sentence that names no exception
+
+    def broken(*a, **k):
+        raise RuntimeError("disk full at /srv/reports")
+    monkeypatch.setattr(reports, "generate", broken)
+    r = an.post("/api/reports", json={**body, "kind": "energy_only"})
+    assert r.status_code == 500 and r.json()["code"] == "report_failed" and "disk" not in r.text, r.text
 
 
 # ------------------------------------------------------------------------------------------------ follow-up: GET /plan/compare (security-roles-08's rest)

@@ -44,6 +44,8 @@ ABANDON_SECONDS = 180
 ABANDONED = f"Nobody read this search for {ABANDON_SECONDS // 60} minutes (its page was closed), so it was stopped"
 
 STATES = ("queued", "running", "done", "cancelled", "failed")
+#: what a job that raised anything but a ValueError (whose sentence it keeps) says
+FAILED = "The task could not be completed"
 _order = itertools.count()
 ACTIVE = ("queued", "running")
 
@@ -200,7 +202,7 @@ def start(kind: str, org: str, owner: str, key: str, run, expected: int = 0, cac
         except ValueError as exc:
             job.state, job.error = "failed", str(exc)
         except Exception:        # the server's log has the trace; the person is told the search could not be made
-            job.state, job.error = "failed", "The task could not be completed"
+            job.state, job.error = "failed", FAILED
             import logging
             logging.getLogger("gridlytics").exception("job %s (%s) failed", job.id, kind)
         else:
