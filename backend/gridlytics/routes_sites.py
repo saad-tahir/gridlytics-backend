@@ -161,9 +161,13 @@ def _mtd_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple[f
     spark = []
     month = t.replace(day=1).isoformat()
     peak = litres = None
+    block = 0
     for r in rows:
         d = json.loads(r["data"])
         spark.append({"day": r["day_local"], "saving_rs": d.get("saving_rs"), "claimed_rs": d.get("claimed_rs")})
+        # the month's days of a switchback native block, which claim nothing: Fleet and Overview say why such a month reads Rs 0 (round 7, audit
+        # flow-savings-pilot-bill-18)
+        block += int(r["day_local"] >= month and d.get("fidelity") == "native_block")
         if r["day_local"] < month or d.get("fidelity") not in verify.CLAIMING or d.get("claim_withheld"):
             continue
         a, n = (d.get("actual") or {}).get("peak_import_kwh"), (d.get("baseline") or {}).get("peak_import_kwh")
@@ -172,7 +176,17 @@ def _mtd_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple[f
         if genset and d.get("litres_saved") is not None:
             litres = (litres or 0.0) + d["litres_saved"]
     energy = {"peak_kwh_avoided": None if peak is None else round(peak, 1), "litres_saved": None if litres is None else round(litres, 1)}
+    energy["native_block_days"] = block
     return mtd, (summ["computed"] or None) if scored else None, spark[-7:], energy
+
+
+def _month_native_block_days(site_id: str, t: date) -> int:
+    """The days of t's month so far that were a native block of the switchback (a savings day of fidelity native_block): they claim nothing, so the
+    overview's month saving says why it reads Rs 0 (round 7, audit flow-savings-pilot-bill-18). The same count as _mtd_saving's for the fleet."""
+    with store.connect() as con:
+        rows = con.execute("SELECT data FROM savings_days WHERE site_id = ? AND baseline = 'native' AND day_local >= ? AND day_local <= ? AND data LIKE ?",
+                           (site_id, t.replace(day=1).isoformat(), t.isoformat(), '%"native_block"%')).fetchall()
+    return sum(1 for r in rows if json.loads(r["data"]).get("fidelity") == "native_block")
 
 
 #: The control states in which a plan is in force at the inverter (R8 2.1's "sites on a plan"), and those that hand the inverter back to its native
@@ -204,6 +218,8 @@ def fleet_row(s: dict, now: int, counts: dict) -> dict:
             "collecting_day": None if days_data >= 14 else int(days_data) + 1 if first else 0,
             # the month's energy behind the claim: not money, so a viewer reads it in place of the rupees (R8 2.1; audit pages-A-11)
             "mtd_peak_kwh_avoided": energy["peak_kwh_avoided"], "mtd_litres_saved": energy["litres_saved"],
+            # the month's native-block days, which claim nothing (not money; round 7, audit flow-savings-pilot-bill-18)
+            "mtd_native_block_days": energy.get("native_block_days", 0),
             # R8 2.1's summary and filters (audit pages-A-17): a plan in force at the inverter (following it or holding; not a monitor site's
             # recommendation, a table not confirmed today, a release, a pause or an offline edge), and a genset on site. control_state names a hold
             # before the tier, so the tier is read here too: a hold at the monitor tier reaches no inverter
@@ -694,7 +710,9 @@ def site_now(site_id: str):
                           "litres_source": fuel["litres_source"],
                           "outage_hours": round(sum((d.get("outage_minutes") or 0) for d in tdays) / 60, 1),
                           "peak_kw": max([d.get("peak_kw") or 0 for d in tdays] or [0]), "saving_rs": mtd,
-                          "saving_rs_method": MTD_SAVING_METHOD, "saving_rs_computed": computed},
+                          "saving_rs_method": MTD_SAVING_METHOD, "saving_rs_computed": computed,
+                          # the month's native-block days, which claim nothing (not money; round 7, audit flow-savings-pilot-bill-18)
+                          "native_block_days": _month_native_block_days(site_id, t)},
                 # the Battery tile's SoC is battery.state's (the last minute with a reading), marked by its own source, not the newest row's (now.soc_source)
                 "spark": spark, "battery": {**{k: bs.get(k) for k in ("soc_pct", "sigma_pct", "trust", "usable_kwh")},
                                             "soc_source": telemetry.soc_source(site_id, bs)} if bs else None,

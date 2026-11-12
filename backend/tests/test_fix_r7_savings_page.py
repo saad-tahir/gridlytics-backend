@@ -742,3 +742,23 @@ def test_the_savings_periods_give_the_billing_period_and_the_pilot_window(world,
     p = a.get(f"/api/sites/{sid}/savings/periods").json()
     assert p["billing"]["start"] == "2026-11-01" and p["last_billing"] == {"start": "2026-10-01", "end": "2026-10-31", "month": "2026-10"}
     assert p["billing"]["reading_day"] is None
+
+
+def test_fleet_and_overview_count_the_months_native_block_days_beside_its_saving(world, monkeypatch):
+    """flow-savings-pilot-bill-18, the Fleet and Overview half (left at batch 5): a month whose scored days are a native block of the switchback reads
+    "Rs 0" on Fleet and Overview with no word why. The fleet row and the overview's month now count those days (not money: a viewer reads the count)."""
+    from gridlytics import routes_sites
+    monkeypatch.setattr(routes_sites, "today", lambda: date(2026, 10, 20))
+    sid = world.site
+    block = {"native": _row(0.4, 0.0, fidelity="native_block"), "tuned": _row(-841.0, 0.0, fidelity="native_block")}
+    with world.use():
+        _put_rows(sid, {"2026-09-30": block,                                    # last month: not this month's
+                        "2026-10-01": block, "2026-10-02": block, "2026-10-03": block,
+                        "2026-10-04": {"native": _row(500.0, 500.0), "tuned": _row(100.0, 100.0)}})
+    for role in ("admin", "viewer"):
+        row = next(s for s in world.c[role].get("/api/fleet").json()["sites"] if s["id"] == sid)
+        assert row.get("mtd_native_block_days") == 3, role                      # before: no such field
+        month = world.c[role].get(f"/api/sites/{sid}/now").json()["month"]
+        assert month.get("native_block_days") == 3, role
+    other = next(s for s in world.c["admin"].get("/api/fleet").json()["sites"] if s["id"] == world.other)
+    assert other["mtd_native_block_days"] == 0
