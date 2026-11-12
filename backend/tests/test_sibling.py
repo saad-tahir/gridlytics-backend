@@ -302,3 +302,27 @@ def test_a_re_capture_runs_on_a_scratch_database_whatever_the_shell_says(tmp_pat
                    "GRIDLYTICS_HOSTS": "127.0.0.1"}
     source = inspect.getsource(fc.main)
     assert "scratch_env(os.environ" in source and "setdefault" not in source
+
+
+def test_an_outage_in_progress_is_typed_whatever_the_hour_the_fixtures_are_checked_at(tmp_path, monkeypatch):
+    # review (round 7, tests-ci): the typed-fields test reads a demo seeded at the current time, so a field served only while the grid is down (the plan
+    # summary's outage_now: forecast.outage's `observed`) was checked only in a run that met a demo outage, and failed then. Here an outage in progress
+    # is made at a fixed moment, and every field of `observed` must be typed in PlanSummary.outage_now
+    from datetime import datetime, timedelta, timezone
+
+    from gridlytics import forecast, store, telemetry
+    monkeypatch.setenv("GRIDLYTICS_DATA_DIR", str(tmp_path))
+    db = tmp_path / "companies" / "c.db"
+    db.parent.mkdir(parents=True)
+    t0 = int(datetime(2026, 11, 2, 10, 0, tzinfo=timezone(timedelta(hours=5))).timestamp())
+    site = {"id": "outage-site", "data": {"disco": "LESCO", "lat": 31.5, "lon": 74.3}, "connections": [{"id": "c1", "data": {"regime": "none"}}],
+            "assets": {}}
+    with store.use_company(db):
+        telemetry.ingest(site["id"], [{"ts": t0 + 60 * i, "grid_present": 0 if i >= 3 else 1} for i in range(-10, 12)], "edge")
+        observed = forecast.outage(site, t0, now=t0 + 750)["observed"]
+    assert observed and set(observed) >= {"since", "elapsed_min", "expected_remaining_min"}
+    ts = _web("frontend/src/types/api.ts")
+    summary = ts[ts.index("export interface PlanSummary {"):]
+    m = re.search(r"\n  outage_now\??: (.*?);\n", summary[:summary.index("\n}\n") + 1])
+    assert m, "PlanSummary.outage_now"
+    assert sorted(k for k in observed if not re.search(rf"\b{k}\??:", m.group(1))) == [], m.group(1)
