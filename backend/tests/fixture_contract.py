@@ -320,6 +320,17 @@ def capture(client, headers: dict, ids: dict, variants: dict | None = None) -> d
     return out
 
 
+def scratch_env(environ, scratch: Path) -> None:
+    """The settings a re-capture runs under, whatever the shell holds: its own database in `scratch` (never the owner's data/), local sign-in, this
+    machine's host, no copy before a reset; the data folder is the one `seeded` makes. Set, not defaulted: a GRIDLYTICS_DB or GRIDLYTICS_DATA_DIR the
+    shell already names (the launcher's, the owner's) would otherwise take the seed."""
+    environ["GRIDLYTICS_DB"] = str(scratch / "scratch.db")
+    environ["GRIDLYTICS_AUTH_MODE"] = "local"
+    environ["GRIDLYTICS_HOSTS"] = "127.0.0.1"
+    environ["GRIDLYTICS_RESET_BACKUP"] = "0"
+    environ.pop("GRIDLYTICS_DATA_DIR", None)
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="Compare the web app's fixtures with a scratch backend's answers; --write re-captures their shape.")
@@ -328,10 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     here = Path(__file__).resolve().parent
     sys.path[:0] = [str(here.parent), str(here)]
-    os.environ.setdefault("GRIDLYTICS_DB", str(Path(tempfile.mkdtemp(prefix="gridlytics-fixtures-")) / "scratch.db"))
-    os.environ.setdefault("GRIDLYTICS_AUTH_MODE", "local")
-    os.environ.setdefault("GRIDLYTICS_HOSTS", "127.0.0.1")
-    os.environ.setdefault("GRIDLYTICS_RESET_BACKUP", "0")
+    scratch_env(os.environ, Path(tempfile.mkdtemp(prefix="gridlytics-fixtures-")))
     import sibling
     folder = Path(tempfile.mkdtemp(prefix="gridlytics-fixtures-"))
     root = sibling.frontend_file("frontend/src/test/fixtures")

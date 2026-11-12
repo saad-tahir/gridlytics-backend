@@ -289,3 +289,16 @@ def test_the_fixture_contract_sees_a_missing_and_a_stale_field_and_re_captures_w
                                "summary": {"by_site": {"0f0f0f0f0f0f": {"x": 5}}, "control_release": None}},
                       "alerts": [{"old_field_no_one_names": 1}]}
     assert fc.differences(merged, live, names) == (set(), set())
+
+
+def test_a_re_capture_runs_on_a_scratch_database_whatever_the_shell_says(tmp_path):
+    # review (round 7, tests-ci): `fixture_contract.py --write` seeds a demo; a shell that names the owner's database, another sign-in mode or a data
+    # folder must not carry the seed there (before: setdefault kept a GRIDLYTICS_DB the shell already held)
+    import inspect
+    env = {"GRIDLYTICS_DB": str(sibling.REPO / "data" / "gridlytics.db"), "GRIDLYTICS_AUTH_MODE": "supabase", "GRIDLYTICS_DATA_DIR": str(sibling.REPO / "data"),
+           "GRIDLYTICS_RESET_BACKUP": "1", "GRIDLYTICS_HOSTS": "app.example.com"}
+    fc.scratch_env(env, tmp_path)
+    assert env == {"GRIDLYTICS_DB": str(tmp_path / "scratch.db"), "GRIDLYTICS_AUTH_MODE": "local", "GRIDLYTICS_RESET_BACKUP": "0",
+                   "GRIDLYTICS_HOSTS": "127.0.0.1"}
+    source = inspect.getsource(fc.main)
+    assert "scratch_env(os.environ" in source and "setdefault" not in source
