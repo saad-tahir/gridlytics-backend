@@ -1,0 +1,264 @@
+{
+  "about": "Every file lifted from solarlytics-backend, held to its upstream by backend/tests/test_lift_drift.py (round 7, audit parity-architecture-07). sha256 is the file as last reviewed against its upstream; upstream_sha256 the upstream file at the commit (or at reviewed_upstream) after the rename. Hashes are of the text with LF line ends.",
+  "upstream": {
+    "repository": "saad-tahir/solarlytics-backend",
+    "commit": "c853130"
+  },
+  "rename": [
+    [
+      "solarlytics",
+      "gridlytics"
+    ],
+    [
+      "Solarlytics",
+      "Gridlytics"
+    ],
+    [
+      "SOLARLYTICS_",
+      "GRIDLYTICS_"
+    ],
+    [
+      "slk_",
+      "glk_"
+    ]
+  ],
+  "files": [
+    {
+      "path": "backend/gridlytics/identity.py",
+      "upstream": "backend/solarlytics/identity.py",
+      "status": "adapted",
+      "why": "A local access token names its sign-in's session and is refused once that session has ended (sign-out, a reused refresh token): audit security-roles-09.",
+      "upstream_sha256": "c6ebd8eb4030c44c2bca8a666f86805f0470dbefc0e30ea9acf01c005ff7bf98",
+      "sha256": "28e6fc1d45e2bb3a2250a6b6ee87aee16020ddad2a62aaa2e8d7dac1f3db62f7"
+    },
+    {
+      "path": "backend/gridlytics/platform.py",
+      "upstream": "backend/solarlytics/platform.py",
+      "status": "adapted",
+      "why": "Gridlytics' roles (admin, operator, analyst, viewer) and permission table; sessions with their registry, sign-out everywhere and one-time passwords (platform.db schema 2 and 3), the account lockout per account, the founder console's company states: audit security-roles-09/-10, parity-supabase-auth-01/-02/-08, founder-console-08, role-analyst-32, pages-A-02.",
+      "upstream_sha256": "8aaaec3922c95d8945b5c0a0befd757dfc6a71e936975400089db773e7c328cb",
+      "sha256": "caebd77bb8a470e86edf82ca7d86645f6a850e9f76cb1161cf4b1ed38237acdc"
+    },
+    {
+      "path": "backend/gridlytics/companies.py",
+      "upstream": "backend/solarlytics/companies.py",
+      "status": "adapted",
+      "why": "The company role admin makes a Gridlytics administrator; a suspended or pending membership is told its state; a password reset or a disable ends every earlier token: audit founder-console-04, parity-supabase-auth-01/-09, security-roles-09.",
+      "upstream_sha256": "c8040fd9bef24bd0ce5fee687f785a42e8fe56791e2809ffc0ae8f27e4c1e1cf",
+      "sha256": "25348c62112f7efd651328faee45373795584af0aab91277e7e5bafdfd0b37e3"
+    },
+    {
+      "path": "backend/gridlytics/routes_local.py",
+      "upstream": "backend/solarlytics/routes_local.py",
+      "status": "adapted",
+      "why": "Open sessions and sign-out of one or every other, the per-account lockout and Supabase-style sign-in throttling, one-time passwords that open only the password change, notification choices: audit security-roles-09/-10, parity-supabase-auth-01/-02/-08, role-analyst-32, pages-A-02.",
+      "upstream_sha256": "8abaca44522e3e05e8e034b7804e6901718d128b969b0ec6368a7e2e79718856",
+      "sha256": "663f545df3ad42bdc751c5c7a185343eb6bbb9d47d466a1d06dc5581924c5d51"
+    },
+    {
+      "path": "backend/gridlytics/founder.py",
+      "upstream": "backend/solarlytics/founder.py",
+      "status": "adapted",
+      "why": "A founder session secret shorter than 32 characters is refused; founder sign-out ends the session on the server and a new password ends every session: audit security-roles-12, founder-console-09.",
+      "upstream_sha256": "b1a4067866fc11628ff83734319d57ec4586a13bb175ac70760f0b6e6a4fa39d",
+      "sha256": "24188b4b0606ea29223bc25e93ae7814e1bfce21b99365a8581bacd9a0a14221"
+    },
+    {
+      "path": "backend/gridlytics/routes_founder.py",
+      "upstream": "backend/solarlytics/routes_founder.py",
+      "status": "adapted",
+      "why": "The founder console's Gridlytics lists and actions (companies, people, backups with keys and reports, the scheduler's health), its sign-out everywhere and the secret check: audit founder-console-07/-08/-09/-10/-13/-16, security-roles-12.",
+      "upstream_sha256": "e2952a8ea303dcc1bd0926d7e76f875b2744c67c1a7a344d6c23f25de9c20f09",
+      "sha256": "8634beff651a45f937ab7bb1245af7588a01b10b3edcc24f83fa833c94052ea1"
+    },
+    {
+      "path": "backend/gridlytics/store_founder.py",
+      "upstream": "backend/solarlytics/store_founder.py",
+      "status": "adapted",
+      "why": "The founder console's store for Gridlytics' companies, sites and backups (search, paging, suspension, the scheduler's last tick): audit founder-console-01/-03/-05/-07/-08/-09/-10/-11/-12/-13/-16/-18, parity-architecture-06, frontend-states-formats-17.",
+      "upstream_sha256": "eca1045761914df8b400a276166724edcb6f459da7efaa0afd75ffc3a616ec94",
+      "sha256": "0b4e0498504936b0c5ee22a59257a72e78d2954c23e20c6dd22a8af718dc0643"
+    },
+    {
+      "path": "backend/gridlytics/store_members.py",
+      "upstream": "backend/solarlytics/store_members.py",
+      "status": "adapted",
+      "why": "No workspace of before to link: Gridlytics has no legacy users, so the adoption of a user of before is empty (plan Part 10.4).",
+      "upstream_sha256": "b0bbfa0f4b5c516aa63e02e18017d02726f8b69752bc4cf9b752cdfce486c79c",
+      "sha256": "84d0fd562f459be2af3748aedb631600610ed4ac5a852385d2a4dc60a5819a02"
+    },
+    {
+      "path": "backend/gridlytics/seed_demo.py",
+      "upstream": "backend/solarlytics/seed_demo.py",
+      "status": "adapted",
+      "why": "Gridlytics' demo company, sites and accounts from the templates in demo/, the founder's four settings in the data folder's .env.founder, the demo history's days: audit pages-A-04, tracker-and-docs-21.",
+      "upstream_sha256": "5389262fba43f19e4219043ab2b1004d2d77251fc51fbbb1bac9286b7608ddd2",
+      "sha256": "0ce436b7f0cdc1c5cafef86823c68c6e5b228215df7b7f96553744e13c424610"
+    },
+    {
+      "path": "backend/gridlytics/backups.py",
+      "upstream": "backend/solarlytics/backups.py",
+      "status": "adapted",
+      "why": "A copy takes the companies' telemetry files, signing keys and reports, with their counts; a restore puts them back: audit founder-console-01/-12/-13, parity-architecture-11/-16, performance-live-07/-08, frontend-states-formats-17.",
+      "upstream_sha256": "fc72985c65c9681e4bf7fca9d19c950ef1ee737a00b3b7075458de2df78999d7",
+      "sha256": "82e58ba7ec2efcfb236cf4083a5ea030f9c6e418237bdedbb9872cc2d14d0e5c"
+    },
+    {
+      "path": "backend/gridlytics/mfa.py",
+      "upstream": "backend/solarlytics/mfa.py",
+      "status": "identical",
+      "upstream_sha256": "ac1113e468978a9b7d327192a3aec07c730cacf57df720f789664ae7aa50a600",
+      "sha256": "ac1113e468978a9b7d327192a3aec07c730cacf57df720f789664ae7aa50a600"
+    },
+    {
+      "path": "backend/gridlytics/auth.py",
+      "upstream": "backend/solarlytics/auth.py",
+      "status": "adapted",
+      "why": "Gridlytics' permissions per role (no member sees costs: a viewer never sees money), manage_sites for an administrator, the sign-in throttling and per-account lockout, the analyst's forecast refresh: audit security-roles-02/-10/-16, tracker-and-docs-03, parity-supabase-auth-08, role-operator-06/-07, pages-C-20/-21.",
+      "upstream_sha256": "42c88e792a837671ff146c1e30ad8eb3a56cf33a6b957045c6c2acb38db67f28",
+      "sha256": "515ed289b14a9c71f957b29de30e85d244bb1b10c5c53bfc8358b1191dec60ac"
+    },
+    {
+      "path": "backend/gridlytics/apikeys.py",
+      "upstream": "backend/solarlytics/apikeys.py",
+      "status": "adapted",
+      "why": "Keys are bound to a site (edge or partner) and refused on another site's path; scopes reach what their words say; a removed site's keys are revoked: DESIGN_LOG The lift, audit security-roles-07, flow-reports-alerts-members-keys-12/-14/-27.",
+      "upstream_sha256": "7a0e46e9cec4b91518abec70a4d5c64bd667b32bc180a9507271e2cfe4fc971c",
+      "sha256": "c06b888c1da20527e226770caa0cf82511a16cd06934ea894f708f011b68fde7"
+    },
+    {
+      "path": "backend/gridlytics/version.py",
+      "upstream": "backend/solarlytics/version.py",
+      "status": "adapted",
+      "why": "Every stored result records the engine that computed it (version.stamp()): audit parity-architecture-12.",
+      "upstream_sha256": "dbaac1d85df7bbc6008a2c61e1083bd634a3e1073b97344c06b966df4da212f0",
+      "sha256": "0109b96dc9c5ee1f7cbc330c9e1b14177b0e122535c65f532c4a3fd6df656e45"
+    },
+    {
+      "path": "backend/gridlytics/jobs.py",
+      "upstream": "backend/solarlytics/jobs.py",
+      "status": "adapted",
+      "why": "Re-solves, control actions' re-solves and reports run as jobs (answered at once within the wait, else 202 and a job to read), and a failing run raises the plan_failed alert: audit performance-live-05, parity-architecture-06, follow-up of security-roles-08.",
+      "upstream_sha256": "e74b5283347ac2ed06628344eeed41bebe8fe37cfdf97ad60cffd502cd0cf192",
+      "sha256": "cc743ba97130cae7f456759d86fca230982fa362864009b5412d09d0acb2a513"
+    },
+    {
+      "path": "backend/gridlytics/ratelimit.py",
+      "upstream": "backend/solarlytics/routes_accept.py",
+      "status": "extract",
+      "why": "The Limiter class of Solarlytics' routes_accept.py, alone in a module of its own; the rest of that file (Solarlytics' acceptance flow) is not lifted. An upstream change to the file is reviewed for the Limiter only.",
+      "upstream_sha256": "959fb0fab26e6407e9260c65363c4d38307626c1c4c35b710b5ddf4dab4640d6",
+      "sha256": "ec576e8be8f53d51d57de8c1226287175cb6dc0e07ffd4fb88099b90fc7e834e"
+    },
+    {
+      "path": "backend/tests/identities.py",
+      "upstream": "backend/tests/identities.py",
+      "status": "identical",
+      "upstream_sha256": "4e345f67c6095b62bfac233d95581e37c723539b2117c292af941e61fa751cef",
+      "sha256": "4e345f67c6095b62bfac233d95581e37c723539b2117c292af941e61fa751cef"
+    },
+    {
+      "path": "backend/tests/test_identity.py",
+      "upstream": "backend/tests/test_identity.py",
+      "status": "identical",
+      "upstream_sha256": "eef705e602f12ef43ae7bf208a329b47af0ff2036e93f99638d6df1e93e5dcd1",
+      "sha256": "eef705e602f12ef43ae7bf208a329b47af0ff2036e93f99638d6df1e93e5dcd1"
+    },
+    {
+      "path": "backend/tests/test_platform.py",
+      "upstream": "backend/tests/test_platform.py",
+      "status": "adapted",
+      "why": "Re-aimed at Gridlytics' roles, sessions and data (the lifted Solarlytics-only cases skipped by name were re-aimed by tests-ci, audit parity-architecture-10).",
+      "upstream_sha256": "11fc39609ca2fa6aef299093727ca623e53a316288b456832d8a003863d8586f",
+      "sha256": "1a5d1df0704eb4233614cb2714ac15d20e80b7e34c7745e8f68cd55fe25cf6be"
+    },
+    {
+      "path": "backend/tests/test_companies.py",
+      "upstream": "backend/tests/test_companies.py",
+      "status": "adapted",
+      "why": "Re-aimed at Gridlytics' company roles and membership states (audit founder-console-04, parity-supabase-auth-09, parity-architecture-10).",
+      "upstream_sha256": "3ef0141826a85b75e626c3de45f49d69a25a719506ca8d13de0a90b77a72f91c",
+      "sha256": "74dca8b4ee1ad84f513739b56c20ae00037f1ae76a19f8aca17712e39bfc587e"
+    },
+    {
+      "path": "backend/tests/test_founder.py",
+      "upstream": "backend/tests/test_founder.py",
+      "status": "adapted",
+      "why": "Re-aimed at Gridlytics' founder console lists, sessions and secret checks (audit founder-console-*, security-roles-12).",
+      "upstream_sha256": "4b7a8434a5f4026caf1727d562b9228af79a80064b6e1b06658ac376aaa8d8c8",
+      "sha256": "7e041226aa966a0fce234ae38468d22ba39ad9acf1dc5816e5e0a84508b16959"
+    },
+    {
+      "path": "backend/tests/test_signin_guard.py",
+      "upstream": "backend/tests/test_signin_guard.py",
+      "status": "adapted",
+      "why": "The lifted request guard's tests without the share links Gridlytics does not have (audit parity-architecture-10).",
+      "upstream_sha256": "83d0e1915fc46d8865ecbbf80dce4e476c2bf3228521a6bd8298fef548b713dc",
+      "sha256": "e6ee3eefa843f3ad4072df327277c3a067347a9b387b80a63608376d9499b107"
+    },
+    {
+      "path": "backend/tests/test_supabase_sql.py",
+      "upstream": "backend/tests/test_supabase_sql.py",
+      "status": "adapted",
+      "why": "Holds the grid_ SQL instead of the solar_ SQL, with Gridlytics' roles (audit parity-supabase-auth-03).",
+      "upstream_sha256": "bc2e6e8de4abea5f0cb40d900406c7bd0ce67f9fcc679200baca0243babd138d",
+      "sha256": "a50564bac59cb95f4a0226b9cfb60200a5036d6939f89bb9e33e77039cb52ec6"
+    },
+    {
+      "path": "supabase/sql/grid_000_preflight.sql",
+      "upstream": "supabase/sql/solar_000_preflight.sql",
+      "status": "adapted",
+      "rename": [
+        [
+          "solar_",
+          "grid_"
+        ]
+      ],
+      "why": "Renamed grid_* with Gridlytics' roles, company header and settings; the SQL adapts Boxlytics at boxlytics@c429bef, naming each piece's source in the file (audit parity-supabase-auth-03).",
+      "upstream_sha256": "41a2f7b7190431d556aef013b783c36c2c4a4c0752f644df1be7095dcb6a7a46",
+      "sha256": "fb2d9a91d494512d750581d3cef39b769987ca71432af8f821c61b416fe8f71d"
+    },
+    {
+      "path": "supabase/migrations/grid_001_accounts_and_companies.sql",
+      "upstream": "supabase/migrations/solar_001_accounts_and_companies.sql",
+      "status": "adapted",
+      "rename": [
+        [
+          "solar_",
+          "grid_"
+        ]
+      ],
+      "why": "Renamed grid_* with Gridlytics' roles, company header and settings; the SQL adapts Boxlytics at boxlytics@c429bef, naming each piece's source in the file (audit parity-supabase-auth-03).",
+      "upstream_sha256": "b7102ebc52f99601c427bef207b5bd6fe2a23e48d99badc61ceffd74e21e07dc",
+      "sha256": "864acda8cf0bc0b659f0dfd371f2c576a826236758727bf4482599f651fed372"
+    },
+    {
+      "path": "supabase/migrations/grid_001_rollback.sql",
+      "upstream": "supabase/migrations/solar_001_rollback.sql",
+      "status": "adapted",
+      "rename": [
+        [
+          "solar_",
+          "grid_"
+        ]
+      ],
+      "why": "Renamed grid_* with Gridlytics' roles, company header and settings; the SQL adapts Boxlytics at boxlytics@c429bef, naming each piece's source in the file (audit parity-supabase-auth-03).",
+      "upstream_sha256": "abd21a4e89139fc2c166832517cfa2976096fce2474c8f0c92b77ee4b36c2465",
+      "sha256": "3d2362880faaf05c978093d6d8a8aee7fbfe927cde363d30f72e56ff5ddf836d"
+    },
+    {
+      "path": "supabase/README.md",
+      "upstream": "supabase/README.md",
+      "status": "adapted",
+      "rename": [
+        [
+          "solar_",
+          "grid_"
+        ]
+      ],
+      "why": "Renamed grid_* with Gridlytics' roles, company header and settings; the SQL adapts Boxlytics at boxlytics@c429bef, naming each piece's source in the file (audit parity-supabase-auth-03).",
+      "upstream_sha256": "712004b5540b6c920e039b09be352e4afbc10415b7879f4775bf2e49805fb15d",
+      "sha256": "43d9a48c9b7c03d14740f7a768e95478cf8f7be923e227bda118e1ed35cd860f"
+    }
+  ]
+}
