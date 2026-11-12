@@ -5,10 +5,15 @@
   every push and pull request, the web repository checked out beside with the read-only FRONTEND_READ_TOKEN, the tests on Windows, pip-audit, the licence
   gate, and the solver benchmarks and the Docker image on a push of v1-build. Without the token (before the owner adds it, or on a fork's pull request)
   the run warns and the tests that read the web repository skip, each saying why, instead of failing the checkout (follow-up frontend-read-token).
+- parity-architecture-16: the founder console named scripts/restore_backup.py (founder-console's, now there), and GRIDLYTICS_WEB_DIST and the ignored
+  release/ folder pointed at a release build no script made. scripts/build_release.py makes the one-port release (DEP-04: the API and a local-mode web
+  build on 8061, with its own data folder, a daily copy and the restore script set to it) and scripts/load_check.py measures a server of its own on
+  throwaway data (DEP-02), never the owner's data or ports. No fetch_tariffs or fetch_schedules: NEPRA's and OGRA's pages are not scraped.
 
 The workflow is read as text (the tests' Python has no YAML parser): each job is the block under its name."""
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -124,3 +129,143 @@ def test_the_workflow_holds_no_secret_never_the_owners_data_and_pins_each_action
     assert "GRIDLYTICS_SCHEDULER" not in wf
     uses = re.findall(r"uses: (\S+)", wf)
     assert uses and all(re.fullmatch(r"actions/(checkout|setup-python)@v\d+", u) for u in uses), uses
+
+
+# ------------------------------------------------------------------------------------------------ parity-architecture-16: the release and load scripts
+
+def _script(name: str):
+    """A script of scripts/ as a module (they are run as files, not imported by the package)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(f"script_{name}", ROOT / "scripts" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_every_script_the_console_and_the_docs_name_exists():
+    # the founder console's Backups page and routes_founder name restore_backup.py; api.py's GRIDLYTICS_WEB_DIST and the ignored release/ folder name a
+    # release build; DEP-02 names a load check
+    for name in ("restore_backup", "build_release", "load_check", "export_contract"):
+        assert (ROOT / "scripts" / f"{name}.py").is_file(), name
+    assert "scripts/restore_backup.py" in (ROOT / "backend" / "gridlytics" / "routes_founder.py").read_text(encoding="utf-8")
+
+
+def test_the_release_build_refuses_a_one_folder_copy_and_a_folder_without_the_web_app(tmp_path):
+    release = _script("build_release")
+    with pytest.raises(SystemExit, match="No web app at"):
+        release.web_folder(str(tmp_path / "nowhere"))
+    both = tmp_path / "both"
+    (both / "frontend").mkdir(parents=True)
+    (both / "frontend" / "package.json").write_text("{}", encoding="utf-8")
+    (both / "backend" / "gridlytics").mkdir(parents=True)
+    (both / "backend" / "gridlytics" / "api.py").write_text("", encoding="utf-8")
+    with pytest.raises(SystemExit, match="holds the engine too"):
+        release.web_folder(str(both))
+    web = tmp_path / "gridlytics-frontend"
+    (web / "frontend").mkdir(parents=True)
+    (web / "frontend" / "package.json").write_text("{}", encoding="utf-8")
+    assert release.web_folder(str(web)) == (web / "frontend").resolve()
+    # a built folder handed in must be a build
+    with pytest.raises(SystemExit, match="no index.html"):
+        release.main(["--dist", str(tmp_path / "nowhere"), "--out", str(tmp_path / "out")])
+
+
+def _dist(folder: Path) -> Path:
+    (folder / "assets").mkdir(parents=True)
+    (folder / "index.html").write_text("<!doctype html><title>Gridlytics</title><div id=root></div>", encoding="utf-8")
+    (folder / "assets" / "index-test.js").write_text("console.log('page')", encoding="utf-8")
+    return folder
+
+
+def test_the_release_folder_runs_the_api_and_the_page_on_one_port_with_its_own_data(tmp_path):
+    release = _script("build_release")
+    out = tmp_path / "out"
+    release.main(["--dist", str(_dist(tmp_path / "dist")), "--out", str(out)])
+    from gridlytics import __version__
+    folder = out / f"gridlytics-{__version__}"
+    assert (folder / "app" / "backend" / "gridlytics" / "api.py").is_file()
+    assert not list((folder / "app").rglob("__pycache__")) and not list((folder / "app").rglob("*.pyc"))
+    assert (folder / "app" / "frontend" / "dist" / "index.html").is_file()
+    assert (folder / "requirements.txt").read_text(encoding="utf-8") == (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert (folder / "data").is_dir() and not any((folder / "data").iterdir()), "the release starts with an empty data folder of its own"
+    for name in ("run.py", "restore_backup.py", "Start Gridlytics.cmd", "README.txt"):
+        assert (folder / name).is_file(), name
+    run = (folder / "run.py").read_text(encoding="utf-8")
+    for words in ('"GRIDLYTICS_PORT", "8061"', 'HERE / "data"', '"GRIDLYTICS_SCHEDULER", "1"', '"GRIDLYTICS_DAILY_BACKUP", "1"', "GRIDLYTICS_WEB_DIST",
+                  'host="127.0.0.1"', "server_header=False"):
+        assert words in run, words
+    # the restore script is pointed at the release's own app and data folder
+    restore = (folder / "restore_backup.py").read_text(encoding="utf-8")
+    assert 'HERE / "app" / "backend"' in restore and 'os.environ.setdefault("GRIDLYTICS_DATA_DIR"' in restore
+    assert "parents[1]" not in restore
+    import zipfile
+    with zipfile.ZipFile(out / f"gridlytics-{__version__}.zip") as z:
+        names = set(z.namelist())
+    assert f"gridlytics-{__version__}/run.py" in names and f"gridlytics-{__version__}/app/frontend/dist/index.html" in names
+    # the release is started as the .cmd starts it, on a spare port and without the scheduler or a browser: the page and the API on one port
+    import subprocess
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    port = _free_port()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GRIDLYTICS_")}
+    env.update(GRIDLYTICS_PORT=str(port), GRIDLYTICS_NO_BROWSER="1", GRIDLYTICS_SCHEDULER="0", GRIDLYTICS_DAILY_BACKUP="0", GRIDLYTICS_LOGS="0")
+    # the founder console's settings come from the release's own data/.env.founder (one of the four here, so the console names the other three)
+    (folder / "data" / ".env.founder").write_text("GRIDLYTICS_FOUNDER_USERNAME='founder'\n", encoding="utf-8")
+    server = subprocess.Popen([sys.executable, "run.py"], cwd=folder, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        for _ in range(120):
+            assert server.poll() is None, server.stdout.read()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as r:
+                    assert r.status == 200 and "server" not in {k.lower() for k, _ in r.getheaders()}
+                break
+            except OSError:
+                time.sleep(0.25)
+        else:
+            pytest.fail("the release did not answer")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/sites/abc/plan", timeout=5) as r:
+            assert "<title>Gridlytics</title>" in r.read().decode("utf-8")
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/founder/login", data=b'{"username": "x", "password": "y"}', method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(req, timeout=5)
+        said = refused.value.read().decode("utf-8")
+        assert refused.value.code == 503 and "GRIDLYTICS_FOUNDER_PASSWORD_HASH" in said and "GRIDLYTICS_FOUNDER_USERNAME" not in said, said
+    finally:
+        server.terminate()
+        server.wait(timeout=15)
+
+
+def test_the_load_check_refuses_the_owners_ports_and_a_busy_one(capsys):
+    load = _script("load_check")
+    for port in (8051, 5195, 8061):
+        with pytest.raises(SystemExit, match="is the owner's"):
+            load.main(["--port", str(port)])
+    import socket
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        with pytest.raises(SystemExit, match="already in use"):
+            load.main(["--port", str(busy.getsockname()[1])])
+
+
+def test_the_load_check_measures_a_server_of_its_own_on_throwaway_data(capsys):
+    load = _script("load_check")
+    code = load.main(["--port", str(_free_port()), "--threads", "2", "--seconds", "1", "--demo-days", "0"])
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert re.search(r"2 threads for \d+ s: \d+ requests, [\d.]+ a second, 0 failed", out), out
+    for name in ("fleet", "sites", "alerts", "tariffs", "meta"):
+        assert re.search(rf"^\s+{name}\s+\d+ sent", out, flags=re.M), name
+    # its throwaway data folder went with its server
+    folder = re.search(r"Seeding a throwaway data folder \((.+?)\)", out).group(1)
+    assert Path(folder).name.startswith("gridlytics-load-") and not Path(folder).exists()

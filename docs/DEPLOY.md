@@ -5,12 +5,29 @@ How a hosted copy of Gridlytics is run (plan Part 2.7, 10.1 and 10.3, DEP-06 and
 
 | Delivery | What it is | Who it suits |
 |---|---|---|
+| The release folder | `python scripts/build_release.py` makes `release/gridlytics-<version>/` and its zip: the API and the web app (built in local mode from the web repository beside, `gridlytics-frontend`, or the folder `--web` names) on one port, http://127.0.0.1:8061, with a data folder of its own; `Start Gridlytics.cmd` runs it on one Windows machine | One office, one machine, nobody reaching it from outside |
 | The container | `Dockerfile` at the root: the API only, its data folder on a volume; `deploy/docker-compose.yml` runs it | The API of a hosted copy |
 | The web app on Vercel and the API in the container | The web repository's (`gridlytics-frontend`) `frontend/` on Vercel at the app's host (its `frontend/vercel.json`); the container at the API's host | A hosted copy on two host names: the hosted delivery |
 
 All run the same code at the same pinned versions (`requirements.txt` here, `frontend/package-lock.json` in the web repository), on SQLite in write-ahead
 mode. What only the owner can do (a Linux host, the domain names, certificates, the server's secrets, the Vercel project, and for supabase mode the Supabase
 project) is in the steps below and in the checklist at the end; nothing here creates them, and agents never do them.
+
+## The release folder
+
+`python scripts/build_release.py` (Python 3.12, and Node 22 with npm to build the web app) makes `release/gridlytics-<version>/` and
+`release/gridlytics-<version>.zip` (both git-ignored). `--web <folder>` names the web repository when it is not `gridlytics-frontend` beside this one;
+`--dist <folder>` takes a web app already built in local mode instead of building one. The folder holds:
+
+- `app/backend/gridlytics/` and `app/frontend/dist/` (the page, which `run.py` names to the API in `GRIDLYTICS_WEB_DIST`, so the page and `/api` share one
+  port), and `requirements.txt` (this repository's pins);
+- `run.py`, which starts it on `127.0.0.1:8061` (`GRIDLYTICS_PORT` changes it) in local mode, with its own `data/`, the daily copies and the 15-minute
+  scheduler in its one process, and reads the founder console's four settings from `data/.env.founder` when one is there; `Start Gridlytics.cmd` makes a
+  private Python environment on the first start and runs it;
+- `restore_backup.py`, the restore of a company's copy, set to the release's own data folder;
+- `README.txt` with the same steps for the person who runs it.
+
+People sign in with the accounts the founder console makes, as on a hosted copy. The build makes no git tag: it prints the tag for the owner to make.
 
 ## The two sign-in modes
 
@@ -78,9 +95,9 @@ docker compose -f deploy/docker-compose.yml logs -f api
   (no sniffing, no framing, no referrer, and a content security policy for scripts, frames, forms and the base address).
 - **GRIDLYTICS_DOCS=1** opens the interactive API pages at `/docs`; leave it unset on a hosted copy.
 - **No web app inside the image.** The image holds the API only and builds no page; the web app is the `gridlytics-frontend` repository's (The web app on
-  Vercel, below). To serve a web build from the container's own host instead, in local mode, build it in the web repository (`VITE_AUTH_MODE=local npm run build`
-  in `frontend/`), mount its `dist/` read only and name it: `-v /srv/gridlytics-web/dist:/web:ro -e GRIDLYTICS_WEB_DIST=/web`. Unset, the API answers
-  `/api` only.
+  Vercel, below). To serve a web build from the container's own host instead, in local mode, build it in the web repository
+  (`VITE_AUTH_MODE=local npm run build` in `frontend/`), mount its `dist/` read only and name it:
+  `-v /srv/gridlytics-web/dist:/web:ro -e GRIDLYTICS_WEB_DIST=/web`. Unset, the API answers `/api` only.
 - **Building the image.** `docker build` reads this repository only (`.dockerignore` leaves out the data folder, `.scratch/`, the tests, every `.env` file
   and the demo seed's password list). The base is pinned to a release (`python:3.12.16-slim-bookworm`); pin it to its digest too once the registry is
   reached, and rebuild it for its security updates (the owner's checklist).
@@ -292,6 +309,9 @@ The domain names are the owner's decision; these examples use `grid.example.com`
 
 - **An update:** take a backup from the founder console, then `docker compose -f deploy/docker-compose.yml up -d --build` on the new version. The API
   migrates each file as it opens it, after copying it.
+- **Load:** `python scripts/load_check.py --threads 8 --seconds 60` measures a server of its own on a throwaway data folder (the demo company, and the four
+  demo sites with `--demo-days`), never the owner's data or a server already running: requests a second, and each page's request times (median, 95th
+  percentile, slowest). Run it on an idle machine, before a hosted copy is sized.
 - **Monitoring:** watch `GET /api/health` through the proxy with an uptime service; `/data/logs/gridlytics.log` holds the errors; set
   `GRIDLYTICS_ERROR_WEBHOOK` for a record of each failed tick in an error tracker; the founder console shows the ticks and the failures.
 

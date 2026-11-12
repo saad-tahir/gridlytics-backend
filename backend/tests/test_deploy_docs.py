@@ -146,8 +146,9 @@ def test_the_guide_has_the_vercel_steps_and_names_each_host_everywhere_it_is_nam
 
 def test_the_guide_has_the_owners_hand_steps():
     guide = _read("docs/DEPLOY.md")
-    for heading in ("## The container", "### The server's environment", "### The founder console", "### The first company and its owner", "### TLS",
-                    "## Backups", "## Gridlytics' own Supabase project", "## The owner's checklist for a hosted copy"):
+    for heading in ("## The release folder", "## The container", "### The server's environment", "### The founder console",
+                    "### The first company and its owner", "### TLS", "## Backups", "## Gridlytics' own Supabase project",
+                    "## The owner's checklist for a hosted copy"):
         assert heading in guide, heading
     container = _section(guide, "## The container")
     # why a hosted start stops (identity.check_startup), the proxy's address as the container sees it, one process per data folder
@@ -164,6 +165,10 @@ def test_the_guide_has_the_owners_hand_steps():
     supabase = _section(guide, "## Gridlytics' own Supabase project")
     for words in ("supabase/README.md", "never Boxlytics'", "Allow new users to sign up", "Google", "server only", "SERVICE_ROLE_KEY"):
         assert words in supabase, words
+    release = _section(guide, "## The release folder")
+    for words in ("python scripts/build_release.py", "127.0.0.1:8061", "GRIDLYTICS_WEB_DIST", "restore_backup.py", "--dist", "Start Gridlytics.cmd"):
+        assert words in release, words
+    assert "python scripts/load_check.py" in guide
     backups = _section(guide, "## Backups")
     for words in ("scripts/restore_backup.py", "keys", "reports", "off the machine"):
         assert words in backups, words
