@@ -307,19 +307,36 @@ def test_the_stage_track_offers_a_viewer_only_the_energy_report_and_a_key_nothin
 def test_the_control_answer_is_the_administrators_without_its_money_for_a_viewer_and_a_key(walk):
     """UX backend ask K17 (plan D9.7, D3.0; owner's question Q20): the Inverter table is listed for a viewer, read only and in energy, from GET /control,
     which needs no permission. At every walked site the viewer's answer, and the edge key's at its own site, are the administrator's with every money key
-    removed at any depth (the issued tables' and the held re-issue's `gain_rs` among them) and nothing else changed. test_ux_k17_control_viewer proves it
-    with gains in the answer."""
+    removed at any depth and nothing else changed. The gains of the issued tables and of a held re-issue are named `gain_rs` in the administrator's
+    answer, which is what the filter strips, and the viewer's and the key's issued rows and re-issue hold no number at all: day, plan, time, reason and
+    decision only (UX K17 check: equal to the filtered answer alone held when a gain was named so the filter left it). test_ux_k17_control_viewer
+    proves the same with gains made for it."""
     from gridlytics import money
-    seen = 0
+    seen, gains = 0, 0
+
+    def rows(body):
+        return [*(body.get("issued") or []), *([body["reissue"]] if body.get("reissue") else [])]
+
+    def numbers(row):
+        return [v for v in row.values() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+
     for url, got in walk["answers"]["/api/sites/{site_id}/control"].items():
         a_status, admin = got["admin"]
         assert a_status == 200, url
+        for row in rows(admin):
+            # a row of an issued table, or the held re-issue: its one figure is its gain, named as money
+            assert set(k for k, v in row.items() if isinstance(v, (int, float)) and not isinstance(v, bool)) <= {"gain_rs"}, (url, row)
+            if row.get("plan_id") is not None:
+                assert "gain_rs" in row, (url, row)
+            gains += row.get("gain_rs") is not None
         for reader in ("viewer", "key"):
             if reader in got:
                 status, body = got[reader]
                 assert status == 200 and body == money.for_key(admin), (url, reader)
+                assert not [r for r in rows(body) if numbers(r) or any("gain" in k for k in r)], (url, reader)
                 seen += 1
     assert seen == 5                                        # four sites read by the viewer, the key's own site by the key
+    assert gains >= 1                                       # the walk's advisory and closed-loop sites issued tables for a gain
 
 
 def test_the_plan_names_its_tariff_and_its_fuel_unit_to_every_reader(walk):
