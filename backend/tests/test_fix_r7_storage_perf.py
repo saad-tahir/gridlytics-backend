@@ -988,6 +988,32 @@ def test_the_compare_replays_a_plan_against_its_capture_once(world, monkeypatch)
     assert len(answers) == 2 and all(x["compare"] for x in answers) and len(replays) - n == 2
 
 
+def test_the_compare_kept_for_a_plan_is_replayed_afresh_when_the_sites_tier_changes(world, monkeypatch):
+    """Integration (storage-perf's kept compare answer with crossmodule's Mode B plan arm, engine-delivery-17): the plan arm replays a closed-loop
+    Mode B site's setpoints and an advisory site's table, and the site's tier was not in what keeps the answer, so a site moved to closed loop under
+    the same plan and capture was answered with the table's replay kept from before."""
+    from test_fix_r7_delivery_twin import _compare_ready, _reserve_plan
+    steps, comp = _reserve_plan()
+    # the plan discharges 40 kW for the first hour, then holds; its table is one hold slot at 60 %
+    for i, st in enumerate(steps):
+        st.update(discharge_kw=40.0 if i < 4 else 0.0, charge_kw=0.0, grid_import_kw=40.0 if i < 4 else 80.0, grid_export_kw=0.0, pv_kw=0.0,
+                  reason="discharge_peak_window" if i < 4 else "hold_for_outage", genset_on=False, reserve_pct=10.0)
+    monkeypatch.setattr(plans, "current", lambda site_id, *x, **k: {"id": "p-tier", "mode": "b", "slots": comp, "steps": steps, "summary": {}})
+    _compare_ready(world)
+    url, a = f"/api/sites/{world.site}/plan/compare", world.c["admin"]
+    with world.use():
+        sites.update(world.site, {"control_mode": "mode_b"}, "t")
+        assert sites.get(world.site)["tier"] != "closed_loop"
+    table = a.get(url).json()["compare"]["plan"]
+    assert table["soc"][4] == pytest.approx(60.0, abs=1.0)                                  # the advisory site keys the table: a hold at 60 %
+    with world.use():
+        sites.set_tier_capable(world.site, "closed_loop")
+        sites.set_tier_allowed(world.site, "closed_loop", "t")
+        assert sites.get(world.site)["tier"] == "closed_loop"
+    setpoints = a.get(url).json()["compare"]["plan"]
+    assert setpoints["soc"][4] == pytest.approx(60.0 - 40.0 / 0.95 * 1.0 / 200 * 100, abs=1.0)   # the edge runs the setpoints: an hour at 40 kW
+
+
 # ------------------------------------------------------------------------------------------------ follow-up: plans.write_log's day of events
 
 def test_the_write_log_reads_the_days_events_through_the_index_and_finds_every_one(company, monkeypatch):

@@ -348,12 +348,14 @@ def plan_compare(site_id: str):
         return {"compare": None, "reason": "too_little_data"}
     steps = p["steps"]
     price, basis = _short_price(s, steps[0]["t"])
-    # the same plan against the same capture, plant (its assets, settings and grid connection: twin.plant_of) and price is replayed once, and
-    # members asking at once while it is being made wait for that one (round 7, storage-perf follow-up of security-roles-08: two 2,880-minute twin
-    # simulations a call, which any member, a viewer included, could loop)
+    # the same plan against the same capture, plant (its assets, settings and grid connection: twin.plant_of), tier (the plan arm replays a
+    # closed-loop Mode B site's setpoints, else the table: delivery.executes_mode_b) and price is replayed once, and members asking at once while it
+    # is being made wait for that one (round 7, storage-perf follow-up of security-roles-08: two 2,880-minute twin simulations a call, which any
+    # member, a viewer included, could loop)
     key = (str(store.db_path()), site_id, p["id"], s["native"]["version"], price,
-           json.dumps({"assets": s.get("assets"), "data": s.get("data"), "connections": [c.get("data") for c in s.get("connections") or []],
-                       "native": s["native"].get("body")}, sort_keys=True, default=str))
+           json.dumps({"assets": s.get("assets"), "data": s.get("data"), "tier": s.get("tier"),
+                       "connections": [c.get("data") for c in s.get("connections") or []], "native": s["native"].get("body")},
+                      sort_keys=True, default=str))
     return out(copy.deepcopy(_compare_once(key, lambda: _compare(s, p, steps, price, basis))))
 
 
