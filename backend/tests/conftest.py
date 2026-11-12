@@ -98,14 +98,8 @@ def _no_real_resolver(monkeypatch):
     yield
 
 
-# Lifted tests that still assert Solarlytics' own data (projects, role presets, the program-routes table); re-aiming them is a tracked follow-up
-# (DESIGN_LOG, "Lifted tests"). They are skipped by name, never silently: the count shows in every run.
-_SOLARLYTICS_ONLY = {
-    "test_later_requests_follow_the_account_and_the_membership", "test_two_companies_resolve_in_isolation",
-    "test_the_companies_list_carries_the_files_figures_and_the_plan", "test_a_company_file_that_cannot_be_read_is_said_and_left_out_of_the_sums",
-    "test_the_overview_adds_up_the_registry_and_the_files_of_the_companies_that_are_on",
-    "test_memberships_are_added_changed_and_removed_and_a_company_keeps_its_owner", "test_the_local_routes_are_mounted_through_program_routes",
-}
+# The lifted tests that asserted Solarlytics' own data (projects, role presets, the program-routes table) were re-aimed for Gridlytics in round 7 (audit
+# parity-architecture-10): none is skipped by name any more, and test_hygiene holds that no test is.
 
 
 #: The opt-in solver benchmarks (round 7, audit pr-review-01): a registered marker, not an ad-hoc switch per test. They run with `-m slow` (only them) or with
@@ -128,5 +122,3 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if item.get_closest_marker(SLOW) and not slow:
             item.add_marker(pytest.mark.skip(reason=f"an opt-in solver benchmark: -m {SLOW} or GRIDLYTICS_SLOW_TESTS=1 runs it (HANDOFF section 9)"))
-        if item.originalname in _SOLARLYTICS_ONLY:
-            item.add_marker(pytest.mark.skip(reason="asserts Solarlytics' own data; re-aim for Gridlytics (DESIGN_LOG: Lifted tests)"))

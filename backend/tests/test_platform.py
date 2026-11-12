@@ -597,15 +597,22 @@ def test_share_links_and_api_keys_name_their_company_through_the_index_tables(pl
 
 # ------------------------------------------------------------------------------------------------ not mounted yet; the git-ignored files
 
-def test_the_local_routes_are_mounted_through_program_routes(issued):
-    from gridlytics import routes_local
+def test_the_local_routes_are_mounted_through_the_feature_routes_in_local_mode(plat, issued):
+    # re-aimed in round 7 (audit parity-architecture-10): Gridlytics mounts its route modules through api.FEATURE_ROUTES, the local sign-in's only in
+    # local mode (the mode of the tests), and the mounted paths answer through the guard (a sign-in with a wrong password is refused by its code, a
+    # context asked without a token is told to sign in), never a 404
+    from gridlytics import identity, routes_local
     mine = {(r.path, m) for r in routes_local.router.routes for m in r.methods}
     assert mine == {("/api/local/session", "POST"), ("/api/local/refresh", "POST"), ("/api/local/logout", "POST"), ("/api/local/context", "GET"),
                     ("/api/local/password", "POST"), ("/api/local/sessions", "GET"), ("/api/local/sessions/end", "POST"),
                     ("/api/local/sessions/end-others", "POST")}
-    # stage B4a mounts them, in local mode (the mode of the tests), as the program's other routes are
-    assert {(r.path, m) for r in api.app.routes if getattr(r, "path", "").startswith("/api/local") for m in r.methods} == mine
-    assert routes_local in api.PROGRAM_ROUTES
+    assert identity.MODE == "local" and routes_local in api.FEATURE_ROUTES
+    assert {(r.path, m) for m_ in api.FEATURE_ROUTES for r in m_.router.routes if r.path.startswith("/api/local") for m in r.methods} == mine
+    c = TestClient(api.app, raise_server_exceptions=False)
+    r = c.post("/api/local/session", json={"email": "nobody@example.test", "password": "not the password at all"})
+    assert r.status_code == 401 and r.json()["code"] == "invalid_credentials", r.text
+    r = c.get("/api/local/context")
+    assert r.status_code == 401 and r.json()["code"] == "sign_in_required", r.text
 
 
 @pytest.mark.skipif(shutil.which("git") is None or not (REPO / ".git").exists(), reason="needs git and the repository")

@@ -29,7 +29,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 import identities
-from gridlytics import api, auth, backups, founder, identity, mfa, routes_founder, store, store_founder, store_members
+from gridlytics import api, auth, backups, founder, identity, mfa, routes_founder, sites, store, store_founder, store_members
 from gridlytics import platform as platformdb
 
 #: Made-up secrets of these tests, never a real one
@@ -517,25 +517,30 @@ def test_a_company_is_renamed_given_seats_and_switched_off_and_its_members_are_r
     assert _audit()[2]["detail"] == {"name": {"from": "Boxlytics Internal", "to": "Boxlytics"}, "seats": {"from": 5, "to": 2}}
 
 
-def test_the_companies_list_carries_the_files_figures_and_the_plan(fdb):
+def test_the_companies_list_carries_the_files_figures(fdb):
+    # re-aimed in round 7 (audit parity-architecture-10): a Gridlytics company's file holds sites and dispatch plans, not projects, quotes or a
+    # commercial plan (v1 sells none: plan Part 15.5)
     c = _console()
     made = _company(c)
     cid, owner = made["company"]["id"], made["owner"]
-    quiet = _company(c, "Development", {"email": "dev@localhost", "name": "Local Tester", "password": "dev first password 1"}, enabled=False)
+    quiet = _company(c, "Development", {"email": "dev@localhost", "name": "Local Tester", "password": "dev first password 1", "one_time": False},
+                     enabled=False)
     token = identity.issue_local(owner["id"], owner["email"], owner["name"], 60)
     _ok(_client().get("/api/sites", headers=identities.headers(token)))
     with store.use_company(platformdb.company_file(cid)):
-        store.set_overrides({"plan": {"id": "pro", "name": "Installer Pro", "price": 100, "trial_days": 14, "started": datetime.now().date().isoformat()}})
+        sites.create({"name": "Mill", "disco": "FESCO"}, "test")
+        gone = sites.create({"name": "Closed mill", "disco": "FESCO"}, "test")
+        sites.delete(gone["id"], "test")
     rows = {x["name"]: x for x in _ok(c.get("/api/founder/companies"))["companies"]}
     assert list(rows) == ["Boxlytics Internal", "Development"]
     box = rows["Boxlytics Internal"]
-    assert {"id", "name", "enabled", "seats", "disabled_reason", "created", "owner", "members", "seats_taken", "admins", "last_seen", "projects",
-            "quotes_issued", "plan"} == set(box)
-    assert box["seats_taken"] == 1 and box["admins"] == 1 and box["projects"] == 0 and box["quotes_issued"] == 0 and box["last_seen"]
+    assert {"id", "name", "enabled", "seats", "disabled_reason", "created", "owner", "members", "seats_taken", "admins", "last_seen", "sites",
+            "sites_closed_loop", "plans_issued", "archived"} == set(box)
+    assert box["seats_taken"] == 1 and box["admins"] == 1 and box["last_seen"] and box["archived"] is False
+    assert (box["sites"], box["sites_closed_loop"], box["plans_issued"]) == (1, 0, 0)          # a deleted site is not counted
     assert datetime.fromisoformat(box["last_seen"]).utcoffset() is not None
-    assert box["plan"]["state"] == "trial" and box["plan"]["name"] == "Installer Pro" and "On trial" in box["plan"]["sentence"]
     dev = rows["Development"]
-    assert dev["seats_taken"] == 0 and dev["admins"] == 0 and dev["last_seen"] is None and dev["plan"]["state"] == "none" and dev["plan"]["name"] is None
+    assert dev["seats_taken"] == 0 and dev["admins"] == 0 and dev["last_seen"] is None and (dev["sites"], dev["plans_issued"]) == (0, 0)
     assert not platformdb.company_file(quiet["company"]["id"]).exists()          # the list made no file
     members = _ok(c.get(f"/api/founder/companies/{cid}/members"))["members"]
     assert members == [{"user_id": owner["id"], "email": OWNER["email"], "name": OWNER["name"], "company_role": "owner", "status": "active",
@@ -552,33 +557,37 @@ def test_a_company_file_that_cannot_be_read_is_said_and_left_out_of_the_sums(fdb
     broken.parent.mkdir(parents=True, exist_ok=True)
     broken.write_bytes(b"this is not a database" * 100)
     box = _ok(c.get("/api/founder/companies"))["companies"][0]
-    assert box["seats_taken"] is None and box["plan"] is None and box["projects"] is None and box["owner"]["email"] == OWNER["email"]
+    # re-aimed in round 7 (audit parity-architecture-10): the file's figures are sites and dispatch plans
+    assert box["seats_taken"] is None and box["sites"] is None and box["plans_issued"] is None and box["owner"]["email"] == OWNER["email"]
     view = _ok(c.get("/api/founder/overview"))
     assert view["unread"] == [{"company_id": made["company"]["id"], "name": "Boxlytics Internal", "reason": "the file could not be read"}]
     assert view["seats"] == {"given": 5, "taken": 0}
 
 
 def test_the_overview_adds_up_the_registry_and_the_files_of_the_companies_that_are_on(fdb):
+    # re-aimed in round 7 (audit parity-architecture-10): Gridlytics' roles and its activity (sites, dispatch plans, telemetry days, reports); the
+    # people sign in with the first password the founder gave them for good (one_time false)
     c = _console()
     made = _company(c)
     cid, owner = made["company"]["id"], made["owner"]
-    _company(c, "Development", {"email": "dev@localhost", "name": "Local Tester", "password": "dev first password 1"}, enabled=False, seats=3)
-    sunia = _ok(c.post("/api/founder/users", json={"email": "sunia@meow.test", "name": "Sunia Ahmed", "password": "sunia first password", "company_id": cid}), 201)
+    _company(c, "Development", {"email": "dev@localhost", "name": "Local Tester", "password": "dev first password 1", "one_time": False}, enabled=False,
+             seats=3)
+    sunia = _ok(c.post("/api/founder/users", json={"email": "sunia@meow.test", "name": "Sunia Ahmed", "password": "sunia first password", "company_id": cid,
+                                                    "one_time": False}), 201)
     for who in (owner, sunia["user"]):
         _ok(_client().get("/api/sites", headers=identities.headers(identity.issue_local(who["id"], who["email"], who["name"], 60))))
     with store.use_company(platformdb.company_file(cid)):
         store_members.update_member(sunia["user"]["id"], role="operator", role_source="set")
-        store.create_project("Rooftop", "", {"a": 1}, {}, by="test")
+        sites.create({"name": "Rooftop", "disco": "LESCO"}, "test")
     view = _ok(c.get("/api/founder/overview"))
-    assert view["companies"] == {"total": 2, "on": 1, "off": 1}
-    assert view["accounts"] == {"total": 3, "disabled": 0}
+    assert view["companies"] == {"total": 2, "on": 1, "off": 1, "archived": 0}
+    assert view["accounts"] == {"total": 3, "disabled": 0, "archived": 0}
     assert view["memberships"] == {"active": 3, "pending": 0, "suspended": 0}
     assert view["seats"] == {"given": 5, "taken": 2}
     assert view["roles"] == {"admin": 1, "operator": 1}
-    assert view["activity"]["seen_7"] == 2 and view["activity"]["seen_30"] == 2
-    assert set(view["activity"]) == {"seen_7", "seen_30", "projects", "quotes_month", "quotes_30", "invoices_30", "acceptances_30", "calcs_30"}
-    assert view["activity"]["projects"] == 1
-    assert view["plans"] == {"none": 1, "trial": 0, "active": 0, "due": 0} and view["unread"] == []
+    assert set(view["activity"]) == set(store_founder.ACTIVITY) == {"seen_7", "seen_30", "sites", "plans_month", "plans_30", "days_30", "reports_30"}
+    assert view["activity"]["seen_7"] == 2 and view["activity"]["seen_30"] == 2 and view["activity"]["sites"] == 1
+    assert view["activity"]["plans_30"] == 0 and view["unread"] == []
 
 
 # ================================================================== users and memberships
@@ -632,7 +641,10 @@ def test_memberships_are_added_changed_and_removed_and_a_company_keeps_its_owner
     other = _company(c, "Development", {"email": "dev@localhost", "name": "Local Tester", "password": "dev first password 1"})["company"]["id"]
     maaz = _ok(c.post("/api/founder/users", json={"email": "maaz@meow.test", "name": "Maaz Ali", "password": "maaz first password"}), 201)["user"]
     m = _ok(c.post(f"/api/founder/users/{maaz['id']}/memberships", json={"company_id": cid, "company_role": "admin"}), 201)["membership"]
-    assert m == {"company_id": cid, "company_name": "Boxlytics Internal", "company_role": "admin", "status": "active"}
+    # re-aimed in round 7 (audit parity-architecture-10): the answer carries the person's Gridlytics role there, its source and their last sign-in,
+    # each null before their first request (audit founder-console-16)
+    assert m == {"company_id": cid, "company_name": "Boxlytics Internal", "company_role": "admin", "status": "active", "gridlytics_role": None,
+                 "role_source": None, "last_seen": None}
     r = c.post(f"/api/founder/users/{maaz['id']}/memberships", json={"company_id": cid, "company_role": "member"})
     assert r.status_code == 409 and _sentence(r)
     assert c.post(f"/api/founder/users/{maaz['id']}/memberships", json={"company_id": str(uuid.uuid4()), "company_role": "member"}).status_code == 404
