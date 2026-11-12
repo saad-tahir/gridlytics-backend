@@ -325,8 +325,9 @@ def plan_tariff(site: dict, conn: dict | None, schedules: list[dict]) -> dict | 
     """The tariff a plan is priced on, as its "Inputs this plan used" names it ("FESCO B-3, version in force from 1 Jul 2026"; plan D3.1.4, UX backend
     ask K14): the site's DISCO (null where it names none), the plant connection's category, and the schedule version (the rate card) in force on the
     horizon's first Karachi day (`version_id`, `name`, `effective_from`), with every schedule version the horizon's days were priced on in order
-    (`versions`, tariffs.schedules_used: two where a new schedule starts at a midnight inside the horizon). "The tariff version" is the schedule
-    version, as a savings day's `tariff_version` is. None off-grid: nothing is priced on a tariff. Words, ids and dates: no rate."""
+    (`versions`, tariffs.schedules_used: one for each stretch of days on one version, so up to three in 48 hours, which touch three Karachi days
+    unless they start at midnight). "The tariff version" is the schedule version, as a savings day's `tariff_version` is. None off-grid: nothing is
+    priced on a tariff. Words, ids and dates: no rate."""
     if conn is None or not schedules:
         return None
     first = schedules[0]

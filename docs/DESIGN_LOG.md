@@ -197,9 +197,10 @@ when the answer is.
     is one version, and the savings ledger and its CSV already speak of the schedule's.
   - **The version in force on the plan's first Karachi day** is the line's; `versions` lists every schedule version the horizon's days were priced on,
     in order, with the first and last day each priced (`tariffs.schedules_used`, from the price vectors' own day runs, so the line and the prices
-    never disagree). Each day names its own version: two versions that repeat a card price alike and share one run of `tariffs.day_versions`, which
-    now keeps each day's schedule by its day (`schedule_of`) beside the run's first. A version awaiting its notification prices nothing and is not
-    named; `tariff_notices` says so, as before.
+    never disagree): one to three of them, since 48 hours from any time but midnight touch three Karachi days (see the check below). Each day names
+    its own version: two versions that repeat a card price alike and share one run of `tariffs.day_versions`, which now keeps each day's schedule
+    by its day (`schedule_of`) beside the run's first. A version awaiting its notification prices nothing and is not named; `tariff_notices` says
+    so, as before.
   - **Null off-grid** (no connection is priced: the vectors are zeros); absent from a plan stored before (the page leaves the line out, the plan's
     fallback). Words, ids and dates, no rate: a viewer and a machine key read it whole (its test and the role walk prove it).
 - **K17, the control answer for a viewer** (plan D9.7, D3.0): confirmed, no code changed. `GET /control` needs no permission, and its one money, the

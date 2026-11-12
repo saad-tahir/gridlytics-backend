@@ -2,8 +2,8 @@
 
 The Plan view's "Inputs this plan used" reads "FESCO B-3, version in force from 1 Jul 2026" (plan D3.1.4), and nothing in a plan said which tariff
 priced it. `summary.tariff` now names the site's DISCO, the plant connection's category and the schedule version (the rate card) in force on the plan's
-first Karachi day, with every schedule version the horizon's days were priced with (`versions`: one, or two where a new schedule starts at a midnight
-inside the 48 hours), each with its first and last Karachi day. "The tariff version" is the schedule version, as a savings day's `tariff_version` is
+first Karachi day, with every schedule version the horizon's days were priced with (`versions`: one for each stretch of days on one version, so up
+to three, since a 48-hour horizon that does not start at midnight touches three Karachi days), each with its first and last Karachi day. "The tariff version" is the schedule version, as a savings day's `tariff_version` is
 (verify, savings_export). An off-grid plan is priced on no tariff: `tariff` is null. Words, ids and dates only: every reader, a viewer and a machine
 key included, reads it whole."""
 from __future__ import annotations
@@ -78,6 +78,27 @@ def test_a_horizon_across_a_new_schedules_first_day_names_both_and_the_one_in_fo
     assert tariff["versions"] == [_named(old, "2026-11-10", "2026-11-10"),
                                   {"version_id": new["id"], "name": "Uniform schedule, a test notification from 11 Nov 2026",
                                    "effective_from": "2026-11-11", "first_day": "2026-11-11", "last_day": "2026-11-12"}]
+
+
+def test_a_horizon_across_two_new_schedules_names_all_three_versions(company):
+    """A 48-hour horizon from 07:00 touches three Karachi days, so with a new schedule from each of the next two midnights it is priced on three
+    versions: `versions` holds all three, in order, and the page draws a line for each after the first (UX K14 check: the contract said one or two)."""
+    sid = _site()
+    old = _schedule("2026-11-10")
+    eleventh = tariffs.propose("schedule", "national", "2026-11-11", {**old["body"], "name": "A schedule from 11 Nov"}, {"verified": "unverified"}, "t")
+    tariffs.approve(eleventh["id"], "test")
+    twelfth = tariffs.propose("schedule", "national", "2026-11-12", {**old["body"], "name": "A schedule from 12 Nov"}, {"verified": "unverified"}, "t")
+    tariffs.approve(twelfth["id"], "test")
+    r = plans.tick(sid, at=T)
+    assert r["status"] in ("active", "held"), r.get("reason")
+    tariff = r["summary"]["tariff"]
+    assert (tariff["version_id"], tariff["name"]) == (old["id"], old["body"]["name"])
+    assert tariff["versions"] == [_named(old, "2026-11-10", "2026-11-10"),
+                                  {"version_id": eleventh["id"], "name": "A schedule from 11 Nov", "effective_from": "2026-11-11",
+                                   "first_day": "2026-11-11", "last_day": "2026-11-11"},
+                                  {"version_id": twelfth["id"], "name": "A schedule from 12 Nov", "effective_from": "2026-11-12",
+                                   "first_day": "2026-11-12", "last_day": "2026-11-12"}]
+    assert plans.get(sid, r["plan_id"])["summary"]["tariff"] == tariff
 
 
 def test_a_horizon_cut_short_by_a_relaxed_retry_names_only_the_days_it_holds(company):
