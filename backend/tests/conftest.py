@@ -102,15 +102,17 @@ def _no_real_resolver(monkeypatch):
 # parity-architecture-10): none is skipped by name any more, and test_hygiene holds that no test is.
 
 
-#: The opt-in solver benchmarks (round 7, audit pr-review-01): a registered marker, not an ad-hoc switch per test. They run with `-m slow` (only them) or with
-#: GRIDLYTICS_SLOW_TESTS=1 (them and the rest, HANDOFF section 9); any other run skips them by name, so the count shows. Their correctness halves are not
-#: here: each benchmark keeps a default-suite test of what it asserts (test_fix_r5_genset: the farm's 192-step plans from two marks)
+#: The opt-in wall-clock benchmarks (round 7, audit pr-review-01 and tests-and-perf-12): a registered marker, not an ad-hoc switch per test. They run with
+#: `-m slow` (only them) or with GRIDLYTICS_SLOW_TESTS=1 (them and the rest, HANDOFF section 9); any other run skips them by name, so the count shows.
+#: Their correctness halves are not here: each benchmark keeps a default-suite test of what it asserts, on work no machine's load changes
+#: (test_fix_r5_genset: the farm's 192-step plans from two marks; tests/budget.py: the solves' node budget; test_fix_r7_tests_ci: DAT-01's and DAT-08's
+#: reads as searches of the minute table's key)
 SLOW = "slow"
 
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", f"{SLOW}: an opt-in solver benchmark (wall-clock ratios over many solves); run with -m {SLOW} or "
-                                       "GRIDLYTICS_SLOW_TESTS=1, before changing optimise.py (HANDOFF section 9)")
+    config.addinivalue_line("markers", f"{SLOW}: an opt-in wall-clock benchmark (solve times, read times); run with -m {SLOW} or "
+                                       "GRIDLYTICS_SLOW_TESTS=1 on an idle machine, before changing optimise.py or telemetry.py (HANDOFF section 9)")
 
 
 def _slow_runs(config) -> bool:
@@ -121,4 +123,4 @@ def pytest_collection_modifyitems(config, items):
     slow = _slow_runs(config)
     for item in items:
         if item.get_closest_marker(SLOW) and not slow:
-            item.add_marker(pytest.mark.skip(reason=f"an opt-in solver benchmark: -m {SLOW} or GRIDLYTICS_SLOW_TESTS=1 runs it (HANDOFF section 9)"))
+            item.add_marker(pytest.mark.skip(reason=f"an opt-in wall-clock benchmark: -m {SLOW} or GRIDLYTICS_SLOW_TESTS=1 runs it (HANDOFF section 9)"))

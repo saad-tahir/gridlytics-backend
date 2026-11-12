@@ -2,8 +2,11 @@
 OPT-04 and OPT-07 were [x] with none of their acceptance in a test. Each test below is one item's acceptance, written against the engine as stage 1 left
 it; nothing reads the network or the owner's data folder (each test's company is a file of its own in a temporary folder).
 
-Timed acceptances (DAT-01's 10 ms day read, DAT-08's 200 ms range) take the best of several runs, as `timeit` does: the best run is the work itself,
-the others add what a busy machine adds (the suite runs four workers on four CPUs).
+Timed acceptances (DAT-01's 10 ms day read, DAT-08's 200 ms range): the default suite holds the work each read does, which no machine's speed or
+load changes (each read of the minute table is a search of its key, site and minute, over the rows asked for only, never a scan of the table or a sort
+of its rows); the wall-clock figures themselves are opt-in benchmarks (the `slow` marker, conftest.py), run alone on an idle machine, taking the best of
+several runs as `timeit` does. Review of round 7: a day read measured 5.3 ms of its 10 ms on this machine idle, too near the limit for `pytest -n 4`
+or a slower CI runner (audit tests-and-perf-12's trap, which the optimiser's tests left by their work budget).
 
 Batch 3 adds the outage forecaster's outputs for an announced window (p_start, dur_steps and g) and its unscheduled hazard, the DISCO prior shrunk
 towards the site's own counts (audit tests-and-perf-24), and the activation gate of a grid-connected site (audit tests-and-perf-19)."""
@@ -221,19 +224,57 @@ def _site_year(sid: str) -> tuple[np.ndarray, np.ndarray]:
     return ts, pv
 
 
-def test_dat01_a_site_year_is_written_and_read_back_a_day_reads_in_under_10_ms_and_the_daily_copy_holds_it(company):
-    # DAT-01's acceptance: a site-year written and read back; a day read under 10 ms; the daily backup copy includes the file
+def _traced(monkeypatch) -> list[str]:
+    """Every statement run on the telemetry file from here on, as sqlite runs it (its trace callback: the bound values written in)."""
+    statements: list[str] = []
+    real = telemetry._open
+
+    def traced():
+        con = real()
+        con.set_trace_callback(statements.append)
+        return con
+
+    monkeypatch.setattr(telemetry, "_open", traced)
+    return statements
+
+
+def _minute_reads(statements: list[str], ordered: bool = True) -> list[tuple[str, list[str]]]:
+    """The reads of the minute table among `statements`, each with its query plan; each must be a search of the table's key (the site, then a range of
+    minutes), never a scan of the table and, where `ordered`, never a sort of the rows it reads: the work a read does is then the rows it asks for,
+    whatever the machine's speed or load."""
+    reads = [sql for sql in statements if re.match(r"\s*SELECT\b", sql, re.I) and re.search(r"\bFROM minute\b", sql)]
+    assert reads, "no read of the minute table was traced"
+    out = []
+    with closing(sqlite3.connect(store.telemetry_path())) as con:
+        for sql in reads:
+            plan = [row[3] for row in con.execute("EXPLAIN QUERY PLAN " + sql)]
+            assert not any(re.match(r"SCAN minute\b", step) for step in plan), (sql, plan)
+            assert any(step.startswith("SEARCH minute USING PRIMARY KEY (site_id=?") for step in plan), (sql, plan)
+            if ordered:
+                assert not any("TEMP B-TREE FOR ORDER BY" in step for step in plan), (sql, plan)
+            out.append((sql, plan))
+    return out
+
+
+def test_dat01_a_site_year_is_written_and_read_back_a_day_reads_only_its_minutes_by_key_and_the_daily_copy_holds_it(company, monkeypatch):
+    # DAT-01's acceptance: a site-year written and read back; a day read under 10 ms (the work here, the wall clock in the benchmark below); the daily
+    # backup copy includes the file
     sid = sites.create({"name": "A year of minutes"}, "t")["id"]
     ts, pv = _site_year(sid)
     back = telemetry.raw(sid, YEAR0, YEAR0 + 366 * 86400, ("pv_power_w", "battery_soc_bms_pct"))
     assert len(back["ts"]) == len(ts) and (back["ts"] == ts).all()
     assert np.array_equal(back["pv_power_w"], pv)
-    # a day read as the bill engine and the replays read it (the whole minute grid of one day, every column)
+    # a day read as the bill engine and the replays read it (the whole minute grid of one day, every column): one search of the key, in the key's
+    # order, that reads the day's 1,440 rows of the year's 525,600
     d0 = YEAR0 + 200 * 86400
-    took, day = _best(lambda: telemetry.minute_grid(sid, d0, d0 + 86400))
+    statements = _traced(monkeypatch)
+    day = telemetry.minute_grid(sid, d0, d0 + 86400)
     assert day["completeness"] == 1.0 and len(day["ts"]) == 1440
     assert np.allclose(day["pv"], pv[200 * 1440:201 * 1440] / 1000.0)
-    assert took < 0.010, f"a day read took {took * 1000:.1f} ms"
+    reads = _minute_reads(statements)
+    assert len(reads) == 1, reads
+    with closing(sqlite3.connect(store.telemetry_path())) as con:
+        assert len(con.execute(reads[0][0]).fetchall()) == 1440
     # the daily copy takes the telemetry file with the workspace file (store.backup), all of the year in it
     made = backups.daily()
     assert made is not None
@@ -256,23 +297,52 @@ def world(tmp_path, monkeypatch):
     return types.SimpleNamespace(db=db, owner=owner, use=lambda: store.use_company(db))
 
 
-def test_dat08_a_30_day_range_asked_at_1_minute_comes_back_downsampled_in_under_200_ms(world):
-    # DAT-08's acceptance: a 30-day range at 1 minute returns downsampled (about 2,000 points per series at most) in under 200 ms, through the route
-    # the telemetry page asks
+def _thirty_days(world) -> tuple:
+    """A site-year in the world's company and the telemetry page's ask of 30 of its days at 1 minute, five series."""
     with world.use():
         sid = sites.create({"name": "Thirty days"}, "t")["id"]
         _site_year(sid)
     start = datetime.fromtimestamp(YEAR0 + 100 * 86400, PKT).isoformat()
     end = datetime.fromtimestamp(YEAR0 + 130 * 86400, PKT).isoformat()
     names = "pv_power_w,load_power_w,grid_power_w,battery_power_w,battery_soc_est_pct"
-    ask = lambda: world.owner.get(f"/api/sites/{sid}/telemetry", params={"start": start, "end": end, "names": names, "res": "1m"})  # noqa: E731
-    took, r = _best(ask, runs=5)
+    return sid, lambda: world.owner.get(f"/api/sites/{sid}/telemetry", params={"start": start, "end": end, "names": names, "res": "1m"})
+
+
+def test_dat08_a_30_day_range_asked_at_1_minute_comes_back_downsampled_by_the_database_from_a_search_of_its_key(world, monkeypatch):
+    # DAT-08's acceptance: a 30-day range at 1 minute returns downsampled (about 2,000 points per series at most) in under 200 ms (the work here, the
+    # wall clock in the benchmark below), through the route the telemetry page asks: the minutes are found by the table's key and bucketed in the
+    # database, which answers no more rows than the points the page gets
+    sid, ask = _thirty_days(world)
+    statements = _traced(monkeypatch)
+    r = ask()
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["requested_resolution"] == "1m" and body["resolution"] != "1m"                # 43,200 minutes asked, downsampled
     assert 0 < len(body["ts"]) <= telemetry.SERIES_MAX_POINTS and body["max_points"] == telemetry.SERIES_MAX_POINTS
     assert all(len(v) == len(body["ts"]) for v in body["series"].values()) and len(body["series"]) == 5
-    assert took < 0.200, f"the 30-day range took {took * 1000:.0f} ms"
+    with world.use():                                                                        # the company's telemetry file, as the route read it
+        ranged = [sql for sql, plan in _minute_reads(statements, ordered=False) if " ts < " in sql]
+        assert ranged
+        with closing(sqlite3.connect(store.telemetry_path())) as con:
+            assert all(len(con.execute(sql).fetchall()) <= telemetry.SERIES_MAX_POINTS for sql in ranged)
+
+
+# the wall-clock figures of DAT-01 and DAT-08: opt-in benchmarks (conftest.py's `slow` marker), run alone on an idle machine (HANDOFF section 9)
+
+@pytest.mark.slow
+def test_dat01_benchmark_a_day_reads_in_under_10_ms(company):
+    sid = sites.create({"name": "A year of minutes"}, "t")["id"]
+    _site_year(sid)
+    d0 = YEAR0 + 200 * 86400
+    took, day = _best(lambda: telemetry.minute_grid(sid, d0, d0 + 86400))
+    assert len(day["ts"]) == 1440 and took < 0.010, f"a day read took {took * 1000:.1f} ms"
+
+
+@pytest.mark.slow
+def test_dat08_benchmark_a_30_day_range_comes_back_in_under_200_ms(world):
+    _, ask = _thirty_days(world)
+    took, r = _best(ask, runs=5)
+    assert r.status_code == 200 and took < 0.200, f"the 30-day range took {took * 1000:.0f} ms"
 
 
 # ------------------------------------------------------------------------------------------------ OPT-03: a brute-force cross-check on a one-day problem
