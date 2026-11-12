@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Body, Response
 from fastapi.responses import PlainTextResponse
 
-from . import auth, gonogo, jobs, savings_export, sites, store, telemetry, verify
+from . import auth, gonogo, jobs, savings_export, sites, store, tariffs, telemetry, verify
 from .routes_common import bad, full_or_404, out, parse_day, site_or_404, today
 from .schemas import PilotEdit, PilotStart, Refusal, SwitchbackPaint, check
 
@@ -88,6 +88,36 @@ def _native_captures(site_id: str, days: list[dict], d1: date) -> list[dict]:
         out.append({**{k: cap.get(k) for k in ("version", "captured_at", "by", "source", "body", "has_photo")}, "first_day": None, "last_day": None,
                     "days": None})
     return out
+
+
+@router.get("/api/sites/{site_id}/savings/periods")
+def savings_periods(site_id: str):
+    """The Savings page's periods only the server can date (R8 2.12: "day, month, billing period, pilot window"; round 7, audit pages-D-23): the
+    billing period today falls in (from the day after the last meter reading to today, with the reading that will close it) and the last whole one,
+    each with its bill's month, from the first grid connection's reading day as the ledger's MDI months are (tariffs.billing_period_for: the
+    calendar month without one), none at an off-grid site or one with no connection saved; and the pilot window, from the start's Pakistan day to
+    the switchback calendar's last day (today at the latest), none before the pilot starts. No money: every role reads it."""
+    site_or_404(site_id)
+    t = today()
+    conns = sites.connections(site_id)
+    conn = conns[0] if conns and conns[0]["data"].get("regime") != "off_grid" else None
+    billing = last = None
+    if conn is not None:
+        a, reading = tariffs.billing_period_for(conn, t)
+        pa, pb = tariffs.billing_period_for(conn, a - timedelta(days=1))
+        billing = {"start": a.isoformat(), "end": t.isoformat(), "reading": reading.isoformat(), "month": tariffs.billing_month_for(conn, t),
+                   "reading_day": tariffs._reading_day(conn)}
+        last = {"start": pa.isoformat(), "end": pb.isoformat(), "month": tariffs.billing_month_for(conn, pb)}
+    pilot = None
+    with store.connect() as con:
+        r = con.execute("SELECT started FROM pilots WHERE site_id = ?", (site_id,)).fetchone()
+    if r is not None and r["started"]:
+        start = verify.local_day(r["started"])
+        blocks = verify.switchback_blocks(site_id)
+        cal_end = max((date.fromisoformat(b["block_end"]) for b in blocks), default=None)
+        end = min(t, cal_end) if cal_end else t
+        pilot = {"start": start.isoformat(), "end": max(start, end).isoformat(), "calendar_end": cal_end.isoformat() if cal_end else None}
+    return {"billing": billing, "last_billing": last, "pilot": pilot}
 
 
 #: How long POST /savings/recompute waits for its job before it answers 202 with the job to read (round 7, audit pr-review-05 with tests-and-perf-11):

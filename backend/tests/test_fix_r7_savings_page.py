@@ -690,3 +690,35 @@ def test_the_savings_answer_says_which_native_captures_its_days_were_replayed_on
         assert caps[1]["captured_at"] and page["native_latest_version"] == 3
     old = world.c["analyst"].get(f"/api/sites/{sid}/savings", params={"start": "2026-09-03", "end": "2026-09-03"}).json()
     assert [(c["version"], c["days"]) for c in old["native_captures"]] == [(1, None)]
+
+
+def test_the_savings_periods_give_the_billing_period_and_the_pilot_window(world, monkeypatch):
+    """pages-D-23 (R8 2.12: the period picker offers "day, month, billing period, pilot window"): the page offered this month, last month, the last
+    30 days and a custom range, so the MDI rows, keyed by billing month, never lined up with a period. GET /savings/periods dates the billing period
+    today falls in (from the day after the last reading to today) and the last whole one, from the connection's reading day as the ledger's months
+    are, and the pilot window (from the start's Pakistan day to the calendar's last day, today at the latest); none before the pilot starts and no
+    billing period at an off-grid site."""
+    from gridlytics import routes_savings
+    sid = world.site
+    monkeypatch.setattr(routes_savings, "today", lambda: date(2026, 11, 12))
+    with world.use():
+        cid = sites.connections(sid)[0]["id"]
+        sites.put_connection(sid, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400, "reading_day": 25}, "test", conn_id=cid)
+    a = world.c["viewer"]
+    p = a.get(f"/api/sites/{sid}/savings/periods").json()
+    assert p["billing"] == {"start": "2026-10-26", "end": "2026-11-12", "reading": "2026-11-25", "month": "2026-11", "reading_day": 25}
+    assert p["last_billing"] == {"start": "2026-09-26", "end": "2026-10-25", "month": "2026-10"}
+    assert p["pilot"] is None
+    with world.use():
+        with store.connect() as con:
+            con.execute("INSERT INTO pilots (site_id, data, started, updated) VALUES (?,?,?,?)", (sid, "{}", "2026-10-31T20:30:00+00:00", "x"))
+            con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,1)", (sid, "2026-11-02", "2026-11-08", "plan"))
+            con.execute("INSERT INTO switchback (site_id, block_start, block_end, arm, locked) VALUES (?,?,?,?,1)", (sid, "2026-11-09", "2026-11-15", "native"))
+    p = a.get(f"/api/sites/{sid}/savings/periods").json()
+    assert p["pilot"] == {"start": "2026-11-01", "end": "2026-11-12", "calendar_end": "2026-11-15"}       # 01:30 on 1 Nov in Pakistan
+    # without a reading day the bill is the calendar month
+    with world.use():
+        sites.put_connection(sid, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400}, "test", conn_id=cid)
+    p = a.get(f"/api/sites/{sid}/savings/periods").json()
+    assert p["billing"]["start"] == "2026-11-01" and p["last_billing"] == {"start": "2026-10-01", "end": "2026-10-31", "month": "2026-10"}
+    assert p["billing"]["reading_day"] is None
