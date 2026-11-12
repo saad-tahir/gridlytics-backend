@@ -1844,14 +1844,16 @@ def confirm_applied(site: dict, day: date, applied: dict, act: dict, plant: twin
     return {"class": cls, "fidelity": score, **detail}
 
 
-def compute_range_detail(site_id: str, d0: date, d1: date, by: str = "system") -> dict:
+def compute_range_detail(site_id: str, d0: date, d1: date, by: str = "system", progress=None) -> dict:
     """Score the days d0..d1 in order, each baseline's chain carried from one to the next, then re-score the stored days after d1 whose chain the
     range moved (_walk_forward). One audit line (RECOMPUTED) lists every day re-scored, why ("recompute", "chain"), and its claim before and
     after; a closed month's changed claims are marked (_restate). Returns {"days": the days d0..d1 scored, "rescored_days": the later days the
     walk re-scored, "restated_days": the days whose claim changed in a closed month} (round 7, audit pr-review-02: before, the answer counted the
-    range only, and nothing recorded what the walk rewrote)."""
+    range only, and nothing recorded what the walk rewrote). `progress(done, total)`, when given, is told after each day of the range (round 7,
+    audit pr-review-05: the recompute runs as a job whose page shows how far it is)."""
     n = 0
     entries: list[dict] = []
+    total = max((d1 - d0).days + 1, 0)
     d = d0
     while d <= d1:
         before = _stored_rows(site_id, d)
@@ -1860,6 +1862,8 @@ def compute_range_detail(site_id: str, d0: date, d1: date, by: str = "system") -
             n += 1
             entries.append(_rescored(d, "recompute", before, new, _restate(site_id, d, before, "recompute", by)))
         d += timedelta(days=1)
+        if progress is not None:
+            progress((d - d0).days, total)
     walked = _walk_forward(site_id, d1, by) if d1 >= d0 else []
     entries += walked
     if entries:

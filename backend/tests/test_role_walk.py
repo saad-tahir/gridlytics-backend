@@ -97,6 +97,10 @@ def walk(tmp_path_factory):
 
     answers: dict[str, dict[str, dict[str, tuple]]] = {}
     unfilled = []
+    # a recompute runs as a job (round 7, savings-page, audit pr-review-05): GET /api/sites/{site_id}/savings/recompute/{job_id}, over a day with no data
+    r = client.post(f"/api/sites/{sids[0]}/savings/recompute", headers=h["admin"], json={"start": "2020-01-01", "end": "2020-01-01"})
+    assert r.status_code == 200, r.text
+    fill.setdefault("job_id", []).append(r.json()["job_id"])
     for template in get_routes():
         if any(f in template for f in FILES):
             continue

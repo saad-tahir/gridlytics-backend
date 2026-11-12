@@ -453,3 +453,82 @@ def test_the_monthly_report_csv_carries_the_claim_columns_and_its_plan_ids_by_ka
     pdf = built[-1]
     assert "as dated in the CSV annex" not in pdf
     assert "tariff_version" in pdf and "native_capture_version" in pdf and "plan_ids" in pdf, pdf
+
+
+# ------------------------------------------------------------------------------------------------ pr-review-05 (tests-and-perf-11): recompute as a job
+
+def test_the_recompute_runs_as_a_job_one_at_a_time_per_site_and_says_how_far_it_is(world, monkeypatch):
+    """pr-review-05 with tests-and-perf-11: POST /savings/recompute scored up to 62 days, each with a bound solve, and as many later days, inside the
+    request, so a month held it open for minutes and a second click started another. It now runs as a job: the request answers 202 with the job
+    once RECOMPUTE_WAIT_S has passed, the job says how many days of the range it has scored, a second recompute of the site while one runs is
+    refused in a sentence (the same person's same period answers that job), and the finished job answers what it did, the later days included."""
+    import threading
+    from gridlytics import routes_savings
+    go, seen = threading.Event(), {}
+
+    def detail(site_id, d0, d1, by="system", progress=None):
+        seen["by"] = by
+        progress(1, 2)
+        assert go.wait(30)
+        progress(2, 2)
+        return {"days": 2, "rescored_days": ["2026-10-14"], "restated_days": []}
+
+    monkeypatch.setattr(verify, "compute_range_detail", detail)
+    monkeypatch.setattr(routes_savings, "RECOMPUTE_WAIT_S", 0.3)
+    url = f"/api/sites/{world.site}/savings/recompute"
+    body = {"start": "2026-10-12", "end": "2026-10-13"}
+    try:
+        r = world.c["analyst"].post(url, json=body)
+        assert r.status_code == 202, r.text                              # before: 200 once every day was scored, the request held open
+        job = r.json()
+        assert job["status"] in ("queued", "running") and job["job_id"] and (job["start"], job["end"]) == ("2026-10-12", "2026-10-13")
+        poll = world.c["analyst"].get(f"{url}/{job['job_id']}").json()
+        assert poll["status"] == "running" and (poll["done"], poll["total"]) == (1, 2), poll
+        # the same person's same period answers the job already running; anyone else's recompute of the site waits for it to end
+        again = world.c["analyst"].post(url, json=body)
+        assert again.status_code == 202 and again.json()["job_id"] == job["job_id"]
+        other = world.c["admin"].post(url, json={"start": "2026-10-01", "end": "2026-10-05"})
+        assert other.status_code == 409 and other.json()["detail"] == ("A recompute of this site from 12 Oct 2026 to 13 Oct 2026 is running; try "
+                                                                         "again when it ends"), other.text
+        # a job is its person's: another's read of it is a 404
+        assert world.c["admin"].get(f"{url}/{job['job_id']}").status_code == 404
+    finally:
+        go.set()
+    from gridlytics import jobs
+    for _ in range(300):
+        done = world.c["analyst"].get(f"{url}/{job['job_id']}").json()
+        if done["status"] not in jobs.ACTIVE:
+            break
+        threading.Event().wait(0.05)
+    assert done == {"status": "done", "days": 2, "rescored_days": ["2026-10-14"], "restated_days": [], "job_id": job["job_id"],
+                    "start": "2026-10-12", "end": "2026-10-13"}, done
+    assert seen["by"] and seen["by"] != "system"
+    # once it has ended, the site recomputes again, here within the wait: the answer is the outcome at once
+    r = world.c["admin"].post(url, json={"start": "2026-10-01", "end": "2026-10-05"})
+    assert r.status_code == 200 and r.json()["status"] == "done" and r.json()["days"] == 2, r.text
+
+
+def test_the_recompute_runs_below_the_ticks_priority(world, monkeypatch):
+    """tests-and-perf-11: the recompute's replays and solves burnt the CPU the scheduler's wall-clock-limited ticks need (HANDOFF 8.A.3). Its work
+    runs in a thread of its own at a higher nice value (Linux threads each have one), and the request's thread keeps its own."""
+    import os
+    import threading
+    from gridlytics import routes_savings
+    if not hasattr(os, "setpriority") or not hasattr(threading, "get_native_id"):
+        pytest.skip("no per-thread priority on this system")
+    base = os.getpriority(os.PRIO_PROCESS, threading.get_native_id())
+    seen = {}
+
+    def detail(site_id, d0, d1, by="system", progress=None):
+        seen["nice"] = os.getpriority(os.PRIO_PROCESS, threading.get_native_id())
+        seen["thread"] = threading.current_thread().name
+        return {"days": 0, "rescored_days": [], "restated_days": []}
+
+    monkeypatch.setattr(verify, "compute_range_detail", detail)
+    monkeypatch.setattr(routes_savings, "RECOMPUTE_WAIT_S", 30.0)
+    r = world.c["analyst"].post(f"/api/sites/{world.site}/savings/recompute", json={"start": "2026-10-12", "end": "2026-10-12"})
+    assert r.status_code == 200 and r.json()["status"] == "done", r.text
+    assert seen["thread"] == "gridlytics-recompute"
+    assert seen["nice"] == max(base, routes_savings.RECOMPUTE_NICE)
+    assert os.getpriority(os.PRIO_PROCESS, threading.get_native_id()) == base
+

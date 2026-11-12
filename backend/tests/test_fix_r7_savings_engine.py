@@ -791,13 +791,15 @@ def test_a_rescore_in_a_month_not_over_is_no_restatement(company, monkeypatch):
 def test_the_recompute_route_answers_the_later_days_it_rescored(world, monkeypatch):
     seen = {}
 
-    def detail(site_id, d0, d1, by="system"):
+    def detail(site_id, d0, d1, by="system", progress=None):
         seen["by"] = by
         return {"days": 2, "rescored_days": ["2026-10-14"], "restated_days": ["2026-10-14"]}
 
     monkeypatch.setattr(verify, "compute_range_detail", detail)
     r = world.c["analyst"].post(f"/api/sites/{world.site}/savings/recompute", json={"start": "2026-10-12", "end": "2026-10-13"})
-    assert r.status_code == 200 and r.json() == {"days": 2, "rescored_days": ["2026-10-14"], "restated_days": ["2026-10-14"]}
+    # round 7 (savings-page, audit pr-review-05): the recompute runs as a job, whose finished answer adds its status, id and period
+    assert r.status_code == 200 and {k: r.json()[k] for k in ("days", "rescored_days", "restated_days", "status")} == {
+        "days": 2, "rescored_days": ["2026-10-14"], "restated_days": ["2026-10-14"], "status": "done"}
     assert seen["by"] and seen["by"] != "system"
 
 

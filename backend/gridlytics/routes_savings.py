@@ -1,16 +1,20 @@
 """Savings (UI-12), the pilot set-up (UI-13), switchback, bills and the fee check; the fleet roll-up."""
 from __future__ import annotations
 
+import contextvars
 import copy
 import csv
 import io
 import json
+import os
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Response
 from fastapi.responses import PlainTextResponse
 
-from . import auth, gonogo, savings_export, sites, store, telemetry, verify
+from . import auth, gonogo, jobs, savings_export, sites, store, telemetry, verify
 from .routes_common import bad, full_or_404, out, parse_day, site_or_404, today
 from .schemas import PilotEdit, PilotStart, Refusal, SwitchbackPaint, check
 
@@ -47,8 +51,65 @@ def savings(site_id: str, start: str | None = None, end: str | None = None):
     return out(summ)
 
 
+#: How long POST /savings/recompute waits for its job before it answers 202 with the job to read (round 7, audit pr-review-05 with tests-and-perf-11):
+#: a few days recompute within it; a month of replays and bound solves, with the later days the walk re-scores, runs on as a job
+RECOMPUTE_WAIT_S = 10.0
+#: The CPU niceness the recompute runs at where the system has one (Linux, macOS): the scheduler's ticks, whose solves are limited by the wall
+#: clock (HANDOFF 8.A.3), take the processor before it
+RECOMPUTE_NICE = 10
+#: The recompute of each site waiting or running, by (company file, site id): one at a time per site
+_recomputes: dict[tuple[str, str], tuple[jobs.Job, date, date]] = {}
+_recomputes_lock = threading.Lock()
+
+
+def _owner() -> str:
+    """Whose job a recompute is: the signed-in person's id (their name where there is none)."""
+    return str((auth.current.get() or {}).get("id") or auth.actor())
+
+
+def _low_priority(fn):
+    """fn() in a thread of its own at RECOMPUTE_NICE (a Linux thread has its own nice value; a pool worker keeps its own for the next job), in the
+    caller's context (its company), its answer or its exception passed back."""
+    got: dict = {}
+
+    def body() -> None:
+        if hasattr(os, "setpriority") and hasattr(threading, "get_native_id"):
+            try:
+                os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), RECOMPUTE_NICE)
+            except OSError:  # not allowed here: it runs at the pool's own priority
+                pass
+        try:
+            got["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001  (raised again in the job's thread, which reports it)
+            got["error"] = exc
+    t = threading.Thread(target=contextvars.copy_context().run, args=(body,), name="gridlytics-recompute", daemon=True)
+    t.start()
+    t.join()
+    if "error" in got:
+        raise got["error"]
+    return got["value"]
+
+
+def _recompute_answer(job: jobs.Job, d0: date, d1: date) -> dict:
+    """A recompute job's answer: once done, what it did (`days`, `rescored_days`, `restated_days`) with `status` done; while it waits or runs,
+    `{status: queued | running, done, total}` (days of the range scored so far); failed, `{status: failed, error}`. Each with `job_id`, `start`
+    and `end`."""
+    base = {"job_id": job.id, "start": d0.isoformat(), "end": d1.isoformat()}
+    if job.state == "done" and job.result is not None:
+        return {**job.result, "status": "done", **base}
+    if job.state in jobs.ACTIVE:
+        return {"status": job.state, "done": job.done, "total": job.total, **base}
+    error = job.error if job.error and job.error != jobs.FAILED else "The recompute could not be completed; the server's log has the cause"
+    return {"status": "failed", "error": error, **base}
+
+
 @router.post("/api/sites/{site_id}/savings/recompute")
-def recompute(site_id: str, inp: dict = Body(default={})):
+def recompute(site_id: str, response: Response, inp: dict = Body(default={})):
+    """Score the period's finished days again (run_jobs; at most 62 days), then the later days whose chain they moved. It runs as a job (jobs.py), one
+    at a time per site, in a thread of lower priority than the scheduler's ticks (round 7, audit pr-review-05 and tests-and-perf-11: up to 62 days of
+    replays and bound solves, and as many later days, ran inside the request). The answer is the job's outcome when it ends within RECOMPUTE_WAIT_S,
+    else 202 with `{status: queued | running, job_id, done, total}`, read at GET /sites/:id/savings/recompute/:job_id. A second recompute of the site
+    while one runs is refused (409), unless it is the same person's same period, which answers that job."""
     auth.need("run_jobs", "Recomputing savings")
     site_or_404(site_id)
     t = today()
@@ -56,13 +117,50 @@ def recompute(site_id: str, inp: dict = Body(default={})):
     d1 = parse_day(inp.get("end"), t - timedelta(days=1))
     if (d1 - d0).days > 62:
         raise Refusal(422, "Recompute at most 62 days at a time", "invalid")
-    # round 7 (audit pr-review-02): the later days the forward walk re-scored, and those whose claim changed in a closed month, beside the count
-    done = verify.compute_range_detail(site_id, d0, d1, by=auth.actor())
-    if not done["days"] and not done["rescored_days"]:
-        # a recompute that scored no day (no data in the range) writes no line of its own: the request is audited all the same (round 7, audit
-        # security-roles-04)
-        store.audit(auth.actor(), verify.RECOMPUTED, site_id, {"start": d0.isoformat(), "end": d1.isoformat(), "days": []})
-    return done
+    who, owner, place = auth.actor(), _owner(), (str(store.db_path()), site_id)
+
+    def run(progress, stopped) -> dict:
+        # round 7 (audit pr-review-02): the later days the forward walk re-scored, and those whose claim changed in a closed month, beside the count
+        done = _low_priority(lambda: verify.compute_range_detail(site_id, d0, d1, by=who, progress=progress))
+        if not done["days"] and not done["rescored_days"]:
+            # a recompute that scored no day (no data in the range) writes no line of its own: the request is audited all the same (round 7, audit
+            # security-roles-04)
+            store.audit(who, verify.RECOMPUTED, site_id, {"start": d0.isoformat(), "end": d1.isoformat(), "days": []})
+        return done
+    with _recomputes_lock:
+        running = _recomputes.get(place)
+        if running is not None and running[0].state in jobs.ACTIVE:
+            job, r0, r1 = running
+            if job.owner != owner or (r0, r1) != (d0, d1):
+                raise Refusal(409, f"A recompute of this site from {r0:%d %b %Y} to {r1:%d %b %Y} is running; try again when it ends", "busy")
+        else:
+            try:
+                job = jobs.start("recompute", site_id, owner, f"recompute:{site_id}:{d0}:{d1}:{time.time_ns()}", run,
+                                 expected=max((d1 - d0).days + 1, 0), cache=False, abandon=False)
+            except jobs.Refused as exc:
+                raise Refusal(429, str(exc), "rate_limited") from None
+            _recomputes[place] = (job, d0, d1)
+    job = jobs.wait(job, RECOMPUTE_WAIT_S)
+    if job.state in jobs.ACTIVE:
+        response.status_code = 202
+    return _recompute_answer(job, d0, d1)
+
+
+@router.get("/api/sites/{site_id}/savings/recompute/{job_id}")
+def recompute_job(site_id: str, job_id: str):
+    """A recompute of the caller's (POST /savings/recompute): `{status: queued | running, done, total}` while it runs, then its outcome. Another
+    person's, another site's or one forgotten (an hour after it ended, or after a restart) is a 404."""
+    auth.need("run_jobs", "Recomputing savings")
+    site_or_404(site_id)
+    job = jobs.get(job_id, site_id, _owner())
+    place = _recomputes.get((str(store.db_path()), site_id))
+    if job is None or job.kind != "recompute":
+        raise Refusal(404, "No such recompute: it ended over an hour ago, or the server restarted since", "not_found")
+    d0, d1 = (place[1], place[2]) if place and place[0] is job else (None, None)
+    ans = _recompute_answer(job, d0 or date.min, d1 or date.min)
+    if d0 is None:
+        ans.update(start=None, end=None)
+    return ans
 
 
 @router.get("/api/sites/{site_id}/savings/kpis")
