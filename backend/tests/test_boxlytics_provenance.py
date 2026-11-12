@@ -53,3 +53,17 @@ def test_the_plain_sha256_founder_hash_is_listed_as_a_compatibility_path_to_remo
     section = _section()
     row = next(line for line in section.splitlines() if "plain SHA-256" in line)
     assert "backend/gridlytics/founder.py" in row and "to be removed" in row
+
+
+def test_the_sql_rows_say_which_lines_follow_boxlytics_as_written():
+    """The section said every construction was rewritten in Gridlytics' own code, yet grid_001 keeps two places line for line as Boxlytics' migrations
+    write them: get_my_context's memberships answer and company_list_members' columns and order (a comparison of six-line runs, as the web app's
+    scripts/provenance-check.mjs makes, found 12; UX 1 check). The rows of 003 and 011 name those lines, and the section's opening allows for them."""
+    section = _section()
+    assert "except the lines a row says follow Boxlytics as written" in section
+    rows = {name: next(line for line in section.splitlines() if f"`migrations/{name}`" in line) for name in ("003_company_views.sql", "011_token_economy.sql")}
+    assert "follow Boxlytics as written" in rows["003_company_views.sql"] and "lines 348 to 396" in rows["003_company_views.sql"]
+    assert "follows Boxlytics as written" in rows["011_token_economy.sql"] and "lines 312 to 330" in rows["011_token_economy.sql"]
+    sql = (ROOT / "supabase" / "migrations" / "grid_001_accounts_and_companies.sql").read_text(encoding="utf-8").splitlines()
+    assert sql[311].strip() == "'memberships', (" and "company_list_members" in sql[347], "the line numbers in the notice moved: correct them"
+
