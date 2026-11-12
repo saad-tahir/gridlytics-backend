@@ -22,7 +22,7 @@ from pathlib import Path
 import jwt
 import pytest
 
-from gridlytics import auth, companies, identity, store, store_members
+from gridlytics import auth, companies, identity, sites, store, store_members
 from gridlytics import platform as platformdb
 
 #: Made up for the tests: never real secrets or keys
@@ -338,12 +338,13 @@ def test_later_requests_follow_the_account_and_the_membership(local):
     platformdb.set_membership(maaz["id"], north["id"], role="admin")
     who = companies.resolve(token, None)
     assert (who.user["role"], who.user["company_role"], _member(north, maaz)["role_source"]) == ("admin", "admin", "default")
-    # a role set in Gridlytics stays when the company role moves between admin and member
+    # a role set in Gridlytics stays when the company role moves between admin and member (re-aimed in round 7, audit parity-architecture-10:
+    # Solarlytics' estimator is Gridlytics' analyst)
     with store.use_company(_file(north)):
-        store_members.update_member(maaz["id"], role="estimator", role_source="set")
+        store_members.update_member(maaz["id"], role="analyst", role_source="set")
     platformdb.set_membership(maaz["id"], north["id"], role="member")
     who = companies.resolve(token, None)
-    assert (who.user["role"], who.user["company_role"]) == ("estimator", "member")
+    assert (who.user["role"], who.user["company_role"]) == ("analyst", "member")
     assert len(_rows(_file(north), "SELECT * FROM members")) == 1
 
 
@@ -380,12 +381,13 @@ def test_seats_come_from_the_registry(local):
 # ============================================================================================================ local mode: two companies
 
 def test_two_companies_resolve_in_isolation(local):
+    # re-aimed in round 7 (audit parity-architecture-10, tests-and-perf-14): Gridlytics' roles, and a site where Solarlytics saved a run
     north, south = _company("Northwind Solar"), _company("Southwind Energy")
     saad = _account("saad@example.test", "Saad Khan", (north, "owner"), (south, "member"))
     sunia = _account("sunia@example.test", "Sunia Ahmed", (north, "member"))
     with store.use_company(_file(south)):
         store_members.set_preset("saad@example.test", "analyst")
-        store_members.set_preset("sunia@example.test", "approver")
+        store_members.set_preset("sunia@example.test", "operator")
     a, b = companies.resolve(_token(saad), north["id"]), companies.resolve(_token(saad), south["id"])
     # one person, two companies, two rows in two files: the owner's admin in A, the preset of B in B
     assert (a.user["role"], b.user["role"]) == ("admin", "analyst")
@@ -394,16 +396,19 @@ def test_two_companies_resolve_in_isolation(local):
     # a preset of B does not reach A: Sunia is a viewer in A, and B's preset for her is still unused
     assert companies.resolve(_token(sunia), None).user["role"] == "viewer"
     with store.use_company(b.db_path):
-        assert store_members.preset("sunia@example.test")["role"] == "approver"
+        assert store_members.preset("sunia@example.test")["role"] == "operator"
     _refused(403, "not_a_member", _token(sunia), south["id"])
     assert sunia["id"] not in {r["user_id"] for r in _rows(b.db_path, "SELECT * FROM members")}
-    # what is saved in A's file is not in B's
+    # what is saved in A's file is not in B's: a site and its audit line
     with store.use_company(a.db_path):
-        run = store.save_run("structure", "North's run", "", {}, {})
+        site = sites.create({"name": "North's mill", "disco": "FESCO"}, "test")
     with store.use_company(b.db_path):
-        assert store.get_run(run["id"]) is None and store.list_runs() == []
+        assert sites.get(site["id"]) is None and sites.listing() == []
+        assert not any(e["action"] == "added a site" for e in store.list_audit())
     with store.use_company(a.db_path):
-        assert [r["id"] for r in store.list_runs()] == [run["id"]]
+        assert [s["id"] for s in sites.listing()] == [site["id"]]
+    assert [r["name"] for r in _rows(a.db_path, "SELECT name FROM sites")] == ["North's mill"]
+    assert _rows(b.db_path, "SELECT name FROM sites") == []
 
 
 # ============================================================================================================ supabase mode

@@ -85,11 +85,23 @@ def test_the_gensets_night_load_ratio_is_its_output_over_the_dark_minutes():
     assert verify.night_load_ratio({"rated_kw": 0.0}, series) == 0.75
 
 
-def test_an_off_grid_days_carry_over_is_valued_at_the_gensets_cost_at_its_night_load(company):
+def _fixed_ids(monkeypatch, seed: int = 4) -> None:
+    """Every id the store makes from here on drawn from a seeded generator (round 7, tests-ci follow-up): demo.create_sites gives its sites fresh
+    random ids and the twin seeds each site's days by its id, so a test of the demo farm's numbers ran on a different farm-day every run (and, in a
+    full run, failed on some). With the ids fixed it runs on the same days every time."""
+    import random
+
+    from gridlytics import store
+    rng = random.Random(seed)
+    monkeypatch.setattr(store, "new_id", lambda n=12: f"{rng.getrandbits(128):032x}"[:n])
+
+
+def test_an_off_grid_days_carry_over_is_valued_at_the_gensets_cost_at_its_night_load(company, monkeypatch):
     # the demo farm: a kWh left at midnight serves the night, where the genset otherwise carries 8-21 kW near its 14.4 kW minimum; valued at its cost
     # at 75 % load (before: about Rs 128 a kWh), the per-day ledger ran Rs 2,600-12,200 ahead of 11-day continuous replays in four of five rebuilds
     from gridlytics import demo, optimise, sites, tariffs
 
+    _fixed_ids(monkeypatch)                     # the same farm id, so the same twin days, on every run
     sid = next(i for i in demo.create_sites("t") if "farm" in sites.full(i)["name"].lower())
     _, sp, _ = twin_day(sid, P, 0.5, seed=1)
     twin_day(sid, D, float(sp["soc"][-1]), seed=2)
@@ -104,8 +116,8 @@ def test_an_off_grid_days_carry_over_is_valued_at_the_gensets_cost_at_its_night_
     at_night = b["eta_d"] * optimise._gen_marginal(gm, ratio) - optimise.wear_cost(b)
     at_75 = b["eta_d"] * optimise._gen_marginal(gm) - optimise.wear_cost(b)
     assert r["actual"]["v_end"] == pytest.approx(at_night, abs=0.01) and at_night > at_75 + 15.0
-    # the stored end energies are rounded to 0.01 kWh each, so their difference is good to 0.01 kWh at v_end (Rs 1.6 here; demo.create_sites draws
-    # a fresh site id, and the twin seeds its days by it, so a fixed Rs 1 failed on some draws)
+    # the stored end energies are rounded to 0.01 kWh each, so their difference is good to 0.01 kWh at v_end (Rs 1.6 here; a fixed Rs 1 failed on
+    # some farm-days, when the farm's id, and so its days, were drawn afresh each run)
     assert r["levers"]["carry_over"] == pytest.approx((r["actual"]["e_end_kwh"] - r["baseline"]["e_end_kwh"]) * r["actual"]["v_end"],
                                                       abs=0.011 * r["actual"]["v_end"])
 

@@ -371,5 +371,5 @@ def test_two_state_writers_at_once_keep_both_fields(tmp_path, monkeypatch):
     th.join(10)
     th2.join(10)
     with store.use_company(db):
-        st = sites.state(sid) if hasattr(sites, "state") else sites.full(sid)["state"]
+        st = sites.state(sid)
     assert st.get("first") == 1 and st.get("second") == 2

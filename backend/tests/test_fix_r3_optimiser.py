@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 import numpy as np
 import pytest
 
+import budget
 from gridlytics import forecast, optimise, plans, sites, store, telemetry, twin
 from test_fix_optimiser import _now_t0, _problem, _site, _until  # noqa: F401  (the round-1 fixtures and helpers)
 from test_fix_r2_optimiser import _connection, _floor
@@ -84,9 +85,11 @@ def test_a_force_charge_window_around_an_outage_sheds_no_more_in_the_outage_than
 
 # ------------------------------------------------------------------------------------------------ regression-threshold-offgrid-solve-time
 
-def test_a_time_limited_off_grid_threshold_plan_with_a_full_tank_never_sheds_instead_of_starting_the_set(company):
+def test_a_time_limited_off_grid_threshold_plan_with_a_full_tank_never_sheds_instead_of_starting_the_set(company, monkeypatch):
     # the farm with a full 400 L tank at 21:00 in Pakistan on 4 November: the 10 s solve stopped at its limit with a plan that shed 51.6 kWh over
-    # the night with the set off, the battery on its 25 % threshold and over 360 L in the tank
+    # the night with the set off, the battery on its 25 % threshold and over 360 L in the tank. Round 7 (audit tests-and-perf-12): on a work
+    # budget (budget.py), so the plan is the same on any machine under any load; the time-limited path itself is test_fix_r2_optimiser's 120 L farm
+    b = budget.use(monkeypatch)
     s = sites.create({"name": "Farm", "critical_load_kw": [8.0] * 24, "genset_start_control": "soc_threshold", "outage_load_mode": 1, "site_type": "farm"}, "t")
     sid = s["id"]
     sites.put_asset(sid, "pv", {"kwp_dc": 80, "kw_ac": 70}, "t")
@@ -109,7 +112,8 @@ def test_a_time_limited_off_grid_threshold_plan_with_a_full_tank_never_sheds_ins
               and float(sol["F"][:t].sum()) < gen["fuel_available"] - burn]            # fuel in the tank
     assert dodged == [], (dodged, r.get("shed_rule_resolve"))
     assert float(sol["U"].sum()) * 0.25 < 1.5                                          # 51.6 kWh before
-    assert r["solve_seconds"] < 25.0                                                   # at most two solves at the limit
+    # at most two solves, each given the tick's limit (the wall clock's 25 s before round 7: a sum of times that a loaded machine stretched)
+    assert 1 <= len(b.solves) <= 2 and all(x["limit_s"] == 10.0 for x in b.solves) and b.cpu_ok(), b.solves
 
 
 def _offgrid_threshold(fuel: float, voll: float) -> dict:

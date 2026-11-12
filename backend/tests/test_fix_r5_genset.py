@@ -6,12 +6,11 @@ with the set on, so the plan shed load (329 kWh over 11 days) and the twin's ope
 optimiser's own toy problems at the demo farm's sizes and the demo twin's generated days; nothing reads the network."""
 from __future__ import annotations
 
-import os
-
 from datetime import datetime, timezone
 
 import numpy as np
 import pytest
+import budget
 from test_fix_optimiser import _problem
 from test_fix_r2_savings import D, P
 from test_fix_savings import company, twin_day  # noqa: F401 (company is a fixture)
@@ -68,11 +67,55 @@ def test_a_night_below_the_sets_minimum_load_runs_the_set_instead_of_shedding(ou
 
 
 FARM_MARKS = [(soc, h) for soc in (0.2, 0.5) for h in range(0, 24, 3)]
+#: the default suite's two of them (round 7, audit pr-review-01): an evening start low and a midnight start half full, each with a whole night and a
+#: second day of runs in its 192 steps
+FARM_DEFAULT_MARKS = [(0.2, 18), (0.5, 0)]
 
 
-@pytest.mark.skipif(os.environ.get("GRIDLYTICS_SLOW_TESTS") != "1",
-                    reason="solver benchmark: about a minute on an idle machine on mains power, many minutes and a timing failure when the machine is "
-                           "busy or throttled on battery. GRIDLYTICS_SLOW_TESTS=1 runs it; run it before changing optimise.py (HANDOFF section 9)")
+def _demo_farm() -> tuple[str, int]:
+    sid = next(i for i in demo.create_sites("t") if "farm" in sites.full(i)["name"].lower())
+    return sid, twin.day_start_utc(datetime(2026, 11, 5).date())
+
+
+def _farm_plan(sid: str, day0: int, soc: float, h: int) -> tuple[int, dict, dict]:
+    """The demo farm's plan from hour `h` of 5 November at state of charge `soc` (400 L in the tank), solved as the tick solves it."""
+    sites.put_state(sid, soc=soc, fuel_l=400.0)
+    site = sites.full(sid)
+    t0 = forecast.align(day0 + h * 3600)
+    p = plans.build_problem(site, t0, forecast.issue(site, t0, save=False), 192)
+    return t0, p, optimise.solve_with_policy(p, time_limit=10.0)
+
+
+def _check_farm_plan(t0: int, p: dict, r: dict, soc: float, h: int) -> tuple[list[tuple], int]:
+    """What every farm plan must do (round 5): solve to optimality inside the tick's limit (the default suite's test: inside its work budget,
+    budget.py; the opt-in benchmark: inside its 10 s), shed (almost) nothing, run the set under a night load below its minimum. Returns the second day's starts and stops that fall off the clock's hour marks (the second_day_hour rows), with the number of
+    starts and stops there, so a caller can see the check was not empty."""
+    assert r["status"] == "optimal" and r["time_limited"] is False and r["relaxed"] is False, (soc, h, r["status"], r.get("mip_gap"))
+    s = r["sol"]
+    assert float(s["U"].sum()) * H < 0.5, (soc, h, float(s["U"].sum()) * H)
+    night = np.asarray(p["L"]) - np.asarray(p["PV"]) < MIN_KW
+    assert (s["u"][night] > 0.5).any(), (soc, h)                                     # runs under a load below the set's minimum
+    changes = [t for t in range(97, 192) if s["u"][t] != s["u"][t - 1]]
+    return [(soc, h, t) for t in changes if (t0 // 900 + t) % 4], len(changes)
+
+
+@pytest.mark.parametrize("soc,h", FARM_DEFAULT_MARKS, ids=["soc20_from_18h", "soc50_from_00h"])
+def test_the_demo_farms_192_step_plans_run_the_set_at_night_and_start_the_second_days_runs_on_hour_marks(company, soc, h, monkeypatch):
+    # the default suite's check of what the opt-in benchmark below asserts besides its timing (round 7, audit pr-review-01: skipped by default, it was
+    # the only test of the real farm's 192-step plans and of the second day's hour-mark rows, whose deletion failed nothing): no shed, the set run
+    # under a night load below its minimum, optimal inside the tick's work budget (audit tests-and-perf-12: a node budget and this process's CPU
+    # time, budget.py, not the wall clock, which `pytest -n 4` or a busy machine stretches past the tick's 10 s), and on the horizon's second day
+    # every start and stop on an hour mark
+    b = budget.use(monkeypatch)
+    sid, day0 = _demo_farm()
+    t0, p, r = _farm_plan(sid, day0, soc, h)
+    assert b.solves and all(x["limit_s"] == 10.0 for x in b.solves) and b.cpu_ok(), b.solves
+    flips, changes = _check_farm_plan(t0, p, r, soc, h)
+    assert changes >= 1, (soc, h, changes)                                            # the second day has a start or a stop to check
+    assert not flips, flips
+
+
+@pytest.mark.slow
 def test_the_demo_farms_plans_from_every_three_hour_mark_run_the_set_and_solve_about_as_fast_as_without_the_surplus(company):
     # the demo farm (192 steps, a manual start, 400 L in the tank) planned from each 3-hour mark of 5 November at two states of charge. Before:
     # the plans shed the nights' load with the set off (1 to 88 kWh in every plan). The night runs this change allows doubled or tripled the
@@ -80,23 +123,14 @@ def test_the_demo_farms_plans_from_every_three_hour_mark_run_the_set_and_solve_a
     # worst): on an idle machine on mains power HEAD's model 1.2 s and 2.5 s, the surplus without those rows 3.0 s and 8.5 s, with them 1.4 s
     # and 3.7 s; on battery power 2.2 s and 5.2 s, 6.1 s and 17.6 s (four over the tick's 10 s), 2.9 s and 7.6 s. So the time is checked
     # against the model without the surplus (`a_gen_surplus` off, row for row HEAD's) solved here on the same machine, and each solve must
-    # finish inside the limit. One easy instance hid the slowdown, so this times a set
-    sid = next(i for i in demo.create_sites("t") if "farm" in sites.full(i)["name"].lower())
-    day0 = twin.day_start_utc(datetime(2026, 11, 5).date())
+    # finish inside the limit. One easy instance hid the slowdown, so this times a set. An opt-in benchmark (the `slow` marker, conftest.py: about a
+    # minute on an idle machine on mains power, many minutes and a timing failure when the machine is busy or throttled on battery); the test above
+    # keeps its correctness in the default suite
+    sid, day0 = _demo_farm()
     secs, ref, flips = [], [], []
     for soc, h in FARM_MARKS:
-        sites.put_state(sid, soc=soc, fuel_l=400.0)
-        site = sites.full(sid)
-        t0 = forecast.align(day0 + h * 3600)
-        p = plans.build_problem(site, t0, forecast.issue(site, t0, save=False), 192)
-        r = optimise.solve_with_policy(p, time_limit=10.0)
-        assert r["status"] == "optimal" and r["time_limited"] is False and r["relaxed"] is False, (soc, h, r["status"], r.get("mip_gap"))
-        s = r["sol"]
-        assert float(s["U"].sum()) * H < 0.5, (soc, h, float(s["U"].sum()) * H)
-        night = np.asarray(p["L"]) - np.asarray(p["PV"]) < MIN_KW
-        assert (s["u"][night] > 0.5).any(), (soc, h)                                 # runs under a load below the set's minimum
-        # the second day's runs start and stop on the clock's hour marks (the second_day_hour rows); the first day keeps its quarters
-        flips += [(soc, h, t) for t in range(97, 192) if s["u"][t] != s["u"][t - 1] and (t0 // 900 + t) % 4]
+        t0, p, r = _farm_plan(sid, day0, soc, h)
+        flips += _check_farm_plan(t0, p, r, soc, h)[0]
         secs.append(r["solve_seconds"])
         q = {**p, "battery": {**p["battery"], "a_gen_surplus": False}}
         assert not optimise.genset_surplus_steps(q).any()

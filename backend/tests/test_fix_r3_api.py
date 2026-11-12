@@ -442,7 +442,9 @@ def test_the_fuel_log_is_listed(world):
     assert all("cost_rs" not in x for x in world.c["viewer"].get(f"/api/sites/{sid}/genset/fuel").json()["logs"])
 
 
-def test_an_upload_passes_its_file_name_where_the_import_takes_one(world, monkeypatch):
+def test_an_upload_passes_its_file_name_to_the_import(world, monkeypatch):
+    """The uploaded file's name always goes with the import (round 7, audit tests-and-perf-20): routes_telemetry no longer asks import_csv's
+    signature whether it takes one, a shim that dropped the name silently when the import changed, and that this test kept alive by covering it."""
     sid = world.site
     a = world.c["admin"]
     seen = []
@@ -451,17 +453,20 @@ def test_an_upload_passes_its_file_name_where_the_import_takes_one(world, monkey
         seen.append(file_name)
         return {"rows": 1, "gaps": 0}
 
-    def without_name(site_id, content, tz_offset_h=0.0, mapping=None, now=None):
-        seen.append("called")
-        return {"rows": 1, "gaps": 0}
-
     csv = b"ts,grid_present\n2026-11-01T00:00:00Z,1\n"
     monkeypatch.setattr(telemetry, "import_csv", with_name)
     assert a.post(f"/api/sites/{sid}/telemetry/upload", files={"file": ("march.csv", csv, "text/csv")}).status_code == 200
     r = a.post(f"/api/sites/{sid}/telemetry/upload", params={"file_name": "C:\\logs\\april.csv"}, content=csv, headers={"Content-Type": "text/csv"})
     assert r.status_code == 200 and seen == ["march.csv", "april.csv"], (r.text, seen)
+
+    def without_name(site_id, content, tz_offset_h=0.0, mapping=None, now=None):
+        seen.append("stored without its name")
+        return {"rows": 1, "gaps": 0}
+
+    # an import that no longer takes the name is an error, not an upload stored with its name dropped (the shim answered 200 here)
     monkeypatch.setattr(telemetry, "import_csv", without_name)
-    assert a.post(f"/api/sites/{sid}/telemetry/upload", files={"file": ("may.csv", csv, "text/csv")}).status_code == 200 and seen[-1] == "called"
+    assert a.post(f"/api/sites/{sid}/telemetry/upload", files={"file": ("may.csv", csv, "text/csv")}).status_code == 500
+    assert seen[-1] == "april.csv"
 
 
 # ------------------------------------------------------------------------------------------------ alerts

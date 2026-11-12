@@ -78,7 +78,11 @@ _ORIGIN = re.compile(r"https?://([a-z0-9.-]+|\[[0-9a-f:.]+\])(:\d{1,5})?")
 
 def _cors_origins(raw: str) -> list[str]:
     raw = raw.strip()
-    names = json.loads(raw) if raw.startswith("[") else (raw.split(",") if raw else [])
+    try:
+        names = json.loads(raw) if raw.startswith("[") else (raw.split(",") if raw else [])
+    except ValueError:
+        # a broken JSON array stops the start with its setting named (round 7, audit parity-architecture-10), not with the parser's own words
+        raise RuntimeError("GRIDLYTICS_CORS_ORIGINS is not a JSON array of origins: write it as [\"https://host\"] or as origins with commas between") from None
     out = []
     for name in (str(n).strip().rstrip("/").lower() for n in names):
         if name and not _ORIGIN.fullmatch(name):
@@ -88,9 +92,21 @@ def _cors_origins(raw: str) -> list[str]:
     return out
 
 
+def _cors_regex(raw: str) -> str | None:
+    """The preview origins' pattern, checked at the start (round 7, audit parity-architecture-10): a broken one stops the start with its setting named,
+    where it would otherwise fail every request with an origin (CORS and the guard compile it then)."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        re.compile(raw)
+    except re.error as exc:
+        raise RuntimeError(f"GRIDLYTICS_CORS_ORIGIN_REGEX is not a pattern Python reads: {exc}") from None
+    return raw
+
+
 CORS_ORIGINS = _cors_origins(os.environ.get("GRIDLYTICS_CORS_ORIGINS", ""))
-_regex = os.environ.get("GRIDLYTICS_CORS_ORIGIN_REGEX", "").strip()
-CORS_ORIGIN_REGEX = _regex or None
+CORS_ORIGIN_REGEX = _cors_regex(os.environ.get("GRIDLYTICS_CORS_ORIGIN_REGEX", ""))
 # Idempotency-Key: a client may send a first save's key as a header as well as in the body (the web app sends it in the body)
 CORS_ALLOW_HEADERS = ["Authorization", "Content-Type", "X-Gridlytics-Company", "X-Request-ID", "x-founder-session", "Idempotency-Key"]
 CORS_EXPOSE_HEADERS = ["X-Request-ID", "X-Total-Count", "X-Gridlytics-Engine", "X-Gridlytics-Role", "X-API-Version", "Content-Disposition", "Retry-After"]
