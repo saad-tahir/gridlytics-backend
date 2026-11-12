@@ -20,7 +20,7 @@ import identities
 import pytest
 from test_founder import _audit, _client, _console, _ok, _sentence, clock, fdb  # noqa: F401  (fixtures)
 
-from gridlytics import access_requests, api, auth, schemas
+from gridlytics import access_requests, api, auth, backups, schemas
 from gridlytics import platform as platformdb
 from gridlytics.ratelimit import Limiter
 
@@ -326,16 +326,20 @@ def test_the_founder_sets_a_state_and_a_note_and_each_change_is_in_the_founders_
     assert got["state"] == "contacted" and got["note"] == "Called her; a pilot at Unit 2 first." and got["updated_at"] == "2027-01-15T13:02:00+05:00"
     line = _audit()[0]
     assert line["action"] == "changed an access request" and line["actor"] == "founder" and line["target"] == "ayesha@rahimtextiles.pk"
-    assert line["detail"] == {"request": rid, "topic": "access", "state": {"from": "new", "to": "contacted"},
-                              "note": {"from": "", "to": "Called her; a pilot at Unit 2 first."}}
+    # the note's text is the request's, never the audit's (UX K2 check: the audit outlives the request): added, changed or cleared
+    assert line["detail"] == {"request": rid, "topic": "access", "state": {"from": "new", "to": "contacted"}, "note": "added"}
     # one at a time; the same again writes nothing
     _ok(c.patch(f"{FOUNDER}/{rid}", json={"state": "done"}))
     assert _audit()[0]["detail"] == {"request": rid, "topic": "access", "state": {"from": "contacted", "to": "done"}}
     count = len(_audit())
     assert _ok(c.patch(f"{FOUNDER}/{rid}", json={"state": "done", "note": "Called her; a pilot at Unit 2 first."}))["request"]["state"] == "done"
     assert len(_audit()) == count
+    _ok(c.patch(f"{FOUNDER}/{rid}", json={"note": "Called her twice."}))
+    assert _audit()[0]["detail"] == {"request": rid, "topic": "access", "note": "changed"}
     # an empty note clears it; back to new is allowed
     assert _ok(c.patch(f"{FOUNDER}/{rid}", json={"note": "", "state": "new"}))["request"]["note"] == ""
+    assert _audit()[0]["detail"] == {"request": rid, "topic": "access", "state": {"from": "done", "to": "new"}, "note": "cleared"}
+    assert "Called her" not in json.dumps(_audit())
     assert _listed(c)["counts"] == {"new": 1, "contacted": 0, "done": 0, "declined": 0, "all": 1}
 
 
@@ -345,6 +349,7 @@ def test_the_founder_sets_a_state_and_a_note_and_each_change_is_in_the_founders_
     ({"state": "archived"}, 422, "A request's state is new, contacted, done or declined"),
     ({"state": 1}, 422, "The state must be text"),
     ({"note": "n" * 1001}, 422, "The note must be at most 1,000 characters"),
+    ({"note": "Rang \u202eher"}, 422, "The note must be plain text"),
     ({"state": "done", "email": "x@y.pk"}, 422, "Unknown field 'email'"),
     ([], 422, "Send the change as a set of named values"),
     ("done", 422, "Send the change as a set of named values"),
@@ -382,8 +387,11 @@ def test_the_founder_filters_by_state_with_counts_and_pages(fdb, clock, monkeypa
     monkeypatch.setattr(access_requests, "PAGE", 2)
     assert [r["id"] for r in _listed(c, "?offset=2")["requests"]] == ids[2:4]
     assert [r["id"] for r in _listed(c, "?state=new&offset=1")["requests"]] == ids[4:]
+    # digits are ASCII digits: "²" was a 500, "٣" read as 3 (UX K2 check)
     for query, words in (("?state=archived", "Filter the requests by state"), ("?offset=-1", "The offset is a whole number from 0"),
-                         ("?offset=x", "The offset is a whole number from 0")):
+                         ("?offset=x", "The offset is a whole number from 0"), ("?offset=%C2%B2", "The offset is a whole number from 0"),
+                         ("?offset=%D9%A3", "The offset is a whole number from 0"), ("?offset=1%C2%B2", "The offset is a whole number from 0"),
+                         ("?offset=1234567890", "The offset is a whole number from 0")):
         r = c.get(FOUNDER + query)
         assert r.status_code == 422 and r.json()["detail"].startswith(words) and _sentence(r), (query, r.text)
 
@@ -530,3 +538,63 @@ def test_an_ipv6_sender_is_counted_by_its_64(fdb, clock, monkeypatch):
     assert access_requests.counted_as("::ffff:10.0.0.7") == "10.0.0.7" == access_requests.counted_as("10.0.0.7")
     assert access_requests.counted_as("forwarded") == "forwarded" and access_requests.counted_as("") == "unknown"
 
+
+def test_the_founders_audit_forgets_the_requester_with_the_request_and_never_holds_the_note(fdb, clock):
+    """The 12-month keeping did not hold for what the founder's audit copied: each change kept the requester's email as its target and the note's text
+    from and to, for good. The note's text is now never copied; the email goes from the audit when the request is removed, and the line keeps what was
+    done. Nothing in the registry names the requester after the keeping."""
+    assert _send(AYESHA).status_code == 202
+    c = _console()
+    rid = _listed(c)["requests"][0]["id"]
+    note = "Ayesha's mobile 0300 7654321; not a fit"
+    _ok(c.patch(f"{FOUNDER}/{rid}", json={"state": "declined", "note": note}))
+    _ok(c.patch(f"{FOUNDER}/{rid}", json={"note": "Not a fit for now"}))
+    clock.step(200 * 86400)
+    later = {**AYESHA, "name": "Bilal Ahmed", "email": "bilal@kamalfoods.pk"}
+    assert _send(later, address="10.0.0.2").status_code == 202
+    c = _console()                                                               # a session lasts 8 hours: a new one each time the clock moves on
+    bid = next(r["id"] for r in _listed(c)["requests"] if r["email"] == later["email"])
+    _ok(c.patch(f"{FOUNDER}/{bid}", json={"state": "contacted"}))
+    assert "0300 7654321" not in json.dumps(_audit())
+    clock.step(166 * 86400)                                                      # Ayesha's is 366 days old, Bilal's 166
+    assert [r["email"] for r in _listed(_console())["requests"]] == [later["email"]]
+    hers = [e for e in _audit() if e["action"] == "changed an access request" and e["detail"]["request"] == rid]
+    assert [e["target"] for e in hers] == ["", ""] and [e["detail"].get("note") for e in hers] == ["changed", "added"]
+    assert hers[1]["detail"]["state"] == {"from": "new", "to": "declined"}
+    his = [e for e in _audit() if e["action"] == "changed an access request" and e["detail"]["request"] == bid]
+    assert [e["target"] for e in his] == [later["email"]]
+    # the whole registry, every table: no trace of her
+    with closing(sqlite3.connect(platformdb.db_path())) as con:
+        tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+        held = [(t, row) for t in tables for row in con.execute(f"SELECT * FROM {t}") if any(
+            isinstance(v, str) and ("ayesha@rahimtextiles.pk" in v or "7654321" in v or "Ayesha" in v) for v in row)]
+    assert held == []
+
+
+def test_the_keeping_is_applied_by_the_registrys_housekeeping_and_at_a_send(fdb, clock):
+    """B21.2 item 4: "applied by the registry's housekeeping". The prune ran only at a send or the founder's read, so a quiet registry kept an old request,
+    and the daily copy took it again each day. The hourly check of the daily backup removes it before the registry is copied; a send removes it too."""
+    assert _send(AYESHA).status_code == 202
+    clock.step(366 * 86400)
+    made = backups.daily_all(lambda: [])
+    assert _rows() == []
+    line = next(e for e in _audit() if e["action"] == "removed access requests past their keeping time")
+    assert line["actor"] == "server" and line["detail"]["removed"] == 1
+    copy = next(p for p in made if p.name.startswith("platform-"))
+    with closing(sqlite3.connect(copy)) as con:
+        assert con.execute("SELECT COUNT(*) FROM access_requests").fetchone()[0] == 0
+    # nothing to remove: the check writes nothing more, and a registry not yet made is not made by it
+    count = len(_audit())
+    backups.daily_all(lambda: [])
+    assert len(_audit()) == count
+    # a send alone, with no read and no backup, removes what is past its keeping
+    assert _send({**AYESHA, "email": "first@rahimtextiles.pk"}).status_code == 202
+    clock.step(366 * 86400)
+    assert _send({**AYESHA, "email": "second@rahimtextiles.pk"}, address="10.0.0.3").status_code == 202
+    assert [r["email"] for r in _rows()] == ["second@rahimtextiles.pk"]
+
+
+def test_the_housekeeping_never_makes_a_registry(fdb, clock):
+    assert not platformdb.db_path().exists()
+    backups.daily_all(lambda: [])
+    assert not platformdb.db_path().exists()

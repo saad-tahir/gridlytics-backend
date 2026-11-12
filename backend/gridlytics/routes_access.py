@@ -13,6 +13,7 @@ says whether an email has one. The founder's two routes check the founder's own 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Request
@@ -24,6 +25,8 @@ from . import platform as platformdb
 
 router = APIRouter()
 log = logging.getLogger("gridlytics")
+#: A page's offset: ASCII digits only (str.isdigit takes "²", which int() cannot read, and "٣", which it reads as 3: UX K2 check)
+_OFFSET = re.compile(r"[0-9]{1,9}")
 
 
 def _filled(value) -> bool:
@@ -74,15 +77,16 @@ def founder_access_requests(state: str = "all", offset: str = "0"):
     """The requests, newest first, in one state or all, a page (access_requests.PAGE) at a time from `offset`, with how many there are in each state."""
     if state not in (*access_requests.STATES, "all"):
         _api._fail("Filter the requests by state: new, contacted, done, declined or all")
-    if not offset.isdigit() or len(offset) > 9:
+    if not _OFFSET.fullmatch(offset):
         _api._fail("The offset is a whole number from 0")
     return access_requests.listing(state, int(offset))
 
 
 @router.patch("/api/founder/access-requests/{request_id}", dependencies=[Depends(routes_founder._session)])
 def founder_access_request_change(request_id: str, inp: Any = Body(None)):
-    """Set a request's state (new, contacted, done, declined), the founder's note, or both. A change is written to the founder's audit, with what it was
-    and what it is now; a change that changes nothing writes nothing."""
+    """Set a request's state (new, contacted, done, declined), the founder's note, or both. A change is written to the founder's audit: the state from
+    and to, and whether the note was added, changed or cleared, never its text (access_requests.audit_detail); a change that changes nothing writes
+    nothing. The line's target is the requester's email until the request is removed past its keeping (access_requests.prune)."""
     request_id = routes_founder._id(request_id, "access request")
     if not isinstance(inp, dict):
         _api._fail("Send the change as a set of named values: the request's state, its note, or both")
@@ -91,7 +95,6 @@ def founder_access_request_change(request_id: str, inp: Any = Body(None)):
     if done is None:
         routes_founder._missing("access request")
     before, after = done
-    changes = {k: {"from": before[k], "to": after[k]} for k in ("state", "note") if before[k] != after[k]}
-    if changes:
-        platformdb.founder_audit("changed an access request", after["email"], {"request": request_id, "topic": after["topic"], **changes})
+    if detail := access_requests.audit_detail(before, after):
+        platformdb.founder_audit(access_requests.CHANGED, after["email"], detail)
     return {"request": after}

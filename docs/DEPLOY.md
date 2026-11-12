@@ -77,7 +77,9 @@ docker compose -f deploy/docker-compose.yml logs -f api
   lockout to count tries by the address the proxy gives; without it, every try through the proxy counts under one address, and the log says so once.
 - **The volume.** `/data` holds everything the app keeps, and the app (user 10001) writes nowhere else:
   - `platform.db`: the registry (the companies, each with its files, seats and whether Gridlytics is on; the founder's audit; the requests for access
-    sent from the contact page, kept 12 months; in local mode the accounts, the memberships, the sessions and the record of sign-ins);
+    sent from the contact page, kept 12 months, then removed by the hourly backup check, the founder's audit keeping what was done to them but not
+    the requester's email, and the registry's daily copies for their 14 days; in local mode the accounts, the memberships, the sessions and the record
+    of sign-ins);
   - `companies/<company id>.db` and `companies/<company id>-telemetry.db`: one company's workspace and its telemetry; a request opens its own company's
     files only; `companies/backup/` holds their copies;
   - `keys/<company id>/`: the signing keys of the company's sites (the edge checks each plan's signature with them);
@@ -130,7 +132,7 @@ the web app's settings (`frontend/.env.example` in the web repository: every `VI
 | `GRIDLYTICS_SCHEDULER`, `GRIDLYTICS_TICK_WORKERS` | both | `1` runs the 15-minute loop in this process (the image sets it; one process per data folder); how many sites a tick solves at once |
 | `GRIDLYTICS_RATE_USER`, `GRIDLYTICS_RATE_ADDRESS`, `GRIDLYTICS_RATE_PUBLIC` | both | Requests a minute per person, per address, and per address to the public paths |
 | `GRIDLYTICS_RATE_SIGN_IN`, `GRIDLYTICS_RATE_REPORTS` | both | Sign-ins from one address in 5 minutes; reports a company may generate in an hour |
-| `GRIDLYTICS_RATE_ACCESS_REQUESTS` | both | Requests for access the contact page may send from one address in an hour (5; `0` turns the limit off) |
+| `GRIDLYTICS_RATE_ACCESS_REQUESTS` | both | Requests for access the contact page may send from one address (an IPv6 address by its /64) in an hour (5; `0` turns the limit off) |
 | `GRIDLYTICS_DOCS` | both | `1` opens the API pages at `/docs`; off on a hosted copy |
 | `GRIDLYTICS_DEMO_DAYS`, `GRIDLYTICS_DEMO_REPLAN_HOURS` | both | The demo sites' days of history and how often it re-plans, for a company's administrator who loads them from Fleet |
 

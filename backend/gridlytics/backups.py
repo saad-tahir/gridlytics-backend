@@ -168,7 +168,8 @@ def _company_files() -> list[Path]:
 def daily_all(files=None, keep: int = KEEP) -> list[Path]:
     """One check of the daily backup: today's copy of the default database (when it lies in the data folder in use: a scratch run's store.DB_PATH is the
     owner's file, audit performance-live-07), of every company's file `files()` gives (the registry's companies when None) and of the registry itself,
-    each made once a day. The copies made now; a copy that fails is logged and tried again at the next check, and never stops the others."""
+    each made once a day, the registry's requests for access past their keeping removed first. The copies made now; a copy that fails is logged and
+    tried again at the next check, and never stops the others."""
     made, seen = [], set()
     default = Path(store.DB_PATH)
     here = os.path.normcase(os.path.abspath(default.parent)) == os.path.normcase(os.path.abspath(platformdb.data_dir()))
@@ -185,6 +186,14 @@ def daily_all(files=None, keep: int = KEEP) -> list[Path]:
             continue
         if copy is not None:
             made.append(copy)
+    try:
+        # the registry's housekeeping (UX K2 check; plan B21.2 item 4): the requests for access past their keeping go before it is copied, whether or not
+        # anyone sends one or the founder reads them
+        if platformdb.db_path().exists():
+            from . import access_requests
+            access_requests.prune()
+    except Exception:
+        log.exception("the requests for access past their keeping could not be removed")
     try:
         # losing the registry would lose every account and membership
         copy = _daily(platformdb.db_path(), platformdb.backup, keep)

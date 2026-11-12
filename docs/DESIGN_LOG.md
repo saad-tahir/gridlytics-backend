@@ -123,6 +123,7 @@ check" commits):
     fits a request for help with an account or something else, which is never set up.
   - **Each change is in the founder's audit** ("changed an access request", the requester's email as its target, as an account's changes are
     targeted by email; `{request, topic, state: {from, to}, note: {from, to}}`, only what changed); a change that changes nothing writes nothing.
+    (The note's text and the email past the keeping, no longer: see the check below.)
   - **Times** are kept in UTC (B21.2) and answered in Pakistan time (`received_at`, `updated_at`, ISO 8601 with +05:00). `about` is the table's
     "About the site" made by the server from the facts ("2 to 5 sites · Deye · LESCO"), so the console holds no second list of their words.
 - **The store is schema 4 of the registry** (`platform.db`, `access_requests`, its state held by a CHECK), never a company's file: the requests come
@@ -134,6 +135,41 @@ check" commits):
   decides; the privacy notice's section 6 should then say the same.
 - Owner's questions: Q25 (the form with a founder console inbox, not a `mailto:` only) and Q75 (People's request lands in Access requests as "Another
   person") ship their recommended yes; Q30 as above.
+
+### Batch k2, the check (12 Nov 2026)
+
+Independent checkers read K2 and K3; each finding was tried against the code and every one held. What changed:
+
+- **An optional field left empty** is taken as `""` or null alike, as the contract said: the server refused null for the text fields, `""` for the
+  choices (a select left on its empty choice) and either for the equipment. A `mode="before"` validator turns a text field's null into `""`, a
+  choice's `""` into null and the equipment's null or `""` into none; a needed field sent null is told what to give ("Give your full name").
+- **The founder's audit and the keeping** (the owner's question Q30 still open). Each change's line kept the requester's email as its target and the
+  note's text, from and to, for good, past the 12 months the contract, the deployment guide and the privacy notice's example promise. The note's
+  text is now never copied (the line says the note was `added`, `changed` or `cleared`), and when a request is removed past its keeping, the lines of
+  its changes lose their target, the email; they keep the request's id, its topic and the state from and to. The founder's audit is otherwise never
+  changed: blanking a removed requester's email is its one exception, so that "kept 12 months" is true of everything that names the requester. The
+  registry's daily copies hold a removed request for their 14 days (DEPLOY.md says so; the privacy notice should too).
+- **The housekeeping** (B21.2 item 4: "applied by the registry's housekeeping"): the hourly check of the daily backup removes the requests past their
+  keeping before it copies the registry, so a quiet registry does not keep them and its copy does not take them again; a send and the founder's read
+  still do too. The check never makes a registry.
+- **The rate.** The API's one limiter pruned every key by the caller's window once it held over 20,000 keys: the next minute's check forgot an
+  address's hour, and the sign-in limiter's five minutes. `ratelimit.Limiter` now keeps each key's own window (a lifted file; `lift_manifest.json`
+  records why). An IPv6 sender is counted by its /64, which one connection holds whole. Every 429 of the send carries `retry_at`, the API-wide
+  limits' (per address, per address without a session) too, so the page's "Try again after 14:01" always has its time.
+- **Field shapes.** The email refuses control and invisible format characters and the characters a plainly written address never holds (`<>()[]\,;:"`);
+  every text field refuses the direction controls (U+202A to U+202E, U+2066 to U+2069), which reorder what the founder's console shows; the one-line
+  fields refuse the C1 controls and the line and paragraph separators. The zero-width joiners stay allowed in a name, as Urdu is typed with them. A
+  phone may start with a bracket ("(042) 35761234") and holds six digits at least. The founder list's offset is ASCII digits ("²" was a 500, "٣" read
+  as 3).
+- **One sentence.** `schemas.message` joins a refusal's clauses as one sentence, each after the first starting lower case unless its first word is an
+  abbreviation or a name with a mark ("Give your full name; give a work email, such as name@company.com"); `alerts.py`'s two rewordings of its
+  message read either case. The topic is checked with the other fields, so a form missing several is told each at once, not one after another.
+- **Tests.** `test_founder`'s sweeps (the session's 401, the 503 until set up, the bodies' walk) read every `/api/founder` route the app serves: the
+  access requests, in `routes_access.py`, were outside them, and a founder route added outside `routes_founder.py` would have been too. The API walk
+  checks that each role's session, the analyst's too, gets the founder's 401.
+- **Not done.** A ceiling on the requests kept a day across every address: a sender with many addresses can still fill the registry, 8 KB a request,
+  until the keeping removes them. Its number, and what a person is told past it, are the owner's call. A route to delete one request on demand (a
+  privacy request) is still not asked by the plan.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 

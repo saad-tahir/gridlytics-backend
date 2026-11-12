@@ -98,8 +98,13 @@ def test_a_request_for_access_reaches_the_founder_from_anyone_signed_in_or_not(w
     r = client.post("/api/public/access-requests", json=body)
     assert r.status_code == 202 and r.content == b"", r.text
     for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
-        r = client.post("/api/public/access-requests", json=body, headers=_login(client, password, email))
+        h = _login(client, password, email)
+        r = client.post("/api/public/access-requests", json=body, headers=h)
         assert r.status_code == 202 and r.content == b"", (email, r.text)
+        # no role's session reaches the founder's Access requests, the analyst's too (the role walk has no analyst: UX K2 check)
+        for method, path in (("GET", "/api/founder/access-requests"), ("PATCH", "/api/founder/access-requests/00000000-0000-4000-8000-000000000000")):
+            r = client.request(method, path, headers=h, json={"state": "done"} if method == "PATCH" else None)
+            assert r.status_code == 401 and r.json()["code"] == "founder_session_required", (email, method, r.text[:200])
     founder_h = {"x-founder-session": founder.new_token()[0]}
     got = client.get("/api/founder/access-requests?state=new", headers=founder_h).json()
     mine = [r for r in got["requests"] if r["email"] == "api-walk@example.pk"]

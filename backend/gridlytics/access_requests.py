@@ -12,9 +12,11 @@ and answered in Pakistan time.
   (`sent_by`), so the founder can tell an administrator's "Another person in my company" from anyone's.
 - **The founder's list and change** (`GET` and `PATCH /api/founder/access-requests`), behind the founder's own session: newest first, filtered by state,
   with the count of each state for the console's filter; each change of state or note is written to the founder's audit.
-- **Keeping** (B21.2 item 4): a request is kept KEEP_DAYS from when it came, and removed at the next send or the founder's next read, with one line in the
-  founder's audit. The owner's question Q30 (how long access requests are kept) has no recommended answer in the plan; the privacy notice's example, 12
-  months, ships until the owner decides (one number here).
+- **Keeping** (B21.2 item 4): a request is kept KEEP_DAYS from when it came, and removed by the registry's housekeeping (the hourly check of the daily
+  backup, before the registry is copied), at the next send or at the founder's next read, with one line in the founder's audit. Its email goes from the
+  founder's audit with it (the lines of its changes keep what was done, not to whom), and the note's text is never copied there. The owner's question Q30
+  (how long access requests are kept) has no recommended answer in the plan; the privacy notice's example, 12 months, ships until the owner decides (one
+  number here).
 """
 from __future__ import annotations
 
@@ -303,15 +305,36 @@ def again(seconds: int) -> datetime:
     return (t.replace(second=0, microsecond=0) + timedelta(minutes=1)) if (t.second or t.microsecond) else t
 
 
+#: The founder's audit line of a change of a request (routes_access), whose target is the requester's email while the request is kept
+CHANGED = "changed an access request"
+
+
+def audit_detail(before: dict, after: dict) -> dict:
+    """What the founder's audit keeps of a change: the request's id and topic, the state from and to, and whether the note was added, changed or cleared,
+    never its text (a note may hold a phone number; the audit outlives the request). Empty when nothing changed."""
+    changes: dict = {}
+    if before["state"] != after["state"]:
+        changes["state"] = {"from": before["state"], "to": after["state"]}
+    if before["note"] != after["note"]:
+        changes["note"] = "added" if not before["note"] else "cleared" if not after["note"] else "changed"
+    return {"request": after["id"], "topic": after["topic"], **changes} if changes else {}
+
+
 def prune() -> int:
-    """Remove the requests kept longer than KEEP_DAYS from when they came; how many went. The founder's audit says so, in one line for each removal."""
+    """Remove the requests kept longer than KEEP_DAYS from when they came; how many went. The founder's audit says so, in one line for each removal, and
+    forgets their emails: the lines of their changes keep what was done (the state, whether the note changed), not to whom."""
     now = _now()
     cutoff = (now - timedelta(days=KEEP_DAYS)).isoformat(timespec="seconds")
     with platformdb._read() as con:
         if con.execute("SELECT 1 FROM access_requests WHERE received_at < ? LIMIT 1", (cutoff,)).fetchone() is None:
             return 0
     with platformdb._write() as con:
+        ids = [r["id"] for r in con.execute("SELECT id FROM access_requests WHERE received_at < ?", (cutoff,))]
         gone = con.execute("DELETE FROM access_requests WHERE received_at < ?", (cutoff,)).rowcount
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            con.execute(f"UPDATE founder_audit SET target = '' WHERE action = ? AND target != '' AND json_extract(detail, '$.request') IN "
+                        f"({','.join('?' * len(chunk))})", (CHANGED, *chunk))
     if gone:
         platformdb.founder_audit("removed access requests past their keeping time", "",
                                  {"removed": gone, "kept_days": KEEP_DAYS, "received_before": karachi(cutoff)}, actor="server")
