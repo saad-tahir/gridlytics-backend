@@ -1031,12 +1031,32 @@ def day_versions(conn: dict, days: list[date]) -> list[dict]:
         if runs and runs[-1]["key"] == key:
             runs[-1]["last"], runs[-1]["days"] = d, runs[-1]["days"] + 1
             runs[-1]["versions"].update({v["id"]: v for v in used})
+            runs[-1]["schedule_of"][d] = s
             continue
         ov = bodies["override"] or {}
         runs.append({"key": key, "first": d, "last": d, "days": 1, "schedule": s, "card": bodies["card"],
                      "cal": ov["calendar"] if isinstance(ov.get("calendar"), dict) else bodies["tou"] or {"seasons": []}, "tax": bodies["tax"] or {},
-                     "nb": bodies["net_billing"], "lg": bodies["net_metering_legacy"], "ov": ov, "versions": {v["id"]: v for v in used}})
+                     "nb": bodies["net_billing"], "lg": bodies["net_metering_legacy"], "ov": ov, "versions": {v["id"]: v for v in used},
+                     # each day's own schedule version: two versions that repeat a card price alike and share a run (UX K14)
+                     "schedule_of": {d: s}})
     return runs
+
+
+def schedules_used(run_of: dict[date, dict]) -> list[dict]:
+    """The schedule versions in force on a span of consecutive Karachi days (day_versions' runs by day), in order of the days: {version_id, name,
+    effective_from, first_day, last_day} for each stretch of days on one schedule version. Each day's own version, not its run's first: two versions
+    that repeat a card price alike and share a run, and the day still names the version in force on it. Words, ids and dates only: no rate (UX backend
+    ask K14)."""
+    out: list[dict] = []
+    for d in sorted(run_of):
+        run = run_of[d]
+        s = (run.get("schedule_of") or {}).get(d) or run["schedule"]
+        if out and out[-1]["version_id"] == s["id"] and date.fromisoformat(out[-1]["last_day"]) + timedelta(days=1) == d:
+            out[-1]["last_day"] = d.isoformat()
+            continue
+        out.append({"version_id": s["id"], "name": version_name(s), "effective_from": s["effective_from"], "first_day": d.isoformat(),
+                    "last_day": d.isoformat()})
+    return out
 
 
 def _mdi(ts: np.ndarray, imp: np.ndarray, peak: np.ndarray | None, interval: int, block: str) -> float:
@@ -1396,11 +1416,14 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
     force on the first step's day.
 
     `tariff_notices` lists the versions awaiting their notification whose start the horizon reaches (`awaiting_notices`): the steps from then on
-    are priced with the version still in force."""
+    are priced with the version still in force.
+
+    `schedules` names the schedule versions (the rate cards) the horizon's Karachi days were priced with, in order, each with the first and last
+    day it priced (schedules_used; UX backend ask K14); empty off-grid."""
     h = 0.25
     out = {"c_imp": np.zeros(steps), "c_exp": np.zeros(steps), "peak": np.zeros(steps, dtype=bool), "month": np.zeros(steps, dtype=int),
            "local_hour": np.zeros(steps), "grid": np.ones(steps), "icp": {}, "mdi": None, "billing_month": [], "billing_month_end_step": steps,
-           "export_tie_break": np.zeros(steps), "tariff_notices": []}
+           "export_tie_break": np.zeros(steps), "tariff_notices": [], "schedules": []}
     times = [t0_utc + timedelta(minutes=15 * i) for i in range(steps)]
     locs = [t.astimezone(PKT) for t in times]
     for i, loc in enumerate(locs):
@@ -1427,6 +1450,7 @@ def vectors(conn: dict | None, t0_utc: datetime, steps: int = 192, mtd_import: d
         while d <= r["last"]:
             run_of[d] = r
             d += timedelta(days=1)
+    out["schedules"] = schedules_used(run_of)
     day_price: dict[date, tuple[float, float]] = {}
     for d, r in run_of.items():
         tf = _tax_factor(conn, r["tax"], r["ov"])

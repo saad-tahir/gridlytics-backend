@@ -185,6 +185,24 @@ The review of the whole lane so far ("UX K review" commits) found two faults in 
   the words the monitor tier has ("The first plan arrives within 15 minutes", "No plan yet: ..."); a tier above monitor makes it done once a plan
   exists. This refines the k1 line "Recommending is done once the tier is above monitor".
 
+### Batch k3: K14, K17, K19 (12 Nov 2026)
+
+The Plan section's asks (plan step 7; K19 also step 8's Overview). No schema change: each new field is in the plan's stored `summary` (JSON) or made
+when the answer is.
+
+- **K14, the tariff a plan was priced on** (plan D9.4, D3.1.4): `summary.tariff` = `{disco, category, version_id, name, effective_from, versions}`
+  (`plans.plan_tariff`), stored with the plan, a failed solve's too. Decisions the plan left open:
+  - **"The tariff version" is the schedule version** (the rate card), as a savings day's `tariff_version` is (verify, `savings_export.tariff_dates`)
+    and as the plan's line names it ("FESCO B-3, version in force from 1 Jul 2026"). The calendar, tax and prosumer versions are not named: the line
+    is one version, and the savings ledger and its CSV already speak of the schedule's.
+  - **The version in force on the plan's first Karachi day** is the line's; `versions` lists every schedule version the horizon's days were priced on,
+    in order, with the first and last day each priced (`tariffs.schedules_used`, from the price vectors' own day runs, so the line and the prices
+    never disagree). Each day names its own version: two versions that repeat a card price alike and share one run of `tariffs.day_versions`, which
+    now keeps each day's schedule by its day (`schedule_of`) beside the run's first. A version awaiting its notification prices nothing and is not
+    named; `tariff_notices` says so, as before.
+  - **Null off-grid** (no connection is priced: the vectors are zeros); absent from a plan stored before (the page leaves the line out, the plan's
+    fallback). Words, ids and dates, no rate: a viewer and a machine key read it whole (its test and the role walk prove it).
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

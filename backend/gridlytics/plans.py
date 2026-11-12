@@ -321,6 +321,29 @@ def terminal_cal_hold(b_cal: np.ndarray, c_imp: np.ndarray, load: np.ndarray, pv
     return float(np.sum(np.asarray(b_cal, dtype=float)[-n:][:hold]))
 
 
+def plan_tariff(site: dict, conn: dict | None, schedules: list[dict]) -> dict | None:
+    """The tariff a plan is priced on, as its "Inputs this plan used" names it ("FESCO B-3, version in force from 1 Jul 2026"; plan D3.1.4, UX backend
+    ask K14): the site's DISCO (null where it names none), the plant connection's category, and the schedule version (the rate card) in force on the
+    horizon's first Karachi day (`version_id`, `name`, `effective_from`), with every schedule version the horizon's days were priced on in order
+    (`versions`, tariffs.schedules_used: two where a new schedule starts at a midnight inside the horizon). "The tariff version" is the schedule
+    version, as a savings day's `tariff_version` is. None off-grid: nothing is priced on a tariff. Words, ids and dates: no rate."""
+    if conn is None or not schedules:
+        return None
+    first = schedules[0]
+    return {"disco": (site.get("data") or {}).get("disco") or None, "category": conn["data"].get("tariff_category"),
+            "version_id": first["version_id"], "name": first["name"], "effective_from": first["effective_from"],
+            "versions": [dict(v) for v in schedules]}
+
+
+def tariff_over(tariff: dict | None, ts) -> dict | None:
+    """plan_tariff for the steps a plan holds: a relaxed retry solves a shorter horizon (optimise.shorten) than the prices were made for, and its
+    tariff names only the schedule versions of the Karachi days its steps start in."""
+    if not tariff or ts is None or not len(ts):
+        return tariff
+    last = _local(int(ts[-1])).date().isoformat()
+    return {**tariff, "versions": [{**v, "last_day": min(v["last_day"], last)} for v in tariff["versions"] if v["first_day"] <= last]}
+
+
 def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
     # the connection the plant and the site's meter readings are on (round 7 stage 2, tracker-and-docs-01): the plan's import and export are its; a
     # site's other connections carry loads the plan neither meters nor changes, so their bills are the same whatever it does
@@ -371,6 +394,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
          # (the setting accepts 0) made a manual floor's slack and an outage's shortfall cheaper than the grid
          "voll": max(float(d.get("voll_rs_per_kwh", 500)), float(np.max(vec["c_imp"])) if len(vec["c_imp"]) else 0.0), "reserve_threshold": float((d.get("reserve_policy") or {}).get("p_threshold", 0.2)),
          "icp": vec["icp"], "regime": regime, "tariff_notices": vec.get("tariff_notices", []),
+         # the tariff the horizon is priced on, for the plan's "Inputs this plan used" (UX backend ask K14); none off-grid
+         "tariff": plan_tariff(site, None if off_grid else conn, vec.get("schedules") or []),
          # PV and the battery reach the AC side through the inverter: its kW AC bounds both, and the reserve (round 7, engine-plans-live-06)
          "inverter_kw_ac": (float(a["inverter"]["kw_ac"]) if (a.get("inverter") or {}).get("kw_ac") else None)}
     if vec["mdi"] and mtd:
@@ -888,7 +913,9 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                           "first_solve_seconds": res.get("first_solve_seconds")},
                "horizon_steps": p["T"], "control_release": release,
                # a tariff version awaiting its notification the horizon reaches: the plan is priced with the one still in force (engine-tariffs-06)
-               "tariff_notices": p.get("tariff_notices", [])}
+               "tariff_notices": p.get("tariff_notices", []),
+               # the tariff the plan is priced on (plan_tariff, over the steps it holds; UX backend ask K14), null off-grid
+               "tariff": tariff_over(p.get("tariff"), p.get("ts"))}
     # how many of the plans made in the 24 hours to this one, this one included, stopped at their time limit (round 7, engine-plans-live-19:
     # time_limited_recent counted them and nothing read it), for the plan page; a failed solve counts as a plan, never as time-limited
     recent = time_limited_recent(site_id, 24.0, now)
