@@ -32,9 +32,10 @@ from gridlytics import platform as platformdb
 
 #: Values for the other path parameters of a site's routes: made up, so a route that looks them up finds nothing in either company
 PARAMS = {"kind": "pv", "plan_id": "0f0f0f0f0f0f", "role": "battery", "bill_id": "0f0f0f0f0f0f", "conn_id": "0f0f0f0f0f0f", "oid": "1",
-          "action": "resume", "nid": "0f0f0f0f0f0f", "start": "1793976300"}
-#: GET routes that answer 404 on a company's own site in this world too: they look up a made-up id
-OWN_404 = {"/api/sites/{site_id}/plans/{plan_id}"}
+          "action": "resume", "nid": "0f0f0f0f0f0f", "start": "1793976300", "job_id": "0f0f0f0f0f0f"}
+#: GET routes that answer 404 on a company's own site in this world too: they look up a made-up id (a plan; a re-solve's and a savings recompute's
+#: job, round 7 storage-perf and savings-page)
+OWN_404 = {"/api/sites/{site_id}/plans/{plan_id}", "/api/sites/{site_id}/jobs/{job_id}", "/api/sites/{site_id}/savings/recompute/{job_id}"}
 #: GET routes a person is refused on any site (403, the same on their own): the signed plan message is pulled by the site's edge with its key
 PERSON_REFUSED = {"/api/sites/{site_id}/plans/current/message"}
 
