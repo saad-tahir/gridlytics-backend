@@ -311,3 +311,26 @@ def test_the_sign_in_stack_matches_a_solarlytics_checkout_beside_when_there_is_o
     theirs = {**_pins(other / "requirements.txt"), **_pins(other / "requirements-dev.txt")}
     ours = {**_pins(ROOT / "requirements.txt"), **_pins(ROOT / "requirements-dev.txt")}
     assert {k: ours[k] for k in [*FAMILY_PINS, *FAMILY_DEV_PINS]} == {k: theirs[k] for k in [*FAMILY_PINS, *FAMILY_DEV_PINS]}
+
+
+# ------------------------------------------------------------------------------------------------ parity-architecture-13: the secret files git never takes
+
+_GIT = __import__("shutil").which("git") is not None and (ROOT / ".git").exists()
+
+
+def _ignored(path: str) -> bool:
+    import subprocess
+    return subprocess.run(["git", "check-ignore", "-q", "--no-index", path], cwd=ROOT).returncode == 0
+
+
+@pytest.mark.skipif(not _GIT, reason="needs git and the repository")
+def test_every_secret_file_a_deployer_or_the_seed_may_make_is_ignored_and_the_examples_are_not():
+    # the family's rules (solarlytics-backend/.gitignore): a filled-in server environment (DEPLOY.md copies .env.production.example to .env.production),
+    # the founder console's settings wherever they are written, the token-signing secret and the signing keys of a data folder kept anywhere in the
+    # repository (not only data/), the demo accounts' passwords, and Python's caches
+    for path in (".env", ".env.production", ".env.founder", ".env.local", "backend/.env", "data/.env.founder", "platform.secret",
+                 "data/platform.secret", "scratch-data/platform.secret", "scratch-data/keys/site-1-k1.pem", "demo/DEMO_ACCOUNTS.local.md",
+                 "demo/other.local.md", "backend/gridlytics/__pycache__/api.cpython-312.pyc", "backend/x.pyc", ".pytest_cache/v/cache/lastfailed"):
+        assert _ignored(path), f"{path} is not ignored: git add -A would commit it"
+    for path in (".env.production.example", ".env.example", "demo/companies.template.csv", "backend/gridlytics/identity.py", "docs/DEPLOY.md"):
+        assert not _ignored(path), f"{path} is ignored, but it belongs in the repository"
