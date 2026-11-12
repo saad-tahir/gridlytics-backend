@@ -66,6 +66,30 @@ def test_the_monthly_and_fleet_reports_count_a_gas_genset_s_fuel_in_mmbtu(world,
     assert "Fuel saved (Estimated)" in rollup and "1.9 MMBtu" in rollup and "Diesel" not in rollup, rollup
 
 
+def test_the_company_roll_up_csv_names_each_site_s_fuel_unit(world, monkeypatch):
+    """Review (frontend-states-formats-01): the roll-up's CSV gave a gas genset's MMBtu under `litres_saved` with nothing to say so; each row now names
+    its fuel's unit beside the figure ("L" for diesel, "MMBtu" for captive gas or RLNG, blank without a genset)."""
+    import csv
+    import io
+
+    from gridlytics import reports
+    sid, two, month = world.site, world.other, _past_month()
+    day = f"{month}-05"
+    _with_summary(monkeypatch, _fake_summary(month, [_day_row(day)], native=_baseline(litres_saved=1.9)), [_tday(day)])
+
+    def rows(rep: dict) -> dict[str, dict]:
+        return {r["site_id"]: r for r in csv.DictReader(io.StringIO(reports.file_path(rep["id"], "csv").read_text(encoding="utf-8")))}
+    with world.use():
+        _data_from_last_year(sid)
+        sites.put_asset(two, "genset", {"rated_kw": 1000, "fuel_kind": "gas_captive"}, "test")
+        gas = rows(reports.generate("company_rollup", "", month, "test"))
+        sites.remove_asset(two, "genset", "test")
+        bare = rows(reports.generate("company_rollup", "", month, "test"))
+    assert (gas[sid]["litres_saved"], gas[sid]["fuel_unit"]) == ("1.9", "L"), gas[sid]
+    assert (gas[two]["litres_saved"], gas[two]["fuel_unit"]) == ("1.9", "MMBtu"), gas[two]
+    assert bare[two]["fuel_unit"] == "" and bare[sid]["fuel_unit"] == "L", bare
+
+
 # ------------------------------------------------------------------------------------------------ role-operator-10, flow-reports-alerts-members-keys-30
 
 def test_an_off_grid_site_s_energy_report_prints_no_grid_import_export_peak_or_outage_rows(world, monkeypatch):

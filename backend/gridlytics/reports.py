@@ -711,7 +711,9 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
     rows, out_rows, prelim_names, stale_names = [], [], [], []
     # the fuel saved in each unit apart, litres of diesel and MMBtu of gas, never added together (round 7 sweeps, frontend-states-formats-01)
     tot = {"nat": 0.0, "tun": 0.0, "claimed": 0.0, "litres": 0.0, "mmbtu": 0.0, "verified": 0}
-    doc.csv.writerow(["site_id", "site", "saving_native_rs", "saving_tuned_rs", "claimed_rs", "litres_saved", "verified_days", "preliminary",
+    # each row names its fuel's unit beside the figure, "L" or "MMBtu" (blank without a genset): a gas genset's litres_saved are MMBtu (round 7 sweeps,
+    # review of frontend-states-formats-01)
+    doc.csv.writerow(["site_id", "site", "saving_native_rs", "saving_tuned_rs", "claimed_rs", "litres_saved", "fuel_unit", "verified_days", "preliminary",
                       "chain_stale_days"])
     computed = []
     for s in sites.listing():
@@ -731,7 +733,7 @@ def _company_rollup(doc: _Doc, p0: date, p1: date, today: date, inputs: dict) ->
         rows.append([doc.cell(s["name"]), rs(nat.get("saving_rs")), rs(tun.get("saving_rs")), rs(nat.get("claimed_rs")),
                      _litres_saved(nat, scored, has_genset, unit), str(nat.get("verified_days", 0)), doc.cell(status)])
         doc.csv.writerow([s["id"], s["name"], nat.get("saving_rs"), tun.get("saving_rs"), nat.get("claimed_rs"), nat.get("litres_saved"),
-                          nat.get("verified_days"), bool(summ.get("preliminary")), ";".join(stale)])
+                          unit.strip() if has_genset else "", nat.get("verified_days"), bool(summ.get("preliminary")), ";".join(stale)])
         tot["nat"] += _finite(nat.get("saving_rs")) or 0.0
         tot["tun"] += _finite(tun.get("saving_rs")) or 0.0
         tot["claimed"] += _finite(nat.get("claimed_rs")) or 0.0
