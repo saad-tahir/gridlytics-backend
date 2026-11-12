@@ -41,6 +41,15 @@ def _label(loc: tuple, titles: dict | None = None) -> str:
     return head + "".join(f"'s {str(p).replace('_', ' ')}" for p in loc[1:] if not isinstance(p, int))
 
 
+def _clause(text: str) -> str:
+    """A refusal's clause after the first, as it reads inside the one sentence: its first letter lower-cased when its first word is a plain word ("Give",
+    "The", "A"), never an abbreviation or a name with a mark ("DISCO", "MMBtu", "Punjab's"). So a form missing two fields is told "Give your full name;
+    give a work email", one sentence (UX K3 check)."""
+    word = text.split(" ", 1)[0]
+    plain = word.isascii() and word.isalpha() and word[:1].isupper() and (word[1:].islower() if len(word) > 1 else word != "I")
+    return text[:1].lower() + text[1:] if plain else text
+
+
 def message(exc: ValidationError, model: type[BaseModel] | None = None) -> str:
     titles = {k: f.title for k, f in (model.model_fields if model is not None else {}).items() if f.title}
     parts = []
@@ -59,7 +68,7 @@ def message(exc: ValidationError, model: type[BaseModel] | None = None) -> str:
         else:
             parts.append(f"{_label(loc, titles)}: {text}")
     more = len(exc.errors()) - 4
-    return "; ".join(parts) + (f"; and {more} more" if more > 0 else "")
+    return "; ".join(parts[:1] + [_clause(p) for p in parts[1:]]) + (f"; and {more} more" if more > 0 else "")
 
 
 def check(model: type[BaseModel], body: Any, **context) -> Any:

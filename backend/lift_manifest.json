@@ -146,9 +146,9 @@
       "path": "backend/gridlytics/ratelimit.py",
       "upstream": "backend/solarlytics/routes_accept.py",
       "status": "extract",
-      "why": "The Limiter class of Solarlytics' routes_accept.py, alone in a module of its own; the rest of that file (Solarlytics' acceptance flow) is not lifted. An upstream change to the file is reviewed for the Limiter only.",
+      "why": "The Limiter class of Solarlytics' routes_accept.py, alone in a module of its own; the rest of that file (Solarlytics' acceptance flow) is not lifted. An upstream change to the file is reviewed for the Limiter only. Each key is kept for its own window when the limiter prunes (Gridlytics' UX K3 check): the API's one limiter holds keys of a minute, of five minutes and of an hour, and a minute's check over a full limiter forgot the longer counts. Solarlytics' routes_accept uses one window per limiter, so nothing to port back unless it shares one across windows.",
       "upstream_sha256": "959fb0fab26e6407e9260c65363c4d38307626c1c4c35b710b5ddf4dab4640d6",
-      "sha256": "ec576e8be8f53d51d57de8c1226287175cb6dc0e07ffd4fb88099b90fc7e834e"
+      "sha256": "ada76b6afd5d04d2305960cec34dbc2e2180854baed77dc58163ed70e4511c5c"
     },
     {
       "path": "backend/tests/identities.py",

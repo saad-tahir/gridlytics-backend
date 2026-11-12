@@ -18,8 +18,10 @@ and answered in Pakistan time.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -61,12 +63,18 @@ MOST = {"name": 80, "company": 120, "city": 80, "phone": 32, "email": 254, "mess
 _SITES_WORDS = {"1": "1 site", "2-5": "2 to 5 sites", "6+": "6 or more sites"}
 _BRAND_WORDS = {"deye": "Deye", "huawei": "Huawei", "sungrow": "Sungrow", "growatt": "Growatt", "voltronic": "Voltronic", "solis": "Solis",
                 "other": "Another brand"}
-#: A work email's shape (plan B4: "checked for shape only"): something, an @, and a domain with a dot
-_EMAIL = re.compile(r"[^@\s]{1,64}@[^@\s.]+(?:\.[^@\s.]+)+")
-_PHONE = re.compile(r"\+?[0-9][0-9 ()-]{5,30}")
-#: Control characters: none in a one-line field, and none but a line end or a tab in the message or the note
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_CONTROL_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+#: A work email's shape (plan B4: "checked for shape only"): something, an @, and a domain with a dot; no space, and none of the characters an address
+#: written plainly never holds (brackets, quotes, commas, colons), so a name in markup is no email
+_EMAIL = re.compile(r"[^@\s<>()\[\]\\,;:\"]{1,64}@[^@\s.<>()\[\]\\,;:\"]+(?:\.[^@\s.<>()\[\]\\,;:\"]+)+")
+#: A phone number as Pakistan writes it: digits, spaces, dashes and brackets, a + first or not ("+92 300 1234567", "(042) 35761234"); six digits at least
+_PHONE = re.compile(r"\+?[0-9(][0-9 ()-]{5,30}")
+#: Control characters (C0, DEL and C1) and the line and paragraph separators: none in a one-line field, and none but a line end or a tab in the message
+#: or the note
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_CONTROL_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+#: The direction controls (embeddings, overrides, isolates): invisible, they reorder how the founder's console shows a name, an email or a message, so
+#: none is taken in any field (UX K3 check)
+_REORDER = re.compile(r"[\u202a-\u202e\u2066-\u2069]")
 
 
 def _line(value: str, words: str, most: int) -> str:
@@ -74,15 +82,24 @@ def _line(value: str, words: str, most: int) -> str:
         raise ValueError(f"{words} must be at most {most:,} characters")
     if _CONTROL.search(value):
         raise ValueError(f"{words} must be one line of text")
+    if _REORDER.search(value):
+        raise ValueError(f"{words} must be plain text")
     return value
 
 
 def _text(value: str, words: str, most: int) -> str:
     if len(value) > most:
         raise ValueError(f"{words} must be at most {most:,} characters")
-    if _CONTROL_TEXT.search(value):
+    if _CONTROL_TEXT.search(value) or _REORDER.search(value):
         raise ValueError(f"{words} must be plain text")
     return value
+
+
+def _hidden(value: str) -> bool:
+    """Whether a value holds a character no one sees: a control, a separator, or an invisible format character (zero-width spaces and joiners, direction
+    marks, the byte-order mark). An email never holds one; a name may hold the joiners Urdu and emoji use, so the one-line fields refuse only the
+    controls, the separators and the direction controls."""
+    return any(unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") for ch in value)
 
 
 class AccessRequestIn(Strict):
@@ -90,7 +107,8 @@ class AccessRequestIn(Strict):
     another person; a message for help with an account and for something else; the site facts optional. `website` is the hidden field (HONEYPOT), which
     the route reads before this model: a filled one never gets here."""
 
-    topic: str | None = Field(None, title="What this is about")
+    # checked when it is not sent too (validate_default), so a form missing several fields is told each at once, the topic with them
+    topic: str | None = Field(None, title="What this is about", validate_default=True)
     # the two needed fields are checked when they are not sent, too (validate_default), so a missing one is refused in the same words
     name: str = Field("", title="The name", validate_default=True)
     email: str = Field("", title="The work email", validate_default=True)
@@ -104,6 +122,32 @@ class AccessRequestIn(Strict):
     message: str = Field("", title="The message")
     website: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _empties(cls, data):
+        """An optional field left empty comes as "" or null alike (the contract: leave it out, or send it empty or null; a select left on its empty
+        choice sends ""): a text field's null is "", a choice's "" (or spaces) is null, and the equipment's null or "" is none (UX K3 check)."""
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for key in ("name", "email", "company", "phone", "city", "message"):
+            if key in data and data[key] is None:
+                data[key] = ""
+        for key in ("topic", "sites", "inverter", "disco"):
+            if isinstance(data.get(key), str) and not data[key].strip():
+                data[key] = None
+        if "equipment" in data and (data["equipment"] is None or (isinstance(data["equipment"], str) and not data["equipment"].strip())):
+            data["equipment"] = []
+        return data
+
+    @field_validator("topic")
+    @classmethod
+    def _topic_named(cls, v: str | None) -> str | None:
+        if v not in TOPICS:
+            raise ValueError("Choose what this is about: access for your company, another person in your company, help with your account, or something "
+                             "else")
+        return v
+
     @field_validator("name")
     @classmethod
     def _name(cls, v: str) -> str:
@@ -114,7 +158,7 @@ class AccessRequestIn(Strict):
     @field_validator("email")
     @classmethod
     def _email(cls, v: str) -> str:
-        if len(v) > MOST["email"] or not _EMAIL.fullmatch(v):
+        if len(v) > MOST["email"] or not _EMAIL.fullmatch(v) or _hidden(v):
             raise ValueError("Give a work email, such as name@company.com")
         return v
 
@@ -126,7 +170,7 @@ class AccessRequestIn(Strict):
     @field_validator("phone")
     @classmethod
     def _phone(cls, v: str) -> str:
-        if v and (len(v) > MOST["phone"] or not _PHONE.fullmatch(v)):
+        if v and (len(v) > MOST["phone"] or not _PHONE.fullmatch(v) or sum(ch.isdigit() for ch in v) < 6):
             raise ValueError("Give a phone number in digits, such as +92 300 1234567")
         return v
 
@@ -170,9 +214,6 @@ class AccessRequestIn(Strict):
 
     @model_validator(mode="after")
     def _topic(self):
-        if self.topic not in TOPICS:
-            raise ValueError("Choose what this is about: access for your company, another person in your company, help with your account, or something "
-                             "else")
         if self.topic in NEEDS_COMPANY and not self.company:
             raise ValueError("Give your company's name")
         if self.topic in NEEDS_MESSAGE and not self.message:
@@ -238,10 +279,22 @@ def view(r) -> dict:
 
 # ------------------------------------------------------------------------------------------------ the rate and the keeping
 
+def counted_as(address: str) -> str:
+    """The address a send is counted under: an IPv4 address as it is; an IPv6 address by its /64, which one connection holds whole, so a sender cannot
+    take a new address for each send (UX K3 check); anything else ("forwarded", a test client's name) as it is."""
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return address or "unknown"
+    if ip.version == 6 and ip.ipv4_mapped is None:
+        return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+    return str(ip.ipv4_mapped or ip) if ip.version == 6 else str(ip)
+
+
 def wait(address: str) -> int:
     """Seconds before another request from this address is taken; 0 when it is (and it is counted). In memory, as the API's other rates: a restart
-    forgets them."""
-    return auth.limiter().hit(("access_request", address or "unknown"), RATE_LIMIT, RATE_WINDOW) if RATE_LIMIT else 0
+    forgets them; the limiter keeps each count for its own window, however full it is (ratelimit.Limiter)."""
+    return auth.limiter().hit(("access_request", counted_as(address)), RATE_LIMIT, RATE_WINDOW) if RATE_LIMIT else 0
 
 
 def again(seconds: int) -> datetime:

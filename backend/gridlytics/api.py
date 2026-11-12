@@ -121,6 +121,8 @@ SECURITY_HEADERS = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DEN
 MAX_BODY = 25_000_000
 #: Paths that take less than MAX_BODY: the contact page's request for access, 8 KB (UX backend ask K3; plan B21.2 item 1)
 BODY_CAPS = {"/api/public/access-requests": access_requests.BODY_BYTES}
+#: Paths whose 429 says when a send works again (`retry_at`, Karachi time), from the API's own limits too: the contact page's request for access
+RETRY_AT_PATHS = {"/api/public/access-requests"}
 _BODY_METHODS = ("POST", "PUT", "DELETE", "PATCH")
 _REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{8,64}")
 
@@ -133,8 +135,12 @@ def _refusal(request_id: str, status: int, detail, code: str | None = None, head
     return JSONResponse(_error_body(status, detail, request_id, code), status_code=status, headers={"X-Request-ID": request_id, **(headers or {})})
 
 
-def _too_many(rid: str, wait: int, who: str) -> JSONResponse:
-    return _refusal(rid, 429, f"Too many requests {who}; try again in {wait} second{'s' if wait != 1 else ''}", "too_many_requests", {"Retry-After": str(wait)})
+def _too_many(rid: str, wait: int, who: str, path: str = "") -> JSONResponse:
+    body = _error_body(429, f"Too many requests {who}; try again in {wait} second{'s' if wait != 1 else ''}", rid, "too_many_requests")
+    if path in RETRY_AT_PATHS:
+        # the contact page says "Try again after 14:01" from retry_at, whichever limit refused the send (UX K3 check)
+        body["retry_at"] = access_requests.again(wait).isoformat(timespec="seconds")
+    return JSONResponse(body, status_code=429, headers={"X-Request-ID": rid, "Retry-After": str(wait)})
 
 
 def _body_cap(path: str) -> int:
@@ -273,7 +279,7 @@ async def _guarded(request, call_next, rid: str):
     ingest = bool(_INGEST.match(path))
     # the ingest paths' budget is per key (DAT-03): a key skips the address limiter there only once it is found (below), never on its shape alone
     if api_call and not (keyed and ingest) and (wait := auth.rate_wait("address", address)):
-        return _too_many(rid, wait, "from this address")
+        return _too_many(rid, wait, "from this address", path)
     if ingest and not keyed:
         # the edge paths take a site API key, never a person's session (plan Part 7.5 and 10.5): no role may write telemetry, events or capabilities
         return _refusal(rid, 403 if has_bearer else 401, "The edge paths take the site's API key", "key_required",
@@ -293,7 +299,7 @@ async def _guarded(request, call_next, rid: str):
         if key is None:
             # a key that is not found counts against its address like any other request, so made-up keys cannot skip the limiter
             if ingest and (wait := auth.rate_wait("address", address)):
-                return _too_many(rid, wait, "from this address")
+                return _too_many(rid, wait, "from this address", path)
             return _refusal(rid, 401, "This API key is not known, or it was revoked", "invalid_key", {"WWW-Authenticate": "Bearer"})
         needed = apikeys.scope_needed(request.method, path)
         if needed is None or needed not in key["scopes"]:
@@ -307,7 +313,7 @@ async def _guarded(request, call_next, rid: str):
         if named.group(1) != key.get("site_id"):
             return _refusal(rid, 403, "This API key belongs to another site", "wrong_site")
         if (wait := auth.rate_wait("user", f"key:{key['id']}")):
-            return _too_many(rid, wait, "for this key")
+            return _too_many(rid, wait, "for this key", path)
         user, org = apikeys.acting_user(key), key["org_id"]
     elif has_bearer:
         wanted = request.headers.get("x-gridlytics-company")
@@ -337,7 +343,7 @@ async def _guarded(request, call_next, rid: str):
     request.state.identity = ident
     acting = user["id"] if user else ident.user_id if ident else None
     if api_call and not keyed and (wait := (auth.rate_wait("user", acting) if acting else auth.rate_wait("public", address) if public else 0)):
-        return _too_many(rid, wait, "from this account" if acting else "from this address")
+        return _too_many(rid, wait, "from this account" if acting else "from this address", path)
     request.state.company_id = company["id"] if company else ""
     markers = _enter(user, org, company, db_file)
     if user is None and ident is None and path.startswith("/api/") and not public:

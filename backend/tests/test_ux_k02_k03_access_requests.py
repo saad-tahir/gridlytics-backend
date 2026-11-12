@@ -20,8 +20,9 @@ import identities
 import pytest
 from test_founder import _audit, _client, _console, _ok, _sentence, clock, fdb  # noqa: F401  (fixtures)
 
-from gridlytics import access_requests, api, auth
+from gridlytics import access_requests, api, auth, schemas
 from gridlytics import platform as platformdb
+from gridlytics.ratelimit import Limiter
 
 PKT = timezone(timedelta(hours=5))
 URL = "/api/public/access-requests"
@@ -186,6 +187,28 @@ def test_a_refused_request_is_not_counted_and_a_late_one_says_tomorrow(fdb, cloc
     ({"topic": "other", "message": "  "}, "Write your message"),
     ({"role": "admin"}, "Unknown field 'role'"),
     ({"password": "let me in please"}, "Unknown field 'password'"),
+    # the check (UX K3): what the founder's console would show as something else, and the needed fields sent null
+    ({"email": "a\x07b@rahimtextiles.pk"}, "Give a work email, such as name@company.com"),
+    ({"email": "<b>a</b>@rahimtextiles.pk"}, "Give a work email, such as name@company.com"),
+    ({"email": "ayesha@rahimtextiles.pk\u202e"}, "Give a work email, such as name@company.com"),
+    ({"email": "ay\u200besha@rahimtextiles.pk"}, "Give a work email, such as name@company.com"),
+    ({"email": "\"ayesha\"@rahimtextiles.pk"}, "Give a work email, such as name@company.com"),
+    ({"name": "Ayesha\u202eRahim"}, "The name must be plain text"),
+    ({"name": "Ayesha\u2066Rahim"}, "The name must be plain text"),
+    ({"name": "Ayesha\x85Rahim"}, "The name must be one line of text"),
+    ({"name": "Ayesha\u2028Rahim"}, "The name must be one line of text"),
+    ({"company": "Rahim\u202dTextiles"}, "The company's name must be plain text"),
+    ({"city": "Faisal\u202eabad"}, "The city must be plain text"),
+    ({"message": "Two units \u202eon B-3"}, "The message must be plain text"),
+    ({"message": "Two units\x9bon B-3"}, "The message must be plain text"),
+    ({"phone": "1-----"}, "Give a phone number in digits, such as +92 300 1234567"),
+    ({"phone": "((((((("}, "Give a phone number in digits, such as +92 300 1234567"),
+    ({"phone": "12345"}, "Give a phone number in digits, such as +92 300 1234567"),
+    ({"name": None}, "Give your full name"),
+    ({"email": None}, "Give a work email, such as name@company.com"),
+    ({"topic": ""}, "Choose what this is about"),
+    ({"topic": "access", "company": None}, "Give your company's name"),
+    ({"topic": "support", "message": None}, "Write your message: say what you need"),
 ])
 def test_each_field_is_refused_in_one_plain_sentence(fdb, clock, change, words):
     body = {**AYESHA, **change}
@@ -385,3 +408,125 @@ def test_only_the_founder_reads_or_changes_the_requests(fdb, clock, monkeypatch)
     r = console.get(FOUNDER)
     assert r.status_code == 503 and r.json()["code"] == "unavailable", r.text
     assert _send({**AYESHA, "email": "late@rahimtextiles.pk"}).status_code == 202 and len(_rows()) == 2
+
+
+# ================================================================== the check (batch k2's checkers' findings)
+
+def test_an_optional_field_left_empty_is_taken_whether_it_comes_empty_or_null(fdb, clock):
+    """The contract says an optional field may be left out, or sent empty or null: a select left on its empty choice sends "", a cleared text field may
+    send null. Each was refused (null for the text fields, "" for the choices, either for the equipment) with a sentence about a field nobody filled."""
+    base = {"topic": "support", "name": "Bilal Ahmed", "email": "bilal@kamalfoods.pk", "message": "Locked out of my account"}
+    optional = ("company", "phone", "city", "sites", "equipment", "inverter", "disco", "website")
+    for empty in (None, "", "   "):
+        r = _send({**base, **dict.fromkeys(optional, empty)})
+        assert r.status_code == 202, (empty, r.text)
+    rows = _rows()
+    assert len(rows) == 3
+    for row in rows:
+        assert (row["company"], row["phone"], row["city"], row["sites"], row["inverter"], row["disco"]) == ("", "", "", None, None, None), row
+        assert json.loads(row["equipment"]) == []
+    # each alone, as a page sends it: the text fields null, the choices ""
+    for field, empty in (("company", None), ("phone", None), ("city", None), ("message", None), ("sites", ""), ("inverter", ""), ("disco", ""),
+                         ("equipment", None), ("equipment", "")):
+        # the company is needed for access, the message for something else: each is left empty under a topic that does not need it
+        body = {**AYESHA, "topic": "access" if field == "message" else "other", field: empty}
+        assert _send(body).status_code == 202, (field, empty)
+    # an empty choice reads as not given on the founder's side (the first three, oldest last)
+    listed = access_requests.listing()["requests"]
+    assert len(listed) == 12 and [r["about"] for r in listed[-3:]] == [None, None, None]
+
+
+def test_a_phone_number_is_taken_as_pakistan_writes_it(fdb, clock):
+    """"(042) 35761234", a landline as it is usually written, was refused although the contract takes brackets."""
+    for phone in ("(042) 35761234", "+92 (42) 3576 1234", "042 3576 1234", "0300-1234567", "+923001234567", "+(92) 300 1234567"):
+        r = _send({**AYESHA, "phone": phone})
+        assert r.status_code == 202, (phone, r.text)
+    assert [r["phone"] for r in _rows()][:1] == ["(042) 35761234"]
+
+
+def test_an_urdu_name_with_its_joiner_is_taken(fdb, clock):
+    """The zero-width non-joiner is how Urdu is typed: a name may hold it (the direction controls are what is refused); an email never holds one."""
+    assert _send({**AYESHA, "name": "\u0639\u0627\u0626\u0634\u06c1\u200c\u0631\u062d\u06cc\u0645"}).status_code == 202
+    assert _send({**AYESHA, "email": "ayesha\u200c@rahimtextiles.pk"}).status_code == 422
+
+
+def test_a_form_missing_several_fields_is_told_each_in_one_sentence(fdb, clock):
+    """Two capitalised clauses spliced with a semicolon were not one sentence, and the topic's refusal waited until the fields were right, so a person
+    could be refused three times in turn."""
+    r = _send({})
+    assert r.status_code == 422 and r.json()["detail"] == (
+        "Choose what this is about: access for your company, another person in your company, help with your account, or something else; "
+        "give your full name; give a work email, such as name@company.com"), r.text
+    r = _send({"topic": "access", "name": "Ayesha Rahim", "email": "ayesha"})
+    assert r.json()["detail"] == "Give a work email, such as name@company.com", r.text
+    # a clause that starts with an abbreviation or a name keeps its capital
+    assert schemas._clause("DISCO must be one of the list") == "DISCO must be one of the list"
+    assert schemas._clause("MMBtu must be a number") == "MMBtu must be a number"
+    assert schemas._clause("Punjab's rate is missing") == "Punjab's rate is missing"
+    assert schemas._clause("A request's state is new") == "a request's state is new"
+    assert schemas._clause("Unknown field 'role'") == "unknown field 'role'"
+
+
+def test_every_429_of_the_send_says_when_it_works_again(fdb, clock, monkeypatch):
+    """The contract types `retry_at` on this path's 429; the API's own limits (per address, and per address without a session) answered it with no
+    `retry_at`, so the page's "Try again after 14:01" read undefined. Every limit now says it on this path; another path's 429 is as before."""
+    t = [1000.0]
+    monkeypatch.setattr(auth.limiter(), "clock", lambda: t[0])
+    for kind in ("public", "address"):
+        auth.limiter().reset()
+        with monkeypatch.context() as m:
+            m.setitem(auth.RATE_LIMITS, kind, 2)
+            for i in range(2):
+                assert _send({**AYESHA, "email": f"{kind}{i}@rahimtextiles.pk"}).status_code == 202
+            for path in (URL, "/api/v1" + URL[4:]):
+                r = _client().post(path, json=AYESHA)
+                assert r.status_code == 429 and r.json()["code"] == "too_many_requests", (kind, r.text)
+                wait = int(r.headers["Retry-After"])
+                at = datetime.fromisoformat(r.json()["retry_at"])
+                assert at.utcoffset() == timedelta(hours=5) and at.second == 0 and at >= datetime.fromtimestamp(clock.now + wait, PKT), (kind, r.text)
+            if kind == "address":
+                other = _client().get("/api/auth/state")
+                assert other.status_code == 429 and "retry_at" not in other.json(), other.text
+
+
+def test_the_hourly_count_is_kept_for_its_hour_however_full_the_limiter(fdb, clock, monkeypatch):
+    """The API's one limiter pruned every key by the caller's window once it held more than MAX_KEYS: the next minute's check forgot an address's
+    requests for access after a minute, not an hour, and the address could send five more."""
+    monkeypatch.setattr(access_requests, "RATE_LIMIT", SHIPPED_RATE)
+    monkeypatch.setattr(Limiter, "MAX_KEYS", 50)
+    t = [1000.0]
+    monkeypatch.setattr(auth.limiter(), "clock", lambda: t[0])
+    for i in range(access_requests.RATE_LIMIT):
+        assert _send({**AYESHA, "email": f"p{i}@rahimtextiles.pk"}).status_code == 202
+    assert _send(AYESHA).status_code == 429
+    for i in range(60):                                   # a busy minute: many keys of the minute's window
+        auth.limiter().hit(("api", "address", f"10.1.0.{i}"), 1000, 60)
+    t[0] += 61
+    assert auth.rate_wait("address", "10.2.0.1") == 0     # a minute's check over a full limiter prunes it
+    assert _send(AYESHA).status_code == 429
+    assert len(auth.limiter()._hits) < 10                 # the minute's keys went, the hour's stayed
+    # and the Limiter alone: each key by its own window
+    now = [0.0]
+    lim = Limiter(clock=lambda: now[0])
+    for _ in range(3):
+        assert lim.hit(("hour",), 3, 3600) == 0
+    for i in range(60):
+        lim.hit(("minute", i), 10, 60)
+    now[0] = 120.0
+    lim.hit(("minute", "late"), 10, 60)
+    assert lim.hit(("hour",), 3, 3600) > 0 and set(lim._hits) == {("hour",), ("minute", "late")}
+    lim.reset()
+    assert lim._hits == {} and lim._windows == {}
+
+
+def test_an_ipv6_sender_is_counted_by_its_64(fdb, clock, monkeypatch):
+    """One connection holds a whole IPv6 /64: counted by the address alone, a sender took a new address for each send."""
+    monkeypatch.setattr(access_requests, "RATE_LIMIT", 2)
+    assert _send(AYESHA, address="2001:db8:1:2::a").status_code == 202
+    assert _send(AYESHA, address="2001:db8:1:2:ffff:ffff:ffff:fffe").status_code == 202
+    assert _send(AYESHA, address="2001:db8:1:2::c").status_code == 429
+    assert _send(AYESHA, address="2001:db8:1:3::a").status_code == 202
+    assert access_requests.counted_as("2001:db8:1:2::a") == "2001:db8:1:2::/64"
+    assert access_requests.counted_as("::ffff:10.0.0.7") == "10.0.0.7" == access_requests.counted_as("10.0.0.7")
+    assert access_requests.counted_as("forwarded") == "forwarded" and access_requests.counted_as("") == "unknown"
+
