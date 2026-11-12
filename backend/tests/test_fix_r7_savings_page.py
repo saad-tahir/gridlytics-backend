@@ -613,3 +613,27 @@ def test_a_monthly_savings_report_is_refused_for_a_site_with_fewer_than_seven_da
     with world.use():
         telemetry.write_rows([(sid, now - 8 * 86400, "csv", 1.0, 1000.0)], ("site_id", "ts", "source_id", "grid_present", "grid_import_wh"))
     assert a.post("/api/reports", json={"kind": "monthly_savings", "site_id": sid, "period": this}).status_code == 200
+
+
+# ------------------------------------------------------------------------------------------------ batch 5: the ledger, the days table and the daily chart
+
+def _put_tdays(sid: str, days: dict[str, dict]) -> None:
+    with store.connect() as con:
+        for day, data in days.items():
+            con.execute("INSERT OR REPLACE INTO telemetry_days (site_id, day_local, data) VALUES (?,?,?)", (sid, day, json.dumps(data)))
+
+
+def test_each_savings_day_carries_its_outage_hours_so_a_losing_day_can_be_explained(world):
+    """flow-savings-pilot-bill-17: six of eight Karachi days were negative with no word why. DESIGN_LOG (the compiler fixes) gives the reason for
+    most: a day without an outage pays the premium of holding the outage reserve, which the outage days repay. The page has each day's levers; it
+    now has each day's outage hours too (energy, not money: a viewer keeps them), so it can say which losing days had no outage. A day with no
+    telemetry row reads null, not 0."""
+    sid = world.site
+    with world.use():
+        _put_rows(sid, {"2026-10-03": {"native": _row(-3622.0, -3622.0), "tuned": _row(-100.0, -100.0)},
+                        "2026-10-04": {"native": _row(5000.0, 5000.0), "tuned": _row(900.0, 900.0)},
+                        "2026-10-05": {"native": _row(10.0, 10.0), "tuned": _row(5.0, 5.0)}})
+        _put_tdays(sid, {"2026-10-03": {"outage_minutes": 0}, "2026-10-04": {"outage_minutes": 150}})
+    for role in ("analyst", "viewer"):
+        page = world.c[role].get(f"/api/sites/{sid}/savings", params={"start": "2026-10-03", "end": "2026-10-05"}).json()
+        assert {d["day"]: d.get("outage_hours") for d in page["days"]} == {"2026-10-03": 0.0, "2026-10-04": 2.5, "2026-10-05": None}, role

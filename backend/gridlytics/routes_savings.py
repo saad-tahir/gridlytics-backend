@@ -33,6 +33,11 @@ def savings(site_id: str, start: str | None = None, end: str | None = None):
                                                                                   "genset_hours", "throughput_kwh", "unserved_kwh")}
     summ["energy"]["outage_hours"] = round(sum((d.get("outage_minutes") or 0) for d in tdays) / 60, 1)
     summ["energy"]["peak_kw"] = max([d.get("peak_kw") or 0 for d in tdays] or [0])
+    # each day's outage hours (energy, not money), so the page can say which losing days had no outage: such a day pays for holding the outage
+    # reserve, which the outage days repay (round 7, audit flow-savings-pilot-bill-17); null where the day has no telemetry row
+    outages = {d["day"]: round((d.get("outage_minutes") or 0) / 60, 1) for d in tdays}
+    for d in summ["days"]:
+        d["outage_hours"] = outages.get(d["day"])
     # the genset's litres as the actual arm reads them (metered, else the fitted curve) and where they came from, so the page can mark curve litres
     # "Estimated"; the day rows hold metered litres only. Read per minute, so capped at about two months (a longer range keeps the metered sum and
     # names no source)
