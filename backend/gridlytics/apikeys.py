@@ -1,11 +1,12 @@
-"""Scoped API keys (completion program, package P21; master IN-01).
+"""Scoped API keys (plan Part 10.5), lifted from solarlytics-backend at c853130 (apikeys.py) and cut down to Gridlytics' scopes.
 
-A key is made by an administrator (`manage_users`) for one organisation, with a name, the role whose rights it acts with, and its scopes. It is shown once,
-when it is made, and kept as the SHA-256 of the key (as share links and invitations are), with the first characters to recognise it by. A request carries it
-as `Authorization: Bearer <key>`; the API's guard then works in the company that holds the key (platform.db's index, written here when the key is made in a
-company's database: stage B4a of the sign-in) and the key's organisation, as a user of the key's role named after the key, so every permission
-and every rule that hides a cost from a role holds through a key exactly as through a session (a key never has more rights than its role). On top of the role,
-a key reaches only what its scopes name, on its own site only (plan Part 10.5; the words of each are SCOPES', the paths RESOURCES'):
+A key is made by an administrator (`manage_users`) for one organisation and one of its sites, with a name, its kind and its scopes. It is shown once,
+when it is made, and kept as the SHA-256 of the key (as the sign-in's refresh tokens are), with the first characters to recognise it by. A request carries
+it as `Authorization: Bearer <key>`; the API's guard then works in the company that holds the key (platform.db's index, written here when the key is made
+in a company's database: stage B4a of the sign-in) and the key's organisation, as a user named after the key (acting_user). A machine key carries scopes,
+not a role: the role it was made with is kept for the record only, so it holds no role permission and is served no money field, whatever that role
+(auth.can, money.for_reader). A key reaches only what its scopes name, on its own site only (plan Part 10.5; the words of each are SCOPES', the paths
+RESOURCES'):
 
 * a scope is a resource and an access: `telemetry:write` (the edge paths), `plans:read` (the plan in force, its versions, its comparison and the control
   state) and `sites:read` (the site's settings); the site's data is in no scope (audit security-roles-07);
@@ -24,8 +25,6 @@ import json
 import re
 import secrets
 import uuid
-
-from fastapi import HTTPException
 
 from . import auth, store
 from . import platform as platformdb
@@ -58,17 +57,6 @@ NAME_MAX = 80
 DEFAULT_ROLE = "operator"
 #: Keys one organisation may hold, revoked ones included (a list that is read whole)
 MAX_KEYS = 200
-
-
-#: What a key does only with the scope that names it
-SCOPE_ACTIONS = {"quotes:approve": "approves a quote", "quotes:price": "changes a price"}
-
-
-def need(scope: str) -> None:
-    """Refuse a key that lacks `scope` (a session of a person is never asked: its role says what it may do); the sentence names the scope."""
-    user = auth.current.get() or {}
-    if user.get("api_key") and scope not in (user.get("scopes") or []):
-        raise HTTPException(status_code=403, detail=f"An API key {SCOPE_ACTIONS[scope]} only with the scope {scope}")
 
 
 def token_hash(token: str) -> str:

@@ -265,3 +265,30 @@ def test_a_csv_with_its_date_and_its_time_in_separate_columns_is_guessed_and_imp
 def test_the_mapping_vocabulary_offers_a_time_of_day_column(world):  # noqa: F811
     keys = {k["key"]: k for k in world.c["operator"].get(f"/api/sites/{world.site}/telemetry/mapping").json()["keys"]}
     assert keys["ts_time"] == {"key": "ts_time", "units": [], "signed": False, "required": False}
+
+
+# ------------------------------------------------------------------------------------------------ flow-reports-alerts-members-keys-27: lifted wording
+
+def test_the_key_errors_and_the_report_audit_line_carry_no_solarlytics_wording(world):
+    """The key module was lifted from Solarlytics: its refusal named the scope quotes:read, which Gridlytics does not have, its docstring and a dead
+    `need` described quotes, customers and projects; the audit trail read "generated a energy only report"."""
+    import inspect
+
+    from gridlytics import apikeys, reports
+    a, sid = world.c["admin"], world.site
+    r = a.post("/api/platform/keys", json={"name": "x", "scopes": [], "site_id": sid})
+    assert r.status_code == 422 and r.json()["detail"] == "Give the key one or more scopes, such as plans:read", r.text
+    r = a.post("/api/platform/keys", json={"name": "x", "scopes": ["quotes:read"], "site_id": sid})
+    assert r.status_code == 422 and r.json()["detail"] == "Unknown scope 'quotes:read': the scopes are telemetry:write, plans:read, sites:read", r.text
+    source = inspect.getsource(apikeys).lower()
+    for word in ("quote", "customers", "projects", "invitation", "share link", "completion program"):
+        assert word not in source, word
+    # each kind of report in the audit trail with its own article and its words, as the reports page names it
+    assert {k: reports.made_words(k) for k in reports.KINDS} == {
+        "monthly_savings": "generated a monthly savings report", "energy_only": "generated an energy-only report",
+        "daily_operations": "generated a daily operations sheet", "company_rollup": "generated a company roll-up",
+        "pilot": "generated a pilot report"}
+    with world.use():
+        _data_from_last_year(sid)
+        reports.generate("energy_only", sid, _past_month(), "test")
+        assert store.list_audit()[0]["action"] == "generated an energy-only report"

@@ -28,6 +28,10 @@ KINDS = ("monthly_savings", "energy_only", "daily_operations", "company_rollup",
 COMPANY_KINDS = ("company_rollup",)
 TITLES = {"monthly_savings": "Monthly savings report", "energy_only": "Monthly energy report", "daily_operations": "Daily operations sheet",
           "company_rollup": "Company roll-up", "pilot": "Pilot report"}
+#: Each kind as the audit trail names a report generated of it, with its own article (round 7, audit flow-reports-alerts-members-keys-27: the kind's
+#: key with its underscores dropped read "generated a energy only report")
+MADE_WORDS = {"monthly_savings": "a monthly savings report", "energy_only": "an energy-only report", "daily_operations": "a daily operations sheet",
+              "company_rollup": "a company roll-up", "pilot": "a pilot report"}
 LEVER_NAMES = {"peak_window": "Peak-window import avoided", "offpeak_energy": "Off-peak energy (charging)", "export": "Export credit",
                "genset": "Genset fuel and running cost", "wear": "Battery wear", "carry_over": "Carry-over (change in stored energy)",
                "mdi": "Maximum demand (MDI)"}
@@ -1050,6 +1054,11 @@ def _daily_sheet(doc: _Doc, site: dict, day: date, today: date, now_ts: int) -> 
         _what_happened(doc, site, day)
 
 
+def made_words(kind: str) -> str:
+    """The audit trail's action for a report of `kind` generated: "generated an energy-only report"."""
+    return f"generated {MADE_WORDS.get(kind, 'a report')}"
+
+
 def generate(kind: str, site_id: str, period: str, by: str) -> dict:
     """Render a report as PDF and CSV and keep its row. A company kind (COMPANY_KINDS) covers every site and is kept with an empty site_id."""
     now = datetime.now(PKT)
@@ -1100,7 +1109,7 @@ def generate(kind: str, site_id: str, period: str, by: str) -> dict:
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rid, site_id, kind, period, store._now(), h, f"{_folder()}/{rid}.pdf", f"{_folder()}/{rid}.csv",
                                                        "done", None if prelim is None else int(prelim), str(by or "")[:120]))
     replaced = _prune(kind, site_id, period)
-    store.audit(by, f"generated a {kind.replace('_', ' ')} report", site_id, {"period": period, "report": rid, **({"replaced": replaced} if replaced else {})})
+    store.audit(by, made_words(kind), site_id, {"period": period, "report": rid, **({"replaced": replaced} if replaced else {})})
     return get(rid)
 
 
