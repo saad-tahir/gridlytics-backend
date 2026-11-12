@@ -152,6 +152,10 @@ def test_the_demo_installer_marks_one_table_a_day_and_the_mill_marks_it_the_next
     today = datetime.now(PKT).date()
     d0 = twin.day_start_utc(today)
     ids = {}
+    # A new site's first run reaches back an hour (and never past the clock): in the first hour after Karachi midnight that hour is yesterday's,
+    # and the farm, which marks on its own day, then rightly marks yesterday's table as well. The expectation follows the span, so the test holds
+    # at any hour (it failed between 00:00 and 01:00 Karachi time).
+    reaches_yesterday = datetime.fromtimestamp(time.time(), PKT).hour == 0       # the clock demo.advance reads
     for sid in (farm, mill):
         ids[sid] = (_plan(sid, d0 - 86400 - 900, "self_use", status="superseded"), _plan(sid, d0 - 900, "discharge", status="superseded"))
         _plan(sid, d0 + 900, "charge_grid")                                  # today's later plans are not keyed in
@@ -159,7 +163,8 @@ def test_the_demo_installer_marks_one_table_a_day_and_the_mill_marks_it_the_next
         demo.advance(sid)                                                    # a second run marks nothing twice
     yesterday = (today - timedelta(days=1)).isoformat()
     # the farm's installer keys the nightly table and marks it the same day: one table a day, within the write budget
-    assert _marks(farm) == [(today.isoformat(), ids[farm][1], demo.INSTALLER, "vendor_app")]
+    farm_yesterday = [(yesterday, ids[farm][0], demo.INSTALLER, "vendor_app")] if reaches_yesterday else []
+    assert _marks(farm) == farm_yesterday + [(today.isoformat(), ids[farm][1], demo.INSTALLER, "vendor_app")]
     # the Faisalabad mill's marks come the next morning: yesterday's is in, today's is not yet (its alert says so)
     assert _marks(mill) == [(yesterday, ids[mill][0], demo.INSTALLER, "vendor_app")]
     written = telemetry.raw(mill, d0, d0 + 86400, ("inverter_mode_active",))["inverter_mode_active"]
