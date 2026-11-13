@@ -276,6 +276,32 @@ when the answer is.
     page draws `peak_kwh_avoided` as the plan says and may draw litres where a row has no grid. Neither is money: a viewer's bars are these and the day.
   - **The Overview's `spark` is the same function's**, now with the site's own grid and genset (it read every site as having both, which only the
     fleet row's month figures had told apart).
+- **K18, the grid bill so far** (plan D9.8, D2.10): `month.grid_bill_rs` and `month.grid_bill_rs_basis` (`first_day`, `last_day`, `reading`,
+  `billing_month`, `days`, `completeness`, `estimated`, `metering`, `computed`), both money names, stripped for a viewer and a machine key by the
+  API's filter (and not worked out for a reader without `see_costs`). The figure is `verify.bill_so_far`: `verify.rebuild_bill`, the Bills page's own
+  rebuild, priced by `tariffs.rebuild`, so the band and the Bills page cannot differ in method. Decisions the plan left open:
+  - **"The month" is the bill's**: the billing period today falls in (`tariffs.billing_period_for`, the Savings page's billing period and the MDI
+    month: from the day after the last meter reading where the connection has a reading day, else the calendar month).
+  - **To the end of yesterday.** The rebuild fills a minute no reading covers from the period's own profile, so a day still running would be billed
+    whole, its hours to come estimated. The last whole Karachi day is billed: on the period's first day there is no figure.
+  - **The bill's own billing month.** `tariffs.rebuild` took the billing month (the adders, the ICP rule and baseline, the seasonal month) from the
+    last day billed, which is the reading date for an entered bill but not for a bill so far: with the meter read on the 25th, a bill so far on 30 Aug
+    would have taken August's adders for September's bill. `tariffs.rebuild` and `verify.rebuild_bill` take `billed_on` (the reading date), the
+    period's last day by default, so every bill before is unchanged (tested).
+  - **As the DISCO would print it if read at midnight**: `total_rs` (charges, taxes and credits, as the Bills page compares with the printed total),
+    with the credit the bill before carried (`_carried_into`, as entering the bill takes it), fixed charges prorated by the days so far (the engine's
+    rule past 4 days off 30), and s.235 on the amount so far. The connection's metering factor is applied where it is calibrated
+    (`metering_scalars`), as the savings ledger prices both arms; the stored rebuild of an entered bill stays uncalibrated (the fit reads it), so
+    the two differ by the factor where one is applied, which `metering` says.
+  - **Gaps** are filled from the period's profile, as the Bills page's rebuild fills them; below `BILL_COMPLETENESS_MIN` (90 %) of the days' minutes
+    read, `estimated` is true (the Bills page gives no verdict there). With no grid reading at all in the days so far there is no figure: a bill of
+    fixed charges alone would be no estimate.
+  - **Null** off-grid, with no connection, for a connection the readings do not meter, before a whole day of the period, with no grid reading, and
+    where the tariff cannot price the days (logged; the band then holds the saving alone, never a failed Overview).
+  - **Kept for 15 minutes** (`BILL_SO_FAR_REUSE_S`) per site and day while the company's audit trail is unchanged: the rebuild reads up to a month of
+    minutes (about 150 ms) and the Overview polls every 30 seconds. A bill entered, a tariff, a connection or a metering change writes an audit line
+    and is read at once; a late reading for a past day within the 15 minutes.
+  - Owner's question Q49 ("Grid bill so far" on the Overview's money band, if the backend can give it): the recommended yes ships.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 

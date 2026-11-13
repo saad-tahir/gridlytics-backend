@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from .routes_common import PKT, bad, full_or_404, karachi, now_ts, out, put_stat
 from .schemas import Refusal
 
 router = APIRouter()
+log = logging.getLogger("gridlytics.routes_sites")
 
 #: The prices page's days: from the earliest telemetry and rate cards the product reads to a year from today
 PRICES_EARLIEST = date(2015, 1, 1)
@@ -896,6 +898,11 @@ class _Kept:
 
 #: the month's outages (telemetry.outages over the month so far), reused for a minute while the site's newest reading is the same
 _MONTH_OUTAGES = _Kept(60)
+#: the grid bill so far (verify.bill_so_far), reused for BILL_SO_FAR_REUSE_S while the company's audit trail is unchanged: it rebuilds up to a month of
+#: minutes, and it bills whole days only (to the end of yesterday), so what changes it within the day is a bill entered, a tariff, connection or
+#: metering change (each an audit line: read again at once) or a late reading for a past day (read within the reuse)
+BILL_SO_FAR_REUSE_S = 900
+_BILL_SO_FAR = _Kept(BILL_SO_FAR_REUSE_S)
 
 
 def _plan_facts(plan: dict | None) -> dict | None:
@@ -986,6 +993,31 @@ def _month_energy(s: dict, tdays: list[dict], bs: dict | None, outages: tuple[in
             "unserved_kwh": round(total("unserved_kwh"), 1), "battery_cycles": round(total("discharge_kwh") / e_nom, 2) if e_nom else None}
 
 
+def _grid_bill(s: dict, t: date) -> tuple[float | None, dict | None]:
+    """The grid bill so far for the money band (UX backend ask K18; plan D9.8, D2.10), verify.bill_so_far, the Bills page's rebuild, on the plant's
+    connection: (`grid_bill_rs`, `grid_bill_rs_basis`: its days, the reading that closes the bill, its billing month, completeness, whether it is
+    estimated, the metering factor, and when it was computed in Karachi time). Both money names, so a viewer and a machine key get neither. (None, None)
+    off-grid, with no connection, before a whole day of the period, with no grid reading, and where the tariff cannot price it."""
+    conn = (s.get("connections") or [None])[0]
+    if conn is None or _off_grid(s, conn) or not auth.can("see_costs"):
+        return None, None
+    with store.connect() as con:
+        changed = con.execute("SELECT MAX(id) FROM audit").fetchone()[0]
+
+    def make():
+        try:
+            got = verify.bill_so_far(s["id"], conn, t)
+        except Exception:  # noqa: BLE001  (a tariff that cannot price the period: the band holds the saving alone, never a failed Overview)
+            log.exception("the grid bill so far could not be rebuilt for site %s", s["id"])
+            got = None
+        return {**got, "computed": karachi(now_ts())} if got else None
+    key = (str(store.db_path()), s["id"], t.isoformat(), changed, json.dumps(conn, sort_keys=True, default=str))
+    got = _BILL_SO_FAR.get(key, make)
+    if got is None:
+        return None, None
+    return got.pop("total_rs"), got
+
+
 @router.get("/api/sites/{site_id}/header")
 def site_header(site_id: str):
     """What every site page's header shows (plan Part 9.2): the site's name, tier, status and demo link, the control chip and the last-data stamp, from
@@ -1025,6 +1057,7 @@ def site_now(site_id: str):
     sum_ = lambda k: round(sum((d.get(k) or 0) for d in tdays), 1)
     # the month's litres as the Savings page reads them, with their source (meter or curve; audit R7 pages-A-06: the overview said "estimated" always)
     fuel = _litres_of_month(s, t.replace(day=1).isoformat(), t.isoformat(), last, now) if a.get("genset") else {"litres": 0.0, "litres_source": None}
+    bill, bill_basis = _grid_bill(s, t)
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "status", "demo_link")}, "control": control_state(s, last, now), "now": _snapshot(last),
                 "caps": caps, "now_next": plans.now_and_next(plan, now), "plan_status": (plan or {}).get("summary", {}).get("status_label"),
                 "stage": (plan or {}).get("summary", {}).get("stage"),
@@ -1040,7 +1073,9 @@ def site_now(site_id: str):
                           # the month's native-block days, which claim nothing (not money; round 7, audit flow-savings-pilot-bill-18)
                           "native_block_days": _month_native_block_days(site_id, t),
                           # the This month tiles' energy (UX backend ask K12): not money, every reader reads them
-                          **_month_energy(s, tdays, bs, _month_outages(s, t, now, last))},
+                          **_month_energy(s, tdays, bs, _month_outages(s, t, now, last)),
+                          # the grid bill so far (UX backend ask K18): money names, stripped for a viewer and a machine key
+                          "grid_bill_rs": bill, "grid_bill_rs_basis": bill_basis},
                 # the Battery tile's SoC is battery.state's (the last minute with a reading), marked by its own source, not the newest row's (now.soc_source)
                 "spark": spark, "battery": {**{k: bs.get(k) for k in ("soc_pct", "sigma_pct", "trust", "usable_kwh")},
                                             "soc_source": telemetry.soc_source(site_id, bs)} if bs else None,

@@ -138,6 +138,28 @@ def test_the_plan_section_reads_alike_for_every_role_in_energy(world):
     assert [n for n, g in seen.items() if g["tariff"] is None] == ["Rahim Yar Khan farm (demo)"]
 
 
+def test_the_overview_and_fleet_read_alike_for_every_role_in_energy_and_the_grid_bill_for_see_costs(world):
+    """UX backend asks K12, K13 and K18 (plan step 8): every role reads the Overview's plan facts (`plan`, `plan_expired_at`), today's apply mark
+    (`applied_today`), the This month tiles' energy and each spark day's energy (`peak_kwh_avoided`, `litres_saved`) on the Overview and on Fleet, the
+    same for each; the grid bill so far (`month.grid_bill_rs`, `month.grid_bill_rs_basis`) reaches the readers with see_costs only."""
+    client, password, _ = world
+    seen: dict[str, dict] = {}
+    for email, costs in (("owner@onyxleaf.demo", True), ("operator@onyxleaf.demo", True), ("analyst@onyxleaf.demo", True),
+                         ("viewer@onyxleaf.demo", False)):
+        h = _login(client, password, email)
+        for row in client.get("/api/fleet", headers=h).json()["sites"]:
+            now = client.get(f"/api/sites/{row['id']}/now", headers=h).json()
+            month = now["month"]
+            got = {"plan": now["plan"], "expired": now["plan_expired_at"], "applied": now["applied_today"],
+                   "month": {k: month[k] for k in ("peak_import_kwh", "pv_self_pct", "outages", "outages_covered", "unserved_kwh", "battery_cycles")},
+                   "bars": [(p["day"], p["peak_kwh_avoided"], p["litres_saved"]) for p in row["spark"]],
+                   "now_bars": [(p["day"], p["peak_kwh_avoided"], p["litres_saved"]) for p in now["spark"]]}
+            assert got["bars"] == got["now_bars"], (email, row["name"])
+            assert seen.setdefault(row["name"], got) == got, (email, row["name"])
+            assert ("grid_bill_rs" in month and "grid_bill_rs_basis" in month) is costs, (email, row["name"])
+    assert len(seen) == 4
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

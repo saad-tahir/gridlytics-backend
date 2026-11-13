@@ -1108,7 +1108,7 @@ def settle(lines: list[dict], charges: float, credit_after_tax: float, brought: 
 
 def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, conn: dict, period_start: date, period_end: date,
             energy_scalar: float = 1.0, mdi_scalar: float = 1.0, period_start_exclusive: bool = False, power_factor_pct: float | None = None,
-            credit_brought_forward_rs: float = 0.0) -> dict:
+            credit_brought_forward_rs: float = 0.0, billed_on: date | None = None) -> dict:
     """The connection's bill over the consumption days [period_start, period_end], both inclusive, from 1-minute series.
 
     `period_start` is the first day billed, the day after the previous meter reading, and `period_end` the reading date. A caller holding the two
@@ -1119,6 +1119,10 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     lines named by their days); the adders, the ICP rule, s.235 and the flat fees are the billing month's (the reading date's). `power_factor_pct`
     (the bill's printed power factor) adds the PF penalty to a fixed charge set by maximum demand; `credit_brought_forward_rs` is the export credit
     the bill before carried (`credit_carried_rs` of its result).
+
+    `billed_on` is the reading date that closes the bill when the days billed stop before it (the Overview's grid bill so far, verify.bill_so_far):
+    its month is the billing month, so the adders, the ICP rule and its baseline month and the seasonal month are the bill's own, not those of the last
+    day read; `period_end` by default.
 
     `ts_utc` holds epoch seconds of each minute's start (UTC); `import_kw` and `export_kw` the mean power of that minute. Returns the line items, the totals
     (as billed, and as the company bears them), the aggregates verification reads, and every version's hash with the series' (plan 6.3 step 13);
@@ -1134,7 +1138,8 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     last = runs[-1]
     tax_end = last["tax"]
     tf_end = _tax_factor(conn, tax_end, last["ov"])
-    billing_month = period_end.strftime("%Y-%m")
+    closing = billed_on or period_end
+    billing_month = closing.strftime("%Y-%m")
     t0 = datetime(period_start.year, period_start.month, period_start.day, tzinfo=PKT).timestamp()
     t1 = (datetime(period_end.year, period_end.month, period_end.day, tzinfo=PKT) + timedelta(days=1)).timestamp()
     mask = (ts_utc >= t0) & (ts_utc < t1)
@@ -1186,11 +1191,11 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     # 4. the ICP split per period by monthly totals (the billing month's rule and baseline). At a legacy net-metering site the reference is imported
     # units: a period is eligible only with a net import in it, its increment is its imports over the baseline, and the increments are capped at
     # the month's imports less exports and split pro rata (SRO 2409(I)/2025, R9 section 5; plan 6.3 step 4); never more than the period's billed units
-    icp = icp_rule(period_end)
+    icp = icp_rule(closing)
     incremental = {"peak": 0.0, "off_peak": 0.0}
     if icp and data["tariff_category"] in icp["categories"]:
         for p, _ in periods:
-            base = icp_baseline(conn, period_end.month, period_end.year, p)
+            base = icp_baseline(conn, closing.month, closing.year, p)
             if base is None:
                 continue
             if legacy_any:
@@ -1240,7 +1245,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     # fixed charge set by maximum demand per point of PF below 90 percent, R9 section 3); `days` of `of_days` is the proration the line shows
     prorate = n_days / 30.0 if abs(n_days - 30) > 4 else 1.0
     of_days = 30 if prorate != 1.0 else n_days
-    seasonal = _seasonal_factor(data, period_end.month)
+    seasonal = _seasonal_factor(data, closing.month)
     pf_factor = 1.0 + 0.02 * (90.0 - float(power_factor_pct)) if _num(power_factor_pct) and power_factor_pct < 90 else 1.0
     fixed = 0.0
     fixed_run = [0.0] * len(runs)
@@ -1362,7 +1367,7 @@ def rebuild(ts_utc: np.ndarray, import_kw: np.ndarray, export_kw: np.ndarray, co
     # a credit brought forward was the month before's)
     bearable = charges - recovered - (credit - pre_tax)
     versions = {v["id"]: v for r in runs for v in r["versions"].values()}
-    icp_v = resolve("icp", "national", period_end) if icp else None
+    icp_v = resolve("icp", "national", closing) if icp else None
     if icp_v:
         versions[icp_v["id"]] = icp_v
     out = {"lines": lines, "total_rs": round(total, 2), "bearable_rs": round(bearable, 2), "recovered_taxes_rs": round(recovered, 2),

@@ -401,6 +401,30 @@ def test_the_energy_bars_reach_a_viewer_and_the_rupee_bars_do_not(walk):
         assert got["viewer"][1]["spark"] == [{k: b[k] for k in energy} for b in got["admin"][1]["spark"]], url
 
 
+def test_the_grid_bill_so_far_is_named_as_money_and_reaches_no_viewer(walk):
+    """UX backend ask K18 (plan D9.8, D2.10): `month.grid_bill_rs` and `month.grid_bill_rs_basis` are money names (money.is_money), so the API's
+    filter strips both for a viewer (and a machine key, which reaches no Overview); the administrator reads a figure at every grid site once a whole
+    day of its billing period has passed (the demo's connections are billed by the calendar month), and none at the off-grid farm."""
+    from gridlytics import money
+    from gridlytics.routes_common import today
+    client, h = walk["client"], walk["headers"]
+    assert money.is_money("grid_bill_rs") and money.is_money("grid_bill_rs_basis")
+    names = {s["id"]: s["name"] for s in client.get("/api/fleet", headers=h["admin"]).json()["sites"]}
+    bills = {}
+    for url, got in walk["answers"]["/api/sites/{site_id}/now"].items():
+        admin, viewer = got["admin"][1]["month"], got["viewer"][1]["month"]
+        assert "grid_bill_rs" in admin and "grid_bill_rs_basis" in admin, url
+        assert not [k for k in viewer if "grid_bill" in k], url
+        bills[names[url.split("/")[3]]] = admin["grid_bill_rs"]
+        if admin["grid_bill_rs"] is not None:
+            basis = admin["grid_bill_rs_basis"]
+            assert basis["first_day"] == today().replace(day=1).isoformat() and basis["computed"].endswith("+05:00"), url
+    assert bills["Rahim Yar Khan farm (demo)"] is None
+    grid = [n for n in bills if n != "Rahim Yar Khan farm (demo)"]
+    if today().day > 1:
+        assert all(isinstance(bills[n], float) and bills[n] > 0 for n in grid), bills
+
+
 def test_a_request_for_access_is_anyones_to_send_and_only_the_founders_to_read(walk, monkeypatch):
     """UX backend asks K2 and K3: the contact page's request for access goes to the founder from anyone signed in (202 with no body: nothing to filter;
     a site key is refused, as on every path that names no site), and none of the company's readers reaches the founder's Access requests, whose

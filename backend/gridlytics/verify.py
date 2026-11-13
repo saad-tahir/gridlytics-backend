@@ -3103,12 +3103,13 @@ def _profile_fill(ts: np.ndarray, a: np.ndarray, covered: np.ndarray) -> tuple[n
 
 
 def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_exclusive: bool = False, power_factor_pct: float | None = None,
-                 credit_brought_forward_rs: float = 0.0, energy_scalar: float = 1.0, mdi_scalar: float = 1.0) -> dict:
+                 credit_brought_forward_rs: float = 0.0, energy_scalar: float = 1.0, mdi_scalar: float = 1.0, billed_on: date | None = None) -> dict:
     """The connection's bill over [p0, p1] (both billed) rebuilt from telemetry; with period_start_exclusive, p0 is the previous reading date and
     the bill starts the day after it (tariffs.rebuild's convention). Minutes no reading covers are filled from the period's own profile
     (`_profile_fill`), never counted as zero import; `completeness` is the share of the period's minutes a grid reading covers and `filled_kwh`
     what the fill added, and below BILL_COMPLETENESS_MIN the comparison gives no verdict (`_check`). `energy_scalar` and `mdi_scalar`: the
-    connection's metering factor (`fit_metering`), 1 for the stored rebuild, which the fit reads."""
+    connection's metering factor (`fit_metering`), 1 for the stored rebuild, which the fit reads. `billed_on`: the reading date that closes the bill
+    when p1 is before it (a bill so far, `bill_so_far`; tariffs.rebuild)."""
     first = p0 + timedelta(days=1) if period_start_exclusive else p0
     t0 = twin.day_start_utc(first)
     t1 = twin.day_start_utc(p1) + 86400
@@ -3118,11 +3119,43 @@ def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_excl
     exp, filled_exp = _profile_fill(g["ts"], g["exp"], covered)
     out = tariffs.rebuild(g["ts"], imp, exp, conn, p0, p1, energy_scalar=float(energy_scalar), mdi_scalar=float(mdi_scalar),
                           period_start_exclusive=period_start_exclusive, power_factor_pct=power_factor_pct,
-                          credit_brought_forward_rs=credit_brought_forward_rs)
+                          credit_brought_forward_rs=credit_brought_forward_rs, billed_on=billed_on)
     out["completeness"] = round(float(covered.mean()) if len(covered) else 0.0, 4)
     out["filled_kwh"] = {"import": round(filled_imp, 3), "export": round(filled_exp, 3)}
     out["engine"] = version.stamp()  # the engine that rebuilt it (round 7, audit parity-architecture-12)
     return out
+
+
+def bill_so_far(site_id: str, conn: dict | None, day: date) -> dict | None:
+    """The grid bill so far, for the Overview's money band (UX backend ask K18; plan D9.8, D2.10): the bill `day` falls in, rebuilt by
+    `rebuild_bill` (the Bills page's own rebuild) from the billing period's first day (the day after the last meter reading, the calendar month's
+    first without a reading day: tariffs.billing_period_for, the Savings page's billing period) to the day before `day`, the last whole Karachi day.
+    The day still running is left out: the rebuild fills a minute no reading covers from the period's own profile, so today's hours to come would be
+    billed as estimated. Its month is the bill's (`billed_on`, the reading date that closes it: the adders, the ICP rule, the seasonal month), with the
+    credit the bill before carried (`_carried_into`, as entering a bill takes it) and the connection's metering factor where it is calibrated
+    (`metering_scalars`, as the ledger prices both arms): the bill the DISCO would print if the meter were read at midnight. Fixed charges are
+    prorated by the days so far, and taxes charged by slab (s.235) are on the amount so far.
+
+    {total_rs, first_day, last_day, reading, billing_month, days, completeness, estimated, metering}: `completeness` is the share of the days'
+    minutes a grid reading covers, `estimated` below BILL_COMPLETENESS_MIN (the rest is filled from the period's profile, an estimate, as the Bills
+    page says no verdict there), `metering` "calibrated" where the fitted factor is applied, else "uncalibrated". None for a connection the site's
+    readings do not meter (not the plant's), on the billing period's first day (no whole day billed yet) and with no grid reading in the days so far
+    (nothing to rebuild from)."""
+    if conn is None or not conn.get("plant", True) or (conn.get("data") or {}).get("regime") == "off_grid":
+        return None
+    p0, reading = tariffs.billing_period_for(conn, day)
+    last = day - timedelta(days=1)
+    if last < p0:
+        return None
+    k_e, k_m = metering_scalars(site_id, conn)
+    bill = rebuild_bill(site_id, conn, p0, last, credit_brought_forward_rs=_carried_into(conn["id"], p0), energy_scalar=k_e, mdi_scalar=k_m,
+                        billed_on=reading)
+    comp = float(bill.get("completeness") or 0.0)
+    if comp <= 0.0:
+        return None
+    return {"total_rs": bill["total_rs"], "first_day": p0.isoformat(), "last_day": last.isoformat(), "reading": reading.isoformat(),
+            "billing_month": bill["billing_month"], "days": bill["days"], "completeness": comp, "estimated": comp < BILL_COMPLETENESS_MIN,
+            "metering": "calibrated" if metering_of(site_id, conn["id"]).get("applied") else "uncalibrated"}
 
 
 def _connection_label(conns: list[dict], cid: str) -> dict | None:
