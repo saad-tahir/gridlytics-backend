@@ -269,7 +269,8 @@ when the answer is.
 - **K13, the energy spark** (plan D9.3, D1.7): each day of a fleet row's `spark` carries `peak_kwh_avoided` (the grid import moved out of the peak
   window against the native replay) and `litres_saved` (the fuel avoided, in the genset's unit), beside `saving_rs` and `claimed_rs`. Decisions:
   - **The energy the day claims, by the month's own rule** (`routes_sites._claimed_energy`, read by the bars and by `mtd_peak_kwh_avoided` and
-    `mtd_litres_saved`), so this month's bars add up to the month's figure. A day that claims nothing (recommendation only, a claim withheld) reads 0,
+    `mtd_litres_saved`), so a bar and the month's figure agree on which days claim and what (they add up only to within rounding, over the days the
+    spark shows: the check below). A day that claims nothing (recommendation only, a claim withheld) reads 0,
     as its `claimed_rs` does: the Energy bars draw the claim, as the Money bars do (role-analyst-14), never the replay's noise. Null where the site has
     no grid (kWh) or no genset (fuel), or where a claiming day lacks the figure (an unmetered genset's litres).
   - **`litres_saved` too**, which the plan does not ask: the off-grid farm has no peak import, so without it its Energy bars would be empty; the
@@ -281,7 +282,8 @@ when the answer is.
   API's filter (and not worked out for a reader without `see_costs`). The figure is `verify.bill_so_far`: `verify.rebuild_bill`, the Bills page's own
   rebuild, priced by `tariffs.rebuild`, so the band and the Bills page cannot differ in method. Decisions the plan left open:
   - **"The month" is the bill's**: the billing period today falls in (`tariffs.billing_period_for`, the Savings page's billing period and the MDI
-    month: from the day after the last meter reading where the connection has a reading day, else the calendar month).
+    month: from the day after the connection's reading day, else the calendar month), unless a bill entered since was read off that day (the check
+    below: `verify.bill_so_far_period`).
   - **To the end of yesterday.** The rebuild fills a minute no reading covers from the period's own profile, so a day still running would be billed
     whole, its hours to come estimated. The last whole Karachi day is billed: on the period's first day there is no figure.
   - **The bill's own billing month.** `tariffs.rebuild` took the billing month (the adders, the ICP rule and baseline, the seasonal month) from the
@@ -298,10 +300,48 @@ when the answer is.
     fixed charges alone would be no estimate.
   - **Null** off-grid, with no connection, for a connection the readings do not meter, before a whole day of the period, with no grid reading, and
     where the tariff cannot price the days (logged; the band then holds the saving alone, never a failed Overview).
-  - **Kept for 15 minutes** (`BILL_SO_FAR_REUSE_S`) per site and day while the company's audit trail is unchanged: the rebuild reads up to a month of
-    minutes (about 150 ms) and the Overview polls every 30 seconds. A bill entered, a tariff, a connection or a metering change writes an audit line
-    and is read at once; a late reading for a past day within the 15 minutes.
+  - **Kept for 15 minutes** (`BILL_SO_FAR_REUSE_S`) per site and day while the company's audit trail and what the bill reads besides the minutes
+    (`verify.bill_so_far_inputs`, the check below) are unchanged: the rebuild reads up to a month of minutes (about 150 ms) and the Overview polls
+    every 30 seconds. A bill entered, a tariff, a connection or a metering change is read at once; a late reading for a past day within the 15
+    minutes.
   - Owner's question Q49 ("Grid bill so far" on the Overview's money band, if the backend can give it): the recommended yes ships.
+
+### Batch k4, the check (13 Nov 2026)
+
+Independent checkers read K12, K13 and K18; each finding was tried against the code, and all seven held ("UX K12 check", "UX K13 check" and "UX K18
+check" commits). What changed:
+
+- **K18: the bill so far follows the DISCO's real reading.** It started the day after the connection's reading day and took the credit only of a
+  bill ending exactly the day before. A DISCO reads the meter a day or more off that day, so with the August bill read on the 27th (reading day
+  the 25th) the bill so far billed 26 and 27 Aug a second time and dropped the credit that bill carried forward. `verify.bill_so_far_period`: where
+  a bill entered for the connection was read since the billing period began (its reading date at most today), the bill so far starts the day
+  after that reading, closes at the reading day after the one that bill was read for (the reading day nearest its reading date: read on 22 Sep
+  for the 25 Sep reading, it closes on 25 Oct), and takes that bill's credit. Once that closing reading day has passed with no bill entered for it,
+  the reading day stands again; with no bill entered, as before. The rest of the product (the month-to-date counters, the MDI month, the Savings
+  page's billing period) keeps the connection's reading day: the bill so far is the one figure meant to match the bill the DISCO will print.
+  Golden: the August bill read on the 27th with Rs 5,000 carried, 28 and 29 Aug billed in September, Rs 87,972.68, worked line by line.
+- **K18: kept under what it reads.** Entering, correcting or deleting a bill writes its audit line before the credits are chained (`_rechain`) and
+  the metering factor fitted again (`refit_metering`), so a `/now` read in that gap kept the old credit or the uncalibrated factor under the new
+  audit line for 15 minutes. The kept figure's key now holds `verify.bill_so_far_inputs` (its first day and closing reading, the credit carried
+  into it, the metering factor and whether it is applied), and the bill is worked from those same inputs, so a key can never hold a figure of
+  other inputs. Tested by reading `/now` from inside the refit.
+- **K18: the gate tested.** The cache test read a viewer after the administrator, on a warm store whose key is not the role's, so it passed with
+  the `see_costs` gate removed. A viewer now reads first on an empty store and the rebuild is not called.
+- **K12: `latest_attempt` where no plan is in force.** With the site's first solve held back by the guard (or failed), `/now` said nothing: no plan,
+  so no `plan.latest_attempt`, and nothing ran out. The band would have said "The first plan arrives within 15 minutes" with no "Re-solve now"
+  (D2.3, D2.13). The top-level `latest_attempt` ({id, status, reason, generated_at}) is the newest solve where no plan is in force and it failed or
+  was held; null beside a plan in force (the plan's own says it) and under a pause, a release or a native block (the chip's). D9.2 named only the
+  plan in force's facts, but D2.3's primary action needs this state.
+- **K12: no zero without a figure.** The month's `unserved_kwh` and `battery_cycles` counted a day row without the key as 0, so a month of rows
+  stored without them read "0 kWh unserved" and "0 cycles". Each is now the sum over the rows that carry it, None where none does (as the fleet's
+  totals are); a day of 0 is still 0.
+- **K13: the bars and the month figure.** They share one rule of which days claim and what, but each bar is rounded to 0.1 on its own and the spark
+  is the last 7 scored days, while the month figure is every claiming day summed and rounded once. The contract and the type said the bars add up
+  to the month figure; they now say so only to within rounding, over the days shown, and the page draws neither as the other's sum. No figure
+  changed (the Savings page's month figure is the same sum). The K13 test uses figures that do not round cleanly and a month of 10 claiming days.
+- **The fixtures** a contract test asked for are answers the server could give: `now` and `viewer_now` mark the plan in force applied (by Bilal at
+  07:42, as their control chip "Following plan (table applied)" says) and carry `latest_attempt` null, and each fleet row's spark days add up to its
+  month figures. Recorded in the web repository's BUILD_NOTES.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
