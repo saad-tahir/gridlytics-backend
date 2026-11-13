@@ -82,7 +82,7 @@ def test_a_draft_that_passes_is_set_beside_the_version_in_force_with_what_it_cha
     v = got["versions"][0]
     assert (v["kind"], v["key"], v["name"], v["effective_from"]) == ("adder", "fca", "FCA July 2026 (corrected)", "2026-09-01")
     assert (v["in_force"]["name"], v["in_force"]["effective_from"]) == ("FCA July 2026", "2026-09-01")
-    assert [(c["field"], c["before"], c["after"], c["change_pct"]) for c in v["changes"]] == [
+    assert [(c["field"], c["before"], c["after"], c["change_pct"]) for c in v["tariff_changes"]] == [
         ("body.name", "FCA July 2026", "FCA July 2026 (corrected)", None), ("body.rate", 2.0581, 2.5581, 24.3)]
 
 
@@ -124,7 +124,7 @@ def test_a_draft_is_saved_as_its_author_types_seen_by_its_author_and_administrat
     d = r.json()
     assert (d["id"], d["status"], d["name"], d["mine"], d["kinds"], d["effective_from"]) == ("fca-dec", "draft", "FCA", True, ["adder"], None)
     assert d["updated"].endswith("+05:00") and d["created"].endswith("+05:00") and d["author"]
-    assert d["body"]["editor"] == {"step": "C", "started_from": "in_force"} and d["body"]["source"] == {"ref": "", "url": "", "verified": None}
+    assert d["tariff_body"]["editor"] == {"step": "C", "started_from": "in_force"} and d["tariff_body"]["source"] == {"ref": "", "url": "", "verified": None}
     # typed on: the same id saves over it
     r = an.put("/api/tariffs/drafts/fca-dec", json=_draft(_fca(FCA_DEC), start="2026-12-01"))
     assert r.json()["name"] == "FCA October 2026" and r.json()["effective_from"] == "2026-12-01"
@@ -132,7 +132,7 @@ def test_a_draft_is_saved_as_its_author_types_seen_by_its_author_and_administrat
     # an administrator sees everyone's, says whose, and may not write over another person's
     listed = admin.get("/api/tariffs/drafts").json()["drafts"]
     assert [(x["id"], x["mine"], x["author"]) for x in listed] == [("fca-dec", False, d["author"])]
-    assert admin.get("/api/tariffs/drafts/fca-dec").json()["body"]["versions"][0]["body"]["rate"] == 1.38
+    assert admin.get("/api/tariffs/drafts/fca-dec").json()["tariff_body"]["versions"][0]["body"]["rate"] == 1.38
     r = admin.put("/api/tariffs/drafts/fca-dec", json=_draft(_fca()))
     assert r.status_code == 409 and r.json()["code"] == "draft_taken", r.text
     # an administrator's own draft is not the analyst's to read
@@ -182,7 +182,7 @@ def test_a_draft_submitted_waits_for_approval_and_a_second_person_approves_it(wo
     assert got["submitted"][0]["source"]["kind"] == "manual" and got["submitted"][0]["source"]["ref"] == "NEPRA decision of 4 Sep 2026"
     assert "by_id" not in got["submitted"][0] and got["submitted"][0]["template"] is False and got["submitted"][0]["withdrawn"] is None
     assert got["pending"] == waiting + 2
-    assert got["message"] == "Submitted: FCA October 2026 and NJ, from 1 Dec 2026. It waits for an administrator's approval."
+    assert got["message"] == "Submitted: FCA October 2026 and NJ, from 1 Dec 2026. They wait for an administrator's approval."
     assert an.get("/api/tariffs/drafts/d1").status_code == 404
     assert [a["action"] for a in _actions(world)][:2] == ["proposed a tariff version"] * 2
     # the analyst's version: any administrator approves it
@@ -243,7 +243,7 @@ def test_a_waiting_version_is_withdrawn_by_its_author_or_an_administrator(world)
     assert r.status_code == 200 and r.json()["draft_id"], r.text
     d = an.get(f"/api/tariffs/drafts/{r.json()['draft_id']}").json()
     assert d["mine"] is True and d["author"] == back["by"] and d["effective_from"] == "2026-12-01"
-    assert d["body"]["versions"] == [{"kind": "adder", "key": "dss", "body": back["body"]}] and d["body"]["source"]["ref"] == "test"
+    assert d["tariff_body"]["versions"] == [{"kind": "adder", "key": "dss", "body": back["body"]}] and d["tariff_body"]["source"]["ref"] == "test"
     # an approved version is not withdrawn
     active = next(x for x in admin.get("/api/tariffs/versions?kind=adder").json() if x["status"] == "active")
     assert admin.post(f"/api/tariffs/versions/{active['id']}/withdraw", json={}).status_code == 422

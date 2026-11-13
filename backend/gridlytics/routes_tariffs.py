@@ -21,9 +21,10 @@ def _agreements(on: date) -> list[dict]:
     active, not_started, ended or unreadable) and the regime it is billed under that day (`billed_as`, tariffs.regime_on): its own while the
     agreement is in force, net billing after a legacy agreement ends, else none, whose export earns nothing (plan 9.3 UI-03, "Regime expired").
 
-    `ends_in_days` (UX backend ask K32; R8 2.3): the days from the day shown to the agreement's last day, for an agreement in force that ends within
-    the site's alert rules' `agreement_days` (60 by default), the window the Tariff alert regime_expiring_<connection> is raised in, so the page's
-    "Ends in 45 days" and the alert agree; 0 on its last day; null otherwise."""
+    `ends_in_days` (UX backend ask K32; R8 2.3): the days from the day shown to the agreement's last day, for an agreement that ends within the
+    site's alert rules' `agreement_days` (60 by default), by the Tariff alert regime_expiring_<connection>'s own rule (`alerts._agreements`: any
+    state but ended, one not started yet too, UX K32 check), so the page's "Ends in 45 days" and the alert agree; 0 on its last day; null
+    otherwise."""
     from . import alerts  # alerts imports the plans, which import the routes' helpers at module load
     rows = []
     for s in sites.listing():
@@ -34,11 +35,13 @@ def _agreements(on: date) -> list[dict]:
                 continue
             d = c.get("data") or {}
             ends = None
-            window = tariffs.agreement_window(c) if state == "active" else None
-            if window and window[1] is not None:
+            try:
+                left = (date.fromisoformat(d["agreement_end"]) - on).days if d.get("agreement_end") else None
+            except (TypeError, ValueError):
+                left = None
+            if left is not None and left >= 0:
                 warn = warn if warn is not None else alerts._th(alerts.site_rules(s["id"]), "Tariff", "agreement_days")
-                left = (window[1] - on).days
-                ends = left if 0 <= left <= warn else None
+                ends = left if left <= warn else None
             rows.append({"site_id": s["id"], "site_name": s["name"], "connection_id": c["id"], "meter_ref": d.get("meter_ref") or "",
                          "tariff_category": d.get("tariff_category"), "regime": d.get("regime"), "agreement_start": d.get("agreement_start"),
                          "agreement_end": d.get("agreement_end"), "state": state, "billed_as": tariffs.regime_on(c, on), "ends_in_days": ends})
@@ -56,6 +59,8 @@ def _row(v: dict) -> dict:
     Karachi time, by, reason}, null unless it was withdrawn)."""
     me = _me()
     row = {k: x for k, x in v.items() if k not in ("by_id", "withdrawn_at", "withdrawn_by", "withdrawn_note")}
+    if row.get("created"):
+        row["created"] = karachi(row["created"])         # stored in UTC; served in Karachi time (UX K32 check)
     row["template"] = v.get("by") == "shipped"
     row["mine"] = bool(me) and v.get("by_id") == me
     row["withdrawn"] = ({"at": karachi(v["withdrawn_at"]), "by": v.get("withdrawn_by") or None, "reason": v.get("withdrawn_note") or None}
@@ -256,7 +261,7 @@ def _what_if(req) -> tuple[list[dict], dict]:
     auth.need("edit_tariffs", "Pricing a tariff draft")
     if req.draft_id is not None:
         d = _draft_or_404(req.draft_id)
-        body, ref, source = d["body"], req.draft_id, "draft_id"
+        body, ref, source = d["tariff_body"], req.draft_id, "draft_id"
     else:
         body, ref, source = req.draft.model_dump(), "draft", "draft"
     found = tariff_drafts.problems(body, on)
@@ -313,7 +318,8 @@ def draft_get(draft_id: str):
 @router.put("/api/tariffs/drafts/{draft_id}")
 def draft_put(draft_id: str, inp: dict = Body(...)):
     """Saves the caller's draft as they type (the editor's whole work: `TariffDraft`), under the id the editor chose. A draft id another person's draft
-    holds is refused (409 draft_taken), never written over: an administrator resuming someone else's draft saves it under an id of their own."""
+    holds is refused (409 draft_taken), never written over and without saying whose it is: an administrator resuming someone else's draft saves it
+    under an id of their own."""
     auth.need("edit_tariffs", "Saving a tariff draft")
     if not tariff_drafts.DRAFT_ID.match(draft_id):
         raise Refusal(422, "A draft's id is 1 to 64 letters, digits, dashes or underscores", "invalid")
@@ -339,46 +345,59 @@ def draft_delete(draft_id: str):
 @router.post("/api/tariffs/drafts/{draft_id}/submit")
 def draft_submit(draft_id: str):
     """Submits the caller's own draft for approval: one version a kind it changes, with its start and source, waiting for an administrator, all or
-    none (tariffs.propose_many; each audited "proposed a tariff version"); the draft is then gone. A draft with anything to fix is refused (422)
-    with every problem (`problems`). A second person approves (the owner's question Q65): nothing here publishes."""
+    none (tariffs.propose_many; each audited "proposed a tariff version"). The draft is taken in the transaction that makes its versions (UX K32
+    check): a second submit of it (a double click, a retry) finds it gone (404), and a draft saved again since it was checked is not submitted (409
+    draft_changed). A draft with anything to fix is refused (422) with every problem (`problems`). A second person approves (the owner's question
+    Q65): nothing here publishes."""
     auth.need("edit_tariffs", "Submitting a tariff draft")
     d = _draft_or_404(draft_id)
     if not d["mine"]:
         raise Refusal(403, "A draft is submitted by its author", "not_author")
     on = today()
-    found = tariff_drafts.problems(d["body"], on)
+    body = d["tariff_body"]
+    found = tariff_drafts.problems(body, on)
     if found:
         raise _unfit(found)
     try:
-        made = tariffs.propose_many(tariff_drafts.items(d["body"], on), auth.actor(), _me())
+        made = tariffs.propose_many(tariff_drafts.items(body, on), auth.actor(), _me(), claim=tariff_drafts.claim(draft_id, _me() or auth.actor(), body))
+    except tariff_drafts.Gone as exc:
+        raise Refusal(404, str(exc), "not_found") from None
+    except tariff_drafts.Changed as exc:
+        raise Refusal(409, str(exc), "draft_changed") from None
     except (ValueError, TypeError) as exc:
         raise bad(exc) from None
-    tariff_drafts.delete(draft_id)
     start = date.fromisoformat(made[0]["effective_from"])
+    waits = "It waits" if len(made) == 1 else "They wait"
     return {"submitted": [_row(v) for v in made], "pending": sum(1 for v in tariffs.versions() if v["status"] == "pending"),
-            "message": f"Submitted: {d['name']}, from {tariffs._day_words(start)}. It waits for an administrator's approval."}
+            "message": f"Submitted: {d['name']}, from {tariffs._day_words(start)}. {waits} for an administrator's approval."}
 
 
 @router.post("/api/tariffs/versions/{version_id}/withdraw")
 def withdraw(version_id: str, inp: dict = Body(default={})):
     """Withdraws a version waiting for approval (plan F2.2): its author, or an administrator. Status "withdrawn", with when, by whom and why; audited.
-    `redraft` (an administrator's "send back") makes a draft of it for its author to change and submit again (`draft_id`)."""
+    `redraft` is an administrator's "send back" (H6.8: "approve or send back", `approve_tariff`): a draft of it for its author to change and submit
+    again (`draft_id`; to the administrator where the version has no author's id), made in the withdrawal's transaction and named in its audit line
+    (`sent_back_as`, `sent_back_to`; UX K32 check)."""
     auth.need("edit_tariffs", "Withdrawing a tariff version")
     req = check(TariffWithdrawIn, inp or {})
+    if req.redraft:
+        auth.need("approve_tariff", "Sending a tariff version back to its author")
+    made: list[str] = []
+
+    def send_back(con, v: dict) -> tuple[str, str]:
+        person, name = (v["by_id"], v["by"]) if v.get("by_id") else (_me() or auth.actor(), auth.actor())
+        made.append(tariff_drafts.make(person, name, tariff_drafts.from_version(v), con))
+        return made[0], name
+
     try:
-        v = tariffs.withdraw(version_id, auth.actor(), _me(), req.reason, administrator=_administrator())
+        v = tariffs.withdraw(version_id, auth.actor(), _me(), req.reason, administrator=_administrator(), send_back=send_back if req.redraft else None)
     except KeyError:
         raise Refusal(404, "No such tariff version", "not_found") from None
     except tariffs.NotYours as exc:
         raise Refusal(403, str(exc), "not_author") from None
     except ValueError as exc:
         raise bad(exc) from None
-    draft_id = None
-    if req.redraft:
-        with store.connect() as con:
-            r = con.execute("SELECT by, by_id FROM tariff_versions WHERE id = ?", (version_id,)).fetchone()
-        draft_id = tariff_drafts.make(r["by_id"] or _me() or auth.actor(), r["by"] if r["by_id"] else auth.actor(), tariff_drafts.from_version(v))
-    return {**_row(v), "draft_id": draft_id}
+    return {**_row(v), "draft_id": made[0] if made else None}
 
 
 @router.post("/api/tariffs/preview")
@@ -441,9 +460,13 @@ def preview(inp: dict = Body(...)):
 def simulate(inp: dict = Body(...)):
     """A site's bill rebuilt under the version in force and under a draft (plan F2.5.5 "Simulate on a site"; R8 2.3): one of its entered bills, with
     the printed total beside (`bill_id`), or a billing month of its readings where none is entered (`month`). The Bills page's own rebuild
-    (verify.rebuild_bill, priced by tariffs.rebuild) with the bill's period, printed power factor and the credit the bill before carried, so the
-    version in force's figure is the stored rebuild's. `reaches`: whether any of the draft's versions prices a day of the bill (a version for
-    another DISCO group, regime, connection or billing month changes nothing)."""
+    (verify.rebuild_bill, priced by tariffs.rebuild) with the bill's period, printed power factor and the credit the bill before carried, as the
+    stored rebuild was made. `reaches`: whether any of the draft's versions prices a day of the bill (a version for
+    another DISCO group, regime, connection or billing month changes nothing).
+
+    The version in force is priced now, under the library as it stands: for an entered bill it equals the rebuild stored when the bill was entered or
+    corrected (the Bills page's) while nothing that rebuild read has changed since; `stored_rs` carries that stored figure (null for a month) so the
+    page can say when a version approved since, or readings filled in since, make the two differ (UX K32 check)."""
     auth.need("see_costs", "Simulating a tariff version on a site")
     req = check(TariffSimulateIn, inp)
     extra, what = _what_if(req)
@@ -461,6 +484,10 @@ def simulate(inp: dict = Body(...)):
         exclusive = bool(real.get("previous_reading_date"))
         p0 = date.fromisoformat(real["previous_reading_date"]) if exclusive else first
         pf, printed, bill_id = real.get("power_factor_pct"), real.get("total_rs"), r["id"]
+        try:
+            stored = (json.loads(r["rebuilt"]) or {}).get("total_rs") if r["rebuilt"] else None
+        except (TypeError, ValueError):
+            stored = None
         carried = verify._carried_into(conn["id"], first, skip_id=r["id"])
     else:
         conn = _grid_connection(s, req.connection_id)
@@ -470,7 +497,7 @@ def simulate(inp: dict = Body(...)):
         first, p1 = tariffs.billing_period_for(conn, reading)
         if p1 >= today():
             raise Refusal(422, f"The bill for {reading:%B %Y} is not read yet: pick a billing month that has ended", "invalid")
-        p0, exclusive, pf, printed = first, False, None, None
+        p0, exclusive, pf, printed, stored = first, False, None, None, None
         carried = verify._carried_into(conn["id"], first)
     if not conn.get("plant", True):
         raise Refusal(422, "The site's readings are not this connection's meter: its bill cannot be rebuilt", "invalid")
@@ -488,7 +515,8 @@ def simulate(inp: dict = Body(...)):
             "first_day": base["first_day"], "last_day": base["last_day"], "days": base["days"], "completeness": base["completeness"],
             "estimated": base["completeness"] < verify.BILL_COMPLETENESS_MIN, "what_if": what,
             "reaches": any(v.get("id") in ids for v in new["versions"]),
-            "bill": {"in_force_rs": x, "draft_rs": z, "printed_rs": printed, "difference_rs": round(z - x, 2), "change_pct": _pct(x, z),
+            "bill": {"in_force_rs": x, "draft_rs": z, "printed_rs": printed, "stored_rs": stored if tariffs._num(stored) else None,
+                     "difference_rs": round(z - x, 2), "change_pct": _pct(x, z),
                      "in_force_lines": base["lines"], "draft_lines": new["lines"]},
             "tariff_notices": new.get("tariff_notices") or []}
 

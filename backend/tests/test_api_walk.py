@@ -161,15 +161,18 @@ def test_the_overview_and_fleet_read_alike_for_every_role_in_energy_and_the_grid
 
 
 def test_the_tariff_editor_answers_each_role_by_its_permissions(world):
-    """UX backend ask K32 (plan step 13, Tariffs and the editor): drafting (validate, drafts, a draft's prices) is the administrator's and the
-    analyst's (edit_tariffs); a waiting version's prices are every see_costs reader's; a viewer is refused every one. A draft is its author's: the
-    analyst's list holds the analyst's alone, the administrator's everyone's."""
+    """UX backend ask K32 (plan step 13, Tariffs and the editor): drafting (validate, drafts, a draft's prices, submit, discard) is the administrator's
+    and the analyst's (edit_tariffs); a waiting version's prices and simulated bill are every see_costs reader's; a viewer is refused every one. A
+    draft is its author's: the analyst's list holds the analyst's alone, the administrator's everyone's. A version is withdrawn by its author (UX K32
+    check: every route of the editor is walked here)."""
     client, password, _ = world
     draft = {"effective_from": "2026-12-01", "source": {"ref": "walk", "verified": "primary"},
              "versions": [{"kind": "adder", "key": "fca", "body": {"rate": 1.38, "billing_months": ["2026-12"]}}]}
     owner = _login(client, password, "owner@onyxleaf.demo")
-    sid = next(s["id"] for s in client.get("/api/fleet", headers=owner).json()["sites"] if s["name"] == "Faisalabad textile mill (demo)")
+    fleet = client.get("/api/fleet", headers=owner).json()["sites"]
+    sid = next(s["id"] for s in fleet if s["name"] == "Faisalabad textile mill (demo)")
     waiting = next(v for v in client.get("/api/tariffs/versions?kind=adder", headers=owner).json() if v["status"] == "pending")
+    bill = next(b for s in fleet for b in client.get(f"/api/sites/{s['id']}/bills", headers=owner).json())
     for email, drafts, prices in (("owner@onyxleaf.demo", 200, 200), ("operator@onyxleaf.demo", 403, 200), ("analyst@onyxleaf.demo", 200, 200),
                                   ("viewer@onyxleaf.demo", 403, 403)):
         h = _login(client, password, email)
@@ -183,6 +186,23 @@ def test_the_tariff_editor_answers_each_role_by_its_permissions(world):
         if drafts == 200:
             mine = {d["id"] for d in listed.json()["drafts"]}
             assert f"api-walk-{who}" in mine and (who == "owner" or mine == {f"api-walk-{who}"}), (email, mine)
+        simulated = client.post("/api/tariffs/simulate", headers=h, json={"site_id": bill["site_id"], "bill_id": bill["id"], "version_id": waiting["id"]})
+        assert simulated.status_code == prices, (email, simulated.text[:200])
+        url = f"/api/tariffs/drafts/api-walk-{who}"
+        assert client.get(url, headers=h).status_code == drafts, email
+        if drafts == 200:
+            # submitted by its author (one version waits, the draft is gone), the version withdrawn by its author, a draft saved again discarded
+            r = client.post(f"{url}/submit", headers=h)
+            assert r.status_code == 200, (email, r.text[:200])
+            assert client.get(url, headers=h).status_code == 404, email
+            vid = r.json()["submitted"][0]["id"]
+            assert client.post(f"/api/tariffs/versions/{vid}/withdraw", headers=h, json={"reason": "api walk"}).json()["status"] == "withdrawn"
+            assert client.put(url, headers=h, json=draft).status_code == 200, email
+            assert client.delete(url, headers=h).status_code == 200, email
+        else:
+            assert client.post(f"{url}/submit", headers=h).status_code == 403, email
+            assert client.delete(url, headers=h).status_code == 403, email
+            assert client.post(f"/api/tariffs/versions/{waiting['id']}/withdraw", headers=h, json={}).status_code == 403, email
     assert client.get("/api/tariffs", headers=owner).json()["schedule"]["template"] is True
 
 

@@ -464,8 +464,9 @@ def test_a_request_for_access_is_anyones_to_send_and_only_the_founders_to_read(w
 
 def test_the_tariff_editor_reaches_no_viewer_and_no_key_and_names_its_rupees_as_money(walk):
     """UX backend ask K32 (plan F11 item 6): the editor's routes need see_costs at least (rates are money, R8 2.3), drafting needs edit_tariffs; a
-    viewer and a machine key are refused every one, an operator reads a waiting version's prices but drafts nothing. The administrator's week of
-    prices and simulated bill carry every rupee under a money name, so the API's filter would leave a reader without see_costs none of them."""
+    viewer and a machine key are refused every one, an operator reads a waiting version's prices and simulated bill but drafts nothing. Every answer
+    carries its rupees under money names (the week of prices, the simulated bill, what a version changes, a draft's body), so the API's filter would
+    leave a reader without see_costs none of them (UX K32 check: the validate answer and the drafts too)."""
     from gridlytics import money
     client, h = walk["client"], walk["headers"]
     sid = next(s["id"] for s in client.get("/api/fleet", headers=h["admin"]).json()["sites"] if s["name"] == "Faisalabad textile mill (demo)")
@@ -479,13 +480,20 @@ def test_the_tariff_editor_reaches_no_viewer_and_no_key_and_names_its_rupees_as_
              "preview": ("POST", "/api/tariffs/preview", {"site_id": sid, "version_id": waiting["id"], "days": 1}),
              "preview_draft": ("POST", "/api/tariffs/preview", {"site_id": sid, "draft": draft, "days": 1}),
              "simulate": ("POST", "/api/tariffs/simulate", {"site_id": bill["site_id"], "bill_id": bill["id"], "draft": draft}),
-             "withdraw": ("POST", f"/api/tariffs/versions/{waiting['id']}/withdraw", {"reason": "walk"})}
-    allowed = {"admin": set(calls) - {"withdraw"}, "operator": {"preview"}, "viewer": set(), "key": set()}
+             "simulate_version": ("POST", "/api/tariffs/simulate", {"site_id": bill["site_id"], "bill_id": bill["id"], "version_id": waiting["id"]}),
+             "withdraw": ("POST", f"/api/tariffs/versions/{waiting['id']}/withdraw", {"reason": "walk"}),
+             "submit": ("POST", "/api/tariffs/drafts/walk-draft/submit", None), "discard": ("DELETE", "/api/tariffs/drafts/walk-draft", None)}
+    #: tested on their refusals alone: each changes what the others read
+    changing = {"withdraw", "submit", "discard"}
+    allowed = {"admin": set(calls) - changing, "operator": {"preview", "simulate_version"}, "viewer": set(), "key": set()}
+    #: the money names each answer carries its rupees under
+    named = {"validate": {"tariff_changes"}, "drafts": {"tariff_body"}, "draft": {"tariff_body"}, "save": {"tariff_body"},
+             "preview": {"c_imp", "c_exp", "rates"}, "preview_draft": {"c_imp", "c_exp", "rates"}, "simulate": {"bill"}, "simulate_version": {"bill"}}
     answers = {}
     for reader in READERS:
         for name, (method, url, body) in calls.items():
-            if name == "withdraw":
-                continue                                        # tested on its own: it changes the version the others read
+            if name in changing:
+                continue
             r = client.request(method, url, json=body, headers=h[reader])
             want = 200 if name in allowed[reader] else 403
             assert r.status_code == want, (reader, name, r.status_code, r.text[:200])
@@ -493,15 +501,21 @@ def test_the_tariff_editor_reaches_no_viewer_and_no_key_and_names_its_rupees_as_
                 answers[(reader, name)] = r.json()
             else:
                 assert not any(RUPEES.search(s) for s in _strings(r.json())), (reader, name)
+    assert {name for _, name in answers} == set(calls) - changing
     for (reader, name), body in answers.items():
-        if name in ("preview", "preview_draft", "simulate"):
-            assert {"c_imp", "c_exp", "rates", "bill"} & {k for _, k, _, _ in _items(body) if isinstance(k, str) and money.is_money(k)}, name
-            kept = money.for_key(body)
-            assert not (_numbers(body, money_only=True) - _numbers(body, money_only=False)) & _numbers(kept), (reader, name)
+        names = {k for _, k, _, _ in _items(body) if isinstance(k, str) and money.is_money(k)}
+        assert named[name] <= names, (reader, name, names)
+        kept = money.for_key(body)
+        assert not (_numbers(body, money_only=True) - _numbers(body, money_only=False)) & _numbers(kept), (reader, name)
+        if name in ("validate", "drafts", "draft", "save"):
+            assert _numbers(kept) == set(), (reader, name, kept)       # no figure of a rate is left outside a money name
     assert answers[("operator", "preview")]["in_force"]["c_imp"] == answers[("admin", "preview")]["in_force"]["c_imp"]
-    # a viewer and a key never withdraw; the shipped waiting version has no author, so only an administrator does
+    assert answers[("operator", "simulate_version")]["bill"] == answers[("admin", "simulate_version")]["bill"]
+    # a viewer, a key and an operator never withdraw, submit or discard; the shipped waiting version has no author, so only an administrator withdraws
     for reader in ("viewer", "key", "operator"):
-        assert client.post(calls["withdraw"][1], json={}, headers=h[reader]).status_code == 403, reader
+        for name in sorted(changing):
+            method, url, _ = calls[name]
+            assert client.request(method, url, json={} if method == "POST" else None, headers=h[reader]).status_code == 403, (reader, name)
 
 
 def test_answers_that_are_files_pass_unchanged(walk):

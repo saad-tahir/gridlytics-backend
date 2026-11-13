@@ -61,10 +61,15 @@ def _shipped_todo(con) -> list[tuple[dict, object]]:
 
     A shipped body that changed since the file was seeded (a correction of shipped data for the same start, such as the debt-service surcharge's
     category rates) replaces the shipped row of the same start and status. The company's own decisions stand: a start the company versioned itself
-    and the build never shipped, and a shipped row the company has since superseded, approved or closed out of that status, are left alone."""
+    and the build never shipped, and a shipped row the company has since superseded, approved, withdrawn or closed out of that status, are left alone.
+
+    A version the company drafted and then withdrew (UX K32 check) is no decision about its start: it is in force on no day, so a newer build's
+    shipped version at that start still reaches the company (else its bills would go without, for example, that month's FCA)."""
     rows = con.execute("SELECT id, kind, key, effective_from, effective_to, status, hash, by FROM tariff_versions ORDER BY created, rowid").fetchall()
     at: dict[tuple, list] = {}
     for r in rows:
+        if r["status"] == "withdrawn" and r["by"] != "shipped":
+            continue
         at.setdefault((r["kind"], r["key"], r["effective_from"]), []).append(r)
     todo: list[tuple[dict, object]] = []
     for v in tariff_data.SHIPPED:
@@ -624,10 +629,13 @@ def version_problems(kind, key, effective_from, body, source) -> list[tuple[tupl
 
 
 def _insert_version(con, kind: str, key: str, effective_from: str, body: dict, source: dict, by: str, by_id: str) -> str:
+    """A pending version, known from the day it was drafted in Karachi (UX K32 check: the UTC day named the day before until 05:00)."""
     vid = store.new_id()
+    now = store._now()
+    known = datetime.fromisoformat(now).astimezone(PKT).date().isoformat()
     con.execute("INSERT INTO tariff_versions (id, kind, key, effective_from, effective_to, known_from, status, supersedes, body, source, hash, created, by, "
-                "by_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (vid, kind, key, effective_from, None, store._now()[:10], "pending", None, json.dumps(body),
-                                                               json.dumps(source), _hash(body), store._now(), by, by_id or ""))
+                "by_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (vid, kind, key, effective_from, None, known, "pending", None, json.dumps(body),
+                                                               json.dumps(source), _hash(body), now, by, by_id or ""))
     store.audit(by, "proposed a tariff version", f"{kind}/{key}", {"effective_from": effective_from}, con=con)
     return vid
 
@@ -645,15 +653,20 @@ def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, 
     return next(v for v in versions(kind) if v["id"] == vid)
 
 
-def propose_many(items: list[dict], by: str, by_id: str = "") -> list[dict]:
+def propose_many(items: list[dict], by: str, by_id: str = "", claim=None) -> list[dict]:
     """Several versions proposed together (a tariff draft submitted: one version a kind, the same start and source), all or none: each is checked as
-    `propose` checks one, and they are stored in one write transaction (UX K32). Each item is {kind, key, effective_from, body, source}."""
+    `propose` checks one, and they are stored in one write transaction (UX K32). Each item is {kind, key, effective_from, body, source}.
+
+    `claim(con)`, when given, runs first in that transaction (UX K32 check: the draft they come from is taken there, so a second submit of it makes
+    nothing); what it raises leaves nothing written."""
     for it in items:
         found = version_problems(it.get("kind"), it.get("key"), it.get("effective_from"), it.get("body"), it.get("source"))
         if found:
             raise ValueError(found[0][1])
     _seeded()
     with store.write_transaction() as con:
+        if claim is not None:
+            claim(con)
         ids = [_insert_version(con, it["kind"], it["key"], _canonical_day(it["effective_from"]), it["body"], it["source"], by, by_id) for it in items]
     every = {v["id"]: v for v in versions()}
     return [every[i] for i in ids]
@@ -742,10 +755,14 @@ def approve(version_id: str, by: str, by_id: str = "") -> dict:
     return next(v for v in versions(r["kind"]) if v["id"] == version_id)
 
 
-def withdraw(version_id: str, by: str, by_id: str = "", reason: str = "", administrator: bool = False) -> dict:
+def withdraw(version_id: str, by: str, by_id: str = "", reason: str = "", administrator: bool = False, send_back=None) -> dict:
     """Take back a version waiting for approval (plan F2.2, F11 item 6; UX K32): its author (by sign-in id), or an administrator, withdraws it. Its
     status becomes "withdrawn": in force on no day, never counted as waiting, never approved; when, who and why are kept with it and in the audit
-    trail. Raises KeyError for no such version, NotYours for someone else's (not an administrator), ValueError for one not waiting."""
+    trail. Raises KeyError for no such version, NotYours for someone else's (not an administrator), ValueError for one not waiting.
+
+    `send_back(con, version)` (an administrator's "send back", H6.8) makes the draft that goes back to its author in the same transaction and
+    returns (its id, whose it is): the audit line then names them (`sent_back_as`, `sent_back_to`), and if it fails the version still waits (UX
+    K32 check)."""
     with store.write_transaction() as con:
         r = con.execute("SELECT * FROM tariff_versions WHERE id = ?", (version_id,)).fetchone()
         if r is None:
@@ -756,8 +773,10 @@ def withdraw(version_id: str, by: str, by_id: str = "", reason: str = "", admini
             raise ValueError("Only a version waiting for approval can be withdrawn")
         con.execute("UPDATE tariff_versions SET status = 'withdrawn', withdrawn_at = ?, withdrawn_by = ?, withdrawn_note = ? WHERE id = ?",
                     (store._now(), by, reason, version_id))
-        store.audit(by, "withdrew a tariff version", f"{r['kind']}/{r['key']}", {"version_id": version_id, "effective_from": r["effective_from"],
-                                                                                 "reason": reason}, con=con)
+        detail = {"version_id": version_id, "effective_from": r["effective_from"], "reason": reason}
+        if send_back is not None:
+            detail["sent_back_as"], detail["sent_back_to"] = send_back(con, _ver(r))
+        store.audit(by, "withdrew a tariff version", f"{r['kind']}/{r['key']}", detail, con=con)
     return next(v for v in versions(r["kind"]) if v["id"] == version_id)
 
 

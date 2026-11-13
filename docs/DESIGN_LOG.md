@@ -422,6 +422,49 @@ withdrawal, the template flag and the agreement's end. One schema change: versio
   would keep none of them. A draft's and a version's bodies hold rates under `body`, as the library's answers always have, behind those
   permissions.
 
+### Batch k5, the check (13 Nov 2026)
+
+Independent checkers read K32; each finding was tried against the code. Fourteen held, in whole or in part, and were fixed with a test that fails
+without the fix (`test_ux_k32_check`, and the API and role walks); none was wrong ("UX K32 check" commits). What changed:
+
+- **A draft is submitted once.** The submit read the draft, checked it, made its versions in one transaction and removed the draft in another, so
+  two submits of one draft (a double click, a retry) both made versions (the checker's probe: one draft, two waiting versions). The draft is now
+  taken in the transaction that makes its versions (`tariffs.propose_many`'s `claim`, `tariff_drafts.claim`): a second submit finds it gone (404,
+  as reading it now gives), and a draft saved again after it was read and checked is not submitted as it was (409 `draft_changed`), so the
+  versions made are always the draft that was checked, and a newer draft is never removed under its author.
+- **A withdrawn draft of the company's is no decision about its start.** The shipped library's seeding (`_shipped_todo`) read every row at a (kind,
+  key, start) as the company's own decision, so a version the company drafted and withdrew stopped a newer build's shipped version at that start for
+  good (the probe: no FCA on December's bills). The reason the drafts got a table of their own applied to the new status too: the seeding now leaves
+  out a withdrawn row the company drafted. A shipped version the company withdrew stays withdrawn, and a newer build's correction of it is not added
+  either: the company's withdrawal stands, as its closing of a shipped row always has.
+- **Money names on every rupee of the editor.** The validate answer's field changes (a rate before and after, its percent) and a draft's body (its
+  rates under any key, such as an adder's `category_rates`) had no money name; the routes' permissions kept them from a viewer and a key, but the
+  lane's rule is that the names do. They are now `tariff_changes` (added to `money.MONEY_KEYS`) and `tariff_body` (already one), and the role walk
+  proves the filter leaves no figure of the validate answer, the drafts list, a draft or a saved draft (`money.for_key` keeps no number of them).
+  This replaces the batch's "a draft's body holds rates under `body`"; a version's own row keeps `body`, as the library's answers always have,
+  behind `see_costs`.
+- **The agreement's end agrees with the alert in every state.** The Tariff alert says "ends on ..." for an agreement that has not started yet but
+  ends within the window; `ends_in_days` was given only for one in force. It now follows the alert's own rule: any state but ended.
+- **The simulated bill beside the stored rebuild.** The version in force is priced now, while a bill's stored rebuild is fixed when it is entered
+  or corrected, so after an approval or readings filled in since, the editor's "Rebuilt on the version in force" and the Bills page's rebuilt total
+  differ. The contract no longer says they are equal; `bill.stored_rs` carries the stored one (null for a month) so the page can say when they
+  differ. Tested across a correction approved after the bill was entered.
+- **The editor's words.** The problems the validate route, a submit and a preview list are in the editor's units and words where the library's
+  name a stored key or a fraction (`tariff_drafts.editor_words`, by the field: "The floor for B-3 is a percent of the sanctioned load, from 0 to
+  100", "GST is a percent from 0 to under 100", "Season 2 needs a peak window: a start and a different end, in 24-hour time"; plan F2.5.2 and
+  F2.5.3, "Percent entry, fraction stored"). The raw route and approval keep the library's own words. The strict models' refusals are plain
+  sentences: "A draft's versions must have at most 7 items", "Version 2's kind must be one of ...", "The start must be at most 10 characters"
+  (`schemas.message`: a list's length in words; a list item named by its model's item word).
+- **Sending back.** `redraft` needs `approve_tariff` (H6.8: "approve or send back"); an author withdraws their own version but does not send it
+  back to themself. The draft is made in the withdrawal's transaction (a failure leaves the version waiting) and the audit line names it
+  (`sent_back_as`, `sent_back_to`).
+- **A taken draft id** is refused in words that do not say whose it is ("This draft id is taken: save the draft under a new id"). The 409 still says
+  the id is in use: the editor chooses random ids, so nothing of another person's draft is learnt.
+- **Small things.** The submit's message says "They wait" for more than one version. A version row's `created` is served in Karachi time and a new
+  version's `known_from` is Karachi's day (the UTC day named the day before until 05:00). Every route of the editor is in the API walk (simulate,
+  submit, withdraw, a draft read and discarded) and the role walk (submit and discard refused to a viewer, a key and an operator; the operator's
+  simulation of a waiting version read); an analyst's discard, submit, preview and simulation of an administrator's draft each read 404.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

@@ -34,11 +34,16 @@ _WORDS = {"string_type": "{label} must be text", "string_too_long": "{label} mus
           "enum": "{label} must be one of {expected}"}
 
 
-def _label(loc: tuple, titles: dict | None = None) -> str:
+def _label(loc: tuple, titles: dict | None = None, items: dict | None = None) -> str:
     """The field a refusal names: "The cycle cap per day" from its key, or its own words where the model gives a top-level field a title (`Field(title=
-    "The meter reading (hm³)")`), so a field whose key is a unit or a code reads as people say it (UX K24 check)."""
-    head = (titles or {}).get(loc[0]) or "The " + str(loc[0]).replace("_", " ")
-    return head + "".join(f"'s {str(p).replace('_', ' ')}" for p in loc[1:] if not isinstance(p, int))
+    "The meter reading (hm³)")`), so a field whose key is a unit or a code reads as people say it (UX K24 check). A field inside a list item is named
+    by the item where the model names its list's items (`Field(json_schema_extra={"item": "version"})`): "Version 2's kind" (UX K32 check)."""
+    item = (items or {}).get(loc[0])
+    if item and len(loc) > 1 and isinstance(loc[1], int):
+        head, rest = f"{item[:1].upper()}{item[1:]} {loc[1] + 1}", loc[2:]
+    else:
+        head, rest = (titles or {}).get(loc[0]) or "The " + str(loc[0]).replace("_", " "), loc[1:]
+    return head + "".join(f"'s {str(p).replace('_', ' ')}" for p in rest if not isinstance(p, int))
 
 
 def _clause(text: str) -> str:
@@ -51,22 +56,30 @@ def _clause(text: str) -> str:
 
 
 def message(exc: ValidationError, model: type[BaseModel] | None = None) -> str:
-    titles = {k: f.title for k, f in (model.model_fields if model is not None else {}).items() if f.title}
+    fields = model.model_fields if model is not None else {}
+    titles = {k: f.title for k, f in fields.items() if f.title}
+    items = {k: f.json_schema_extra["item"] for k, f in fields.items() if isinstance(f.json_schema_extra, dict) and f.json_schema_extra.get("item")}
     parts = []
     for e in exc.errors()[:4]:
         loc = tuple(e["loc"])
         text = e["msg"].removeprefix("Value error, ")
+        label = _label(loc, titles, items) if loc else ""
         if not loc or e["type"] == "value_error":
             parts.append(text)
         elif e["type"] == "extra_forbidden":
             parts.append(f"Unknown field '{'.'.join(str(p) for p in loc)}'")
         elif e["type"] == "string_too_short":
             n = (e.get("ctx") or {}).get("min_length", 1)
-            parts.append(f"{_label(loc, titles)} is needed" if n <= 1 else f"{_label(loc, titles)} must be at least {n} characters")
+            parts.append(f"{label} is needed" if n <= 1 else f"{label} must be at least {n} characters")
+        elif e["type"] in ("too_long", "too_short"):
+            # a list's length (UX K32 check): pydantic's own words are "List should have at most 7 items after validation, not 8"
+            ctx = e.get("ctx") or {}
+            n = ctx.get("max_length") if e["type"] == "too_long" else ctx.get("min_length")
+            parts.append(f"{label} must have {'at most' if e['type'] == 'too_long' else 'at least'} {n} item{'' if n == 1 else 's'}")
         elif e["type"] in _WORDS:
-            parts.append(_WORDS[e["type"]].format(label=_label(loc, titles), **(e.get("ctx") or {})))
+            parts.append(_WORDS[e["type"]].format(label=label, **(e.get("ctx") or {})))
         else:
-            parts.append(f"{_label(loc, titles)}: {text}")
+            parts.append(f"{label}: {text}")
     more = len(exc.errors()) - 4
     return "; ".join(parts[:1] + [_clause(p) for p in parts[1:]]) + (f"; and {more} more" if more > 0 else "")
 
@@ -212,9 +225,9 @@ class TariffDraft(Strict):
     (YYYY-MM-DD, or empty while drafted), its source, one version a kind it changes (at most seven), and the editor's own state (`editor`: its step,
     what it started from), kept as sent."""
 
-    effective_from: str = Field("", max_length=10)
+    effective_from: str = Field("", max_length=10, title="The start")
     source: TariffDraftSource = Field(default_factory=TariffDraftSource)
-    versions: list[TariffDraftVersion] = Field(default_factory=list, max_length=7)
+    versions: list[TariffDraftVersion] = Field(default_factory=list, max_length=7, title="A draft's versions", json_schema_extra={"item": "version"})
     editor: dict = Field(default_factory=dict)
 
 
