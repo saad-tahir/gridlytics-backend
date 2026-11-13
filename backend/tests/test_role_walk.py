@@ -387,6 +387,20 @@ def test_the_overview_s_band_facts_and_this_month_tiles_reach_a_viewer_whole(wal
     assert seen == 4
 
 
+def test_the_energy_bars_reach_a_viewer_and_the_rupee_bars_do_not(walk):
+    """UX backend ask K13 (plan D9.3, D1.7): each spark day's `peak_kwh_avoided` and `litres_saved` (the energy it claims) are no money: the viewer's
+    bars are the administrator's without `saving_rs` and `claimed_rs`, on Fleet and on the Overview."""
+    client, h = walk["client"], walk["headers"]
+    energy = ("day", "peak_kwh_avoided", "litres_saved")
+    admin = {s["id"]: s["spark"] for s in client.get("/api/fleet", headers=h["admin"]).json()["sites"]}
+    viewer = {s["id"]: s["spark"] for s in client.get("/api/fleet", headers=h["viewer"]).json()["sites"]}
+    assert admin.keys() == viewer.keys()
+    for sid, bars in admin.items():
+        assert viewer[sid] == [{k: b[k] for k in energy} for b in bars], sid
+    for url, got in walk["answers"]["/api/sites/{site_id}/now"].items():
+        assert got["viewer"][1]["spark"] == [{k: b[k] for k in energy} for b in got["admin"][1]["spark"]], url
+
+
 def test_a_request_for_access_is_anyones_to_send_and_only_the_founders_to_read(walk, monkeypatch):
     """UX backend asks K2 and K3: the contact page's request for access goes to the founder from anyone signed in (202 with no body: nothing to filter;
     a site key is refused, as on every path that names no site), and none of the company's readers reaches the founder's Access requests, whose

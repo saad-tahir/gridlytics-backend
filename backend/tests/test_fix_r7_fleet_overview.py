@@ -172,8 +172,8 @@ def test_the_fleet_s_7_day_bars_carry_each_day_s_claimed_saving_so_unclaimed_rep
     spark = _row(a.get("/api/fleet").json(), sid)["spark"]
     assert [(p["day"], p["claimed_rs"]) for p in spark] == [(y.isoformat(), 0.0), (t.isoformat(), 512.4)]    # before: saving_rs only
     assert spark[0]["saving_rs"] == -0.09                                                  # the replay's own figure stays beside it
-    # money both: a viewer's bars carry the days only
-    assert [set(p) for p in _row(world.c["viewer"].get("/api/fleet").json(), sid)["spark"]] == [{"day"}, {"day"}]
+    # money both: a viewer's bars carry the days and the energy each claims only (UX K13: the Energy form's bars), no rupee
+    assert [set(p) for p in _row(world.c["viewer"].get("/api/fleet").json(), sid)["spark"]] == [{"day", "peak_kwh_avoided", "litres_saved"}] * 2
 
 
 # ------------------------------------------------------------------------------------------------ pages-A-11, role-viewer-18

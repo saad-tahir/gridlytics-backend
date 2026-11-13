@@ -266,6 +266,16 @@ when the answer is.
   - **A day stored without its peak import is aggregated again.** A CSV upload aggregates its days without the tariff's peak flags (only the nightly
     job and `/now`'s today pass them), so a CSV site's month had no peak figure. `/now` aggregates such a day again with the flags and writes it back
     once, as it does today's row (round 7, tests-and-perf-10); a day whose tariff calendar cannot be read stays without it.
+- **K13, the energy spark** (plan D9.3, D1.7): each day of a fleet row's `spark` carries `peak_kwh_avoided` (the grid import moved out of the peak
+  window against the native replay) and `litres_saved` (the fuel avoided, in the genset's unit), beside `saving_rs` and `claimed_rs`. Decisions:
+  - **The energy the day claims, by the month's own rule** (`routes_sites._claimed_energy`, read by the bars and by `mtd_peak_kwh_avoided` and
+    `mtd_litres_saved`), so this month's bars add up to the month's figure. A day that claims nothing (recommendation only, a claim withheld) reads 0,
+    as its `claimed_rs` does: the Energy bars draw the claim, as the Money bars do (role-analyst-14), never the replay's noise. Null where the site has
+    no grid (kWh) or no genset (fuel), or where a claiming day lacks the figure (an unmetered genset's litres).
+  - **`litres_saved` too**, which the plan does not ask: the off-grid farm has no peak import, so without it its Energy bars would be empty; the
+    page draws `peak_kwh_avoided` as the plan says and may draw litres where a row has no grid. Neither is money: a viewer's bars are these and the day.
+  - **The Overview's `spark` is the same function's**, now with the site's own grid and genset (it read every site as having both, which only the
+    fleet row's month figures had told apart).
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 

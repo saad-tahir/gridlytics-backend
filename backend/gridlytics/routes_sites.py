@@ -189,27 +189,51 @@ def _month_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple
         rows = con.execute("SELECT day_local, data FROM savings_days WHERE site_id = ? AND baseline = 'native' AND day_local >= ? ORDER BY day_local",
                            (site_id, (t - timedelta(days=40)).isoformat())).fetchall()
     # each day's claimed saving beside the replay's own figure: the bars draw the claim, as the month column does, so a recommendation-only day's
-    # replay noise (the Lahore mall's -Rs 0.09) is not drawn as a loss (audit role-analyst-14, flow-savings-pilot-bill-21, engine-money-live-14)
+    # replay noise (the Lahore mall's -Rs 0.09) is not drawn as a loss (audit role-analyst-14, flow-savings-pilot-bill-21, engine-money-live-14);
+    # and the energy the day claims, the Energy form's bars (UX backend ask K13; plan D9.3, D1.7): not money, so a viewer reads them
     spark = []
     month = t.replace(day=1).isoformat()
     peak = litres = None
     block = 0
     for r in rows:
         d = json.loads(r["data"])
-        spark.append({"day": r["day_local"], "saving_rs": d.get("saving_rs"), "claimed_rs": d.get("claimed_rs")})
+        claimed = _claimed_energy(d, grid, genset)
+        spark.append({"day": r["day_local"], "saving_rs": d.get("saving_rs"), "claimed_rs": d.get("claimed_rs"),
+                      **_spark_energy(claimed, grid, genset)})
         # the month's days of a switchback native block, which claim nothing: Fleet and Overview say why such a month reads Rs 0 (round 7, audit
         # flow-savings-pilot-bill-18)
         block += int(r["day_local"] >= month and d.get("fidelity") == "native_block")
-        if r["day_local"] < month or d.get("fidelity") not in verify.CLAIMING or d.get("claim_withheld"):
+        if r["day_local"] < month or claimed is None:
             continue
-        a, n = (d.get("actual") or {}).get("peak_import_kwh"), (d.get("baseline") or {}).get("peak_import_kwh")
-        if grid and a is not None and n is not None:
-            peak = (peak or 0.0) + n - a
-        if genset and d.get("litres_saved") is not None:
-            litres = (litres or 0.0) + d["litres_saved"]
+        if claimed[0] is not None:
+            peak = (peak or 0.0) + claimed[0]
+        if claimed[1] is not None:
+            litres = (litres or 0.0) + claimed[1]
     energy = {"peak_kwh_avoided": None if peak is None else round(peak, 1), "litres_saved": None if litres is None else round(litres, 1)}
     energy["native_block_days"] = block
     return mtd, (summ["computed"] or None) if scored else None, spark[-7:], energy
+
+
+def _claimed_energy(d: dict, grid: bool, genset: bool) -> tuple[float | None, float | None] | None:
+    """The energy a stored savings day (its native baseline's row) claims beside its rupees: the grid import moved out of the peak window against the
+    native replay (kWh) and the fuel avoided (the genset's unit), each None where the day does not carry it, at a site without a grid (`grid`) or a
+    genset (`genset`). None when the day claims nothing (a recommendation-only day, one whose claim is withheld): its energy is not counted, as its
+    rupees are not. The one rule of the month's figure and of each day's bar (UX backend ask K13), so the bars of the month add up to it."""
+    if d.get("fidelity") not in verify.CLAIMING or d.get("claim_withheld"):
+        return None
+    a, n = (d.get("actual") or {}).get("peak_import_kwh"), (d.get("baseline") or {}).get("peak_import_kwh")
+    peak = n - a if grid and a is not None and n is not None else None
+    litres = d["litres_saved"] if genset and d.get("litres_saved") is not None else None
+    return peak, litres
+
+
+def _spark_energy(claimed: tuple[float | None, float | None] | None, grid: bool, genset: bool) -> dict:
+    """A day's energy bars (UX backend ask K13; plan D9.3): `peak_kwh_avoided` and `litres_saved` as the day claims them (`_claimed_energy`); 0 for a
+    day that claims nothing, as its `claimed_rs` is 0; null where the site has no grid (no peak import) or no genset (no fuel), or where the claiming
+    day does not carry the figure."""
+    if claimed is None:
+        return {"peak_kwh_avoided": 0.0 if grid else None, "litres_saved": 0.0 if genset else None}
+    return {"peak_kwh_avoided": None if claimed[0] is None else round(claimed[0], 1), "litres_saved": None if claimed[1] is None else round(claimed[1], 1)}
 
 
 def _month_native_block_days(site_id: str, t: date) -> int:
@@ -991,8 +1015,9 @@ def site_now(site_id: str):
     # each day row with its peak-window import (UX K12's This month); a day without a reading (today's, before its first minute) is no row
     tdays = _with_peak_import(s, [d for d in tdays if d.get("day")])
     td = next((d for d in tdays if d["day"] == t.isoformat()), td)
-    mtd, computed, spark, _ = _mtd_saving(site_id)
     a = s.get("assets") or {}
+    # the site's own grid and genset, as its fleet row reads them, so the spark's energy (UX K13) is the same in both
+    mtd, computed, spark, _ = _mtd_saving(site_id, grid=not _off_grid(s, (s.get("connections") or [None])[0]), genset=a.get("genset") is not None)
     caps = {"pv_kw": (a.get("pv") or {}).get("kw_ac"), "battery_kw": (a.get("battery") or {}).get("p_dis_kw"), "genset_kw": (a.get("genset") or {}).get("rated_kw"),
             "grid_kw": (s["connections"][0]["data"]["sanctioned_load_kw"] if s.get("connections") else None)}
     # the battery estimate shared by the site's open pages for a minute (battery.estimate; round 7, audit performance-live-02)
