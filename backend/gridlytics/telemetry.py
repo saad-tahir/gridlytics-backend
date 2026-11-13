@@ -829,6 +829,18 @@ def _write_days(site_id: str, ts: np.ndarray, cols: dict, texts: dict, spans: np
     return {"accepted": accepted, "overlap": overlap}
 
 
+def refuse_named_twice(content: bytes) -> None:
+    """Refuses (ValueError, in words) a file whose header names a column twice: the import reads a repeated name's last column, which the person
+    uploading would not expect. Only the header is read (audit R7 performance-live-04: the route parsed every row for the date window and the import
+    parsed them all again). The upload's route reads a file by it before import_csv, and the upload's preview (preview_csv) before its rows, so the
+    preview refuses such a file in the same words (UX K15 check: it answered the rows the upload then refused)."""
+    head = content[:_HEAD_BYTES].decode("utf-8-sig", errors="replace")
+    row = next(csv.reader(io.StringIO(head), delimiter=_dialect(head)[0]), None) or []
+    twice = sorted({h for h in row if h.strip() and row.count(h) > 1})
+    if twice:
+        raise ValueError(f"The header names {', '.join(twice[:5])} more than once: give each column once and upload again")
+
+
 class _Layout:
     """How a CSV is read (`_layout`): its mapping, date order, separator and decimal mark, header, each column's key, the notes of the header, each
     mapped key's factor (its unit and sign) and each key's column."""
@@ -1076,9 +1088,10 @@ def _value(key: str, v):
 
 def preview_csv(head: str, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None) -> dict:
     """How the upload will read a file (UX backend ask K15; plan D9.5, C11.4 stage 2): its head read with `mapping` (mapping_of; None reads the columns
-    by their names) and the time zone of its times (`tz_offset_h`), by the upload's own steps: _layout, _read_columns, the window, _in_order, the grid
-    signal, the step, _check_values and the voltage's grid state. Nothing is written. The first PREVIEW_ROWS rows are answered as they will be stored, in
-    time order: `at` the minute in Karachi time (ISO 8601, +05:00) and `values` each key read in its stored unit and the product's sign (battery
+    by their names) and the time zone of its times (`tz_offset_h`), by the upload's own steps: refuse_named_twice, _layout, _read_columns, the window,
+    _in_order, the grid signal, the step, _check_values and the voltage's grid state. Nothing is written. The first PREVIEW_ROWS rows are answered as
+    they will be stored, in time order: `at` the minute the row is stored on, in Karachi time (ISO 8601, +05:00), and `values` each key read in its
+    stored unit and the product's sign (battery
     discharge and grid import positive), the grid's and the genset's state as true or false, an unreadable or impossible reading None; an energy column
     is the row's own figure, which the upload spreads over the minutes the row stands for (`step_min`). With the keys read (in the file's order), the
     rows read and skipped (no readable time; the first such cell), the date order used, the header's notes and the readings' warnings, as the upload
@@ -1088,7 +1101,9 @@ def preview_csv(head: str, tz_offset_h: float = 0.0, mapping: dict | None = None
     except (ValueError, OverflowError, TypeError):
         raise ValueError("The timezone offset is hours from UTC, between -23 and 23") from None
     content = _whole_lines(head).encode("utf-8")
-    lay = _layout(content, mapping, "auto")
+    m = mapping_of(mapping) if mapping else None         # in the upload's order: its route reads the mapping, then the header's names, then the file
+    refuse_named_twice(content)
+    lay = _layout(content, m, "auto")
     log = list(lay.log)
     parsed, bad_ts, first_bad = _read_columns(content, lay.delim, lay.decimal, lay.at, lay.scale, tz_offset_h, lay.ts_format)
     if not parsed.ts:
@@ -1117,7 +1132,8 @@ def preview_csv(head: str, tz_offset_h: float = 0.0, mapping: dict | None = None
     rows = []
     for i in range(min(PREVIEW_ROWS, len(ts))):
         values = {k: _value(k, cols[k][i] if k in cols else texts[k][i]) for k in keys}
-        rows.append({"at": datetime.fromtimestamp(int(ts[i]), PKT).isoformat(timespec="seconds"), "values": values})
+        # the minute the upload stores the row on (_write_days), not the file's second (UX K15 check)
+        rows.append({"at": datetime.fromtimestamp(int(ts[i]) // 60 * 60, PKT).isoformat(timespec="seconds"), "values": values})
     return {"rows": rows, "keys": keys, "read": read, "skipped": bad_ts, "first_unreadable": first_bad, "step_min": step, "ts_format": lay.ts_format,
             "tz_offset_h": tz_offset_h, "notes": log, "warnings": warnings}
 

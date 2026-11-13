@@ -92,6 +92,24 @@ def test_what_the_preview_reads_is_what_the_upload_stores(world):
             assert (s >= 0.5) == v if key == "grid_present" else abs(s - v) < 1e-6, (i, key, s, v)
 
 
+def test_a_row_s_time_is_the_minute_it_is_stored_on(world):
+    """A logger that writes seconds: the upload stores each row on its minute, and the preview's `at` is that minute, not the file's second (UX K15
+    check)."""
+    head = ("ts,grid_present,load_power_w\n"
+            "2026-03-01T00:00:30+05:00,1,1000\n"
+            "2026-03-01T00:01:30+05:00,1,1100\n"
+            "2026-03-01T00:02:59+05:00,0,1200\n")
+    rows = _preview(world, {"head": head}).json()["rows"]
+    assert [x["at"] for x in rows] == ["2026-03-01T00:00:00+05:00", "2026-03-01T00:01:00+05:00", "2026-03-01T00:02:00+05:00"], rows
+    up = world.c["operator"].post(f"/api/sites/{world.site}/telemetry/upload", content=head, headers={"Content-Type": "text/csv"})
+    assert up.status_code == 200, up.text
+    with world.use():
+        t0 = int(datetime(2026, 3, 1, tzinfo=PKT).timestamp())
+        stored = telemetry.raw(world.site, t0, t0 + 180, ("load_power_w",))
+    assert [datetime.fromtimestamp(int(t), PKT).isoformat() for t in stored["ts"]] == [x["at"] for x in rows]
+    assert [float(v) for v in stored["load_power_w"]] == [x["values"]["load_power_w"] for x in rows]
+
+
 def test_a_head_cut_in_the_middle_of_a_line_reads_its_whole_lines_only(world):
     cut = VENDOR[: VENDOR.index("01/03/2026 00:05") + 12]          # "01/03/2026 0" of the last line
     got = _preview(world, {"head": cut, "mapping": MAPPING, "tz_offset_h": 5}).json()
@@ -118,7 +136,9 @@ def test_what_the_upload_refuses_the_preview_refuses_in_the_same_words(world):
     no_grid = "ts,pv_power_w\n2026-03-01T00:00:00Z,5\n"
     unreadable = "ts,grid_present\nsoon,1\n"
     future = "ts,grid_present\n2099-01-01T00:00:00Z,1\n"
-    for head in (no_ts, no_grid, unreadable, future):
+    # a header that names a column twice: the upload's route refuses it before reading a row (UX K15 check: the preview read it)
+    named_twice = "ts,grid_present,load_power_w,load_power_w\n2026-03-01T00:00:00+05:00,1,1000,2000\n2026-03-01T00:01:00+05:00,1,1000,2000\n"
+    for head in (no_ts, no_grid, unreadable, future, named_twice):
         up = op.post(f"/api/sites/{sid}/telemetry/upload", content=head, headers={"Content-Type": "text/csv"})
         pre = _preview(world, {"head": head})
         assert up.status_code == pre.status_code == 422, (head, up.text, pre.text)
@@ -143,6 +163,13 @@ def test_only_the_roles_that_upload_preview_and_another_company_s_site_is_no_sit
         assert r.status_code == status, (role, r.text)
         if status == 403:
             assert "Rs" not in r.json()["detail"], r.text
+            # the role is refused first, whatever JSON the body holds (UX K15 check: a body that was not an object was the framework's 422)
+            for odd in ([], "x", 5, None):
+                r = world.c[role].post(URL.format(world.site), json=odd)
+                assert (r.status_code, r.json()["detail"]) == (403, "Previewing a file's rows is for an administrator or an operator"), (role, odd, r.text)
+    for odd in ([], "x", 5, None):
+        r = world.c["operator"].post(URL.format(world.site), json=odd)
+        assert (r.status_code, r.json()["detail"]) == (422, "Send the file's head as a set of named values: head, mapping and tz_offset_h"), (odd, r.text)
     assert world.anon.post(URL.format(world.site), json=body, headers=world.key(["telemetry:write", "sites:read"])).status_code == 403
     other = identities.company("Another company", own_file=True)
     with store.use_company(platformdb.company_file(other)):
