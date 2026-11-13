@@ -305,6 +305,14 @@ def delivered_floor_pct(site: dict) -> float:
     return delivery.fallback_floor(fallback_floor_pct(site), bms_low_pct(site))
 
 
+def grid_floor(site: dict) -> float:
+    """The state of charge (a share) the plan holds on its grid-up steps (`soc_floor_grid`): the delivered floor (delivered_floor_pct), never above the
+    battery's highest state of charge, which it cannot be charged past. Set-up's reserve figures read the same floor (setup_check.reserve_figures; UX K6
+    check: a floor typed above the highest state of charge counted energy the battery never holds)."""
+    battery = (site.get("assets") or {}).get("battery") or {}
+    return min(float(battery.get("soc_max", 0.95)), delivered_floor_pct(site) / 100.0)
+
+
 def terminal_cal_hold(b_cal: np.ndarray, c_imp: np.ndarray, load: np.ndarray, pv: np.ndarray, off_grid: bool) -> float:
     """The terminal value's c_cal_hold (Part 4.4): the calendar cost of holding a kWh from the horizon's end until the next peak uses it, the
     sum of the per-step slopes over the steps between (round 7, engine-optimiser-10: it was the mean slope of 32 steps, one 15-minute step's
@@ -473,7 +481,7 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                "b_cal": optimise.calendar_slope(temp, b_asset["replacement_cost_per_kwh"]) if d.get("calendar_cost_on", True) else np.zeros(steps),
                "charge_block": mask["charge_block"],
                # the floor the delivered table and the fallback hold with the grid up (round 7, engine-delivery-02); never above soc_max
-               "soc_floor_grid": min(float(b_asset["soc_max"]), delivered_floor_pct(site) / 100.0),
+               "soc_floor_grid": grid_floor(site),
                # the site's daily cycle cap (round 7, brief-vs-build-04): kWh discharged per local day, at most cycle_cap_per_day times E_nom (a
                # cycle as the battery page counts it), less what the battery discharged since midnight on t0's day
                "cycle_cap_kwh": float(d.get("cycle_cap_per_day", 1.5)) * e_nom,

@@ -168,8 +168,16 @@ def test_an_operator_reads_the_figures_without_the_wear_cost_and_a_viewer_and_a_
 
 
 def test_another_company_s_site_is_no_site_here(world):
+    """The route answers this company's site (so a 404 below is its own refusal, not a path that is not served), and another company's site, with a
+    connection and a battery, is no site here, for every role that reads the check (UX K6 check)."""
     other = identities.company("Another company", own_file=True)
     from gridlytics import platform as platformdb
     with store.use_company(platformdb.company_file(other)):
         theirs = sites.create({"name": "Their Mill", "disco": "LESCO"}, "t")["id"]
-    assert _check(world, {}, site=theirs).status_code == 404
+        held = sites.put_connection(theirs, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400}, "t")
+        sites.put_asset(theirs, "battery", {"nameplate_kwh": 100, "p_ch_kw": 50, "p_dis_kw": 50}, "t")
+    for role in ("admin", "operator", "analyst"):
+        assert _check(world, {}, role).status_code == 200, role
+        for body in ({}, {"assets": {"battery": AH_BATTERY}}, {"connection": {"id": held["id"], "tariff_category": "B-2(b)"}}):
+            r = _check(world, body, role, site=theirs)
+            assert (r.status_code, r.json()["detail"]) == (404, "No such site"), (role, r.text)

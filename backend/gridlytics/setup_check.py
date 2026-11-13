@@ -36,6 +36,8 @@ PERCENT_WORDS = {("battery", "soh"): "The state of health is a percent above 30,
 _RANGE = {"greater_than", "greater_than_equal", "less_than", "less_than_equal", "float_type", "float_parsing"}
 #: The load a genset's fuel an hour is given at, as shares of its rating (plan C5.5: "At half load about 68 L/h; at full load about 122 L/h")
 HALF, FULL = 0.5, 1.0
+#: The site's fields the reserve's figures read (reserve_figures): a problem in one of them holds the figures back; a problem elsewhere does not
+RESERVE_FIELDS = ("critical_load_kw", "reserve_policy")
 
 
 class SetupAssetsIn(Strict):
@@ -84,11 +86,19 @@ def _without(fields: dict) -> dict:
 
 
 def _site_section(stored: dict, sent: dict | None) -> tuple[dict | None, list[dict]]:
-    """The site's fields as the save would store them: the sent ones over the stored ones. A stored key the model does not know (a demo site's `twin`)
-    sent back unchanged is no field of the form, as sites.update takes it."""
+    """The site's fields as the save would store them: the sent ones over the stored ones, and every problem. A stored key the model does not know (a
+    demo site's `twin`) sent back unchanged is no field of the form, as sites.update takes it. With problems, the site as it would be is the sent
+    fields that have none over the stored ones (a field with a problem counts as stored, as a section with problems does for the warnings), so the
+    warnings and the reserve read the fields typed beside an empty name (UX K6 check); None where even that cannot be read."""
     known = {k: v for k, v in stored.items() if k in sites.SiteFields.model_fields}
     sent = {k: v for k, v in _without(sent or {}).items() if k in sites.SiteFields.model_fields or stored.get(k) != v}
-    return _section(sites.SiteFields, {**known, **sent}, ("site",), lambda loc: SITE_STEPS.get(str(loc[0]), "a") if loc else "a", "site")
+    step_of = lambda loc: SITE_STEPS.get(str(loc[0]), "a") if loc else "a"  # noqa: E731
+    data, found = _section(sites.SiteFields, {**known, **sent}, ("site",), step_of, "site")
+    if data is None:
+        bad = {p["path"][1] for p in found if len(p["path"]) > 1}
+        if bad and all(p["path"][1:2] for p in found):
+            data, _ = _section(sites.SiteFields, {**known, **{k: v for k, v in sent.items() if k not in bad}}, ("site",), step_of)
+    return data, found
 
 
 def battery_figures(b: dict, money_settings: bool) -> dict:
@@ -116,26 +126,30 @@ def genset_figures(g: dict) -> dict:
 
 
 def reserve_figures(data: dict, b: dict, inverter: dict | None) -> dict:
-    """What the reserve floor holds for an outage (plan C7.4): the floor the plan and the fallback keep with the grid up (plans.delivered_floor_pct:
-    the reserve floor, never under the battery's cut-off plus 2 points or 10 %), the energy the battery gives the load between it and the battery's own
-    cut-off (where an outage takes it to, after its discharge losses), and the minutes of the critical load's highest hour that carries; the power
-    the battery gives (its discharge power, or the inverter's AC size where that is smaller)."""
-    floor = plans.delivered_floor_pct({"data": data, "assets": {"battery": b}})
-    low = float(b["soc_min"]) * 100
-    held = max(0.0, floor - low) / 100.0 * float(b["nameplate_kwh"]) * float(b.get("soh", 1.0)) * float(b.get("eta_d", 0.95))
+    """What the reserve floor holds for an outage (plan C7.4): the floor the plan keeps with the grid up (plans.grid_floor, the plan's own: the reserve
+    floor, never under the battery's cut-off plus 2 points or 10 %, and never above its highest state of charge), the energy the battery gives the load
+    between it and the battery's own cut-off (where an outage takes it to, after its discharge losses), and the minutes of the critical load's highest
+    hour that carries; the power the battery gives (its discharge power, or the inverter's AC size where that is smaller)."""
+    floor = plans.grid_floor({"data": data, "assets": {"battery": b}})
+    low = float(b["soc_min"])
+    held = max(0.0, floor - low) * float(b["nameplate_kwh"]) * float(b.get("soh", 1.0)) * float(b.get("eta_d", 0.95))
     crit = max([float(x) for x in data.get("critical_load_kw") or [] if isinstance(x, (int, float))] or [0.0])
     gives = min(float(b["p_dis_kw"]), float(inverter["kw_ac"])) if inverter else float(b["p_dis_kw"])
-    return {"floor_pct": round(floor, 1), "floor_set_pct": float((data.get("reserve_policy") or {}).get("min_soc_pct", 20.0)), "battery_low_pct": round(low, 1),
+    return {"floor_pct": round(floor * 100, 1), "floor_set_pct": float((data.get("reserve_policy") or {}).get("min_soc_pct", 20.0)),
+            "battery_low_pct": round(low * 100, 1),
             "held_kwh": round(held, 2), "critical_kw": crit, "minutes": round(held / crit * 60.0, 1) if crit > 0 else None, "battery_kw": round(gives, 2)}
 
 
-def run(s: dict, site_in: dict | None, assets_in: dict | None, connection_in: dict | None, money_settings: bool) -> dict:
-    """The check of `s` (full() of the site) with the sections as typed. Raises UnknownConnection for a connection id the site does not have."""
-    problems: list[dict] = []
+def run(s: dict, site_in: dict | None, assets_in: dict | None, connection_in: dict | None, money_settings: bool,
+        refused: list[dict] | None = None) -> dict:
+    """The check of `s` (full() of the site) with the sections as typed. `refused` are the problems the reader's role would meet on saving them (a
+    change the save refuses with 403, each on its field: routes_sites._validate_refusals). Raises UnknownConnection for a connection id the site does
+    not have."""
+    problems: list[dict] = list(refused or [])
     data, found = _site_section(s.get("data") or {}, site_in)
     problems += found
-    site_ok = data is not None
-    data = data if site_ok else {k: v for k, v in (s.get("data") or {}).items()}
+    site_read = data is not None
+    data = data if site_read else {k: v for k, v in (s.get("data") or {}).items()}
     held = {r: {k: v for k, v in a.items() if k != "id"} for r, a in (s.get("assets") or {}).items()}
     assets, failed = dict(held), {}
     for role, fields in (assets_in or {}).items():
@@ -167,11 +181,13 @@ def run(s: dict, site_in: dict | None, assets_in: dict | None, connection_in: di
         not_derived["battery"] = not_derived["reserve"] = failed["battery"]
     elif bat:
         derived["battery"] = battery_figures(bat, money_settings)
-        if not site_ok:
-            not_derived["reserve"] = next(p["message"] for p in problems if p["path"][0] == "site")
+        # the reserve reads the critical load and the reserve policy: only a problem in one of them holds it back (any, where the site as it would be
+        # cannot be read at all); the inverter is the site's as it would be, the stored one where the typed one has a problem, as for the warnings
+        held_back = [p["message"] for p in problems if p["path"][0] == "site" and (not site_read or p["path"][1:2] and p["path"][1] in RESERVE_FIELDS)]
+        if held_back:
+            not_derived["reserve"] = held_back[0]
         else:
-            inverter = assets.get("inverter") if "inverter" not in failed else None
-            derived["reserve"] = reserve_figures(data, bat, inverter)
+            derived["reserve"] = reserve_figures(data, bat, assets.get("inverter"))
     if "genset" in failed:
         not_derived["genset"] = failed["genset"]
     elif assets.get("genset"):

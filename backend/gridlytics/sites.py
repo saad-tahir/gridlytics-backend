@@ -12,7 +12,7 @@ import math
 import re
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -49,6 +49,10 @@ class DataSource(Strict):
     at: str | None = Field(None, max_length=40)
 
 
+#: The largest hour of a critical load (kW), the typical peak load's own bound
+CRITICAL_LOAD_MAX_KW = 100000
+
+
 class SiteFields(Strict):
     name: str = Field(min_length=1, max_length=120)
     address: str = Field("", max_length=300)
@@ -64,7 +68,9 @@ class SiteFields(Strict):
     #: the reserve floor plus 5 points whatever the controller did); None: that assumption (genset_start_soc), which the web app marks Preliminary
     genset_start_soc_pct: float | None = Field(None, gt=0, le=100, title="The state of charge the genset starts at (%)")
     outage_load_mode: Literal[0, 1] = Field(0, title="What the genset carries in an outage")
-    critical_load_kw: list[float] = Field(default_factory=lambda: [0.0] * 24, min_length=24, max_length=24, title="The critical load (kW)")
+    #: each hour's critical load, 0 or more (plan C7.3; UX K6 check: a negative hour was stored, and counted as load the battery need not carry)
+    critical_load_kw: list[Annotated[float, Field(ge=0.0, le=CRITICAL_LOAD_MAX_KW)]] = Field(default_factory=lambda: [0.0] * 24, min_length=24,
+                                                                                         max_length=24, title="The critical load (kW)")
     voll_rs_per_kwh: float = Field(500.0, ge=0.0, le=10000.0, title="The value of lost load (Rs per kWh)")
     reserve_policy: ReservePolicy = ReservePolicy()
     cycle_cap_per_day: float = Field(1.5, ge=0.1, le=5.0, title="The cycle cap (full cycles a day)")
@@ -840,6 +846,12 @@ def setup_warnings(site: dict) -> list[str]:
         if crit > (inv if by_inverter else bat["p_dis_kw"]):
             what = f"the battery can give through the inverter ({kw(inv)})" if by_inverter else f"the battery's discharge power ({kw(bat['p_dis_kw'])})"
             out.append(f"The critical load ({kw(crit)} at most) is more than {what}: it cannot carry it alone in an outage")
+    # the battery cannot be charged past its highest state of charge, so the plan holds a floor typed above it there (plans.grid_floor; UX K6 check)
+    policy = d.get("reserve_policy") if isinstance(d.get("reserve_policy"), dict) else {}
+    floor, top = policy.get("min_soc_pct", 20.0), bat.get("soc_max")
+    if _number(floor) and _number(top) and floor > top * 100 + 1e-9:
+        out.append(f"The reserve floor ({_num(float(floor))} %) is above the battery's highest state of charge ({_num(top * 100)} %): the plan holds the "
+                   f"reserve at {_num(top * 100)} %")
     if crit > 0 and d.get("load_peak_kw") and crit > d["load_peak_kw"]:
         out.append(f"The critical load ({kw(crit)} at most) is above the typical peak load ({kw(d['load_peak_kw'])}): check both")
     # the outage model pools the company's sites on one feeder or transformer code (forecast: sites.outage_unit, "the key the outage model pools on")

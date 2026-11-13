@@ -536,10 +536,49 @@ def site_validate(site_id: str, inp: dict = Body(...)):
     assets_in = {role: (_with_held_money(role, dict(fields), held.get(role)) if isinstance(fields, dict) else fields)
                  for role, fields in (req.assets.sent() if req.assets else {}).items()}
     try:
-        answer = setup_check.run(s, req.site, assets_in, req.connection, money_settings=auth.can("see_money_settings"))
+        answer = setup_check.run(s, req.site, assets_in, req.connection, money_settings=auth.can("see_money_settings"),
+                                 refused=_validate_refusals(s, req.site, assets_in))
     except setup_check.UnknownConnection:
         raise Refusal(404, "This site has no such connection", "not_found") from None
     return out(answer)
+
+
+def _refusal_words(permission: str, doing: str) -> str:
+    """auth.need's refusal in its own words, without raising it (auth.py is lifted from Solarlytics and is left as reviewed): test_ux_k06_check
+    holds each one equal to the save's own 403."""
+    return f"{doing} is for {auth.roles_words(permission)}"
+
+
+def _validate_refusals(s: dict, site_in: dict | None, assets_in: dict) -> list[dict]:
+    """What the reader's own saves of the sections would refuse with 403 (UX K6 check: an operator's check said a step was fine whose save was then
+    refused), each a problem on the field it concerns, in the save's words, by the saves' own rules: a control limit changed without manage_sites
+    (site_update's _limits_changed, field by field), a money setting of the site or of its equipment changed without edit_money_settings
+    (_need_money_settings, the equipment's after _with_held_money, as asset_put takes it), and equipment whose money settings an administrator set
+    unticked without it (asset_delete)."""
+    out: list[dict] = []
+    data, held = s.get("data") or {}, s.get("assets") or {}
+    site_in = site_in or {}
+    if not auth.can("manage_sites"):
+        out += [setup_check._problem(setup_check.SITE_STEPS.get(k, "a"), ("site", k), _refusal_words("manage_sites", "Changing the site's control limits"))
+                for k in SITE_LIMIT_FIELDS if k in site_in and _limits_changed({k: site_in[k]}, data)]
+    if auth.can("edit_money_settings"):
+        return out
+    before = {**_defaults(sites.SiteFields, SITE_MONEY_FIELDS), **data}
+    out += [setup_check._problem(setup_check.SITE_STEPS.get(k, "a"), ("site", k),
+                                 _refusal_words("edit_money_settings", "Changing the site's value of lost load or wear costing"))
+            for k in SITE_MONEY_FIELDS if k in site_in and site_in[k] != before.get(k)]
+    for role, fields in assets_in.items():
+        names = ASSET_MONEY_FIELDS.get(role, ())
+        if fields is None:
+            if _money_set(role, held.get(role)):
+                out.append(setup_check._problem("b", ("assets", role), _refusal_words(
+                    "edit_money_settings", "Removing equipment whose money settings (prices and wear) an administrator set")))
+            continue
+        before = {**_defaults(sites.ASSET_MODELS[role], names), **(held.get(role) or {})}
+        out += [setup_check._problem("b", ("assets", role, k), _refusal_words("edit_money_settings",
+                                                                             "Changing the equipment's money settings (prices and wear)"))
+                for k in names if isinstance(fields, dict) and k in fields and fields[k] != before.get(k)]
+    return out
 
 
 @router.post("/api/sites/{site_id}/activate")
