@@ -640,6 +640,25 @@ def test_each_reader_is_offered_the_alert_kinds_it_receives_for_email(walk):
             assert set(body["follow"]) <= set(body["categories"]) and set(body["email_kinds"]) <= set(body["categories"]), r
 
 
+def test_the_filtered_audit_trail_and_its_export_are_the_administrator_s_alone(walk):
+    """UX backend ask K34 (plan G2.4): the company trail's filtered page and its CSV need manage_users (the trail holds the fee and fuel prices): the
+    operator, the viewer and a key are refused with no rupee; the administrator reads the page with its groups and people."""
+    client, h = walk["client"], walk["headers"]
+    got = walk["answers"]["/api/audit/search"]["/api/audit/search"]
+    assert {r: s for r, (s, _) in got.items()} == {"admin": 200, "operator": 403, "viewer": 403}
+    assert client.get("/api/audit/search", headers=h["key"]).status_code == 403
+    page = got["admin"][1]
+    assert page["total"] >= len(page["entries"]) > 0 and page["groups"] and page["people"]
+    assert all(e["at"].endswith("+05:00") for e in page["entries"])
+    for reader in READERS:
+        r = client.get("/api/audit/export.csv", headers=h[reader])
+        assert r.status_code == (200 if reader == "admin" else 403), (reader, r.text[:200])
+        if reader != "admin":
+            assert not RUPEES.search(r.text), reader
+        else:
+            assert r.headers["content-type"].startswith("text/csv") and r.text.startswith("at_karachi,who,email,action,group,target,site,detail")
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

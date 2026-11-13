@@ -19,18 +19,18 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES as _GZIP_SKIPPED
 
-from . import __version__, access_requests, apikeys, auth, backups, companies, identity, money, store, store_members, telemetry, version
+from . import __version__, access_requests, apikeys, audit_trail, auth, backups, companies, identity, money, store, store_members, telemetry, version
 from . import platform as platformdb
 from .schemas import Refusal
 
@@ -760,8 +760,44 @@ def users_unlock(user_id: str, inp: dict | None = Body(None)):
 
 @app.get("/api/audit")
 def audit_list(offset: int = 0):
+    """The company's trail as today's Audit trail page reads it: a list, 300 lines from `offset`, newest first. The filtered page is /api/audit/search."""
     auth.need("manage_users")
     return store.list_audit(offset=max(0, offset))
+
+
+def _trail_filters(who, group, site, day_from, day_to, q) -> dict:
+    return {"who": who, "group": group, "site": site, "day_from": day_from, "day_to": day_to, "q": q}
+
+
+@app.get("/api/audit/search")
+def audit_search(who: str | None = None, group: str | None = None, site: str | None = None, day_from: str | None = Query(None, alias="from"),
+                 to: str | None = None, q: str | None = None, offset: str | None = None):
+    """The company's trail, filtered (UX backend ask K34; plan G2.4, G9 item 3): who (a person's id, "demo", or the product's own word), the kind of
+    change (`group`), the site, From and To (Karachi days, both included) and a search (`q`), a page of 300 lines newest first, as {entries, total,
+    offset, limit, groups, people}. Times in Karachi time. manage_users, as the trail."""
+    auth.need("manage_users", "Reading the audit trail")
+    try:
+        return audit_trail.company_search(**_trail_filters(who, group, site, day_from, to, q), offset=offset)
+    except audit_trail.Refused as exc:
+        raise Refusal(422, str(exc), "invalid") from None
+
+
+@app.get("/api/audit/export.csv")
+def audit_export(who: str | None = None, group: str | None = None, site: str | None = None, day_from: str | None = Query(None, alias="from"),
+                 to: str | None = None, q: str | None = None):
+    """The filtered trail as CSV (plan G2.4's Export as CSV; UX K34), with the same filters as /api/audit/search, every line they match (at most
+    audit_trail.EXPORT_MAX), times in Karachi time with their offset. The administrator's: manage_users to read the trail, export to download it."""
+    auth.need("manage_users", "Reading the audit trail")
+    auth.need("export", "Exporting the audit trail")
+    filters = _trail_filters(who, group, site, day_from, to, q)
+    try:
+        text, lines = audit_trail.company_csv(**filters)
+    except audit_trail.Refused as exc:
+        raise Refusal(422, str(exc), "invalid") from None
+    given = {("from" if k == "day_from" else "to" if k == "day_to" else k): v for k, v in filters.items() if v}
+    store.audit(auth.actor(), "exported the audit trail", "", {"lines": lines, **given})
+    day = datetime.now(audit_trail.PKT).date().isoformat()
+    return PlainTextResponse(text, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="audit-trail-{day}.csv"'})
 
 
 # ------------------------------------------------------------------------------------------------ the feature routes

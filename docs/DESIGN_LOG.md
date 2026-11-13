@@ -687,6 +687,29 @@ committed (backend 1753 passed; web gates clean). Two defects were found and fix
   - **Left for the owner:** the redesigned My account has no control for the inbox's own `follow` list (G3.4 has none, since it believed nothing
     read it). Whether the inbox keeps following it (today's page and the inbox's "Show every kind" still set and lift it), or lists every kind the
     role receives, is the owner's call.
+- **K34, filters on both audit trails** (plan G9 item 3, G2.4, G4.5): one module, `audit_trail.py`, holds each trail's groups (the "Kind of change"
+  select's: People and keys, Sites and set-up, Plans and control, Tariffs and money, Savings and pilot, Reports and exports, Demo; the founder's
+  Sign-ins, Refused sign-ins, Companies, Accounts and memberships, Backups, Access requests) as one map from an action's words to its group,
+  registered as an SQLite function so a page and its count are one query each; a test reads every `store.audit(...)` and `founder_audit(...)` call
+  of the backend and its scripts and fails on an action of no group. Filters: who, the kind (`group`), the site (the line's target, or the site its
+  detail names) or the company, From and To (Karachi days, both included), and a search of who, what, of and the detail (a site's name finds its
+  lines). Owner's question Q79 (the audit filters, which need this): built, as the owner wants the whole plan.
+  - **The company trail's filtered page is a new path,** `GET /api/audit/search` (`{entries, total, offset, limit, groups, people}`), where the plan
+    names `GET /api/audit` answering `{entries, total}`: today's Audit trail tab reads `GET /api/audit` as a list, and this lane merges before step
+    14 rebuilds the tab, so changing that answer's shape would break the page in between (the lane's rule: each ask's fallback keeps the page of
+    before working). `GET /api/audit` is unchanged; step 14 moves to the new path and the old one can go after it.
+  - **`people`** is who is in the trail (the Who select: "the people in the trail, plus Gridlytics (demo set-up)"), one `who` each: the person's id,
+    `demo` for the demo set-up whoever loaded it, else the product's own word (`system`, `edge`, `shipped`).
+  - **CSV:** `GET /api/audit/export.csv` with the same filters (the administrator's: `manage_users` to read the trail and `export` to download it),
+    every matching line (at most 100,000), times in Karachi time with their offset, the detail as JSON, a cell a spreadsheet would read as a formula
+    quote-prefixed; audited "exported the audit trail" with the filters given (Reports and exports).
+  - **The founder's trail keeps each line's company** (platform.db schema 5, `founder_audit.company_id`, the copy to `backup/` first as every
+    registry migration): each console line of a company is written with it; the lines before are filled from the company's name in them (a
+    company's own lines and a backup's by their target, a membership's or an account's by the detail's `company`), by today's names and the
+    names before a rename. A name two companies share, or none has, leaves a line of no company: it is listed unfiltered only. `GET
+    /api/founder/audit` keeps `{entries}` and gains `total`, `offset`, `limit` and `groups`; each line its `group`, `company_id` and
+    `company_name`; its `at` is Karachi time now, where it was UTC (the same moment).
+  - Every time the new answers give is Karachi time; the company trail's `at` in `GET /api/audit` stays as today's page reads it.
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

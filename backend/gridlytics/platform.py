@@ -1,6 +1,6 @@
 """The platform's registry, `platform.db`: companies, the accounts of local sign-in, memberships, refresh tokens, the founder's audit and the record of sign-ins
 (the owner's decisions of 24 October 2026, sections 1, 2 and 5; stage P1 of the sign-in and split), and the access requests sent to the founder from the
-contact page (schema 4; access_requests.py; UX backend asks K2 and K3).
+contact page (schema 4; access_requests.py; UX backend asks K2 and K3); schema 5 keeps the company a line of the founder's audit is of (UX K34).
 
 One server keeps a database per company (`companies/<id>.db`, a full workspace each) and this one registry beside them. The data folder is GRIDLYTICS_DATA_DIR
 when it is set, and otherwise the folder of `store.DB_PATH`, read at every call: a test or a scratch run that moves the workspace's file moves the registry
@@ -36,7 +36,7 @@ from pathlib import Path
 
 from . import auth, identity, store
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 #: An access token's life (Supabase's default, decisions-v2 section 1)
 ACCESS_MINUTES = 60
 #: A refresh token not used for this long has ended; a session ends this many days after its sign-in, however used (the cookie sessions' rules)
@@ -155,7 +155,50 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
             sent_by TEXT)""")
         con.execute("CREATE INDEX IF NOT EXISTS access_requests_received ON access_requests(received_at)")
         con.execute("CREATE INDEX IF NOT EXISTS access_requests_state ON access_requests(state, received_at)")
+    if version < 5:
+        # the company a line of the founder's audit is of, for the console's Company filter (UX backend ask K34; plan G4.5, G9 item 3): given where a
+        # line is written with one, and filled here for the lines before it from the company's name in them (_backfill_audit_companies).
+        # _connect() has copied the file to backup/ before this runs
+        if "company_id" not in {r[1] for r in con.execute("PRAGMA table_info(founder_audit)")}:
+            con.execute("ALTER TABLE founder_audit ADD COLUMN company_id TEXT NOT NULL DEFAULT ''")
+        con.execute("CREATE INDEX IF NOT EXISTS founder_audit_company ON founder_audit(company_id, id)")
+        _backfill_audit_companies(con)
     con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+#: The founder's audit lines whose target is a company's name (the rest name it in their detail's `company`, if at all)
+_COMPANY_TARGETS = ("made a company", "changed a company", "switched Gridlytics on", "switched Gridlytics off", "archived a company",
+                    "brought a company back from the archive", "made a backup")
+
+
+def _backfill_audit_companies(con: sqlite3.Connection) -> None:
+    """The company of each founder's audit line written before lines kept it (schema 5): the company named by the line (its target for a company's own
+    lines and a backup's, else its detail's `company`), by the names companies have now and had before a rename (a "changed a company" line's name
+    from and to). A name two companies share, or none has, leaves the line of no company."""
+    rows = con.execute("SELECT id, name FROM companies").fetchall()
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["name"]] = counts.get(r["name"], 0) + 1
+    names = {r["name"]: r["id"] for r in rows if counts[r["name"]] == 1}
+    lines = con.execute("SELECT id, action, target, detail FROM founder_audit ORDER BY id DESC").fetchall()
+    for r in lines:                                # newest first: a rename's new name is known before its old one
+        if r["action"] != "changed a company":
+            continue
+        try:
+            change = (json.loads(r["detail"] or "{}") or {}).get("name") or {}
+        except ValueError:
+            continue
+        before, after = change.get("from"), change.get("to")
+        if isinstance(before, str) and isinstance(after, str) and after in names and before not in names:
+            names[before] = names[after]
+    for r in lines:
+        try:
+            detail = json.loads(r["detail"] or "{}")
+        except ValueError:
+            detail = {}
+        name = r["target"] if r["action"] in _COMPANY_TARGETS else (detail.get("company") if isinstance(detail, dict) else None)
+        if isinstance(name, str) and name in names:
+            con.execute("UPDATE founder_audit SET company_id = ? WHERE id = ?", (names[name], r["id"]))
 
 
 def _connect() -> sqlite3.Connection:
@@ -768,9 +811,17 @@ def clear_lock(email: str, account_id: str, by: str) -> None:
 
 # ------------------------------------------------------------------------------------------------ the founder's audit (decisions-v2 section 4)
 
-def founder_audit(action: str, target: str = "", detail: dict | None = None, actor: str = "founder") -> None:
+def founder_audit(action: str, target: str = "", detail: dict | None = None, actor: str = "founder", company_id: str = "") -> None:
+    """One line of the founder's audit: what was done (its words are grouped in audit_trail.FOUNDER_GROUPS), to what, the detail, by whom, and the
+    company it is of when it is of one (the console's Company filter; UX K34)."""
     with _write() as con:
-        con.execute("INSERT INTO founder_audit (at, actor, action, target, detail) VALUES (?,?,?,?,?)", (_now(), actor, action, target, json.dumps(detail or {})))
+        con.execute("INSERT INTO founder_audit (at, actor, action, target, detail, company_id) VALUES (?,?,?,?,?,?)",
+                    (_now(), actor, action, target, json.dumps(detail or {}), company_id or ""))
+
+
+def reading():
+    """A connection to the registry for reading, closed at the end of the block (the founder's audit's filtered pages: audit_trail.founder_search)."""
+    return _read()
 
 
 def list_founder_audit(limit: int = 300, offset: int = 0) -> list[dict]:

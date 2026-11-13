@@ -327,6 +327,38 @@ def test_my_account_offers_each_role_the_alert_kinds_it_receives(world):
     assert r.json()["follow"] == r.json()["categories"]
 
 
+def _founder(monkeypatch) -> dict:
+    from gridlytics import founder
+    for name, value in (("GRIDLYTICS_FOUNDER_USERNAME", "founder"), ("GRIDLYTICS_FOUNDER_PASSWORD_HASH", founder.hash_password("a made-up walk password")),
+                        ("GRIDLYTICS_FOUNDER_TOTP_SECRET", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
+                        ("GRIDLYTICS_FOUNDER_SESSION_SECRET", "a made-up founder session secret of the api walk")):
+        monkeypatch.setenv(name, value)
+    return {"x-founder-session": founder.new_token()[0]}
+
+
+def test_the_administrator_filters_and_exports_the_audit_trail_and_the_founder_filters_theirs(world, monkeypatch):
+    """UX backend ask K34 (plan step 14): the company trail filtered by who, site and days with its total and its CSV, for the administrator alone;
+    the founder's audit filtered by company, each line with its company."""
+    client, password, _ = world
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    page = client.get("/api/audit/search", headers=owner).json()
+    assert page["total"] >= len(page["entries"]) > 0 and [g["key"] for g in page["groups"]][0] == "people"
+    sid = client.get("/api/fleet", headers=owner).json()["sites"][0]["id"]
+    on_site = client.get("/api/audit/search", params={"site": sid}, headers=owner).json()
+    assert all(e["site_id"] == sid for e in on_site["entries"]) and on_site["total"] <= page["total"]
+    demo = client.get("/api/audit/search", params={"who": "demo"}, headers=owner).json()          # the demo set-up's lines (the seed's too)
+    assert demo["total"] >= 1 and {e["who"] for e in demo["entries"]} == {"demo"} and "demo" in {p["who"] for p in page["people"]}
+    csv_text = client.get("/api/audit/export.csv", params={"site": sid}, headers=owner).text
+    assert csv_text.splitlines()[0] == "at_karachi,who,email,action,group,target,site,detail"
+    for email in ("operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        assert client.get("/api/audit/search", headers=h).status_code == 403 and client.get("/api/audit/export.csv", headers=h).status_code == 403
+    fh = _founder(monkeypatch)
+    cid = client.get("/api/founder/companies", headers=fh).json()["companies"][0]["id"]
+    audit = client.get("/api/founder/audit", params={"company": cid}, headers=fh).json()
+    assert audit["total"] >= 1 and all(e["company_id"] == cid for e in audit["entries"]), audit
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")
