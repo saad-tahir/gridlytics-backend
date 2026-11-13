@@ -24,7 +24,7 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Re
 from pydantic import Field, ValidationError
 
 from . import alerts, auth, contract, delivery, demo, forecast, money, plans, sites, store, telemetry
-from .routes_common import full_or_404, now_ts, out, put_state, site_or_404, state_change
+from .routes_common import full_or_404, karachi, now_ts, out, put_state, site_or_404, state_change
 from .schemas import Refusal, Strict, check
 
 router = APIRouter()
@@ -626,8 +626,21 @@ def plan_message(site_id: str):
     return msg
 
 
+def _site_key(site_id: str) -> dict:
+    """Whether an edge device's key, not revoked, exists for the site, and when the newest was made (Pakistan time): the edge checklist's item 1 ("Make
+    the site key") for every reader of the edge's state, an operator too, who may not list the company's keys (UX backend ask K8; plan C19.2 item 4,
+    C12.2). Nothing of the key itself: no prefix, no id, no name. A partner tool's key is not the box's."""
+    with store.connect() as con:
+        r = con.execute("SELECT MAX(created) AS made FROM api_keys WHERE org_id = ? AND site_id = ? AND kind = 'edge' AND revoked IS NULL",
+                        (store.org(), site_id)).fetchone()
+    made = r["made"] if r else None
+    return {"exists": made is not None, "made_at": karachi(made)}
+
+
 @router.get("/api/sites/{site_id}/edge")
 def edge_status(site_id: str):
+    """The edge's state as Data and devices reads it: when it was last seen and whether it is online, its heartbeat, capabilities, acks, the plan
+    messages sent, the site's public key (edit_sites), what it reports, the clock, and `key` (whether the box's key was made: UX K8)."""
     s = full_or_404(site_id)
     st = s.get("state") or {}
     with store.connect() as con:
@@ -641,7 +654,7 @@ def edge_status(site_id: str):
                 "capabilities": json.loads(cap["body"]) if cap else None, "acks": [{**dict(a), "body": json.loads(a["body"])} for a in acks],
                 "sent": [dict(r) for r in sent], "public_key": delivery.public_key(site_id) if auth.can("edit_sites") else None,
                 # what the edge reports when it is not running the plan in force, and the clock-offset ladder's step (audit engine-delivery-10, 12)
-                "reports": plans.edge_view(site_id), "clock": plans.clock_info(site_id)})
+                "reports": plans.edge_view(site_id), "clock": plans.clock_info(site_id), "key": _site_key(site_id)})
 
 
 # ------------------------------------------------------------------------------------------------ the site's signing key (audit engine-delivery-13)

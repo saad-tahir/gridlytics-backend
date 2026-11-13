@@ -642,6 +642,14 @@ committed (backend 1753 passed; web gates clean). Two defects were found and fix
     is the owner's to set.
   - With Q65's answer a company with one administrator cannot approve that administrator's own versions (recorded at batch k5).
 
+### Batch k7: K8, K15, K16, K33, K34, K35 (13 Nov 2026)
+
+- **K8, whether the box's key was made** (plan C19.2 item 4, C12.2): `GET /sites/:id/edge` answers `key: {exists, made_at}`, whether an edge
+  device's key, not revoked, exists for the site and when the newest was made (Karachi time), read by every reader of the edge's state (the
+  operator too, who may not list keys). A partner tool's key is not the box's: only `kind` edge counts, as only an edge device's key sends the box's
+  heartbeats. Nothing of the key itself is answered (no prefix, id or name); the checklist's "by AK" is left out, since who made a key is the key
+  list's (`manage_users`), not something an operator needs to tick item 1.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

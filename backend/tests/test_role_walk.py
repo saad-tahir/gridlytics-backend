@@ -580,6 +580,22 @@ def test_the_source_test_s_first_rows_carry_no_money_and_reach_no_viewer_and_no_
     assert not {k for _, k, _, _ in _items(admin) if isinstance(k, str) and money.is_money(k)}
 
 
+def test_the_edge_key_s_existence_reaches_every_reader_of_the_edge_and_nothing_of_the_key(walk):
+    """UX backend ask K8 (plan C19.2 item 4): GET /edge says whether the box's key was made and when (`key`), the same for the administrator, the operator
+    (who may not list keys) and the viewer; nothing of the key itself (no prefix, no id, no name); a machine key does not read the edge's state."""
+    client, h = walk["client"], walk["headers"]
+    sid = walk["edge_site"]
+    got = walk["answers"]["/api/sites/{site_id}/edge"][f"/api/sites/{sid}/edge"]
+    assert {r: s for r, (s, _) in got.items()} == {"admin": 200, "operator": 200, "viewer": 200, "key": 403}
+    keys = {r: body["key"] for r, (s, body) in got.items() if s == 200}
+    assert keys["admin"]["exists"] is True and keys["admin"]["made_at"].endswith("+05:00") and len(set(map(str, keys.values()))) == 1, keys
+    listed = client.get("/api/platform/keys", headers=h["admin"]).json()
+    mine = [k for k in listed if k["site_id"] == sid and k["kind"] == "edge" and not k["revoked"]]
+    for r, (s, body) in got.items():
+        text = json.dumps(body)
+        assert "glk_" not in text and not any(k["prefix"] in text or k["id"] in text or f'"{k["name"]}"' in text for k in mine), r
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

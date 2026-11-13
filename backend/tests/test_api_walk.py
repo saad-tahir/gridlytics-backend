@@ -264,6 +264,19 @@ def test_the_source_test_shows_its_first_rows_to_the_roles_that_edit_the_site(wo
             assert all(row["at"].endswith("+05:00") and list(row["values"]) == t["points"] for row in t["sample"]), email
 
 
+def test_every_role_reads_whether_the_box_s_key_was_made(world):
+    """UX backend ask K8 (plan step 9d, the edge checklist's item 1): GET /sites/:id/edge carries `key` ({exists, made_at}) for every role alike, the
+    operator too, who may not list the company's keys; a key made for the site reads as made, in Karachi time."""
+    client, password, _ = world
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    sid = next(s["id"] for s in client.get("/api/fleet", headers=owner).json()["sites"] if s["name"] == "Lahore mall (demo)")
+    made = client.post("/api/platform/keys", headers=owner, json={"name": "api walk box", "scopes": ["telemetry:write"], "site_id": sid, "kind": "edge"})
+    assert made.status_code == 200, made.text
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        key = client.get(f"/api/sites/{sid}/edge", headers=_login(client, password, email)).json()["key"]
+        assert key["exists"] is True and key["made_at"].endswith("+05:00") and set(key) == {"exists", "made_at"}, (email, key)
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")
