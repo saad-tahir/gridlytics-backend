@@ -543,6 +543,30 @@ def test_set_up_s_check_names_the_wear_cost_as_a_money_setting_and_reaches_no_vi
     assert operator == admin
 
 
+def test_set_up_s_price_preview_names_its_rupees_as_money_and_reaches_no_viewer_and_no_key(walk):
+    """UX backend ask K5 (plan C19.2 item 1, C6.7): the price preview needs see_costs, so a viewer and a key are refused in words with no rupee; the
+    operator reads the administrator's answer; every rupee is under a money name (`c_imp`, `c_exp`, the MDI's `rate_rs_per_kw`, the ICP's `rate`), so
+    the filter would leave a reader without see_costs no figure of them, and the peak windows, which carry none, whole."""
+    from gridlytics import money
+    client, h = walk["client"], walk["headers"]
+    sid = walk["edge_site"]
+    body = {"tariff_category": "B-2(b)", "sanctioned_load_kw": 900, "regime": "none"}
+    answers = {}
+    for reader in READERS:
+        r = client.post(f"/api/sites/{sid}/prices/preview", json=body, headers=h[reader])
+        assert r.status_code == (200 if reader in ("admin", "operator") else 403), (reader, r.status_code, r.text[:200])
+        answers[reader] = r.json()
+        if r.status_code != 200:
+            assert not any(RUPEES.search(s) for s in _strings(r.json())), reader
+    admin = answers["admin"]
+    assert {k: v for k, v in answers["operator"].items() if k != "as_of"} == {k: v for k, v in admin.items() if k != "as_of"}
+    assert {"c_imp", "c_exp"} <= {k for _, k, _, _ in _items(admin) if isinstance(k, str) and money.is_money(k)}
+    kept = money.for_key(admin)
+    assert not (_numbers(admin, money_only=True) - _numbers(admin, money_only=False)) & _numbers(kept)
+    assert kept["peak_windows"] == admin["peak_windows"] and kept["time_of_use"] == admin["time_of_use"]
+    assert not any(RUPEES.search(s) for s in _strings(admin["peak_windows"]))
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

@@ -524,6 +524,26 @@ genset was saved before, so no migration or copy of the company's file was neede
     (`routes_sites._with_held_money`, now shared by both), so an operator's check reads the wear the plan prices.
   - `setup_warnings` are `sites.setup_warnings` of the site as it would be (a section with problems counts as stored).
 
+- **K5, the price preview** (plan C19.2 item 1, C6.2, C6.7, C6.8): `POST /api/sites/{id}/prices/preview?day=` prices the connection's fields as
+  step C holds them, before they are saved and before the site has any connection. Decisions:
+  - **The body is the connection's save** (`PUT /connection`'s body: the fields, with `id`, `if_unchanged` and `idempotency_key` taken and the
+    last two ignored), checked as the save checks it, a group the site's DISCO contradicts refused alike, so the picture never shows prices a save
+    would refuse. `id` names the saved connection being edited: its own bill's peak window (a site override) and its billing month's readings then
+    apply, as `GET /prices?connection=` has them. The day is GET's (`day`, today by default, 2015 to a year ahead).
+  - **One function prices both routes** (`routes_sites._prices`, out of `GET /prices`): the preview is `GET /prices`' answer for the fields as typed
+    (tested equal after the save), plus `preview: true`, `as_of` (the server's stamp in Karachi time, the picture's "As of 14:12"), `time_of_use`
+    (step C's derived line: "Time of use: the other DISCOs' windows (follows FESCO)", "Time of use: K-Electric's windows") and `peak_windows`.
+    `GET /prices` answers as before.
+  - **The peak windows** are the calendar the connection is priced on, on the day: a site override's own window where its bill shows one, else the
+    DISCO group's time-of-use version in force (`source`, `version_id`, `effective_from`), each season with its months and its window in words
+    ("Dec to Feb: peak 17:00 to 21:00", a run of months across the year's end too), and `by_month`, January first, the share of each hour in the
+    window (the Tariffs page's `peakShareByHour`: a half hour is 0.5), null for a month in no season. Windows only: no money, so the page may keep
+    the strip where it hides the prices.
+  - **No rate card in force** for the category on the day (plan C6.8's warn state) is 422 `no_tariff_version`, "No B-2(b) rate card is in force on 1
+    Jun 2025, so the plan cannot price this connection: check Tariffs"; any other day the library cannot price keeps GET's refusal.
+  - see_costs, as `GET /prices` (the prices are money: `c_imp`, `c_exp`, the MDI's `rate_rs_per_kw`, the ICP's `rate`); a viewer and a machine key
+    are refused. Nothing is saved or audited (exempt in the audit walk).
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

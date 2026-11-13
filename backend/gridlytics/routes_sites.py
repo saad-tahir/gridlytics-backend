@@ -1274,18 +1274,32 @@ def site_prices(site_id: str, day: str | None = None, connection: str | None = N
     net-metered site the month's exports per period are netted first, as the ledger does."""
     auth.need("see_costs", "Seeing prices")
     s = full_or_404(site_id)
-    from .routes_common import parse_day
-    d = parse_day(day, today())
-    # the day lies between 2015 (the earliest telemetry and rate cards) and a year from today: a day outside has no prices, and one before 1970 or past
-    # about the year 3000 has no local time on Windows (datetime.fromtimestamp raises OSError there)
-    if not PRICES_EARLIEST <= d <= today() + timedelta(days=PRICES_AHEAD_DAYS):
-        raise Refusal(422, f"Prices are shown for days from {PRICES_EARLIEST.isoformat()} to a year from today", "invalid")
+    d = _prices_day(day)
     if connection:
         conn = next((c for c in s.get("connections") or [] if c["id"] == connection), None)
         if conn is None:
             raise Refusal(404, "This site has no such connection", "not_found")
     else:
         conn = (s.get("connections") or [None])[0]
+    try:
+        return _prices(site_id, conn, d)
+    except (LookupError, ValueError) as exc:
+        raise bad(exc) from None
+
+
+def _prices_day(day: str | None) -> date:
+    from .routes_common import parse_day
+    d = parse_day(day, today())
+    # the day lies between 2015 (the earliest telemetry and rate cards) and a year from today: a day outside has no prices, and one before 1970 or past
+    # about the year 3000 has no local time on Windows (datetime.fromtimestamp raises OSError there)
+    if not PRICES_EARLIEST <= d <= today() + timedelta(days=PRICES_AHEAD_DAYS):
+        raise Refusal(422, f"Prices are shown for days from {PRICES_EARLIEST.isoformat()} to a year from today", "invalid")
+    return d
+
+
+def _prices(site_id: str, conn: dict | None, d: date) -> dict:
+    """GET /prices' answer for connection `conn` ({id, data}: a saved one, or the fields of one not saved, id None) on day `d`. Raises LookupError
+    (tariffs.NoTariffVersion) or ValueError where the day cannot be priced."""
     t0 = datetime(d.year, d.month, d.day, tzinfo=PKT)
     month_q = month_x = None
     try:
@@ -1296,8 +1310,6 @@ def site_prices(site_id: str, day: str | None = None, connection: str | None = N
             if conn["data"].get("regime") == "net_metering_legacy":
                 month_x = tot["export"]
         v = tariffs.vectors(conn, t0.astimezone(timezone.utc), 96, month_q, None, 0.0 if month_q is not None else 1e9, month_x, None)
-    except (LookupError, ValueError) as exc:
-        raise bad(exc) from None
     except (OSError, OverflowError):
         raise Refusal(422, "That day has no prices", "invalid") from None
     return {"day": d.isoformat(), "connection_id": conn["id"] if conn else None, "t": [int(t0.timestamp()) + 900 * i for i in range(96)], "c_imp": [round(float(x), 2) for x in v["c_imp"]],
@@ -1307,3 +1319,94 @@ def site_prices(site_id: str, day: str | None = None, connection: str | None = N
             "month_import_kwh": {k: round(float(x), 1) for k, x in month_q.items()} if month_q is not None else None,
             "month_export_kwh": {k: round(float(x), 1) for k, x in month_x.items()} if month_x is not None else None,
             "tariff_notices": v.get("tariff_notices", [])}  # a version awaiting its notification the day reaches (tariffs, engine-tariffs-06)
+
+
+def _months_words(months: list[int]) -> str:
+    """A season's months in words: "Dec to Feb" for a run (across the year's end too), "All year", else listed ("Jan, Mar and May")."""
+    held = sorted(set(m for m in months if 1 <= m <= 12))
+    if len(held) == 12:
+        return "All year"
+    if not held:
+        return "No months"
+    for first in held:
+        run = [(first - 1 + i) % 12 + 1 for i in range(len(held))]
+        if sorted(run) == held:
+            return _MONTHS[first - 1] if len(run) == 1 else f"{_MONTHS[first - 1]} to {_MONTHS[run[-1] - 1]}"
+    names = [_MONTHS[m - 1] for m in held]
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _peak_share(peak: list) -> list[float]:
+    """The share of each hour of the day inside a peak window [start, end), which may run past midnight (the Tariffs page's peakShareByHour)."""
+    try:
+        s, e = (tariffs._minutes(peak[0]), tariffs._minutes(peak[1]))
+    except (TypeError, ValueError, IndexError, AttributeError):
+        return [0.0] * 24
+    spans = [(s, e)] if e > s else [(s, 1440), (0, e)]
+    return [round(sum(max(0, min(h * 60 + 60, y) - max(h * 60, x)) for x, y in spans) / 60.0, 4) for h in range(24)]
+
+
+def _peak_windows(conn: dict, d: date) -> dict:
+    """The time-of-use calendar the connection is priced on, on day `d`, month by hour (plan C6.7, PEAK WINDOWS THROUGH THE YEAR; UX backend ask K5):
+    the site override's own peak window where its bill shows one (tariffs.calendar_for), else the DISCO group's calendar in force; each season with
+    its months and its window in words ("Dec to Feb: peak 17:00 to 21:00"), and `by_month`, January first, the share of each hour in the peak window
+    (null for a month in no season). Windows and times only: no money."""
+    group = "ke" if conn["data"].get("disco_group") == "ke" else "xwdisco"
+    override = tariffs.site_override(conn, d)
+    if isinstance(override.get("calendar"), dict):
+        cal, source, version = override["calendar"], "site_override", tariffs.resolve("override", str(conn.get("id")), d)
+    else:
+        version = tariffs.resolve("tou", group, d)
+        cal, source = (version["body"] if version else {"seasons": []}), "tou"
+    seasons = [{"months": list(x.get("months") or []), "peak": list(x.get("peak") or []),
+                "words": f"{_months_words(x.get('months') or [])}: peak {(x.get('peak') or ['', ''])[0]} to {(x.get('peak') or ['', ''])[-1]}"}
+               for x in cal.get("seasons") or []]
+    by_month = []
+    for m in range(1, 13):
+        season = next((x for x in seasons if m in x["months"]), None)
+        by_month.append(_peak_share(season["peak"]) if season else None)
+    return {"disco_group": group, "source": source, "version_id": version["id"] if version else None,
+            "effective_from": version["effective_from"] if version else None, "seasons": seasons, "by_month": by_month}
+
+
+def _time_of_use(group: str, disco: str | None) -> dict:
+    """Step C's derived line (plan C6.2): the windows the connection is billed on, and the DISCO they follow."""
+    words = "K-Electric's windows" if group == "ke" else "the other DISCOs' windows"
+    follows = f" (follows {disco})" if disco and disco != "K-Electric" else ""
+    return {"disco_group": group, "disco": disco, "words": f"Time of use: {words}{follows}"}
+
+
+def _day_words(d: date) -> str:
+    return f"{d.day} {_MONTHS[d.month - 1]} {d.year}"
+
+
+@router.post("/api/sites/{site_id}/prices/preview")
+def site_prices_preview(site_id: str, inp: dict = Body(...), day: str | None = None):
+    """The day's prices for the connection's fields as step C holds them, before they are saved and before the site has any connection (UX backend ask
+    K5, plan C19.2 item 1, C6.7): GET /prices' answer for those fields, with `preview` true, the server's stamp (`as_of`, Karachi time), the
+    time-of-use line (`time_of_use`) and the DISCO group's peak windows month by month (`peak_windows`). The body is the connection's save as `PUT
+    /connection` takes it, checked as the save checks it (one sentence a refusal); its `id` names the saved connection being edited (its own bill's
+    peak window and the month's readings then apply), and `if_unchanged` and `idempotency_key` are ignored. Nothing is saved. see_costs (the prices
+    are money)."""
+    auth.need("see_costs", "Seeing prices")
+    s = full_or_404(site_id)
+    cid = inp.get("id")
+    if cid is not None and not any(c["id"] == cid for c in s.get("connections") or []):
+        raise Refusal(404, "This site has no such connection", "not_found")
+    d = _prices_day(day)
+    disco = (s.get("data") or {}).get("disco")
+    data = check(sites.ConnectionFields, sites._from_disco({k: v for k, v in inp.items() if k not in setup_check.SAVE_ONLY}, disco)).model_dump()
+    problem = sites.group_problem(data["disco_group"], disco)
+    if problem:
+        raise Refusal(422, problem, "invalid")
+    conn = {"id": cid, "site_id": site_id, "data": data}
+    try:
+        answer = _prices(site_id, conn, d)
+    except tariffs.NoTariffVersion:
+        # plan C6.8's warn state: the library has no rate card in force for this category and day
+        raise Refusal(422, f"No {data['tariff_category']} rate card is in force on {_day_words(d)}, so the plan cannot price this connection: check "
+                      "Tariffs", "no_tariff_version") from None
+    except (LookupError, ValueError) as exc:
+        raise bad(exc) from None
+    return out({**answer, "preview": True, "as_of": karachi(now_ts()), "time_of_use": _time_of_use(data["disco_group"], disco),
+                "peak_windows": _peak_windows(conn, d)})

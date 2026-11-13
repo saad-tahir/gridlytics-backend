@@ -229,6 +229,26 @@ def test_set_up_s_checks_answer_each_role_that_opens_set_up(world):
     assert client.get(f"/api/sites/{sid}", headers=owner).json()["assets"]["battery"]["entry_unit"] == "kwh"
 
 
+def test_set_up_s_price_preview_answers_the_readers_of_costs(world):
+    """UX backend ask K5 (plan step 9b, Set-up C's TARIFF DAY): `POST /sites/:id/prices/preview` prices the connection's fields as typed for every
+    see_costs reader alike (the TARIFF DAY needs see_costs), with the DISCO group's peak windows; a viewer is refused. Nothing is saved."""
+    client, password, _ = world
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    sid = next(s["id"] for s in client.get("/api/fleet", headers=owner).json()["sites"] if s["name"] == "Lahore mall (demo)")
+    held = client.get(f"/api/sites/{sid}", headers=owner).json()["connections"]
+    body = {"tariff_category": "B-2(b)", "sanctioned_load_kw": 900, "regime": "none"}
+    seen = {}
+    for email, status in (("owner@onyxleaf.demo", 200), ("operator@onyxleaf.demo", 200), ("analyst@onyxleaf.demo", 200), ("viewer@onyxleaf.demo", 403)):
+        h = _login(client, password, email)
+        r = client.post(f"/api/sites/{sid}/prices/preview", headers=h, json=body)
+        assert r.status_code == status, (email, r.text[:200])
+        if status == 200:
+            got = {k: v for k, v in r.json().items() if k != "as_of"}
+            assert seen.setdefault("answer", got) == got, email
+    assert seen["answer"]["peak_windows"]["disco_group"] == "xwdisco" and len(seen["answer"]["c_imp"]) == 96
+    assert client.get(f"/api/sites/{sid}", headers=owner).json()["connections"] == held
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

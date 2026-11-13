@@ -37,6 +37,7 @@ EXEMPT = {
     ("POST", "/api/sites/{site_id}/telemetry/mapping/guess"): "reads a file's first lines and stores nothing",
     ("POST", "/api/sites/{site_id}/source/test"): "tests the data source and changes nothing",
     ("POST", "/api/sites/{site_id}/validate"): "checks Set-up's steps as typed and saves nothing (UX K6)",
+    ("POST", "/api/sites/{site_id}/prices/preview"): "prices a connection's fields as typed and saves nothing (UX K5)",
     ("POST", "/api/public/access-requests"): "a visitor's request to the founder, signed out and of no company: kept in the registry, where the founder's "
                                              "changes to it are written to the founder's audit (test_ux_k02_k03_access_requests)",
     ("POST", "/api/tariffs/versions/validate"): "checks a tariff draft and stores nothing (UX K32)",
