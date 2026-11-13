@@ -776,7 +776,7 @@ finding from two checkers). Each was fixed with a test that fails without the fi
   with `at`, `exact` and `latest_belief_time`. Decisions:
   - **The issue held then, not only an exact match.** Issues are pruned (whole for 3 days, hourly for 35, then each day's day-ahead issue), so an
     older plan's quarter-hour issue is gone; the page opens the issue held at that time, `exact` false, and the band says which it is. An exact
-    match is the plan's own issue.
+    match is the issue stored at that very time: the plan's own, unless a refresh or a re-solve in the same quarter replaced it (the check below).
   - **Both forms the pages hold:** a plan's `belief_time` (ISO, UTC as plans answer it) and the forecast page's (epoch seconds); a time with no
     offset is Karachi time. Digits are matched as ASCII, at most ten, and the ISO form by pattern, so "٣" or "²" are refused (K34's check found
     int() reading them); a time more than a minute ahead is refused; each refusal is one sentence (422 `invalid`).
@@ -794,8 +794,9 @@ finding from two checkers). Each was fixed with a test that fails without the fi
   statement both read (`verify.peak_import_avoided`, `fuel_saved`, `taxes_recovered`, `preliminary_by`, `period_tariff_notices`, with
   `savings_export.plan_at_start`); the statement's Summary gains "Peak-window import avoided", its ledger "Taxes you recover (not part of the
   saving)", its fuel row reads `fuel_saved`, and a tariff notice the month reaches is printed. Decisions:
-  - **Peak-window import avoided** counts every scored day whose import is known (the days of "On all scored days", as `litres_saved` does), not
-    only the claiming days: it is the replay's energy evidence, and a withheld day of unmetered import is no reading. null off-grid.
+  - **Peak-window import avoided** counts the claiming days whose both arms' peak-window import is known (`verify.claimed_energy`, K13's rule,
+    which Fleet's month figure reads too), null off-grid and with no such day. (Corrected by the check below: it first counted every scored day
+    whose import was known.)
   - **Taxes recovered, from the arms:** the ledger's grid levers are bearable rupees, so each claiming day's peak-window and off-peak levers and
     MDI share times the share of a bearable rupee its connection recovers that day (`tariffs.recoverable_share`: GST where `gst_recoverable`, the
     s.235 advance where `s235_adjustable`, on the bill amount with GST, further and extra tax, over the bearable stack). On the claim, the band's
@@ -814,6 +815,56 @@ finding from two checkers). Each was fixed with a test that fails without the fi
     report's), so no page or document changes until the owner chooses.
   - Money: `taxes_recovered_rs` is a `_rs` name, stripped for a viewer and a key (the role walk proves it); every other addition is energy,
     settings or words, read alike by every reader.
+
+### Batch k8, the check (13 Nov 2026)
+
+Independent checkers read K20, K21, K23, K26 and K27 and reported eleven findings (two of them the same K20 finding); each was tried against the
+code. Nine held and were fixed or documented; two are left for the owner. The code fixes have tests that fail on the tree before them ("UX K20,
+K23, K26, K27 check" commits). What changed:
+
+- **The Savings tile and Fleet say one peak-window figure** (K27, medium). `peak_import_kwh_avoided` counted every scored day whose import was
+  known: not-applied, recommendation-only and native-block days, and days withheld for another reason than the import (a replay over unread load or
+  PV among them), whose replays are no saving of the plan's. Fleet's `mtd_peak_kwh_avoided` (K13) counts the claiming days only, and `_month_saving`
+  is "the Savings page's This month" by its own words, so one month read two figures (570 against 520 kWh on the K27 test's days), and the viewer's
+  sentence "moved 9,840 kWh out of the peak window ... on 27 verified days" put the larger beside the claim's days. The day rule is one function now,
+  `verify.claimed_energy` (moved from `routes_sites._claimed_energy`, which calls it), read by Fleet, Overview's bars, the summary and the
+  statement. **A settled rule against the plan's wording:** the plan's registry text for the tile says "Counted on the days replayed in the
+  period"; K13's settled rule (the energy a day claims, "never the replay's noise") wins, and the page's InfoButton should say "Counted on the days
+  that claim a saving" (the contract says so). `_claimed_energy`'s own test (K13) is unchanged; a legacy row with its import unknown and no
+  `claim_withheld` now claims no energy, as it claims no rupee (`_day_claims`).
+  - **Left as the plan names it:** `fuel_saved` is `litres_saved` in its unit, every scored day whose fuel is known, which the plan names as the
+    Diesel tile's source; Fleet's `mtd_litres_saved` counts the claiming days. That difference predates K27 (round 7's `litres_saved` against
+    K13); aligning it changes `litres_saved`, the statement's fuel row and the portfolio's, so it is left for the owner.
+- **No figure without its days, never a zero** (K27, K12's rule). A period with no scored day answered 0.0 for the peak-window import, the fuel
+  saved and the taxes. Now `peak_import_kwh_avoided` is null when no day is counted (`peak_import_days` 0), `fuel_saved` null with no scored
+  day, `taxes_recovered_rs` null with no claiming day; the statement says "-" for the fuel saved with no scored day (it said "0 L"; null alone
+  would have read "not metered").
+- **The taxes recovered carry the levers' sign** (K27). A claim whose grid levers are negative (off-peak charging that bought more grid energy
+  than native) has negative taxes recovered: the recoverable tax the plan added to the bills, recovered all the same. Golden: -Rs 500 x 0.239 =
+  -Rs 119.50. The contract and the type say what a negative means and how the line says it.
+- **A past issue's time before 1970 is refused in a sentence** (K20, found by two checkers). An `at` in year 1's first five hours in Karachi
+  passed the form and the future check, found no issue, and the 404's date could not be worded (`datetime.fromtimestamp` of year 0): a server
+  error. Any time before 1970 is now 422 `invalid`, "The time of a forecast must not be before 1970": no issue can be kept from then.
+- **Solar's count runs from the first day** (K23). The per-day count ran only once the 14 days held more than 30 hours of readings, so a site's
+  first whole day read "0 of 3" and the next "2 of 3", and a logger that sends daylight only (10 hours a day) reached stage 1 on its fourth day,
+  not its third. The gate was the original build's shortcut, in no rule; each day is counted by its own rule now (more than 4 hours of output
+  where the clear sky is above a fifth of the inverter). The stage moves with the count, as K23 says: one number for both.
+- **`exact` is the issue stored at that time** (K20, documented). Issues are stored by site, kind and belief time, so a refresh or a re-solve in
+  a plan's own quarter replaces the issue that plan was solved on; `?at=` then opens the replacing issue with `exact` true. The contract no longer
+  calls it "the plan's own issue" without that proviso. Recording each plan's issue (a hash in its summary) would tell them apart; not done.
+- **The role walk raises the alerts it reads** (K26). The demo raises no `forecast_bust` and no `savings_negative` alert, so the walk's empty
+  lists proved nothing about the filter; it raises one of each on a demo site and checks that every reader lists the bust, the administrator the
+  Savings alert, and the viewer none.
+- **The fixtures' new values are the API's for each fixture's own figures** (K21, K27). `fixture_contract.py --write` adds a missing key with its
+  value from a new capture beside the fixture's older figures, so `fc_pv`'s and `fc_load`'s `daily_kwh` ran from 00:45 to 00:45 with other
+  issues' energy, and `savings.json`'s peak figure and fuel saved disagreed with its own days. They are set from the fixtures' own `t`, quantiles,
+  days and levers by the server's functions (`forecast.daily_kwh`, the claiming days, `tariffs.recoverable_share`); the tuned arm's peak figure,
+  which no day row holds, keeps its value.
+- **Q60 is one instruction** (K27). The contract told the lanes to show the screen's rule while the decision logs said nothing changes until the
+  owner chooses; the contract now says `preliminary` (the report's rule) stays the chip's source until the owner settles Q60.
+- **Left for the owner: the missed-forecasts list's run of days** (K26). While a `forecast_bust` alert is open, a later bust day moves its
+  `detail` to that day, so a run of missed days lists as one row. The plan reads the list from the alerts ("what the server already records"), and
+  this is in the contract; a per-day source (each scored day's bust and hours, stored by the nightly job) is a later item if the owner wants it.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
