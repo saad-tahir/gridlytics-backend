@@ -949,6 +949,38 @@ def preliminary(site_id: str, stage: int | None) -> dict:
 WEATHER_FEED = False
 
 
+#: the quantile levels of an issue's daily energy range (UX K21): the day read at its 10 % and 90 % levels, beside the median
+DAILY_LOW, DAILY_HIGH = "q10", "q90"
+
+
+def _karachi_iso(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), PKT).isoformat(timespec="seconds")
+
+
+def daily_kwh(t: list, q: dict) -> list[dict]:
+    """A PV or load issue's energy per Karachi day (UX backend ask K21, plan E6 item 2): for each Karachi day the issue's steps reach, oldest first,
+    {day, from, to (Karachi ISO, the steps' span), whole_day (all 96 steps of the day), median_kwh, low_kwh, high_kwh}: the day's energy with the
+    issue read at its median, at its 10 % level and at its 90 % level (kW x 0.25 h per 15-minute step, to 0.1 kWh).
+
+    The issue holds quantiles per step, not scenarios: its days are read at one level each, every step of the day at that level. That is the issue's
+    own construction: a PV issue is one clearness per day times the clear-sky curve (pv: every quantile is cs x the ratio x the day's clearness at
+    that level, capped at the inverter), and a load issue at stage 0 one factor times the template, at stage 1 each step's median plus its spread
+    times the same z. So the day's energy at a level is the sum of its steps at that level (the steps move together through a day, which a sum of
+    quantiles over independent steps would not assume). The browser must not add the quantiles itself; this is the server's reading."""
+    if not t or not isinstance(q, dict) or not all(isinstance(q.get(k), list) for k in ("q50", DAILY_LOW, DAILY_HIGH)):
+        return []
+    n = min(len(t), *(len(q[k]) for k in ("q50", DAILY_LOW, DAILY_HIGH)))
+    days: dict[str, list[int]] = {}
+    for i in range(n):
+        days.setdefault(datetime.fromtimestamp(int(t[i]), PKT).date().isoformat(), []).append(i)
+    out = []
+    for day, idx in days.items():
+        sums = sorted(sum(float(q[k][i] or 0.0) for i in idx) * STEP_S / 3600 for k in (DAILY_LOW, "q50", DAILY_HIGH))
+        out.append({"day": day, "from": _karachi_iso(int(t[idx[0]])), "to": _karachi_iso(int(t[idx[-1]]) + STEP_S), "whole_day": len(idx) == 96,
+                    "median_kwh": round(sums[1], 1), "low_kwh": round(sums[0], 1), "high_kwh": round(sums[2], 1)})
+    return out
+
+
 def page(site: dict, kind: str) -> dict:
     """The latest issue of a kind with the actuals so far (15-minute means) for the forecast page, and `past`: the 24 hours before its belief time with
     their actuals and the issue held a day before over them, so the chart shows how the forecast tracked. The tick re-issues every 15 minutes, so the
@@ -956,8 +988,8 @@ def page(site: dict, kind: str) -> dict:
     `verified_days_needed` beside it. An outage page also carries `announced`: the announced windows over the chart's span (announced_blocks). Every
     page says whether the forecasts read a weather feed (`weather_feed`, WEATHER_FEED).
 
-    UX backend ask K23 (plan E6 item 4): every issue says how far its kind is from stage 1 (`stage_progress`, null for an issue stored
-    before K23)."""
+    UX backend asks K21 and K23 (plan E6 items 2 and 4): a PV or load issue carries `issue.daily_kwh` (daily_kwh); every issue says how far its
+    kind is from stage 1 (`stage_progress`, null for an issue stored before K23)."""
     na = not_applicable(site, kind)
     if na:
         return {"kind": kind, "issue": None, "not_applicable": na, "stage": None, "preliminary": False, "weather_feed": WEATHER_FEED,
@@ -971,6 +1003,8 @@ def page(site: dict, kind: str) -> dict:
     t1 = max(t0, min(now // 60 * 60, t0 + STEPS * STEP_S))  # whole minutes only
     actual = _actual15(site["id"], kind, t0, t1) if kind in PAST_KEYS else None
     issue = {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version", "stage_progress")}
+    if kind in ("pv", "load"):
+        issue["daily_kwh"] = daily_kwh([int(x) for x in t], f)
     out = {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
            "issue": issue, "actual": actual,
            **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None, "not_applicable": None,

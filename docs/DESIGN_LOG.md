@@ -761,6 +761,17 @@ finding from two checkers). Each was fixed with a test that fails without the fi
   one table the rules read (`forecast.STAGE1_DAYS`: 3, 3 and 7), so "2 of 3 days" and the stage cannot disagree. Every forecast page answers the
   stored issue's (the Outages answer's `forecast` too); null for an issue stored before K23 (the next 15-minute issue carries it), a kind that does
   not apply and no issue. `have` is not capped at `need`, and an outage count is floored (6.9 days of readings is "6 of 7", stage 0, as the rule).
+- **K21, each issue's energy per Karachi day** (plan E6 item 2, E1.1.6): every PV and load page carries `issue.daily_kwh`: per Karachi day the 48
+  hours reach, the day read at the issue's median and at its 10 % and 90 % levels (kWh to 0.1), the steps' span in Karachi time and whether the day
+  is whole. Worked out when the page is read, from the stored quantiles, so a past issue (K20) and every issue stored before carry it too.
+  - **Against the plan's wording, by the engine as it is:** E6 asks for "a range from the issue's own scenarios", but an issue holds seven
+    quantiles per step and no scenarios (no part of the engine draws any). The server reads each day at one level, every step of the day at that
+    level, which is how the issues are built: a solar issue is the clear-sky curve times one clearness for the day, drawn from the month's or the
+    site's days (`forecast.pv`: every quantile is cs x the ratio x the day's clearness at that level, capped at the inverter), a load issue at stage 0
+    one factor times the template, at stage 1 each step's median plus its spread times the same z. So the day's energy at a level is its steps at
+    that level; summing independent steps' quantiles would shrink the range to almost nothing, which the plan's warning is about. Tested: a stage-0
+    November solar day reads 0.89, 0.466 and 1.0 of its clear-sky energy, the clearness levels themselves. Where conformal bands set a step's spread
+    (stage 1 with enough stored errors), the errors are not known to be independent through a day, so one level per day stays the wide reading.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
