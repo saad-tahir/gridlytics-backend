@@ -260,7 +260,7 @@ def test_the_request_store_is_a_migration_of_the_registry_with_its_copy_made_fir
     assert not list((path.parent / "backup").glob("*.db"))
     assert _send(AYESHA).status_code == 202
     with closing(sqlite3.connect(path)) as con:
-        assert con.execute("PRAGMA user_version").fetchone()[0] == platformdb.SCHEMA_VERSION == 4
+        assert con.execute("PRAGMA user_version").fetchone()[0] == platformdb.SCHEMA_VERSION >= 4      # 5 since UX K34
         assert con.execute("SELECT COUNT(*) FROM access_requests").fetchone()[0] == 1
     copies = list((path.parent / "backup").glob("platform-*-schema-v3.db"))
     assert len(copies) == 1

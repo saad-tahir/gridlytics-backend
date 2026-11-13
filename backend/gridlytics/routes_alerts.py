@@ -13,10 +13,15 @@ router = APIRouter()
 
 
 @router.get("/api/alerts")
-def inbox(state: str | None = "active", site_id: str | None = None, category: str | None = None, every: bool = False):
+def inbox(state: str | None = "active", site_id: str | None = None, category: str | None = None, every: bool = False, kind: str | None = None):
     """The inbox: the kinds of alert the person follows (My account's notification choices; round 7 sweeps, the rest of role-analyst-32), or with
-    `every` every kind their role receives."""
-    return out(alerts.listing(state or None, site_id, category, followed_only=not every))
+    `every` every kind their role receives. `kind` keeps one rule's alerts (UX backend ask K26: `?kind=forecast_bust&state=&every=true` is the
+    Accuracy view's missed forecasts, resolved ones too); a kind in no form of a rule's name is refused in one sentence."""
+    try:
+        rule = alerts.alert_kind(kind)
+    except ValueError as exc:
+        raise bad(exc) from None
+    return out(alerts.listing(state or None, site_id, category, followed_only=not every, kind=rule))
 
 
 @router.get("/api/alerts/counts")
@@ -33,9 +38,15 @@ def _readable(rules: dict) -> dict:
     return {c: r for c, r in rules.items() if c in cats}
 
 
+def _answer(rules: dict) -> dict:
+    """The rules the reader receives, each with its thresholds' defaults and ranges (`limits`; UX backend ask K16, plan D9.6)."""
+    return alerts.with_limits(_readable(rules))
+
+
 @router.get("/api/alerts/rules")
 def rules_get():
-    return _readable(alerts.rules())
+    """The company's rules, {category: rule}, each rule with `limits` ({threshold: {default, min, max}}; UX K16)."""
+    return _answer(alerts.rules())
 
 
 @router.put("/api/alerts/rules")
@@ -44,7 +55,7 @@ def rules_put(inp: Any = Body(...)):
     flow-reports-alerts-members-keys-10); the body is any JSON so that a list or a text is refused in those words too."""
     auth.need("edit_workspace", "Changing the alert rules")
     try:
-        return alerts.set_rules(inp, auth.actor())
+        return _answer(alerts.set_rules(inp, auth.actor()))
     except ValueError as exc:
         raise bad(exc) from None
 
@@ -53,7 +64,7 @@ def rules_put(inp: Any = Body(...)):
 def site_rules_get(site_id: str):
     """The rules the evaluator applies at a site (the company's with the site's overrides on top) and the overrides themselves."""
     site_or_404(site_id)
-    return {"site_id": site_id, "rules": _readable(alerts.site_rules(site_id)), "overrides": _readable(alerts.site_overrides(site_id))}
+    return {"site_id": site_id, "rules": _answer(alerts.site_rules(site_id)), "overrides": _readable(alerts.site_overrides(site_id))}
 
 
 @router.put("/api/alerts/rules/sites/{site_id}")
@@ -61,9 +72,10 @@ def site_rules_put(site_id: str, inp: Any = Body(...)):
     auth.need("edit_workspace", "Changing a site's alert rules")
     site_or_404(site_id)
     try:
-        return alerts.set_site_rules(site_id, inp, auth.actor())
+        done = alerts.set_site_rules(site_id, inp, auth.actor())
     except ValueError as exc:
         raise bad(exc) from None
+    return {**done, "rules": _answer(done["rules"])}
 
 
 @router.get("/api/alerts/assignees")

@@ -264,6 +264,157 @@ def test_the_source_test_shows_its_first_rows_to_the_roles_that_edit_the_site(wo
             assert all(row["at"].endswith("+05:00") and list(row["values"]) == t["points"] for row in t["sample"]), email
 
 
+def test_every_role_reads_whether_the_box_s_key_was_made(world):
+    """UX backend ask K8 (plan step 9d, the edge checklist's item 1): GET /sites/:id/edge carries `key` ({exists, made_at}) for every role alike, the
+    operator too, who may not list the company's keys; a key made for the site reads as made, in Karachi time."""
+    client, password, _ = world
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    sid = next(s["id"] for s in client.get("/api/fleet", headers=owner).json()["sites"] if s["name"] == "Lahore mall (demo)")
+    made = client.post("/api/platform/keys", headers=owner, json={"name": "api walk box", "scopes": ["telemetry:write"], "site_id": sid, "kind": "edge"})
+    assert made.status_code == 200, made.text
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        key = client.get(f"/api/sites/{sid}/edge", headers=_login(client, password, email)).json()["key"]
+        assert key["exists"] is True and key["made_at"].endswith("+05:00") and set(key) == {"exists", "made_at"}, (email, key)
+
+
+def test_every_role_reads_the_alert_thresholds_defaults_and_ranges(world):
+    """UX backend ask K16 (plan step 14, Alerts › Rules: "Default 15 · 5 to 1,440"): every rule of the company's and of a site's rules carries `limits`,
+    the same for every role that receives its category (a viewer the five energy kinds)."""
+    from gridlytics import alerts
+    client, password, _ = world
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        sid = client.get("/api/fleet", headers=h).json()["sites"][0]["id"]
+        for rules in (client.get("/api/alerts/rules", headers=h).json(), client.get(f"/api/alerts/rules/sites/{sid}", headers=h).json()["rules"]):
+            assert rules and all(r["limits"] == alerts.threshold_limits(c) for c, r in rules.items()), email
+            assert email != "viewer@onyxleaf.demo" or set(rules) == set(alerts.ENERGY_CATEGORIES), email
+        assert client.get("/api/alerts/rules", headers=h).json()["Data"]["limits"]["gap_hours"] == {"default": 1.0, "min": 0.25, "max": 24}, email
+
+
+def test_the_roles_that_upload_preview_a_file_s_first_rows(world):
+    """UX backend ask K15 (plan step 9d, the CSV upload's stage 2): POST /telemetry/mapping/preview answers the first five rows as the upload will store
+    them, in Karachi time, to the roles that upload (the administrator, the operator), and refuses the analyst and the viewer; nothing is stored."""
+    client, password, _ = world
+    head = "Time,Grid,Load (kW)\n2026-03-01 00:00,on,30.1\n2026-03-01 00:01,on,30.0\n"
+    body = {"head": head, "mapping": {"columns": {"Time": {"key": "ts"}, "Grid": {"key": "grid_present"},
+                                                  "Load (kW)": {"key": "load_power_w", "unit": "kW"}}}, "tz_offset_h": 5}
+    for email, status in (("owner@onyxleaf.demo", 200), ("operator@onyxleaf.demo", 200), ("analyst@onyxleaf.demo", 403), ("viewer@onyxleaf.demo", 403)):
+        h = _login(client, password, email)
+        sid = client.get("/api/fleet", headers=h).json()["sites"][0]["id"]
+        imports = len(client.get(f"/api/sites/{sid}/telemetry/quality", headers=h).json().get("imports") or [])
+        r = client.post(f"/api/sites/{sid}/telemetry/mapping/preview", json=body, headers=h)
+        assert r.status_code == status, (email, r.text[:200])
+        if status == 200:
+            rows = r.json()["rows"]
+            assert [x["at"] for x in rows] == ["2026-03-01T00:00:00+05:00", "2026-03-01T00:01:00+05:00"], rows
+            assert rows[0]["values"] == {"grid_present": True, "load_power_w": 30100.0}, rows
+        assert len(client.get(f"/api/sites/{sid}/telemetry/quality", headers=h).json().get("imports") or []) == imports, email
+
+
+def test_my_account_offers_each_role_the_alert_kinds_it_receives(world):
+    """UX backend ask K33 (plan step 14b): the email card's kinds are those each role receives (an operator eight, a viewer five); a kind not received
+    is refused in words; ticking kinds for email leaves the inbox's own list as it was."""
+    client, password, _ = world
+    for email, n in (("owner@onyxleaf.demo", 9), ("operator@onyxleaf.demo", 8), ("analyst@onyxleaf.demo", 9), ("viewer@onyxleaf.demo", 5)):
+        h = _login(client, password, email)
+        got = client.get("/api/platform/notifications", headers=h).json()
+        assert len(got["categories"]) == n and got["categories"] == client.get("/api/alerts/counts", headers=h).json()["categories"], email
+    h = _login(client, password, "viewer@onyxleaf.demo")
+    r = client.put("/api/platform/notifications", json={"email_kinds": ["Savings"]}, headers=h)
+    assert r.status_code == 422 and r.json()["detail"] == "You do not receive Savings alerts", r.text
+    r = client.put("/api/platform/notifications", json={"email_kinds": ["Reserve", "Data"]}, headers=h)
+    assert r.status_code == 200 and r.json()["email_kinds"] == ["Data", "Reserve"] and r.json()["email"] is True, r.text
+    assert r.json()["follow"] == r.json()["categories"]
+
+
+def _founder(monkeypatch) -> dict:
+    from gridlytics import founder
+    for name, value in (("GRIDLYTICS_FOUNDER_USERNAME", "founder"), ("GRIDLYTICS_FOUNDER_PASSWORD_HASH", founder.hash_password("a made-up walk password")),
+                        ("GRIDLYTICS_FOUNDER_TOTP_SECRET", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
+                        ("GRIDLYTICS_FOUNDER_SESSION_SECRET", "a made-up founder session secret of the api walk")):
+        monkeypatch.setenv(name, value)
+    return {"x-founder-session": founder.new_token()[0]}
+
+
+def test_the_administrator_filters_and_exports_the_audit_trail_and_the_founder_filters_theirs(world, monkeypatch):
+    """UX backend ask K34 (plan step 14): the company trail filtered by who, site and days with its total and its CSV, for the administrator alone;
+    the founder's audit filtered by company, each line with its company."""
+    client, password, _ = world
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    page = client.get("/api/audit/search", headers=owner).json()
+    assert page["total"] >= len(page["entries"]) > 0 and [g["key"] for g in page["groups"]][0] == "people"
+    sid = client.get("/api/fleet", headers=owner).json()["sites"][0]["id"]
+    on_site = client.get("/api/audit/search", params={"site": sid}, headers=owner).json()
+    assert all(e["site_id"] == sid for e in on_site["entries"]) and on_site["total"] <= page["total"]
+    demo = client.get("/api/audit/search", params={"who": "demo"}, headers=owner).json()          # the demo set-up's lines (the seed's too)
+    assert demo["total"] >= 1 and {e["who"] for e in demo["entries"]} == {"demo"} and "demo" in {p["who"] for p in page["people"]}
+    csv_text = client.get("/api/audit/export.csv", params={"site": sid}, headers=owner).text
+    assert csv_text.splitlines()[0] == "at_karachi,who,email,action,group,target,site,detail"
+    for email in ("operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        assert client.get("/api/audit/search", headers=h).status_code == 403 and client.get("/api/audit/export.csv", headers=h).status_code == 403
+    fh = _founder(monkeypatch)
+    cid = client.get("/api/founder/companies", headers=fh).json()["companies"][0]["id"]
+    audit = client.get("/api/founder/audit", params={"company": cid}, headers=fh).json()
+    assert audit["total"] >= 1 and all(e["company_id"] == cid for e in audit["entries"]), audit
+
+
+def test_the_founder_and_the_administrator_read_when_a_company_was_last_copied(world, monkeypatch):
+    """UX backend ask K35: each of the founder's companies carries `last_backup`; GET /platform/org carries it for the administrator alone."""
+    client, password, _ = world
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    assert "last_backup" in client.get("/api/platform/org", headers=owner).json()
+    for email in ("operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        assert "last_backup" not in client.get("/api/platform/org", headers=_login(client, password, email)).json(), email
+    companies = client.get("/api/founder/companies", headers=_founder(monkeypatch)).json()["companies"]
+    assert companies and all("last_backup" in c for c in companies)
+
+
+def test_the_forecasts_section_s_asks_answer_every_role(world):
+    """UX backend asks K20, K21, K23 and K26 (plan step 10): every role opens each kind's issue by its belief time (`?at=`, the plan's ISO time and
+    the page's epoch seconds), reads each PV and load issue's daily energy and each kind's stage progress, and the missed forecasts by kind; a kind
+    that does not apply answers no progress."""
+    from datetime import datetime, timezone
+    client, password, _ = world
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        for row in client.get("/api/fleet", headers=h).json()["sites"]:
+            for kind in ("pv", "load", "outage"):
+                latest = client.get(f"/api/sites/{row['id']}/forecasts/{kind}", headers=h).json()
+                if latest.get("not_applicable") or not latest.get("issue"):
+                    assert latest["stage_progress"] is None, (email, row["name"], kind)
+                    continue
+                bt = latest["belief_time"]
+                assert latest["stage_progress"]["need"] == {"pv": 3, "load": 3, "outage": 7}[kind], (email, kind)
+                assert ("daily_kwh" in latest["issue"]) == (kind != "outage"), (email, kind)
+                iso = datetime.fromtimestamp(bt, timezone.utc).isoformat(timespec="seconds")
+                for at in (str(bt), iso):
+                    r = client.get(f"/api/sites/{row['id']}/forecasts/{kind}", params={"at": at}, headers=h)
+                    assert r.status_code == 200, (email, row["name"], kind, r.text[:200])
+                    past = r.json()
+                    assert past["belief_time"] == bt and past["exact"] is True and past["issue"].get("daily_kwh") == latest["issue"].get("daily_kwh")
+            r = client.get("/api/alerts", params={"kind": "forecast_bust", "state": "", "every": "true", "site_id": row["id"]}, headers=h)
+            assert r.status_code == 200 and all(a["rule"] == "forecast_bust" for a in r.json()), (email, r.text[:200])
+
+
+def test_the_savings_summary_additions_answer_every_role(world):
+    """UX backend ask K27 (plan step 11a): every role reads the energy additions (the peak-window import avoided, the fuel saved in its unit, each
+    day's native peak-window import and plan, the tuned table's rows, the tariff notices, Preliminary by both rules); the taxes recovered are money,
+    for the readers of costs alone."""
+    client, password, _ = world
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        for row in client.get("/api/fleet", headers=h).json()["sites"]:
+            s = client.get(f"/api/sites/{row['id']}/savings", headers=h).json()
+            assert set(s["preliminary_rules"]) == {"screen", "report"} and isinstance(s["tariff_notices"], list), (email, row["name"])
+            for base in ("native", "tuned"):
+                b = s["baselines"][base]
+                assert {"peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_days", "fuel_unit"} <= set(b), (email, base)
+                assert ("taxes_recovered_rs" in b) == (not email.startswith("viewer")), (email, base)
+            assert "rule_table" in s["baselines"]["tuned"]
+            assert all("plan_id" in d and "peak_import_kwh_native" in d for d in s["days"]), (email, row["name"])
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

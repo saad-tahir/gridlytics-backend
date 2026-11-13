@@ -515,11 +515,12 @@ def test_my_account_keeps_my_notification_choices(world):
     first = v.get("/api/platform/notifications")
     assert first.status_code == 200, first.text
     body = first.json()
-    assert body["categories"][:3] == ["Data", "Control", "Reserve"] and body["follow"] == body["categories"] and body["email"] is False
+    # the kinds the viewer receives (UX K33: a viewer was offered the money kinds too), every one followed until they choose
+    assert body["categories"][:3] == ["Data", "Reserve", "Battery"] and body["follow"] == body["categories"] and body["email"] is False
     r = v.put("/api/platform/notifications", json={"follow": ["Data", "Genset"], "email": True})
     assert r.status_code == 200 and (r.json()["follow"], r.json()["email"]) == (["Data", "Genset"], True), r.text
     assert (v.get("/api/platform/notifications").json()["follow"], a.get("/api/platform/notifications").json()["follow"]) == (
-        ["Data", "Genset"], body["categories"])                                          # the viewer's own, not the administrator's
+        ["Data", "Genset"], a.get("/api/platform/notifications").json()["categories"])   # the viewer's own, not the administrator's (all nine)
     for wrong in ({"follow": ["Weather"]}, {"follow": "Data"}, {"email": "yes"}, {"follow": [], "sms": True}, []):
         r = v.put("/api/platform/notifications", json=wrong)
         assert r.status_code == 422 and len(r.json()["detail"].split()) >= 3, (wrong, r.text)

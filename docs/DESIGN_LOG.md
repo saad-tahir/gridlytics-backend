@@ -642,6 +642,271 @@ committed (backend 1753 passed; web gates clean). Two defects were found and fix
     is the owner's to set.
   - With Q65's answer a company with one administrator cannot approve that administrator's own versions (recorded at batch k5).
 
+### Batch k7: K8, K15, K16, K33, K34, K35 (13 Nov 2026)
+
+- **K8, whether the box's key was made** (plan C19.2 item 4, C12.2): `GET /sites/:id/edge` answers `key: {exists, made_at}`, whether an edge
+  device's key, not revoked, exists for the site and when the newest was made (Karachi time), read by every reader of the edge's state (the
+  operator too, who may not list keys). A partner tool's key is not the box's: only `kind` edge counts, as only an edge device's key sends the box's
+  heartbeats. Nothing of the key itself is answered (no prefix, id or name); the checklist's "by AK" is left out, since who made a key is the key
+  list's (`manage_users`), not something an operator needs to tick item 1.
+- **K15, the CSV upload's preview** (plan D9.5, C11.4 stage 2): `POST /sites/:id/telemetry/mapping/preview` (`upload_data`, as the upload and the
+  guess) takes the file's head (the first 64 KB the page already reads for the guess), the mapping as set (`PUT /telemetry/mapping`'s shape; left
+  out, the columns are read by their names) and `tz_offset_h` (as the upload; the page sends 5 for Karachi time), and answers the first five rows
+  as the upload will store them: `at` in Karachi time, `values` each key in its stored unit and the product's sign, the grid's and the genset's
+  state as true or false, an impossible or unreadable reading null. Nothing is written. The upload's header reading, row order (the last row of a
+  repeated minute), grid signal, step and value checks are one function each now (`telemetry._layout`, `_in_order`, `_grid_read`, `_step_of`,
+  `_grid_from_voltage`), read by `import_csv` and `preview_csv` alike, so the preview refuses what the upload refuses, in the same words, and a file
+  previewed then uploaded is stored as the preview said (tested minute by minute). Decisions the plan left open:
+  - **Stored order, not file order.** "As Gridlytics will store them": the rows in time order, a repeated minute's last row. For a logger's file
+    (in time order) this is the file's order.
+  - **An energy column is the row's own figure.** A 15-minute row's 3 kWh is stored as 200 Wh in each of its minutes; the preview shows the row's
+    3,000 Wh with `step_min` 15, the figure a person checks against the file.
+  - **A head cut in the middle of a line** reads its last line only when it has as many cells as the header (the guess's own rule).
+  - **Values to six decimals**, so 30.1 kW reads 30100, not a float's 30100.000000000004.
+  - Owner's question Q47 (the CSV upload moves to Set-up › Data and devices with a server preview of the first rows): the recommended yes ships.
+- **K16, the alert thresholds' defaults and ranges** (plan D9.6, D6.3): every rule of every rules answer (`GET` and `PUT /api/alerts/rules`, a
+  site's `rules` in `GET` and `PUT /api/alerts/rules/sites/:id`) carries `limits`, each threshold's `{default, min, max}` straight from
+  `alerts.THRESHOLDS`, so the editor writes "Default 15 · 5 to 1,440" and a save holds the same range. The Data category's staleness has no default
+  figure ("by the data source"): `by_source` gives each kind of source's minutes before a warning (an edge 30, the maker's cloud 20, a CSV upload
+  1,440). The limits are the server's: a rule sent back with them (the editor's body, or any client that sends the rule as read) is taken and the
+  limits never saved. Inside each rule rather than beside the categories, because the answer is `{category: rule}` and the pages read its keys as
+  categories. No money: a viewer reads the five energy kinds' limits.
+- **K33, the email alert kinds per reader** (plan G9 item 2, G3.4): `GET /api/platform/notifications` answers `categories` as the inbox gives them
+  (`alerts.reader_categories()`: a viewer Data, Reserve, Battery, Genset and Forecast; an operator eight, no Product; an administrator or an
+  analyst nine), and a save refuses a kind the person does not receive ("You do not receive Savings alerts"). Owner's question Q77 (email choices
+  kept, folded under "Not sending yet", the email checkbox dropped, only the kinds received offered): the recommended yes ships.
+  - **A settled rule wins over the plan here.** G3.4 was written on the inventory's "the server stores it and no code reads it", and makes the
+    card's ticks the `follow` list, with a save of a kind turning `email` on. Since round 7's sweeps (the rest of role-analyst-32) the inbox and
+    its badge list only the kinds in `follow` (`alerts.followed_categories`; the contract's "The inbox follows a person's notification choices"),
+    so ticks that set `follow` would hide every unticked kind from the person's inbox, which G3.4 itself rejects ("a person could unfollow Reserve
+    and miss a critical alert ... the inbox and the counts must stay complete"). The email card's ticks are therefore their own list,
+    `email_kinds`: a save of it with at least one kind sets `email` true (the plan's rule), with none false, and leaves `follow` as it was. Today's
+    page keeps `follow` and `email` ("Email them to me as well": the kinds followed, by email too); a choice made before K33 reads as G3.4's
+    compatibility rule says (the kinds by email are the kinds followed while `email` is true, none while it is false). A kind kept from a role
+    held before is not answered and not read.
+  - **Left for the owner:** the redesigned My account has no control for the inbox's own `follow` list (G3.4 has none, since it believed nothing
+    read it). Whether the inbox keeps following it (today's page and the inbox's "Show every kind" still set and lift it), or lists every kind the
+    role receives, is the owner's call.
+- **K34, filters on both audit trails** (plan G9 item 3, G2.4, G4.5): one module, `audit_trail.py`, holds each trail's groups (the "Kind of change"
+  select's: People and keys, Sites and set-up, Plans and control, Tariffs and money, Savings and pilot, Reports and exports, Demo; the founder's
+  Sign-ins, Refused sign-ins, Companies, Accounts and memberships, Backups, Access requests) as one map from an action's words to its group,
+  registered as an SQLite function so a page and its count are one query each; a test reads every `store.audit(...)` and `founder_audit(...)` call
+  of the backend and its scripts and fails on an action of no group. Filters: who, the kind (`group`), the site (the line's target, or the site its
+  detail names) or the company, From and To (Karachi days, both included), and a search of who, what, of and the detail (a site's name finds its
+  lines). Owner's question Q79 (the audit filters, which need this): built, as the owner wants the whole plan.
+  - **The company trail's filtered page is a new path,** `GET /api/audit/search` (`{entries, total, offset, limit, groups, people}`), where the plan
+    names `GET /api/audit` answering `{entries, total}`: today's Audit trail tab reads `GET /api/audit` as a list, and this lane merges before step
+    14 rebuilds the tab, so changing that answer's shape would break the page in between (the lane's rule: each ask's fallback keeps the page of
+    before working). `GET /api/audit` is unchanged; step 14 moves to the new path and the old one can go after it.
+  - **`people`** is who is in the trail (the Who select: "the people in the trail, plus Gridlytics (demo set-up)"), one `who` each: the person's id,
+    `demo` for the demo set-up whoever loaded it, else the product's own word (`system`, `edge`, `shipped`).
+  - **CSV:** `GET /api/audit/export.csv` with the same filters (the administrator's: `manage_users` to read the trail and `export` to download it),
+    every matching line (at most 100,000), times in Karachi time with their offset, the detail as JSON, a cell a spreadsheet would read as a formula
+    quote-prefixed; audited "exported the audit trail" with the filters given (Reports and exports).
+  - **The founder's trail keeps each line's company** (platform.db schema 5, `founder_audit.company_id`, the copy to `backup/` first as every
+    registry migration): each console line of a company is written with it; the lines before are filled from the company's name in them (a
+    company's own lines and a backup's by their target, a membership's or an account's by the detail's `company`), by today's names and the
+    names before a rename. A name two companies share, or none has, leaves a line of no company: it is listed unfiltered only. `GET
+    /api/founder/audit` keeps `{entries}` and gains `total`, `offset`, `limit` and `groups`; each line its `group`, `company_id` and
+    `company_name`; its `at` is Karachi time now, where it was UTC (the same moment).
+  - Every time the new answers give is Karachi time; the company trail's `at` in `GET /api/audit` stays as today's page reads it.
+- **K35, each company's last backup** (plan G9 item 4): `GET /api/founder/companies` (and every company answer of the console) gives each company's
+  `last_backup`, when its newest copy was made (the `modified` of the copy the Backups page lists first), in Karachi time, null with none, the
+  backup folder listed once for all companies (`backups.newest_copies`). The batch names it "founder or administrator only": the company's
+  administrator (`manage_users`) reads the same for their own company in `GET /api/platform/org`; no other role and no key is given the field.
+
+### Batch k7, the check (13 Nov 2026)
+
+Independent checkers read K8, K15, K16, K33, K34 and K35; each finding was tried against the code, and all eight held (two of them the same
+finding from two checkers). Each was fixed with a test that fails without the fix (the K15, K33 and K34 tests), checked on the tree before the fix
+("UX K15/K33/K34 check" commits). K8, K16 and K35 had none. What changed:
+
+- **The preview refuses a header that names a column twice** (K15, medium). The upload's route refused such a file before reading a row, and the
+  preview did not ask, so it answered five clean rows (the repeated name's last column) of a file the upload then refused. The check is
+  `telemetry.refuse_named_twice` now, read by the upload's route and by `preview_csv` alike, in the upload's order (the mapping, the header's names,
+  then the file), with its words: "The header names load_power_w more than once: give each column once and upload again".
+- **A row's `at` is the minute it is stored on** (K15). The upload stores a row on its minute (`_write_days`: the time to the minute), and the
+  preview answered the file's second, so a logger that writes seconds read 00:00:30 where 00:00:00 is stored.
+- **A role without `upload_data` is refused whatever JSON the body holds** (K15). The route took the body as an object, so the framework refused a
+  viewer's list or text with its own words before the role was read; it takes any JSON now and checks the role first, and an administrator's or
+  an operator's body that is no object is refused in a sentence ("Send the file's head as a set of named values: head, mapping and
+  tz_offset_h"). A body that is not JSON at all is still the framework's 422, before any route runs; the contract says "any JSON body".
+- **A save of `follow` keeps the kinds the role does not give** (K33, medium). Since K33 a viewer is offered five kinds, and today's My account
+  page sends `follow` with every save, the email checkbox's too; the save kept only the five, so once the person's role was raised the inbox and
+  its badge hid every kind the new role adds (a critical Control alert of an operator). The kinds not offered keep what was kept for them now:
+  followed until chosen (as before K33, when every kind was offered), unfollowed where an earlier role's choice unfollowed them. The answer is
+  still the kinds received. Storing the kinds left out instead of those kept was not chosen: the inbox's reader (`alerts.followed_categories`)
+  and every choice saved before read `follow` as the kinds kept.
+- **`email` is on while a kind received is chosen for email** (K33). A person whose email kinds were all of a role held before (an administrator
+  who ticked Savings alone, made a viewer) read `email: true` with `email_kinds: []`; `email` is worked out from the kinds answered now, on the
+  card's rule. Nothing was sent either way (email does not send yet).
+- **A page's offset is ASCII digits, at most nine** (K34, found by two checkers). `audit_trail.offset_of` took whatever `int()` reads: an offset
+  past what SQLite holds was a server error on both trails, and "٣", "1_0", "+3" and " 5 " were read as numbers. The founder's lists' rule
+  (`routes_access._OFFSET`, the K2 check) holds for both trails now: "The offset is a whole number from 0". Today's `GET /api/audit` (an `int`
+  query, unchanged by K34) still gives a server error for an offset past what SQLite holds; it predates the batch and goes when step 14 moves to
+  `/api/audit/search`.
+- **A company's name given up and taken by a later company is no company's** (K34, schema 5's filling). The lines before schema 5 were filled by
+  today's names and the names before a rename, so when a company was renamed and a later company took its old name, the first company's lines of
+  that name were given to the later one. Only a name one company alone has held (its name now, and its names before each rename, read newest
+  first so a chain of renames is followed) is filled now; a name two companies have held, at once or in turn, leaves its lines of no company
+  (listed unfiltered only). This replaces the batch's "A name two companies share, or none has". Telling the two apart by the order of the
+  lines (the later company's lines are after its "made a company") was not chosen: a line written out of that order would be given to the wrong
+  company, and a line of no company is only missing from a filter, never shown under the wrong one.
+
+### Batch k8: K20, K21, K23, K26, K27 (13 Nov 2026)
+
+- **K23, stage progress per kind** (plan E6 item 4, E1.3.4): each issue saves `stage_progress`, `{have, need, unit: "days"}`, counted by the stage
+  rule itself as it decides the stage: solar, the whole days of the site's own output in the 14 local days before the issue's day; load, the whole
+  days of unshed readings in the last 21; outages, the whole days of grid readings in the last 28 at the site and on its feeder. The thresholds are
+  one table the rules read (`forecast.STAGE1_DAYS`: 3, 3 and 7), so "2 of 3 days" and the stage cannot disagree. Every forecast page answers the
+  stored issue's (the Outages answer's `forecast` too); null for an issue stored before K23 (the next 15-minute issue carries it), a kind that does
+  not apply and no issue. `have` is not capped at `need`, and an outage count is floored (6.9 days of readings is "6 of 7", stage 0, as the rule).
+- **K21, each issue's energy per Karachi day** (plan E6 item 2, E1.1.6): every PV and load page carries `issue.daily_kwh`: per Karachi day the 48
+  hours reach, the day read at the issue's median and at its 10 % and 90 % levels (kWh to 0.1), the steps' span in Karachi time and whether the day
+  is whole. Worked out when the page is read, from the stored quantiles, so a past issue (K20) and every issue stored before carry it too.
+  - **Against the plan's wording, by the engine as it is:** E6 asks for "a range from the issue's own scenarios", but an issue holds seven
+    quantiles per step and no scenarios (no part of the engine draws any). The server reads each day at one level, every step of the day at that
+    level, which is how the issues are built: a solar issue is the clear-sky curve times one clearness for the day, drawn from the month's or the
+    site's days (`forecast.pv`: every quantile is cs x the ratio x the day's clearness at that level, capped at the inverter), a load issue at stage 0
+    one factor times the template, at stage 1 each step's median plus its spread times the same z. So the day's energy at a level is its steps at
+    that level; summing independent steps' quantiles would shrink the range to almost nothing, which the plan's warning is about. Tested: a stage-0
+    November solar day reads 0.89, 0.466 and 1.0 of its clear-sky energy, the clearness levels themselves. Where conformal bands set a step's spread
+    (stage 1 with enough stored errors), the errors are not known to be independent through a day, so one level per day stays the wide reading.
+- **K20, a past issue by its time** (plan E6 item 1, D3.3, D3.4, E3): `GET /sites/:id/forecasts/:kind?at=` answers the issue held at that time,
+  with `at`, `exact` and `latest_belief_time`. Decisions:
+  - **The issue held then, not only an exact match.** Issues are pruned (whole for 3 days, hourly for 35, then each day's day-ahead issue), so an
+    older plan's quarter-hour issue is gone; the page opens the issue held at that time, `exact` false, and the band says which it is. An exact
+    match is the issue stored at that very time: the plan's own, unless a refresh or a re-solve in the same quarter replaced it (the check below).
+  - **Both forms the pages hold:** a plan's `belief_time` (ISO, UTC as plans answer it) and the forecast page's (epoch seconds); a time with no
+    offset is Karachi time. Digits are matched as ASCII, at most ten, and the ISO form by pattern, so "٣" or "²" are refused (K34's check found
+    int() reading them); a time more than a minute ahead is refused; each refusal is one sentence (422 `invalid`).
+  - **A past issue as it stood:** its actuals over its whole horizon so far, its Preliminary count from the verified days before its own Karachi
+    day (`forecast.verified_days(before=)`), an outage issue's announced windows from the schedule in force at its time (`forecast.schedule(at=)`).
+  - Nothing kept from then: 404 `no_issue`, "No solar forecast issued at or before 14:15 on 12 Nov 2026 is kept"; another company's site is "No
+    such site", as on every site route. Every role reads it; a machine key does not (the page's own scope rule).
+- **K26, alerts by kind** (plan E6 item 8, E1.3.8): `GET /api/alerts?kind=` keeps one rule's alerts, within the categories the reader receives
+  (a viewer's `?kind=savings_negative` lists nothing). The kind is a rule's name in form (lower-case ASCII letters, digits and underscores, at most
+  64, starting with a letter), since rules are named per kind of event and connection (`edge_<event>`, `forecast_stage_<kind>`,
+  `regime_expiring_<id>`); one in no such form is refused in one sentence, an unknown one lists nothing. Noted for the page, unchanged here: an
+  alert is raised once while its condition holds, so a day that busts while the day before's alert is still open moves that alert's `detail` to
+  the later day; a run of missed days reads as its last (the daily scores keep every day).
+- **K27, the savings summary's additions** (plan F11 item 1, F1.1.3 to F1.1.9): one function per figure, which `verify.summary` and the monthly
+  statement both read (`verify.peak_import_avoided`, `fuel_saved`, `taxes_recovered`, `preliminary_by`, `period_tariff_notices`, with
+  `savings_export.plan_at_start`); the statement's Summary gains "Peak-window import avoided", its ledger "Taxes you recover (not part of the
+  saving)", its fuel row reads `fuel_saved`, and a tariff notice the month reaches is printed. Decisions:
+  - **Peak-window import avoided** counts the claiming days whose both arms' peak-window import is known (`verify.claimed_energy`, K13's rule,
+    which Fleet's month figure reads too), null off-grid and with no such day. (Corrected by the check below: it first counted every scored day
+    whose import was known.)
+  - **Taxes recovered, from the arms:** the ledger's grid levers are bearable rupees, so each claiming day's peak-window and off-peak levers and
+    MDI share times the share of a bearable rupee its connection recovers that day (`tariffs.recoverable_share`: GST where `gst_recoverable`, the
+    s.235 advance where `s235_adjustable`, on the bill amount with GST, further and extra tax, over the bearable stack). On the claim, the band's
+    figure. Export credits carry none (net billing credits them after tax; a legacy agreement's netted units are left out too, so the figure is
+    a little low at a legacy net-metering site), nor do the genset, wear and carry-over levers (no DISCO bill taxes them). Not from rebuilt bills:
+    a period is not a billing period, and rebuilding both arms' bills on every read would take minutes.
+  - **The capture version per day** was answered since round 7 (`native_capture_version`, and the page's `native_captures` with each version's
+    first and last day): nothing new. **The plan per day** is the plan in force when the Karachi day began (`plan_ids`' rule: a held or failed
+    run is no plan in force).
+  - **The tuned table's rows** are served in the product's grammar (start, mode, floor, target, grid charge). The vendor's layout of F1.1.6
+    (program, power W) is not: a brand's programs are compiled from a plan's slots (`delivery.compile_mode_a`), which a static rule has not got.
+  - **Tariff notices:** `tariffs.awaiting_notices` at the period's last day, as rebuilt bills carry them; words and dates, every reader.
+  - **Preliminary by two rules** (owner's question Q60; plan F0.1 decision 15): Q60 gives no recommended answer (the owner's call), while F0.1
+    decision 15 recommends that each figure says which rule it follows. Both are answered (`preliminary_rules`: the screen's, 28 verified days and
+    the native capture; the report's, also 8 weeks of switchback and every FCA billed), and `preliminary` keeps the one rule of before (the
+    report's), so no page or document changes until the owner chooses.
+  - Money: `taxes_recovered_rs` is a `_rs` name, stripped for a viewer and a key (the role walk proves it); every other addition is energy,
+    settings or words, read alike by every reader.
+
+### Batch k8, the check (13 Nov 2026)
+
+Independent checkers read K20, K21, K23, K26 and K27 and reported eleven findings (two of them the same K20 finding); each was tried against the
+code. Nine held and were fixed or documented; two are left for the owner. The code fixes have tests that fail on the tree before them ("UX K20,
+K23, K26, K27 check" commits). What changed:
+
+- **The Savings tile and Fleet say one peak-window figure** (K27, medium). `peak_import_kwh_avoided` counted every scored day whose import was
+  known: not-applied, recommendation-only and native-block days, and days withheld for another reason than the import (a replay over unread load or
+  PV among them), whose replays are no saving of the plan's. Fleet's `mtd_peak_kwh_avoided` (K13) counts the claiming days only, and `_month_saving`
+  is "the Savings page's This month" by its own words, so one month read two figures (570 against 520 kWh on the K27 test's days), and the viewer's
+  sentence "moved 9,840 kWh out of the peak window ... on 27 verified days" put the larger beside the claim's days. The day rule is one function now,
+  `verify.claimed_energy` (moved from `routes_sites._claimed_energy`, which calls it), read by Fleet, Overview's bars, the summary and the
+  statement. **A settled rule against the plan's wording:** the plan's registry text for the tile says "Counted on the days replayed in the
+  period"; K13's settled rule (the energy a day claims, "never the replay's noise") wins, and the page's InfoButton should say "Counted on the days
+  that claim a saving" (the contract says so). `_claimed_energy`'s own test (K13) is unchanged; a legacy row with its import unknown and no
+  `claim_withheld` now claims no energy, as it claims no rupee (`_day_claims`).
+  - **Left as the plan names it:** `fuel_saved` is `litres_saved` in its unit, every scored day whose fuel is known, which the plan names as the
+    Diesel tile's source; Fleet's `mtd_litres_saved` counts the claiming days. That difference predates K27 (round 7's `litres_saved` against
+    K13); aligning it changes `litres_saved`, the statement's fuel row and the portfolio's, so it is left for the owner.
+- **No figure without its days, never a zero** (K27, K12's rule). A period with no scored day answered 0.0 for the peak-window import, the fuel
+  saved and the taxes. Now `peak_import_kwh_avoided` is null when no day is counted (`peak_import_days` 0), `fuel_saved` null with no scored
+  day, `taxes_recovered_rs` null with no claiming day; the statement says "-" for the fuel saved with no scored day (it said "0 L"; null alone
+  would have read "not metered").
+- **The taxes recovered carry the levers' sign** (K27). A claim whose grid levers are negative (off-peak charging that bought more grid energy
+  than native) has negative taxes recovered: the recoverable tax the plan added to the bills, recovered all the same. Golden: -Rs 500 x 0.239 =
+  -Rs 119.50. The contract and the type say what a negative means and how the line says it.
+- **A past issue's time before 1970 is refused in a sentence** (K20, found by two checkers). An `at` in year 1's first five hours in Karachi
+  passed the form and the future check, found no issue, and the 404's date could not be worded (`datetime.fromtimestamp` of year 0): a server
+  error. Any time before 1970 is now 422 `invalid`, "The time of a forecast must not be before 1970": no issue can be kept from then.
+- **Solar's count runs from the first day** (K23). The per-day count ran only once the 14 days held more than 30 hours of readings, so a site's
+  first whole day read "0 of 3" and the next "2 of 3", and a logger that sends daylight only (10 hours a day) reached stage 1 on its fourth day,
+  not its third. The gate was the original build's shortcut, in no rule; each day is counted by its own rule now (more than 4 hours of output
+  where the clear sky is above a fifth of the inverter). The stage moves with the count, as K23 says: one number for both.
+- **`exact` is the issue stored at that time** (K20, documented). Issues are stored by site, kind and belief time, so a refresh or a re-solve in
+  a plan's own quarter replaces the issue that plan was solved on; `?at=` then opens the replacing issue with `exact` true. The contract no longer
+  calls it "the plan's own issue" without that proviso. Recording each plan's issue (a hash in its summary) would tell them apart; not done.
+- **The role walk raises the alerts it reads** (K26). The demo raises no `forecast_bust` and no `savings_negative` alert, so the walk's empty
+  lists proved nothing about the filter; it raises one of each on a demo site and checks that every reader lists the bust, the administrator the
+  Savings alert, and the viewer none.
+- **The fixtures' new values are the API's for each fixture's own figures** (K21, K27). `fixture_contract.py --write` adds a missing key with its
+  value from a new capture beside the fixture's older figures, so `fc_pv`'s and `fc_load`'s `daily_kwh` ran from 00:45 to 00:45 with other
+  issues' energy, and `savings.json`'s peak figure and fuel saved disagreed with its own days. They are set from the fixtures' own `t`, quantiles,
+  days and levers by the server's functions (`forecast.daily_kwh`, the claiming days, `tariffs.recoverable_share`); the tuned arm's peak figure,
+  which no day row holds, keeps its value.
+- **Q60 is one instruction** (K27). The contract told the lanes to show the screen's rule while the decision logs said nothing changes until the
+  owner chooses; the contract now says `preliminary` (the report's rule) stays the chip's source until the owner settles Q60.
+- **Left for the owner: the missed-forecasts list's run of days** (K26). While a `forecast_bust` alert is open, a later bust day moves its
+  `detail` to that day, so a run of missed days lists as one row. The plan reads the list from the alerts ("what the server already records"), and
+  this is in the contract; a per-day source (each scored day's bust and hours, stored by the nightly job) is a later item if the owner wants it.
+
+### Batches k7 and k8, the senior review (13 Nov 2026)
+
+The review of K8, K15, K16, K33, K34 and K35 (k7) and K20, K21, K23, K26 and K27 (k8) with their checks ("UX K review" commits). Both suites
+passed on the batches as committed (backend 1858 passed, 9 skipped, 1 xfailed; web gates: typecheck, 196 files and 1286 tests, build). One
+defect was found and fixed, with tests that fail without the fix (`test_ux_k27_savings_summary`); the Savings answer gains one key (`fuel_days`).
+After the fix both pass again (backend 1859 passed, 9 skipped, 1 xfailed; web gates as before).
+
+- **The diesel avoided is counted on the days that claim, as the peak-window import beside it** (K27, medium). The batch k8 check moved
+  `peak_import_kwh_avoided` onto K13's rule (the claiming days, `verify.claimed_energy`) and left `fuel_saved` as `litres_saved`, every scored day
+  whose fuel is known, for the owner. That left one month with two diesel figures, Fleet's and the Overview's `mtd_litres_saved` (15 L on the K27
+  test's days) against the Savings tile (17 L: the not-applied day's 2 L of replay counted), and the Savings page's two energy tiles, and the
+  viewer's sentence that stands in for the claim ("moved 9,840 kWh out of the peak window and avoided 1,260 L of diesel ... on 27 verified days"),
+  on two sets of days: the kWh on the claim's days, the litres on every scored day. K13's settled rule names both figures ("the energy a day
+  claims ... never the replay's noise", for `peak_kwh_avoided` and `litres_saved` alike), so the check's own reason for moving the peak figure
+  holds for the fuel: `verify.fuel_saved` now sums the claiming days whose fuel is known (`claimed_energy`), with the days it counts
+  (`fuel_days`), the figure Fleet's month says. **A settled rule against the plan's wording:** F1.1.4 names `litres_saved` as the Diesel tile's
+  source; K13's rule wins, as it did for the peak figure. `litres_saved` itself is unchanged: the ledger's figure of every scored day, beside
+  `saving_rs`, and the company roll-up's (PDF row, CSV and total), which reads it beside the savings of all days.
+  - null without a genset; with no claiming day ("-": nothing claimed, so no fuel is said, as the peak figure); with claiming days whose fuel was
+    known on none of them ("not metered"). The page tells the last two apart by `claiming_days`.
+  - The monthly statement's fuel row and its key figure ("... saved against the native settings on the days that claim (Estimated)") read
+    `fuel_saved` (`reports._fuel_saved`), one function with the page, as K27 meant; the round-7 statement read `litres_saved` there. The test
+    helpers' fake baseline (`test_fix_r7_alerts_reports._baseline`) gives `fuel_saved` the value of `litres_saved` (a month whose scored days all
+    claim), and the never-metered test's withheld days claim nothing ("-", the note still says "not metered on 2 of 2 days").
+- **Checked and found right, no change:** every new answer's rupees are under money names (`taxes_recovered_rs`; the preview, the rules' limits,
+  the edge's key, the stage progress, the daily energy, the tuned table and the tariff notices hold none), and the role walk shows the viewer and
+  a key refused the preview, both audit trails and the export with no rupee in the refusal, the taxes stripped for both, `last_backup` given to
+  the administrator alone and the notification kinds per role; each new route checks its permission before its body (the preview, the founder's
+  trail with its session), and another company's site is 404 on every site route (the edge, the preview, a past issue, the savings), a site filter
+  of another company's site lists nothing; platform.db schema 5 is the next free number, made after `platform._connect`'s copy to `backup/`, with
+  its migration test, the rename chain and a name held by two companies included; every new time a person reads is Karachi time (the key's
+  `made_at`, `last_backup`, both trails' `at`, the preview's minutes, the daily energy's spans, a refusal's "14:15 on 12 Nov 2026"); the contract
+  and the types match the answers; no banned word or American spelling in the added text.
+- **Left for the owner, not changed:**
+  - The company roll-up's fuel (`litres_saved`, every scored day) and Fleet's month figure (`mtd_litres_saved`, the claiming days) still differ for
+    a month with days that claim nothing, as they did before this lane: the roll-up says its fuel beside the savings of all days. Aligning it
+    changes a document's figure and its CSV column, which is the owner's call.
+  - The run of missed forecasts read as one alert (K26), and `exact` after a refresh in the plan's own quarter (K20), as the check recorded.
+  - Searching the trails' detail text does not match non-ASCII words (the detail is stored as ASCII-escaped JSON), and SQLite's `lower()` folds
+    ASCII letters only, so a search for "ö" does not find "Ö" in a name; Urdu, which has no case, and site names (matched in Python) are found.
+
 ## 2026-11-12 UX step 0: the fixture contract and a slot's reason detail (tests only)
 
 The web app's fixtures are held to the API's answers by `backend/tests/fixture_contract.py` (round 7, parity-architecture-09). Its full run failed at

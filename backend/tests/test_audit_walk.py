@@ -35,6 +35,7 @@ EXEMPT = {
     ("PUT", "/api/drafts/{draft_id}"): "a person's own unsaved draft of a new site: the site it becomes is audited when it is added",
     ("DELETE", "/api/drafts/{draft_id}"): "a person's own unsaved draft of a new site",
     ("POST", "/api/sites/{site_id}/telemetry/mapping/guess"): "reads a file's first lines and stores nothing",
+    ("POST", "/api/sites/{site_id}/telemetry/mapping/preview"): "reads a file's first rows with a column mapping and stores nothing (UX K15)",
     ("POST", "/api/sites/{site_id}/source/test"): "tests the data source and changes nothing",
     ("POST", "/api/sites/{site_id}/validate"): "checks Set-up's steps as typed and saves nothing (UX K6)",
     ("POST", "/api/sites/{site_id}/prices/preview"): "prices a connection's fields as typed and saves nothing (UX K5)",

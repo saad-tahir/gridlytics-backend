@@ -22,7 +22,7 @@
     POST  /api/founder/users/{id}/memberships        {company_id, company_role}  -> 201 {membership}
     PATCH /api/founder/users/{id}/memberships/{cid}  {company_role?, status?}    -> {membership}  (with gridlytics_role and last_seen there now)
     DELETE /api/founder/users/{id}/memberships/{cid}                       -> {removed: true}
-    GET   /api/founder/audit?offset=                                       -> {entries}
+    GET   /api/founder/audit?offset=&group=&company=&from=&to=&q=          -> {entries, total, offset, limit, groups}
 
 The guard lets /api/founder through with no token and no company (the founder is no person of a company): every route but the two sign-in steps checks the
 founder's own session, the header x-founder-session, before it reads a field of the body (only a body that is not JSON at all is refused first, 422
@@ -37,10 +37,10 @@ import logging
 import uuid
 from contextlib import contextmanager
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 
 from . import api as _api
-from . import founder, identity, schemas, store_founder
+from . import audit_trail, founder, identity, schemas, store_founder
 from . import platform as platformdb
 
 router = APIRouter()
@@ -250,7 +250,8 @@ def founder_company_new(inp: dict = Body(...)):
             platformdb.mark_one_time(account["id"])                 # a new owner's first password is one-time (audit founder-console-08)
         platformdb.founder_audit("made a company", company["name"], {"seats": seats, "enabled": enabled, "owner": account["email"],
                                                                       "new_owner": "user_id" not in owner,
-                                                                      **({"one_time": one_time} if "user_id" not in owner else {})})
+                                                                      **({"one_time": one_time} if "user_id" not in owner else {})},
+                                  company_id=company["id"])
         return {"company": store_founder.company_view(company["id"]), "owner": store_founder.user(account["id"]),
                 "membership": store_founder.membership_view(account["id"], company["id"])}
 
@@ -268,7 +269,7 @@ def founder_company_change(company_id: str, inp: dict = Body(...)):
         before, after = store_founder.update_company(company_id, name, seats)
         changes = {k: {"from": before[k], "to": after[k]} for k in ("name", "seats") if before[k] != after[k]}
         if changes:
-            platformdb.founder_audit("changed a company", after["name"], changes)
+            platformdb.founder_audit("changed a company", after["name"], changes, company_id=company_id)
         return {"company": store_founder.company_view(company_id)}
 
 
@@ -288,7 +289,8 @@ def founder_company_access(company_id: str, inp: dict = Body(...)):
     if enabled and company_id in store_founder.archived("company"):
         raise schemas.Refusal(409, f"{held['name']} is archived: bring it back from the archive first")
     row = platformdb.update_company(company_id, enabled=enabled, disabled_reason="" if enabled else reason)
-    platformdb.founder_audit(f"switched Gridlytics {'on' if enabled else 'off'}", row["name"], {} if enabled else {"reason": row["disabled_reason"]})
+    platformdb.founder_audit(f"switched Gridlytics {'on' if enabled else 'off'}", row["name"], {} if enabled else {"reason": row["disabled_reason"]},
+                             company_id=company_id)
     with _said():
         return {"company": store_founder.company_view(company_id)}
 
@@ -304,7 +306,7 @@ def founder_company_archive(company_id: str, inp: dict = Body(...)):
     with _said():
         row, detail = store_founder.archive_company(company_id, on)
         if detail is not None:
-            platformdb.founder_audit("archived a company" if on else "brought a company back from the archive", row["name"], detail)
+            platformdb.founder_audit("archived a company" if on else "brought a company back from the archive", row["name"], detail, company_id=company_id)
         return {"company": store_founder.company_view(company_id), "made": (detail or {}).get("copy")}
 
 
@@ -330,7 +332,7 @@ def founder_back_up(company_id: str, inp: dict | None = Body(None)):
     with _said():
         made, listed = store_founder.back_up(company_id)
     if made:
-        platformdb.founder_audit("made a backup", platformdb.company(company_id)["name"], {"file": made})
+        platformdb.founder_audit("made a backup", platformdb.company(company_id)["name"], {"file": made}, company_id=company_id)
     return {"made": made, "backups": listed}
 
 
@@ -364,7 +366,7 @@ def founder_user_new(inp: dict = Body(...)):
             platformdb.mark_one_time(made["id"])                    # the first password is one-time (audit founder-console-08)
         platformdb.founder_audit("made an account", made["email"],
                                  {**({"company": platformdb.company(company_id)["name"], "company_role": role} if company_id else {}),
-                                  **({"one_time": one_time} if identity.MODE == "local" else {})})
+                                  **({"one_time": one_time} if identity.MODE == "local" else {})}, company_id=company_id or "")
         return {"user": store_founder.user(made["id"])}
 
 
@@ -446,7 +448,8 @@ def founder_membership_new(user_id: str, inp: dict = Body(...)):
     company_id = _id(inp["company_id"], "company")
     with _said():
         account = store_founder.add_membership(user_id, company_id, role)
-        platformdb.founder_audit("added a membership", account["email"], {"company": platformdb.company(company_id)["name"], "company_role": role})
+        platformdb.founder_audit("added a membership", account["email"], {"company": platformdb.company(company_id)["name"], "company_role": role},
+                                 company_id=company_id)
         store_founder.follow_membership(company_id, user_id, "active")
         store_founder.follow_roles(company_id)
         return {"membership": store_founder.membership_view(user_id, company_id)}
@@ -465,7 +468,7 @@ def founder_membership_change(user_id: str, company_id: str, inp: dict = Body(..
         account, before, after = store_founder.change_membership(user_id, company_id, role, status)
         changes = {"company": platformdb.company(company_id)["name"],
                    **{k: {"from": before[w], "to": after[w]} for k, w in (("company_role", "role"), ("status", "status")) if before[w] != after[w]}}
-        platformdb.founder_audit("changed a membership", account["email"], changes)
+        platformdb.founder_audit("changed a membership", account["email"], changes, company_id=company_id)
         if status is not None:
             # also when the status was already this one: a member row a failed follow-up left behind is set right by sending the status again
             store_founder.follow_membership(company_id, user_id, status)
@@ -481,7 +484,8 @@ def founder_membership_remove(user_id: str, company_id: str):
     user_id, company_id = _id(user_id, "account"), _id(company_id, "company")
     with _said():
         account, before = store_founder.remove_membership(user_id, company_id)
-        platformdb.founder_audit("removed a membership", account["email"], {"company": platformdb.company(company_id)["name"], "company_role": before["role"]})
+        platformdb.founder_audit("removed a membership", account["email"], {"company": platformdb.company(company_id)["name"], "company_role": before["role"]},
+                                 company_id=company_id)
         store_founder.follow_membership(company_id, user_id, "removed")
     return {"removed": True}
 
@@ -489,8 +493,14 @@ def founder_membership_remove(user_id: str, company_id: str):
 # ------------------------------------------------------------------------------------------------ the audit
 
 @router.get("/api/founder/audit", dependencies=[Depends(_session)])
-def founder_audit(offset: int = 0):
-    """The founder's audit, newest first, AUDIT_PAGE entries from `offset`."""
-    if offset < 0:
-        _api._fail("The offset is a whole number from 0")
-    return {"entries": platformdb.list_founder_audit(AUDIT_PAGE, offset)}
+def founder_audit(offset: str | None = None, group: str | None = None, company: str | None = None, day_from: str | None = Query(None, alias="from"),
+                  to: str | None = None, q: str | None = None):
+    """The founder's audit, newest first, AUDIT_PAGE entries from `offset`, filtered (UX backend ask K34; plan G4.5, G9 item 3): the kind of change
+    (`group`), the company (its id), From and To (Karachi days, both included) and a search (`q`), as {entries, total, offset, limit, groups}. Times in
+    Karachi time; each line with its group and its company."""
+    if company is not None and company != "" and platformdb.company(company) is None:
+        _missing("company")
+    try:
+        return audit_trail.founder_search(group=group, company=company, day_from=day_from, day_to=to, q=q, offset=offset, limit=AUDIT_PAGE)
+    except audit_trail.Refused as exc:
+        _api._fail(str(exc))

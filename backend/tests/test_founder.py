@@ -541,7 +541,7 @@ def test_the_companies_list_carries_the_files_figures(fdb):
     assert list(rows) == ["Boxlytics Internal", "Development"]
     box = rows["Boxlytics Internal"]
     assert {"id", "name", "enabled", "seats", "disabled_reason", "created", "owner", "members", "seats_taken", "admins", "last_seen", "sites",
-            "sites_closed_loop", "sites_failing", "plans_issued", "archived"} == set(box)
+            "sites_closed_loop", "sites_failing", "plans_issued", "archived", "last_backup"} == set(box)     # last_backup: UX K35
     assert box["seats_taken"] == 1 and box["admins"] == 1 and box["last_seen"] and box["archived"] is False
     # a deleted site is not counted; nor is a site whose tick has not run (sites_failing: the active sites whose last tick made no plan, round 7
     # storage-perf, parity-architecture-06)
@@ -774,7 +774,8 @@ def test_the_audit_lists_every_action_newest_first_a_page_at_a_time(fdb):
         platformdb.founder_audit("made a backup", f"Company {i}", {"file": f"f{i}.db"})
     entries = _ok(c.get("/api/founder/audit"))["entries"]
     assert [e["target"] for e in entries] == ["Company 2", "Company 1", "Company 0", "Boxlytics Internal"]
-    assert set(entries[0]) == {"at", "actor", "action", "target", "detail"} and entries[0]["actor"] == "founder"
+    # each line's group and company (UX K34: the console's Kind and Company filters)
+    assert set(entries[0]) == {"at", "actor", "action", "target", "detail", "group", "company_id", "company_name"} and entries[0]["actor"] == "founder"
     assert [e["target"] for e in _ok(c.get("/api/founder/audit?offset=3"))["entries"]] == ["Boxlytics Internal"]
     assert c.get("/api/founder/audit?offset=-1").status_code == 422
 

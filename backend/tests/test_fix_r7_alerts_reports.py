@@ -587,10 +587,14 @@ def _story(monkeypatch) -> list[str]:
 
 
 def _baseline(**over) -> dict:
+    """A fake baseline of verify.summary. Its scored days all claim, unless told otherwise, so the fuel saved on the claim's days (`fuel_saved`, the
+    statement's fuel row since the review of batches k7 and k8) is the ledger's `litres_saved`."""
     b = {"saving_rs": 1900.5, "claimed_rs": 1901.13, "levers": {"peak_window": 1500.0, "genset": 250.0, "mdi": 150.5}, "litres_saved": 72.4,
          "verified_days": 2, "perfect_foresight_rs": 4000.0, "mdi_months": {}, "unserved_kwh_actual": 0.0, "unserved_kwh_baseline": 2.0,
-         "genset_unknown_days": 0, "import_unknown_days": 0}
-    return {**b, **over}
+         "genset_unknown_days": 0, "import_unknown_days": 0, "claiming_days": 2, "fuel_days": 2}
+    out = {**b, **over}
+    out.setdefault("fuel_saved", out["litres_saved"])
+    return out
 
 
 def _day_row(day: str, **over) -> dict:
@@ -630,8 +634,11 @@ def test_the_monthly_report_says_not_metered_for_an_unmetered_genset_and_marks_w
     d1, d2 = f"{month}-03", f"{month}-04"
     days = [_day_row(d1, levers={"genset": None}, claim_withheld="genset_unknown"),
             _day_row(d2, levers={"genset": None}, claim_withheld="import_unknown", import_unknown=True)]
-    unmetered = _baseline(litres_saved=0.0, genset_unknown_days=2, levers={"peak_window": 1500.0, "mdi": 0.0})
-    _with_summary(monkeypatch, _fake_summary(month, days, native=unmetered, tuned=_baseline(litres_saved=0.0, genset_unknown_days=2)),
+    # both days withheld: none claims, so no fuel saved is said ("-"), and the note says the fuel was not metered (review of batches k7 and k8)
+    unmetered = _baseline(litres_saved=0.0, genset_unknown_days=2, levers={"peak_window": 1500.0, "mdi": 0.0}, claiming_days=0, fuel_saved=None,
+                          fuel_days=0)
+    _with_summary(monkeypatch, _fake_summary(month, days, native=unmetered, tuned=_baseline(litres_saved=0.0, genset_unknown_days=2, claiming_days=0,
+                                                                                            fuel_saved=None, fuel_days=0)),
                   [_tday(d1), _tday(d2)])
     built = _story(monkeypatch)
     with world.use():

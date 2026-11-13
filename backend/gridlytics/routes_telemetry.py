@@ -5,7 +5,7 @@ import json
 import math
 import re
 from datetime import date, datetime, timedelta, timezone
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import numpy as np
 from fastapi import APIRouter, Body, Request
@@ -59,23 +59,9 @@ def quality(site_id: str, days: int = 14):
     return {"days": rows, "first_data": first, "imports": imports}
 
 
-def _upload_head(content: bytes) -> None:
-    """Refuses (ValueError, in words) a file whose header names a column twice: the import reads a repeated name's last column, which the person
-    uploading would not expect. Only the header is read (audit R7 performance-live-04: the route parsed every row for the date window and the import
-    parsed them all again). The rows' window (2015 to a day from now, at most telemetry.UPLOAD_MAX_DAYS: plan Part 2.8, uploaded CSV is untrusted input
-    parsed with size and time caps) is telemetry.import_csv's, judged from the rows it parses once, before it stores anything."""
-    import csv
-    import io
-    head = content[:65536].decode("utf-8-sig", errors="replace")
-    row = next(csv.reader(io.StringIO(head), delimiter=telemetry._dialect(head)[0]), None) or []
-    twice = sorted({h for h in row if h.strip() and row.count(h) > 1})
-    if twice:
-        raise ValueError(f"The header names {', '.join(twice[:5])} more than once: give each column once and upload again")
-
-
 def _import(site_id: str, body: bytes, tz_offset_h: float, file_name: str | None = None, mapping: dict | None = None) -> dict:
     m = telemetry.mapping_of(mapping) if mapping else None
-    _upload_head(body)
+    telemetry.refuse_named_twice(body)
     extra = {"mapping": m} if m else {}
     try:
         # the uploaded file's name goes with the import (the quality page's imports rows)
@@ -203,6 +189,34 @@ def mapping_guess(site_id: str, inp: dict = Body(...)):
     body = check(GuessIn, inp)
     saved = telemetry.saved_mapping(site_id)
     return telemetry.guess_mapping(body.head, saved["mapping"] if saved else None)
+
+
+class PreviewIn(Strict):
+    """`POST /sites/:id/telemetry/mapping/preview` (UX backend ask K15; plan D9.5, C11.4): the file's head and the mapping as the person has set it."""
+    #: the file's first lines (the web app sends its first 64 KB, as for the guess); a last line cut short is not read
+    head: str = Field(..., min_length=1, max_length=65536, title="The start of the file")
+    #: the column mapping as set (PUT /telemetry/mapping's shape); left out, the columns are read by their names
+    mapping: MappingIn | None = None
+    #: the hours the file's times are ahead of UTC (the upload's tz_offset_h: 5 for Karachi time, 0 for UTC); a time written with its own offset is read
+    #: as written
+    tz_offset_h: float = Field(0.0, ge=-23, le=23, strict=True, title="The time zone offset (hours from UTC)")
+
+
+@router.post("/api/sites/{site_id}/telemetry/mapping/preview")
+def mapping_preview(site_id: str, inp: Any = Body(None)):
+    """How the upload will read a file (UX backend ask K15; plan D9.5): its first five rows as they will be stored, in Karachi time and the product's
+    units and signs, read from the file's head with the mapping as set, by the upload's own rules (telemetry.preview_csv). Nothing is stored; what the
+    upload refuses is refused here in the same words (422). upload_data, as the upload: a role without it is refused (403) whatever JSON the body
+    holds, its shape checked only after the role (UX K15 check)."""
+    auth.need("upload_data", "Previewing a file's rows")
+    site_or_404(site_id)
+    if not isinstance(inp, dict):
+        raise Refusal(422, "Send the file's head as a set of named values: head, mapping and tz_offset_h", "invalid")
+    body = check(PreviewIn, inp)
+    try:
+        return telemetry.preview_csv(body.head, body.tz_offset_h, body.mapping.model_dump() if body.mapping else None)
+    except ValueError as exc:
+        raise bad(exc) from None
 
 
 @router.get("/api/sites/{site_id}/telemetry/export.csv")

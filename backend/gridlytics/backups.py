@@ -144,6 +144,34 @@ def list_backups() -> list[dict]:
     return out
 
 
+def newest_copies(paths: list[Path]) -> dict[Path, str | None]:
+    """When the newest copy of each database in `paths` was made (UTC, ISO with its offset: the `modified` of the copy the Backups page lists first), or
+    None for one with no copy (UX backend ask K35; plan G9 item 4: "No copy since 8 Nov" on the founder's Overview and company drawer, without reading
+    every company's list). Each backup folder is listed once, whatever the number of companies whose copies it holds."""
+    out: dict[Path, str | None] = {p: None for p in paths}
+    by_folder: dict[Path, list[Path]] = {}
+    for p in paths:
+        by_folder.setdefault(folder(p), []).append(p)
+    for where, mine in by_folder.items():
+        try:
+            names = [f for f in where.iterdir()] if where.exists() else []
+        except OSError:
+            continue
+        for p in mine:
+            ours = _ours(path=p)
+            newest = None
+            for f in names:
+                if not ours.match(f.name):
+                    continue
+                try:
+                    made = f.stat().st_mtime
+                except FileNotFoundError:          # pruned while being listed
+                    continue
+                newest = made if newest is None or made > newest else newest
+            out[p] = datetime.fromtimestamp(newest, timezone.utc).isoformat(timespec="seconds") if newest is not None else None
+    return out
+
+
 def _daily(path: Path, copy, keep: int) -> Path | None:
     """Today's daily copy of the database `path`, made by `copy(tag)`, if there is none yet; then its oldest daily copies beyond `keep` are removed."""
     today = datetime.now().strftime("%Y-%m-%d")

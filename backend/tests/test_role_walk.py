@@ -580,6 +580,164 @@ def test_the_source_test_s_first_rows_carry_no_money_and_reach_no_viewer_and_no_
     assert not {k for _, k, _, _ in _items(admin) if isinstance(k, str) and money.is_money(k)}
 
 
+def test_the_edge_key_s_existence_reaches_every_reader_of_the_edge_and_nothing_of_the_key(walk):
+    """UX backend ask K8 (plan C19.2 item 4): GET /edge says whether the box's key was made and when (`key`), the same for the administrator, the operator
+    (who may not list keys) and the viewer; nothing of the key itself (no prefix, no id, no name); a machine key does not read the edge's state."""
+    client, h = walk["client"], walk["headers"]
+    sid = walk["edge_site"]
+    got = walk["answers"]["/api/sites/{site_id}/edge"][f"/api/sites/{sid}/edge"]
+    assert {r: s for r, (s, _) in got.items()} == {"admin": 200, "operator": 200, "viewer": 200, "key": 403}
+    keys = {r: body["key"] for r, (s, body) in got.items() if s == 200}
+    assert keys["admin"]["exists"] is True and keys["admin"]["made_at"].endswith("+05:00") and len(set(map(str, keys.values()))) == 1, keys
+    listed = client.get("/api/platform/keys", headers=h["admin"]).json()
+    mine = [k for k in listed if k["site_id"] == sid and k["kind"] == "edge" and not k["revoked"]]
+    for r, (s, body) in got.items():
+        text = json.dumps(body)
+        assert "glk_" not in text and not any(k["prefix"] in text or k["id"] in text or f'"{k["name"]}"' in text for k in mine), r
+
+
+def test_the_alert_thresholds_limits_reach_each_reader_of_the_rules_alike_and_hold_no_money(walk):
+    """UX backend ask K16 (plan D9.6): each rule's `limits` (its thresholds' defaults and ranges) reach the administrator, the operator and the viewer
+    alike for the categories each receives (a viewer: the energy ones, so no bill tolerance), none of them under a money name."""
+    from gridlytics import alerts, money
+    got = walk["answers"]["/api/alerts/rules"]["/api/alerts/rules"]
+    limits = {r: {c: rule["limits"] for c, rule in body.items()} for r, (s, body) in got.items() if s == 200}
+    assert set(limits) >= {"admin", "operator", "viewer"}, got.keys()
+    assert set(limits["viewer"]) == set(alerts.ENERGY_CATEGORIES) and "Tariff" in limits["operator"], limits.keys()
+    for reader, cats in limits.items():
+        assert cats == {c: limits["admin"][c] for c in cats} == {c: alerts.threshold_limits(c) for c in cats}, reader
+        assert not {k for _, k, _, _ in _items(cats) if isinstance(k, str) and money.is_money(k)}, reader
+
+
+def test_the_csv_preview_reaches_the_roles_that_upload_and_carries_no_money(walk):
+    """UX backend ask K15 (plan D9.5): the upload's preview is for upload_data: the administrator and the operator read the same rows; the viewer and
+    a key (whose scopes hold no upload) are refused with no rupee; the rows are energy only."""
+    from gridlytics import money
+    client, h = walk["client"], walk["headers"]
+    sid = walk["edge_site"]
+    body = {"head": "ts,grid_present,pv_power_w,battery_power_w\n2026-03-01T00:00:00+05:00,1,1200,-300\n", "tz_offset_h": 5}
+    got = {reader: client.post(f"/api/sites/{sid}/telemetry/mapping/preview", json=body, headers=h[reader]) for reader in READERS}
+    assert {r: g.status_code for r, g in got.items()} == {"admin": 200, "operator": 200, "viewer": 403, "key": 403}
+    admin = got["admin"].json()
+    assert admin["rows"] and got["operator"].json() == admin
+    assert not {k for _, k, _, _ in _items(admin) if isinstance(k, str) and money.is_money(k)}
+    for reader in ("viewer", "key"):
+        assert not any(RUPEES.search(s) for s in _strings(got[reader].json())), reader
+
+
+def test_each_reader_is_offered_the_alert_kinds_it_receives_for_email(walk):
+    """UX backend ask K33 (plan G9 item 2): the notification choices offer each person the kinds of alert its role receives, as the inbox does: the
+    viewer the five energy kinds, the operator every kind but Product, the administrator all nine; a key has no choices (403)."""
+    from gridlytics import alerts
+    got = walk["answers"]["/api/platform/notifications"]["/api/platform/notifications"]
+    assert {r: s for r, (s, _) in got.items()} == {"admin": 200, "operator": 200, "viewer": 200}   # the walk reads a key on its site's paths only
+    assert walk["client"].get("/api/platform/notifications", headers=walk["headers"]["key"]).status_code == 403
+    cats = {r: body["categories"] for r, (s, body) in got.items() if s == 200}
+    assert cats == {"admin": list(alerts.CATEGORIES), "operator": [c for c in alerts.CATEGORIES if c != "Product"],
+                    "viewer": list(alerts.ENERGY_CATEGORIES)}, cats
+    for r, (s, body) in got.items():
+        if s == 200:
+            assert set(body["follow"]) <= set(body["categories"]) and set(body["email_kinds"]) <= set(body["categories"]), r
+
+
+def test_the_filtered_audit_trail_and_its_export_are_the_administrator_s_alone(walk):
+    """UX backend ask K34 (plan G2.4): the company trail's filtered page and its CSV need manage_users (the trail holds the fee and fuel prices): the
+    operator, the viewer and a key are refused with no rupee; the administrator reads the page with its groups and people."""
+    client, h = walk["client"], walk["headers"]
+    got = walk["answers"]["/api/audit/search"]["/api/audit/search"]
+    assert {r: s for r, (s, _) in got.items()} == {"admin": 200, "operator": 403, "viewer": 403}
+    assert client.get("/api/audit/search", headers=h["key"]).status_code == 403
+    page = got["admin"][1]
+    assert page["total"] >= len(page["entries"]) > 0 and page["groups"] and page["people"]
+    assert all(e["at"].endswith("+05:00") for e in page["entries"])
+    for reader in READERS:
+        r = client.get("/api/audit/export.csv", headers=h[reader])
+        assert r.status_code == (200 if reader == "admin" else 403), (reader, r.text[:200])
+        if reader != "admin":
+            assert not RUPEES.search(r.text), reader
+        else:
+            assert r.headers["content-type"].startswith("text/csv") and r.text.startswith("at_karachi,who,email,action,group,target,site,detail")
+
+
+def test_only_the_administrator_reads_when_the_company_was_last_copied(walk):
+    """UX backend ask K35: GET /api/platform/org carries `last_backup` for the administrator (manage_users) only; the operator, the viewer and a key
+    are not given the key at all."""
+    got = walk["answers"]["/api/platform/org"]["/api/platform/org"]
+    for reader, (status, body) in got.items():
+        if status != 200:
+            continue
+        assert ("last_backup" in body) == (reader == "admin"), (reader, body)
+    assert got["admin"][0] == 200 and got["operator"][0] == 200 and got["viewer"][0] == 200
+    keyed = walk["client"].get("/api/platform/org", headers=walk["headers"]["key"])
+    assert keyed.status_code != 200 or "last_backup" not in keyed.json(), keyed.text
+
+
+def test_a_past_forecast_issue_reaches_every_person_alike_and_no_key(walk):
+    """UX backend asks K20, K21 and K23 (plan E6 items 1, 2, 4): the issue held at a belief time (`?at=`) reads alike for the administrator, the
+    operator and the viewer, with its daily energy and stage progress and no money; a machine key reaches no forecast (its scopes hold no site
+    data), refused in words without a rupee."""
+    from gridlytics import money
+    client, h = walk["client"], walk["headers"]
+    sid = walk["edge_site"]
+    for kind in ("pv", "load", "outage"):
+        latest = walk["answers"]["/api/sites/{site_id}/forecasts/{kind}"][f"/api/sites/{sid}/forecasts/{kind}"]["admin"][1]
+        if not latest.get("issue"):
+            continue
+        got = {r: client.get(f"/api/sites/{sid}/forecasts/{kind}", params={"at": str(latest["belief_time"])}, headers=h[r]) for r in READERS}
+        assert {r: g.status_code for r, g in got.items()} == {"admin": 200, "operator": 200, "viewer": 200, "key": 403}, kind
+        bodies = {r: g.json() for r, g in got.items() if g.status_code == 200}
+        for r, body in bodies.items():
+            assert body["belief_time"] == latest["belief_time"] and body["exact"] is True, (kind, r)
+            assert body["issue"].get("daily_kwh") == bodies["admin"]["issue"].get("daily_kwh"), (kind, r)
+            assert body["stage_progress"] == bodies["admin"]["stage_progress"], (kind, r)
+            assert not {k for _, k, _, _ in _items(body) if isinstance(k, str) and money.is_money(k)}, (kind, r)
+        assert not any(RUPEES.search(x) for x in _strings(got["key"].json())), kind
+
+
+def test_the_missed_forecasts_by_kind_reach_each_reader_of_the_inbox(walk):
+    """UX backend ask K26 (plan E6 item 8): `?kind=` keeps one rule's alerts within the categories each reader receives; a kind in no form of a
+    rule's name is refused in one sentence, the same for every reader."""
+    from gridlytics import alerts, platform as platformdb, seed_demo, store
+    client, h = walk["client"], walk["headers"]
+    sid = walk["sites"][0]
+    # K26 check: the demo raises neither kind, so the walk raises one of each on a demo site, or an empty list would prove nothing
+    demo = next(c for c in platformdb.list_companies() if c["name"] == seed_demo.DEMO_COMPANIES[0]["name"])
+    with store.use_company(platformdb.company_file(demo)):
+        alerts._set(True, sid, "forecast_bust", "Forecast", "info", "The day-ahead PV forecast for 8 November was off by more than 30 % of the "
+                    "clear-sky output for 3.5 hours", {"day": "2026-11-08", "hours": 3.5})
+        alerts._set(True, sid, "savings_negative", "Savings", "warning", "A day saved less than nothing", {"day": "2026-11-10"})
+    q = {"state": "", "every": "true", "site_id": sid}
+    for reader in ("admin", "operator", "viewer"):
+        r = client.get("/api/alerts", params={**q, "kind": "forecast_bust"}, headers=h[reader])
+        assert r.status_code == 200 and r.json() and {a["rule"] for a in r.json()} == {"forecast_bust"}, (reader, r.text[:200])
+        assert r.json()[0]["detail"] == {"day": "2026-11-08", "hours": 3.5}, reader
+        bad = client.get("/api/alerts", params={"kind": "Forecast bust"}, headers=h[reader])
+        assert bad.status_code == 422 and bad.json()["detail"] == "The kind of alert is a rule's name in lower case, such as forecast_bust", reader
+    admin = client.get("/api/alerts", params={**q, "kind": "savings_negative"}, headers=h["admin"]).json()
+    assert admin and {a["rule"] for a in admin} == {"savings_negative"}
+    viewer = client.get("/api/alerts", params={**q, "kind": "savings_negative"}, headers=h["viewer"]).json()
+    assert viewer == []                                                  # a viewer receives no Savings alert, by kind or not
+
+
+def test_the_savings_additions_reach_a_viewer_in_energy_and_the_taxes_do_not(walk):
+    """UX backend ask K27 (plan F11 item 1): the taxes recovered on the claim are a money name, stripped for a viewer; the peak-window import
+    avoided, the fuel saved and its unit, the tuned table's rows, each day's native peak-window import and plan, the tariff notices and Preliminary
+    by both rules reach the viewer as the administrator reads them."""
+    from gridlytics import money
+    assert money.is_money("taxes_recovered_rs")
+    energy = ("peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_days", "fuel_unit")
+    for url, got in walk["answers"]["/api/sites/{site_id}/savings"].items():
+        admin, viewer = got["admin"][1], got["viewer"][1]
+        for base in ("native", "tuned"):
+            assert "taxes_recovered_rs" in admin["baselines"][base] and "taxes_recovered_rs" not in viewer["baselines"][base], (url, base)
+            assert {k: viewer["baselines"][base][k] for k in energy} == {k: admin["baselines"][base][k] for k in energy}, (url, base)
+        assert viewer["baselines"]["tuned"]["rule_table"] == admin["baselines"]["tuned"]["rule_table"], url
+        assert [(d["plan_id"], d["peak_import_kwh_native"]) for d in viewer["days"]] == [(d["plan_id"], d["peak_import_kwh_native"])
+                                                                                         for d in admin["days"]], url
+        assert viewer["tariff_notices"] == admin["tariff_notices"] and viewer["preliminary_rules"] == admin["preliminary_rules"], url
+        assert got["operator"][1]["baselines"]["native"].get("taxes_recovered_rs") == admin["baselines"]["native"]["taxes_recovered_rs"], url
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

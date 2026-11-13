@@ -393,7 +393,7 @@ def seed(companies=None, people=None, *, reset_passwords: bool = False, out: str
             seats = c["seats"] if c["seats"] is not None else max(platformdb.SEATS, len(mine))
             row, account = store_founder.create_company(c["name"], seats, True, spec)
             platformdb.founder_audit("made a company", row["name"], {"seats": seats, "enabled": True, "owner": account["email"],
-                                                                    "new_owner": "user_id" not in spec}, actor=ACTOR)
+                                                                    "new_owner": "user_id" not in spec}, actor=ACTOR, company_id=row["id"])
             if "user_id" not in spec:
                 done["accounts"].append(account["email"])
             rows[row["name"].lower()] = row
@@ -403,7 +403,8 @@ def seed(companies=None, people=None, *, reset_passwords: bool = False, out: str
             account = platformdb.account_by_email(p["email"])
             if account is None:
                 account = store_founder.create_account(p["email"], p["name"], made.setdefault(p["email"], new_password()), company["id"], p["company_role"])
-                platformdb.founder_audit("made an account", account["email"], {"company": company["name"], "company_role": p["company_role"]}, actor=ACTOR)
+                platformdb.founder_audit("made an account", account["email"], {"company": company["name"], "company_role": p["company_role"]}, actor=ACTOR,
+                                         company_id=company["id"])
                 done["accounts"].append(account["email"])
                 continue
             if p["email"] not in made and p["email"] not in done["kept"]:
@@ -417,7 +418,7 @@ def seed(companies=None, people=None, *, reset_passwords: bool = False, out: str
             if platformdb.membership(account["id"], company["id"]) is None:
                 store_founder.add_membership(account["id"], company["id"], p["company_role"])
                 platformdb.founder_audit("added a membership", account["email"], {"company": company["name"], "company_role": p["company_role"]},
-                                         actor=ACTOR)
+                                         actor=ACTOR, company_id=company["id"])
                 store_founder.follow_membership(company["id"], account["id"], "active")
                 done["memberships"].append((account["email"], company["name"]))
         founder_login = _founder_login(reset_passwords, earlier["founder"])

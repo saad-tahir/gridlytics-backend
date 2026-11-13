@@ -100,3 +100,29 @@ def plan_ids(site_id: str, d0: str, d1: str) -> dict[str, list[str]]:
         out[d.isoformat()] = ids
         d += timedelta(days=1)
     return out
+
+
+def plan_at_start(site_id: str, d0: str, d1: str) -> dict[str, str | None]:
+    """The plan in force when each Pakistan day d0..d1 began (UX backend ask K27, plan F1.1.7's "Open the plan of Sat 31 Oct"): the latest plan made
+    at or before its midnight in Pakistan time, by plan_ids' rule (a failed or held run is no plan in force); None before the site's first plan."""
+    first, last = date.fromisoformat(d0[:10]), date.fromisoformat(d1[:10])
+    if last < first:
+        return {}
+    t0, t1 = twin.day_start_utc(first), twin.day_start_utc(last)
+    ok = "status IN ('active', 'superseded')"
+    with store.connect() as con:
+        start = con.execute(f"SELECT id FROM plans WHERE site_id = ? AND {ok} AND belief_time <= ? ORDER BY belief_time DESC, generated_at DESC, "
+                            "rowid DESC LIMIT 1", (site_id, _iso(t0))).fetchone()
+        made = con.execute(f"SELECT id, belief_time FROM plans WHERE site_id = ? AND {ok} AND belief_time > ? AND belief_time <= ? "
+                           "ORDER BY belief_time, generated_at, rowid", (site_id, _iso(t0), _iso(t1))).fetchall()
+    current = start["id"] if start else None
+    out: dict[str, str | None] = {}
+    i, d = 0, first
+    while d <= last:
+        begin = _iso(twin.day_start_utc(d))
+        while i < len(made) and made[i]["belief_time"] <= begin:
+            current = made[i]["id"]
+            i += 1
+        out[d.isoformat()] = current
+        d += timedelta(days=1)
+    return out

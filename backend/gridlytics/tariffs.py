@@ -1143,6 +1143,19 @@ def _tax_stack(tf: dict) -> float:
     return f
 
 
+def recoverable_share(conn: dict, on) -> float:
+    """The taxes a connection recovers per bearable rupee of a taxed charge on a day (UX backend ask K27, plan 8.2's "taxes you recover" line): GST
+    where `gst_recoverable` and the s.235 advance where `s235_adjustable` (on the bill amount, GST, further and extra tax included, where the class pays
+    it), over the bearable stack every price and the ledger carry (_tax_stack). A rupee of the ledger's grid energy or MDI lever was one of these
+    bearable rupees, so its recovered taxes are this share of it; 0 where the company recovers neither (a no-STRN commercial site bears both)."""
+    tf = _tax_factor_energy(conn, on)
+    extra = tf.get("extra") or 0.0
+    rec = tf["gst"] if tf["gst_recoverable"] else 0.0
+    if tf["s235_applies"] and tf["s235_adjustable"]:
+        rec += tf["s235_marginal"] * (1.0 + tf["gst"] + tf["further"] + extra)
+    return rec / _tax_stack(tf)
+
+
 def _unit_duty(conn: dict, tax: dict) -> float:
     """Punjab's additional electricity duty on heavy consumers, Rs per kWh of grid import (R9 section 7: 4 paisa a unit for industrial and commercial
     connections above 500 kVA, collected on the DISCO bill; Electricity Duty Rules 2026). The sanctioned load stands for the kVA where no
