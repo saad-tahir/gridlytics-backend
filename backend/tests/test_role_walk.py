@@ -567,6 +567,19 @@ def test_set_up_s_price_preview_names_its_rupees_as_money_and_reaches_no_viewer_
     assert not any(RUPEES.search(s) for s in _strings(admin["peak_windows"]))
 
 
+def test_the_source_test_s_first_rows_carry_no_money_and_reach_no_viewer_and_no_key(walk):
+    """UX backend ask K9: the source test's rows are the site's data (the points it lists, energy only), for edit_sites: the viewer and a key (whose
+    scopes hold no site data, audit security-roles-07) are refused; the operator reads the administrator's rows."""
+    from gridlytics import money
+    client, h = walk["client"], walk["headers"]
+    sid = walk["edge_site"]
+    got = {reader: client.post(f"/api/sites/{sid}/source/test", headers=h[reader]) for reader in READERS}
+    assert {r: g.status_code for r, g in got.items()} == {"admin": 200, "operator": 200, "viewer": 403, "key": 403}
+    admin = got["admin"].json()
+    assert admin["sample"] and got["operator"].json()["sample"] == admin["sample"]
+    assert not {k for _, k, _, _ in _items(admin) if isinstance(k, str) and money.is_money(k)}
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

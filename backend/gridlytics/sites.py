@@ -11,7 +11,7 @@ import json
 import math
 import re
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -874,19 +874,49 @@ SOURCE_NO_GRID = ("The data received carries no grid presence (grid_present or t
                   "planned. Add the point to the source, or choose a source that reports it")
 
 
+#: The rows the test shows of what it received (plan C4.5, R8 2.2 "first rows"; UX backend ask K9): the newest minutes, oldest first
+SOURCE_SAMPLE_ROWS = 5
+#: The points that are a yes or no
+SOURCE_FLAGS = ("grid_present", "genset_running")
+PKT = timezone(timedelta(hours=5))
+
+
 def _iso(ts) -> str:
-    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat()
+    """A moment of the test in Pakistan time, as people read it (ISO with +05:00; UX backend ask K9: it was UTC)."""
+    return datetime.fromtimestamp(int(ts), PKT).isoformat()
+
+
+def _sample(got: dict, points: list[str]) -> list[dict]:
+    """The newest SOURCE_SAMPLE_ROWS minutes received, oldest first, each {at (Karachi), values: {point: value}} with every point the test lists, in
+    the units the product stores them in (the point's name says it: W, %, V; a yes or no for grid presence and the genset's running; the inverter's
+    mode as sent), null where the minute carries none."""
+    ts = got["ts"]
+    rows = []
+    for i in range(max(0, len(ts) - SOURCE_SAMPLE_ROWS), len(ts)):
+        values = {}
+        for p in points:
+            v = got[p][i]
+            if p == "inverter_mode_active":
+                values[p] = v if v not in (None, "") else None
+            elif v is None or math.isnan(float(v)):
+                values[p] = None
+            else:
+                values[p] = bool(float(v)) if p in SOURCE_FLAGS else round(float(v), 2)
+        rows.append({"at": _iso(ts[i]), "values": values})
+    return rows
 
 
 def source_test(site_id: str) -> dict:
     """What the site's data source has sent (plan 9.3 tab A: a connection test that refuses a source without a grid-present signal; until then the
     wizard had only the person's tick): the minutes received in the day up to the last one, the points among SOURCE_POINTS that carry a value, and
     `grid_signal`: "found" (grid_present or the grid voltage is among them), "missing" (data arrived without either) or "no_data" (nothing yet: a site
-    is set up before its data flows, so this is no refusal). Times are ISO, UTC."""
+    is set up before its data flows, so this is no refusal), and `sample`, the newest rows of those points (_sample; UX backend ask K9). Times are ISO
+    in Pakistan time (+05:00)."""
     kind = (((get(site_id) or {}).get("data") or {}).get("data_source") or {}).get("kind")
     last = telemetry.latest(site_id)
     if not last:
-        return {"kind": kind, "grid_signal": "no_data", "rows": 0, "first_at": None, "last_at": None, "points": [], "sentence": SOURCE_NO_DATA}
+        return {"kind": kind, "grid_signal": "no_data", "rows": 0, "first_at": None, "last_at": None, "points": [], "sample": [],
+                "sentence": SOURCE_NO_DATA}
     got = telemetry.raw(site_id, int(last["ts"]) - SOURCE_TEST_S + 60, int(last["ts"]) + 60, columns=SOURCE_POINTS)
     ts = got["ts"]
 
@@ -896,7 +926,7 @@ def source_test(site_id: str) -> dict:
     points = [p for p in SOURCE_POINTS if carried(p)]
     grid = [p for p in GRID_POINTS if p in points]
     return {"kind": kind, "grid_signal": "found" if grid else "missing", "rows": len(ts), "first_at": _iso(ts[0]), "last_at": _iso(ts[-1]),
-            "points": points,
+            "points": points, "sample": _sample(got, points),
             "sentence": f"Grid presence is in the data received ({' and '.join(GRID_POINT_WORDS[p] for p in grid)}), so outages can be seen" if grid
             else SOURCE_NO_GRID}
 

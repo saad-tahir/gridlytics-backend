@@ -544,6 +544,14 @@ genset was saved before, so no migration or copy of the company's file was neede
   - see_costs, as `GET /prices` (the prices are money: `c_imp`, `c_exp`, the MDI's `rate_rs_per_kw`, the ICP's `rate`); a viewer and a machine key
     are refused. Nothing is saved or audited (exempt in the audit walk).
 
+- **K9, the source test's first rows** (plan C19.2 item 5, C4.5, R8 2.2; optional, built): `POST /sites/:id/source/test` adds `sample`, the
+  newest five minutes received (oldest first), each `{at, values}` with every point the test lists, in the units the product stores them in (the
+  point's name says it: W, %, V), a yes or no for grid presence and the genset's running, the inverter's mode as sent, null where the minute has
+  none. The newest, not the window's first: the card is read while the source is being connected, so the rows that show it sends now say more than
+  a day-old minute; the plan's "first rows" is the card's label. **Times in Pakistan time**: C19.2 asks for the rows "with UTC times", which the
+  owner's rule (every time meant for people in Pakistan time) overrides; `first_at` and `last_at` are Karachi ISO (+05:00) too, where they were UTC
+  (the same moments: the web app formats them with `pktDateTime`). Still `edit_sites`, as the test was; no money.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

@@ -650,7 +650,7 @@ def test_a_source_test_says_what_the_data_carries_and_a_source_without_grid_pres
     t = op.post(f"/api/sites/{sid}/source/test").json()
     assert (t["kind"], t["grid_signal"], t["rows"]) == ("csv", "missing", 30), t
     assert t["points"] == ["pv_power_w", "load_power_w"]
-    assert t["first_at"] < t["last_at"] and t["last_at"].endswith("+00:00")
+    assert t["first_at"] < t["last_at"] and t["last_at"].endswith("+05:00")       # Pakistan time (UX K9)
     assert t["sentence"] == ("The data received carries no grid presence (grid_present or the grid voltage): outages cannot be seen and the reserve "
                              "cannot be planned. Add the point to the source, or choose a source that reports it")
     r = a.post(f"/api/sites/{sid}/activate")

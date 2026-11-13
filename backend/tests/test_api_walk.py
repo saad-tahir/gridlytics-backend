@@ -249,6 +249,21 @@ def test_set_up_s_price_preview_answers_the_readers_of_costs(world):
     assert client.get(f"/api/sites/{sid}", headers=owner).json()["connections"] == held
 
 
+def test_the_source_test_shows_its_first_rows_to_the_roles_that_edit_the_site(world):
+    """UX backend ask K9 (plan step 9a, Set-up A's result card): `POST /sites/:id/source/test` answers the administrator and the operator (edit_sites)
+    with up to five rows of what the source sent, in Pakistan time; the analyst and the viewer are refused."""
+    client, password, _ = world
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    sid = next(s["id"] for s in client.get("/api/fleet", headers=owner).json()["sites"] if s["name"] == "Faisalabad textile mill (demo)")
+    for email, status in (("owner@onyxleaf.demo", 200), ("operator@onyxleaf.demo", 200), ("analyst@onyxleaf.demo", 403), ("viewer@onyxleaf.demo", 403)):
+        r = client.post(f"/api/sites/{sid}/source/test", headers=_login(client, password, email))
+        assert r.status_code == status, (email, r.text[:200])
+        if status == 200:
+            t = r.json()
+            assert t["grid_signal"] == "found" and 1 <= len(t["sample"]) <= 5, (email, t)
+            assert all(row["at"].endswith("+05:00") and list(row["values"]) == t["points"] for row in t["sample"]), email
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")
