@@ -57,18 +57,28 @@ def company_tax_defaults() -> dict | None:
     """The four tax flags of the grid connection the company saved last (UX backend ask K10; plan C19.2 item 6, C6.4), with the site it is at: a site
     that is not removed and is no demo site (a demo's figures are not the company's), a connection of a regime that buys from the grid (an off-grid
     one bears no bill's taxes). None while the company has none. The province is not among them: it follows the new site's DISCO (sites._from_disco).
-    Last saved by its stamp (to the second), then by the order rows were made."""
+    Last saved by the audit trail's order of "saved a connection" (UX K10 check: the rows' stamps are to the second, so two saves in one second tied,
+    and moving the plant's mark off a connection stamped it although it was not saved); a connection with no such line, by its stamp, then the order
+    rows were made."""
     with store.connect() as con:
-        r = con.execute("SELECT c.id, c.site_id, c.data, c.updated, s.name FROM connections c JOIN sites s ON s.id = c.site_id WHERE s.deleted IS NULL "
-                        "AND s.demo_link IS NULL AND COALESCE(json_extract(c.data, '$.regime'), '') != 'off_grid' "
-                        "ORDER BY c.updated DESC, c.rowid DESC LIMIT 1").fetchone()
-    if r is None:
-        return None
-    tax = (json.loads(r["data"]) or {}).get("tax") or {}
+        rows = con.execute("SELECT c.id, c.site_id, c.data, c.updated, s.name FROM connections c JOIN sites s ON s.id = c.site_id WHERE s.deleted IS NULL "
+                           "AND s.demo_link IS NULL AND COALESCE(json_extract(c.data, '$.regime'), '') != 'off_grid' "
+                           "ORDER BY c.updated DESC, c.rowid DESC").fetchall()
+        if not rows:
+            return None
+        found, saved_at = rows[0], rows[0]["updated"]
+        mine = {r["id"]: r for r in rows}
+        # newest first, and almost always the first line read is one of them
+        for a in con.execute("SELECT at, detail FROM audit WHERE action = 'saved a connection' ORDER BY id DESC"):
+            cid = (json.loads(a["detail"] or "{}") or {}).get("connection_id")
+            if cid in mine:
+                found, saved_at = mine[cid], a["at"]
+                break
+    tax = (json.loads(found["data"]) or {}).get("tax") or {}
     flags = {k: bool(tax.get(k, sites.TaxFlags.model_fields[k].default)) for k in TAX_DEFAULT_FLAGS}
     flags["gst_recoverable"] = flags["gst_recoverable"] and flags["strn"]
-    return {**flags, "site_id": r["site_id"], "site_name": r["name"], "connection_id": r["id"], "saved_at": karachi(r["updated"]),
-            "words": f"As at {r['name']}"}
+    return {**flags, "site_id": found["site_id"], "site_name": found["name"], "connection_id": found["id"], "saved_at": karachi(saved_at),
+            "words": f"As at {found['name']}"}
 
 
 def _icp_categories() -> list[str]:

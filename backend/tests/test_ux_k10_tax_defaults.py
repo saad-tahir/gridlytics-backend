@@ -59,3 +59,49 @@ def test_the_roles_that_open_set_up_read_it_and_a_viewer_does_not(world):
         assert (d is not None) is has, (role, d)
     # a machine key reaches no company setting, the meta answer included (apikeys: outside every scope)
     assert world.anon.get("/api/meta", headers=world.key(["sites:read", "plans:read"])).status_code == 403
+
+
+# ------------------------------------------------------------------------------------------------ UX K10 check
+
+def test_two_saves_in_one_second_the_later_is_the_company_s_default(world, monkeypatch):
+    """The stamps are to the second: two saves in one second (a script, a quick second save) tie on `updated`, and the order rows were made is not
+    the order they were saved in. The save order is the audit trail's (UX K10 check: Mill One's re-save lost to Secret Site Two's older row)."""
+    monkeypatch.setattr(store, "_now", lambda: "2026-11-13T08:27:58+00:00")
+    assert world.c["admin"].put(f"/api/sites/{world.other}/connection", json={"tariff_category": "B-2(b)", "sanctioned_load_kw": 300}).status_code == 200
+    with world.use():
+        mill = sites.connections(world.site)[0]
+    r = world.c["admin"].put(f"/api/sites/{world.site}/connection", json={"id": mill["id"], "tariff_category": "B-2(b)", "sanctioned_load_kw": 400,
+                                                                           "tax": {"atl": False}})
+    assert r.status_code == 200, r.text
+    d = _defaults(world)
+    assert (d["words"], d["connection_id"], d["atl"], d["saved_at"]) == ("As at Mill One", mill["id"], False, "2026-11-13T13:27:58+05:00")
+
+
+def test_moving_the_plant_mark_off_a_connection_is_no_save_of_it(world):
+    """Marking one connection as the plant's unmarks the site's other, which bumps that row's stamp: it was not saved, so its flags are not the
+    company's last (UX K10 check)."""
+    two, a = world.other, world.c["admin"]
+    first = a.put(f"/api/sites/{two}/connection", json={"tariff_category": "B-2(b)", "sanctioned_load_kw": 300}).json()["connections"][0]["id"]
+    r = a.put(f"/api/sites/{two}/connection", json={"tariff_category": "A-3", "regime": "flat", "sanctioned_load_kw": 40, "plant": True,
+                                                    "tax": NONE_RECOVERED})
+    assert r.status_code == 200, r.text
+    second = next(c["id"] for c in r.json()["connections"] if c["id"] != first)
+    assert _defaults(world)["connection_id"] == second
+    # the first saved again as the plant's: the second is unmarked in the same write, and is not saved
+    r = a.put(f"/api/sites/{two}/connection", json={"id": first, "tariff_category": "B-2(b)", "sanctioned_load_kw": 300, "plant": True})
+    assert r.status_code == 200, r.text
+    d = _defaults(world)
+    assert (d["connection_id"], d["atl"], d["s235_adjustable"]) == (first, True, True), d
+
+
+def test_another_company_s_connection_saved_later_is_never_this_company_s(world):
+    import identities
+    from gridlytics import platform as platformdb
+    from gridlytics.routes_sites import company_tax_defaults
+    other = identities.company("Another company", own_file=True)
+    with store.use_company(platformdb.company_file(other)):
+        theirs = sites.create({"name": "Their Mill", "disco": "LESCO"}, "t")["id"]
+        sites.put_connection(theirs, {"tariff_category": "B-2(b)", "sanctioned_load_kw": 400, "tax": {"strn": False, "gst_recoverable": False}}, "t")
+        assert company_tax_defaults()["words"] == "As at Their Mill"
+    d = _defaults(world)
+    assert (d["words"], d["strn"]) == ("As at Mill One", True)
