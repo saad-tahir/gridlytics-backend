@@ -697,13 +697,25 @@ def test_a_past_forecast_issue_reaches_every_person_alike_and_no_key(walk):
 def test_the_missed_forecasts_by_kind_reach_each_reader_of_the_inbox(walk):
     """UX backend ask K26 (plan E6 item 8): `?kind=` keeps one rule's alerts within the categories each reader receives; a kind in no form of a
     rule's name is refused in one sentence, the same for every reader."""
+    from gridlytics import alerts, platform as platformdb, seed_demo, store
     client, h = walk["client"], walk["headers"]
+    sid = walk["sites"][0]
+    # K26 check: the demo raises neither kind, so the walk raises one of each on a demo site, or an empty list would prove nothing
+    demo = next(c for c in platformdb.list_companies() if c["name"] == seed_demo.DEMO_COMPANIES[0]["name"])
+    with store.use_company(platformdb.company_file(demo)):
+        alerts._set(True, sid, "forecast_bust", "Forecast", "info", "The day-ahead PV forecast for 8 November was off by more than 30 % of the "
+                    "clear-sky output for 3.5 hours", {"day": "2026-11-08", "hours": 3.5})
+        alerts._set(True, sid, "savings_negative", "Savings", "warning", "A day saved less than nothing", {"day": "2026-11-10"})
+    q = {"state": "", "every": "true", "site_id": sid}
     for reader in ("admin", "operator", "viewer"):
-        r = client.get("/api/alerts", params={"kind": "forecast_bust", "state": "", "every": "true"}, headers=h[reader])
-        assert r.status_code == 200 and all(a["rule"] == "forecast_bust" for a in r.json()), (reader, r.text[:200])
+        r = client.get("/api/alerts", params={**q, "kind": "forecast_bust"}, headers=h[reader])
+        assert r.status_code == 200 and r.json() and {a["rule"] for a in r.json()} == {"forecast_bust"}, (reader, r.text[:200])
+        assert r.json()[0]["detail"] == {"day": "2026-11-08", "hours": 3.5}, reader
         bad = client.get("/api/alerts", params={"kind": "Forecast bust"}, headers=h[reader])
         assert bad.status_code == 422 and bad.json()["detail"] == "The kind of alert is a rule's name in lower case, such as forecast_bust", reader
-    viewer = client.get("/api/alerts", params={"kind": "savings_negative", "state": "", "every": "true"}, headers=h["viewer"]).json()
+    admin = client.get("/api/alerts", params={**q, "kind": "savings_negative"}, headers=h["admin"]).json()
+    assert admin and {a["rule"] for a in admin} == {"savings_negative"}
+    viewer = client.get("/api/alerts", params={**q, "kind": "savings_negative"}, headers=h["viewer"]).json()
     assert viewer == []                                                  # a viewer receives no Savings alert, by kind or not
 
 
