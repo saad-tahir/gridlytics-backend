@@ -253,16 +253,10 @@ def _month_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple
 
 
 def _claimed_energy(d: dict, grid: bool, genset: bool) -> tuple[float | None, float | None] | None:
-    """The energy a stored savings day (its native baseline's row) claims beside its rupees: the grid import moved out of the peak window against the
-    native replay (kWh) and the fuel avoided (the genset's unit), each None where the day does not carry it, at a site without a grid (`grid`) or a
-    genset (`genset`). None when the day claims nothing (a recommendation-only day, one whose claim is withheld): its energy is not counted, as its
-    rupees are not. The one rule of the month's figure and of each day's bar (UX backend ask K13), so the bars of the month add up to it."""
-    if d.get("fidelity") not in verify.CLAIMING or d.get("claim_withheld"):
-        return None
-    a, n = (d.get("actual") or {}).get("peak_import_kwh"), (d.get("baseline") or {}).get("peak_import_kwh")
-    peak = n - a if grid and a is not None and n is not None else None
-    litres = d["litres_saved"] if genset and d.get("litres_saved") is not None else None
-    return peak, litres
+    """The energy a stored savings day (its native baseline's row) claims beside its rupees: verify.claimed_energy, the one rule of the month's figure,
+    of each day's bar (UX backend ask K13), so the bars of the month add up to it, and of the Savings summary's peak-window import avoided (UX K27
+    check), so Fleet, Overview and Savings say one figure for one month."""
+    return verify.claimed_energy(d, grid, genset)
 
 
 def _spark_energy(claimed: tuple[float | None, float | None] | None, grid: bool, genset: bool) -> dict:

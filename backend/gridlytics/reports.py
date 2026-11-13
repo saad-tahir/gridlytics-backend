@@ -112,9 +112,12 @@ def _fuel(site: dict | None) -> tuple[str, str]:
 def _litres_saved(b: dict, scored: int, has_genset: bool, unit: str = " L") -> str:
     """The fuel a baseline's ledger saved, as the page's ledger says it (savings-ledger.tsx): "not metered" when the genset's fuel was unknown on
     every scored day (verify.summary sums such days as nothing, so its 0.0 is no figure), else the figure in the fuel's `unit` (_fuel); "no genset" at
-    a site without one. The figure is verify.fuel_saved's, the summary's `fuel_saved` (UX K27: one function for the page and the report)."""
+    a site without one, "-" with no scored day. The figure is verify.fuel_saved's, the summary's `fuel_saved` (UX K27: one function for the page and
+    the report)."""
     if not has_genset:
         return "no genset"
+    if scored <= 0:
+        return "-"  # no scored day: no figure, as the summary's null (UX K27 check), neither "0 L" nor "not metered"
     saved = verify.fuel_saved(b, scored, True)
     return "not metered" if saved is None else smart(saved, unit)
 
@@ -358,7 +361,8 @@ def diesel_line(site: dict, tdays: list[dict], nat: dict, scored: int, d0: date,
         if lu.get("litres_source"):
             parts.append(f"{smart(lu.get('litres'), unit)} used ({'metered' if lu['litres_source'] == 'meter' else 'Estimated from the fuel curve'})")
     saved = _litres_saved(nat, scored, True, unit)
-    parts.append(f"{name.lower()} saved not metered" if saved == "not metered" else f"{saved} saved against the native settings (Estimated)")
+    if saved != "-":  # no scored day: no fuel saved to say
+        parts.append(f"{name.lower()} saved not metered" if saved == "not metered" else f"{saved} saved against the native settings (Estimated)")
     return "; ".join(parts) + "."
 
 

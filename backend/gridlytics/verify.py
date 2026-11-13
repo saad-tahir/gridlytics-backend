@@ -2116,28 +2116,43 @@ def _mdi_month(site_id: str, conn: dict | None, bm: str, today: date) -> dict:
 # ------------------------------------------------------------------------------------------------ the summary's figures (UX backend ask K27)
 # One function per figure, which verify.summary and the reports (reports.py) both call, so the Savings page and the documents say one figure.
 
+def claimed_energy(d: dict, grid: bool, genset: bool) -> tuple[float | None, float | None] | None:
+    """The energy a stored savings day (one baseline's row) claims beside its rupees: the grid import moved out of the peak window against the
+    baseline's replay (kWh) and the fuel avoided (the genset's unit), each None where the day does not carry it, at a site without a grid (`grid`) or
+    a genset (`genset`). None when the day claims nothing (_day_claims: a recommendation-only or not-applied day, a native block, a claim withheld):
+    its energy is not counted, as its rupees are not, so the replay's noise on a day the plan did not run, or a replay over unread inputs, is never
+    an energy saving. The one rule of the Fleet and Overview month figures and bars (UX backend ask K13) and of the Savings summary's
+    `peak_import_kwh_avoided` (UX K27 check), so the pages say one figure for one month."""
+    if not _day_claims(d):
+        return None
+    a, n = (d.get("actual") or {}).get("peak_import_kwh"), (d.get("baseline") or {}).get("peak_import_kwh")
+    peak = float(n) - float(a) if grid and a is not None and n is not None else None
+    litres = float(d["litres_saved"]) if genset and d.get("litres_saved") is not None else None
+    return peak, litres
+
+
 def peak_import_avoided(rows: list[dict]) -> tuple[float, int]:
-    """The grid energy a baseline would have bought in the peak window less what was bought (kWh), over a baseline's scored day rows whose import is
-    known (an unmetered import's peak-window figure is no reading), and the days counted (plan F11 item 1, the tile "Peak-window import avoided").
-    Energy: every reader reads it. A row stored without the arms' peak-window import adds nothing."""
+    """The grid energy a baseline would have bought in the peak window less what was bought (kWh), over a baseline's day rows that claim and carry
+    both arms' peak-window import (claimed_energy, K13's rule: the energy the claim rests on), and the days counted (plan F11 item 1, the tile
+    "Peak-window import avoided"). Energy: every reader reads it. The caller answers no figure (null) when no day is counted, never a zero."""
     total, n = 0.0, 0
     for d in rows:
-        base, act = d.get("baseline") or {}, d.get("actual") or {}
-        if d.get("import_unknown") or base.get("peak_import_kwh") is None or act.get("peak_import_kwh") is None:
+        got = claimed_energy(d, True, False)
+        if got is None or got[0] is None:
             continue
-        total += float(base["peak_import_kwh"]) - float(act["peak_import_kwh"])
+        total += got[0]
         n += 1
     return round(total, 1), n
 
 
 def fuel_saved(b: dict, scored: int, has_genset: bool) -> float | None:
-    """The fuel a baseline's ledger saved, in the genset's own unit (`fuel_unit`: litres of diesel, MMBtu of gas): None without a genset, or where
-    its fuel was unknown on every scored day (the sum of none is no figure, never 0); the Savings page's tile and the report's "Diesel saved" (plan
-    F11 item 1, sf-01)."""
-    if not has_genset:
+    """The fuel a baseline's ledger saved (its `litres_saved`, every scored day whose fuel is known, the figure the plan's Diesel tile names), in the
+    genset's own unit (`fuel_unit`: litres of diesel, MMBtu of gas): None without a genset, with no scored day, or where its fuel was unknown on every
+    scored day (the sum of none is no figure, never 0); the Savings page's tile and the report's "Diesel saved" (plan F11 item 1, sf-01)."""
+    if not has_genset or scored <= 0:
         return None
     unmetered = int(b.get("genset_unknown_days") or 0)
-    if b.get("litres_saved") is None or (scored > 0 and unmetered >= scored):
+    if b.get("litres_saved") is None or unmetered >= scored:
         return None
     return round(float(b["litres_saved"]), 1)
 
@@ -2147,8 +2162,13 @@ def taxes_recovered(conn: dict | None, claimed: list[tuple[str, dict, float]]) -
     with "taxes you recover" as its own line, so the saving reads as the CFO's ex-GST number; plan F11 item 1): over the claiming days, each as
     (day, its levers, its share of its month's MDI lever), the day's grid levers (peak window and off-peak energy) and MDI share times the share of a
     bearable rupee its connection recovers that day (tariffs.recoverable_share). Not part of the saving. The export credit carries none (net
-    billing credits it after tax), nor do the genset, wear and carry-over levers, which no DISCO bill taxes. None off-grid."""
-    if conn is None:
+    billing credits it after tax), nor do the genset, wear and carry-over levers, which no DISCO bill taxes. None off-grid, and None with no claiming
+    day (no claim to rest on, never a zero).
+
+    Its sign is the levers': positive, the recoverable tax the plan took off the bills (the part of the bills' fall the company would have recovered
+    anyway); negative where the claim's grid levers are (the plan bought more grid energy, or dearer, than the baseline: off-peak charging), the
+    recoverable tax it added to the bills, which the company recovers all the same. Never turned positive."""
+    if conn is None or not claimed:
         return None
     total = 0.0
     share: dict[str, float] = {}
@@ -2495,7 +2515,8 @@ def _k27_figures(site_id: str, out: dict, days: dict[str, dict], d0: str, d1: st
         b = out["baselines"][base]
         rows = [(day, by[base]) for day, by in sorted(days.items()) if by.get(base)]
         avoided, counted = peak_import_avoided([r for _, r in rows])
-        b["peak_import_kwh_avoided"] = avoided if conn0 is not None else None
+        # null off-grid and with no day counted (no claiming day carries the figure), never a zero (K12's rule; UX K27 check)
+        b["peak_import_kwh_avoided"] = avoided if conn0 is not None and counted else None
         b["peak_import_days"] = counted if conn0 is not None else 0
         b["fuel_saved"] = fuel_saved(b, len(rows), has_genset)
         b["fuel_unit"] = unit

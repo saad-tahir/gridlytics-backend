@@ -58,18 +58,67 @@ def _rows() -> dict:
     return {d: {"native": native[d], "tuned": tuned[d]} for d in native}
 
 
-def test_the_peak_window_import_avoided_counts_the_days_whose_import_is_known(company):
-    """Golden: (400 - 80) + (300 - 100) + (200 - 150) = 570 kWh against the native settings over 3 days; the withheld day's unmetered import is no
-    reading. Against the tuned table the baseline's peak import is half: (200 - 80) + (150 - 100) + (100 - 150) = 120 kWh. Each day carries its
-    native arm's peak-window import."""
+def test_the_peak_window_import_avoided_counts_the_days_that_claim(company):
+    """Golden: (400 - 80) + (300 - 100) = 520 kWh against the native settings over the 2 claiming days; the not-applied day's replay (200 - 150) is
+    no saving of the plan's, and the withheld day's unmetered import is no reading (K13's rule, verify.claimed_energy: the energy a day claims beside
+    its rupees). Against the tuned table the baseline's peak import is half: (200 - 80) + (150 - 100) = 170 kWh. Each day carries its native arm's
+    peak-window import, a day that claims nothing too."""
     sid = make_site(name="K27 peak")
     _put_rows(sid, _rows())
     s = verify.summary(sid, "2026-11-01", "2026-11-04")
     nat, tun = s["baselines"]["native"], s["baselines"]["tuned"]
-    assert (nat["peak_import_kwh_avoided"], nat["peak_import_days"]) == (570.0, 3)
-    assert (tun["peak_import_kwh_avoided"], tun["peak_import_days"]) == (120.0, 3)
+    assert (nat["peak_import_kwh_avoided"], nat["peak_import_days"]) == (520.0, 2)
+    assert (tun["peak_import_kwh_avoided"], tun["peak_import_days"]) == (170.0, 2)
+    assert nat["peak_import_days"] <= nat["claiming_days"] == 2
     assert [d["peak_import_kwh_native"] for d in s["days"]] == [400.0, 300.0, 200.0, 999.0]
     assert verify.peak_import_avoided([{"actual": {}, "baseline": {}}]) == (0.0, 0)          # a row stored without the figures adds nothing
+    # a day withheld for another reason than its import (its import known) claims nothing either: its replay ran over unread load or PV
+    unread = _day(0.0, {"peak_window": 50.0}, peak_native=500.0, peak_actual=100.0, claim_withheld="inputs_unread")
+    assert verify.peak_import_avoided([unread]) == (0.0, 0)
+
+
+def test_the_savings_page_and_fleet_say_one_peak_window_figure_for_the_month(world, monkeypatch):
+    """K27 check: the Fleet row's month figure (`mtd_peak_kwh_avoided`, K13) and the Savings summary's tile for the same month are one figure, by one
+    rule (verify.claimed_energy): 520 kWh over the claiming days, never the not-applied day's replay nor the withheld day."""
+    from gridlytics import routes_sites
+    monkeypatch.setattr(routes_sites, "today", lambda: date(2026, 11, 4))
+    w = world
+    with w.use():
+        _put_rows(w.site, _rows())
+    row = next(r for r in w.c["admin"].get("/api/fleet").json()["sites"] if r["id"] == w.site)
+    page = w.c["admin"].get(f"/api/sites/{w.site}/savings", params={"start": "2026-11-01", "end": "2026-11-04"}).json()
+    assert row["mtd_peak_kwh_avoided"] == page["baselines"]["native"]["peak_import_kwh_avoided"] == 520.0
+    viewer = w.c["viewer"].get(f"/api/sites/{w.site}/savings", params={"start": "2026-11-01", "end": "2026-11-04"}).json()
+    assert viewer["baselines"]["native"]["peak_import_kwh_avoided"] == 520.0
+
+
+def test_a_period_with_no_day_to_count_answers_no_figure_never_a_zero(company):
+    """K27 check (K12's rule, "null without its data, never a zero"): a grid site with a genset before its first scored day answers no peak-window
+    figure, no fuel saved and no taxes recovered; a period whose days claim nothing answers no peak-window figure and no taxes, while its fuel saved
+    (every scored day's, as `litres_saved`) is a figure."""
+    sid = make_site(name="K27 empty")
+    nat = verify.summary(sid, "2026-11-01", "2026-11-04")["baselines"]["native"]
+    assert (nat["peak_import_kwh_avoided"], nat["peak_import_days"], nat["fuel_saved"], nat["taxes_recovered_rs"]) == (None, 0, None, None)
+    assert nat["fuel_unit"] == "L"
+    rows = _rows()
+    rows = {d: {b: {**r, "fidelity": "not_applied", "claimed_rs": 0.0} for b, r in by.items()} for d, by in rows.items() if d != "2026-11-04"}
+    _put_rows(sid, rows)
+    nat = verify.summary(sid, "2026-11-01", "2026-11-04")["baselines"]["native"]
+    assert nat["claiming_days"] == 0
+    assert (nat["peak_import_kwh_avoided"], nat["peak_import_days"], nat["taxes_recovered_rs"]) == (None, 0, None)
+    assert nat["fuel_saved"] == 17.0
+    assert verify.fuel_saved({"litres_saved": 0.0, "genset_unknown_days": 0}, 0, True) is None
+
+
+def test_the_taxes_recovered_are_negative_where_the_claim_s_grid_levers_are_golden(company):
+    """Golden: a claiming day whose plan bought more grid energy than the native settings would have (off-peak charging): peak window Rs 200,
+    off-peak -Rs 700, grid levers -Rs 500 x 0.239 = -Rs 119.50. The bills carried that much more of the tax the company recovers: a negative figure,
+    as the levers are, never turned positive."""
+    sid = make_site(name="K27 negative taxes")
+    neg = {"2026-11-01": {"native": _day(-500.0, {"peak_window": 200.0, "offpeak_energy": -700.0}, peak_native=300.0, peak_actual=100.0)}}
+    _put_rows(sid, neg)
+    s = verify.summary(sid, "2026-11-01", "2026-11-01")
+    assert s["baselines"]["native"]["taxes_recovered_rs"] == pytest.approx(-500.0 * SHARE, abs=0.005) == -119.50
 
 
 def test_the_taxes_recovered_on_the_claim_are_the_recovered_share_of_its_grid_levers_golden(company):
