@@ -49,5 +49,15 @@ def test_fewer_minutes_than_five_are_shown_whole_and_none_says_none(world):
 
 
 def test_the_test_and_its_rows_are_for_a_role_that_edits_the_site(world):
+    """The rows reach the roles the test is for, and no other (UX K9 check: the test only pinned the source test's own rule, so it passed without the
+    rows)."""
+    with world.use():
+        now = telemetry._now_ts() // 60 * 60
+        telemetry.ingest(world.site, [{"ts": now - 60, "grid_present": 1, "pv_power_w": 900}], "csv")
     for role, want in (("admin", 200), ("operator", 200), ("analyst", 403), ("viewer", 403)):
-        assert world.c[role].post(f"/api/sites/{world.site}/source/test").status_code == want, role
+        r = world.c[role].post(f"/api/sites/{world.site}/source/test")
+        assert r.status_code == want, role
+        if want == 200:
+            assert r.json()["sample"] == [{"at": r.json()["last_at"], "values": {"grid_present": True, "pv_power_w": 900.0}}], (role, r.text)
+        else:
+            assert "sample" not in r.text and "900" not in r.text, (role, r.text)
