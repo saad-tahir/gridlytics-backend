@@ -36,6 +36,15 @@ EXEMPT = {
     ("DELETE", "/api/drafts/{draft_id}"): "a person's own unsaved draft of a new site",
     ("POST", "/api/sites/{site_id}/telemetry/mapping/guess"): "reads a file's first lines and stores nothing",
     ("POST", "/api/sites/{site_id}/source/test"): "tests the data source and changes nothing",
+    ("POST", "/api/sites/{site_id}/validate"): "checks Set-up's steps as typed and saves nothing (UX K6)",
+    ("POST", "/api/sites/{site_id}/prices/preview"): "prices a connection's fields as typed and saves nothing (UX K5)",
+    ("POST", "/api/public/access-requests"): "a visitor's request to the founder, signed out and of no company: kept in the registry, where the founder's "
+                                             "changes to it are written to the founder's audit (test_ux_k02_k03_access_requests)",
+    ("POST", "/api/tariffs/versions/validate"): "checks a tariff draft and stores nothing (UX K32)",
+    ("PUT", "/api/tariffs/drafts/{draft_id}"): "a person's own tariff draft as they type it: the versions it becomes are audited when it is submitted, and "
+                                               "its discarding is audited (UX K32)",
+    ("POST", "/api/tariffs/preview"): "prices a draft beside the version in force and stores nothing (UX K32)",
+    ("POST", "/api/tariffs/simulate"): "rebuilds a bill under a draft beside the version in force and stores nothing (UX K32)",
 }
 #: Path prefixes outside the company's trail, with the reason
 EXEMPT_PREFIXES = {
@@ -133,6 +142,7 @@ WALKED = {
     ("PUT", "/api/sites/{site_id}/assets/{role}"), ("DELETE", "/api/sites/{site_id}/assets/{role}"), ("PUT", "/api/sites/{site_id}/tier"),
     ("POST", "/api/sites/{site_id}/native"), ("POST", "/api/sites/{site_id}/overrides"), ("DELETE", "/api/sites/{site_id}/overrides/{oid}"),
     ("POST", "/api/tariffs/versions"), ("POST", "/api/tariffs/versions/{version_id}/approve"), ("POST", "/api/tariffs/fuel"),
+    ("POST", "/api/tariffs/drafts/{draft_id}/submit"), ("POST", "/api/tariffs/versions/{version_id}/withdraw"), ("DELETE", "/api/tariffs/drafts/{draft_id}"),
     ("PUT", "/api/sites/{site_id}/telemetry/mapping"), ("PUT", "/api/sites/{site_id}/outages/schedule"),
     ("PUT", "/api/sites/{site_id}/outages/{start}/cause"), ("POST", "/api/sites/{site_id}/genset/curve/refit"),
     ("POST", "/api/sites/{site_id}/genset/requests/{nid}"), ("POST", "/api/sites/{site_id}/genset/fuel"),
@@ -216,6 +226,15 @@ def test_the_walk_holds_every_walked_route_to_an_audit_line_and_money_settings_t
     v = walk("POST", "/api/tariffs/versions", who="analyst", action="proposed a tariff version",
              body={"kind": "override", "key": cid, "effective_from": "2026-11-01", "body": {"electricity_duty": 0.02}, "source": src}).json()
     walk("POST", "/api/tariffs/versions/{version_id}/approve", f"/api/tariffs/versions/{v['id']}/approve", action="approved a tariff version", body={})
+    # the tariff editor (UX K32): a draft submitted, a waiting version withdrawn, a draft discarded
+    draft = {"effective_from": "2026-12-01", "source": {"ref": "walk", "verified": "primary"},
+             "versions": [{"kind": "adder", "key": "fca", "body": {"rate": 1.38, "billing_months": ["2026-12"]}}]}
+    assert w.c["analyst"].put("/api/tariffs/drafts/walk", json=draft).status_code == 200
+    made = walk("POST", "/api/tariffs/drafts/{draft_id}/submit", "/api/tariffs/drafts/walk/submit", who="analyst", action="proposed a tariff version").json()
+    walk("POST", "/api/tariffs/versions/{version_id}/withdraw", f"/api/tariffs/versions/{made['submitted'][0]['id']}/withdraw", who="analyst",
+         action="withdrew a tariff version", body={"reason": "walk"})
+    assert w.c["analyst"].put("/api/tariffs/drafts/walk", json=draft).status_code == 200
+    walk("DELETE", "/api/tariffs/drafts/{draft_id}", "/api/tariffs/drafts/walk", action="discarded a tariff draft")
     walk("POST", "/api/tariffs/fuel", action="set a fuel price", body={"kind": "hsd", "valid_from": "2026-11-01", "price": 291.5})
     walk("POST", "/api/tariffs/fuel", action="set a fuel price", body={"kind": "hsd", "valid_from": "2026-11-01", "price": 295.0})
     assert _detail(w, "set a fuel price")["changes"]["price"] == {"before": 291.5, "after": 295.0}
@@ -245,8 +264,10 @@ def test_the_walk_holds_every_walked_route_to_an_audit_line_and_money_settings_t
          action="answered a genset request", body={"outcome": "done"})
     walk("POST", "/api/sites/{site_id}/genset/fuel", f"/api/sites/{sid}/genset/fuel", who="operator", action="logged fuel",
          body={"litres": 50, "cost_rs": 14321.5, "note": "tanker"})
+    # the unit of the genset's fuel (round 7 integration: MMBtu at a gas genset) and how it was entered (UX backend ask K24: litres, MMBtu as billed,
+    # or a meter reading in hm³ with its calorific value)
     assert _detail(w, "logged fuel") == {"day": _detail(w, "logged fuel")["day"], "litres": 50.0, "cost_rs": 14321.5, "note": "tanker",
-                                         "fuel_unit": "L"}    # the unit of the genset's fuel (round 7 integration: MMBtu at a gas genset)
+                                         "fuel_unit": "L", "entry": "litres"}
 
     # ---- the edge reports the tier its source supports
     kh = w.key(["telemetry:write"])

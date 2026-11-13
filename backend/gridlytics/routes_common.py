@@ -67,6 +67,19 @@ def today() -> date:
     return datetime.now(PKT).date()
 
 
+def karachi(stamp) -> str | None:
+    """A stored time (an ISO stamp, UTC when it names no zone, or epoch seconds) as people read it: ISO 8601 in Pakistan time, to the second
+    ("2026-11-11T14:13:00+05:00"); None for none."""
+    if stamp is None or stamp == "":
+        return None
+    if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+        t = datetime.fromtimestamp(int(stamp), timezone.utc)
+    else:
+        t = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        t = t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    return t.astimezone(PKT).isoformat(timespec="seconds")
+
+
 def parse_day(s: str | None, default: date) -> date:
     if not s:
         return default

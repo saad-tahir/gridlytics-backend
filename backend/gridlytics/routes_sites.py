@@ -1,19 +1,24 @@
 """Sites, the fleet, the overview snapshot, connections, assets, tiers, native captures, overrides and wizard drafts (UI-01, 02, 04, 17)."""
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 from fastapi import APIRouter, Body, Header, HTTPException
 from pydantic import ValidationError
 
-from . import alerts, auth, battery, delivery, demo, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, twin, verify
-from .routes_common import PKT, bad, full_or_404, now_ts, out, put_state, site_or_404, today
-from .schemas import Refusal
+from . import (alerts, auth, battery, delivery, demo, lifecycle, money, plans, setup_check, sites, store, store_members, tariff_data, tariffs, telemetry,
+               twin, verify)
+from .routes_common import PKT, bad, full_or_404, karachi, now_ts, out, put_state, site_or_404, today
+from .schemas import Refusal, check
 
 router = APIRouter()
+log = logging.getLogger("gridlytics.routes_sites")
 
 #: The prices page's days: from the earliest telemetry and rate cards the product reads to a year from today
 PRICES_EARLIEST = date(2015, 1, 1)
@@ -35,7 +40,45 @@ def meta():
             "fallback": {"on_expiry": "inverter_native", "on_link_loss_after_s": delivery.LINK_LOSS_AFTER_S},
             # who holds each permission, in the refusals' words ("an administrator, an operator or an analyst"), so a page that says who may act reads
             # it here rather than listing roles of its own (round 7, audit pr-review-07)
-            "who_can": {p: auth.roles_words(p) for p in auth.PERMISSIONS}}
+            "who_can": {p: auth.roles_words(p) for p in auth.PERMISSIONS},
+            # who holds each permission, as a list of roles in auth.ROLES order, straight from auth.PERMISSIONS: the role guide and People's
+            # consequence line draw it, so neither can drift from what the server allows (UX backend ask K4, plan G9 item 1). No money; every reader
+            "role_matrix": {p: [r for r in auth.ROLES if r in who] for p, who in auth.PERMISSIONS.items()},
+            # the tax status of the company's grid connection saved last, for Set-up C's four boxes to start from ("As at Mill B"), to the roles that
+            # open Set-up (UX backend ask K10, the owner's question Q35: per connection, prefilled); null for a viewer, or with no such connection
+            "company_tax_defaults": company_tax_defaults() if auth.can("see_costs") else None}
+
+
+#: The tax flags Set-up C's DUTY AND TAXES group asks for (plan C6.4), as sites.TaxFlags stores them: the province follows the site's DISCO instead
+TAX_DEFAULT_FLAGS = ("strn", "gst_recoverable", "s235_adjustable", "atl")
+
+
+def company_tax_defaults() -> dict | None:
+    """The four tax flags of the grid connection the company saved last (UX backend ask K10; plan C19.2 item 6, C6.4), with the site it is at: a site
+    that is not removed and is no demo site (a demo's figures are not the company's), a connection of a regime that buys from the grid (an off-grid
+    one bears no bill's taxes). None while the company has none. The province is not among them: it follows the new site's DISCO (sites._from_disco).
+    Last saved by the audit trail's order of "saved a connection" (UX K10 check: the rows' stamps are to the second, so two saves in one second tied,
+    and moving the plant's mark off a connection stamped it although it was not saved); a connection with no such line, by its stamp, then the order
+    rows were made."""
+    with store.connect() as con:
+        rows = con.execute("SELECT c.id, c.site_id, c.data, c.updated, s.name FROM connections c JOIN sites s ON s.id = c.site_id WHERE s.deleted IS NULL "
+                           "AND s.demo_link IS NULL AND COALESCE(json_extract(c.data, '$.regime'), '') != 'off_grid' "
+                           "ORDER BY c.updated DESC, c.rowid DESC").fetchall()
+        if not rows:
+            return None
+        found, saved_at = rows[0], rows[0]["updated"]
+        mine = {r["id"]: r for r in rows}
+        # newest first, and almost always the first line read is one of them
+        for a in con.execute("SELECT at, detail FROM audit WHERE action = 'saved a connection' ORDER BY id DESC"):
+            cid = (json.loads(a["detail"] or "{}") or {}).get("connection_id")
+            if cid in mine:
+                found, saved_at = mine[cid], a["at"]
+                break
+    tax = (json.loads(found["data"]) or {}).get("tax") or {}
+    flags = {k: bool(tax.get(k, sites.TaxFlags.model_fields[k].default)) for k in TAX_DEFAULT_FLAGS}
+    flags["gst_recoverable"] = flags["gst_recoverable"] and flags["strn"]
+    return {**flags, "site_id": found["site_id"], "site_name": found["name"], "connection_id": found["id"], "saved_at": karachi(saved_at),
+            "words": f"As at {found['name']}"}
 
 
 def _icp_categories() -> list[str]:
@@ -108,14 +151,11 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
     if tier == "monitor":
         return {"key": "recommendation", "label": "Recommendation only"}
     if tier == "advisory_writes":
-        day = today().isoformat()
-        with store.connect() as con:
-            marks = con.execute("SELECT plan_id, created FROM applied WHERE site_id = ? AND day_local = ?", (site["id"], day)).fetchall()
-        ok = bool(marks)
-        issued = plans.issued_for(site["id"], day) if ok else None
-        if issued and issued["plan_id"] not in {m["plan_id"] for m in marks} and issued["issued_at"] > max(m["created"] for m in marks):
+        mark = plans.applied_mark(site["id"], today().isoformat())
+        if mark and mark["superseded"]:
             # today's table was issued again after the mark (round 7, audit pages-B-02): what the inverter runs is the table keyed before it
             return {"key": "unconfirmed", "label": "New table issued: key it in and mark it"}
+        ok = mark is not None
         return {"key": "following" if ok else "unconfirmed", "label": "Following plan (table applied)" if ok else "Table not confirmed today"}
     return {"key": "following", "label": "Following plan"}
 
@@ -187,27 +227,51 @@ def _month_saving(site_id: str, grid: bool = True, genset: bool = True) -> tuple
         rows = con.execute("SELECT day_local, data FROM savings_days WHERE site_id = ? AND baseline = 'native' AND day_local >= ? ORDER BY day_local",
                            (site_id, (t - timedelta(days=40)).isoformat())).fetchall()
     # each day's claimed saving beside the replay's own figure: the bars draw the claim, as the month column does, so a recommendation-only day's
-    # replay noise (the Lahore mall's -Rs 0.09) is not drawn as a loss (audit role-analyst-14, flow-savings-pilot-bill-21, engine-money-live-14)
+    # replay noise (the Lahore mall's -Rs 0.09) is not drawn as a loss (audit role-analyst-14, flow-savings-pilot-bill-21, engine-money-live-14);
+    # and the energy the day claims, the Energy form's bars (UX backend ask K13; plan D9.3, D1.7): not money, so a viewer reads them
     spark = []
     month = t.replace(day=1).isoformat()
     peak = litres = None
     block = 0
     for r in rows:
         d = json.loads(r["data"])
-        spark.append({"day": r["day_local"], "saving_rs": d.get("saving_rs"), "claimed_rs": d.get("claimed_rs")})
+        claimed = _claimed_energy(d, grid, genset)
+        spark.append({"day": r["day_local"], "saving_rs": d.get("saving_rs"), "claimed_rs": d.get("claimed_rs"),
+                      **_spark_energy(claimed, grid, genset)})
         # the month's days of a switchback native block, which claim nothing: Fleet and Overview say why such a month reads Rs 0 (round 7, audit
         # flow-savings-pilot-bill-18)
         block += int(r["day_local"] >= month and d.get("fidelity") == "native_block")
-        if r["day_local"] < month or d.get("fidelity") not in verify.CLAIMING or d.get("claim_withheld"):
+        if r["day_local"] < month or claimed is None:
             continue
-        a, n = (d.get("actual") or {}).get("peak_import_kwh"), (d.get("baseline") or {}).get("peak_import_kwh")
-        if grid and a is not None and n is not None:
-            peak = (peak or 0.0) + n - a
-        if genset and d.get("litres_saved") is not None:
-            litres = (litres or 0.0) + d["litres_saved"]
+        if claimed[0] is not None:
+            peak = (peak or 0.0) + claimed[0]
+        if claimed[1] is not None:
+            litres = (litres or 0.0) + claimed[1]
     energy = {"peak_kwh_avoided": None if peak is None else round(peak, 1), "litres_saved": None if litres is None else round(litres, 1)}
     energy["native_block_days"] = block
     return mtd, (summ["computed"] or None) if scored else None, spark[-7:], energy
+
+
+def _claimed_energy(d: dict, grid: bool, genset: bool) -> tuple[float | None, float | None] | None:
+    """The energy a stored savings day (its native baseline's row) claims beside its rupees: the grid import moved out of the peak window against the
+    native replay (kWh) and the fuel avoided (the genset's unit), each None where the day does not carry it, at a site without a grid (`grid`) or a
+    genset (`genset`). None when the day claims nothing (a recommendation-only day, one whose claim is withheld): its energy is not counted, as its
+    rupees are not. The one rule of the month's figure and of each day's bar (UX backend ask K13), so the bars of the month add up to it."""
+    if d.get("fidelity") not in verify.CLAIMING or d.get("claim_withheld"):
+        return None
+    a, n = (d.get("actual") or {}).get("peak_import_kwh"), (d.get("baseline") or {}).get("peak_import_kwh")
+    peak = n - a if grid and a is not None and n is not None else None
+    litres = d["litres_saved"] if genset and d.get("litres_saved") is not None else None
+    return peak, litres
+
+
+def _spark_energy(claimed: tuple[float | None, float | None] | None, grid: bool, genset: bool) -> dict:
+    """A day's energy bars (UX backend ask K13; plan D9.3): `peak_kwh_avoided` and `litres_saved` as the day claims them (`_claimed_energy`); 0 for a
+    day that claims nothing, as its `claimed_rs` is 0; null where the site has no grid (no peak import) or no genset (no fuel), or where the claiming
+    day does not carry the figure."""
+    if claimed is None:
+        return {"peak_kwh_avoided": 0.0 if grid else None, "litres_saved": 0.0 if genset else None}
+    return {"peak_kwh_avoided": None if claimed[0] is None else round(claimed[0], 1), "litres_saved": None if claimed[1] is None else round(claimed[1], 1)}
 
 
 def _month_native_block_days(site_id: str, t: date) -> int:
@@ -226,13 +290,15 @@ ON_PLAN = ("following", "hold", "force_charge")
 HANDED_BACK = ("native", "paused", "native_block")
 
 
-def fleet_row(s: dict, now: int, counts: dict, gensets: dict | None = None) -> dict:
+def fleet_row(s: dict, now: int, counts: dict, gensets: dict | None = None, equipment: dict | None = None) -> dict:
+    """A fleet row. `gensets` (site id to its genset's data) and `equipment` (site id to {role: data}) are the fleet's single read of every site's
+    assets; without them the row reads the site's own."""
     last = telemetry.latest(s["id"])
     first = telemetry.first_ts(s["id"])
     plan = plans.current(s["id"], slots=False)       # the row reads the next event from the steps, never the table (round 7, tests-and-perf-06)
     nn = plans.now_and_next(plan, now)
-    days_data = (now - first) / 86400 if first else 0
-    conn = (sites.connections(s["id"]) or [None])[0]
+    conns = sites.connections(s["id"])
+    conn = (conns or [None])[0]
     # off-grid is the site's own fact, as tab C and POST /activate read it (_grid_settled): a connection of regime off_grid, or none at a farm or a
     # site whose data says off_grid. A grid site whose connection is not saved yet has no category yet (null), and its outages count (audit pages-A-03)
     off_grid = _off_grid(s, conn)
@@ -248,7 +314,8 @@ def fleet_row(s: dict, now: int, counts: dict, gensets: dict | None = None) -> d
             "control": control, "last_data": last["ts"] if last else None, "now": _snapshot(last),
             "next_event": (nn or {}).get("next", [None])[0] if nn and nn.get("next") else None, "open_alerts": counts.get(s["id"], 0),
             "mtd_saving_rs": mtd, "mtd_saving_rs_method": MTD_SAVING_METHOD, "mtd_saving_rs_computed": computed, "spark": spark,
-            "collecting_day": None if days_data >= 14 else int(days_data) + 1 if first else 0,
+            # the stage track's day of collection, the one figure (lifecycle.collecting_day; UX K1 check)
+            "collecting_day": lifecycle.collecting_day(first, now),
             # the month's energy behind the claim: not money, so a viewer reads it in place of the rupees (R8 2.1; audit pages-A-11)
             "mtd_peak_kwh_avoided": energy["peak_kwh_avoided"], "mtd_litres_saved": energy["litres_saved"],
             # the month's native-block days, which claim nothing (not money; round 7, audit flow-savings-pilot-bill-18)
@@ -261,7 +328,10 @@ def fleet_row(s: dict, now: int, counts: dict, gensets: dict | None = None) -> d
             # frontend-states-formats-01); null without a genset
             "fuel_kind": (gen.get("fuel_kind") or "hsd") if gen is not None else None,
             # handed back to the native settings: the row says so, so the web app counts a fleet's real sites by the summary's own rule (review)
-            "on_native": control["key"] in HANDED_BACK}
+            "on_native": control["key"] in HANDED_BACK,
+            # the stage track's state, for Fleet's Stage column and filter and the site switcher (UX backend ask K1; no money)
+            "lifecycle": _lifecycle(s, now, last=last, first=first, plan=plan, control=control, connections=conns,
+                                    assets=None if equipment is None else equipment.get(s["id"], {}))}
 
 
 @router.get("/api/fleet")
@@ -275,10 +345,14 @@ def fleet():
 def _fleet():
     now = now_ts()
     c = alerts.counts()
+    equipment: dict = {}
     with store.connect() as con:
-        # each site's genset by site id, as sites.assets reads it (the latest of the role wins)
-        gensets = {d["site_id"]: d["data"] for d in map(store.row, con.execute("SELECT site_id, data FROM assets WHERE role = 'genset' ORDER BY created"))}
-    rows = [fleet_row(s, now, c["by_site"], gensets) for s in sites.listing()]
+        # every site's equipment by role, as sites.assets reads it (the latest of a role wins), read once for the whole fleet: the row's genset and
+        # its fuel kind, and the lifecycle's battery and a draft's inverter (round 7, storage-perf follow-up; UX backend ask K1)
+        for d in map(store.row, con.execute("SELECT site_id, role, data FROM assets ORDER BY created")):
+            equipment.setdefault(d["site_id"], {})[d["role"]] = d["data"]
+    gensets = {sid: held["genset"] for sid, held in equipment.items() if "genset" in held}
+    rows = [fleet_row(s, now, c["by_site"], gensets, equipment) for s in sites.listing()]
     online = sum(1 for r in rows if r["last_data"] and now - r["last_data"] < 1800)
     stamps = [r["mtd_saving_rs_computed"] for r in rows if r["mtd_saving_rs_computed"]]
     # the sum of the sites' figures; None while no site has a scored day this month, never Rs 0 (audit frontend-states-formats-14)
@@ -425,12 +499,10 @@ def site_source_test(site_id: str):
     return sites.source_test(site_id)
 
 
-@router.post("/api/sites/{site_id}/activate")
-def site_activate(site_id: str):
-    auth.need("manage_sites", "Activating a site")
-    s = sites.full(site_id) or {}
-    if not s:
-        raise HTTPException(status_code=404, detail="No such site")
+def _activation_missing(s: dict) -> list[tuple[str, str]]:
+    """What activation still asks for (`s` is full() of the site), each as (the Set-up step that holds it, its words in the refusal), in the steps'
+    order: the refusal of POST /activate and the lifecycle's "Draft: step C of 6" read the same rules (UX backend ask K1). The words name the Set-up
+    step ("step A"), as the redesigned Set-up calls its screens, where they named the wizard's tab (UX backend ask K11, plan C19.2 item 7)."""
     missing = []
     src = (s.get("data") or {}).get("data_source") or {}
     # an off-grid site has no grid to report: its source needs no grid-presence signal (round 7 sweeps, a sites-onboarding review follow-up: the farm was
@@ -439,26 +511,122 @@ def site_activate(site_id: str):
     if not (isinstance(src, dict) and src.get("kind") in sites.DATA_SOURCE_KINDS and (src.get("grid_signal_confirmed") or off_grid)):
         # plan 9.3 tab A: without a grid-presence signal outages cannot be seen and the reserve cannot be planned (audit flow-onboarding-08: a site with no
         # source, or an unconfirmed one, was activated and planned)
-        missing.append("the data source (tab A)" if off_grid else "the data source, with its grid-presence signal confirmed (tab A)")
-    elif sites.grid_connected(s) and sites.source_test(site_id)["grid_signal"] == "missing":
+        missing.append(("a", "the data source (step A)" if off_grid else "the data source, with its grid-presence signal confirmed (step A)"))
+    elif sites.grid_connected(s) and sites.source_test(s["id"])["grid_signal"] == "missing":
         # the source's test (plan 9.3: "refuses a source without a grid-present signal"; audit flow-onboarding-22): data arrived, and none of it says
         # whether the grid is up, whatever the tick says
-        missing.append("the grid-presence signal to the data the source sends (the data received has neither grid_present nor the grid voltage; tab A)")
+        missing.append(("a", "the grid-presence signal to the data the source sends (the data received has neither grid_present nor the grid voltage; "
+                             "step A)"))
     if not (s.get("assets") or {}).get("inverter"):
-        missing.append("the inverter (tab B)")
+        missing.append(("b", "the inverter (step B)"))
     if not _grid_settled(s, s.get("connections") or []):
-        missing.append("the grid connection and tariff (tab C)")
+        missing.append(("c", "the grid connection and tariff (step C)"))
     elif any((c.get("data") or {}).get("tariff_category") not in tariff_data.CARDS_279 for c in s.get("connections") or []):
         # a connection stored before the category was checked (audit flow-onboarding-07): the tick could price nothing and the site never planned
-        missing.append("the tariff category of each grid connection (tab C)")
+        missing.append(("c", "the tariff category of each grid connection (step C)"))
     elif any(sites.group_problem((c.get("data") or {}).get("disco_group"), (s.get("data") or {}).get("disco")) for c in s.get("connections") or []):
         # the site's DISCO changed after its connection was saved: it would be priced with the other DISCO's peak windows (audit flow-onboarding-02)
-        missing.append("the DISCO group of each grid connection, to match the site's DISCO (tab C)")
+        missing.append(("c", "the DISCO group of each grid connection, to match the site's DISCO (step C)"))
+    return missing
+
+
+@router.post("/api/sites/{site_id}/validate")
+def site_validate(site_id: str, inp: dict = Body(...)):
+    """Checks Set-up's steps as typed, over the site as stored, and saves nothing (UX backend ask K6; setup_check): `problems` ({step, field, path,
+    message}, each on its field; empty when the sections can be saved), `setup_warnings` of the site as it would be, and `derived` (the battery's
+    nominal and usable kWh, the genset's usable kW and fuel an hour at half and full load, the reserve floor's kWh and minutes of the critical load;
+    the wear cost per kWh for see_money_settings only), with `not_derived` saying why a figure could not be worked out. Every role that opens Set-up
+    reads it (see_costs: an administrator, an operator, an analyst); a viewer and a machine key are refused."""
+    auth.need("see_costs", "Checking a site's set-up")
+    s = full_or_404(site_id)
+    req = check(setup_check.SetupCheckIn, inp)
+    held = s.get("assets") or {}
+    # the equipment's money settings as the save takes them: stored where left out or hidden from the role (_with_held_money), so an operator's
+    # check reads the wear the plan prices
+    assets_in = {role: (_with_held_money(role, dict(fields), held.get(role)) if isinstance(fields, dict) else fields)
+                 for role, fields in (req.assets.sent() if req.assets else {}).items()}
+    try:
+        answer = setup_check.run(s, req.site, assets_in, req.connection, money_settings=auth.can("see_money_settings"),
+                                 refused=_validate_refusals(s, req.site, assets_in))
+    except setup_check.UnknownConnection:
+        raise Refusal(404, "This site has no such connection", "not_found") from None
+    return out(answer)
+
+
+def _refusal_words(permission: str, doing: str) -> str:
+    """auth.need's refusal in its own words, without raising it (auth.py is lifted from Solarlytics and is left as reviewed): test_ux_k06_check
+    holds each one equal to the save's own 403."""
+    return f"{doing} is for {auth.roles_words(permission)}"
+
+
+def _validate_refusals(s: dict, site_in: dict | None, assets_in: dict) -> list[dict]:
+    """What the reader's own saves of the sections would refuse with 403 (UX K6 check: an operator's check said a step was fine whose save was then
+    refused), each a problem on the field it concerns, in the save's words, by the saves' own rules: a control limit changed without manage_sites
+    (site_update's _limits_changed, field by field), a money setting of the site or of its equipment changed without edit_money_settings
+    (_need_money_settings, the equipment's after _with_held_money, as asset_put takes it), and equipment whose money settings an administrator set
+    unticked without it (asset_delete)."""
+    out: list[dict] = []
+    data, held = s.get("data") or {}, s.get("assets") or {}
+    site_in = site_in or {}
+    if not auth.can("manage_sites"):
+        out += [setup_check._problem(setup_check.SITE_STEPS.get(k, "a"), ("site", k), _refusal_words("manage_sites", "Changing the site's control limits"))
+                for k in SITE_LIMIT_FIELDS if k in site_in and _limits_changed({k: site_in[k]}, data)]
+    if auth.can("edit_money_settings"):
+        return out
+    before = {**_defaults(sites.SiteFields, SITE_MONEY_FIELDS), **data}
+    out += [setup_check._problem(setup_check.SITE_STEPS.get(k, "a"), ("site", k),
+                                 _refusal_words("edit_money_settings", "Changing the site's value of lost load or wear costing"))
+            for k in SITE_MONEY_FIELDS if k in site_in and site_in[k] != before.get(k)]
+    for role, fields in assets_in.items():
+        names = ASSET_MONEY_FIELDS.get(role, ())
+        if fields is None:
+            if _money_set(role, held.get(role)):
+                out.append(setup_check._problem("b", ("assets", role), _refusal_words(
+                    "edit_money_settings", "Removing equipment whose money settings (prices and wear) an administrator set")))
+            continue
+        before = {**_defaults(sites.ASSET_MODELS[role], names), **(held.get(role) or {})}
+        out += [setup_check._problem("b", ("assets", role, k), _refusal_words("edit_money_settings",
+                                                                             "Changing the equipment's money settings (prices and wear)"))
+                for k in names if isinstance(fields, dict) and k in fields and fields[k] != before.get(k)]
+    return out
+
+
+@router.post("/api/sites/{site_id}/activate")
+def site_activate(site_id: str):
+    auth.need("manage_sites", "Activating a site")
+    s = sites.full(site_id) or {}
+    if not s:
+        raise HTTPException(status_code=404, detail="No such site")
+    missing = _activation_missing(s)
     if missing:
-        raise Refusal(422, "Add " + " and ".join(missing) + " before activating", "incomplete")
+        # `missing` names each step beside its words, so Review links "step A" to its step without reading the sentence (UX backend ask K11)
+        raise Refusal(422, "Add " + " and ".join(words for _, words in missing) + " before activating", "incomplete",
+                      extra={"missing": [{"step": step, "words": words} for step, words in missing]})
     sites.set_status(site_id, "active")
     store.audit(auth.actor(), "activated a site", site_id)
     return _site_answer(site_id)
+
+
+def _lifecycle(s: dict, now: int, *, last: dict | None, first: int | None, plan: dict | None, control: dict, connections: list | None = None,
+               assets: dict | None = None) -> dict:
+    """The site's lifecycle for the current reader (lifecycle.py; UX backend ask K1). A site not yet active says the first Set-up step activation
+    still asks for, read from the site as the activation reads it. `s` is full() of the site, or a site row with its `connections` and `assets` (by
+    role) given, as the fleet has them; without them they are read."""
+    if "connections" in s:
+        connections, assets = s.get("connections") or [], s.get("assets") or {}
+    elif connections is None or assets is None:
+        whole = sites.full(s["id"]) or {}
+        connections, assets = whole.get("connections") or [], whole.get("assets") or {}
+    step = block = None
+    if s.get("status") != "active":
+        missing = _activation_missing({**s, "connections": connections, "assets": assets})
+        step = missing[0][0] if missing else None
+    elif (s.get("tier") or "monitor") == "monitor":
+        # Delivering offers the raise of the tier only when PUT /tier would take it: the refusal and the track read one rule (UX K1 check)
+        refusal = _tier_refusal(s, "advisory_writes")
+        block = refusal.code if refusal else None
+    return lifecycle.build(s, now, first_ts=first, last_ts=last["ts"] if last else None, plan=plan, control=control, setup_step=step,
+                           battery="battery" in assets, tier_block=block)
 
 
 #: A new connection's save is idempotent (a retried first save never inserts a second row): by the client's key when it sends one (the Idempotency-Key
@@ -549,13 +717,8 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
     names = ASSET_MONEY_FIELDS.get(role, ())
     if names:
         cur = sites.assets(site_id).get(role)
-        defaults = _defaults(sites.ASSET_MODELS[role], names)
-        before = {**defaults, **(cur or {})}
-        if cur is not None:
-            # a money setting left out keeps its stored value (the asset is saved whole, so it would otherwise fall back to its default); so does one the
-            # role is not shown (an operator, audit role-operator-06) sent at its default, which the form put in place of the value it never received
-            hidden = money.unseen(names)
-            inp.update({k: cur[k] for k in names if k in cur and (k not in inp or k in hidden and inp[k] == defaults.get(k))})
+        before = {**_defaults(sites.ASSET_MODELS[role], names), **(cur or {})}
+        _with_held_money(role, inp, cur)
         _need_money_settings(inp, before, names, "Changing the equipment's money settings (prices and wear)")
     try:
         sites.put_asset(site_id, role, inp, auth.actor(), expect)
@@ -564,6 +727,18 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
     except ValueError as exc:
         raise bad(exc) from None
     return _site_answer(site_id)
+
+
+def _with_held_money(role: str, inp: dict, cur: dict | None) -> dict:
+    """The asset's body with its stored money settings where the save leaves them out (the asset is saved whole, so one would otherwise fall back to
+    its default), and where the role is not shown them (an operator, audit role-operator-06) and sends the default the form put in place of the value
+    it never received. `inp` is changed and returned."""
+    names = ASSET_MONEY_FIELDS.get(role, ())
+    if names and cur is not None:
+        defaults = _defaults(sites.ASSET_MODELS[role], names)
+        hidden = money.unseen(names)
+        inp.update({k: cur[k] for k in names if k in cur and (k not in inp or k in hidden and inp[k] == defaults.get(k))})
+    return inp
 
 
 def _money_set(role: str, cur: dict | None) -> bool:
@@ -589,9 +764,25 @@ def asset_delete(site_id: str, role: str):
 
 def _has_inverter_mode(site_id: str) -> bool:
     """Whether any minute of the site carries the inverter's mode: a CSV source without the inverter_mode_active column is for monitor only (plan Part 7.5,
-    telemetry.import_csv says so on import), while one with it supports advisory writes (sites.SOURCE_CAPABLE; audit flow-onboarding-03)."""
-    with telemetry.connect() as con:
+    telemetry.import_csv says so on import), while one with it supports advisory writes (sites.SOURCE_CAPABLE; audit flow-onboarding-03). A read
+    (telemetry.reading: no write lock): the stage track asks it on every site answer and fleet row of an active CSV site at the monitor tier, and the
+    write lock made them wait for an import, an edge batch or the tick, and stopped those for the scan (UX K review)."""
+    with telemetry.reading() as con:
         return con.execute("SELECT 1 FROM minute WHERE site_id = ? AND inverter_mode_active IS NOT NULL LIMIT 1", (site_id,)).fetchone() is not None
+
+
+def _tier_refusal(s: dict, tier: str) -> Refusal | None:
+    """Why the allowed tier of site `s` (a site row) cannot be set to `tier` (one of sites.TIERS), as the refusal PUT /tier answers, else None: one
+    rule for the refusal and the lifecycle's Delivering stage, which offers to raise the tier only when this lets it (UX backend ask K1, check)."""
+    capable = s.get("tier_capable") or "monitor"
+    if sites.TIERS.index(tier) > sites.TIERS.index(capable):
+        return Refusal(422, f"This site's data source supports {capable.replace('_', ' ')} at most", "above_capable")
+    if tier != "monitor" and ((s.get("data") or {}).get("data_source") or {}).get("kind") == "csv" and not _has_inverter_mode(s["id"]):
+        return Refusal(422, "No imported file of this site carries inverter_mode_active, the inverter's mode that the savings comparison needs: until one "
+                       "does, a CSV source supports monitor only", "no_inverter_mode")
+    if tier != "monitor" and not sites.native_latest(s["id"]):
+        return Refusal(422, "Capture the inverter's native settings before control is allowed: they are the fallback and the baseline", "no_capture")
+    return None
 
 
 @router.put("/api/sites/{site_id}/tier")
@@ -601,13 +792,9 @@ def tier_put(site_id: str, inp: dict = Body(...)):
     tier = inp.get("tier")
     if tier not in sites.TIERS:
         raise Refusal(422, "The tier is monitor, advisory_writes or closed_loop", "invalid")
-    if sites.TIERS.index(tier) > sites.TIERS.index(s["tier_capable"]):
-        raise Refusal(422, f"This site's data source supports {s['tier_capable'].replace('_', ' ')} at most", "above_capable")
-    if tier != "monitor" and ((s.get("data") or {}).get("data_source") or {}).get("kind") == "csv" and not _has_inverter_mode(site_id):
-        raise Refusal(422, "No imported file of this site carries inverter_mode_active, the inverter's mode that the savings comparison needs: until one does, "
-                      "a CSV source supports monitor only", "no_inverter_mode")
-    if tier != "monitor" and not sites.native_latest(site_id):
-        raise Refusal(422, "Capture the inverter's native settings before control is allowed: they are the fallback and the baseline", "no_capture")
+    refusal = _tier_refusal(s, tier)
+    if refusal is not None:
+        raise refusal
     signoff = str(inp.get("signoff", "") or "")[:200]
     try:
         sites.set_tier_allowed(site_id, tier, auth.actor(), signoff)
@@ -641,6 +828,12 @@ def _site_answer(site_id: str) -> dict:
     s.pop("photo", None)
     s["tier_signoff"] = _tier_signoff(site_id, s.get("state"))
     s["setup_warnings"] = sites.setup_warnings(s)
+    # the stage track (UX backend ask K1): the Overview's track and the switcher read it here. Not for a machine key: its `sites:read` is the site's
+    # settings, and the track speaks of the site's data, its pilot and its statements, which are in no scope (audit security-roles-07; UX K1 check)
+    if not (auth.current.get() or {}).get("api_key"):
+        now, last = now_ts(), telemetry.latest(site_id)
+        s["lifecycle"] = _lifecycle(s, now, last=last, first=telemetry.first_ts(site_id), plan=plans.current(site_id, now, slots=False),
+                                    control=control_state(s, last, now))
     return out(s)
 
 
@@ -718,6 +911,11 @@ def _off_grid(site: dict, conn: dict | None) -> bool:
     return conn["data"].get("regime") == "off_grid" if conn is not None else _grid_settled(site, [])
 
 
+def _self_pct(pv: float | None, exp: float | None) -> float | None:
+    """The share of the solar made that was used on site, not exported (percent, one decimal); None with no solar made."""
+    return round(100 * min(1.0, max(0.0, (pv - (exp or 0)) / pv)), 1) if pv else None
+
+
 def _today_kpis(site: dict, td: dict | None, bs: dict | None, now: int, day: date) -> dict:
     """The Overview's KPI tiles of the plan (R8 2.4) for today in Pakistan time: the share of the solar made that was used on site (not exported), the
     battery's equivalent full cycles (its discharge over the pack's capacity at its present health, nameplate times state of health, as the battery
@@ -725,14 +923,20 @@ def _today_kpis(site: dict, td: dict | None, bs: dict | None, now: int, day: dat
     reading today, no solar yet, no battery, an off-grid site's outages) is None, never a zero (audit pages-A-09)."""
     td = td or {}
     pv, exp, dis = td.get("pv_kwh"), td.get("export_kwh"), td.get("discharge_kwh")
-    self_pct = round(100 * min(1.0, max(0.0, (pv - (exp or 0)) / pv)), 1) if pv else None
+    self_pct = _self_pct(pv, exp)
     e_nom = (bs or {}).get("e_nom_kwh")
     cycles = round(dis / e_nom, 2) if dis is not None and e_nom else None
     outages = covered = None
     if td and not _off_grid(site, (site.get("connections") or [None])[0]):
-        log = telemetry.outages(site["id"], int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp()), now)
-        outages, covered = len(log), sum(1 for o in log if not o["unserved_kwh"])
+        outages, covered = _outage_counts(site["id"], int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp()), now)
     return {"pv_self_pct": self_pct, "battery_cycles": cycles, "outages": outages, "outages_covered": covered}
+
+
+def _outage_counts(site_id: str, t0: int, t1: int) -> tuple[int, int]:
+    """The outages from t0 to t1 (telemetry.outages) and how many of them the site rode through with no critical load unserved: the "Outages covered"
+    tile's figure, today's (`today_kpis`) and This month's (`month.outages`, UX K12) by this one rule (UX K review: each had its own copy)."""
+    log_ = telemetry.outages(site_id, t0, t1)
+    return len(log_), sum(1 for o in log_ if not o["unserved_kwh"])
 
 
 def _waiting_genset_requests(site_id: str, limit: int = 3) -> list[dict]:
@@ -782,6 +986,178 @@ def _litres_of_month(s: dict, d0: str, d1: str, last: dict | None, now: int) -> 
     return dict(got)
 
 
+class _Kept:
+    """Answers kept by key for `seconds` (the monotonic clock), the whole store cleared past `size` keys: what the Overview's 30-second poll reads
+    again unchanged. Each caller gets its own copy."""
+
+    def __init__(self, seconds: float, size: int = 512):
+        self.seconds, self.size = seconds, size
+        self.items: dict = {}
+        self.lock = threading.Lock()
+
+    def get(self, key, make):
+        at = time.monotonic()
+        with self.lock:
+            hit = self.items.get(key)
+        if hit is not None and at - hit[0] < self.seconds:
+            return copy.deepcopy(hit[1])
+        got = make()
+        with self.lock:
+            if len(self.items) >= self.size:
+                self.items.clear()
+            self.items[key] = (at, got)
+        return copy.deepcopy(got)
+
+
+#: the month's outages (telemetry.outages over the month so far), reused for a minute while the site's newest reading is the same
+_MONTH_OUTAGES = _Kept(60)
+#: the grid bill so far (verify.bill_so_far), reused for BILL_SO_FAR_REUSE_S while the company's audit trail and what the bill reads besides the
+#: minutes (verify.bill_so_far_inputs: its period, the credit carried into it, the metering factor) are unchanged: it rebuilds up to a month of
+#: minutes, and it bills whole days only (to the end of yesterday), so what changes it within the day is a bill entered, a tariff, connection or
+#: metering change (read again at once) or a late reading for a past day (read within the reuse)
+BILL_SO_FAR_REUSE_S = 900
+_BILL_SO_FAR = _Kept(BILL_SO_FAR_REUSE_S)
+
+
+def _attempt(row) -> dict:
+    """A solve that made no plan in force, for the band's warn line (UX backend ask K12): {id, status (failed or held), reason (the code the Plan page
+    words), generated_at (Karachi time)}."""
+    return {"id": row["id"], "status": row["status"], "reason": row["reason"] or None, "generated_at": karachi(row["generated_at"])}
+
+
+def _attempt_without_plan(site_id: str, now: int) -> dict | None:
+    """The newest solve when no plan is in force and it failed or its guard held it (the first plan held back, or every solve since the last plan
+    failed): the band's warn line and "Re-solve now" (UX K12 check; plan D2.3, D2.13), which `plan.latest_attempt` gives only beside a plan in
+    force. None while a pause, a release or a native block is in force (the control chip says why no plan is), and when the newest solve made a
+    plan or none was made. The plan's own `latest_attempt` is the same rule's (plans.newest_unplanned; UX K review)."""
+    if plans.control_release(site_id, now):
+        return None
+    r = plans.newest_unplanned(site_id)
+    return _attempt(r) if r is not None else None
+
+
+def _plan_facts(plan: dict | None) -> dict | None:
+    """The plan in force for the Overview's band (UX backend ask K12; plan D9.2, D2.3): its id, when it was made and until when it stands (ISO 8601,
+    Karachi time), its status in words and its forecasts' stage, and the newest solve when it failed or its guard held it after this plan was made
+    (`latest_attempt`: {id, status, reason, generated_at}; the plan in force stays: "The 14:30 solve was held back by the guard ... The 14:15 plan
+    stays in force."). None when no plan is in force."""
+    if not plan:
+        return None
+    summary = plan.get("summary") or {}
+    late = plan.get("latest_attempt")
+    return {"id": plan["id"], "generated_at": karachi(plan.get("generated_at")), "valid_until": karachi(plan.get("valid_until")),
+            "status_label": summary.get("status_label"), "stage": summary.get("stage"),
+            "latest_attempt": _attempt(late) if late else None}
+
+
+def _plan_expired_at(site_id: str, now: int) -> str | None:
+    """When the last plan ran out, where that is why no plan is in force (plans.held_info's plan_expired: the ticks stopped or every solve since failed;
+    the inverter runs its own settings): its valid_until in Karachi time. None otherwise, a pause, a release or a native block included, which the
+    control chip names."""
+    held = plans.held_info(site_id, now)
+    return karachi(held.get("since")) if held and held.get("reason") == plans.EXPIRED_REASON else None
+
+
+def _applied_today(site_id: str, day: date) -> dict | None:
+    """Today's table marked as applied, for the band's "Today's table applied by Bilal at 07:42." (UX backend ask K12; plan D9.2, D2.3, D4.2): who
+    marked it (`by`, the person's name), when (`at`, ISO 8601 in Karachi time), how it was keyed (`method`: installer_keyed, vendor_app,
+    owner_keyed or edge_ack), the plan whose table was keyed, and `superseded` when a table issued after the mark names another plan (the control
+    chip then reads "New table issued: key it in and mark it"). The latest mark of the day (plans.applied_mark, the chip's own rule); None unmarked."""
+    mark = plans.applied_mark(site_id, day.isoformat())
+    if mark is None:
+        return None
+    return {"by": mark["by"], "at": karachi(mark["created"]), "method": mark["method"], "plan_id": mark["plan_id"], "superseded": mark["superseded"]}
+
+
+def _with_peak_import(s: dict, tdays: list[dict]) -> list[dict]:
+    """The month's day rows, each with its peak-window import at a grid site: a row stored without it (a CSV upload aggregates its days without the
+    tariff's peak flags, which only the nightly job and GET /now's today pass) is aggregated again with them and written back once, as today's row is
+    (_today_row), keeping what it holds. A day whose tariff calendar cannot be read stays without it. Off-grid, or with no connection: as stored."""
+    conn = (s.get("connections") or [None])[0]
+    if conn is None or _off_grid(s, conn):
+        return tdays
+    out = []
+    for d in tdays:
+        if d.get("peak_import_kwh") is None:
+            day = date.fromisoformat(d["day"])
+            try:
+                flags = plans.peak_mask(conn, twin.minutes_of(day))
+            except (LookupError, ValueError, TypeError):
+                flags = None                         # a tariff the calendar cannot read: the day stays without its peak import, never a 500
+            if flags is not None:
+                row = telemetry.aggregate_day(s["id"], day, flags, keep=d)
+                if row:
+                    d = {"day": d["day"], **row}
+        out.append(d)
+    return out
+
+
+def _month_outages(s: dict, t: date, now: int, last: dict | None) -> tuple[int | None, int | None]:
+    """The month's outages so far and how many the site rode through with no critical load unserved (as today's `today_kpis`, over the month in
+    Karachi time); (None, None) off-grid and without a reading this month."""
+    t0 = int(datetime(t.year, t.month, 1, tzinfo=PKT).timestamp())
+    if last is None or last["ts"] < t0 or _off_grid(s, (s.get("connections") or [None])[0]):
+        return None, None
+
+    return tuple(_MONTH_OUTAGES.get((str(store.db_path()), s["id"], t0, last["ts"]), lambda: _outage_counts(s["id"], t0, now)))
+
+
+def _month_energy(s: dict, tdays: list[dict], bs: dict | None, outages: tuple[int | None, int | None]) -> dict:
+    """The month's energy figures for the Overview's This month tiles (UX backend ask K12; plan D9.2, D2.9), from the month's day rows: the grid import
+    bought in the peak windows, the share of the solar made used on site, the outages and those covered, and the swap tiles' unserved load (off-grid)
+    and battery cycles (no genset, off-grid; the discharge over the pack's capacity at its present health, as today's). Each None without its data
+    (no row this month, no row carrying the figure, no solar made, no battery, no grid), never a zero; the peak import also None while a day of the
+    month has no peak figure (its tariff calendar unreadable), never a part of the month."""
+    if not tdays:
+        return {"peak_import_kwh": None, "pv_self_pct": None, "outages": outages[0], "outages_covered": outages[1], "unserved_kwh": None,
+                "battery_cycles": None}
+    off_grid = _off_grid(s, (s.get("connections") or [None])[0])
+    # the month's sum of a figure over the day rows that carry it; None where none does, never a zero (UX K12 check: a row stored without
+    # `unserved_kwh` or `discharge_kwh` counted as 0, so such a month read "0 kWh unserved" and "0 cycles")
+    total = lambda k: (sum(d[k] for d in tdays if d.get(k) is not None) if any(d.get(k) is not None for d in tdays) else None)  # noqa: E731
+    peaks = [d.get("peak_import_kwh") for d in tdays]
+    e_nom = (bs or {}).get("e_nom_kwh")
+    unserved, dis = total("unserved_kwh"), total("discharge_kwh")
+    return {"peak_import_kwh": None if off_grid or any(p is None for p in peaks) else round(sum(peaks), 1),
+            "pv_self_pct": _self_pct(total("pv_kwh"), total("export_kwh")), "outages": outages[0], "outages_covered": outages[1],
+            "unserved_kwh": None if unserved is None else round(unserved, 1),
+            "battery_cycles": round(dis / e_nom, 2) if dis is not None and e_nom else None}
+
+
+def _grid_bill(s: dict, t: date) -> tuple[float | None, dict | None]:
+    """The grid bill so far for the money band (UX backend ask K18; plan D9.8, D2.10), verify.bill_so_far, the Bills page's rebuild, on the plant's
+    connection: (`grid_bill_rs`, `grid_bill_rs_basis`: its days, the reading that closes the bill, its billing month, completeness, whether it is
+    estimated, the metering factor, and when it was computed in Karachi time). Both money names, so a viewer and a machine key get neither. (None, None)
+    off-grid, with no connection, before a whole day of the period, with no grid reading, and where the tariff cannot price it."""
+    conn = (s.get("connections") or [None])[0]
+    if conn is None or _off_grid(s, conn) or not auth.can("see_costs"):
+        return None, None
+    with store.connect() as con:
+        changed = con.execute("SELECT MAX(id) FROM audit").fetchone()[0]
+    # what the bill reads besides the minutes (its period, the credit carried into it, the metering factor) is in the key, and the bill is worked
+    # from the same: entering a bill writes its audit line before the credits are chained and the factor fitted again (UX K18 check)
+    try:
+        inputs = verify.bill_so_far_inputs(s["id"], conn, t)
+    except Exception:  # noqa: BLE001  (as the rebuild below: the band holds the saving alone, never a failed Overview)
+        log.exception("the grid bill so far's period, credit and metering factor could not be read for site %s", s["id"])
+        return None, None
+    if inputs is None:
+        return None, None
+
+    def make():
+        try:
+            got = verify.bill_so_far(s["id"], conn, t, inputs)
+        except Exception:  # noqa: BLE001  (a tariff that cannot price the period: the band holds the saving alone, never a failed Overview)
+            log.exception("the grid bill so far could not be rebuilt for site %s", s["id"])
+            got = None
+        return {**got, "computed": karachi(now_ts())} if got else None
+    key = (str(store.db_path()), s["id"], t.isoformat(), changed, json.dumps(conn, sort_keys=True, default=str), json.dumps(inputs, sort_keys=True))
+    got = _BILL_SO_FAR.get(key, make)
+    if got is None:
+        return None, None
+    return got.pop("total_rs"), got
+
+
 @router.get("/api/sites/{site_id}/header")
 def site_header(site_id: str):
     """What every site page's header shows (plan Part 9.2): the site's name, tier, status and demo link, the control chip and the last-data stamp, from
@@ -796,7 +1172,8 @@ def site_header(site_id: str):
 
 @router.get("/api/sites/{site_id}/now")
 def site_now(site_id: str):
-    """The overview's snapshot: the energy flow now, the plan's current step and the next three reasons, today's and the month's figures."""
+    """The overview's snapshot: the energy flow now, the plan's current step and the next three reasons, today's and the month's figures, and the unit
+    of their fuel figures (`fuel_unit`, UX backend ask K19: a gas genset's are MMBtu, kept under `litres`)."""
     s = full_or_404(site_id)
     now = now_ts()
     last = telemetry.latest(site_id)
@@ -807,8 +1184,12 @@ def site_now(site_id: str):
     td = _today_row(s, t, last, stored)
     if td is not None and td is not stored:
         tdays = [d for d in tdays if d["day"] != t.isoformat()] + [td]      # the month's sums with today's fresh row
-    mtd, computed, spark, _ = _mtd_saving(site_id)
+    # each day row with its peak-window import (UX K12's This month); a day without a reading (today's, before its first minute) is no row
+    tdays = _with_peak_import(s, [d for d in tdays if d.get("day")])
+    td = next((d for d in tdays if d["day"] == t.isoformat()), td)
     a = s.get("assets") or {}
+    # the site's own grid and genset, as its fleet row reads them, so the spark's energy (UX K13) is the same in both
+    mtd, computed, spark, _ = _mtd_saving(site_id, grid=not _off_grid(s, (s.get("connections") or [None])[0]), genset=a.get("genset") is not None)
     caps = {"pv_kw": (a.get("pv") or {}).get("kw_ac"), "battery_kw": (a.get("battery") or {}).get("p_dis_kw"), "genset_kw": (a.get("genset") or {}).get("rated_kw"),
             "grid_kw": (s["connections"][0]["data"]["sanctioned_load_kw"] if s.get("connections") else None)}
     # the battery estimate shared by the site's open pages for a minute (battery.estimate; round 7, audit performance-live-02)
@@ -816,22 +1197,35 @@ def site_now(site_id: str):
     sum_ = lambda k: round(sum((d.get(k) or 0) for d in tdays), 1)
     # the month's litres as the Savings page reads them, with their source (meter or curve; audit R7 pages-A-06: the overview said "estimated" always)
     fuel = _litres_of_month(s, t.replace(day=1).isoformat(), t.isoformat(), last, now) if a.get("genset") else {"litres": 0.0, "litres_source": None}
+    bill, bill_basis = _grid_bill(s, t)
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "status", "demo_link")}, "control": control_state(s, last, now), "now": _snapshot(last),
                 "caps": caps, "now_next": plans.now_and_next(plan, now), "plan_status": (plan or {}).get("summary", {}).get("status_label"),
-                "stage": (plan or {}).get("summary", {}).get("stage"), "today": td,
+                "stage": (plan or {}).get("summary", {}).get("stage"),
+                # the band's plan facts and today's apply mark (UX backend ask K12): the plan in force with its times in Karachi time, when the last
+                # plan ran out where that is why none is in force, and who marked today's table applied
+                "plan": _plan_facts(plan), "plan_expired_at": None if plan else _plan_expired_at(site_id, now),
+                # the newest solve, held or failed, where no plan is in force (beside a plan in force it is plan.latest_attempt; UX K12 check)
+                "latest_attempt": None if plan else _attempt_without_plan(site_id, now),
+                "applied_today": _applied_today(site_id, t), "today": td,
                 "month": {"import_kwh": sum_("import_kwh"), "pv_kwh": sum_("pv_kwh"), "genset_hours": sum_("genset_hours"), "litres": fuel["litres"],
                           "litres_source": fuel["litres_source"],
                           "outage_hours": round(sum((d.get("outage_minutes") or 0) for d in tdays) / 60, 1),
                           "peak_kw": max([d.get("peak_kw") or 0 for d in tdays] or [0]), "saving_rs": mtd,
                           "saving_rs_method": MTD_SAVING_METHOD, "saving_rs_computed": computed,
                           # the month's native-block days, which claim nothing (not money; round 7, audit flow-savings-pilot-bill-18)
-                          "native_block_days": _month_native_block_days(site_id, t)},
+                          "native_block_days": _month_native_block_days(site_id, t),
+                          # the This month tiles' energy (UX backend ask K12): not money, every reader reads them
+                          **_month_energy(s, tdays, bs, _month_outages(s, t, now, last)),
+                          # the grid bill so far (UX backend ask K18): money names, stripped for a viewer and a machine key
+                          "grid_bill_rs": bill, "grid_bill_rs_basis": bill_basis},
                 # the Battery tile's SoC is battery.state's (the last minute with a reading), marked by its own source, not the newest row's (now.soc_source)
                 "spark": spark, "battery": {**{k: bs.get(k) for k in ("soc_pct", "sigma_pct", "trust", "usable_kwh")},
                                             "soc_source": telemetry.soc_source(site_id, bs)} if bs else None,
                 "alerts": alerts.listing("active", site_id)[:5], "last_data": last["ts"] if last else None,
                 "first_data": telemetry.first_ts(site_id), "today_kpis": _today_kpis(s, td, bs, now, t),
-                "genset_requests": _waiting_genset_requests(site_id)})
+                "genset_requests": _waiting_genset_requests(site_id),
+                # the unit of today.litres and month.litres: "L", "MMBtu" for a captive-gas or RLNG genset, null without a genset (UX K19)
+                "fuel_unit": sites.genset_fuel_unit(a.get("genset"))})
 
 
 @router.get("/api/sites/{site_id}/overview/chart")
@@ -954,18 +1348,32 @@ def site_prices(site_id: str, day: str | None = None, connection: str | None = N
     net-metered site the month's exports per period are netted first, as the ledger does."""
     auth.need("see_costs", "Seeing prices")
     s = full_or_404(site_id)
-    from .routes_common import parse_day
-    d = parse_day(day, today())
-    # the day lies between 2015 (the earliest telemetry and rate cards) and a year from today: a day outside has no prices, and one before 1970 or past
-    # about the year 3000 has no local time on Windows (datetime.fromtimestamp raises OSError there)
-    if not PRICES_EARLIEST <= d <= today() + timedelta(days=PRICES_AHEAD_DAYS):
-        raise Refusal(422, f"Prices are shown for days from {PRICES_EARLIEST.isoformat()} to a year from today", "invalid")
+    d = _prices_day(day)
     if connection:
         conn = next((c for c in s.get("connections") or [] if c["id"] == connection), None)
         if conn is None:
             raise Refusal(404, "This site has no such connection", "not_found")
     else:
         conn = (s.get("connections") or [None])[0]
+    try:
+        return _prices(site_id, conn, d)
+    except (LookupError, ValueError) as exc:
+        raise bad(exc) from None
+
+
+def _prices_day(day: str | None) -> date:
+    from .routes_common import parse_day
+    d = parse_day(day, today())
+    # the day lies between 2015 (the earliest telemetry and rate cards) and a year from today: a day outside has no prices, and one before 1970 or past
+    # about the year 3000 has no local time on Windows (datetime.fromtimestamp raises OSError there)
+    if not PRICES_EARLIEST <= d <= today() + timedelta(days=PRICES_AHEAD_DAYS):
+        raise Refusal(422, f"Prices are shown for days from {PRICES_EARLIEST.isoformat()} to a year from today", "invalid")
+    return d
+
+
+def _prices(site_id: str, conn: dict | None, d: date) -> dict:
+    """GET /prices' answer for connection `conn` ({id, data}: a saved one, or the fields of one not saved, id None) on day `d`. Raises LookupError
+    (tariffs.NoTariffVersion) or ValueError where the day cannot be priced."""
     t0 = datetime(d.year, d.month, d.day, tzinfo=PKT)
     month_q = month_x = None
     try:
@@ -976,8 +1384,6 @@ def site_prices(site_id: str, day: str | None = None, connection: str | None = N
             if conn["data"].get("regime") == "net_metering_legacy":
                 month_x = tot["export"]
         v = tariffs.vectors(conn, t0.astimezone(timezone.utc), 96, month_q, None, 0.0 if month_q is not None else 1e9, month_x, None)
-    except (LookupError, ValueError) as exc:
-        raise bad(exc) from None
     except (OSError, OverflowError):
         raise Refusal(422, "That day has no prices", "invalid") from None
     return {"day": d.isoformat(), "connection_id": conn["id"] if conn else None, "t": [int(t0.timestamp()) + 900 * i for i in range(96)], "c_imp": [round(float(x), 2) for x in v["c_imp"]],
@@ -987,3 +1393,76 @@ def site_prices(site_id: str, day: str | None = None, connection: str | None = N
             "month_import_kwh": {k: round(float(x), 1) for k, x in month_q.items()} if month_q is not None else None,
             "month_export_kwh": {k: round(float(x), 1) for k, x in month_x.items()} if month_x is not None else None,
             "tariff_notices": v.get("tariff_notices", [])}  # a version awaiting its notification the day reaches (tariffs, engine-tariffs-06)
+
+
+def _months_words(months: list[int]) -> str:
+    """A season's months in words: "Dec to Feb" for a run (across the year's end too), "All year", else listed ("Jan, Mar and May")."""
+    held = sorted(set(m for m in months if 1 <= m <= 12))
+    if len(held) == 12:
+        return "All year"
+    if not held:
+        return "No months"
+    for first in held:
+        run = [(first - 1 + i) % 12 + 1 for i in range(len(held))]
+        if sorted(run) == held:
+            return _MONTHS[first - 1] if len(run) == 1 else f"{_MONTHS[first - 1]} to {_MONTHS[run[-1] - 1]}"
+    names = [_MONTHS[m - 1] for m in held]
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _peak_windows(conn: dict, d: date) -> dict:
+    """The time-of-use calendar the connection is priced on, on day `d`, month by hour (plan C6.7, PEAK WINDOWS THROUGH THE YEAR; UX backend ask K5):
+    the site override's own peak window where its bill shows one, else the DISCO group's calendar in force (tariffs.calendar_version, the calendar
+    the prices are made on); each season with its months and its window in words ("Dec to Feb: peak 17:00 to 21:00"), and `by_month`, January first,
+    each hour's share of the peak as the price vector marks it (tariffs.peak_share_by_hour; null for a month in no season). Windows and times only:
+    no money."""
+    cal, source, version = tariffs.calendar_version(conn, d)
+    seasons = [{"months": list(x.get("months") or []), "peak": list(x.get("peak") or []),
+                "words": f"{_months_words(x.get('months') or [])}: peak {(x.get('peak') or ['', ''])[0]} to {(x.get('peak') or ['', ''])[-1]}"}
+               for x in cal.get("seasons") or []]
+    return {"disco_group": "ke" if conn["data"].get("disco_group") == "ke" else "xwdisco", "source": source,
+            "version_id": version["id"] if version else None, "effective_from": version["effective_from"] if version else None, "seasons": seasons,
+            "by_month": [tariffs.peak_share_by_hour(cal, m) for m in range(1, 13)]}
+
+
+def _time_of_use(group: str, disco: str | None) -> dict:
+    """Step C's derived line (plan C6.2): the windows the connection is billed on, and the DISCO they follow."""
+    words = "K-Electric's windows" if group == "ke" else "the other DISCOs' windows"
+    follows = f" (follows {disco})" if disco and disco != "K-Electric" else ""
+    return {"disco_group": group, "disco": disco, "words": f"Time of use: {words}{follows}"}
+
+
+def _day_words(d: date) -> str:
+    return f"{d.day} {_MONTHS[d.month - 1]} {d.year}"
+
+
+@router.post("/api/sites/{site_id}/prices/preview")
+def site_prices_preview(site_id: str, inp: dict = Body(...), day: str | None = None):
+    """The day's prices for the connection's fields as step C holds them, before they are saved and before the site has any connection (UX backend ask
+    K5, plan C19.2 item 1, C6.7): GET /prices' answer for those fields, with `preview` true, the server's stamp (`as_of`, Karachi time), the
+    time-of-use line (`time_of_use`) and the DISCO group's peak windows month by month (`peak_windows`). The body is the connection's save as `PUT
+    /connection` takes it, checked as the save checks it (one sentence a refusal); its `id` names the saved connection being edited (its own bill's
+    peak window and the month's readings then apply), and `if_unchanged` and `idempotency_key` are ignored. Nothing is saved. see_costs (the prices
+    are money)."""
+    auth.need("see_costs", "Seeing prices")
+    s = full_or_404(site_id)
+    cid = inp.get("id")
+    if cid is not None and not any(c["id"] == cid for c in s.get("connections") or []):
+        raise Refusal(404, "This site has no such connection", "not_found")
+    d = _prices_day(day)
+    disco = (s.get("data") or {}).get("disco")
+    data = check(sites.ConnectionFields, sites._from_disco({k: v for k, v in inp.items() if k not in setup_check.SAVE_ONLY}, disco)).model_dump()
+    problem = sites.group_problem(data["disco_group"], disco)
+    if problem:
+        raise Refusal(422, problem, "invalid")
+    conn = {"id": cid, "site_id": site_id, "data": data}
+    try:
+        answer = _prices(site_id, conn, d)
+    except tariffs.NoTariffVersion:
+        # plan C6.8's warn state: the library has no rate card in force for this category and day
+        raise Refusal(422, f"No {data['tariff_category']} rate card is in force on {_day_words(d)}, so the plan cannot price this connection: check "
+                      "Tariffs", "no_tariff_version") from None
+    except (LookupError, ValueError) as exc:
+        raise bad(exc) from None
+    return out({**answer, "preview": True, "as_of": karachi(now_ts()), "time_of_use": _time_of_use(data["disco_group"], disco),
+                "peak_windows": _peak_windows(conn, d)})

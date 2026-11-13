@@ -4,7 +4,7 @@ Every request model of Gridlytics is strict: types enforced, unknown fields refu
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -34,29 +34,109 @@ _WORDS = {"string_type": "{label} must be text", "string_too_long": "{label} mus
           "enum": "{label} must be one of {expected}"}
 
 
-def _label(loc: tuple) -> str:
-    head = "The " + str(loc[0]).replace("_", " ")
-    return head + "".join(f"'s {str(p).replace('_', ' ')}" for p in loc[1:] if not isinstance(p, int))
+def _label(loc: tuple, titles: dict | None = None, items: dict | None = None) -> str:
+    """The field a refusal names: "The cycle cap per day" from its key, or its own words where the model gives a top-level field a title (`Field(title=
+    "The meter reading (hm³)")`), so a field whose key is a unit or a code reads as people say it (UX K24 check). A field inside a list item is named
+    by the item where the model names its list's items (`Field(json_schema_extra={"item": "version"})`): "Version 2's kind" (UX K32 check)."""
+    item = (items or {}).get(loc[0])
+    if item and len(loc) > 1 and isinstance(loc[1], int):
+        head, rest = f"{item[:1].upper()}{item[1:]} {loc[1] + 1}", loc[2:]
+    else:
+        head, rest = (titles or {}).get(loc[0]) or "The " + str(loc[0]).replace("_", " "), loc[1:]
+    return head + "".join(f"'s {str(p).replace('_', ' ')}" for p in rest if not isinstance(p, int))
 
 
-def message(exc: ValidationError) -> str:
-    parts = []
-    for e in exc.errors()[:4]:
+def _clause(text: str) -> str:
+    """A refusal's clause after the first, as it reads inside the one sentence: its first letter lower-cased when its first word is a plain word ("Give",
+    "The", "A"), never an abbreviation or a name with a mark ("DISCO", "MMBtu", "Punjab's"). So a form missing two fields is told "Give your full name;
+    give a work email", one sentence (UX K3 check)."""
+    word = text.split(" ", 1)[0]
+    plain = word.isascii() and word.isalpha() and word[:1].isupper() and (word[1:].islower() if len(word) > 1 else word != "I")
+    return text[:1].lower() + text[1:] if plain else text
+
+
+def _model_of(annotation):
+    """The model a field holds (itself, or inside `X | None` or a list), else None."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    return next((m for m in map(_model_of, get_args(annotation)) if m is not None), None)
+
+
+def _title_at(model: type[BaseModel] | None, loc: tuple) -> str | None:
+    """The title of the field a nested `loc` names (the models followed down), or None: "The reserve floor (% state of charge)" for
+    ("reserve_policy", "min_soc_pct") where the field gives one (UX K6), so a field inside a part of a form is named as the form names it."""
+    m, title = model, None
+    for p in loc:
+        if isinstance(p, int):
+            continue
+        fields = m.model_fields if m is not None else {}
+        if p not in fields:
+            return None
+        title, m = fields[p].title, _model_of(fields[p].annotation)
+    return title
+
+
+def _sentence(e: dict, titles: dict, items: dict, model: type[BaseModel] | None = None) -> str:
+    """One validation error in the refusals' words."""
+    loc = tuple(e["loc"])
+    text = e["msg"].removeprefix("Value error, ")
+    nested = _title_at(model, loc) if loc and loc[0] not in items and sum(not isinstance(p, int) for p in loc) > 1 else None
+    label = nested or (_label(loc, titles, items) if loc else "")
+    if not loc or e["type"] == "value_error":
+        return text
+    if e["type"] == "extra_forbidden":
+        return f"Unknown field '{'.'.join(str(p) for p in loc)}'"
+    if e["type"] == "string_too_short":
+        n = (e.get("ctx") or {}).get("min_length", 1)
+        return f"{label} is needed" if n <= 1 else f"{label} must be at least {n} characters"
+    if e["type"] in ("too_long", "too_short"):
+        # a list's length (UX K32 check): pydantic's own words are "List should have at most 7 items after validation, not 8"
+        ctx = e.get("ctx") or {}
+        n = ctx.get("max_length") if e["type"] == "too_long" else ctx.get("min_length")
+        return f"{label} must have {'at most' if e['type'] == 'too_long' else 'at least'} {n} item{'' if n == 1 else 's'}"
+    if e["type"] in _WORDS:
+        # a whole bound of a number field as a whole number: "at least 12", not "at least 12.0" (UX K7)
+        ctx = {k: int(v) if isinstance(v, float) and v.is_integer() else v for k, v in (e.get("ctx") or {}).items()}
+        return _WORDS[e["type"]].format(label=label, **ctx)
+    return f"{label}: {text}"
+
+
+def _names(model: type[BaseModel] | None) -> tuple[dict, dict]:
+    fields = model.model_fields if model is not None else {}
+    titles = {k: f.title for k, f in fields.items() if f.title}
+    items = {k: f.json_schema_extra["item"] for k, f in fields.items() if isinstance(f.json_schema_extra, dict) and f.json_schema_extra.get("item")}
+    return titles, items
+
+
+def problems(exc: ValidationError, model: type[BaseModel] | None = None) -> list[tuple[tuple, str, str]]:
+    """Every error of a validation, each (the field's path, its sentence in the refusals' words, pydantic's type of it), in pydantic's order: what a
+    set-up check lists one a field (UX backend ask K6). A model's own check that concerns one field (`FieldProblem`, raised inside a model validator,
+    which pydantic places on the model) is placed on that field."""
+    titles, items = _names(model)
+    out = []
+    for e in exc.errors():
         loc = tuple(e["loc"])
-        text = e["msg"].removeprefix("Value error, ")
-        if not loc or e["type"] == "value_error":
-            parts.append(text)
-        elif e["type"] == "extra_forbidden":
-            parts.append(f"Unknown field '{'.'.join(str(p) for p in loc)}'")
-        elif e["type"] == "string_too_short":
-            n = (e.get("ctx") or {}).get("min_length", 1)
-            parts.append(f"{_label(loc)} is needed" if n <= 1 else f"{_label(loc)} must be at least {n} characters")
-        elif e["type"] in _WORDS:
-            parts.append(_WORDS[e["type"]].format(label=_label(loc), **(e.get("ctx") or {})))
-        else:
-            parts.append(f"{_label(loc)}: {text}")
+        err = (e.get("ctx") or {}).get("error")
+        if e["type"] == "value_error" and isinstance(err, FieldProblem):
+            loc = loc + tuple(err.field.split("."))
+        out.append((loc, _sentence(e, titles, items, model), e["type"]))
+    return out
+
+
+class FieldProblem(ValueError):
+    """A model's check that concerns one field (`field`, dotted from the model): its refusal reads as any other, one sentence; the set-up check ties it
+    to that field (UX backend ask K6)."""
+
+    def __init__(self, sentence: str, field: str):
+        super().__init__(sentence)
+        self.field = field
+
+
+def message(exc: ValidationError, model: type[BaseModel] | None = None) -> str:
+    titles, items = _names(model)
+    parts = [_sentence(e, titles, items, model) for e in exc.errors()[:4]]
     more = len(exc.errors()) - 4
-    return "; ".join(parts) + (f"; and {more} more" if more > 0 else "")
+    return "; ".join(parts[:1] + [_clause(p) for p in parts[1:]]) + (f"; and {more} more" if more > 0 else "")
 
 
 def check(model: type[BaseModel], body: Any, **context) -> Any:
@@ -64,7 +144,7 @@ def check(model: type[BaseModel], body: Any, **context) -> Any:
     try:
         return model.model_validate(body, context=context)
     except ValidationError as exc:
-        raise Refusal(422, message(exc), "invalid") from exc
+        raise Refusal(422, message(exc, model), "invalid") from exc
 
 
 # ------------------------------------------------------------------------------------------------ the pilot set-up (UI-13; round 7, audit pages-D-04)
@@ -169,3 +249,91 @@ class SwitchbackPaint(Strict):
         if v not in (3, 7):
             raise ValueError("A block must be 3 or 7 days long")
         return v
+
+
+# ------------------------------------------------------------------------------------------------ the tariff editor (UX backend ask K32)
+
+from typing import Literal  # noqa: E402
+
+TariffKind = Literal["schedule", "tou", "adder", "tax", "icp", "prosumer", "override"]
+
+
+class TariffDraftSource(Strict):
+    """Where a draft's versions were read (step A): the SRO, NEPRA decision or bill (`ref`), its web address, and how far it is checked."""
+
+    ref: str = Field("", max_length=200)
+    url: str = Field("", max_length=500)
+    verified: Literal["primary", "secondary", "unverified"] | None = None
+
+
+class TariffDraftVersion(Strict):
+    """One version of a draft: its kind, its key (the adder's, the calendar's DISCO group, the regime, or a site override's connection; the
+    national kinds' one key is filled in) and its body as the editor holds it, checked only when the draft is checked or submitted."""
+
+    kind: TariffKind
+    key: str = Field("", max_length=80)
+    body: dict = Field(default_factory=dict)
+
+
+class TariffDraft(Strict):
+    """A tariff draft as the editor saves it (`PUT /api/tariffs/drafts/{id}`) and checks it (`POST /api/tariffs/versions/validate`): its start
+    (YYYY-MM-DD, or empty while drafted), its source, one version a kind it changes (at most seven), and the editor's own state (`editor`: its step,
+    what it started from), kept as sent."""
+
+    effective_from: str = Field("", max_length=10, title="The start")
+    source: TariffDraftSource = Field(default_factory=TariffDraftSource)
+    versions: list[TariffDraftVersion] = Field(default_factory=list, max_length=7, title="A draft's versions", json_schema_extra={"item": "version"})
+    editor: dict = Field(default_factory=dict)
+
+
+class _WhatIf(Strict):
+    """What a preview prices as if approved: the draft as typed, a saved draft, or a version waiting for approval (exactly one)."""
+
+    draft: TariffDraft | None = None
+    draft_id: str | None = Field(None, max_length=64)
+    version_id: str | None = Field(None, max_length=64)
+
+    @model_validator(mode="after")
+    def _one(self):
+        if sum(x is not None for x in (self.draft, self.draft_id, self.version_id)) != 1:
+            raise ValueError("Send one of draft (the draft as typed), draft_id (a saved draft) or version_id (a version waiting for approval)")
+        return self
+
+
+class TariffPreviewIn(_WhatIf):
+    """`POST /api/tariffs/preview`: a week of 15-minute prices at a site (its plant's connection, or the one named) from `start` (the draft's start
+    by default), under the version in force and under the draft."""
+
+    site_id: str = Field(min_length=1, max_length=64)
+    connection_id: str | None = Field(None, max_length=64)
+    start: str | None = None
+    days: int = Field(7, ge=1, le=7, strict=True)
+
+    @field_validator("start")
+    @classmethod
+    def _start(cls, v):
+        return _iso_day(v, "The first day")
+
+
+class TariffSimulateIn(_WhatIf):
+    """`POST /api/tariffs/simulate`: one of a site's bills (`bill_id`), or a billing month of its readings where none is entered (`month`,
+    YYYY-MM, at its plant's connection or the one named), rebuilt under the version in force and under the draft."""
+
+    site_id: str = Field(min_length=1, max_length=64)
+    bill_id: str | None = Field(None, max_length=64)
+    month: str | None = Field(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    connection_id: str | None = Field(None, max_length=64)
+
+    @model_validator(mode="after")
+    def _bill_or_month(self):
+        if (self.bill_id is None) == (self.month is None):
+            raise ValueError("Send one of bill_id (an entered bill) or month (a billing month, YYYY-MM)")
+        return self
+
+
+class TariffWithdrawIn(Strict):
+    """`POST /api/tariffs/versions/{id}/withdraw`: why (kept with the version and in the audit trail), and whether it goes back to its author as a
+    draft (`redraft`, an administrator's "send back")."""
+
+    reason: str = Field("", max_length=300)
+    redraft: bool = Field(False, strict=True)

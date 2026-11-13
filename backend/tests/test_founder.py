@@ -29,7 +29,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 import identities
-from gridlytics import api, auth, backups, founder, identity, mfa, routes_founder, sites, store, store_founder, store_members
+from gridlytics import api, auth, backups, founder, identity, mfa, sites, store, store_founder, store_members
 from gridlytics import platform as platformdb
 
 #: Made-up secrets of these tests, never a real one
@@ -129,11 +129,16 @@ def _audit() -> list[dict]:
 
 
 def _founder_routes() -> list[tuple[str, str]]:
-    return sorted((m, r.path) for r in routes_founder.router.routes if isinstance(r, APIRoute) for m in r.methods - {"HEAD", "OPTIONS"})
+    """Every /api/founder route the app serves, whichever module holds it (the access requests are routes_access.py's, UX backend ask K2): the guard
+    lets the whole prefix through, so a founder route added anywhere is walked here for its session, its 503 and its bodies. The app's own routes and
+    every feature router's (FastAPI keeps an included router as one entry of `app.routes`)."""
+    routes = [*api.app.routes, *(r for m in api.FEATURE_ROUTES for r in m.router.routes)]
+    return sorted({(m, r.path) for r in routes if isinstance(r, APIRoute) and r.path.startswith(api.FOUNDER_PREFIX)
+                   for m in r.methods - {"HEAD", "OPTIONS"}})
 
 
 def _url(path: str) -> str:
-    return path.replace("{company_id}", str(uuid.uuid4())).replace("{user_id}", str(uuid.uuid4()))
+    return path.replace("{company_id}", str(uuid.uuid4())).replace("{user_id}", str(uuid.uuid4())).replace("{request_id}", str(uuid.uuid4()))
 
 
 # ================================================================== the session token: Boxlytics' format (founder-auth.ts)
@@ -200,7 +205,8 @@ def test_every_founder_route_but_the_login_needs_the_session_whatever_else_the_r
             ("GET", "/api/founder/users"), ("POST", "/api/founder/users"), ("POST", "/api/founder/users/{user_id}/password"),
             ("PATCH", "/api/founder/users/{user_id}"), ("POST", "/api/founder/users/{user_id}/memberships"),
             ("PATCH", "/api/founder/users/{user_id}/memberships/{company_id}"), ("DELETE", "/api/founder/users/{user_id}/memberships/{company_id}"),
-            ("GET", "/api/founder/audit")} == set(routes)
+            ("GET", "/api/founder/audit"),
+            ("GET", "/api/founder/access-requests"), ("PATCH", "/api/founder/access-requests/{request_id}")} == set(routes)
     for method, path in routes:
         if path.startswith("/api/founder/login"):
             continue
@@ -795,12 +801,16 @@ def test_every_founder_route_answers_with_the_session_and_refuses_a_body_of_the_
              ("PATCH", "/api/founder/users/{user_id}"): {"disabled": False, "name": "Walk"},
              ("POST", "/api/founder/users/{user_id}/memberships"): {"company_id": cid, "company_role": "member"},
              ("PATCH", "/api/founder/users/{user_id}/memberships/{company_id}"): {"status": "active"},
-             ("POST", "/api/founder/logout"): {"everywhere": False}}
+             ("POST", "/api/founder/logout"): {"everywhere": False},
+             ("PATCH", "/api/founder/access-requests/{request_id}"): {"state": "contacted", "note": "Walked"}}
+    sent = TestClient(api.app).post("/api/public/access-requests", json={"topic": "access", "name": "Walk", "email": "walk@meow.test", "company": "Walk"})
+    assert sent.status_code == 202, sent.text
+    request_id = _ok(c.get("/api/founder/access-requests"))["requests"][0]["id"]
     problems = []
     logout = ("POST", "/api/founder/logout")
     # signing out ends the walk's session (round 7, audit founder-console-09): it is walked last, each body with a session of its own
     for method, path in sorted(_founder_routes(), key=lambda route: route == logout):
-        url = path.replace("{company_id}", cid).replace("{user_id}", other)
+        url = path.replace("{company_id}", cid).replace("{user_id}", other).replace("{request_id}", request_id)
         good = goods.get((method, path))
         if method == "GET" or good is None:
             r = c.request(method, url)

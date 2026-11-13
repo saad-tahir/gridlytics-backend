@@ -35,9 +35,9 @@
       "path": "backend/gridlytics/platform.py",
       "upstream": "backend/solarlytics/platform.py",
       "status": "adapted",
-      "why": "Gridlytics' roles (admin, operator, analyst, viewer) and permission table; sessions with their registry, sign-out everywhere and one-time passwords (platform.db schema 2 and 3), the account lockout per account, the founder console's company states: audit security-roles-09/-10, parity-supabase-auth-01/-02/-08, founder-console-08, role-analyst-32, pages-A-02.",
+      "why": "Gridlytics' roles (admin, operator, analyst, viewer) and permission table; sessions with their registry, sign-out everywhere and one-time passwords (platform.db schema 2 and 3), the account lockout per account, the founder console's company states: audit security-roles-09/-10, parity-supabase-auth-01/-02/-08, founder-console-08, role-analyst-32, pages-A-02. Schema 4: the access requests the contact page sends the founder (Gridlytics' UX backend asks K2 and K3; the rules and the store are access_requests.py, not lifted); Solarlytics has no contact form, so nothing to port back.",
       "upstream_sha256": "8aaaec3922c95d8945b5c0a0befd757dfc6a71e936975400089db773e7c328cb",
-      "sha256": "caebd77bb8a470e86edf82ca7d86645f6a850e9f76cb1161cf4b1ed38237acdc"
+      "sha256": "b5aa99090c9a36309291204521f858308eb9b42b53fb1337ca555893ea478a7d"
     },
     {
       "path": "backend/gridlytics/companies.py",
@@ -99,9 +99,9 @@
       "path": "backend/gridlytics/backups.py",
       "upstream": "backend/solarlytics/backups.py",
       "status": "adapted",
-      "why": "A copy takes the companies' telemetry files, signing keys and reports, with their counts; a restore puts them back: audit founder-console-01/-12/-13, parity-architecture-11/-16, performance-live-07/-08, frontend-states-formats-17.",
+      "why": "A copy takes the companies' telemetry files, signing keys and reports, with their counts; a restore puts them back: audit founder-console-01/-12/-13, parity-architecture-11/-16, performance-live-07/-08, frontend-states-formats-17. The daily check removes the requests for access past their keeping before it copies the registry (Gridlytics' UX K2 check; access_requests.py, not lifted); Solarlytics has no contact form.",
       "upstream_sha256": "fc72985c65c9681e4bf7fca9d19c950ef1ee737a00b3b7075458de2df78999d7",
-      "sha256": "82e58ba7ec2efcfb236cf4083a5ea030f9c6e418237bdedbb9872cc2d14d0e5c"
+      "sha256": "1a3d08f2138ceba1a494270bbf837fea4784cc475441637004e196d7c38f2696"
     },
     {
       "path": "backend/gridlytics/mfa.py",
@@ -146,9 +146,9 @@
       "path": "backend/gridlytics/ratelimit.py",
       "upstream": "backend/solarlytics/routes_accept.py",
       "status": "extract",
-      "why": "The Limiter class of Solarlytics' routes_accept.py, alone in a module of its own; the rest of that file (Solarlytics' acceptance flow) is not lifted. An upstream change to the file is reviewed for the Limiter only.",
+      "why": "The Limiter class of Solarlytics' routes_accept.py, alone in a module of its own; the rest of that file (Solarlytics' acceptance flow) is not lifted. An upstream change to the file is reviewed for the Limiter only. Each key is kept for its own window when the limiter prunes (Gridlytics' UX K3 check): the API's one limiter holds keys of a minute, of five minutes and of an hour, and a minute's check over a full limiter forgot the longer counts. Solarlytics' routes_accept uses one window per limiter, so nothing to port back unless it shares one across windows.",
       "upstream_sha256": "959fb0fab26e6407e9260c65363c4d38307626c1c4c35b710b5ddf4dab4640d6",
-      "sha256": "ec576e8be8f53d51d57de8c1226287175cb6dc0e07ffd4fb88099b90fc7e834e"
+      "sha256": "ada76b6afd5d04d2305960cec34dbc2e2180854baed77dc58163ed70e4511c5c"
     },
     {
       "path": "backend/tests/identities.py",
@@ -184,9 +184,9 @@
       "path": "backend/tests/test_founder.py",
       "upstream": "backend/tests/test_founder.py",
       "status": "adapted",
-      "why": "Re-aimed at Gridlytics' founder console lists, sessions and secret checks (audit founder-console-*, security-roles-12).",
+      "why": "Re-aimed at Gridlytics' founder console lists, sessions and secret checks (audit founder-console-*, security-roles-12). The founder route sweeps read every /api/founder route the app serves, the access requests of routes_access.py included (Gridlytics' UX K2 check).",
       "upstream_sha256": "4b7a8434a5f4026caf1727d562b9228af79a80064b6e1b06658ac376aaa8d8c8",
-      "sha256": "7e041226aa966a0fce234ae38468d22ba39ad9acf1dc5816e5e0a84508b16959"
+      "sha256": "055f8c3d2b0d261b391eb6e8cb36e03f5abc75b68445370abbc77223a96aab22"
     },
     {
       "path": "backend/tests/test_signin_guard.py",

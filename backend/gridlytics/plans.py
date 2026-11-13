@@ -151,8 +151,9 @@ def _carried_genset(site_id: str, t0: int) -> dict:
     return {"u_prev": int(last), "elapsed": int(elapsed_steps), "hours_today": hours_today, "unknown": False}
 
 
-#: the fuel kinds that come by pipe: no tank to run dry, so the plan does not ration them (an explicit kind, never a tank of 0 litres)
-PIPED_FUELS = ("gas_captive", "lng_captive")
+#: the fuel kinds that come by pipe: no tank to run dry, so the plan does not ration them (an explicit kind, never a tank of 0 litres). The gas fuels,
+#: one list (sites.GAS_FUELS): a plan's fuel basis "piped" is how a plan stored before UX K19 tells its unit
+PIPED_FUELS = sites.GAS_FUELS
 
 
 def fuel_level(site: dict, t0: int) -> dict | None:
@@ -304,6 +305,14 @@ def delivered_floor_pct(site: dict) -> float:
     return delivery.fallback_floor(fallback_floor_pct(site), bms_low_pct(site))
 
 
+def grid_floor(site: dict) -> float:
+    """The state of charge (a share) the plan holds on its grid-up steps (`soc_floor_grid`): the delivered floor (delivered_floor_pct), never above the
+    battery's highest state of charge, which it cannot be charged past. Set-up's reserve figures read the same floor (setup_check.reserve_figures; UX K6
+    check: a floor typed above the highest state of charge counted energy the battery never holds)."""
+    battery = (site.get("assets") or {}).get("battery") or {}
+    return min(float(battery.get("soc_max", 0.95)), delivered_floor_pct(site) / 100.0)
+
+
 def terminal_cal_hold(b_cal: np.ndarray, c_imp: np.ndarray, load: np.ndarray, pv: np.ndarray, off_grid: bool) -> float:
     """The terminal value's c_cal_hold (Part 4.4): the calendar cost of holding a kWh from the horizon's end until the next peak uses it, the
     sum of the per-step slopes over the steps between (round 7, engine-optimiser-10: it was the mean slope of 32 steps, one 15-minute step's
@@ -319,6 +328,30 @@ def terminal_cal_hold(b_cal: np.ndarray, c_imp: np.ndarray, load: np.ndarray, pv
     else:
         hold = int(np.argmax(np.asarray(c_imp, dtype=float)[-n:]))
     return float(np.sum(np.asarray(b_cal, dtype=float)[-n:][:hold]))
+
+
+def plan_tariff(site: dict, conn: dict | None, schedules: list[dict]) -> dict | None:
+    """The tariff a plan is priced on, as its "Inputs this plan used" names it ("FESCO B-3, version in force from 1 Jul 2026"; plan D3.1.4, UX backend
+    ask K14): the site's DISCO (null where it names none), the plant connection's category, and the schedule version (the rate card) in force on the
+    horizon's first Karachi day (`version_id`, `name`, `effective_from`), with every schedule version the horizon's days were priced on in order
+    (`versions`, tariffs.schedules_used: one for each stretch of days on one version, so up to three in 48 hours, which touch three Karachi days
+    unless they start at midnight). "The tariff version" is the schedule version, as a savings day's `tariff_version` is. None off-grid: nothing is
+    priced on a tariff. Words, ids and dates: no rate."""
+    if conn is None or not schedules:
+        return None
+    first = schedules[0]
+    return {"disco": (site.get("data") or {}).get("disco") or None, "category": conn["data"].get("tariff_category"),
+            "version_id": first["version_id"], "name": first["name"], "effective_from": first["effective_from"],
+            "versions": [dict(v) for v in schedules]}
+
+
+def tariff_over(tariff: dict | None, ts) -> dict | None:
+    """plan_tariff for the steps a plan holds: a relaxed retry solves a shorter horizon (optimise.shorten) than the prices were made for, and its
+    tariff names only the schedule versions of the Karachi days its steps start in."""
+    if not tariff or ts is None or not len(ts):
+        return tariff
+    last = _local(int(ts[-1])).date().isoformat()
+    return {**tariff, "versions": [{**v, "last_day": min(v["last_day"], last)} for v in tariff["versions"] if v["first_day"] <= last]}
 
 
 def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
@@ -371,6 +404,8 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
          # (the setting accepts 0) made a manual floor's slack and an outage's shortfall cheaper than the grid
          "voll": max(float(d.get("voll_rs_per_kwh", 500)), float(np.max(vec["c_imp"])) if len(vec["c_imp"]) else 0.0), "reserve_threshold": float((d.get("reserve_policy") or {}).get("p_threshold", 0.2)),
          "icp": vec["icp"], "regime": regime, "tariff_notices": vec.get("tariff_notices", []),
+         # the tariff the horizon is priced on, for the plan's "Inputs this plan used" (UX backend ask K14); none off-grid
+         "tariff": plan_tariff(site, None if off_grid else conn, vec.get("schedules") or []),
          # PV and the battery reach the AC side through the inverter: its kW AC bounds both, and the reserve (round 7, engine-plans-live-06)
          "inverter_kw_ac": (float(a["inverter"]["kw_ac"]) if (a.get("inverter") or {}).get("kw_ac") else None)}
     if vec["mdi"] and mtd:
@@ -446,7 +481,7 @@ def build_problem(site: dict, t0: int, bundle: dict, steps: int = 192) -> dict:
                "b_cal": optimise.calendar_slope(temp, b_asset["replacement_cost_per_kwh"]) if d.get("calendar_cost_on", True) else np.zeros(steps),
                "charge_block": mask["charge_block"],
                # the floor the delivered table and the fallback hold with the grid up (round 7, engine-delivery-02); never above soc_max
-               "soc_floor_grid": min(float(b_asset["soc_max"]), delivered_floor_pct(site) / 100.0),
+               "soc_floor_grid": grid_floor(site),
                # the site's daily cycle cap (round 7, brief-vs-build-04): kWh discharged per local day, at most cycle_cap_per_day times E_nom (a
                # cycle as the battery page counts it), less what the battery discharged since midnight on t0's day
                "cycle_cap_kwh": float(d.get("cycle_cap_per_day", 1.5)) * e_nom,
@@ -888,7 +923,13 @@ def tick(site_id: str, at: int | None = None, steps: int = 192, save: bool = Tru
                           "first_solve_seconds": res.get("first_solve_seconds")},
                "horizon_steps": p["T"], "control_release": release,
                # a tariff version awaiting its notification the horizon reaches: the plan is priced with the one still in force (engine-tariffs-06)
-               "tariff_notices": p.get("tariff_notices", [])}
+               "tariff_notices": p.get("tariff_notices", []),
+               # the tariff the plan is priced on (plan_tariff, over the steps it holds; UX backend ask K14), null off-grid
+               "tariff": tariff_over(p.get("tariff"), p.get("ts")),
+               # the unit of the plan's fuel figures (breakdown.litres, each step's litres): "L", "MMBtu" for a gas genset (UX backend ask K19), the
+               # genset's fuel as the plan was made; null where the plan planned no genset, as its `fuel` is: none at the site, or one whose start
+               # control is "none", which the plan cannot start (all its fuel figures 0), so a plan stored before reads the same (_stored_fuel_unit)
+               "fuel_unit": sites.genset_fuel_unit((site.get("assets") or {}).get("genset")) if fuel else None}
     # how many of the plans made in the 24 hours to this one, this one included, stopped at their time limit (round 7, engine-plans-live-19:
     # time_limited_recent counted them and nothing read it), for the plan page; a failed solve counts as a plan, never as time-limited
     recent = time_limited_recent(site_id, 24.0, now)
@@ -1010,9 +1051,21 @@ def _iso(ts: int) -> str:
 
 # ------------------------------------------------------------------------------------------------ reading
 
+def _stored_fuel_unit(summary: dict) -> None:
+    """A plan stored before its summary carried `fuel_unit` (UX backend ask K19) reads it from the fuel it planned on, which every plan since round 7
+    (engine-optimiser-05) stored: "piped" is a gas genset's basis and only a gas genset's (PIPED_FUELS is sites.GAS_FUELS), any other a diesel
+    tank's; null where the plan planned no genset (none at the site, or start control "none"), as tick stores it now. A plan older than that is left
+    without it (the page falls back to hours)."""
+    if not isinstance(summary, dict) or "fuel_unit" in summary or "fuel" not in summary:
+        return
+    fuel = summary["fuel"]
+    summary["fuel_unit"] = None if not isinstance(fuel, dict) else "MMBtu" if fuel.get("basis") == "piped" else "L"
+
+
 def _plan_out(r, with_steps: bool = True) -> dict:
     d = dict(r)
     d["summary"] = json.loads(d["summary"] or "{}")
+    _stored_fuel_unit(d["summary"])
     if with_steps:
         d["steps"] = json.loads(d["steps"]) if d.get("steps") else []
         d["slots"] = json.loads(d["slots"]) if d.get("slots") else None
@@ -1035,13 +1088,31 @@ def current(site_id: str, now: int | None = None, slots: bool = True) -> dict | 
     cols = "*" if slots else f"{LIGHT_COLUMNS}, steps"
     with store.connect() as con:
         r = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
-        last = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
+        late = newest_unplanned(site_id, con)
     if r is None or _past_valid_until(r["valid_until"], now):
         return None
     out = _plan_out(r)
-    if last and last["status"] in ("failed", "held") and last["id"] != out["id"]:
-        out["latest_attempt"] = dict(last)
+    if late and late["id"] != out["id"]:
+        out["latest_attempt"] = late
     return out
+
+
+#: The statuses of a solve that put no new plan in force: it failed, or it was held (by its guard, a pause or a release, or a time limit far from
+#: its bound with the plan before kept)
+UNPLANNED = ("failed", "held")
+
+
+def newest_unplanned(site_id: str, con=None) -> dict | None:
+    """The site's newest solve when it put no new plan in force (UNPLANNED): {id, status, reason, generated_at (as stored, UTC)}; None when the newest
+    solve made a plan, or none was made. Of two solves stored in the same second, the one stored last is the newer. The one rule of a plan's
+    `latest_attempt` (`current`, which the alerts' plan_failed reads) and of the Overview's where no plan is in force (UX backend ask K12; UX K review:
+    each had its own query and list of statuses, and only one of them told two solves of one second apart). `con`: an open connection to read on."""
+    if con is None:
+        with store.connect() as c:
+            return newest_unplanned(site_id, c)
+    r = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC, rowid DESC LIMIT 1",
+                    (site_id,)).fetchone()
+    return dict(r) if r is not None and r["status"] in UNPLANNED else None
 
 
 def held_info(site_id: str, now: int | None = None) -> dict | None:
@@ -1855,6 +1926,22 @@ def issued_for(site_id: str, day_local: str) -> dict | None:
     """The table to write for a Karachi day: its latest issue, else None (none issued yet: the plan in force's table is a draft)."""
     rows = issued_tables(site_id, day_local)
     return rows[-1] if rows else None
+
+
+def applied_mark(site_id: str, day_local: str) -> dict | None:
+    """The day's table marked as applied: the latest mark of the day ({plan_id, by, method, created}: who marked it, how it was keyed and when, a
+    stored UTC stamp) with `superseded`, whether a table was issued for the day after every mark and names a plan none of them marked (what the
+    inverter runs is then the table keyed before it: round 7, audit pages-B-02). None when nobody marked the day. The one rule of the control chip
+    ("Following plan (table applied)", or "New table issued: key it in and mark it") and of the Overview's "Today's table applied by Bilal at 07:42"
+    (UX backend ask K12), so the two never disagree."""
+    with store.connect() as con:
+        marks = con.execute("SELECT plan_id, by, method, created FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created, rowid",
+                            (site_id, day_local)).fetchall()
+    if not marks:
+        return None
+    issued = issued_for(site_id, day_local)
+    superseded = bool(issued and issued["plan_id"] not in {m["plan_id"] for m in marks} and issued["issued_at"] > max(m["created"] for m in marks))
+    return {**dict(marks[-1]), "superseded": superseded}
 
 
 def _write_issue(site_id: str, day_local: str, plan_id: str, reason: str, at: int, gain_rs: float | None = None) -> dict:

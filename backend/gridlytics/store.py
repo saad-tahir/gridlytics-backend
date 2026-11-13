@@ -8,7 +8,8 @@ The context functions, the WAL-once rule, the copy before a migration and BEGIN 
 (store.py lines 33-131, 475-526, 956-990, 1402-1420; DESIGN_LOG first section). The schema is Gridlytics' own: version 1 holds the four tables the lifted
 package needs (members, role_presets, api_keys, audit) and the EMS tables of plan Part 3.2; version 2 adds reports.preliminary; version 3 (round 7)
 adds edge_seen and keeps every capabilities message (`_V3`); version 4 (round 7) adds table_issues, the Mode A tables issued to the inverter (`_V4`);
-version 5 (round 7) adds reports.generated_by, alerts.history and alerts.assigned_id (`_V5_COLUMNS`).
+version 5 (round 7) adds reports.generated_by, alerts.history and alerts.assigned_id (`_V5_COLUMNS`); version 8 (UX backend ask K32) adds the tariff
+editor's drafts and a tariff version's author id and withdrawal (`_V8`, `_V8_COLUMNS`).
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ DEFAULT_ORG = "default"
 _ORG: ContextVar[str] = ContextVar("gridlytics_org", default=DEFAULT_ORG)
 _DB: ContextVar[Path | None] = ContextVar("gridlytics_db", default=None)
 _ACTOR: ContextVar[dict | None] = ContextVar("gridlytics_actor", default=None)
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _lock = threading.Lock()
 
 
@@ -259,6 +260,21 @@ _V7 = [
 _V7_COLUMNS = (("runs", "error", "TEXT NOT NULL DEFAULT ''"), ("runs", "seconds", "REAL"))
 
 
+#: Version 8 (UX backend ask K32; plan F2.5, F11 item 6): the tariff editor's drafts, saved on the server as their author types: the editor's whole
+#: work (one version a kind it changes, their start and source, partial while it is drafted), seen by its author and by administrators, never read
+#: by the engine and never counted as waiting. A table of its own rather than a status of tariff_versions: a half-typed body must never reach a
+#: lookup, and the shipped library's seeding reads every row of that table by its start. `person` is the author's sign-in id, as a site draft's is
+_V8 = [
+    """CREATE TABLE IF NOT EXISTS tariff_drafts (id TEXT PRIMARY KEY, person TEXT NOT NULL, person_name TEXT NOT NULL DEFAULT '', body TEXT NOT NULL,
+        created TEXT NOT NULL, updated TEXT NOT NULL)""",
+    "CREATE INDEX IF NOT EXISTS tariff_drafts_person ON tariff_drafts (person, updated)",
+]
+#: and a tariff version keeps its author's sign-in id ('' for a watcher's, a shipped one and a row of before), which a second person's approval and its
+#: author's withdrawal are told by, and when, by whom and why it was withdrawn (status "withdrawn")
+_V8_COLUMNS = (("tariff_versions", "by_id", "TEXT NOT NULL DEFAULT ''"), ("tariff_versions", "withdrawn_at", "TEXT"),
+               ("tariff_versions", "withdrawn_by", "TEXT NOT NULL DEFAULT ''"), ("tariff_versions", "withdrawn_note", "TEXT NOT NULL DEFAULT ''"))
+
+
 def _migrate(con: sqlite3.Connection, version: int) -> None:
     if version < 1:
         for sql in _V1:
@@ -285,6 +301,12 @@ def _migrate(con: sqlite3.Connection, version: int) -> None:
         for sql in _V7:
             con.execute(sql)
         for table, column, kind in _V7_COLUMNS:
+            if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+    if version < 8:
+        for sql in _V8:
+            con.execute(sql)
+        for table, column, kind in _V8_COLUMNS:
             if column not in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 

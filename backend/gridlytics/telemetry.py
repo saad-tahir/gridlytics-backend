@@ -1587,16 +1587,19 @@ def _csv_cell(v):
 
 
 def export_csv(site_id: str, t0: int, t1: int) -> str:
-    """The stored minutes of [t0, t1) as CSV. The rows are fetched in one read and formatted after it has closed, so the formatting (about half a second
-    for 32 days) holds no transaction open (performance-live-03)."""
+    """The stored minutes of [t0, t1) as CSV: first the minute in Karachi time, ISO 8601 with its offset ("2026-11-11T14:16:00+05:00"), then the same
+    minute in UTC for machines (`ts_utc`, as before), then the stored series (UX backend ask K25, plan E6 item 7: the owner's rule of Pakistan time for
+    every time meant for people, and [req] 1's ISO 8601 with offset; it wrote UTC only). The rows are fetched in one read and formatted after it has
+    closed, so the formatting (about half a second for 32 days) holds no transaction open (performance-live-03)."""
     with reading() as con:
         rows = con.execute(f"SELECT ts, {', '.join(COLUMNS[3:])} FROM minute WHERE site_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
                            (site_id, int(t0), int(t1))).fetchall()
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["ts_utc"] + list(COLUMNS[3:]))
+    w.writerow(["ts_karachi", "ts_utc"] + list(COLUMNS[3:]))
     for r in rows:
-        w.writerow([datetime.fromtimestamp(r[0], timezone.utc).isoformat().replace("+00:00", "Z")] + [_csv_cell(_finite(v)) for v in r[1:]])
+        w.writerow([datetime.fromtimestamp(r[0], PKT).isoformat(), datetime.fromtimestamp(r[0], timezone.utc).isoformat().replace("+00:00", "Z")]
+                   + [_csv_cell(_finite(v)) for v in r[1:]])
     return buf.getvalue()
 
 

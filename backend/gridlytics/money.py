@@ -21,8 +21,8 @@ from . import auth
 MONEY_KEYS = frozenset({
     "price", "prices", "rate", "rates", "cost", "costs", "fee", "voll", "c_imp", "c_exp", "c_fuel", "c_cyc", "c_start", "c_runhr", "c_om",
     "objective", "objective_rs", "saving", "savings", "saving_rs", "ledger", "rate_mdi", "replacement_cost_per_kwh", "fuel_price", "diesel_price",
-    "export_credit", "import_price", "export_price", "tariff_body", "bill", "rebuilt", "real", "cost_breakdown", "wear_rs", "v_end", "terminal_value",
-    "fee_rs", "gain_share", "price_per_l", "value_rs", "money", "energy_charge", "fixed_charge", "taxes", "adders", "fee_ratio",
+    "export_credit", "import_price", "export_price", "tariff_body", "tariff_changes", "bill", "rebuilt", "real", "cost_breakdown", "wear_rs", "v_end",
+    "terminal_value", "fee_rs", "gain_share", "price_per_l", "value_rs", "money", "energy_charge", "fixed_charge", "taxes", "adders", "fee_ratio",
     "levers", "mdi_rate", "rs_per_kwh", "c_short", "naepp", "lines", "cards", "fuel_prices",
     "saving_rs_per_day_unadjusted", "saving_rs_per_day_adjusted",
 })
@@ -31,7 +31,9 @@ FEE_KEYS = frozenset({"fee", "fee_rs", "gain_share", "fee_ratio"})
 #: site's fields and the optimiser's problem give them, and the figures made from them alone: the wear price (c_cyc, the replacement cost over the
 #: warranty) and the shortage cost (c_short: the genset's marginal cost, or the value of lost load). The warranty's cycles and depth are not money
 MONEY_SETTING_KEYS = frozenset({"voll", "voll_rs_per_kwh", "replacement_cost_per_kwh", "c_cyc", "c_start", "c_start_rs", "c_runhr", "c_runhr_rs", "c_om",
-                                "c_om_rs_per_kwh", "c_short"})
+                                "c_om_rs_per_kwh", "c_short",
+                                # the battery's wear cost per kWh discharged in Set-up's check (UX backend ask K6): c_cyc's figure, in the page's name
+                                "wear_cost_rs_per_kwh"})
 SUFFIXES = ("_rs", "_rs_per_kwh", "_rs_per_kw", "_pkr")
 #: Text whose absence from a JSON answer proves no key of it is money (every money key holds one of these: a name of MONEY_KEYS or FEE_KEYS, or the
 #: characters of a rupee suffix); JSON never escapes a letter or "_", so a key holding one holds it in the answer's text too

@@ -1083,7 +1083,9 @@ def _rule(cat: str, v: dict | None, strict: bool) -> dict:
         try:
             r = RuleIn.model_validate(v)
         except ValidationError as exc:
-            words = message(exc).replace("The escalate after min", "The escalation").replace("The thresholds's ", "The threshold ")
+            words = message(exc)
+            for old, new in (("he escalate after min", "he escalation"), ("he thresholds's ", "he threshold ")):   # a clause after the first is "the ..."
+                words = words.replace("T" + old, "T" + new).replace("t" + old, "t" + new)
             raise ValueError(f"{cat} alerts: {words}") from None
         channels, quiet, escalate = r.channels, r.quiet_hours, r.escalate_after_min
     else:

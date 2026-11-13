@@ -38,10 +38,7 @@ def fuel_unit(site_id: str) -> str:
     """The unit of a site's genset fuel figures (its `litres` columns): "L" for diesel, "MMBtu" for a captive-gas or RLNG genset, whose curve and price
     are per MMBtu (sites.GAS_FUELS); "" without a genset. Round 7 integration (savings-page with sweeps' frontend-states-formats-01): the Savings CSV
     and the monthly and energy reports' CSV named a gas genset's MMBtu as litres, as the company roll-up's CSV no longer did."""
-    gen = (sites.assets(site_id) or {}).get("genset")
-    if not gen:
-        return ""
-    return "MMBtu" if (gen.get("fuel_kind") or "hsd") in sites.GAS_FUELS else "L"
+    return sites.genset_fuel_unit((sites.assets(site_id) or {}).get("genset")) or ""
 
 
 def withheld(day: dict) -> str | None:

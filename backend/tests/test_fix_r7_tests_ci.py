@@ -706,14 +706,14 @@ def test_a_grid_connected_site_is_activated_once_its_source_inverter_and_connect
         return r.json()["detail"]
 
     # tab A alone: tabs B and C are asked for, in tab order
-    assert refused() == "Add the inverter (tab B) and the grid connection and tariff (tab C) before activating"
+    assert refused() == "Add the inverter (step B) and the grid connection and tariff (step C) before activating"
     assert a.put(f"/api/sites/{sid}/assets/inverter", json={"brand": "deye", "kw_ac": 100}).status_code == 200
-    assert refused() == "Add the grid connection and tariff (tab C) before activating"
+    assert refused() == "Add the grid connection and tariff (step C) before activating"
     r = a.put(f"/api/sites/{sid}/connection", json={"tariff_category": "B-2(b)", "sanctioned_load_kw": 400})
     assert r.status_code == 200, r.text
     # the DISCO changed after the connection was saved: its group no longer matches, and the site is not activated with the other DISCO's windows
     assert a.put(f"/api/sites/{sid}", json={"disco": "K-Electric"}).status_code == 200
-    assert refused() == "Add the DISCO group of each grid connection, to match the site's DISCO (tab C) before activating"
+    assert refused() == "Add the DISCO group of each grid connection, to match the site's DISCO (step C) before activating"
     assert a.put(f"/api/sites/{sid}", json={"disco": "FESCO"}).status_code == 200
     # the source, the inverter and the connection: activated, with no battery, PV or genset (the plan then runs on the grid and the inverter alone)
     r = a.post(f"/api/sites/{sid}/activate")
