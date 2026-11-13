@@ -772,6 +772,18 @@ finding from two checkers). Each was fixed with a test that fails without the fi
     that level; summing independent steps' quantiles would shrink the range to almost nothing, which the plan's warning is about. Tested: a stage-0
     November solar day reads 0.89, 0.466 and 1.0 of its clear-sky energy, the clearness levels themselves. Where conformal bands set a step's spread
     (stage 1 with enough stored errors), the errors are not known to be independent through a day, so one level per day stays the wide reading.
+- **K20, a past issue by its time** (plan E6 item 1, D3.3, D3.4, E3): `GET /sites/:id/forecasts/:kind?at=` answers the issue held at that time,
+  with `at`, `exact` and `latest_belief_time`. Decisions:
+  - **The issue held then, not only an exact match.** Issues are pruned (whole for 3 days, hourly for 35, then each day's day-ahead issue), so an
+    older plan's quarter-hour issue is gone; the page opens the issue held at that time, `exact` false, and the band says which it is. An exact
+    match is the plan's own issue.
+  - **Both forms the pages hold:** a plan's `belief_time` (ISO, UTC as plans answer it) and the forecast page's (epoch seconds); a time with no
+    offset is Karachi time. Digits are matched as ASCII, at most ten, and the ISO form by pattern, so "٣" or "²" are refused (K34's check found
+    int() reading them); a time more than a minute ahead is refused; each refusal is one sentence (422 `invalid`).
+  - **A past issue as it stood:** its actuals over its whole horizon so far, its Preliminary count from the verified days before its own Karachi
+    day (`forecast.verified_days(before=)`), an outage issue's announced windows from the schedule in force at its time (`forecast.schedule(at=)`).
+  - Nothing kept from then: 404 `no_issue`, "No solar forecast issued at or before 14:15 on 12 Nov 2026 is kept"; another company's site is "No
+    such site", as on every site route. Every role reads it; a machine key does not (the page's own scope rule).
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 

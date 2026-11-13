@@ -370,6 +370,31 @@ def test_the_founder_and_the_administrator_read_when_a_company_was_last_copied(w
     assert companies and all("last_backup" in c for c in companies)
 
 
+def test_the_forecasts_section_s_asks_answer_every_role(world):
+    """UX backend asks K20, K21 and K23 (plan step 10): every role opens each kind's issue by its belief time (`?at=`, the plan's ISO time and the
+    page's epoch seconds), reads each PV and load issue's daily energy and each kind's stage progress; a kind that does not apply answers no
+    progress."""
+    from datetime import datetime, timezone
+    client, password, _ = world
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        for row in client.get("/api/fleet", headers=h).json()["sites"]:
+            for kind in ("pv", "load", "outage"):
+                latest = client.get(f"/api/sites/{row['id']}/forecasts/{kind}", headers=h).json()
+                if latest.get("not_applicable") or not latest.get("issue"):
+                    assert latest["stage_progress"] is None, (email, row["name"], kind)
+                    continue
+                bt = latest["belief_time"]
+                assert latest["stage_progress"]["need"] == {"pv": 3, "load": 3, "outage": 7}[kind], (email, kind)
+                assert ("daily_kwh" in latest["issue"]) == (kind != "outage"), (email, kind)
+                iso = datetime.fromtimestamp(bt, timezone.utc).isoformat(timespec="seconds")
+                for at in (str(bt), iso):
+                    r = client.get(f"/api/sites/{row['id']}/forecasts/{kind}", params={"at": at}, headers=h)
+                    assert r.status_code == 200, (email, row["name"], kind, r.text[:200])
+                    past = r.json()
+                    assert past["belief_time"] == bt and past["exact"] is True and past["issue"].get("daily_kwh") == latest["issue"].get("daily_kwh")
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

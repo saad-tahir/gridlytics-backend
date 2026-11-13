@@ -588,9 +588,15 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
 
 # ------------------------------------------------------------------------------------------------ outages
 
-def schedule(site_id: str) -> dict | None:
+def schedule(site_id: str, at: int | None = None) -> dict | None:
+    """The feeder's announced schedule in force now, or at `at` (epoch seconds: the latest version saved by then; UX K20's past issue)."""
     with store.connect() as con:
-        r = con.execute("SELECT * FROM outage_schedules WHERE site_id = ? ORDER BY fetched_at DESC LIMIT 1", (site_id,)).fetchone()
+        if at is None:
+            r = con.execute("SELECT * FROM outage_schedules WHERE site_id = ? ORDER BY fetched_at DESC LIMIT 1", (site_id,)).fetchone()
+        else:
+            when = datetime.fromtimestamp(int(at), timezone.utc).isoformat(timespec="seconds")
+            r = con.execute("SELECT * FROM outage_schedules WHERE site_id = ? AND fetched_at <= ? ORDER BY fetched_at DESC LIMIT 1",
+                            (site_id, when)).fetchone()
     if r is None:
         return None
     return {"id": r["id"], "fetched_at": r["fetched_at"], "source": r["source"], "windows": json.loads(r["slots"])}
@@ -927,19 +933,20 @@ PRELIMINARY_DAYS = 28
 VERIFIED_DAY_COMPLETENESS = 0.5
 
 
-def verified_days(site_id: str) -> int:
+def verified_days(site_id: str, before: str | None = None) -> int:
     """The site's local days with at least VERIFIED_DAY_COMPLETENESS of their minutes of data (telemetry_days, written by the import, the twin and the
-    nightly job)."""
+    nightly job); with `before` ("YYYY-MM-DD"), only the days before that Karachi day (a past issue's count when it was made, UX K20)."""
     with store.connect() as con:
-        r = con.execute("SELECT COUNT(*) FROM telemetry_days WHERE site_id = ? AND json_extract(data, '$.completeness') >= ?",
-                        (site_id, VERIFIED_DAY_COMPLETENESS)).fetchone()
+        r = con.execute("SELECT COUNT(*) FROM telemetry_days WHERE site_id = ? AND json_extract(data, '$.completeness') >= ?"
+                        + (" AND day_local < ?" if before else ""),
+                        (site_id, VERIFIED_DAY_COMPLETENESS, *((before,) if before else ()))).fetchone()
     return int(r[0])
 
 
-def preliminary(site_id: str, stage: int | None) -> dict:
+def preliminary(site_id: str, stage: int | None, before: str | None = None) -> dict:
     """Whether a forecast (or a plan built on one) of this stage is still Preliminary at the site, with the verified days so far and needed; the plan
-    and the other pages can call it to mark their figures by the same rule."""
-    n = verified_days(site_id)
+    and the other pages can call it to mark their figures by the same rule. With `before`, as it stood on that Karachi day (verified_days)."""
+    n = verified_days(site_id, before)
     return {"preliminary": stage is None or int(stage) < 1 or n < PRELIMINARY_DAYS, "verified_days": n, "verified_days_needed": PRELIMINARY_DAYS}
 
 
@@ -981,21 +988,27 @@ def daily_kwh(t: list, q: dict) -> list[dict]:
     return out
 
 
-def page(site: dict, kind: str) -> dict:
+def page(site: dict, kind: str, at: int | None = None) -> dict:
     """The latest issue of a kind with the actuals so far (15-minute means) for the forecast page, and `past`: the 24 hours before its belief time with
     their actuals and the issue held a day before over them, so the chart shows how the forecast tracked. The tick re-issues every 15 minutes, so the
     latest issue's own actuals are at most one step. `preliminary` follows the design rules (see preliminary()), with `verified_days` and
     `verified_days_needed` beside it. An outage page also carries `announced`: the announced windows over the chart's span (announced_blocks). Every
     page says whether the forecasts read a weather feed (`weather_feed`, WEATHER_FEED).
 
-    UX backend asks K21 and K23 (plan E6 items 2 and 4): a PV or load issue carries `issue.daily_kwh` (daily_kwh); every issue says how far its
-    kind is from stage 1 (`stage_progress`, null for an issue stored before K23)."""
+    UX backend asks K20, K21 and K23 (plan E6 items 1, 2 and 4): with `at` (epoch seconds), the issue held at that time instead of the latest (the
+    latest issued at or before it, still kept: telemetry.ISSUE_ALL_DAYS whole, ISSUE_HOURLY_DAYS hourly, then each day's day-ahead issue), with
+    `at`, `exact` (the issue's belief time is `at`) and `latest_belief_time`, its actuals over its whole horizon where they have come, its
+    Preliminary count as it stood on its day and the announced windows of the schedule then; None when no issue of the kind is kept from at or
+    before `at`. A PV or load issue carries `issue.daily_kwh` (daily_kwh); every issue says how far its kind is from stage 1 (`stage_progress`,
+    null for an issue stored before K23)."""
     na = not_applicable(site, kind)
     if na:
         return {"kind": kind, "issue": None, "not_applicable": na, "stage": None, "preliminary": False, "weather_feed": WEATHER_FEED,
                 "stage_progress": None}
-    f = telemetry.latest_forecast(site["id"], kind)
+    f = telemetry.latest_forecast(site["id"], kind, at)
     if f is None:
+        if at is not None:
+            return None
         return {"kind": kind, "issue": None, "not_applicable": None, "weather_feed": WEATHER_FEED, "stage_progress": None}
     t0 = f["belief_time"]
     t = step_times(t0)
@@ -1005,13 +1018,18 @@ def page(site: dict, kind: str) -> dict:
     issue = {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version", "stage_progress")}
     if kind in ("pv", "load"):
         issue["daily_kwh"] = daily_kwh([int(x) for x in t], f)
+    before = datetime.fromtimestamp(int(t0), PKT).date().isoformat() if at is not None else None
     out = {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
            "issue": issue, "actual": actual,
-           **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None, "not_applicable": None,
+           **preliminary(site["id"], f["stage"], before), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None, "not_applicable": None,
            "weather_feed": WEATHER_FEED, "stage_progress": f.get("stage_progress")}
+    if at is not None:
+        latest = telemetry.latest_forecast_time(site["id"], kind)
+        out.update(at=int(at), exact=int(t0) == int(at), latest_belief_time=latest)
     if kind == "outage":
-        # the announced windows over the chart's span, the past 24 hours and the issue's 48, from the schedule in force now (pages-C-19)
-        sch = schedule(site["id"])
+        # the announced windows over the chart's span, the past 24 hours and the issue's 48, from the schedule in force now (pages-C-19), or for a past
+        # issue the schedule in force at its belief time (UX K20)
+        sch = schedule(site["id"], None if at is None else t0)
         out["announced"] = announced_blocks(sch["windows"] if sch else [], t0 - PAST_STEPS * STEP_S, t0 + STEPS * STEP_S)
     return out
 

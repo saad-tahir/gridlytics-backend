@@ -672,6 +672,28 @@ def test_only_the_administrator_reads_when_the_company_was_last_copied(walk):
     assert keyed.status_code != 200 or "last_backup" not in keyed.json(), keyed.text
 
 
+def test_a_past_forecast_issue_reaches_every_person_alike_and_no_key(walk):
+    """UX backend asks K20, K21 and K23 (plan E6 items 1, 2, 4): the issue held at a belief time (`?at=`) reads alike for the administrator, the
+    operator and the viewer, with its daily energy and stage progress and no money; a machine key reaches no forecast (its scopes hold no site
+    data), refused in words without a rupee."""
+    from gridlytics import money
+    client, h = walk["client"], walk["headers"]
+    sid = walk["edge_site"]
+    for kind in ("pv", "load", "outage"):
+        latest = walk["answers"]["/api/sites/{site_id}/forecasts/{kind}"][f"/api/sites/{sid}/forecasts/{kind}"]["admin"][1]
+        if not latest.get("issue"):
+            continue
+        got = {r: client.get(f"/api/sites/{sid}/forecasts/{kind}", params={"at": str(latest["belief_time"])}, headers=h[r]) for r in READERS}
+        assert {r: g.status_code for r, g in got.items()} == {"admin": 200, "operator": 200, "viewer": 200, "key": 403}, kind
+        bodies = {r: g.json() for r, g in got.items() if g.status_code == 200}
+        for r, body in bodies.items():
+            assert body["belief_time"] == latest["belief_time"] and body["exact"] is True, (kind, r)
+            assert body["issue"].get("daily_kwh") == bodies["admin"]["issue"].get("daily_kwh"), (kind, r)
+            assert body["stage_progress"] == bodies["admin"]["stage_progress"], (kind, r)
+            assert not {k for _, k, _, _ in _items(body) if isinstance(k, str) and money.is_money(k)}, (kind, r)
+        assert not any(RUPEES.search(x) for x in _strings(got["key"].json())), kind
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

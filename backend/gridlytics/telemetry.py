@@ -1792,6 +1792,13 @@ def latest_forecast(site_id: str, kind: str, at_or_before: int | None = None) ->
     return {"belief_time": r["belief_time"], "stage": r["stage"], "model_version": r["model_version"], **json.loads(r["body"])}
 
 
+def latest_forecast_time(site_id: str, kind: str) -> int | None:
+    """The belief time of the latest issue of a kind (epoch seconds), or None: a past issue's page names the latest beside it (UX K20)."""
+    with reading() as con:
+        r = con.execute("SELECT MAX(belief_time) FROM forecast_issues WHERE site_id = ? AND kind = ?", (site_id, kind)).fetchone()
+    return int(r[0]) if r and r[0] is not None else None
+
+
 def next_seq(site_id: str, stream: str, seq: int) -> bool:
     """Idempotency by (site, stream, sequence): True if the sequence is new."""
     with connect() as con:
