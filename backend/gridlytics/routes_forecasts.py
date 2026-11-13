@@ -24,8 +24,8 @@ AT_WORDS = "The time of a forecast is a date and time such as 2026-11-12T14:15:0
 
 
 def at_time(value: str | None) -> int | None:
-    """The `at` of a past issue's address as epoch seconds, None when not given; refused in one sentence when it is neither form or is still to
-    come. Sent URL-encoded: a raw "+" of an offset reads as a space, which no form takes."""
+    """The `at` of a past issue's address as epoch seconds, None when not given; refused in one sentence when it is neither form, is before 1970 or
+    is still to come. Sent URL-encoded: a raw "+" of an offset reads as a space, which no form takes."""
     if value is None or value == "":
         return None
     text = value if isinstance(value, str) else ""
@@ -39,6 +39,10 @@ def at_time(value: str | None) -> int | None:
         ts = int((t if t.tzinfo else t.replace(tzinfo=PKT)).timestamp())
     else:
         raise Refusal(422, AT_WORDS, "invalid")
+    if ts < 0:
+        # no issue is kept from before 1970, and a time of year 1 in Karachi is no date the refusal below could word (K20 check: it was a server
+        # error)
+        raise Refusal(422, "The time of a forecast must not be before 1970", "invalid")
     if ts > now_ts() + 60:
         raise Refusal(422, "The time of a forecast must not be in the future", "invalid")
     return ts

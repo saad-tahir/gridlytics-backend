@@ -113,6 +113,12 @@ def test_every_role_opens_a_past_issue_by_the_plan_s_belief_time_or_the_page_s(a
     (" 1700000000", "The time of a forecast is a date and time such as 2026-11-12T14:15:00+05:00, or seconds since 1970"),
     ("2026-11-12T14:15:00 05:00", "The time of a forecast is a date and time such as 2026-11-12T14:15:00+05:00, or seconds since 1970"),
     ("2999-01-01T00:00:00+05:00", "The time of a forecast must not be in the future"),
+    # K20 check: before 1970 no issue can be kept, and year 1's first hours in Karachi were a server error while the 404's date was worded
+    ("0001-01-01T00:00", "The time of a forecast must not be before 1970"),
+    ("0001-01-01T02:00", "The time of a forecast must not be before 1970"),
+    ("0001-01-01T00:00:00+05:00", "The time of a forecast must not be before 1970"),
+    ("0001-01-01T00:00:00+00:00", "The time of a forecast must not be before 1970"),
+    ("1969-12-31T23:59:59+00:00", "The time of a forecast must not be before 1970"),
 ])
 def test_a_time_in_no_form_or_still_to_come_is_refused_in_one_sentence(api_world, at, words):
     r = api_world.c["viewer"].get(f"/api/sites/{api_world.site}/forecasts/pv", params={"at": at})
