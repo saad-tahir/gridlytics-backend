@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Body, HTTPException
 
-from . import alerts, apikeys, auth, store, store_members
+from . import alerts, apikeys, audit_trail, auth, backups, store, store_members
 from . import platform as platformdb
 from .schemas import Refusal
 
@@ -17,14 +17,19 @@ router = APIRouter()
 @router.get("/api/platform/org")
 def org_mine():
     """Who the company is, the caller's role, and its seats: `seats` (the registry's limit) and `seats_used` (members not switched off, the owner
-    included), both null when the request works in no company of the registry."""
+    included), both null when the request works in no company of the registry. For an administrator (manage_users) only, `last_backup`: when the
+    company's newest copy was made, Karachi time, or null with none (UX backend ask K35, as the founder's company list gives it)."""
     company = auth.company.get()
     seats = used = None
     if company and company.get("id"):
         row = platformdb.company(company["id"])
         if row is not None and row.get("seats") is not None:
             seats, used = int(row["seats"]), store_members.count_members()
-    return {"company": company, "role": (auth.current.get() or {}).get("role"), "seats": seats, "seats_used": used}
+    out = {"company": company, "role": (auth.current.get() or {}).get("role"), "seats": seats, "seats_used": used}
+    if auth.can("manage_users") and not (auth.current.get() or {}).get("api_key"):
+        path = store.db_path()
+        out["last_backup"] = audit_trail.karachi(backups.newest_copies([path])[path])
+    return out
 
 
 @router.get("/api/platform/keys")

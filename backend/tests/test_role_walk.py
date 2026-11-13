@@ -659,6 +659,19 @@ def test_the_filtered_audit_trail_and_its_export_are_the_administrator_s_alone(w
             assert r.headers["content-type"].startswith("text/csv") and r.text.startswith("at_karachi,who,email,action,group,target,site,detail")
 
 
+def test_only_the_administrator_reads_when_the_company_was_last_copied(walk):
+    """UX backend ask K35: GET /api/platform/org carries `last_backup` for the administrator (manage_users) only; the operator, the viewer and a key
+    are not given the key at all."""
+    got = walk["answers"]["/api/platform/org"]["/api/platform/org"]
+    for reader, (status, body) in got.items():
+        if status != 200:
+            continue
+        assert ("last_backup" in body) == (reader == "admin"), (reader, body)
+    assert got["admin"][0] == 200 and got["operator"][0] == 200 and got["viewer"][0] == 200
+    keyed = walk["client"].get("/api/platform/org", headers=walk["headers"]["key"])
+    assert keyed.status_code != 200 or "last_backup" not in keyed.json(), keyed.text
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

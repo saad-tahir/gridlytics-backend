@@ -359,6 +359,17 @@ def test_the_administrator_filters_and_exports_the_audit_trail_and_the_founder_f
     assert audit["total"] >= 1 and all(e["company_id"] == cid for e in audit["entries"]), audit
 
 
+def test_the_founder_and_the_administrator_read_when_a_company_was_last_copied(world, monkeypatch):
+    """UX backend ask K35: each of the founder's companies carries `last_backup`; GET /platform/org carries it for the administrator alone."""
+    client, password, _ = world
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    assert "last_backup" in client.get("/api/platform/org", headers=owner).json()
+    for email in ("operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        assert "last_backup" not in client.get("/api/platform/org", headers=_login(client, password, email)).json(), email
+    companies = client.get("/api/founder/companies", headers=_founder(monkeypatch)).json()["companies"]
+    assert companies and all("last_backup" in c for c in companies)
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

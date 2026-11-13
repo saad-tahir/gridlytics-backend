@@ -710,6 +710,11 @@ committed (backend 1753 passed; web gates clean). Two defects were found and fix
     /api/founder/audit` keeps `{entries}` and gains `total`, `offset`, `limit` and `groups`; each line its `group`, `company_id` and
     `company_name`; its `at` is Karachi time now, where it was UTC (the same moment).
   - Every time the new answers give is Karachi time; the company trail's `at` in `GET /api/audit` stays as today's page reads it.
+- **K35, each company's last backup** (plan G9 item 4): `GET /api/founder/companies` (and every company answer of the console) gives each company's
+  `last_backup`, when its newest copy was made (the `modified` of the copy the Backups page lists first), in Karachi time, null with none, the
+  backup folder listed once for all companies (`backups.newest_copies`). The batch names it "founder or administrator only": the company's
+  administrator (`manage_users`) reads the same for their own company in `GET /api/platform/org`; no other role and no key is given the field.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

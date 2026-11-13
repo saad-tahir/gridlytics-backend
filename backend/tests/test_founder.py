@@ -541,7 +541,7 @@ def test_the_companies_list_carries_the_files_figures(fdb):
     assert list(rows) == ["Boxlytics Internal", "Development"]
     box = rows["Boxlytics Internal"]
     assert {"id", "name", "enabled", "seats", "disabled_reason", "created", "owner", "members", "seats_taken", "admins", "last_seen", "sites",
-            "sites_closed_loop", "sites_failing", "plans_issued", "archived"} == set(box)
+            "sites_closed_loop", "sites_failing", "plans_issued", "archived", "last_backup"} == set(box)     # last_backup: UX K35
     assert box["seats_taken"] == 1 and box["admins"] == 1 and box["last_seen"] and box["archived"] is False
     # a deleted site is not counted; nor is a site whose tick has not run (sites_failing: the active sites whose last tick made no plan, round 7
     # storage-perf, parity-architecture-06)

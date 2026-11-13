@@ -31,7 +31,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from . import auth, backups, identity, store, store_members
+from . import audit_trail, auth, backups, identity, store, store_members
 from . import platform as platformdb
 from .founder import CODE_REFUSED, PASSWORD_TAKEN, SIGNED_IN, WHO
 
@@ -615,7 +615,15 @@ def _membership_view(m: dict, names: dict) -> dict:
     return {"company_id": m["company_id"], "company_name": names.get(m["company_id"], ""), "company_role": m["role"], "status": m["status"]}
 
 
-def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None, shelved: set[str] = frozenset()) -> dict:
+def _last_backups(rows: list[dict]) -> dict[str, str | None]:
+    """Each company's newest copy, by id, in Karachi time (UX K35; backups.newest_copies), the backup folders listed once for them all."""
+    paths = {row["id"]: platformdb.company_file(row) for row in rows}
+    made = backups.newest_copies([p for p in paths.values() if p is not None])
+    return {cid: audit_trail.karachi(made.get(p)) if p is not None else None for cid, p in paths.items()}
+
+
+def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None, shelved: set[str] = frozenset(),
+                  last_backup: str | None = None) -> dict:
     # the owner shown is one who can sign in when there is one; a disabled one is marked (audit founder-console-10)
     owners = [accounts[m["user_id"]] for m in mine if m["role"] == "owner" and m["status"] == "active" and m["user_id"] in accounts]
     owner = next((a for a in owners if not a["disabled"]), owners[0] if owners else None)
@@ -629,7 +637,9 @@ def _company_view(row: dict, mine: list[dict], accounts: dict, read: dict | None
             "last_seen": max(seen) if seen else None,
             "sites": read["sites"] if read is not None else None, "sites_closed_loop": read["sites_closed_loop"] if read is not None else None,
             "sites_failing": read["sites_failing"] if read is not None else None,
-            "plans_issued": read["plans_issued"] if read is not None else None, "archived": row["id"] in shelved}
+            "plans_issued": read["plans_issued"] if read is not None else None, "archived": row["id"] in shelved,
+            # when its newest copy was made, Karachi time (UX K35): "No copy since 8 Nov" for a company that is on
+            "last_backup": last_backup}
 
 
 def company_view(company_id: str) -> dict:
@@ -639,15 +649,17 @@ def company_view(company_id: str) -> dict:
     d = directory()
     mine = d.memberships(company_id=company_id)
     accounts = {a["id"]: a for a in (d.accounts() if mine else [])}
-    return _company_view(row, mine, accounts, _read_or_none(row), archived("company"))
+    return _company_view(row, mine, accounts, _read_or_none(row), archived("company"), _last_backups([row])[row["id"]])
 
 
 def companies() -> list[dict]:
     """Every company, the archived ones too, each saying whether it is (the console hides them until asked)."""
     d = directory()
     every, accounts, shelved = d.memberships(), {a["id"]: a for a in d.accounts()}, archived("company")
-    return [_company_view(row, [m for m in every if m["company_id"] == row["id"]], accounts, _read_or_none(row), shelved)
-            for row in platformdb.list_companies()]
+    rows = platformdb.list_companies()
+    last = _last_backups(rows)
+    return [_company_view(row, [m for m in every if m["company_id"] == row["id"]], accounts, _read_or_none(row), shelved, last[row["id"]])
+            for row in rows]
 
 
 def overview() -> dict:

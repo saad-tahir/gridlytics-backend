@@ -75,9 +75,9 @@
       "path": "backend/gridlytics/store_founder.py",
       "upstream": "backend/solarlytics/store_founder.py",
       "status": "adapted",
-      "why": "The founder console's store for Gridlytics' companies, sites and backups (search, paging, suspension, the scheduler's last tick): audit founder-console-01/-03/-05/-07/-08/-09/-10/-11/-12/-13/-16/-18, parity-architecture-06, frontend-states-formats-17.",
+      "why": "The founder console's store for Gridlytics' companies, sites and backups (search, paging, suspension, the scheduler's last tick): audit founder-console-01/-03/-05/-07/-08/-09/-10/-11/-12/-13/-16/-18, parity-architecture-06, frontend-states-formats-17. Each company's last backup in the console's lists (Gridlytics' UX K35).",
       "upstream_sha256": "eca1045761914df8b400a276166724edcb6f459da7efaa0afd75ffc3a616ec94",
-      "sha256": "0b4e0498504936b0c5ee22a59257a72e78d2954c23e20c6dd22a8af718dc0643"
+      "sha256": "140151bc8d08f47f00a6da427ffcfdb1b1a88af7b456da913191e643425eb117"
     },
     {
       "path": "backend/gridlytics/store_members.py",
@@ -99,9 +99,9 @@
       "path": "backend/gridlytics/backups.py",
       "upstream": "backend/solarlytics/backups.py",
       "status": "adapted",
-      "why": "A copy takes the companies' telemetry files, signing keys and reports, with their counts; a restore puts them back: audit founder-console-01/-12/-13, parity-architecture-11/-16, performance-live-07/-08, frontend-states-formats-17. The daily check removes the requests for access past their keeping before it copies the registry (Gridlytics' UX K2 check; access_requests.py, not lifted); Solarlytics has no contact form.",
+      "why": "A copy takes the companies' telemetry files, signing keys and reports, with their counts; a restore puts them back: audit founder-console-01/-12/-13, parity-architecture-11/-16, performance-live-07/-08, frontend-states-formats-17. The daily check removes the requests for access past their keeping before it copies the registry (Gridlytics' UX K2 check; access_requests.py, not lifted); Solarlytics has no contact form. The newest copy of each company's file, the backup folder listed once (Gridlytics' UX K35).",
       "upstream_sha256": "fc72985c65c9681e4bf7fca9d19c950ef1ee737a00b3b7075458de2df78999d7",
-      "sha256": "1a3d08f2138ceba1a494270bbf837fea4784cc475441637004e196d7c38f2696"
+      "sha256": "35a41c117bb96f0f6636a8806c9c70893c281e2f00bef7a3c125d47d625bf512"
     },
     {
       "path": "backend/gridlytics/mfa.py",
@@ -184,9 +184,9 @@
       "path": "backend/tests/test_founder.py",
       "upstream": "backend/tests/test_founder.py",
       "status": "adapted",
-      "why": "Re-aimed at Gridlytics' founder console lists, sessions and secret checks (audit founder-console-*, security-roles-12). The founder route sweeps read every /api/founder route the app serves, the access requests of routes_access.py included (Gridlytics' UX K2 check). The audit's lines carry their group and company (UX K34).",
+      "why": "Re-aimed at Gridlytics' founder console lists, sessions and secret checks (audit founder-console-*, security-roles-12). The founder route sweeps read every /api/founder route the app serves, the access requests of routes_access.py included (Gridlytics' UX K2 check). The audit's lines carry their group and company (UX K34), and each company its last backup (UX K35).",
       "upstream_sha256": "4b7a8434a5f4026caf1727d562b9228af79a80064b6e1b06658ac376aaa8d8c8",
-      "sha256": "ba53d88d0fdaaf316ebd05187a471bf1119c0fb05b904a119c7409383c009883"
+      "sha256": "a839bc13a6767301abe20094f7fbc21ff47a6ca9d6d4f052b562d3712767824c"
     },
     {
       "path": "backend/tests/test_signin_guard.py",
