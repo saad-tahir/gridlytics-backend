@@ -1008,6 +1008,26 @@ THRESHOLDS: dict[str, dict[str, tuple]] = {
                "gas_price_days": (183, 1, 730)},
     "Forecast": {"bust_pct": (30, 5, 100), "bust_hours": (2.0, 0.5, 12)},
 }
+#: The kinds of data source whose staleness differs, by the minutes before a warning (STALE_MINUTES; an edge, an HTTPS batch or the twin: STALE_DEFAULT),
+#: as the rule editor says the Data category's "by the data source" default (UX K16)
+STALE_BY_SOURCE = {"edge": STALE_DEFAULT[0], "oem_cloud": STALE_MINUTES["oem_cloud"][0], "csv": STALE_MINUTES["csv"][0]}
+
+
+def threshold_limits(cat: str) -> dict:
+    """A category's thresholds as the rule editor shows them beside each field (UX backend ask K16; plan D9.6, D6.3: "Default 15 · 5 to 1,440"): each
+    name's default and the range a save holds it to, {default, min, max}, from THRESHOLDS; the Data category's staleness, whose default is "by the data
+    source" (None), with each kind of source's minutes (`by_source`). {} for a category with nothing to set."""
+    out = {name: {"default": d, "min": lo, "max": hi} for name, (d, lo, hi) in THRESHOLDS.get(cat, {}).items()}
+    if "stale_minutes" in out:
+        out["stale_minutes"]["by_source"] = dict(STALE_BY_SOURCE)
+    return out
+
+
+def with_limits(rules_: dict) -> dict:
+    """Rules as an answer gives them: each category's rule with its `limits` (threshold_limits), which are the server's and never saved."""
+    return {c: {**r, "limits": threshold_limits(c)} for c, r in rules_.items()}
+
+
 _QUIET = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
 QUIET_WORDS = "Quiet hours are two times of day in Karachi time, such as 22:00-07:00"
 
@@ -1077,8 +1097,9 @@ def _threshold_values(cat: str, given: dict | None, strict: bool) -> dict:
 def _rule(cat: str, v: dict | None, strict: bool) -> dict:
     """A category's rule in its stored shape: channels (in the app always first), quiet hours, escalation and thresholds. With `strict` (an edit) a
     problem is a ValueError of one sentence; otherwise a stored value that is no longer valid reads as its default (quiet hours typed as free text
-    before they were checked read as none)."""
-    v = v if isinstance(v, dict) else {}
+    before they were checked read as none). A rule's `limits` (with_limits: the server's thresholds' defaults and ranges, which an answer carries) are
+    not a setting: a rule sent back with them is read without them (UX K16)."""
+    v = {k: x for k, x in v.items() if k != "limits"} if isinstance(v, dict) else {}
     if strict:
         try:
             r = RuleIn.model_validate(v)

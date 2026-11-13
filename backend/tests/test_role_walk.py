@@ -596,6 +596,19 @@ def test_the_edge_key_s_existence_reaches_every_reader_of_the_edge_and_nothing_o
         assert "glk_" not in text and not any(k["prefix"] in text or k["id"] in text or f'"{k["name"]}"' in text for k in mine), r
 
 
+def test_the_alert_thresholds_limits_reach_each_reader_of_the_rules_alike_and_hold_no_money(walk):
+    """UX backend ask K16 (plan D9.6): each rule's `limits` (its thresholds' defaults and ranges) reach the administrator, the operator and the viewer
+    alike for the categories each receives (a viewer: the energy ones, so no bill tolerance), none of them under a money name."""
+    from gridlytics import alerts, money
+    got = walk["answers"]["/api/alerts/rules"]["/api/alerts/rules"]
+    limits = {r: {c: rule["limits"] for c, rule in body.items()} for r, (s, body) in got.items() if s == 200}
+    assert set(limits) >= {"admin", "operator", "viewer"}, got.keys()
+    assert set(limits["viewer"]) == set(alerts.ENERGY_CATEGORIES) and "Tariff" in limits["operator"], limits.keys()
+    for reader, cats in limits.items():
+        assert cats == {c: limits["admin"][c] for c in cats} == {c: alerts.threshold_limits(c) for c in cats}, reader
+        assert not {k for _, k, _, _ in _items(cats) if isinstance(k, str) and money.is_money(k)}, reader
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

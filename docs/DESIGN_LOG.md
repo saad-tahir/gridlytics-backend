@@ -649,7 +649,13 @@ committed (backend 1753 passed; web gates clean). Two defects were found and fix
   operator too, who may not list keys). A partner tool's key is not the box's: only `kind` edge counts, as only an edge device's key sends the box's
   heartbeats. Nothing of the key itself is answered (no prefix, id or name); the checklist's "by AK" is left out, since who made a key is the key
   list's (`manage_users`), not something an operator needs to tick item 1.
-
+- **K16, the alert thresholds' defaults and ranges** (plan D9.6, D6.3): every rule of every rules answer (`GET` and `PUT /api/alerts/rules`, a
+  site's `rules` in `GET` and `PUT /api/alerts/rules/sites/:id`) carries `limits`, each threshold's `{default, min, max}` straight from
+  `alerts.THRESHOLDS`, so the editor writes "Default 15 · 5 to 1,440" and a save holds the same range. The Data category's staleness has no default
+  figure ("by the data source"): `by_source` gives each kind of source's minutes before a warning (an edge 30, the maker's cloud 20, a CSV upload
+  1,440). The limits are the server's: a rule sent back with them (the editor's body, or any client that sends the rule as read) is taken and the
+  limits never saved. Inside each rule rather than beside the categories, because the answer is `{category: rule}` and the pages read its keys as
+  categories. No money: a viewer reads the five energy kinds' limits.
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

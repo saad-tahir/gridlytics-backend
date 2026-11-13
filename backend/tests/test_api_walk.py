@@ -277,6 +277,20 @@ def test_every_role_reads_whether_the_box_s_key_was_made(world):
         assert key["exists"] is True and key["made_at"].endswith("+05:00") and set(key) == {"exists", "made_at"}, (email, key)
 
 
+def test_every_role_reads_the_alert_thresholds_defaults_and_ranges(world):
+    """UX backend ask K16 (plan step 14, Alerts › Rules: "Default 15 · 5 to 1,440"): every rule of the company's and of a site's rules carries `limits`,
+    the same for every role that receives its category (a viewer the five energy kinds)."""
+    from gridlytics import alerts
+    client, password, _ = world
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        sid = client.get("/api/fleet", headers=h).json()["sites"][0]["id"]
+        for rules in (client.get("/api/alerts/rules", headers=h).json(), client.get(f"/api/alerts/rules/sites/{sid}", headers=h).json()["rules"]):
+            assert rules and all(r["limits"] == alerts.threshold_limits(c) for c, r in rules.items()), email
+            assert email != "viewer@onyxleaf.demo" or set(rules) == set(alerts.ENERGY_CATEGORIES), email
+        assert client.get("/api/alerts/rules", headers=h).json()["Data"]["limits"]["gap_hours"] == {"default": 1.0, "min": 0.25, "max": 24}, email
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")
