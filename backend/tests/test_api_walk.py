@@ -160,6 +160,32 @@ def test_the_overview_and_fleet_read_alike_for_every_role_in_energy_and_the_grid
     assert len(seen) == 4
 
 
+def test_the_tariff_editor_answers_each_role_by_its_permissions(world):
+    """UX backend ask K32 (plan step 13, Tariffs and the editor): drafting (validate, drafts, a draft's prices) is the administrator's and the
+    analyst's (edit_tariffs); a waiting version's prices are every see_costs reader's; a viewer is refused every one. A draft is its author's: the
+    analyst's list holds the analyst's alone, the administrator's everyone's."""
+    client, password, _ = world
+    draft = {"effective_from": "2026-12-01", "source": {"ref": "walk", "verified": "primary"},
+             "versions": [{"kind": "adder", "key": "fca", "body": {"rate": 1.38, "billing_months": ["2026-12"]}}]}
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    sid = next(s["id"] for s in client.get("/api/fleet", headers=owner).json()["sites"] if s["name"] == "Faisalabad textile mill (demo)")
+    waiting = next(v for v in client.get("/api/tariffs/versions?kind=adder", headers=owner).json() if v["status"] == "pending")
+    for email, drafts, prices in (("owner@onyxleaf.demo", 200, 200), ("operator@onyxleaf.demo", 403, 200), ("analyst@onyxleaf.demo", 200, 200),
+                                  ("viewer@onyxleaf.demo", 403, 403)):
+        h = _login(client, password, email)
+        who = email.split("@")[0]
+        assert client.put(f"/api/tariffs/drafts/api-walk-{who}", headers=h, json=draft).status_code == drafts, email
+        assert client.post("/api/tariffs/versions/validate", headers=h, json=draft).status_code == drafts, email
+        assert client.post("/api/tariffs/preview", headers=h, json={"site_id": sid, "draft": draft, "days": 1}).status_code == drafts, email
+        assert client.post("/api/tariffs/preview", headers=h, json={"site_id": sid, "version_id": waiting["id"], "days": 1}).status_code == prices, email
+        listed = client.get("/api/tariffs/drafts", headers=h)
+        assert listed.status_code == drafts, email
+        if drafts == 200:
+            mine = {d["id"] for d in listed.json()["drafts"]}
+            assert f"api-walk-{who}" in mine and (who == "owner" or mine == {f"api-walk-{who}"}), (email, mine)
+    assert client.get("/api/tariffs", headers=owner).json()["schedule"]["template"] is True
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

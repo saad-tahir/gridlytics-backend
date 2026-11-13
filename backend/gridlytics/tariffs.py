@@ -19,6 +19,8 @@ import json
 import math
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
@@ -191,11 +193,81 @@ def versions(kind: str | None = None) -> list[dict]:
     return [_ver(r) for r in rows]
 
 
+#: The versions priced as if they were approved, inside `what_if` (UX backend ask K32: the tariff editor's week of prices and its bill simulated on a
+#: site under a draft, or under a version waiting for approval). Empty everywhere else: the library is read as it stands
+_WHAT_IF: ContextVar[tuple[dict, ...]] = ContextVar("gridlytics_tariff_what_if", default=())
+
+
+@contextmanager
+def what_if(extra: list[dict]):
+    """Inside the block every lookup (resolve, the day runs, the adders of a billing month, the notices) prices as if `extra` were approved now, in
+    their order, by `approve`'s own rules and with nothing written: each is in force from its start up to the day before the next active version of
+    its kind and key; the version it follows is closed the day before its start, or, with the same start (a correction), in force on no day; and a
+    placeholder awaiting a notification it answers no longer waits. Each is a version as `versions` gives one: id, kind, key, effective_from, body,
+    source, hash, created and by."""
+    token = _WHAT_IF.set(tuple(_WHAT_IF.get()) + tuple(extra))
+    try:
+        yield
+    finally:
+        _WHAT_IF.reset(token)
+
+
+def _what_if_of(kind: str, key: str | None = None) -> list[dict]:
+    return [w for w in _WHAT_IF.get() if w["kind"] == kind and (key is None or w["key"] == key)]
+
+
+def _active_versions(kind: str, key: str | None = None) -> list[dict]:
+    """The active versions of a kind (of one key, or of every key) as approving the what-if versions of that kind would leave them (`what_if`), in
+    the order of their making, a what-if version last. A row whose JSON cannot be read is left out."""
+    _seeded()
+    with store.connect() as con:
+        if key is None:
+            rows = con.execute("SELECT * FROM tariff_versions WHERE kind = ? AND status = 'active' ORDER BY created, rowid", (kind,)).fetchall()
+        else:
+            rows = con.execute("SELECT * FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' ORDER BY created, rowid",
+                               (kind, key)).fetchall()
+    vs: list[dict] = []
+    for r in rows:
+        try:
+            vs.append(_ver(r))
+        except (TypeError, ValueError):
+            continue
+    for w in _what_if_of(kind, key):
+        start = w["effective_from"]
+        day_before = (date.fromisoformat(start) - timedelta(days=1)).isoformat()
+        same = [(i, v) for i, v in enumerate(vs) if v["key"] == w["key"]]
+        before = [(v["effective_from"], i) for i, v in same if v["effective_from"] <= start]
+        if before:
+            i = max(before)[1]
+            prev = vs[i]
+            if prev["effective_from"] == start:
+                del vs[i]                                    # a correction for the same start: the version it corrects is in force on no day
+            elif prev["effective_to"] is None or prev["effective_to"] > day_before:
+                vs[i] = {**prev, "effective_to": day_before}
+        later = [v["effective_from"] for _, v in same if v["effective_from"] > start]
+        end = (date.fromisoformat(min(later)) - timedelta(days=1)).isoformat() if later else None
+        vs.append({**w, "status": "active", "effective_to": end})
+    return vs
+
+
+def _in_force(vs: list[dict], day: str) -> dict | None:
+    """Of versions in the order of their making, the one in force on a day: the latest start not after it, not closed before it, of two with the
+    same start the one made last (resolve's order)."""
+    best = None
+    for i, v in enumerate(vs):
+        if v["effective_from"] <= day and (v["effective_to"] is None or v["effective_to"] >= day):
+            if best is None or (v["effective_from"], i) >= best[:2]:
+                best = (v["effective_from"], i, v)
+    return best[2] if best else None
+
+
 def resolve(kind: str, key: str, on: date | str) -> dict | None:
     """The active version of (kind, key) in force on a date: the latest effective_from not after it and not closed before it (of two with the same
     start, the one created last)."""
     _seeded()
     day = on.isoformat() if isinstance(on, date) else str(on)[:10]
+    if _what_if_of(kind, key):
+        return _in_force(_active_versions(kind, key), day)
     with store.connect() as con:
         r = con.execute("SELECT * FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' AND effective_from <= ? "
                         "AND (effective_to IS NULL OR effective_to >= ?) ORDER BY effective_from DESC, created DESC, rowid DESC LIMIT 1",
@@ -260,6 +332,8 @@ def awaiting_notices(on) -> list[dict]:
     out = []
     for r in rows:
         v = _ver(r)
+        if any(w["effective_from"] >= v["effective_from"] for w in _what_if_of(v["kind"], v["key"])):
+            continue                                        # priced as if approved, a version answering it supersedes it (what_if)
         used = resolve(v["kind"], v["key"], day)
         start = _day_words(date.fromisoformat(v["effective_from"]))
         what = _KIND_WORDS.get(v["kind"], v["kind"])
@@ -311,126 +385,181 @@ def _month_names(months: list[int]) -> str:
     return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
-def validate_body(kind: str, key: str, body, effective_from: str | None = None) -> None:
-    """Refuse (ValueError) a version body the engine could not price with: one approved malformed row would otherwise stop every plan, price and bill."""
+#: The kinds of version the library holds
+KINDS = ("schedule", "tou", "adder", "tax", "icp", "prosumer", "override")
+#: How far a version's source is checked
+VERIFIED = ("primary", "secondary", "unverified")
+#: The tariff editor's step each kind's body is entered on (plan F2.5, decision 10): A what changes (the kind, its key, the start and the source),
+#: B rates and peak windows, C charges and MDI, D export and net billing. A site override's peak windows are B and the rest of it C
+_STEP_OF = {"schedule": "B", "tou": "B", "adder": "C", "tax": "C", "icp": "C", "prosumer": "D", "override": "C"}
+
+
+def step_of(kind: str, path: tuple) -> str:
+    """The editor's step a field is entered on (UX K32): "A" for the kind, key, start and source; the body's by its kind."""
+    if not path or path[0] != "body":
+        return "A"
+    if kind == "override" and len(path) > 1 and path[1] == "calendar":
+        return "B"
+    return _STEP_OF.get(kind, "A")
+
+
+def _collector():
+    """A list of (field path, sentence) and the function that adds to it: one problem a field, the first said of it."""
+    found: list[tuple[tuple, str]] = []
+
+    def add(path: tuple, message: str) -> None:
+        if all(p != path for p, _ in found):
+            found.append((tuple(path), message))
+    return found, add
+
+
+def body_problems(kind: str, key: str, body, effective_from: str | None = None) -> list[tuple[tuple, str]]:
+    """Every problem of a version's key and body that the engine could not price with, each with the field it is about as a path (("key",),
+    ("body", "cards", "B-3", "peak"), ("body", "seasons", 1, "months"), ("effective_from",)), in the order the checks run: one approved malformed row
+    would otherwise stop every plan, price and bill. `validate_body` refuses with the first; the tariff editor's validate route says them all, each
+    tied to its field (UX backend ask K32)."""
+    found, add = _collector()
     if not isinstance(body, dict):
-        raise ValueError("A version's body is a JSON object")
+        add(("body",), "A version's body is a JSON object")
+        return found
     if kind in _KEYS and key not in _KEYS[kind]:
-        raise ValueError(f"A {kind} version's key is one of: {', '.join(_KEYS[kind])}")
+        add(("key",), f"A {kind} version's key is one of: {', '.join(_KEYS[kind])}")
     if "name" in body and not isinstance(body["name"], str):
-        raise ValueError("A version's name is text")
+        add(("body", "name"), "A version's name is text")
     if kind == "schedule":
         cards = body.get("cards")
         if not isinstance(cards, dict) or not cards:
-            raise ValueError("A schedule needs its rate cards: a non-empty map of category to card")
-        for cat, c in cards.items():
-            if not isinstance(c, dict):
-                raise ValueError(f"The card for {cat} is not an object")
-            if c.get("fixed_basis") not in _BASES:
-                raise ValueError(f"The card for {cat} needs fixed_basis: {', '.join(_BASES)}")
-            if not _num(c.get("fixed")) or c["fixed"] < 0:
-                raise ValueError(f"The card for {cat} needs a fixed charge (a number, 0 or more)")
-            if not _num(c.get("floor_share")) or not 0 <= c["floor_share"] <= 1:
-                raise ValueError(f"The card for {cat} needs floor_share between 0 and 1")
-            for f in ("peak", "off_peak", "flat"):
-                if c.get(f) is not None and (not _num(c[f]) or c[f] < 0):
-                    raise ValueError(f"The card for {cat} has a {f} rate that is not a number of 0 or more")
-            if c.get("tou") and c.get("peak") is not None:
-                if not _num(c.get("off_peak")):
-                    raise ValueError(f"The TOU card for {cat} needs peak and off_peak rates")
-            elif not _num(c.get("flat")):
-                raise ValueError(f"The card for {cat} needs a flat rate, or tou with peak and off_peak rates")
+            add(("body", "cards"), "A schedule needs its rate cards: a non-empty map of category to card")
+        else:
+            for cat, c in cards.items():
+                at = ("body", "cards", cat)
+                if not isinstance(c, dict):
+                    add(at, f"The card for {cat} is not an object")
+                    continue
+                if c.get("fixed_basis") not in _BASES:
+                    add((*at, "fixed_basis"), f"The card for {cat} needs fixed_basis: {', '.join(_BASES)}")
+                if not _num(c.get("fixed")) or c["fixed"] < 0:
+                    add((*at, "fixed"), f"The card for {cat} needs a fixed charge (a number, 0 or more)")
+                if not _num(c.get("floor_share")) or not 0 <= c["floor_share"] <= 1:
+                    add((*at, "floor_share"), f"The card for {cat} needs floor_share between 0 and 1")
+                for f in ("peak", "off_peak", "flat"):
+                    if c.get(f) is not None and (not _num(c[f]) or c[f] < 0):
+                        add((*at, f), f"The card for {cat} has a {f} rate that is not a number of 0 or more")
+                if c.get("tou") and c.get("peak") is not None:
+                    if not _num(c.get("off_peak")):
+                        add((*at, "off_peak"), f"The TOU card for {cat} needs peak and off_peak rates")
+                elif not _num(c.get("flat")):
+                    add((*at, "flat"), f"The card for {cat} needs a flat rate, or tou with peak and off_peak rates")
     elif kind == "adder":
         if not _num(body.get("rate")) or abs(body["rate"]) > 100:
-            raise ValueError("An adder needs a rate in Rs/kWh (a number)")
+            add(("body", "rate"), "An adder needs a rate in Rs/kWh (a number)")
         months = body.get("billing_months")
         if months != "all":
             if not isinstance(months, list) or not months or not all(isinstance(m, str) and _YM.match(m) for m in months):
-                raise ValueError('An adder needs billing_months: "all" or a list of billing months as YYYY-MM')
-            if effective_from and effective_from > _month_bounds(min(months))[1]:
-                raise ValueError("An adder's start must fall on or before the end of its first billing month (use the first day of that month); "
-                                 "it is resolved by billing month, so a later start would leave that bill without it")
+                add(("body", "billing_months"), 'An adder needs billing_months: "all" or a list of billing months as YYYY-MM')
+            elif effective_from and effective_from > _month_bounds(min(months))[1]:
+                add(("effective_from",), "An adder's start must fall on or before the end of its first billing month (use the first day of that "
+                                         "month); it is resolved by billing month, so a later start would leave that bill without it")
         exempt = body.get("exempt", [])
         if not isinstance(exempt, list) or not all(isinstance(x, str) for x in exempt):
-            raise ValueError("An adder's exempt is a list of exemptions (for example icp_units, lifeline, prepaid, or a tariff category or class)")
+            add(("body", "exempt"), "An adder's exempt is a list of exemptions (for example icp_units, lifeline, prepaid, or a tariff category or class)")
         rates = body.get("category_rates", {})
         if not isinstance(rates, dict) or not all(isinstance(k, str) and _num(r) and abs(r) <= 100 for k, r in rates.items()):
-            raise ValueError("An adder's category_rates is a map of tariff category or class (for example agricultural) to a rate in Rs/kWh")
+            add(("body", "category_rates"), "An adder's category_rates is a map of tariff category or class (for example agricultural) to a rate in "
+                                             "Rs/kWh")
     elif kind == "tou":
         seasons = body.get("seasons")
         if not isinstance(seasons, list) or not seasons:
-            raise ValueError("A TOU calendar needs seasons, each with months and a peak window")
-        listed: list[int] = []
-        for s in seasons:
-            months = s.get("months") if isinstance(s, dict) else None
-            peak = s.get("peak") if isinstance(s, dict) else None
-            if not isinstance(months, list) or not months or not all(isinstance(m, int) and not isinstance(m, bool) and 1 <= m <= 12 for m in months):
-                raise ValueError("Each TOU season needs months: a list of month numbers 1 to 12")
-            if not isinstance(peak, (list, tuple)) or len(peak) != 2 or not all(isinstance(x, str) and _HHMM.match(x) for x in peak):
-                raise ValueError('Each TOU season needs a peak window: ["HH:MM", "HH:MM"]')
-            if peak[0] == peak[1]:
-                raise ValueError("Each TOU season needs a peak window whose start and end differ")
-            listed += months
-        # peak membership is a function of the month for every month (R9 2.3): a month left out would have no peak at all, one listed twice two windows
-        missing, twice = sorted(set(range(1, 13)) - set(listed)), sorted({m for m in listed if listed.count(m) > 1})
-        if missing:
-            raise ValueError(f"A TOU calendar must give every month one season: {_month_names(missing)} {'has' if len(missing) == 1 else 'have'} none")
-        if twice:
-            raise ValueError(f"A TOU calendar must give every month one season: {_month_names(twice)} {'is' if len(twice) == 1 else 'are'} listed twice")
+            add(("body", "seasons"), "A TOU calendar needs seasons, each with months and a peak window")
+        else:
+            listed: list[int] = []
+            whole = True
+            for i, s in enumerate(seasons):
+                months = s.get("months") if isinstance(s, dict) else None
+                peak = s.get("peak") if isinstance(s, dict) else None
+                if not isinstance(months, list) or not months or not all(isinstance(m, int) and not isinstance(m, bool) and 1 <= m <= 12 for m in months):
+                    add(("body", "seasons", i, "months"), "Each TOU season needs months: a list of month numbers 1 to 12")
+                    whole = False
+                else:
+                    listed += months
+                if not isinstance(peak, (list, tuple)) or len(peak) != 2 or not all(isinstance(x, str) and _HHMM.match(x) for x in peak):
+                    add(("body", "seasons", i, "peak"), 'Each TOU season needs a peak window: ["HH:MM", "HH:MM"]')
+                elif peak[0] == peak[1]:
+                    add(("body", "seasons", i, "peak"), "Each TOU season needs a peak window whose start and end differ")
+            # peak membership is a function of the month for every month (R9 2.3): a month left out would have no peak at all, one listed twice two windows
+            if whole:
+                missing, twice = sorted(set(range(1, 13)) - set(listed)), sorted({m for m in listed if listed.count(m) > 1})
+                if missing:
+                    add(("body", "seasons"), f"A TOU calendar must give every month one season: {_month_names(missing)} "
+                                             f"{'has' if len(missing) == 1 else 'have'} none")
+                if twice:
+                    add(("body", "seasons"), f"A TOU calendar must give every month one season: {_month_names(twice)} "
+                                             f"{'is' if len(twice) == 1 else 'are'} listed twice")
     elif kind == "icp":
         if not _num(body.get("rate")) or body["rate"] < 0:
-            raise ValueError("The ICP needs its rate in Rs/kWh")
+            add(("body", "rate"), "The ICP needs its rate in Rs/kWh")
+        months_ok = True
         for f in ("first_month", "last_month"):
             if not isinstance(body.get(f), str) or not _YM.match(body[f]):
-                raise ValueError(f"The ICP needs {f} as YYYY-MM")
-        if body["first_month"] > body["last_month"]:
-            raise ValueError("The ICP's first month comes before its last")
+                add(("body", f), f"The ICP needs {f} as YYYY-MM")
+                months_ok = False
+        if months_ok and body["first_month"] > body["last_month"]:
+            add(("body", "first_month"), "The ICP's first month comes before its last")
         if not isinstance(body.get("categories"), list) or not all(isinstance(x, str) for x in body["categories"]):
-            raise ValueError("The ICP needs the list of categories it covers")
+            add(("body", "categories"), "The ICP needs the list of categories it covers")
     elif kind == "prosumer":
         if key == "net_billing" and (not _num(body.get("naepp")) or body["naepp"] < 0):
-            raise ValueError("Net billing needs the export price naepp in Rs/kWh")
+            add(("body", "naepp"), "Net billing needs the export price naepp in Rs/kWh")
         sched = body.get("tou_export_schedule")
         if sched is not None and not (isinstance(sched, dict) and all(_num(sched.get(p)) and sched[p] >= 0 for p in ("peak", "off_peak"))):
-            raise ValueError("A TOU export schedule gives the peak and off_peak export prices in Rs/kWh")
+            add(("body", "tou_export_schedule"), "A TOU export schedule gives the peak and off_peak export prices in Rs/kWh")
         if not isinstance(body.get("credit_before_tax", False), bool):
-            raise ValueError("credit_before_tax is true (the export credit comes off the bill before GST) or false (after taxes)")
+            add(("body", "credit_before_tax"), "credit_before_tax is true (the export credit comes off the bill before GST) or false (after taxes)")
         if key == "net_metering_legacy":
             if "nappp" in body and (not _num(body["nappp"]) or body["nappp"] < 0):
-                raise ValueError("Legacy net metering's nappp is the notified national average power purchase price in Rs/kWh")
+                add(("body", "nappp"), "Legacy net metering's nappp is the notified national average power purchase price in Rs/kWh")
             sr = body.get("surplus_rate", "nappp" if "nappp" in body else "off_peak")
             if not (sr in ("nappp", "off_peak", "peak") or (_num(sr) and sr >= 0)):
-                raise ValueError('Legacy net metering\'s surplus_rate is "nappp" (the notified national average power purchase price), "off_peak", '
-                                 '"peak" or a rate in Rs/kWh')
-            if sr == "nappp" and "nappp" not in body:
-                raise ValueError('Legacy net metering\'s surplus_rate "nappp" needs the notified rate: nappp in Rs/kWh')
+                add(("body", "surplus_rate"), 'Legacy net metering\'s surplus_rate is "nappp" (the notified national average power purchase price), '
+                                              '"off_peak", "peak" or a rate in Rs/kWh')
+            elif sr == "nappp" and "nappp" not in body:
+                add(("body", "nappp"), 'Legacy net metering\'s surplus_rate "nappp" needs the notified rate: nappp in Rs/kWh')
             if body.get("netting", "by_period") != "by_period":
-                raise ValueError("Legacy net metering is modelled with by-period netting only (netting: by_period)")
+                add(("body", "netting"), "Legacy net metering is modelled with by-period netting only (netting: by_period)")
     elif kind == "tax":
         for f in ("gst", "further_tax_no_strn"):
             if f in body and (not _num(body[f]) or not 0 <= body[f] < 1):
-                raise ValueError(f"The tax rule {f} is a fraction between 0 and 1")
+                add(("body", f), f"The tax rule {f} is a fraction between 0 and 1")
         ed = body.get("electricity_duty", {})
         if not isinstance(ed, dict) or not all(isinstance(v, dict) and all(_num(x) and 0 <= x < 1 for x in v.values()) for v in ed.values()):
-            raise ValueError("Electricity duty is a map of province to a map of class to a fraction")
+            add(("body", "electricity_duty"), "Electricity duty is a map of province to a map of class to a fraction")
         s235 = body.get("s235", {})
         if not isinstance(s235, dict) or not all(isinstance(v, dict) and all(_num(v.get(f)) for f in ("nil_upto", "mid_rate", "mid_upto", "base_above", "rate_above"))
                                                  for v in s235.values()):
-            raise ValueError("Each s.235 slab needs nil_upto, mid_rate, mid_upto, base_above and rate_above")
+            add(("body", "s235"), "Each s.235 slab needs nil_upto, mid_rate, mid_upto, base_above and rate_above")
         if not isinstance(body.get("ptv", {}), dict) or not all(_num(x) for x in body.get("ptv", {}).values()):
-            raise ValueError("The PTV fee is a map of class to rupees")
+            add(("body", "ptv"), "The PTV fee is a map of class to rupees")
         if "muct_ke" in body and not _num(body["muct_ke"]):
-            raise ValueError("The MUCT fee is a number of rupees")
+            add(("body", "muct_ke"), "The MUCT fee is a number of rupees")
         if "punjab_selfgen_per_kwh" in body and (not _num(body["punjab_selfgen_per_kwh"]) or not 0 <= body["punjab_selfgen_per_kwh"] < 1):
-            raise ValueError("Punjab's per-unit duty is in Rs/kWh (4 paisa is 0.04)")
+            add(("body", "punjab_selfgen_per_kwh"), "Punjab's per-unit duty is in Rs/kWh (4 paisa is 0.04)")
         slabs = body.get("extra_tax_non_atl", [])
         ok = isinstance(slabs, list) and all(isinstance(x, dict) and _num(x.get("rate")) and 0 <= x["rate"] < 1
                                              and (x.get("upto") is None or (_num(x["upto"]) and x["upto"] > 0)) for x in slabs)
         bounds = [x["upto"] for x in slabs if isinstance(x, dict) and x.get("upto") is not None] if ok else []
         if not ok or bounds != sorted(bounds) or any(x.get("upto") is None for x in slabs[:-1]):
-            raise ValueError("The extra tax slabs are a list of {upto (rupees, rising; none on the last), rate (a fraction between 0 and 1)}")
+            add(("body", "extra_tax_non_atl"), "The extra tax slabs are a list of {upto (rupees, rising; none on the last), rate (a fraction between 0 "
+                                               "and 1)}")
     elif kind == "override":
-        _validate_override(body)
+        _override_problems(body, add)
+    return found
+
+
+def validate_body(kind: str, key: str, body, effective_from: str | None = None) -> None:
+    """Refuse (ValueError) a version body the engine could not price with, in the words of its first problem (`body_problems`)."""
+    found = body_problems(kind, key, body, effective_from)
+    if found:
+        raise ValueError(found[0][1])
 
 
 #: What a site override may set (R9 12.6 and 13 step 3): the figures a site's own bill shows that differ from the national objects, and the MDI
@@ -440,46 +569,107 @@ MDI_BLOCKS = ("fixed", "sliding")
 MDI_SCOPES = ("all_hours", "peak")
 
 
-def _validate_override(body: dict) -> None:
+def _override_problems(body: dict, add) -> None:
     extra = sorted(set(body) - {"name", *OVERRIDE_FIELDS})
     if extra:
-        raise ValueError("A site override sets only the electricity duty, adder rates, the peak window calendar, the MDI block mode and the MDI scope "
-                         f"(not {', '.join(extra)})")
+        add(("body",), "A site override sets only the electricity duty, adder rates, the peak window calendar, the MDI block mode and the MDI scope "
+                       f"(not {', '.join(extra)})")
     if not set(body) & set(OVERRIDE_FIELDS):
-        raise ValueError("A site override sets at least one figure the site's bill shows: electricity_duty, adders, calendar, mdi_block or mdi_scope")
+        add(("body",), "A site override sets at least one figure the site's bill shows: electricity_duty, adders, calendar, mdi_block or mdi_scope")
     if "electricity_duty" in body and (not _num(body["electricity_duty"]) or not 0 <= body["electricity_duty"] < 1):
-        raise ValueError("A site override's electricity_duty is a fraction between 0 and 1 (1.5 percent is 0.015)")
+        add(("body", "electricity_duty"), "A site override's electricity_duty is a fraction between 0 and 1 (1.5 percent is 0.015)")
     ads = body.get("adders", {})
     if not isinstance(ads, dict) or not all(isinstance(k, str) and k.strip() and _num(r) and abs(r) <= 100 for k, r in ads.items()):
-        raise ValueError("A site override's adders is a map of adder key (for example dss) to its rate on the site's bill in Rs/kWh")
+        add(("body", "adders"), "A site override's adders is a map of adder key (for example dss) to its rate on the site's bill in Rs/kWh")
     if "calendar" in body:
-        validate_body("tou", "xwdisco", body["calendar"])
+        # the site's own peak windows are a TOU calendar, checked as one
+        for path, message in body_problems("tou", "xwdisco", body["calendar"]):
+            add(("body", "calendar", *path[1:]), message)
     if body.get("mdi_block", "fixed") not in MDI_BLOCKS:
-        raise ValueError("A site override's mdi_block is fixed or sliding (the meter's demand blocks)")
+        add(("body", "mdi_block"), "A site override's mdi_block is fixed or sliding (the meter's demand blocks)")
     if body.get("mdi_scope", "all_hours") not in MDI_SCOPES:
-        raise ValueError("A site override's mdi_scope is all hours (all_hours) or the peak hours only (peak)")
+        add(("body", "mdi_scope"), "A site override's mdi_scope is all hours (all_hours) or the peak hours only (peak)")
 
 
-def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, by: str) -> dict:
-    """A new version from a watcher or a person, pending until an administrator approves it."""
-    if kind not in ("schedule", "tou", "adder", "tax", "icp", "prosumer", "override"):
-        raise ValueError("Unknown tariff kind")
+def override_key_problem(kind: str, key) -> str | None:
+    """A site override's key must be one of this company's grid connections (its site's own bill): the refusal's words, else None."""
+    if kind == "override" and isinstance(key, str) and key.strip() and key not in _sites_by_connection():
+        return "A site override's key is the grid connection it applies to: one of this company's connections"
+    return None
+
+
+def version_problems(kind, key, effective_from, body, source) -> list[tuple[tuple, str]]:
+    """Every problem `propose` refuses a version for, each with its field, in the order propose checks them: the kind, the key, the start, the
+    body and its source, the body by its kind (`body_problems`), and a site override's connection (UX backend ask K32)."""
+    found, add = _collector()
+    if kind not in KINDS:
+        add(("kind",), "Unknown tariff kind")
     if not isinstance(key, str) or not key.strip():
-        raise ValueError("A version needs its key")
-    effective_from = _canonical_day(effective_from)
-    if not isinstance(body, dict) or not isinstance(source, dict) or source.get("verified") not in ("primary", "secondary", "unverified"):
-        raise ValueError("A version carries a body and a source with verified: primary, secondary or unverified")
-    validate_body(kind, key, body, effective_from)
-    if kind == "override" and key not in _sites_by_connection():
-        raise ValueError("A site override's key is the grid connection it applies to: one of this company's connections")
-    _seeded()
+        add(("key",), "A version needs its key")
+    start = None
+    try:
+        start = _canonical_day(effective_from)
+    except ValueError as exc:
+        add(("effective_from",), str(exc))
+    if not isinstance(body, dict) or not isinstance(source, dict) or source.get("verified") not in VERIFIED:
+        add(("body",) if not isinstance(body, dict) else ("source", "verified"),
+            "A version carries a body and a source with verified: primary, secondary or unverified")
+    if kind in KINDS and isinstance(body, dict):
+        for path, message in body_problems(kind, key if isinstance(key, str) else "", body, start):
+            add(path, message)
+    words = override_key_problem(kind, key)
+    if words:
+        add(("key",), words)
+    return found
+
+
+def _insert_version(con, kind: str, key: str, effective_from: str, body: dict, source: dict, by: str, by_id: str) -> str:
     vid = store.new_id()
-    with store.connect() as con:
-        con.execute("INSERT INTO tariff_versions (id, kind, key, effective_from, effective_to, known_from, status, supersedes, body, source, hash, created, by) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (vid, kind, key, effective_from, None, store._now()[:10], "pending", None, json.dumps(body),
-                                                         json.dumps(source), _hash(body), store._now(), by))
-    store.audit(by, "proposed a tariff version", f"{kind}/{key}", {"effective_from": effective_from})
+    con.execute("INSERT INTO tariff_versions (id, kind, key, effective_from, effective_to, known_from, status, supersedes, body, source, hash, created, by, "
+                "by_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (vid, kind, key, effective_from, None, store._now()[:10], "pending", None, json.dumps(body),
+                                                               json.dumps(source), _hash(body), store._now(), by, by_id or ""))
+    store.audit(by, "proposed a tariff version", f"{kind}/{key}", {"effective_from": effective_from}, con=con)
+    return vid
+
+
+def propose(kind: str, key: str, effective_from: str, body: dict, source: dict, by: str, by_id: str = "") -> dict:
+    """A new version from a watcher or a person, pending until an administrator approves it. `by_id` is its author's sign-in id, which a second
+    person's approval and its author's withdrawal are told by (UX K32; '' for a watcher and a row of before)."""
+    found = version_problems(kind, key, effective_from, body, source)
+    if found:
+        raise ValueError(found[0][1])
+    effective_from = _canonical_day(effective_from)
+    _seeded()
+    with store.write_transaction() as con:
+        vid = _insert_version(con, kind, key, effective_from, body, source, by, by_id)
     return next(v for v in versions(kind) if v["id"] == vid)
+
+
+def propose_many(items: list[dict], by: str, by_id: str = "") -> list[dict]:
+    """Several versions proposed together (a tariff draft submitted: one version a kind, the same start and source), all or none: each is checked as
+    `propose` checks one, and they are stored in one write transaction (UX K32). Each item is {kind, key, effective_from, body, source}."""
+    for it in items:
+        found = version_problems(it.get("kind"), it.get("key"), it.get("effective_from"), it.get("body"), it.get("source"))
+        if found:
+            raise ValueError(found[0][1])
+    _seeded()
+    with store.write_transaction() as con:
+        ids = [_insert_version(con, it["kind"], it["key"], _canonical_day(it["effective_from"]), it["body"], it["source"], by, by_id) for it in items]
+    every = {v["id"]: v for v in versions()}
+    return [every[i] for i in ids]
+
+
+def coverage_problem(kind: str, body) -> str | None:
+    """A schedule that leaves a category this company's connections are on without a rate card: approving it is refused
+    (`_check_schedule_covers_connections`), so the editor says so before it is submitted. The refusal's words, else None."""
+    if kind != "schedule" or not isinstance(body, dict) or not isinstance(body.get("cards"), dict) or not body["cards"]:
+        return None
+    with store.connect() as con:
+        try:
+            _check_schedule_covers_connections(con, body["cards"])
+        except ValueError as exc:
+            return str(exc)
+    return None
 
 
 def _check_schedule_covers_connections(con, cards: dict) -> None:
@@ -497,10 +687,21 @@ def _check_schedule_covers_connections(con, cards: dict) -> None:
         raise ValueError(f"The schedule has no rate card for {', '.join(missing)}, which this company's connections are on: add the card(s) before approving")
 
 
-def approve(version_id: str, by: str) -> dict:
+class OwnVersion(ValueError):
+    """The approver is the version's author: a second person approves it (the owner's question Q65, recommended answer; UX K32)."""
+
+
+class NotYours(ValueError):
+    """A person who is neither a version's author nor an administrator asked to withdraw it (UX K32)."""
+
+
+def approve(version_id: str, by: str, by_id: str = "") -> dict:
     """Make a pending version active. The active version of the same key it follows is closed the day before; one with the same start (a correction) is
     superseded outright, and a placeholder awaiting this notification is superseded. A placeholder itself is never approved: the notified version is
-    drafted and approved in its place. The body is checked again before anything changes (the only mutations allowed, logged)."""
+    drafted and approved in its place. The body is checked again before anything changes (the only mutations allowed, logged).
+
+    A second person approves (the owner's question Q65, recommended answer; UX K32): `by_id`, the approver's sign-in id, may not be the author's
+    (`OwnVersion`). A version of a watcher or of before, with no author's id, is approved by any administrator."""
     with store.write_transaction() as con:
         r = con.execute("SELECT * FROM tariff_versions WHERE id = ?", (version_id,)).fetchone()
         if r is None:
@@ -509,6 +710,8 @@ def approve(version_id: str, by: str) -> dict:
             raise ValueError("This version is a placeholder awaiting the notification: draft the notified version and approve that one")
         if r["status"] != "pending":
             raise ValueError("Only a pending version can be approved")
+        if by_id and (r["by_id"] or "") == by_id:
+            raise OwnVersion("A second person approves a tariff version: you drafted this one, so another administrator approves it")
         # a draft stored before starts were checked: a non-canonical start would close the previous version on one day and sort as another
         _canonical_day(r["effective_from"])
         try:
@@ -536,6 +739,25 @@ def approve(version_id: str, by: str) -> dict:
         con.execute("UPDATE tariff_versions SET status = 'active', supersedes = ?, effective_to = ? WHERE id = ?",
                     (prev["id"] if prev else None, end, version_id))
     store.audit(by, "approved a tariff version", f"{r['kind']}/{r['key']}", {"version_id": version_id, "effective_from": r["effective_from"]})
+    return next(v for v in versions(r["kind"]) if v["id"] == version_id)
+
+
+def withdraw(version_id: str, by: str, by_id: str = "", reason: str = "", administrator: bool = False) -> dict:
+    """Take back a version waiting for approval (plan F2.2, F11 item 6; UX K32): its author (by sign-in id), or an administrator, withdraws it. Its
+    status becomes "withdrawn": in force on no day, never counted as waiting, never approved; when, who and why are kept with it and in the audit
+    trail. Raises KeyError for no such version, NotYours for someone else's (not an administrator), ValueError for one not waiting."""
+    with store.write_transaction() as con:
+        r = con.execute("SELECT * FROM tariff_versions WHERE id = ?", (version_id,)).fetchone()
+        if r is None:
+            raise KeyError(version_id)
+        if not administrator and not (by_id and (r["by_id"] or "") == by_id):
+            raise NotYours("Withdrawing a tariff version is for its author or an administrator")
+        if r["status"] != "pending":
+            raise ValueError("Only a version waiting for approval can be withdrawn")
+        con.execute("UPDATE tariff_versions SET status = 'withdrawn', withdrawn_at = ?, withdrawn_by = ?, withdrawn_note = ? WHERE id = ?",
+                    (store._now(), by, reason, version_id))
+        store.audit(by, "withdrew a tariff version", f"{r['kind']}/{r['key']}", {"version_id": version_id, "effective_from": r["effective_from"],
+                                                                                 "reason": reason}, con=con)
     return next(v for v in versions(r["kind"]) if v["id"] == version_id)
 
 
@@ -649,15 +871,21 @@ def adders_for(billing_month: str) -> list[dict]:
     are two keys. A malformed row is skipped rather than failing every bill."""
     _seeded()
     first, last = _month_bounds(billing_month)
-    with store.connect() as con:
-        rows = con.execute("SELECT * FROM tariff_versions WHERE kind = 'adder' AND status = 'active' AND effective_from <= ? "
-                           "ORDER BY key, effective_from, created, rowid", (last,)).fetchall()
+    if _what_if_of("adder"):
+        # sorted by key and start; Python's sort keeps the order of making within them, a what-if version last (UX K32)
+        vs = sorted((v for v in _active_versions("adder") if v["effective_from"] <= last), key=lambda v: (v["key"], v["effective_from"]))
+    else:
+        with store.connect() as con:
+            rows = con.execute("SELECT * FROM tariff_versions WHERE kind = 'adder' AND status = 'active' AND effective_from <= ? "
+                               "ORDER BY key, effective_from, created, rowid", (last,)).fetchall()
+        vs = []
+        for r in rows:
+            try:
+                vs.append(_ver(r))
+            except (TypeError, ValueError):
+                continue
     best: dict[str, dict] = {}
-    for r in rows:
-        try:
-            v = _ver(r)
-        except (TypeError, ValueError):
-            continue
+    for v in vs:
         body = v["body"] if isinstance(v["body"], dict) else {}
         months = body.get("billing_months", [])
         if months == "all":
@@ -986,6 +1214,9 @@ def _tou(card: dict) -> bool:
 def _resolve_days(kind: str, key: str, days: list[date]) -> list[dict | None]:
     """The active version of (kind, key) in force on each day, picked as `resolve` picks it, from one read of the versions."""
     _seeded()
+    if _what_if_of(kind, key):
+        vs = _active_versions(kind, key)
+        return [_in_force(vs, d.isoformat()) for d in days]
     with store.connect() as con:
         rows = con.execute("SELECT * FROM tariff_versions WHERE kind = ? AND key = ? AND status = 'active' "
                            "ORDER BY effective_from DESC, created DESC, rowid DESC", (kind, key)).fetchall()
@@ -1567,7 +1798,11 @@ def _sites_by_connection() -> dict[str, str]:
 
 
 def provenance() -> list[dict]:
-    """Every shipped and added number's source and status, for the tariff page's provenance view."""
+    """Every shipped and added number's source and status, for the tariff page's provenance view: who drafted it (`by`, "shipped" for the build's
+    own; `by_id`, which the routes turn into `mine`), its withdrawal, and `template` (UX K32: a version the build ships from the notified schedules,
+    not one the company drafted or checked)."""
     names = _sites_by_connection()
     return [{"id": v["id"], "kind": v["kind"], "key": v["key"], "effective_from": v["effective_from"], "effective_to": v["effective_to"], "status": v["status"],
-             "name": version_name(v, names), "source": v["source"], "hash": v["hash"]} for v in versions()]
+             "name": version_name(v, names), "source": v["source"], "hash": v["hash"], "by": v.get("by"), "by_id": v.get("by_id") or "",
+             "withdrawn_at": v.get("withdrawn_at"), "withdrawn_by": v.get("withdrawn_by") or "", "withdrawn_note": v.get("withdrawn_note") or "",
+             "template": v.get("by") == "shipped"} for v in versions()]

@@ -181,3 +181,91 @@ class SwitchbackPaint(Strict):
         if v not in (3, 7):
             raise ValueError("A block must be 3 or 7 days long")
         return v
+
+
+# ------------------------------------------------------------------------------------------------ the tariff editor (UX backend ask K32)
+
+from typing import Literal  # noqa: E402
+
+TariffKind = Literal["schedule", "tou", "adder", "tax", "icp", "prosumer", "override"]
+
+
+class TariffDraftSource(Strict):
+    """Where a draft's versions were read (step A): the SRO, NEPRA decision or bill (`ref`), its web address, and how far it is checked."""
+
+    ref: str = Field("", max_length=200)
+    url: str = Field("", max_length=500)
+    verified: Literal["primary", "secondary", "unverified"] | None = None
+
+
+class TariffDraftVersion(Strict):
+    """One version of a draft: its kind, its key (the adder's, the calendar's DISCO group, the regime, or a site override's connection; the
+    national kinds' one key is filled in) and its body as the editor holds it, checked only when the draft is checked or submitted."""
+
+    kind: TariffKind
+    key: str = Field("", max_length=80)
+    body: dict = Field(default_factory=dict)
+
+
+class TariffDraft(Strict):
+    """A tariff draft as the editor saves it (`PUT /api/tariffs/drafts/{id}`) and checks it (`POST /api/tariffs/versions/validate`): its start
+    (YYYY-MM-DD, or empty while drafted), its source, one version a kind it changes (at most seven), and the editor's own state (`editor`: its step,
+    what it started from), kept as sent."""
+
+    effective_from: str = Field("", max_length=10)
+    source: TariffDraftSource = Field(default_factory=TariffDraftSource)
+    versions: list[TariffDraftVersion] = Field(default_factory=list, max_length=7)
+    editor: dict = Field(default_factory=dict)
+
+
+class _WhatIf(Strict):
+    """What a preview prices as if approved: the draft as typed, a saved draft, or a version waiting for approval (exactly one)."""
+
+    draft: TariffDraft | None = None
+    draft_id: str | None = Field(None, max_length=64)
+    version_id: str | None = Field(None, max_length=64)
+
+    @model_validator(mode="after")
+    def _one(self):
+        if sum(x is not None for x in (self.draft, self.draft_id, self.version_id)) != 1:
+            raise ValueError("Send one of draft (the draft as typed), draft_id (a saved draft) or version_id (a version waiting for approval)")
+        return self
+
+
+class TariffPreviewIn(_WhatIf):
+    """`POST /api/tariffs/preview`: a week of 15-minute prices at a site (its plant's connection, or the one named) from `start` (the draft's start
+    by default), under the version in force and under the draft."""
+
+    site_id: str = Field(min_length=1, max_length=64)
+    connection_id: str | None = Field(None, max_length=64)
+    start: str | None = None
+    days: int = Field(7, ge=1, le=7, strict=True)
+
+    @field_validator("start")
+    @classmethod
+    def _start(cls, v):
+        return _iso_day(v, "The first day")
+
+
+class TariffSimulateIn(_WhatIf):
+    """`POST /api/tariffs/simulate`: one of a site's bills (`bill_id`), or a billing month of its readings where none is entered (`month`,
+    YYYY-MM, at its plant's connection or the one named), rebuilt under the version in force and under the draft."""
+
+    site_id: str = Field(min_length=1, max_length=64)
+    bill_id: str | None = Field(None, max_length=64)
+    month: str | None = Field(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    connection_id: str | None = Field(None, max_length=64)
+
+    @model_validator(mode="after")
+    def _bill_or_month(self):
+        if (self.bill_id is None) == (self.month is None):
+            raise ValueError("Send one of bill_id (an entered bill) or month (a billing month, YYYY-MM)")
+        return self
+
+
+class TariffWithdrawIn(Strict):
+    """`POST /api/tariffs/versions/{id}/withdraw`: why (kept with the version and in the audit trail), and whether it goes back to its author as a
+    draft (`redraft`, an administrator's "send back")."""
+
+    reason: str = Field("", max_length=300)
+    redraft: bool = Field(False, strict=True)

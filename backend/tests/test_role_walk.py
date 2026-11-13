@@ -95,6 +95,10 @@ def walk(tmp_path_factory):
     assert r.status_code in (200, 202), r.text           # 202 while a slow solve still runs: its job is read all the same
     jobs_.append(r.json()["job_id"])                    # and a re-solve (round 7, storage-perf): GET /api/sites/{site_id}/jobs/{job_id}
     assert client.put("/api/drafts/walk-draft", headers=h["admin"], json={"name": "Half a site"}).status_code == 200
+    # a tariff draft under the same id (UX K32): GET /api/tariffs/drafts/{draft_id}, whose body holds a rate
+    assert client.put("/api/tariffs/drafts/walk-draft", headers=h["admin"], json={
+        "effective_from": "2026-12-01", "source": {"ref": "walk", "verified": "primary"},
+        "versions": [{"kind": "adder", "key": "fca", "body": {"rate": 1.38, "billing_months": ["2026-12"]}}]}).status_code == 200
     k = client.post("/api/platform/keys", headers=h["admin"], json={"name": "walk", "scopes": ["sites:read", "plans:read"], "site_id": edge_site,
                                                                     "kind": "edge"})
     assert k.status_code == 200, k.text
@@ -456,6 +460,48 @@ def test_a_request_for_access_is_anyones_to_send_and_only_the_founders_to_read(w
     sent = [r for r in got["requests"] if r["email"] == "walk@onyxleaf.demo"]
     assert sorted(r["sent_by"]["role"] for r in sent) == ["admin", "operator", "viewer"]
     assert not {k for _, k, _, _ in _items(got) if isinstance(k, str) and money.is_money(k)} and not any(RUPEES.search(s) for s in _strings(got))
+
+
+def test_the_tariff_editor_reaches_no_viewer_and_no_key_and_names_its_rupees_as_money(walk):
+    """UX backend ask K32 (plan F11 item 6): the editor's routes need see_costs at least (rates are money, R8 2.3), drafting needs edit_tariffs; a
+    viewer and a machine key are refused every one, an operator reads a waiting version's prices but drafts nothing. The administrator's week of
+    prices and simulated bill carry every rupee under a money name, so the API's filter would leave a reader without see_costs none of them."""
+    from gridlytics import money
+    client, h = walk["client"], walk["headers"]
+    sid = next(s["id"] for s in client.get("/api/fleet", headers=h["admin"]).json()["sites"] if s["name"] == "Faisalabad textile mill (demo)")
+    waiting = next(v for v in client.get("/api/tariffs/versions?kind=adder", headers=h["admin"]).json() if v["status"] == "pending")
+    draft = {"effective_from": "2026-11-01", "source": {"ref": "walk", "verified": "primary"},
+             "versions": [{"kind": "adder", "key": "fca", "body": {"rate": 3.1, "billing_months": ["2026-11"]}}]}
+    # the demo's sample bill (the mall's): rebuilt under the draft
+    bill = next(b for s in walk["sites"] for b in client.get(f"/api/sites/{s}/bills", headers=h["admin"]).json())
+    calls = {"validate": ("POST", "/api/tariffs/versions/validate", draft), "drafts": ("GET", "/api/tariffs/drafts", None),
+             "draft": ("GET", "/api/tariffs/drafts/walk-draft", None), "save": ("PUT", "/api/tariffs/drafts/walk-k32", draft),
+             "preview": ("POST", "/api/tariffs/preview", {"site_id": sid, "version_id": waiting["id"], "days": 1}),
+             "preview_draft": ("POST", "/api/tariffs/preview", {"site_id": sid, "draft": draft, "days": 1}),
+             "simulate": ("POST", "/api/tariffs/simulate", {"site_id": bill["site_id"], "bill_id": bill["id"], "draft": draft}),
+             "withdraw": ("POST", f"/api/tariffs/versions/{waiting['id']}/withdraw", {"reason": "walk"})}
+    allowed = {"admin": set(calls) - {"withdraw"}, "operator": {"preview"}, "viewer": set(), "key": set()}
+    answers = {}
+    for reader in READERS:
+        for name, (method, url, body) in calls.items():
+            if name == "withdraw":
+                continue                                        # tested on its own: it changes the version the others read
+            r = client.request(method, url, json=body, headers=h[reader])
+            want = 200 if name in allowed[reader] else 403
+            assert r.status_code == want, (reader, name, r.status_code, r.text[:200])
+            if r.status_code == 200:
+                answers[(reader, name)] = r.json()
+            else:
+                assert not any(RUPEES.search(s) for s in _strings(r.json())), (reader, name)
+    for (reader, name), body in answers.items():
+        if name in ("preview", "preview_draft", "simulate"):
+            assert {"c_imp", "c_exp", "rates", "bill"} & {k for _, k, _, _ in _items(body) if isinstance(k, str) and money.is_money(k)}, name
+            kept = money.for_key(body)
+            assert not (_numbers(body, money_only=True) - _numbers(body, money_only=False)) & _numbers(kept), (reader, name)
+    assert answers[("operator", "preview")]["in_force"]["c_imp"] == answers[("admin", "preview")]["in_force"]["c_imp"]
+    # a viewer and a key never withdraw; the shipped waiting version has no author, so only an administrator does
+    for reader in ("viewer", "key", "operator"):
+        assert client.post(calls["withdraw"][1], json={}, headers=h[reader]).status_code == 403, reader
 
 
 def test_answers_that_are_files_pass_unchanged(walk):

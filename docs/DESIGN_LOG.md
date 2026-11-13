@@ -367,6 +367,61 @@ were each worked out by two copies of one rule; each is one rule now, with a tes
   - At a site on a flat tariff (no time-of-use window) the peak-window import reads 0 kWh, today's as before and This month's alike, since its peak
     mask holds no minute; the page may want its swap tile there.
 
+### Batch k5: K32 (13 Nov 2026)
+
+The tariff editor's backend (plan F11 item 6, F2.1, F2.2, F2.5; step 13): the validate route and the drafts first, then the previews, the
+withdrawal, the template flag and the agreement's end. One schema change: version 8 of a company's file (`store._V8`, `_V8_COLUMNS`), copied to
+`backup/` before it is made, as every migration of the file is (`store._connect`); `test_ux_k32_tariff_editor` holds the copy and the migration.
+
+- **Validate per kind** (`POST /api/tariffs/versions/validate`, HANDOFF's "per-kind body schemas or a validate endpoint"): the library's checks
+  are one collector now, `tariffs.body_problems`, which lists every problem with its field (`("body", "cards", "B-3", "peak")`); `validate_body`,
+  `propose` (`version_problems`) and approval refuse with its first, in the words they used before, so the raw route, approval and the editor
+  cannot disagree. The editor's draft adds what the editor asks and the raw route never did: the source reference is required (plan F2.5.1), a web
+  address is http or https, a kind and key are ticked once, and a schedule must keep a card for every category the company's connections are on
+  (approving one without is refused, so it is said before it is submitted). Each problem names the editor's step (A to D, decision 10) and its
+  version. The answer also sets each version beside the one in force on its start with what it changes, field by field with a percent for a number,
+  so Review's WHAT CHANGED and step B's RATES AGAINST THE VERSION IN FORCE need no arithmetic in the browser (HANDOFF's "and a diff").
+- **Drafts in a table of their own** (`tariff_drafts`), not a status of `tariff_versions` as F11 item 6's wording has it. A draft is the editor's
+  whole work: one version a kind, partial bodies while typed, its start and source, and the editor's state. A half-typed body in `tariff_versions`
+  would sit one status filter away from every lookup, and the shipped library's seeding (`tariffs._shipped_todo`) reads every row there by its
+  start, so a draft at a shipped start would stop a newer build's shipped version reaching the company. The plan's intent holds: saved by its
+  author as they type (`PUT /api/tariffs/drafts/{id}`, an id the editor chooses, as a site draft's), seen by its author and by administrators,
+  never counted in `pending`, answered with `status: "draft"`. Its author is their sign-in id, as a site draft's (round 3's rule). Saving is not
+  audited (as a site draft's is not: the versions it becomes are); discarding is, since an administrator may discard another person's. Only the
+  author writes or submits a draft; an administrator resuming someone else's saves it under an id of their own (409 `draft_taken` otherwise).
+- **Submit**: every version waits for approval, all or none (`tariffs.propose_many`, one write transaction, each audited "proposed a tariff
+  version"); the draft is then gone. The stored source is the raw-JSON dialog's shape (`kind manual`, `ref`, `url`, `retrieved_on` the day
+  submitted, `verified`).
+- **Owner's question Q65** ("Publish now" by an administrator, or a second person approves): the recommended answer ships, "What changes" first
+  and **a second person approves**. There is no publish route, and approval refuses a version's own author (403 `own_version`): a tariff version
+  now keeps its author's sign-in id (`tariff_versions.by_id`). A version with no author's id (the build's, a watcher's, one made before) is
+  approved by any administrator, as before. This changes the approve route: an administrator who drafts can no longer approve their own; in a
+  company with one administrator, the analyst drafts and the administrator approves, or a second administrator is added. Left for the owner if a
+  one-administrator company must publish alone.
+- **Preview and simulate price the draft as if approved** (`tariffs.what_if`): inside the block every lookup (`resolve`, the day runs, the adders
+  of a billing month, the notices) reads the library as approving the draft would leave it, by `approve`'s own rules, and nothing is written; the
+  lookups are unchanged outside it (the overlay is read only when a draft of that kind and key is in it). So the week's prices are the optimiser's
+  own vectors (`tariffs.vectors`, as `GET /sites/:id/prices`, with the billing month's imports for the ICP case) and the simulated bill is the
+  Bills page's own rebuild (`verify.rebuild_bill`, with the bill's period, printed power factor and the credit the bill before carried): for an
+  entered bill, the version in force's figure is the stored rebuild's (tested), and a draft's figure is what approving it gives (tested against the
+  prices after a real approval). A draft must pass every check to be priced; a version waiting for approval is priced by any `see_costs` reader
+  (the Versions drawer's "Simulate on a site"), a draft only by `edit_tariffs`. `simulate` takes a billing month of readings where no bill is
+  entered, only once that month's reading day has passed; `reaches` says whether any of the draft's versions priced a day of the bill.
+- **Withdraw** (`POST /api/tariffs/versions/{id}/withdraw`): a waiting version, by its author or an administrator, status "withdrawn" with when,
+  by whom and why (`withdrawn_at`, `withdrawn_by`, `withdrawn_note`), audited; never in force, never waiting, never approved. `redraft` makes a
+  draft of it for its author: H6.8's "send back" (`approve_tariff`), which F11 did not list, as an administrator's withdrawal.
+- **The template flag**: a version the build ships (`by` "shipped") is `template` in every version row and in `/api/tariffs`' `schedule`. The
+  mark goes once the company's own version is in force; a bill entered and rebuilt within 2 % does not clear it (F11 asks only the shipped flag).
+- **The agreement's end** (R8 2.3): the Tariff alert `regime_expiring_<connection>` was already raised `agreement_days` (60 by default) before an
+  agreement ends (round 7, pages-D-16); `/api/tariffs`' agreements add `ends_in_days` over the same window from the day shown, read from the
+  site's own rules, so "Ends in 45 days" and the alert agree (tested at 0, 45, 60 and 61 days and with a site's window of 90). No state value was
+  added: the page's existing states stay as they are. Owner's question Q69 (agreements under In force): the recommended yes; the answer already
+  carries them on the day shown.
+- **Money**: every route of the editor needs `see_costs` at least and drafting `edit_tariffs` (a viewer and a machine key are refused each one); the
+  rupee figures carry money names all the same (`c_imp`, `c_exp`, `rates`, `bill`, `*_rs`, `*_rs_per_kwh`), and the role walk proves the filter
+  would keep none of them. A draft's and a version's bodies hold rates under `body`, as the library's answers always have, behind those
+  permissions.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in
