@@ -3,7 +3,8 @@ by one function that the Savings page's answer (verify.summary) and the monthly 
 
 - per day: the native arm's peak-window import (`peak_import_kwh_native`) and the plan in force at the day's start (`plan_id`); the capture version
   each day was replayed on was answered before (`native_capture_version`, and the page's `native_captures`);
-- per baseline: `peak_import_kwh_avoided` (energy, every reader) over `peak_import_days`, `fuel_saved` in `fuel_unit` (litres of diesel, MMBtu of gas),
+- per baseline: `peak_import_kwh_avoided` (energy, every reader) over `peak_import_days`, `fuel_saved` in `fuel_unit` (litres of diesel, MMBtu of gas)
+  over `fuel_days` (both on the claim's days, K13's rule: the review of batches k7 and k8),
   `taxes_recovered_rs` on the claim (money: a viewer's answer has none), and for the tuned baseline its table's rows (`rule_table`);
 - the tariff notices the period reaches (`tariff_notices`), and Preliminary by the screen's rule and by the report's (`preliminary_rules`; the owner's
   question Q60, plan F0.1 decision 15).
@@ -88,26 +89,33 @@ def test_the_savings_page_and_fleet_say_one_peak_window_figure_for_the_month(wor
     row = next(r for r in w.c["admin"].get("/api/fleet").json()["sites"] if r["id"] == w.site)
     page = w.c["admin"].get(f"/api/sites/{w.site}/savings", params={"start": "2026-11-01", "end": "2026-11-04"}).json()
     assert row["mtd_peak_kwh_avoided"] == page["baselines"]["native"]["peak_import_kwh_avoided"] == 520.0
+    # the diesel avoided too (review of batches k7 and k8): Fleet's month figure and the Savings tile are 15 L over the 2 claiming days, never the
+    # not-applied day's 2 L of replay nor the withheld day's
+    assert row["mtd_litres_saved"] == page["baselines"]["native"]["fuel_saved"] == 15.0
+    assert page["baselines"]["native"]["fuel_days"] == 2
     viewer = w.c["viewer"].get(f"/api/sites/{w.site}/savings", params={"start": "2026-11-01", "end": "2026-11-04"}).json()
     assert viewer["baselines"]["native"]["peak_import_kwh_avoided"] == 520.0
+    assert viewer["baselines"]["native"]["fuel_saved"] == 15.0
 
 
 def test_a_period_with_no_day_to_count_answers_no_figure_never_a_zero(company):
     """K27 check (K12's rule, "null without its data, never a zero"): a grid site with a genset before its first scored day answers no peak-window
-    figure, no fuel saved and no taxes recovered; a period whose days claim nothing answers no peak-window figure and no taxes, while its fuel saved
-    (every scored day's, as `litres_saved`) is a figure."""
+    figure, no fuel saved and no taxes recovered; a period whose days claim nothing answers none of the three either: the fuel the replays saved
+    on days the plan did not run is the replay's, as their peak-window import is (K13's rule; review of batches k7 and k8: the fuel saved counted
+    every scored day, 17 L here, while the peak-window figure beside it counted none)."""
     sid = make_site(name="K27 empty")
     nat = verify.summary(sid, "2026-11-01", "2026-11-04")["baselines"]["native"]
-    assert (nat["peak_import_kwh_avoided"], nat["peak_import_days"], nat["fuel_saved"], nat["taxes_recovered_rs"]) == (None, 0, None, None)
+    assert (nat["peak_import_kwh_avoided"], nat["peak_import_days"], nat["fuel_saved"], nat["fuel_days"], nat["taxes_recovered_rs"]) == \
+        (None, 0, None, 0, None)
     assert nat["fuel_unit"] == "L"
     rows = _rows()
     rows = {d: {b: {**r, "fidelity": "not_applied", "claimed_rs": 0.0} for b, r in by.items()} for d, by in rows.items() if d != "2026-11-04"}
     _put_rows(sid, rows)
     nat = verify.summary(sid, "2026-11-01", "2026-11-04")["baselines"]["native"]
-    assert nat["claiming_days"] == 0
+    assert nat["claiming_days"] == 0 and nat["litres_saved"] == 17.0                  # the ledger's every scored day, as before
     assert (nat["peak_import_kwh_avoided"], nat["peak_import_days"], nat["taxes_recovered_rs"]) == (None, 0, None)
-    assert nat["fuel_saved"] == 17.0
-    assert verify.fuel_saved({"litres_saved": 0.0, "genset_unknown_days": 0}, 0, True) is None
+    assert (nat["fuel_saved"], nat["fuel_days"]) == (None, 0)
+    assert verify.fuel_saved([], True) == (None, 0)
 
 
 def test_the_taxes_recovered_are_negative_where_the_claim_s_grid_levers_are_golden(company):
@@ -143,22 +151,31 @@ def test_the_taxes_recovered_on_the_claim_are_the_recovered_share_of_its_grid_le
     assert verify.summary(off, "2026-11-01", "2026-11-04")["baselines"]["native"]["peak_import_kwh_avoided"] is None
 
 
-def test_the_fuel_saved_is_in_the_genset_s_own_unit_and_none_where_it_was_never_metered(company):
-    """17 L of diesel saved (10 + 5 + 2 + 0); a captive-gas genset's figure is the same number of MMBtu; a site without a genset has none; a genset
-    unmetered on every scored day has no figure, never 0."""
+def test_the_fuel_saved_counts_the_days_that_claim_in_the_genset_s_own_unit(company):
+    """Golden: 15 L of diesel saved over the 2 claiming days (10 + 5), the figure Fleet's month says (K13's rule, verify.claimed_energy): the
+    not-applied day's 2 L are its replay's, and the withheld day claims nothing (review of batches k7 and k8: the tile counted every scored day,
+    17 L, beside a peak-window figure of the claiming days alone). `litres_saved`, the ledger's figure of every scored day, is unchanged. A
+    captive-gas genset's figure is the same number of MMBtu; a site without a genset has none; claiming days whose fuel was never known give no
+    figure ("not metered" while `claiming_days` is above 0), never 0."""
     sid = make_site(name="K27 diesel")
     _put_rows(sid, _rows())
     nat = verify.summary(sid, "2026-11-01", "2026-11-04")["baselines"]["native"]
-    assert (nat["fuel_saved"], nat["fuel_unit"]) == (17.0, "L") and nat["litres_saved"] == 17.0
+    assert (nat["fuel_saved"], nat["fuel_days"], nat["fuel_unit"]) == (15.0, 2, "L") and nat["litres_saved"] == 17.0
+    tun = verify.summary(sid, "2026-11-01", "2026-11-04")["baselines"]["tuned"]
+    assert (tun["fuel_saved"], tun["fuel_days"]) == (15.0, 2)
     gas = make_site(name="K27 gas", genset={"rated_kw": 200, "f_min": 0.3, "fuel_kind": "gas_captive", "min_up_h": 1.0})
     _put_rows(gas, _rows())
-    assert verify.summary(gas, "2026-11-01", "2026-11-04")["baselines"]["native"]["fuel_unit"] == "MMBtu"
+    nat = verify.summary(gas, "2026-11-01", "2026-11-04")["baselines"]["native"]
+    assert (nat["fuel_saved"], nat["fuel_unit"]) == (15.0, "MMBtu")
     none = make_site(name="K27 no genset", genset=False)
     _put_rows(none, _rows())
     nat = verify.summary(none, "2026-11-01", "2026-11-04")["baselines"]["native"]
-    assert nat["fuel_saved"] is None and nat["fuel_unit"] is None
-    assert verify.fuel_saved({"litres_saved": 0.0, "genset_unknown_days": 4}, 4, True) is None
-    assert verify.fuel_saved({"litres_saved": 3.25, "genset_unknown_days": 1}, 4, True) == 3.2
+    assert (nat["fuel_saved"], nat["fuel_days"], nat["fuel_unit"]) == (None, 0, None)
+    # a claiming day whose fuel is unknown (litres None) adds nothing; every claiming day unknown is no figure
+    unknown = _day(800.0, {"peak_window": 800.0}, litres=None, genset_unknown=True)
+    assert verify.fuel_saved([unknown, unknown], True) == (None, 0)
+    assert verify.fuel_saved([unknown, _day(1.0, {"peak_window": 1.0}, litres=3.25)], True) == (3.2, 1)
+    assert verify.fuel_saved([_day(1.0, {"peak_window": 1.0}, litres=3.25)], False) == (None, 0)
 
 
 def test_each_day_names_the_plan_in_force_at_its_start(company):
@@ -237,7 +254,7 @@ def test_a_viewer_reads_every_energy_addition_and_no_taxes(world):
     assert admin["baselines"]["native"]["taxes_recovered_rs"] == pytest.approx(310.70, abs=0.005)
     for base in ("native", "tuned"):
         assert "taxes_recovered_rs" not in viewer["baselines"][base]
-        for k in ("peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_unit"):
+        for k in ("peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_days", "fuel_unit"):
             assert viewer["baselines"][base][k] == admin["baselines"][base][k], (base, k)
     assert viewer["baselines"]["tuned"]["rule_table"] == TUNED_TABLE
     assert [d["plan_id"] for d in viewer["days"]] == [d["plan_id"] for d in admin["days"]]
@@ -251,9 +268,9 @@ def test_the_monthly_statement_says_the_page_s_figures_by_the_same_functions(wor
     from gridlytics import reports
     sid, month = world.site, _past_month()
     d1 = f"{month}-03"
-    native = _baseline(peak_import_kwh_avoided=570.0, peak_import_days=3, taxes_recovered_rs=310.7)
+    native = _baseline(peak_import_kwh_avoided=570.0, peak_import_days=3, taxes_recovered_rs=310.7, litres_saved=17.0, fuel_saved=15.0)
     tuned = _baseline(saving_rs=800.0, claimed_rs=780.0, perfect_foresight_rs=None, peak_import_kwh_avoided=120.0, peak_import_days=3,
-                      taxes_recovered_rs=155.35)
+                      taxes_recovered_rs=155.35, litres_saved=9.0, fuel_saved=7.5)
     notice = {"kind": "schedule", "key": "national", "version_id": "v", "effective_from": f"{month}-01", "name": "x", "in_use": None,
               "message": "The uniform schedule due from 1 Jan 2027 is awaiting its notification: prices from that day still use the one in force."}
     _with_summary(monkeypatch, _fake_summary(month, [_day_row(d1)], native=native, tuned=tuned, tariff_notices=[notice]), [_tday(d1)])
@@ -263,4 +280,22 @@ def test_the_monthly_statement_says_the_page_s_figures_by_the_same_functions(wor
     text = built[-1]
     assert "Peak-window import avoided | 570 kWh | 120 kWh" in text, text
     assert "Taxes you recover (not part of the saving) | Rs 311 | Rs 155" in text, text
+    # the fuel saved is the page's tile, the claim's days (review of batches k7 and k8), not the ledger's every scored day
+    assert "Diesel saved (Estimated) | 15.0 L | 7.5 L" in text and "17.0 L" not in text, text
     assert notice["message"] in text
+
+
+def test_the_monthly_statement_says_no_fuel_figure_without_a_claiming_day_and_not_metered_with_one(world, monkeypatch):
+    """The statement's fuel row and its key figure read the summary's `fuel_saved` as the page does: "-" with no claiming day (nothing claimed, so
+    no fuel saved is said, never the replay's litres), "not metered" where days claim and the fuel was known on none of them."""
+    from gridlytics import reports
+    sid, month = world.site, _past_month()
+    d1 = f"{month}-03"
+    for native, want in ((_baseline(claiming_days=0, litres_saved=17.0, fuel_saved=None, fuel_days=0), "Diesel saved (Estimated) | - |"),
+                         (_baseline(claiming_days=2, litres_saved=0.0, fuel_saved=None, fuel_days=0), "Diesel saved (Estimated) | not metered |")):
+        _with_summary(monkeypatch, _fake_summary(month, [_day_row(d1)], native=native, tuned=native), [_tday(d1)])
+        built = _story(monkeypatch)
+        with world.use():
+            reports.generate("monthly_savings", sid, month, "test")
+        text = built[-1]
+        assert want in text and "17.0 L" not in text, text

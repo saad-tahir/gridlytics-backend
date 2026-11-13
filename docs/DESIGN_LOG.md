@@ -866,6 +866,47 @@ K23, K26, K27 check" commits). What changed:
   `detail` to that day, so a run of missed days lists as one row. The plan reads the list from the alerts ("what the server already records"), and
   this is in the contract; a per-day source (each scored day's bust and hours, stored by the nightly job) is a later item if the owner wants it.
 
+### Batches k7 and k8, the senior review (13 Nov 2026)
+
+The review of K8, K15, K16, K33, K34 and K35 (k7) and K20, K21, K23, K26 and K27 (k8) with their checks ("UX K review" commits). Both suites
+passed on the batches as committed (backend 1858 passed, 9 skipped, 1 xfailed; web gates: typecheck, 196 files and 1286 tests, build). One
+defect was found and fixed, with tests that fail without the fix (`test_ux_k27_savings_summary`); the Savings answer gains one key (`fuel_days`).
+After the fix both pass again (backend 1859 passed, 9 skipped, 1 xfailed; web gates as before).
+
+- **The diesel avoided is counted on the days that claim, as the peak-window import beside it** (K27, medium). The batch k8 check moved
+  `peak_import_kwh_avoided` onto K13's rule (the claiming days, `verify.claimed_energy`) and left `fuel_saved` as `litres_saved`, every scored day
+  whose fuel is known, for the owner. That left one month with two diesel figures, Fleet's and the Overview's `mtd_litres_saved` (15 L on the K27
+  test's days) against the Savings tile (17 L: the not-applied day's 2 L of replay counted), and the Savings page's two energy tiles, and the
+  viewer's sentence that stands in for the claim ("moved 9,840 kWh out of the peak window and avoided 1,260 L of diesel ... on 27 verified days"),
+  on two sets of days: the kWh on the claim's days, the litres on every scored day. K13's settled rule names both figures ("the energy a day
+  claims ... never the replay's noise", for `peak_kwh_avoided` and `litres_saved` alike), so the check's own reason for moving the peak figure
+  holds for the fuel: `verify.fuel_saved` now sums the claiming days whose fuel is known (`claimed_energy`), with the days it counts
+  (`fuel_days`), the figure Fleet's month says. **A settled rule against the plan's wording:** F1.1.4 names `litres_saved` as the Diesel tile's
+  source; K13's rule wins, as it did for the peak figure. `litres_saved` itself is unchanged: the ledger's figure of every scored day, beside
+  `saving_rs`, and the company roll-up's (PDF row, CSV and total), which reads it beside the savings of all days.
+  - null without a genset; with no claiming day ("-": nothing claimed, so no fuel is said, as the peak figure); with claiming days whose fuel was
+    known on none of them ("not metered"). The page tells the last two apart by `claiming_days`.
+  - The monthly statement's fuel row and its key figure ("... saved against the native settings on the days that claim (Estimated)") read
+    `fuel_saved` (`reports._fuel_saved`), one function with the page, as K27 meant; the round-7 statement read `litres_saved` there. The test
+    helpers' fake baseline (`test_fix_r7_alerts_reports._baseline`) gives `fuel_saved` the value of `litres_saved` (a month whose scored days all
+    claim), and the never-metered test's withheld days claim nothing ("-", the note still says "not metered on 2 of 2 days").
+- **Checked and found right, no change:** every new answer's rupees are under money names (`taxes_recovered_rs`; the preview, the rules' limits,
+  the edge's key, the stage progress, the daily energy, the tuned table and the tariff notices hold none), and the role walk shows the viewer and
+  a key refused the preview, both audit trails and the export with no rupee in the refusal, the taxes stripped for both, `last_backup` given to
+  the administrator alone and the notification kinds per role; each new route checks its permission before its body (the preview, the founder's
+  trail with its session), and another company's site is 404 on every site route (the edge, the preview, a past issue, the savings), a site filter
+  of another company's site lists nothing; platform.db schema 5 is the next free number, made after `platform._connect`'s copy to `backup/`, with
+  its migration test, the rename chain and a name held by two companies included; every new time a person reads is Karachi time (the key's
+  `made_at`, `last_backup`, both trails' `at`, the preview's minutes, the daily energy's spans, a refusal's "14:15 on 12 Nov 2026"); the contract
+  and the types match the answers; no banned word or American spelling in the added text.
+- **Left for the owner, not changed:**
+  - The company roll-up's fuel (`litres_saved`, every scored day) and Fleet's month figure (`mtd_litres_saved`, the claiming days) still differ for
+    a month with days that claim nothing, as they did before this lane: the roll-up says its fuel beside the savings of all days. Aligning it
+    changes a document's figure and its CSV column, which is the owner's call.
+  - The run of missed forecasts read as one alert (K26), and `exact` after a refresh in the plan's own quarter (K20), as the check recorded.
+  - Searching the trails' detail text does not match non-ASCII words (the detail is stored as ASCII-escaped JSON), and SQLite's `lower()` folds
+    ASCII letters only, so a search for "ö" does not find "Ö" in a name; Urdu, which has no case, and site names (matched in Python) are found.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

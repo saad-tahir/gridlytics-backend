@@ -725,7 +725,7 @@ def test_the_savings_additions_reach_a_viewer_in_energy_and_the_taxes_do_not(wal
     by both rules reach the viewer as the administrator reads them."""
     from gridlytics import money
     assert money.is_money("taxes_recovered_rs")
-    energy = ("peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_unit")
+    energy = ("peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_days", "fuel_unit")
     for url, got in walk["answers"]["/api/sites/{site_id}/savings"].items():
         admin, viewer = got["admin"][1], got["viewer"][1]
         for base in ("native", "tuned"):

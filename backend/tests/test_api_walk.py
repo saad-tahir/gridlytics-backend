@@ -409,7 +409,7 @@ def test_the_savings_summary_additions_answer_every_role(world):
             assert set(s["preliminary_rules"]) == {"screen", "report"} and isinstance(s["tariff_notices"], list), (email, row["name"])
             for base in ("native", "tuned"):
                 b = s["baselines"][base]
-                assert {"peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_unit"} <= set(b), (email, base)
+                assert {"peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_days", "fuel_unit"} <= set(b), (email, base)
                 assert ("taxes_recovered_rs" in b) == (not email.startswith("viewer")), (email, base)
             assert "rule_table" in s["baselines"]["tuned"]
             assert all("plan_id" in d and "peak_import_kwh_native" in d for d in s["days"]), (email, row["name"])

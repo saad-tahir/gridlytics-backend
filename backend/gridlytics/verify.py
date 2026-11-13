@@ -2145,16 +2145,24 @@ def peak_import_avoided(rows: list[dict]) -> tuple[float, int]:
     return round(total, 1), n
 
 
-def fuel_saved(b: dict, scored: int, has_genset: bool) -> float | None:
-    """The fuel a baseline's ledger saved (its `litres_saved`, every scored day whose fuel is known, the figure the plan's Diesel tile names), in the
-    genset's own unit (`fuel_unit`: litres of diesel, MMBtu of gas): None without a genset, with no scored day, or where its fuel was unknown on every
-    scored day (the sum of none is no figure, never 0); the Savings page's tile and the report's "Diesel saved" (plan F11 item 1, sf-01)."""
-    if not has_genset or scored <= 0:
-        return None
-    unmetered = int(b.get("genset_unknown_days") or 0)
-    if b.get("litres_saved") is None or unmetered >= scored:
-        return None
-    return round(float(b["litres_saved"]), 1)
+def fuel_saved(rows: list[dict], has_genset: bool) -> tuple[float | None, int]:
+    """The fuel a baseline would have burnt less what was burnt, in the genset's own unit (`fuel_unit`: litres of diesel, MMBtu of gas), over a
+    baseline's day rows that claim and whose fuel is known (claimed_energy, K13's rule: the energy the claim rests on), and the days counted (plan
+    F11 item 1, sf-01: the tile "Diesel avoided" or "Gas avoided", the statement's "Diesel saved"). Fleet's and the Overview's month figure
+    (`mtd_litres_saved`) is the same sum, so the pages say one figure for one month, and the tile counts the days the peak-window tile beside it
+    counts (review of batches k7 and k8: it was `litres_saved`, every scored day, so a not-applied day's replay was said as diesel avoided). None
+    without a genset, with no such day: no claiming day, or none whose fuel is known ("not metered"); the sum of none is no figure, never 0. The
+    ledger's `litres_saved` (every scored day, beside `saving_rs`) is unchanged."""
+    if not has_genset:
+        return None, 0
+    total, n = 0.0, 0
+    for d in rows:
+        got = claimed_energy(d, False, True)
+        if got is None or got[1] is None:
+            continue
+        total += got[1]
+        n += 1
+    return (round(total, 1) if n else None), n
 
 
 def taxes_recovered(conn: dict | None, claimed: list[tuple[str, dict, float]]) -> float | None:
@@ -2502,8 +2510,9 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
 
 def _k27_figures(site_id: str, out: dict, days: dict[str, dict], d0: str, d1: str, conn0: dict | None, mdi_share) -> None:
     """The summary's additions of UX backend ask K27 (plan F11 item 1), each figure by its own function above: per day the native arm's peak-window
-    import and the plan in force at the day's start; per baseline the peak-window import avoided, the fuel saved in its unit and the taxes recovered
-    on the claim, and for the tuned baseline its table's rows; the tariff notices the period reaches."""
+    import and the plan in force at the day's start; per baseline the peak-window import avoided and the fuel saved in its unit, both on the claim's
+    days, with the days each counts, and the taxes recovered on the claim, and for the tuned baseline its table's rows; the tariff notices the period
+    reaches."""
     at_start = savings_export.plan_at_start(site_id, d0, d1) if days else {}
     for entry in out["days"]:
         n = days[entry["day"]].get("native") or {}
@@ -2518,7 +2527,7 @@ def _k27_figures(site_id: str, out: dict, days: dict[str, dict], d0: str, d1: st
         # null off-grid and with no day counted (no claiming day carries the figure), never a zero (K12's rule; UX K27 check)
         b["peak_import_kwh_avoided"] = avoided if conn0 is not None and counted else None
         b["peak_import_days"] = counted if conn0 is not None else 0
-        b["fuel_saved"] = fuel_saved(b, len(rows), has_genset)
+        b["fuel_saved"], b["fuel_days"] = fuel_saved([r for _, r in rows], has_genset)
         b["fuel_unit"] = unit
         b["taxes_recovered_rs"] = taxes_recovered(conn0, [(day, r.get("levers") or {}, mdi_share(day, base)) for day, r in rows if _day_claims(r)])
     rule = next((by["tuned"].get("tuned_rule") for _, by in sorted(days.items(), reverse=True) if (by.get("tuned") or {}).get("tuned_rule")), None)
