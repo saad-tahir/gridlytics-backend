@@ -232,7 +232,7 @@ def test_an_off_grid_site_activates_on_its_connection_or_its_flag_and_reads_off_
         three = sites.create({"name": "Three", "site_type": "office", **source}, "test")["id"]
         sites.put_asset(three, "inverter", {"kw_ac": 50}, "test")
     r = a.post(f"/api/sites/{two}/activate")
-    assert r.status_code == 422 and "tab C" in r.json()["detail"], r.text
+    assert r.status_code == 422 and "step C" in r.json()["detail"], r.text
     assert a.put(f"/api/sites/{two}/connection", json={"regime": "off_grid"}).status_code == 200
     assert a.post(f"/api/sites/{two}/activate").status_code == 200
     row = next(s for s in a.get("/api/fleet").json()["sites"] if s["id"] == two)
