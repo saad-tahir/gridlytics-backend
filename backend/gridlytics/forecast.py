@@ -133,7 +133,9 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
     days_ok, k_days, pr = 0, [], None
     fit = slice(0, 14 * 1440)
     iv = sample_minutes(g["present"])  # sample counts in minutes of data, so a 5- or 15-minute source qualifies as a 1-minute one does
-    if g["present"][fit].sum() * iv > 3 * 600:
+    # every day is counted by the day's own rule from the first one (UX K23 check): a 30-hour total over the 14 days held the count at 0 on a site's
+    # first day ("0 of 3", then "2 of 3") and a logger that sends daylight only back a day from stage 1
+    if g["present"][fit].any():
         csm = solar.pv_power(g["ts"][fit], lat, lon, pv_asset, 1.0, solar.local_month(g["ts"][fit]))
         pvm = available_pv(g)[fit]
         for d in range(14):

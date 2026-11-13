@@ -77,6 +77,25 @@ def test_each_issue_says_how_far_its_kind_is_from_stage_1_by_the_stage_rule_s_ow
     assert of["stage"] == 0 and of["stage_progress"] == {"have": 4, "need": 7, "unit": "days"}
 
 
+def test_one_whole_day_of_solar_reads_1_of_3_and_three_daylight_only_days_are_stage_1(company):
+    """K23 check: the count runs from the first day, as the strip says it ("1 of 3 days", never "0 of 3" and then "2 of 3"); and a logger that sends
+    daylight only (10 hours a day) reaches stage 1 on its third day, as the rule's whole days say, not on its fourth (a 30-hour total held both
+    back)."""
+    sid = "k23-day-one"
+    _write_pv_days(sid, date(2026, 11, 10), 1)
+    t0 = _ts(2026, 11, 11, 10)
+    f = forecast.pv(_site(sid), t0)
+    assert f["stage"] == 0 and f["stage_progress"] == {"have": 1, "need": 3, "unit": "days"}
+    lit = "k23-daylight"
+    for i in range(3):
+        a = _ts(2026, 11, 8 + i, 7)
+        ts = np.arange(a, a + 10 * 3600, 300, dtype=np.int64)
+        kw = solar.pv_power(ts, LAT, LON, PLANT, 1.0, solar.local_month(ts))
+        telemetry.write_rows([(lit, int(x), "edge", float(v) * 1000) for x, v in zip(ts, kw)], ("site_id", "ts", "source_id", "pv_power_w"))
+    f = forecast.pv(_site(lit), t0)
+    assert f["stage"] == 1 and f["stage_progress"] == {"have": 3, "need": 3, "unit": "days"}
+
+
 def test_the_count_and_the_stage_read_one_number(company, monkeypatch):
     """The progress is the stage rule's own count against its own threshold: with the PV threshold at 2 days, two days of data are stage 1 and
     "2 of 2"; the page's words can never say "2 of 3 days" beside a stage 1."""
