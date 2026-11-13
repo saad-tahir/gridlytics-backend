@@ -821,9 +821,15 @@ def _today_kpis(site: dict, td: dict | None, bs: dict | None, now: int, day: dat
     cycles = round(dis / e_nom, 2) if dis is not None and e_nom else None
     outages = covered = None
     if td and not _off_grid(site, (site.get("connections") or [None])[0]):
-        log = telemetry.outages(site["id"], int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp()), now)
-        outages, covered = len(log), sum(1 for o in log if not o["unserved_kwh"])
+        outages, covered = _outage_counts(site["id"], int(datetime(day.year, day.month, day.day, tzinfo=PKT).timestamp()), now)
     return {"pv_self_pct": self_pct, "battery_cycles": cycles, "outages": outages, "outages_covered": covered}
+
+
+def _outage_counts(site_id: str, t0: int, t1: int) -> tuple[int, int]:
+    """The outages from t0 to t1 (telemetry.outages) and how many of them the site rode through with no critical load unserved: the "Outages covered"
+    tile's figure, today's (`today_kpis`) and This month's (`month.outages`, UX K12) by this one rule (UX K review: each had its own copy)."""
+    log_ = telemetry.outages(site_id, t0, t1)
+    return len(log_), sum(1 for o in log_ if not o["unserved_kwh"])
 
 
 def _waiting_genset_requests(site_id: str, limit: int = 3) -> list[dict]:
@@ -916,13 +922,11 @@ def _attempt_without_plan(site_id: str, now: int) -> dict | None:
     """The newest solve when no plan is in force and it failed or its guard held it (the first plan held back, or every solve since the last plan
     failed): the band's warn line and "Re-solve now" (UX K12 check; plan D2.3, D2.13), which `plan.latest_attempt` gives only beside a plan in
     force. None while a pause, a release or a native block is in force (the control chip says why no plan is), and when the newest solve made a
-    plan or none was made."""
+    plan or none was made. The plan's own `latest_attempt` is the same rule's (plans.newest_unplanned; UX K review)."""
     if plans.control_release(site_id, now):
         return None
-    with store.connect() as con:
-        r = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC, rowid DESC LIMIT 1",
-                        (site_id,)).fetchone()
-    return _attempt(r) if r is not None and r["status"] in ("failed", "held") else None
+    r = plans.newest_unplanned(site_id)
+    return _attempt(r) if r is not None else None
 
 
 def _plan_facts(plan: dict | None) -> dict | None:
@@ -988,10 +992,7 @@ def _month_outages(s: dict, t: date, now: int, last: dict | None) -> tuple[int |
     if last is None or last["ts"] < t0 or _off_grid(s, (s.get("connections") or [None])[0]):
         return None, None
 
-    def make():
-        log_ = telemetry.outages(s["id"], t0, now)
-        return len(log_), sum(1 for o in log_ if not o["unserved_kwh"])
-    return tuple(_MONTH_OUTAGES.get((str(store.db_path()), s["id"], t0, last["ts"]), make))
+    return tuple(_MONTH_OUTAGES.get((str(store.db_path()), s["id"], t0, last["ts"]), lambda: _outage_counts(s["id"], t0, now)))
 
 
 def _month_energy(s: dict, tdays: list[dict], bs: dict | None, outages: tuple[int | None, int | None]) -> dict:

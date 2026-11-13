@@ -223,3 +223,59 @@ def test_this_month_has_no_unserved_load_or_cycles_where_no_day_row_carries_them
     rows[1].update(unserved_kwh=0.0, discharge_kwh=0.0)
     got = routes_sites._month_energy(site, rows, {"e_nom_kwh": 200.0}, (None, None))
     assert (got["unserved_kwh"], got["battery_cycles"]) == (0.0, 0.0)
+
+
+# ------------------------------------------------------------------------------------------------ K12, the senior review
+
+def test_the_newest_solve_that_made_no_plan_is_one_rule_beside_a_plan_in_force_and_without_one(world, monkeypatch):
+    """UX K review: the band's warn line reads the newest solve that failed or was held, as `plan.latest_attempt` beside a plan in force
+    (plans.current) and as the top-level `latest_attempt` where none is (the route). Each had its own query and its own list of statuses, and only the
+    route's told two solves stored in the same second apart by the order they were stored. Both now read plans.newest_unplanned."""
+    a, sid = world.c["admin"], world.site
+    t0 = _now() // 900 * 900
+    one = {"id": "made-up", "status": "held", "reason": "guard_soc_floor", "generated_at": _iso(t0 + 120)}
+    monkeypatch.setattr(plans, "newest_unplanned", lambda site_id, con=None: dict(one))
+    want = {**one, "generated_at": karachi(t0 + 120)}
+    got = a.get(f"/api/sites/{sid}/now").json()
+    assert (got["plan"], got["latest_attempt"]) == (None, want)                   # no plan in force: the top-level one
+    pid = _fake_plan(world)
+    got = a.get(f"/api/sites/{sid}/now").json()
+    assert got["plan"]["id"] == pid and got["plan"]["latest_attempt"] == want and got["latest_attempt"] is None
+    with world.use():
+        assert plans.current(sid)["latest_attempt"] == one                        # the alerts' plan_failed reads the same
+
+
+def test_the_newest_solve_of_one_second_is_the_one_stored_last(world):
+    """Two solves stored in the same second (a re-solve beside the scheduled tick): the one stored last is the newer, for the plan's
+    `latest_attempt` as for the Overview's (UX K review)."""
+    sid = world.site
+    t0 = _now() // 900 * 900
+    with world.use():
+        failed = _plan_row(sid, "failed", t0 - 60, t0 + 86400, reason="infeasible")
+        held = _plan_row(sid, "held", t0 - 60, t0 + 86400, reason="guard_soc_floor")
+        assert plans.newest_unplanned(sid)["id"] == held
+        with store.connect() as con:
+            con.execute("UPDATE plans SET status = 'active', reason = '' WHERE id = ?", (held,))
+        assert plans.newest_unplanned(sid) is None                                # the newest made a plan: nothing failed after it
+        assert plans.current(sid)["id"] == held and "latest_attempt" not in plans.current(sid)
+    assert failed
+
+
+def test_today_and_this_month_count_the_outages_covered_by_one_rule(world, monkeypatch):
+    """UX K review: today's "Outages covered" (`today_kpis`) and This month's (`month.outages`, `month.outages_covered`) each counted the outages and
+    those with no critical load unserved with its own copy of the rule. Both now read routes_sites._outage_counts."""
+    a, v, sid = world.c["admin"], world.c["viewer"], world.site
+    d = date(2026, 10, 3)
+    monkeypatch.setattr(routes_sites, "now_ts", lambda: twin.day_start_utc(d) + 14 * 3600)
+    monkeypatch.setattr(routes_sites, "today", lambda: d)
+    with world.use():
+        _minute_rows(sid, d, until_h=14.0)
+    spans = []
+    monkeypatch.setattr(routes_sites, "_outage_counts", lambda site_id, t0, t1: spans.append((t0, t1)) or (7, 3))
+    routes_sites._MONTH_OUTAGES.items.clear()
+    for c in (a, v):
+        got = c.get(f"/api/sites/{sid}/now").json()
+        assert (got["today_kpis"]["outages"], got["today_kpis"]["outages_covered"]) == (7, 3)
+        assert (got["month"]["outages"], got["month"]["outages_covered"]) == (7, 3)
+    starts = {t0 for t0, _ in spans}
+    assert starts == {twin.day_start_utc(d), twin.day_start_utc(date(2026, 10, 1))}  # today from its midnight, the month from the 1st, Karachi time

@@ -343,6 +343,30 @@ check" commits). What changed:
   07:42, as their control chip "Following plan (table applied)" says) and carry `latest_attempt` null, and each fleet row's spark days add up to its
   month figures. Recorded in the web repository's BUILD_NOTES.
 
+### Batches k3 and k4, the senior review (13 Nov 2026)
+
+The review of K12, K13, K14, K17, K18 and K19 with their checks ("UX K review" commits). Both suites passed on the batches as committed. Two figures
+were each worked out by two copies of one rule; each is one rule now, with a test that fails without it. No answer changed shape.
+
+- **The newest solve that put no plan in force.** `plans.current` gave a plan's `latest_attempt` (which the alerts' plan_failed also reads) with its
+  own query and list of statuses, and `/now`'s top-level `latest_attempt` (K12 check) had another; only the second told two solves stored in the same
+  second apart (a re-solve beside the scheduled tick). Both read `plans.newest_unplanned` now (`UNPLANNED`: failed or held; of one second, the one
+  stored last).
+- **Outages covered.** Today's tile (`today_kpis`) and This month's (`month.outages`, `outages_covered`, K12) each counted the outages and those with
+  no critical load unserved. Both read `routes_sites._outage_counts` now.
+- **Checked and found right, no change:** the grid bill so far and its basis are money names, not worked out for a reader without `see_costs`, absent
+  for a viewer and a machine key (the role walk); the control answer reaches a viewer and a key with its gains stripped and nothing else; every new
+  time is Karachi time; no new route, no schema change, and the new kept answers are keyed by the company's file; the contract and the types match
+  the answers field by field. `/now` on the seeded demo costs 50 to 100 ms on a cold read against 50 to 60 ms before these batches, and 15 to 20 ms
+  warm against 13 to 16 ms.
+- **Left for the owner, not changed:**
+  - A connection without a reading day is billed by the calendar month (the product's rule: the month-to-date counters, the MDI month and the
+    Savings billing period read it so). Where its bills are read mid-month, the bill so far follows a bill entered until the month's end, then starts
+    again on the 1st, and the days from that reading to the month's end are on no bill so far until the next bill is entered. Asking the reading day
+    in set-up, or taking it from the bills entered, would close this for every figure at once.
+  - At a site on a flat tariff (no time-of-use window) the peak-window import reads 0 kWh, today's as before and This month's alike, since its peak
+    mask holds no minute; the page may want its swap tile there.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

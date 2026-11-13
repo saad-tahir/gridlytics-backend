@@ -1080,13 +1080,31 @@ def current(site_id: str, now: int | None = None, slots: bool = True) -> dict | 
     cols = "*" if slots else f"{LIGHT_COLUMNS}, steps"
     with store.connect() as con:
         r = con.execute(f"SELECT {cols} FROM plans WHERE site_id = ? AND status = 'active' ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
-        last = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC LIMIT 1", (site_id,)).fetchone()
+        late = newest_unplanned(site_id, con)
     if r is None or _past_valid_until(r["valid_until"], now):
         return None
     out = _plan_out(r)
-    if last and last["status"] in ("failed", "held") and last["id"] != out["id"]:
-        out["latest_attempt"] = dict(last)
+    if late and late["id"] != out["id"]:
+        out["latest_attempt"] = late
     return out
+
+
+#: The statuses of a solve that put no new plan in force: it failed, or it was held (by its guard, a pause or a release, or a time limit far from
+#: its bound with the plan before kept)
+UNPLANNED = ("failed", "held")
+
+
+def newest_unplanned(site_id: str, con=None) -> dict | None:
+    """The site's newest solve when it put no new plan in force (UNPLANNED): {id, status, reason, generated_at (as stored, UTC)}; None when the newest
+    solve made a plan, or none was made. Of two solves stored in the same second, the one stored last is the newer. The one rule of a plan's
+    `latest_attempt` (`current`, which the alerts' plan_failed reads) and of the Overview's where no plan is in force (UX backend ask K12; UX K review:
+    each had its own query and list of statuses, and only one of them told two solves of one second apart). `con`: an open connection to read on."""
+    if con is None:
+        with store.connect() as c:
+            return newest_unplanned(site_id, c)
+    r = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC, rowid DESC LIMIT 1",
+                    (site_id,)).fetchone()
+    return dict(r) if r is not None and r["status"] in UNPLANNED else None
 
 
 def held_info(site_id: str, now: int | None = None) -> dict | None:
