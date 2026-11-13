@@ -27,14 +27,14 @@ BRANDS = ("deye", "huawei", "sungrow", "growatt", "voltronic", "solis", "other")
 
 
 class OutageUnit(Strict):
-    kind: Literal["feeder", "transformer"] = "feeder"
-    code: str = Field("", max_length=40)
-    name: str = Field("", max_length=120)
+    kind: Literal["feeder", "transformer"] = Field("feeder", title="The outage unit's kind")
+    code: str = Field("", max_length=40, title="The feeder or transformer code")
+    name: str = Field("", max_length=120, title="The feeder or transformer name")
 
 
 class ReservePolicy(Strict):
-    p_threshold: float = Field(0.2, ge=0.0, le=1.0)
-    min_soc_pct: float = Field(20.0, ge=0.0, le=100.0)
+    p_threshold: float = Field(0.2, ge=0.0, le=1.0, title="The outage chance that holds the reserve")
+    min_soc_pct: float = Field(20.0, ge=0.0, le=100.0, title="The reserve floor (% state of charge)")
 
 
 DATA_SOURCE_KINDS = ("edge", "csv", "oem_cloud")
@@ -43,8 +43,8 @@ DATA_SOURCE_KINDS = ("edge", "csv", "oem_cloud")
 class DataSource(Strict):
     """Where the site's data comes from and whether its grid-present signal was confirmed (plan Part 9.3 tab A). `confirmed_by` and `at` are stamped by
     the server when a confirmation is saved (see _stamp_source); what a request sends for them is not kept."""
-    kind: Literal[DATA_SOURCE_KINDS]
-    grid_signal_confirmed: bool = False
+    kind: Literal[DATA_SOURCE_KINDS] = Field(title="The kind of data source")
+    grid_signal_confirmed: bool = Field(False, title="The grid-presence confirmation")
     confirmed_by: str = Field("", max_length=120)
     at: str | None = Field(None, max_length=40)
 
@@ -53,23 +53,23 @@ class SiteFields(Strict):
     name: str = Field(min_length=1, max_length=120)
     address: str = Field("", max_length=300)
     city: str = Field("", max_length=80)
-    lat: float = Field(31.5, ge=23.0, le=37.5)
-    lon: float = Field(74.3, ge=60.5, le=77.9)
+    lat: float = Field(31.5, ge=23.0, le=37.5, title="The latitude")
+    lon: float = Field(74.3, ge=60.5, le=77.9, title="The longitude")
     timezone: Literal["Asia/Karachi"] = "Asia/Karachi"
-    disco: Literal[DISCOS] | None = None
-    site_type: Literal[SITE_TYPES] = "industrial_2_shift"
+    disco: Literal[DISCOS] | None = Field(None, title="The DISCO")
+    site_type: Literal[SITE_TYPES] = Field("industrial_2_shift", title="The kind of site")
     outage_unit: OutageUnit = OutageUnit()
-    genset_start_control: Literal["auto_on_grid_loss", "soc_threshold", "manual", "none"] = "none"
+    genset_start_control: Literal["auto_on_grid_loss", "soc_threshold", "manual", "none"] = Field("none", title="How the genset is started")
     #: the battery state of charge (%) at which a soc_threshold controller starts the genset (audit flow-onboarding-11: never asked, so the plan assumed
     #: the reserve floor plus 5 points whatever the controller did); None: that assumption (genset_start_soc), which the web app marks Preliminary
-    genset_start_soc_pct: float | None = Field(None, gt=0, le=100)
-    outage_load_mode: Literal[0, 1] = 0
-    critical_load_kw: list[float] = Field(default_factory=lambda: [0.0] * 24, min_length=24, max_length=24)
-    voll_rs_per_kwh: float = Field(500.0, ge=0.0, le=10000.0)
+    genset_start_soc_pct: float | None = Field(None, gt=0, le=100, title="The state of charge the genset starts at (%)")
+    outage_load_mode: Literal[0, 1] = Field(0, title="What the genset carries in an outage")
+    critical_load_kw: list[float] = Field(default_factory=lambda: [0.0] * 24, min_length=24, max_length=24, title="The critical load (kW)")
+    voll_rs_per_kwh: float = Field(500.0, ge=0.0, le=10000.0, title="The value of lost load (Rs per kWh)")
     reserve_policy: ReservePolicy = ReservePolicy()
-    cycle_cap_per_day: float = Field(1.5, ge=0.1, le=5.0)
-    control_mode: Literal["advisory", "mode_a", "mode_b"] = "advisory"
-    enclosure_temp_offset_c: float = Field(7.0, ge=0.0, le=25.0)
+    cycle_cap_per_day: float = Field(1.5, ge=0.1, le=5.0, title="The cycle cap (full cycles a day)")
+    control_mode: Literal["advisory", "mode_a", "mode_b"] = Field("advisory", title="The control mode")
+    enclosure_temp_offset_c: float = Field(7.0, ge=0.0, le=25.0, title="The enclosure's temperature rise (°C)")
     calendar_cost_on: bool = True
     #: the battery's charge sources (plan Part 4.1, a_grid and a_gen): the grid when it is up, and the genset's output beyond the load
     grid_charge_allowed: bool = True
@@ -77,7 +77,7 @@ class SiteFields(Strict):
     notes: str = Field("", max_length=2000)
     #: the site's typical peak load (kW) from onboarding, which the stage-0 load template scales (twin.peak_load_kw); unset, it is derived from the
     #: connection or the PV
-    load_peak_kw: float | None = Field(None, gt=0, le=100000)
+    load_peak_kw: float | None = Field(None, gt=0, le=100000, title="The typical peak load (kW)")
     #: a site without any grid connection (plan Part 9.3), stored for activation and settings
     off_grid: bool = False
     data_source: DataSource | None = None
@@ -164,11 +164,11 @@ class IcpBaseline(Strict):
 
 
 class TaxFlags(Strict):
-    gst_recoverable: bool = True
-    s235_adjustable: bool = True
-    strn: bool = True
-    atl: bool = True
-    province: Literal["punjab", "sindh", "kp", "balochistan", "ict"] = "punjab"
+    gst_recoverable: bool = Field(True, title="Claims the bill's GST back")
+    s235_adjustable: bool = Field(True, title="Adjusts the bill's income tax (s.235)")
+    strn: bool = Field(True, title="Registered for sales tax (STRN)")
+    atl: bool = Field(True, title="On the active taxpayers list (ATL)")
+    province: Literal["punjab", "sindh", "kp", "balochistan", "ict"] = Field("punjab", title="The province (electricity duty)")
 
     @model_validator(mode="after")
     def _registered(self):
@@ -176,7 +176,7 @@ class TaxFlags(Strict):
         gst_recoverable true, so a no-STRN site's price left its GST out). Without an STRN the GST is borne; saying it is recovered is refused."""
         if not self.strn and self.gst_recoverable:
             if "gst_recoverable" in self.model_fields_set:
-                raise ValueError("A connection without a sales-tax registration (STRN) cannot recover the bill's GST")
+                raise FieldProblem("A connection without a sales-tax registration (STRN) cannot recover the bill's GST", "gst_recoverable")
             self.gst_recoverable = False
         return self
 
@@ -219,24 +219,24 @@ def group_problem(group: str | None, disco: str | None) -> str | None:
 
 
 class ConnectionFields(Strict):
-    meter_ref: str = Field("", max_length=40)
-    disco_group: Literal[DISCO_GROUPS] = "xwdisco"
-    tariff_category: str = Field("B-2(b)", max_length=20)
-    regime: Literal["net_billing", "net_metering_legacy", "none", "flat", "off_grid"] = "none"
+    meter_ref: str = Field("", max_length=40, title="The meter reference")
+    disco_group: Literal[DISCO_GROUPS] = Field("xwdisco", title="The time-of-use windows (DISCO group)")
+    tariff_category: str = Field("B-2(b)", max_length=20, title="The tariff category")
+    regime: Literal["net_billing", "net_metering_legacy", "none", "flat", "off_grid"] = Field("none", title="The export regime")
     #: the net-metering or net-billing agreement's first and last day, YYYY-MM-DD (audit flow-onboarding-18: any text was stored, and an end before the start)
-    agreement_start: str | None = Field(None, max_length=10)
-    agreement_end: str | None = Field(None, max_length=10)
-    sanctioned_load_kw: float = Field(400.0, gt=0, le=100000)
-    export_cap_kw: float = Field(0.0, ge=0, le=100000)
-    mdi_interval_min: Literal[15, 30] = 30
+    agreement_start: str | None = Field(None, max_length=10, title="The agreement start")
+    agreement_end: str | None = Field(None, max_length=10, title="The agreement end")
+    sanctioned_load_kw: float = Field(400.0, gt=0, le=100000, title="The sanctioned load (kW)")
+    export_cap_kw: float = Field(0.0, ge=0, le=100000, title="The export cap (kW)")
+    mdi_interval_min: Literal[15, 30] = Field(30, title="The MDI interval (minutes)")
     icp: IcpBaseline = IcpBaseline()
     tax: TaxFlags = TaxFlags()
-    seasonal_multiplier: float = Field(1.0, ge=1.0, le=1.5)
+    seasonal_multiplier: float = Field(1.0, ge=1.0, le=1.5, title="The seasonal multiplier of the fixed charges")
     #: Tariff F's season (R9 1.2: seasonal industrial consumers, at least six months), calendar months 1 to 12; empty: not on Tariff F
-    season_months: list[int] = Field(default_factory=list)
+    season_months: list[int] = Field(default_factory=list, title="Tariff F's season")
     #: the meter's reading day of the month (from the onboarding bill): a day after it belongs to the next month's bill (tariffs.billing_period_for);
     #: unset, the bill is the calendar month. 29 to 31 read as the month's last day in a shorter month
-    reading_day: int | None = Field(None, ge=1, le=31)
+    reading_day: int | None = Field(None, ge=1, le=31, title="The meter reading day")
     #: the site's inverter, battery and genset are on this connection, and the site's meter readings (its telemetry's grid import and export) are
     #: this meter's (round 7 stage 2, audit tracker-and-docs-01): the plan, the savings ledger and the bill rebuild price this connection. A site has
     #: one such connection: the first saved, unless another is marked (marking one unmarks the others). A save that leaves it out keeps it as stored
@@ -261,7 +261,7 @@ class ConnectionFields(Strict):
     @model_validator(mode="after")
     def _agreement_order(self):
         if self.agreement_start and self.agreement_end and self.agreement_end < self.agreement_start:
-            raise ValueError("The agreement must end after it starts")
+            raise FieldProblem("The agreement must end after it starts", "agreement_end")
         return self
 
     @field_validator("season_months")
@@ -279,7 +279,7 @@ class ConnectionFields(Strict):
     @model_validator(mode="after")
     def _tariff_f(self):
         if self.season_months and tariff_data.category_class(self.tariff_category) != "industrial":
-            raise ValueError("Tariff F (a season) is for industrial connections")
+            raise FieldProblem("Tariff F (a season) is for industrial connections", "season_months")
         return self
 
     @field_validator("tariff_category")
@@ -294,19 +294,19 @@ class ConnectionFields(Strict):
 
 
 class PvFields(Strict):
-    kwp_dc: float = Field(gt=0, le=50000)
-    kw_ac: float = Field(gt=0, le=50000)
-    tilt: float = Field(15.0, ge=0, le=60)
-    azimuth: float = Field(180.0, ge=0, lt=360)
-    gamma_pdc: float = Field(-0.0035, ge=-0.01, le=0.0)
-    losses_pct: float = Field(14.0, ge=0, le=40)
+    kwp_dc: float = Field(gt=0, le=50000, title="The PV's DC size (kWp)")
+    kw_ac: float = Field(gt=0, le=50000, title="The PV's AC size (kW)")
+    tilt: float = Field(15.0, ge=0, le=60, title="The tilt (degrees)")
+    azimuth: float = Field(180.0, ge=0, lt=360, title="The azimuth (degrees)")
+    gamma_pdc: float = Field(-0.0035, ge=-0.01, le=0.0, title="The temperature coefficient")
+    losses_pct: float = Field(14.0, ge=0, le=40, title="The system losses (%)")
 
 
 class InverterFields(Strict):
-    brand: Literal[BRANDS] = "deye"
-    model: str = Field("", max_length=80)
-    kw_ac: float = Field(gt=0, le=50000)
-    firmware: str = Field("", max_length=40)
+    brand: Literal[BRANDS] = Field("deye", title="The inverter's brand")
+    model: str = Field("", max_length=80, title="The inverter's model")
+    kw_ac: float = Field(gt=0, le=50000, title="The inverter's AC size (kW)")
+    firmware: str = Field("", max_length=40, title="The firmware")
 
 
 #: The entry forms a battery's capacity is given in (plan A8.4, C5.4; UX backend ask K7): its nameplate energy in kWh, or a capacity in Ah at a nominal
@@ -315,17 +315,17 @@ BATTERY_ENTRY = ("kwh", "ah")
 
 
 class BatteryFields(Strict):
-    nameplate_kwh: float = Field(gt=0, le=100000)
-    soh: float = Field(1.0, gt=0.3, le=1.0)
-    p_ch_kw: float = Field(gt=0, le=50000)
-    p_dis_kw: float = Field(gt=0, le=50000)
-    eta_c: float = Field(0.95, gt=0.7, le=1.0)
-    eta_d: float = Field(0.95, gt=0.7, le=1.0)
-    soc_min: float = Field(0.10, ge=0.0, lt=0.9)
-    soc_max: float = Field(0.95, gt=0.1, le=1.0)
-    replacement_cost_per_kwh: float = Field(52000.0, ge=0, le=500000)
-    warranted_cycles: float = Field(6000.0, ge=100, le=20000)
-    warranted_depth: float = Field(0.8, gt=0.1, le=1.0)
+    nameplate_kwh: float = Field(gt=0, le=100000, title="The nameplate energy (kWh)")
+    soh: float = Field(1.0, gt=0.3, le=1.0, title="The state of health")
+    p_ch_kw: float = Field(gt=0, le=50000, title="The charge power (kW)")
+    p_dis_kw: float = Field(gt=0, le=50000, title="The discharge power (kW)")
+    eta_c: float = Field(0.95, gt=0.7, le=1.0, title="The charge efficiency")
+    eta_d: float = Field(0.95, gt=0.7, le=1.0, title="The discharge efficiency")
+    soc_min: float = Field(0.10, ge=0.0, lt=0.9, title="The lowest state of charge")
+    soc_max: float = Field(0.95, gt=0.1, le=1.0, title="The highest state of charge")
+    replacement_cost_per_kwh: float = Field(52000.0, ge=0, le=500000, title="The replacement cost (Rs per kWh)")
+    warranted_cycles: float = Field(6000.0, ge=100, le=20000, title="The warranted cycles")
+    warranted_depth: float = Field(0.8, gt=0.1, le=1.0, title="The warranted depth")
     #: the form the capacity was given in (UX backend ask K7), so set-up reopens the way it was filled in and Review repeats it ("1,000 Ah at 51.2
     #: V, 51.2 kWh nominal"): "kwh", the nameplate energy as typed; "ah", a capacity in Ah at a nominal voltage, whose kWh nameplate_kwh is (Ah x V
     #: / 1,000, worked out where the save leaves it out). The engine reads nameplate_kwh alone. The Ah and the voltage are kept with the Ah form only:
@@ -419,25 +419,25 @@ GENSET_ENTRY = ("kva", "kw")
 
 
 class GensetFields(Strict):
-    rated_kw: float = Field(gt=0, le=50000)
-    f_min: float = Field(0.3, ge=0.0, le=1.0)
-    fuel_kind: Literal["hsd", "gas_captive", "lng_captive"] = "hsd"
+    rated_kw: float = Field(gt=0, le=50000, title="The genset's rating (kW)")
+    f_min: float = Field(0.3, ge=0.0, le=1.0, title="The minimum loading")
+    fuel_kind: Literal["hsd", "gas_captive", "lng_captive"] = Field("hsd", title="The fuel")
     #: HOMER's convention: fuel units per hour = b * rated_kw * on + a * output_kw (litres of diesel, or MMBtu of captive gas or RLNG: FUEL_CURVES)
-    a: float = Field(0.273, gt=0, le=5)
-    b: float = Field(0.033, ge=0, le=1)
-    c_start_rs: float = Field(1500.0, ge=0)
-    c_runhr_rs: float = Field(400.0, ge=0)
-    c_om_rs_per_kwh: float = Field(8.0, ge=0)
-    min_up_h: float = Field(1.0, ge=0, le=24)
-    min_down_h: float = Field(0.5, ge=0, le=24)
-    cap_hours_per_day: float = Field(24.0, ge=0, le=24)
-    tank_l: float = Field(2000.0, ge=0)
-    parallel_allowed: bool = False
+    a: float = Field(0.273, gt=0, le=5, title="The fuel per kWh of output (a)")
+    b: float = Field(0.033, ge=0, le=1, title="The fuel at no load (b)")
+    c_start_rs: float = Field(1500.0, ge=0, title="The cost per start (Rs)")
+    c_runhr_rs: float = Field(400.0, ge=0, title="The cost per running hour (Rs)")
+    c_om_rs_per_kwh: float = Field(8.0, ge=0, title="The upkeep (Rs per kWh)")
+    min_up_h: float = Field(1.0, ge=0, le=24, title="The minimum run (h)")
+    min_down_h: float = Field(0.5, ge=0, le=24, title="The minimum rest (h)")
+    cap_hours_per_day: float = Field(24.0, ge=0, le=24, title="The hours a day it may run")
+    tank_l: float = Field(2000.0, ge=0, title="The tank (L)")
+    parallel_allowed: bool = Field(False, title="May run in parallel with the grid")
     #: the nameplate's rating in kVA and the power factor it is rated at (audit flow-onboarding-16: sets are sold and labelled in kVA, so a 250 kVA set
     #: typed as 250 kW was overstated by a quarter): the plan counts on rated_kw, which is rated_kva x power_factor (taken from them when left out).
     #: None: a rating given in kW only, as before
-    rated_kva: float | None = Field(None, gt=0, le=62500)
-    power_factor: float = Field(0.8, ge=0.5, le=1.0)
+    rated_kva: float | None = Field(None, gt=0, le=62500, title="The prime rating (kVA)")
+    power_factor: float = Field(0.8, ge=0.5, le=1.0, title="The power factor")
     #: the form the rating was given in (plan A8.3, C5.5; UX backend ask K7), so set-up reopens the way it was filled in and Review repeats it ("500
     #: kVA at 0.80: 400 kW usable"): "kva", the nameplate's prime rating in kVA at its power factor (rated_kw is their product); "kw", a rating in kW
     #: alone, with no kVA kept (null). Left out, the form is kVA where a rating in kVA is given, else kW, as a save of before was read

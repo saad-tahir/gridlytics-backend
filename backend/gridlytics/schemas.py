@@ -4,7 +4,7 @@ Every request model of Gridlytics is strict: types enforced, unknown fields refu
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -55,11 +55,33 @@ def _clause(text: str) -> str:
     return text[:1].lower() + text[1:] if plain else text
 
 
-def _sentence(e: dict, titles: dict, items: dict) -> str:
+def _model_of(annotation):
+    """The model a field holds (itself, or inside `X | None` or a list), else None."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    return next((m for m in map(_model_of, get_args(annotation)) if m is not None), None)
+
+
+def _title_at(model: type[BaseModel] | None, loc: tuple) -> str | None:
+    """The title of the field a nested `loc` names (the models followed down), or None: "The reserve floor (% state of charge)" for
+    ("reserve_policy", "min_soc_pct") where the field gives one (UX K6), so a field inside a part of a form is named as the form names it."""
+    m, title = model, None
+    for p in loc:
+        if isinstance(p, int):
+            continue
+        fields = m.model_fields if m is not None else {}
+        if p not in fields:
+            return None
+        title, m = fields[p].title, _model_of(fields[p].annotation)
+    return title
+
+
+def _sentence(e: dict, titles: dict, items: dict, model: type[BaseModel] | None = None) -> str:
     """One validation error in the refusals' words."""
     loc = tuple(e["loc"])
     text = e["msg"].removeprefix("Value error, ")
-    label = _label(loc, titles, items) if loc else ""
+    nested = _title_at(model, loc) if loc and loc[0] not in items and sum(not isinstance(p, int) for p in loc) > 1 else None
+    label = nested or (_label(loc, titles, items) if loc else "")
     if not loc or e["type"] == "value_error":
         return text
     if e["type"] == "extra_forbidden":
@@ -86,10 +108,10 @@ def _names(model: type[BaseModel] | None) -> tuple[dict, dict]:
     return titles, items
 
 
-def problems(exc: ValidationError, model: type[BaseModel] | None = None) -> list[tuple[tuple, str]]:
-    """Every error of a validation, each (the field's path, its sentence in the refusals' words), in pydantic's order: what a set-up check lists one
-    a field (UX backend ask K6). A model's own check that concerns one field (`FieldProblem`, raised inside a model validator, which pydantic places on
-    the model) is placed on that field."""
+def problems(exc: ValidationError, model: type[BaseModel] | None = None) -> list[tuple[tuple, str, str]]:
+    """Every error of a validation, each (the field's path, its sentence in the refusals' words, pydantic's type of it), in pydantic's order: what a
+    set-up check lists one a field (UX backend ask K6). A model's own check that concerns one field (`FieldProblem`, raised inside a model validator,
+    which pydantic places on the model) is placed on that field."""
     titles, items = _names(model)
     out = []
     for e in exc.errors():
@@ -97,7 +119,7 @@ def problems(exc: ValidationError, model: type[BaseModel] | None = None) -> list
         err = (e.get("ctx") or {}).get("error")
         if e["type"] == "value_error" and isinstance(err, FieldProblem):
             loc = loc + tuple(err.field.split("."))
-        out.append((loc, _sentence(e, titles, items)))
+        out.append((loc, _sentence(e, titles, items, model), e["type"]))
     return out
 
 
@@ -112,7 +134,7 @@ class FieldProblem(ValueError):
 
 def message(exc: ValidationError, model: type[BaseModel] | None = None) -> str:
     titles, items = _names(model)
-    parts = [_sentence(e, titles, items) for e in exc.errors()[:4]]
+    parts = [_sentence(e, titles, items, model) for e in exc.errors()[:4]]
     more = len(exc.errors()) - 4
     return "; ".join(parts[:1] + [_clause(p) for p in parts[1:]]) + (f"; and {more} more" if more > 0 else "")
 

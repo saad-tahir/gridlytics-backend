@@ -12,9 +12,10 @@ import numpy as np
 from fastapi import APIRouter, Body, Header, HTTPException
 from pydantic import ValidationError
 
-from . import alerts, auth, battery, delivery, demo, lifecycle, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, twin, verify
+from . import (alerts, auth, battery, delivery, demo, lifecycle, money, plans, setup_check, sites, store, store_members, tariff_data, tariffs, telemetry,
+               twin, verify)
 from .routes_common import PKT, bad, full_or_404, karachi, now_ts, out, put_state, site_or_404, today
-from .schemas import Refusal
+from .schemas import Refusal, check
 
 router = APIRouter()
 log = logging.getLogger("gridlytics.routes_sites")
@@ -494,6 +495,28 @@ def _activation_missing(s: dict) -> list[tuple[str, str]]:
     return missing
 
 
+@router.post("/api/sites/{site_id}/validate")
+def site_validate(site_id: str, inp: dict = Body(...)):
+    """Checks Set-up's steps as typed, over the site as stored, and saves nothing (UX backend ask K6; setup_check): `problems` ({step, field, path,
+    message}, each on its field; empty when the sections can be saved), `setup_warnings` of the site as it would be, and `derived` (the battery's
+    nominal and usable kWh, the genset's usable kW and fuel an hour at half and full load, the reserve floor's kWh and minutes of the critical load;
+    the wear cost per kWh for see_money_settings only), with `not_derived` saying why a figure could not be worked out. Every role that opens Set-up
+    reads it (see_costs: an administrator, an operator, an analyst); a viewer and a machine key are refused."""
+    auth.need("see_costs", "Checking a site's set-up")
+    s = full_or_404(site_id)
+    req = check(setup_check.SetupCheckIn, inp)
+    held = s.get("assets") or {}
+    # the equipment's money settings as the save takes them: stored where left out or hidden from the role (_with_held_money), so an operator's
+    # check reads the wear the plan prices
+    assets_in = {role: (_with_held_money(role, dict(fields), held.get(role)) if isinstance(fields, dict) else fields)
+                 for role, fields in (req.assets.sent() if req.assets else {}).items()}
+    try:
+        answer = setup_check.run(s, req.site, assets_in, req.connection, money_settings=auth.can("see_money_settings"))
+    except setup_check.UnknownConnection:
+        raise Refusal(404, "This site has no such connection", "not_found") from None
+    return out(answer)
+
+
 @router.post("/api/sites/{site_id}/activate")
 def site_activate(site_id: str):
     auth.need("manage_sites", "Activating a site")
@@ -620,13 +643,8 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
     names = ASSET_MONEY_FIELDS.get(role, ())
     if names:
         cur = sites.assets(site_id).get(role)
-        defaults = _defaults(sites.ASSET_MODELS[role], names)
-        before = {**defaults, **(cur or {})}
-        if cur is not None:
-            # a money setting left out keeps its stored value (the asset is saved whole, so it would otherwise fall back to its default); so does one the
-            # role is not shown (an operator, audit role-operator-06) sent at its default, which the form put in place of the value it never received
-            hidden = money.unseen(names)
-            inp.update({k: cur[k] for k in names if k in cur and (k not in inp or k in hidden and inp[k] == defaults.get(k))})
+        before = {**_defaults(sites.ASSET_MODELS[role], names), **(cur or {})}
+        _with_held_money(role, inp, cur)
         _need_money_settings(inp, before, names, "Changing the equipment's money settings (prices and wear)")
     try:
         sites.put_asset(site_id, role, inp, auth.actor(), expect)
@@ -635,6 +653,18 @@ def asset_put(site_id: str, role: str, inp: dict = Body(...)):
     except ValueError as exc:
         raise bad(exc) from None
     return _site_answer(site_id)
+
+
+def _with_held_money(role: str, inp: dict, cur: dict | None) -> dict:
+    """The asset's body with its stored money settings where the save leaves them out (the asset is saved whole, so one would otherwise fall back to
+    its default), and where the role is not shown them (an operator, audit role-operator-06) and sends the default the form put in place of the value
+    it never received. `inp` is changed and returned."""
+    names = ASSET_MONEY_FIELDS.get(role, ())
+    if names and cur is not None:
+        defaults = _defaults(sites.ASSET_MODELS[role], names)
+        hidden = money.unseen(names)
+        inp.update({k: cur[k] for k in names if k in cur and (k not in inp or k in hidden and inp[k] == defaults.get(k))})
+    return inp
 
 
 def _money_set(role: str, cur: dict | None) -> bool:

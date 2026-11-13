@@ -493,6 +493,37 @@ genset was saved before, so no migration or copy of the company's file was neede
   Tariff)": an active site's Site settings become Set-up's summary of the same steps (plan C10). The Pilot page's own tabs ("fix it in tab C" of
   the switchback rules) are that page's and are not Set-up's: left as they are.
 
+- **K6, Set-up's check** (plan C19.2 item 2, A8.2, C5.4 to C5.6, C7.4, C9.2): `POST /api/sites/{id}/validate` (`setup_check.py`) takes a step's
+  section as the form holds it (`site`, merged over the stored fields; `assets`, each whole as its save sends it, null for one unticked;
+  `connection`, as `PUT /connection` sends it, its `id` naming a saved one), checks it by the models a save is checked by, over the site as stored,
+  and writes nothing (no audit line). Decisions:
+  - **Who reads it:** every role that opens Set-up (see_costs: administrator, operator, analyst; the analyst reads the steps and Review's derived
+    figures); a viewer, who has no Set-up (plan C4), and a machine key are refused. A new permission would have changed the role matrix (K4) for one
+    route.
+  - **Problems on their fields.** Every error of every section, each with its step (A to D: the site's fields by `SITE_STEPS`, the equipment B, the
+    connection C), its dotted field and its path, in the steps' order. A model's own check that concerns one field raises `schemas.FieldProblem`
+    and is placed on it (the battery's window on `soc_min`, a kVA that disagrees on `rated_kva`, GST claimed without an STRN on
+    `tax.gst_recoverable`, the agreement's order on `agreement_end`, Tariff F on `season_months`); its refusal on a save reads as before. A DISCO
+    group the site's DISCO contradicts is a problem on `disco_group`, as the save refuses it. The site, connection and equipment models' fields now
+    carry titles, so a refusal names a field as the form does ("The charge power (kW) must be more than 0", where "The p ch kw must be more than 0.0"
+    was said), the nested ones too (`schemas._title_at`: "The reserve floor (% state of charge) must be at most 100"). A share the form types as a
+    percent is told in percent (`PERCENT_WORDS`: "The state of health is a percent above 30, up to 100"), the tariff editor's rule (UX K32 check);
+    the save's refusal keeps the stored fraction's bounds.
+  - **The figures** (`derived`), each the engine's own rule: the battery's nominal kWh (its nameplate: Ah x V / 1,000 in the Ah form) and usable kWh
+    at its window (nominal x state of health x (highest minus lowest state of charge), plan A8.4), its entry form and percents; the genset's usable
+    kW (its rating: kVA x the power factor) and its fuel an hour at half and full load by its curve (b x rating + a x output, litres or MMBtu,
+    `estimated: true`); the reserve: the floor held with the grid up (`plans.delivered_floor_pct`, so a floor typed under the battery's cut-off plus
+    2 points says the floor that holds), the energy the battery gives the load from it down to its cut-off, after its discharge losses (x eta_d,
+    as the optimiser's energy balance has it), and the minutes of the critical load's highest hour that carries. The plan's own example ("about 5.1
+    kWh", C7.4) leaves the losses out; the server's 4.86 kWh is what reaches the load. The wear cost per kWh discharged (`optimise.wear_cost`, the
+    price the plan charges) is served for see_money_settings only, under `wear_cost_rs_per_kwh`, added to `money.MONEY_SETTING_KEYS` so the
+    filter strips it for an operator and a key all the same (the role walk proves it).
+  - **A figure that cannot be worked out is null, never 0,** and `not_derived` says why in its section's first problem (plan C5.8: "Usable: could
+    not be worked out: <server's sentence>").
+  - **Money settings an operator is not shown** are taken as stored where the form sent their defaults, as the asset's save takes them
+    (`routes_sites._with_held_money`, now shared by both), so an operator's check reads the wear the plan prices.
+  - `setup_warnings` are `sites.setup_warnings` of the site as it would be (a section with problems counts as stored).
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

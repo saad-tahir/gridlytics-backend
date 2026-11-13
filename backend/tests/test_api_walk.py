@@ -206,6 +206,29 @@ def test_the_tariff_editor_answers_each_role_by_its_permissions(world):
     assert client.get("/api/tariffs", headers=owner).json()["schedule"]["template"] is True
 
 
+def test_set_up_s_checks_answer_each_role_that_opens_set_up(world):
+    """UX backend ask K6 (plan step 9, Set-up B to D and Review): `POST /sites/:id/validate` answers the administrator, the operator and the analyst
+    (every role that opens Set-up: see_costs) with the same problems, warnings and figures, the wear cost for see_money_settings only; a viewer is
+    refused. Nothing is saved."""
+    client, password, _ = world
+    owner = _login(client, password, "owner@onyxleaf.demo")
+    sid = next(s["id"] for s in client.get("/api/fleet", headers=owner).json()["sites"] if s["name"] == "Faisalabad textile mill (demo)")
+    body = {"assets": {"battery": {"entry_unit": "ah", "capacity_ah": 1000, "nominal_v": 51.2, "p_ch_kw": 50, "p_dis_kw": 50}}}
+    seen = {}
+    for email, status, wear in (("owner@onyxleaf.demo", 200, True), ("operator@onyxleaf.demo", 200, False), ("analyst@onyxleaf.demo", 200, True),
+                                ("viewer@onyxleaf.demo", 403, False)):
+        h = _login(client, password, email)
+        r = client.post(f"/api/sites/{sid}/validate", headers=h, json=body)
+        assert r.status_code == status, (email, r.text[:200])
+        if status == 200:
+            got = r.json()
+            assert ("wear_cost_rs_per_kwh" in got["derived"]["battery"]) is wear, email
+            got["derived"]["battery"].pop("wear_cost_rs_per_kwh", None)
+            assert seen.setdefault("answer", got) == got, email
+    assert seen["answer"]["derived"]["battery"]["usable_kwh"] == 43.52
+    assert client.get(f"/api/sites/{sid}", headers=owner).json()["assets"]["battery"]["entry_unit"] == "kwh"
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

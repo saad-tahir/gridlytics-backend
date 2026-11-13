@@ -518,6 +518,31 @@ def test_the_tariff_editor_reaches_no_viewer_and_no_key_and_names_its_rupees_as_
             assert client.request(method, url, json={} if method == "POST" else None, headers=h[reader]).status_code == 403, (reader, name)
 
 
+def test_set_up_s_check_names_the_wear_cost_as_a_money_setting_and_reaches_no_viewer_and_no_key(walk):
+    """UX backend ask K6 (plan C19.2 item 2): the check's battery wear cost (`wear_cost_rs_per_kwh`) is a money setting by name (money.MONEY_SETTING_KEYS),
+    so the API's filter strips it for an operator (plan 9.4: costs but not the money settings) and for a key; the route needs see_costs, so a viewer and
+    a key are refused, and the operator's answer is the administrator's without it."""
+    from gridlytics import money
+    client, h = walk["client"], walk["headers"]
+    sid = walk["edge_site"]
+    body = {"assets": {"battery": {"nameplate_kwh": 100, "p_ch_kw": 50, "p_dis_kw": 50}}}
+    answers = {}
+    for reader in READERS:
+        r = client.post(f"/api/sites/{sid}/validate", json=body, headers=h[reader])
+        assert r.status_code == (200 if reader in ("admin", "operator") else 403), (reader, r.status_code, r.text[:200])
+        answers[reader] = r.json()
+        if r.status_code != 200:
+            assert not any(RUPEES.search(s) for s in _strings(r.json())), reader
+    admin, operator = answers["admin"], answers["operator"]
+    assert "wear_cost_rs_per_kwh" in money.MONEY_SETTING_KEYS and money.is_money("wear_cost_rs_per_kwh")
+    assert admin["derived"]["battery"]["wear_cost_rs_per_kwh"] > 0
+    assert not {k for _, k, _, _ in _items(operator) if k in money.FEE_KEYS | money.MONEY_SETTING_KEYS}
+    # a key's filter would leave no figure of the administrator's that is held only under a money name
+    assert not (_numbers(admin, money_only=True) - _numbers(admin, money_only=False)) & _numbers(money.for_key(admin))
+    admin["derived"]["battery"].pop("wear_cost_rs_per_kwh")
+    assert operator == admin
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]
