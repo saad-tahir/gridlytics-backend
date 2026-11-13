@@ -715,6 +715,44 @@ committed (backend 1753 passed; web gates clean). Two defects were found and fix
   backup folder listed once for all companies (`backups.newest_copies`). The batch names it "founder or administrator only": the company's
   administrator (`manage_users`) reads the same for their own company in `GET /api/platform/org`; no other role and no key is given the field.
 
+### Batch k7, the check (13 Nov 2026)
+
+Independent checkers read K8, K15, K16, K33, K34 and K35; each finding was tried against the code, and all eight held (two of them the same
+finding from two checkers). Each was fixed with a test that fails without the fix (the K15, K33 and K34 tests), checked on the tree before the fix
+("UX K15/K33/K34 check" commits). K8, K16 and K35 had none. What changed:
+
+- **The preview refuses a header that names a column twice** (K15, medium). The upload's route refused such a file before reading a row, and the
+  preview did not ask, so it answered five clean rows (the repeated name's last column) of a file the upload then refused. The check is
+  `telemetry.refuse_named_twice` now, read by the upload's route and by `preview_csv` alike, in the upload's order (the mapping, the header's names,
+  then the file), with its words: "The header names load_power_w more than once: give each column once and upload again".
+- **A row's `at` is the minute it is stored on** (K15). The upload stores a row on its minute (`_write_days`: the time to the minute), and the
+  preview answered the file's second, so a logger that writes seconds read 00:00:30 where 00:00:00 is stored.
+- **A role without `upload_data` is refused whatever JSON the body holds** (K15). The route took the body as an object, so the framework refused a
+  viewer's list or text with its own words before the role was read; it takes any JSON now and checks the role first, and an administrator's or
+  an operator's body that is no object is refused in a sentence ("Send the file's head as a set of named values: head, mapping and
+  tz_offset_h"). A body that is not JSON at all is still the framework's 422, before any route runs; the contract says "any JSON body".
+- **A save of `follow` keeps the kinds the role does not give** (K33, medium). Since K33 a viewer is offered five kinds, and today's My account
+  page sends `follow` with every save, the email checkbox's too; the save kept only the five, so once the person's role was raised the inbox and
+  its badge hid every kind the new role adds (a critical Control alert of an operator). The kinds not offered keep what was kept for them now:
+  followed until chosen (as before K33, when every kind was offered), unfollowed where an earlier role's choice unfollowed them. The answer is
+  still the kinds received. Storing the kinds left out instead of those kept was not chosen: the inbox's reader (`alerts.followed_categories`)
+  and every choice saved before read `follow` as the kinds kept.
+- **`email` is on while a kind received is chosen for email** (K33). A person whose email kinds were all of a role held before (an administrator
+  who ticked Savings alone, made a viewer) read `email: true` with `email_kinds: []`; `email` is worked out from the kinds answered now, on the
+  card's rule. Nothing was sent either way (email does not send yet).
+- **A page's offset is ASCII digits, at most nine** (K34, found by two checkers). `audit_trail.offset_of` took whatever `int()` reads: an offset
+  past what SQLite holds was a server error on both trails, and "٣", "1_0", "+3" and " 5 " were read as numbers. The founder's lists' rule
+  (`routes_access._OFFSET`, the K2 check) holds for both trails now: "The offset is a whole number from 0". Today's `GET /api/audit` (an `int`
+  query, unchanged by K34) still gives a server error for an offset past what SQLite holds; it predates the batch and goes when step 14 moves to
+  `/api/audit/search`.
+- **A company's name given up and taken by a later company is no company's** (K34, schema 5's filling). The lines before schema 5 were filled by
+  today's names and the names before a rename, so when a company was renamed and a later company took its old name, the first company's lines of
+  that name were given to the later one. Only a name one company alone has held (its name now, and its names before each rename, read newest
+  first so a chain of renames is followed) is filled now; a name two companies have held, at once or in turn, leaves its lines of no company
+  (listed unfiltered only). This replaces the batch's "A name two companies share, or none has". Telling the two apart by the order of the
+  lines (the later company's lines are after its "made a company") was not chosen: a line written out of that order would be given to the wrong
+  company, and a line of no company is only missing from a filter, never shown under the wrong one.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in
