@@ -138,16 +138,19 @@ def _bounds(day_from, day_to) -> tuple[str | None, str | None]:
     return (utc(d0) if d0 else None), (utc(d1 + timedelta(days=1)) if d1 else None)
 
 
+#: A page's offset as the address gives it: ASCII digits only, at most nine, the founder's lists' rule (routes_access._OFFSET, UX K2 check). int()
+#: reads "٣" as 3, "1_0" as 10 and " +5 " as 5, and a figure past what SQLite holds was a server error (UX K34 check)
+_OFFSET = re.compile(r"[0-9]{1,9}")
+
+
 def offset_of(value) -> int:
     if value is None or value == "":
         return 0
-    try:
-        n = int(str(value).strip())
-    except ValueError:
-        raise Refused("The offset is a whole number from 0") from None
-    if n < 0:
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 999_999_999:
+        return value                                     # a caller's own figure (the default 0)
+    if not isinstance(value, str) or not _OFFSET.fullmatch(value):
         raise Refused("The offset is a whole number from 0")
-    return n
+    return int(value)
 
 
 def _group_key(value, words: dict) -> str | None:

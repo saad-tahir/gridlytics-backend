@@ -173,24 +173,32 @@ _COMPANY_TARGETS = ("made a company", "changed a company", "switched Gridlytics 
 
 def _backfill_audit_companies(con: sqlite3.Connection) -> None:
     """The company of each founder's audit line written before lines kept it (schema 5): the company named by the line (its target for a company's own
-    lines and a backup's, else its detail's `company`), by the names companies have now and had before a rename (a "changed a company" line's name
-    from and to). A name two companies share, or none has, leaves the line of no company."""
-    rows = con.execute("SELECT id, name FROM companies").fetchall()
-    counts: dict[str, int] = {}
-    for r in rows:
-        counts[r["name"]] = counts.get(r["name"], 0) + 1
-    names = {r["name"]: r["id"] for r in rows if counts[r["name"]] == 1}
+    lines and a backup's, else its detail's `company`), by every name a company has held: its name now and the names it had before a rename (a
+    "changed a company" line's name from and to, read newest first so a chain of renames is followed). Only a name one company alone has held is
+    filled: a name two companies share now, one a company gave up and another took later (UX K34 check: the first company's lines were given to
+    the later one), or one no company has, leaves the line of no company, listed unfiltered only."""
+    held: dict[str, set] = {}                      # each name, and every company that held it (None: a company not known)
+    now: dict[str, str | None] = {}                # the company that holds each name, back to the rename being read (None: two, or not known)
+    for r in con.execute("SELECT id, name FROM companies").fetchall():
+        held.setdefault(r["name"], set()).add(r["id"])
+        now[r["name"]] = None if r["name"] in now else r["id"]
     lines = con.execute("SELECT id, action, target, detail FROM founder_audit ORDER BY id DESC").fetchall()
     for r in lines:                                # newest first: a rename's new name is known before its old one
         if r["action"] != "changed a company":
             continue
         try:
             change = (json.loads(r["detail"] or "{}") or {}).get("name") or {}
-        except ValueError:
+        except (ValueError, AttributeError):
             continue
-        before, after = change.get("from"), change.get("to")
-        if isinstance(before, str) and isinstance(after, str) and after in names and before not in names:
-            names[before] = names[after]
+        before, after = (change.get("from"), change.get("to")) if isinstance(change, dict) else (None, None)
+        if not (isinstance(before, str) and isinstance(after, str)) or before == after:
+            continue
+        who = now.get(after)                       # the company that took `after` in this rename
+        if who is not None:
+            del now[after]                         # before the rename it held `before`, and nobody `after`
+        held.setdefault(before, set()).add(who)
+        now[before] = None if before in now else who
+    names = {name: next(iter(ids)) for name, ids in held.items() if len(ids) == 1 and None not in ids}
     for r in lines:
         try:
             detail = json.loads(r["detail"] or "{}")

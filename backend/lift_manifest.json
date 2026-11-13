@@ -35,9 +35,9 @@
       "path": "backend/gridlytics/platform.py",
       "upstream": "backend/solarlytics/platform.py",
       "status": "adapted",
-      "why": "Gridlytics' roles (admin, operator, analyst, viewer) and permission table; sessions with their registry, sign-out everywhere and one-time passwords (platform.db schema 2 and 3), the account lockout per account, the founder console's company states: audit security-roles-09/-10, parity-supabase-auth-01/-02/-08, founder-console-08, role-analyst-32, pages-A-02. Schema 4: the access requests the contact page sends the founder (Gridlytics' UX backend asks K2 and K3; the rules and the store are access_requests.py, not lifted); Solarlytics has no contact form, so nothing to port back. Schema 5: the company a line of the founder's audit is of, for the console's Company filter, filled for the lines before from the company's name in them (Gridlytics' UX K34; the groups and filters are audit_trail.py, not lifted).",
+      "why": "Gridlytics' roles (admin, operator, analyst, viewer) and permission table; sessions with their registry, sign-out everywhere and one-time passwords (platform.db schema 2 and 3), the account lockout per account, the founder console's company states: audit security-roles-09/-10, parity-supabase-auth-01/-02/-08, founder-console-08, role-analyst-32, pages-A-02. Schema 4: the access requests the contact page sends the founder (Gridlytics' UX backend asks K2 and K3; the rules and the store are access_requests.py, not lifted); Solarlytics has no contact form, so nothing to port back. Schema 5: the company a line of the founder's audit is of, for the console's Company filter, filled for the lines before from the company's name in them, only a name one company alone has held (Gridlytics' UX K34 and its check; the groups and filters are audit_trail.py, not lifted).",
       "upstream_sha256": "8aaaec3922c95d8945b5c0a0befd757dfc6a71e936975400089db773e7c328cb",
-      "sha256": "00955f9ee23d088cb1fdf24133272bf7d1b420022666ecb22663d8d8d54cda91"
+      "sha256": "3b7e22aa29226ce17601018e0bcb0378deb7b71717b43f1d01e04c5957af7771"
     },
     {
       "path": "backend/gridlytics/companies.py",

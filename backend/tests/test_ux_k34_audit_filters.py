@@ -27,6 +27,8 @@ from gridlytics import platform as platformdb
 
 ROOT = Path(__file__).resolve().parents[1]
 SEARCH = "/api/audit/search"
+#: Offsets a page refuses: past what SQLite holds, more than nine digits, and digits or forms int() reads that are not ASCII digits
+BAD_OFFSETS = ("99999999999999999999", "1000000000", "\u0663", "\u0661\u0662", "1_0", "+3", " 5 ", "\u00b2")
 
 
 # ================================================================== the groups: every action the backend writes is in one
@@ -174,6 +176,7 @@ def test_a_page_is_300_lines_with_the_total_of_every_line_matched(world):
     assert first["total"] == 310 and len(first["entries"]) == 300 and first["entries"][0]["detail"]["price"] == 559
     second = _search(world, group="tariffs", offset="300")
     assert second["total"] == 310 and len(second["entries"]) == 10 and second["entries"][-1]["detail"]["price"] == 250
+    assert _search(world, group="tariffs", offset="999999999")["entries"] == [] and _search(world, offset="")["offset"] == 0
 
 
 def test_a_filter_that_cannot_be_read_is_refused_in_a_sentence(world):
@@ -181,7 +184,10 @@ def test_a_filter_that_cannot_be_read_is_refused_in_a_sentence(world):
                          ({"from": "2026-13-01"}, "From is a day written as 2026-11-01"), ({"to": "11/11/2026"}, "To is a day written as 2026-11-01"),
                          ({"from": "2026-11-12", "to": "2026-11-11"}, "From must be on or before To"),
                          ({"q": "x" * 201}, "The search is text of at most 200 characters"),
-                         ({"offset": "-1"}, "The offset is a whole number from 0"), ({"offset": "two"}, "The offset is a whole number from 0")):
+                         ({"offset": "-1"}, "The offset is a whole number from 0"), ({"offset": "two"}, "The offset is a whole number from 0"),
+                         # ASCII digits only, at most nine (the founder's lists' rule, UX K2 check): too large for SQLite was a server error, and
+                         # "٣", "1_0", "+3" and " 5 " were read as numbers (UX K34 check)
+                         *(({"offset": odd}, "The offset is a whole number from 0") for odd in BAD_OFFSETS)):
         r = world.c["admin"].get(SEARCH, params=params)
         assert r.status_code == 422 and r.json()["detail"] == said, (params, r.text)
 
@@ -258,7 +264,8 @@ def test_the_founder_s_trail_is_filtered_by_kind_company_days_and_search_each_li
     assert _ok(c.get("/api/founder/audit", params={"to": "2020-01-01"}))["total"] == 0
     for params, status, said in (({"group": "people"}, 422, "The kind of change is one of signins, refused, companies, accounts, backups, requests"),
                                  ({"company": "no-such-company"}, 404, "No such company"), ({"from": "yesterday"}, 422, "From is a day written as 2026-11-01"),
-                                 ({"offset": "-1"}, 422, "The offset is a whole number from 0")):
+                                 ({"offset": "-1"}, 422, "The offset is a whole number from 0"),
+                                 *(({"offset": odd}, 422, "The offset is a whole number from 0") for odd in BAD_OFFSETS)):
         r = c.get("/api/founder/audit", params=params)
         assert r.status_code == status and r.json()["detail"] == said, (params, r.text)
     # the founder's session only
@@ -275,6 +282,10 @@ def test_schema_5_keeps_each_founder_line_s_company_and_fills_the_lines_before_f
     _ok(c.patch(f"/api/founder/companies/{mill['id']}", json={"name": "Faisal Mills"}))
     twin_a = _company(c, "Twin", {"email": "a@twin.test", "name": "A Twin", "password": "a first password 1", "one_time": False})["company"]
     _company(c, "Twin Two", {"email": "b@twin.test", "name": "B Twin", "password": "b first password 1", "one_time": False})
+    # a name given up in a rename and taken by a later company (UX K34 check: the first company's lines were given to the later one)
+    first_dev = _company(c, "Development", {"email": "a@dev.test", "name": "A Dev", "password": "a first password 1", "one_time": False})["company"]
+    _ok(c.patch(f"/api/founder/companies/{first_dev['id']}", json={"name": "Renamed Mills"}))
+    later_dev = _company(c, "Development", {"email": "b@dev.test", "name": "B Dev", "password": "b first password 1", "one_time": False})["company"]
     path = platformdb.db_path()
     with closing(sqlite3.connect(path)) as con:                                   # back to schema 4, as a server of before holds it
         con.execute("UPDATE companies SET name = 'Twin' WHERE name = 'Twin Two'")
@@ -301,6 +312,11 @@ def test_schema_5_keeps_each_founder_line_s_company_and_fills_the_lines_before_f
     assert next(x["company_id"] for x in lines if x["action"] == "added a membership" and x["target"] == "x@y.test") == mill["id"]
     assert next(x["company_id"] for x in lines if x["target"] == "Gone Ltd") == ""
     assert {x["company_id"] for x in lines if x["action"] == "made a company" and x["target"] in ("Twin", "Twin Two")} == {""}   # two named Twin now
+    # "Development" was held by two companies in turn: its lines cannot be told apart by name, so neither company is given them; the renamed one
+    # keeps its rename by its new name
+    assert [x["company_id"] for x in lines if x["action"] == "made a company" and x["target"] == "Development"] == ["", ""], lines
+    assert next(x["company_id"] for x in lines if x["action"] == "changed a company" and x["target"] == "Renamed Mills") == first_dev["id"]
+    assert later_dev["id"] not in {x["company_id"] for x in lines}
     copies = list((path.parent / "backup").glob("platform-*-schema-v4.db"))
     assert len(copies) == 1
     with closing(sqlite3.connect(copies[0])) as con:
