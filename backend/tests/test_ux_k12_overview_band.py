@@ -165,3 +165,61 @@ def test_this_month_without_a_reading_has_no_figure_never_a_zero(world):
     month = world.c["admin"].get(f"/api/sites/{world.site}/now").json()["month"]
     assert {k: month[k] for k in ("peak_import_kwh", "pv_self_pct", "outages", "outages_covered", "unserved_kwh", "battery_cycles")} == dict.fromkeys(
         ("peak_import_kwh", "pv_self_pct", "outages", "outages_covered", "unserved_kwh", "battery_cycles"))
+
+
+# ------------------------------------------------------------------------------------------------ K12 check
+
+def test_with_no_plan_in_force_the_band_reads_the_newest_solve_its_guard_held_or_that_failed(world):
+    """K12 check: the first solve held back by its guard (or one that failed) left /now with nothing to say: no plan was in force, so there was no
+    `plan.latest_attempt`, and nothing ran out. The top-level `latest_attempt` now carries that solve wherever no plan is in force, for the band's warn
+    line and "Re-solve now" (D2.3, D2.13); a plan in force keeps its own (`plan.latest_attempt`), and a pause, a release or a native block is the
+    control chip's."""
+    a, v, sid = world.c["admin"], world.c["viewer"], world.site
+    t0 = _now() // 900 * 900
+    assert a.get(f"/api/sites/{sid}/now").json()["latest_attempt"] is None      # no solve yet
+    with world.use():
+        held = _plan_row(sid, "held", t0 - 900, t0 + 86400, reason="guard_soc_floor")
+    want = {"id": held, "status": "held", "reason": "guard_soc_floor", "generated_at": karachi(t0 - 900)}
+    for c in (a, v):                                                            # words and a time: a viewer reads it too
+        got = c.get(f"/api/sites/{sid}/now").json()
+        assert (got["plan"], got["plan_expired_at"], got["latest_attempt"]) == (None, None, want)
+        assert got["latest_attempt"]["generated_at"].endswith(KARACHI)
+    with world.use(), store.connect() as con:
+        con.execute("UPDATE plans SET status = 'failed', reason = 'infeasible' WHERE id = ?", (held,))
+    assert a.get(f"/api/sites/{sid}/now").json()["latest_attempt"] == {**want, "status": "failed", "reason": "infeasible"}
+    # a plan in force: the top-level field is null, and a newer failed solve is the plan's own latest_attempt
+    pid = _fake_plan(world)
+    got = a.get(f"/api/sites/{sid}/now").json()
+    assert got["plan"]["id"] == pid and got["plan"]["latest_attempt"] is None and got["latest_attempt"] is None
+    with world.use():
+        bad = _plan_row(sid, "failed", t0 + 60, t0 + 86400, reason="timeout")
+    got = a.get(f"/api/sites/{sid}/now").json()
+    assert got["plan"]["latest_attempt"]["id"] == bad and got["latest_attempt"] is None
+    # the plan ran out and the solves since failed: no plan in force, when it ran out, and the newest failed solve
+    with world.use(), store.connect() as con:
+        con.execute("UPDATE plans SET valid_until = ? WHERE id = ?", (_iso(t0 - 600), pid))
+    got = a.get(f"/api/sites/{sid}/now").json()
+    assert got["plan"] is None and got["plan_expired_at"] == karachi(t0 - 600)
+    assert got["latest_attempt"] == {"id": bad, "status": "failed", "reason": "timeout", "generated_at": karachi(t0 + 60)}
+    # released to native: the control chip says why no plan is in force
+    until = datetime.fromtimestamp(_now() + 7200, PKT).isoformat()
+    assert a.post(f"/api/sites/{sid}/overrides", json={"kind": "force_native", "until": until}).status_code == 200
+    got = a.get(f"/api/sites/{sid}/now").json()
+    assert (got["plan"], got["plan_expired_at"], got["latest_attempt"], got["control"]["key"]) == (None, None, None, "native")
+
+
+def test_this_month_has_no_unserved_load_or_cycles_where_no_day_row_carries_them_never_a_zero():
+    """K12 check: a month whose day rows carry no `unserved_kwh` and no `discharge_kwh` (rows stored without them) read 0 kWh unserved and 0 battery
+    cycles, a missing key counted as 0. Each is now None where no day row of the month carries it, as the fleet's totals are; a row that carries it
+    gives the month its figure."""
+    site = {"id": "s", "connections": [{"data": {"regime": "net_metering"}}]}
+    rows = [{"day": "2026-11-01", "pv_kwh": 100.0, "export_kwh": 0.0}, {"day": "2026-11-02", "pv_kwh": 80.0}]
+    got = routes_sites._month_energy(site, rows, {"e_nom_kwh": 200.0}, (None, None))
+    assert (got["unserved_kwh"], got["battery_cycles"], got["pv_self_pct"]) == (None, None, 100.0)
+    rows[1].update(unserved_kwh=2.5, discharge_kwh=50.0)
+    got = routes_sites._month_energy(site, rows, {"e_nom_kwh": 200.0}, (None, None))
+    assert (got["unserved_kwh"], got["battery_cycles"]) == (2.5, 0.25)
+    # a day of zero is a figure: 0, not None
+    rows[1].update(unserved_kwh=0.0, discharge_kwh=0.0)
+    got = routes_sites._month_energy(site, rows, {"e_nom_kwh": 200.0}, (None, None))
+    assert (got["unserved_kwh"], got["battery_cycles"]) == (0.0, 0.0)

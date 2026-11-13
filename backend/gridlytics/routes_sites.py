@@ -906,6 +906,25 @@ BILL_SO_FAR_REUSE_S = 900
 _BILL_SO_FAR = _Kept(BILL_SO_FAR_REUSE_S)
 
 
+def _attempt(row) -> dict:
+    """A solve that made no plan in force, for the band's warn line (UX backend ask K12): {id, status (failed or held), reason (the code the Plan page
+    words), generated_at (Karachi time)}."""
+    return {"id": row["id"], "status": row["status"], "reason": row["reason"] or None, "generated_at": karachi(row["generated_at"])}
+
+
+def _attempt_without_plan(site_id: str, now: int) -> dict | None:
+    """The newest solve when no plan is in force and it failed or its guard held it (the first plan held back, or every solve since the last plan
+    failed): the band's warn line and "Re-solve now" (UX K12 check; plan D2.3, D2.13), which `plan.latest_attempt` gives only beside a plan in
+    force. None while a pause, a release or a native block is in force (the control chip says why no plan is), and when the newest solve made a
+    plan or none was made."""
+    if plans.control_release(site_id, now):
+        return None
+    with store.connect() as con:
+        r = con.execute("SELECT id, status, reason, generated_at FROM plans WHERE site_id = ? ORDER BY generated_at DESC, rowid DESC LIMIT 1",
+                        (site_id,)).fetchone()
+    return _attempt(r) if r is not None and r["status"] in ("failed", "held") else None
+
+
 def _plan_facts(plan: dict | None) -> dict | None:
     """The plan in force for the Overview's band (UX backend ask K12; plan D9.2, D2.3): its id, when it was made and until when it stands (ISO 8601,
     Karachi time), its status in words and its forecasts' stage, and the newest solve when it failed or its guard held it after this plan was made
@@ -917,8 +936,7 @@ def _plan_facts(plan: dict | None) -> dict | None:
     late = plan.get("latest_attempt")
     return {"id": plan["id"], "generated_at": karachi(plan.get("generated_at")), "valid_until": karachi(plan.get("valid_until")),
             "status_label": summary.get("status_label"), "stage": summary.get("stage"),
-            "latest_attempt": None if not late else {"id": late["id"], "status": late["status"], "reason": late.get("reason") or None,
-                                                     "generated_at": karachi(late.get("generated_at"))}}
+            "latest_attempt": _attempt(late) if late else None}
 
 
 def _plan_expired_at(site_id: str, now: int) -> str | None:
@@ -980,18 +998,22 @@ def _month_energy(s: dict, tdays: list[dict], bs: dict | None, outages: tuple[in
     """The month's energy figures for the Overview's This month tiles (UX backend ask K12; plan D9.2, D2.9), from the month's day rows: the grid import
     bought in the peak windows, the share of the solar made used on site, the outages and those covered, and the swap tiles' unserved load (off-grid)
     and battery cycles (no genset, off-grid; the discharge over the pack's capacity at its present health, as today's). Each None without its data
-    (no row this month, no solar made, no battery, no grid), never a zero; the peak import also None while a day of the month has no peak figure
-    (its tariff calendar unreadable), never a part of the month."""
+    (no row this month, no row carrying the figure, no solar made, no battery, no grid), never a zero; the peak import also None while a day of the
+    month has no peak figure (its tariff calendar unreadable), never a part of the month."""
     if not tdays:
         return {"peak_import_kwh": None, "pv_self_pct": None, "outages": outages[0], "outages_covered": outages[1], "unserved_kwh": None,
                 "battery_cycles": None}
     off_grid = _off_grid(s, (s.get("connections") or [None])[0])
-    total = lambda k: sum((d.get(k) or 0) for d in tdays)  # noqa: E731
+    # the month's sum of a figure over the day rows that carry it; None where none does, never a zero (UX K12 check: a row stored without
+    # `unserved_kwh` or `discharge_kwh` counted as 0, so such a month read "0 kWh unserved" and "0 cycles")
+    total = lambda k: (sum(d[k] for d in tdays if d.get(k) is not None) if any(d.get(k) is not None for d in tdays) else None)  # noqa: E731
     peaks = [d.get("peak_import_kwh") for d in tdays]
     e_nom = (bs or {}).get("e_nom_kwh")
+    unserved, dis = total("unserved_kwh"), total("discharge_kwh")
     return {"peak_import_kwh": None if off_grid or any(p is None for p in peaks) else round(sum(peaks), 1),
             "pv_self_pct": _self_pct(total("pv_kwh"), total("export_kwh")), "outages": outages[0], "outages_covered": outages[1],
-            "unserved_kwh": round(total("unserved_kwh"), 1), "battery_cycles": round(total("discharge_kwh") / e_nom, 2) if e_nom else None}
+            "unserved_kwh": None if unserved is None else round(unserved, 1),
+            "battery_cycles": round(dis / e_nom, 2) if dis is not None and e_nom else None}
 
 
 def _grid_bill(s: dict, t: date) -> tuple[float | None, dict | None]:
@@ -1074,6 +1096,8 @@ def site_now(site_id: str):
                 # the band's plan facts and today's apply mark (UX backend ask K12): the plan in force with its times in Karachi time, when the last
                 # plan ran out where that is why none is in force, and who marked today's table applied
                 "plan": _plan_facts(plan), "plan_expired_at": None if plan else _plan_expired_at(site_id, now),
+                # the newest solve, held or failed, where no plan is in force (beside a plan in force it is plan.latest_attempt; UX K12 check)
+                "latest_attempt": None if plan else _attempt_without_plan(site_id, now),
                 "applied_today": _applied_today(site_id, t), "today": td,
                 "month": {"import_kwh": sum_("import_kwh"), "pv_kwh": sum_("pv_kwh"), "genset_hours": sum_("genset_hours"), "litres": fuel["litres"],
                           "litres_source": fuel["litres_source"],
