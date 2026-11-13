@@ -562,6 +562,50 @@ genset was saved before, so no migration or copy of the company's file was neede
   Set-up) and while there is no such connection. On `/api/meta` rather than a new site's answer: step C of a site's second connection needs it too.
   No money (flags only).
 
+### Batch k6, the check (13 Nov 2026)
+
+Independent checkers read K5, K6, K7, K9, K10 and K11; each finding was tried against the code, and all seven held (all low). Each was fixed with a
+test that fails without the fix (`test_ux_k06_check`, and the K5, K6, K9 and K10 tests), checked on the trees before the fix and before each route
+("UX K05/K06/K09/K10 check" commits). What changed:
+
+- **The reserve's floor is the plan's** (K6). Set-up's reserve took the delivered floor (`plans.delivered_floor_pct`) while the plan caps it at the
+  battery's highest state of charge (`soc_floor_grid`), so a floor typed at 100 % with the top at 95 % counted 43.78 kWh where the plan holds 41.34.
+  One helper now gives the plan's floor (`plans.grid_floor`) to both, and a floor typed above the highest state of charge is a site warning ("The
+  reserve floor (100 %) is above the battery's highest state of charge (95 %): the plan holds the reserve at 95 %"), on every site answer. Golden:
+  (0.95 - 0.10) x 51.2 x 0.95 = 41.34 kWh, 41.3 minutes of 60 kW.
+- **The reserve reads the site as it would be, as the warnings do** (K6). A typed inverter with a problem gave the reserve no inverter (the
+  battery's own 100 kW) while the warnings in the same answer read the stored 30 kW; and any problem in the site's fields (an empty name) held the
+  reserve back with that unrelated sentence. Now a field with a problem counts as stored (`setup_check._site_section`: the site's fields that have
+  none over the stored ones), the warnings and the reserve read that one site, and only a problem in the reserve's own fields (the critical load,
+  the reserve policy) or the battery holds it back. This replaces the batch's "a section with problems counts as stored" for the site's fields.
+- **A negative hour of the critical load is refused** (K6, a gap from before the batch): each hour is 0 to 100,000 kW
+  (`sites.SiteFields.critical_load_kw`, plan C7.3: "0 or more; 24 values"), on save ("The critical load (kW) must be at least 0") and in the check
+  (on "site.critical_load_kw.5", step D).
+- **The check agrees with the save for the reader's role** (K6). An operator's check of a changed reserve floor, value of lost load or battery
+  replacement cost was ok, with the reserve worked out from the floor the operator cannot set, and the save then refused it with 403. Nothing
+  leaked (no money reached the operator; nothing was written), but Set-up said a step was fine that the role cannot save. The check now adds the
+  save's own refusal as a problem on each field it concerns, by the saves' own rules (`routes_sites._validate_refusals`: `_limits_changed` field
+  by field without `manage_sites`; `_need_money_settings`' comparison without `edit_money_settings`, the equipment's after `_with_held_money`; an
+  unticked asset whose money settings an administrator set, as `asset_delete`), in their words (`auth.need`'s, given without raising it; `auth.py`
+  is lifted from Solarlytics and is left as reviewed, so the test holds each sentence equal to the save's own 403): "Changing the site's control
+  limits is for an administrator". A limit or money setting sent as stored is no change. A role problem on the reserve's own fields holds the
+  reserve back, as any problem there does. Taking the stored value instead was not chosen: the save refuses, it does not take the stored value,
+  and the check's answer is the save's.
+- **The peak windows are the engine's rule** (K5). The strip repeated the calendar's choice and the in-peak test. `tariffs.calendar_version` (the
+  calendar a connection is priced on, with its source and version; `calendar_for` now reads it) and `tariffs.peak_share_by_hour` (each hour's share
+  of its four 15-minute steps that `is_peak_local` marks peak, as the price vector marks them) make it; the same figures for every window on the
+  quarter hours (every shipped one), and a window that did not start on one is drawn as the prices treat it. Tested: with the in-peak rule moved,
+  the strip and the day's `peak` move together; a site override's own window is the strip's.
+- **"Saved last" is the order of the saves** (K10). The connection's `updated` stamp is to the second and the rows' order is the order they were
+  made, so a re-save in the same second as another site's newer row lost, and moving the plant's mark onto one connection stamped the other,
+  which was not saved. The order is now the audit trail's "saved a connection" lines (the newest whose connection is still the company's grid
+  connection at a live site that is no demo; one with no line, by its stamp as before); `saved_at` is that save's moment. This replaces the batch's
+  "last saved is the connection's updated stamp (to the second), then the order rows were made". Tested with two saves in one second and with
+  the plant's mark moved; another company's connection saved later is never this company's.
+- **The isolation tests prove the route** (K5, K6, K9). Each first reads the company's own site (200), then another company's site with a
+  connection (and a battery for the check) for every role that reads the route: 404 "No such site", the route's own refusal, not an unserved path.
+  The K9 role test reads the rows themselves (`sample`) for the administrator and the operator, so it fails without K9.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in
