@@ -101,6 +101,42 @@ def test_a_kind_kept_from_a_role_held_before_is_not_offered_or_read(world):
     got = _get(world, "viewer")
     assert (got["follow"], got["email"], got["email_kinds"]) == (["Data"], True, ["Reserve"]), got
     assert world.c["viewer"].get("/api/alerts/counts").json()["following"] == ["Data"]
+    # every kind chosen for email was of the role held before: nothing is emailed, so email reads off (UX K33 check: it read on with no kind)
+    with world.use():
+        store.set_setting(alerts.notify_key(_user_id(world, "viewer")), {"follow": ["Data"], "email": True, "email_kinds": ["Savings", "Tariff"]})
+    got = _get(world, "viewer")
+    assert (got["follow"], got["email"], got["email_kinds"]) == (["Data"], False, []), got
+    got = world.c["viewer"].put("/api/platform/notifications", json={"follow": ["Data", "Genset"]}).json()
+    assert (got["follow"], got["email"], got["email_kinds"]) == (["Data", "Genset"], False, []), got
+    assert _get(world, "viewer") == got
+
+
+def test_a_save_keeps_the_kinds_the_role_does_not_receive_so_a_role_given_more_lists_them(world):
+    """Today's page sends `follow` with every save. A save of the kinds a viewer receives must not unfollow the kinds the role does not give: made an
+    operator later, the person's inbox and badge list Control alerts too (plan G3.4: "the inbox and the counts must stay complete"; UX K33 check)."""
+    v = world.c["viewer"]
+    offered = _get(world, "viewer")["categories"]
+    assert v.put("/api/platform/notifications", json={"follow": offered, "email": True}).status_code == 200
+    with world.use():
+        alerts._open(world.site, "edge_offline", "Control", "critical", "The edge has been silent for 20 minutes", {})
+        alerts._open(world.site, "data_stale", "Data", "warning", "No data for 40 minutes", {})
+    assert v.get("/api/alerts/counts").json()["total"] == 1                           # a viewer receives no Control alert
+    r = world.c["admin"].put(f"/api/users/{_user_id(world, 'viewer')}", json={"role": "operator"})
+    assert r.status_code == 200, r.text
+    got = _get(world, "viewer")
+    assert got["follow"] == got["categories"] == [c for c in alerts.CATEGORIES if c != "Product"], got
+    counts = v.get("/api/alerts/counts").json()
+    assert counts["total"] == 2 and "Control" in (counts["following"] or counts["categories"]), counts
+    assert sorted(a["category"] for a in v.get("/api/alerts").json()) == ["Control", "Data"]
+    # a kind the role does not give keeps what was kept for it: followed until chosen, unfollowed where an earlier role's choice unfollowed it
+    op, key = world.c["operator"], alerts.notify_key(_user_id(world, "operator"))
+    for held, kept in ((None, ["Control", "Product"]), ({"follow": ["Data", "Product"]}, ["Control", "Product"]), ({"follow": ["Data"]}, ["Control"])):
+        with world.use():
+            store.set_setting(key, held)
+        got = op.put("/api/platform/notifications", json={"follow": ["Control"]}).json()
+        assert got["follow"] == ["Control"] and "Product" not in got["categories"], got
+        with world.use():
+            assert store.get_setting(key)["follow"] == kept, held
 
 
 def _user_id(w, role) -> str:

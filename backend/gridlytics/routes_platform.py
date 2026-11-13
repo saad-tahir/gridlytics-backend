@@ -86,14 +86,19 @@ def _notify_out(kept: dict | None) -> dict:
     plan G9 item 2: a viewer was offered the money kinds it never receives): the kinds the inbox and its badge list (`follow`, every kind until they
     choose), whether they want alerts by email (`email`), and which kinds by email (`email_kinds`, My account's email card; plan G3.4). Until the card
     saved its own, the kinds by email were the kinds followed when `email` was true, and none when it was false (plan G3.4's compatibility rule). A kind
-    kept from a role held before is not answered."""
+    kept from a role held before is not answered, and the card's `email` is on while one kind it keeps is received (UX K33 check: kinds of a role
+    held before alone read as email on with no kind)."""
     kept = kept if isinstance(kept, dict) else {}
     cats = alerts.reader_categories()
     follow = kept.get("follow")
     follow = [c for c in cats if c in follow] if isinstance(follow, list) else list(cats)
     email = kept.get("email") is True
     by_email = kept.get("email_kinds")
-    by_email = [c for c in cats if c in by_email] if isinstance(by_email, list) else (list(follow) if email else [])
+    if isinstance(by_email, list):
+        by_email = [c for c in cats if c in by_email]
+        email = bool(by_email)
+    else:
+        by_email = list(follow) if email else []
     return {"categories": list(cats), "follow": follow, "email": email, "email_kinds": by_email}
 
 
@@ -145,7 +150,12 @@ def notifications_put(inp=Body(...)):
     # added to their role later too)
     kept = {k: held[k] for k in ("follow", "email", "email_kinds") if k in held}
     if "follow" in inp:
-        kept["follow"] = now["follow"]
+        # the kinds the person's role does not give are not offered, so a save keeps what was kept for them (followed until chosen): a role given
+        # more kinds later lists them in the inbox and its badge (plan G3.4: "the inbox and the counts must stay complete"; UX K33 check: a
+        # viewer's save unfollowed Control, Tariff, Savings and Product, which an operator's inbox then hid)
+        was = held.get("follow")
+        kept["follow"] = [c for c in alerts.CATEGORIES
+                          if c in now["follow"] or (c not in cats and (c in was if isinstance(was, list) else True))]
     if "email_kinds" in inp:
         # the email card (plan G3.4): the kinds to email are its own, apart from the inbox's, and email is on while one is chosen
         now["email_kinds"] = _kinds(inp["email_kinds"], "email_kinds", cats)
