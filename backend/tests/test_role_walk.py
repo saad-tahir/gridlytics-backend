@@ -609,6 +609,22 @@ def test_the_alert_thresholds_limits_reach_each_reader_of_the_rules_alike_and_ho
         assert not {k for _, k, _, _ in _items(cats) if isinstance(k, str) and money.is_money(k)}, reader
 
 
+def test_the_csv_preview_reaches_the_roles_that_upload_and_carries_no_money(walk):
+    """UX backend ask K15 (plan D9.5): the upload's preview is for upload_data: the administrator and the operator read the same rows; the viewer and
+    a key (whose scopes hold no upload) are refused with no rupee; the rows are energy only."""
+    from gridlytics import money
+    client, h = walk["client"], walk["headers"]
+    sid = walk["edge_site"]
+    body = {"head": "ts,grid_present,pv_power_w,battery_power_w\n2026-03-01T00:00:00+05:00,1,1200,-300\n", "tz_offset_h": 5}
+    got = {reader: client.post(f"/api/sites/{sid}/telemetry/mapping/preview", json=body, headers=h[reader]) for reader in READERS}
+    assert {r: g.status_code for r, g in got.items()} == {"admin": 200, "operator": 200, "viewer": 403, "key": 403}
+    admin = got["admin"].json()
+    assert admin["rows"] and got["operator"].json() == admin
+    assert not {k for _, k, _, _ in _items(admin) if isinstance(k, str) and money.is_money(k)}
+    for reader in ("viewer", "key"):
+        assert not any(RUPEES.search(s) for s in _strings(got[reader].json())), reader
+
+
 def test_each_reader_is_offered_the_alert_kinds_it_receives_for_email(walk):
     """UX backend ask K33 (plan G9 item 2): the notification choices offer each person the kinds of alert its role receives, as the inbox does: the
     viewer the five energy kinds, the operator every kind but Product, the administrator all nine; a key has no choices (403)."""

@@ -649,6 +649,21 @@ committed (backend 1753 passed; web gates clean). Two defects were found and fix
   operator too, who may not list keys). A partner tool's key is not the box's: only `kind` edge counts, as only an edge device's key sends the box's
   heartbeats. Nothing of the key itself is answered (no prefix, id or name); the checklist's "by AK" is left out, since who made a key is the key
   list's (`manage_users`), not something an operator needs to tick item 1.
+- **K15, the CSV upload's preview** (plan D9.5, C11.4 stage 2): `POST /sites/:id/telemetry/mapping/preview` (`upload_data`, as the upload and the
+  guess) takes the file's head (the first 64 KB the page already reads for the guess), the mapping as set (`PUT /telemetry/mapping`'s shape; left
+  out, the columns are read by their names) and `tz_offset_h` (as the upload; the page sends 5 for Karachi time), and answers the first five rows
+  as the upload will store them: `at` in Karachi time, `values` each key in its stored unit and the product's sign, the grid's and the genset's
+  state as true or false, an impossible or unreadable reading null. Nothing is written. The upload's header reading, row order (the last row of a
+  repeated minute), grid signal, step and value checks are one function each now (`telemetry._layout`, `_in_order`, `_grid_read`, `_step_of`,
+  `_grid_from_voltage`), read by `import_csv` and `preview_csv` alike, so the preview refuses what the upload refuses, in the same words, and a file
+  previewed then uploaded is stored as the preview said (tested minute by minute). Decisions the plan left open:
+  - **Stored order, not file order.** "As Gridlytics will store them": the rows in time order, a repeated minute's last row. For a logger's file
+    (in time order) this is the file's order.
+  - **An energy column is the row's own figure.** A 15-minute row's 3 kWh is stored as 200 Wh in each of its minutes; the preview shows the row's
+    3,000 Wh with `step_min` 15, the figure a person checks against the file.
+  - **A head cut in the middle of a line** reads its last line only when it has as many cells as the header (the guess's own rule).
+  - **Values to six decimals**, so 30.1 kW reads 30100, not a float's 30100.000000000004.
+  - Owner's question Q47 (the CSV upload moves to Set-up › Data and devices with a server preview of the first rows): the recommended yes ships.
 - **K16, the alert thresholds' defaults and ranges** (plan D9.6, D6.3): every rule of every rules answer (`GET` and `PUT /api/alerts/rules`, a
   site's `rules` in `GET` and `PUT /api/alerts/rules/sites/:id`) carries `limits`, each threshold's `{default, min, max}` straight from
   `alerts.THRESHOLDS`, so the editor writes "Default 15 · 5 to 1,440" and a save holds the same range. The Data category's staleness has no default

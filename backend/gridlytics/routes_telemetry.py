@@ -205,6 +205,31 @@ def mapping_guess(site_id: str, inp: dict = Body(...)):
     return telemetry.guess_mapping(body.head, saved["mapping"] if saved else None)
 
 
+class PreviewIn(Strict):
+    """`POST /sites/:id/telemetry/mapping/preview` (UX backend ask K15; plan D9.5, C11.4): the file's head and the mapping as the person has set it."""
+    #: the file's first lines (the web app sends its first 64 KB, as for the guess); a last line cut short is not read
+    head: str = Field(..., min_length=1, max_length=65536, title="The start of the file")
+    #: the column mapping as set (PUT /telemetry/mapping's shape); left out, the columns are read by their names
+    mapping: MappingIn | None = None
+    #: the hours the file's times are ahead of UTC (the upload's tz_offset_h: 5 for Karachi time, 0 for UTC); a time written with its own offset is read
+    #: as written
+    tz_offset_h: float = Field(0.0, ge=-23, le=23, strict=True, title="The time zone offset (hours from UTC)")
+
+
+@router.post("/api/sites/{site_id}/telemetry/mapping/preview")
+def mapping_preview(site_id: str, inp: dict = Body(...)):
+    """How the upload will read a file (UX backend ask K15; plan D9.5): its first five rows as they will be stored, in Karachi time and the product's
+    units and signs, read from the file's head with the mapping as set, by the upload's own rules (telemetry.preview_csv). Nothing is stored; what the
+    upload refuses is refused here in the same words (422). upload_data, as the upload."""
+    auth.need("upload_data", "Previewing a file's rows")
+    site_or_404(site_id)
+    body = check(PreviewIn, inp)
+    try:
+        return telemetry.preview_csv(body.head, body.tz_offset_h, body.mapping.model_dump() if body.mapping else None)
+    except ValueError as exc:
+        raise bad(exc) from None
+
+
 @router.get("/api/sites/{site_id}/telemetry/export.csv")
 def export(site_id: str, start: str | None = None, end: str | None = None):
     auth.need("export", "Exporting data")

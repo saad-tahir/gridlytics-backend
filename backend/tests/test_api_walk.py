@@ -291,6 +291,26 @@ def test_every_role_reads_the_alert_thresholds_defaults_and_ranges(world):
         assert client.get("/api/alerts/rules", headers=h).json()["Data"]["limits"]["gap_hours"] == {"default": 1.0, "min": 0.25, "max": 24}, email
 
 
+def test_the_roles_that_upload_preview_a_file_s_first_rows(world):
+    """UX backend ask K15 (plan step 9d, the CSV upload's stage 2): POST /telemetry/mapping/preview answers the first five rows as the upload will store
+    them, in Karachi time, to the roles that upload (the administrator, the operator), and refuses the analyst and the viewer; nothing is stored."""
+    client, password, _ = world
+    head = "Time,Grid,Load (kW)\n2026-03-01 00:00,on,30.1\n2026-03-01 00:01,on,30.0\n"
+    body = {"head": head, "mapping": {"columns": {"Time": {"key": "ts"}, "Grid": {"key": "grid_present"},
+                                                  "Load (kW)": {"key": "load_power_w", "unit": "kW"}}}, "tz_offset_h": 5}
+    for email, status in (("owner@onyxleaf.demo", 200), ("operator@onyxleaf.demo", 200), ("analyst@onyxleaf.demo", 403), ("viewer@onyxleaf.demo", 403)):
+        h = _login(client, password, email)
+        sid = client.get("/api/fleet", headers=h).json()["sites"][0]["id"]
+        imports = len(client.get(f"/api/sites/{sid}/telemetry/quality", headers=h).json().get("imports") or [])
+        r = client.post(f"/api/sites/{sid}/telemetry/mapping/preview", json=body, headers=h)
+        assert r.status_code == status, (email, r.text[:200])
+        if status == 200:
+            rows = r.json()["rows"]
+            assert [x["at"] for x in rows] == ["2026-03-01T00:00:00+05:00", "2026-03-01T00:01:00+05:00"], rows
+            assert rows[0]["values"] == {"grid_present": True, "load_power_w": 30100.0}, rows
+        assert len(client.get(f"/api/sites/{sid}/telemetry/quality", headers=h).json().get("imports") or []) == imports, email
+
+
 def test_my_account_offers_each_role_the_alert_kinds_it_receives(world):
     """UX backend ask K33 (plan step 14b): the email card's kinds are those each role receives (an operator eight, a viewer five); a kind not received
     is refused in words; ticking kinds for email leaves the inbox's own list as it was."""

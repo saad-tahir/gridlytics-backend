@@ -829,34 +829,18 @@ def _write_days(site_id: str, ts: np.ndarray, cols: dict, texts: dict, spans: np
     return {"accepted": accepted, "overlap": overlap}
 
 
-def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
-               file_name: str | None = None, ts_format: str = "auto") -> dict:
-    """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
-    `duplicates` the rows dropped, both in the notes); rows 2 to 60 minutes apart are stored as the minutes each covers (`step_min`, `minutes`; see
-    _write_days), rows further apart are refused; gaps over 5 minutes (or over the step) are reported. A file in which no row's grid_present (or
-    grid_voltage_v) can be read is refused; on and off, true and false, yes and no are read as 1 and 0. Implausible readings are checked
-    (_check_values: impossible cells stored as missing, probable unit slips named). What may make the import wrong is listed in
-    `warnings` (also at the end of `log`), and the import's `status` is then "done_with_warnings", not "done".
+class _Layout:
+    """How a CSV is read (`_layout`): its mapping, date order, separator and decimal mark, header, each column's key, the notes of the header, each
+    mapped key's factor (its unit and sign) and each key's column."""
 
-    The file is read once, in one streamed pass, into a column of numbers per key (_read_columns), so the import's memory is a small multiple of the
-    file's, and the minutes are written one Karachi day per transaction, each day aggregated after its write (_write_days; audit R7 performance-live-04:
-    the file was decoded and parsed twice, a dict and a tuple per row, and written in one transaction that every reader and writer waited for).
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
 
-    The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
-    nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
-    rows are aggregated. Times are read by csv_time in `ts_format` (ISO 8601 or epoch seconds by default); a file in which none can be read is refused
-    with the formats read, a file over UPLOAD_MAX_BYTES with TOO_LARGE, and a time-zone offset outside -23 to 23 hours in one sentence. The imports row
-    keeps the uploaded range (`from_ts`, `to_ts`) and the file's name when given (`file_name`, see _file_name).
 
-    `mapping` (see mapping_of; flow-telemetry-plan-control-12) reads a vendor's columns as the product's keys, in their units and signs, and its
-    `ts_format` (day-first or month-first dates) when `ts_format` is left "auto". Cells separated by ";" or tabs, with decimal commas, are read
-    (_dialect). A file without a ts column, or without a grid signal, is refused with the columns it has."""
-    if len(content) > UPLOAD_MAX_BYTES:
-        raise ValueError(TOO_LARGE)
-    try:
-        timezone(timedelta(hours=tz_offset_h))
-    except (ValueError, OverflowError, TypeError):
-        raise ValueError("The timezone offset is hours from UTC, between -23 and 23") from None
+def _layout(content: bytes, mapping: dict | None, ts_format: str) -> _Layout:
+    """A file's header read as the upload reads it, and its refusals (ValueError, in one sentence): a mapping that cannot be read, no header, no time
+    column, a time of day without its date, no grid signal. The upload (import_csv) and its preview (preview_csv; UX backend ask K15) read a file by
+    this one function, so the preview refuses what the upload refuses, in the same words."""
     m = mapping_of(mapping)
     if ts_format == "auto":
         ts_format = m["ts_format"]
@@ -900,49 +884,56 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     for i, f in enumerate(fields):
         if names.get(f) in MAPPING_KEYS:
             at[names[f]] = i  # a name given twice: its last column, as a reader by name keeps
-    parsed, bad_ts, first_bad = _read_columns(content, delim, decimal, at, scale, tz_offset_h, ts_format)
-    if not parsed.ts:
-        raise ValueError(_no_times(first_bad, ts_format))
-    now = _now_ts() if now is None else int(now)
-    ts = np.frombuffer(parsed.ts, dtype=np.int64)
-    _check_window(ts, now)  # before anything is written
-    if bad_ts:
-        log.append(f"{bad_ts} rows without a readable ts were skipped")
-    # duplicate times keep the last row (plan Part 7.5) and are counted once: a stable sort keeps, of two rows with one time, the later in the file later
+    return _Layout(m=m, ts_format=ts_format, delim=delim, decimal=decimal, fields=fields, names=names, log=log, scale=scale, at=at)
+
+
+def _in_order(ts: np.ndarray, parsed: _Columns) -> tuple[np.ndarray, dict, dict, dict, int]:
+    """A file's parsed rows in time order, each minute once: duplicate times keep the last row (plan Part 7.5) and are counted once (a stable sort keeps,
+    of two rows with one time, the later in the file later). Returns (times, number columns, unreadable cells, text columns, rows dropped). A file in
+    time order without repeats (the usual one) keeps the parsed columns as they are, not copied; otherwise each parsed column is let go once reordered."""
     order = np.argsort(ts, kind="stable")
     minute = ts[order] // 60
     order = order[np.r_[minute[1:] != minute[:-1], True]]
     duplicates = len(ts) - len(order)
     del minute
     if duplicates == 0 and bool(np.all(order[1:] > order[:-1])):
-        # a file in time order without repeats (the usual one): the parsed columns are used as they are, not copied
         cols = {k: np.frombuffer(v, dtype=float) for k, v in parsed.num.items()}
         bad = {k: np.frombuffer(v, dtype=bool) for k, v in parsed.bad.items()}
         texts = parsed.text
-    else:  # one column at a time, each parsed column let go once reordered
+    else:
         ts = ts[order]
         cols = {k: np.frombuffer(parsed.num.pop(k), dtype=float)[order] for k in list(parsed.num)}
         bad = {k: np.frombuffer(parsed.bad.pop(k), dtype=bool)[order] for k in list(parsed.bad)}
         texts = {k: [v[i] for i in order.tolist()] for k, v in parsed.text.items()}
-    del parsed, order
-    if duplicates:
-        log.append(f"{duplicates:,} row{'s repeat' if duplicates != 1 else ' repeats'} a minute that a later row of the file also gives: the last row "
-                   f"of each minute was kept")
-    n = len(ts)
-    # grid_present is what the product sees outages by: a file in which no row's grid signal can be read is refused, and unreadable cells are a warning
-    warnings: list[str] = []
+    return ts, cols, bad, texts, duplicates
+
+
+def _repeats_note(duplicates: int) -> str:
+    return (f"{duplicates:,} row{'s repeat' if duplicates != 1 else ' repeats'} a minute that a later row of the file also gives: the last row of each "
+            f"minute was kept")
+
+
+def _grid_read(cols: dict, bad: dict, n: int) -> tuple[list[str], np.ndarray]:
+    """grid_present is what the product sees outages by: a file in which no row's grid signal (grid_present, or grid_voltage_v) can be read is refused
+    (ValueError), and unreadable grid cells are a warning. Returns (the warnings, where the voltage was read)."""
     none = np.zeros(n, dtype=bool)
     grid_read = ~np.isnan(cols["grid_present"]) if "grid_present" in cols else none
     volt_read = ~np.isnan(cols["grid_voltage_v"]) if "grid_voltage_v" in cols else none
     if not (grid_read | volt_read).any():
         raise ValueError("No row's grid_present (or grid_voltage_v) can be read: write grid_present as 1 for grid on and 0 for grid off (on and off "
                          "are read too) and upload again; the product cannot see outages without it")
+    warnings = []
     unreadable_grid = int(np.sum(~grid_read & ~volt_read & bad["grid_present"])) if "grid_present" in bad else 0
     if unreadable_grid:
         warnings.append(f"{unreadable_grid:,} grid_present cell{'s' if unreadable_grid != 1 else ''} could not be read (1 is grid on, 0 is grid off): "
                         f"the grid is stored as unknown in those minutes, so an outage in them is not seen")
-    # the logger's interval: the most common step between rows, in whole minutes (the shorter on a tie). A 5- or 15-minute row is stored as the minutes it
-    # starts (up to the next row), so its energy, the day's peak and its outage minutes are counted in full (audit R7)
+    return warnings, volt_read
+
+
+def _step_of(ts: np.ndarray) -> tuple[int, np.ndarray, np.ndarray]:
+    """The logger's interval: the most common step between rows, in whole minutes (the shorter on a tie), refused (ValueError) over STEP_MAX_MIN; with
+    the steps between rows and the minutes each row stands for. A 5- or 15-minute row is stored as the minutes it starts (up to the next row), so its
+    energy, the day's peak and its outage minutes are counted in full (audit R7)."""
     diffs = np.diff(ts // 60)
     if len(diffs):
         values, counts = np.unique(diffs, return_counts=True)
@@ -952,10 +943,70 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
     if step > STEP_MAX_MIN:
         raise ValueError(f"Rows are {step} minutes apart: the import reads rows at most {STEP_MAX_MIN} minutes apart; upload the logger's "
                          f"1-, 5- or 15-minute rows")
-    spans = np.r_[np.minimum(step, diffs), step].astype(np.int64)
+    return step, diffs, np.r_[np.minimum(step, diffs), step].astype(np.int64)
+
+
+def _step_note(step: int) -> str:
+    return (f"Rows are {step} minutes apart: each row was stored as the {step} minutes it starts, its readings held over them and its energy "
+            f"({', '.join(INTERVAL_ENERGY)}) spread evenly")
+
+
+def _grid_from_voltage(cols: dict, volt_read: np.ndarray, n: int) -> None:
+    """grid_present from the voltage where the file gives none (plan Part 7.5; 180 V to confirm); an unreadable voltage stays unknown."""
+    if "grid_voltage_v" in cols:
+        grid = cols.get("grid_present", np.full(n, np.nan))
+        derive = np.isnan(grid) & volt_read
+        grid[derive] = (cols["grid_voltage_v"][derive] >= 180).astype(float)
+        cols["grid_present"] = grid
+
+
+def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None,
+               file_name: str | None = None, ts_format: str = "auto") -> dict:
+    """A CSV upload: one row per minute; blanks are missing; duplicate times keep the last row and are counted once (`rows` is the distinct rows kept,
+    `duplicates` the rows dropped, both in the notes); rows 2 to 60 minutes apart are stored as the minutes each covers (`step_min`, `minutes`; see
+    _write_days), rows further apart are refused; gaps over 5 minutes (or over the step) are reported. A file in which no row's grid_present (or
+    grid_voltage_v) can be read is refused; on and off, true and false, yes and no are read as 1 and 0. Implausible readings are checked
+    (_check_values: impossible cells stored as missing, probable unit slips named). What may make the import wrong is listed in
+    `warnings` (also at the end of `log`), and the import's `status` is then "done_with_warnings", not "done".
+
+    The file is read once, in one streamed pass, into a column of numbers per key (_read_columns), so the import's memory is a small multiple of the
+    file's, and the minutes are written one Karachi day per transaction, each day aggregated after its write (_write_days; audit R7 performance-live-04:
+    the file was decoded and parsed twice, a dict and a tuple per row, and written in one transaction that every reader and writer waited for).
+
+    The parsed rows must lie between 2015 and a day after `now` and span at most UPLOAD_MAX_DAYS, or the whole file is refused (ValueError) and
+    nothing is stored; the check reads the rows exactly as the import does (a repeated column keeps its last cell). Only the local days that received
+    rows are aggregated. Times are read by csv_time in `ts_format` (ISO 8601 or epoch seconds by default); a file in which none can be read is refused
+    with the formats read, a file over UPLOAD_MAX_BYTES with TOO_LARGE, and a time-zone offset outside -23 to 23 hours in one sentence. The imports row
+    keeps the uploaded range (`from_ts`, `to_ts`) and the file's name when given (`file_name`, see _file_name).
+
+    `mapping` (see mapping_of; flow-telemetry-plan-control-12) reads a vendor's columns as the product's keys, in their units and signs, and its
+    `ts_format` (day-first or month-first dates) when `ts_format` is left "auto". Cells separated by ";" or tabs, with decimal commas, are read
+    (_dialect). A file without a ts column, or without a grid signal, is refused with the columns it has."""
+    if len(content) > UPLOAD_MAX_BYTES:
+        raise ValueError(TOO_LARGE)
+    try:
+        timezone(timedelta(hours=tz_offset_h))
+    except (ValueError, OverflowError, TypeError):
+        raise ValueError("The timezone offset is hours from UTC, between -23 and 23") from None
+    lay = _layout(content, mapping, ts_format)
+    ts_format, delim, decimal, at, scale, log = lay.ts_format, lay.delim, lay.decimal, lay.at, lay.scale, lay.log
+    parsed, bad_ts, first_bad = _read_columns(content, delim, decimal, at, scale, tz_offset_h, ts_format)
+    if not parsed.ts:
+        raise ValueError(_no_times(first_bad, ts_format))
+    now = _now_ts() if now is None else int(now)
+    ts = np.frombuffer(parsed.ts, dtype=np.int64)
+    _check_window(ts, now)  # before anything is written
+    if bad_ts:
+        log.append(f"{bad_ts} rows without a readable ts were skipped")
+    ts, cols, bad, texts, duplicates = _in_order(ts, parsed)
+    del parsed
+    if duplicates:
+        log.append(_repeats_note(duplicates))
+    n = len(ts)
+    warnings, volt_read = _grid_read(cols, bad, n)
+    step, diffs, spans = _step_of(ts)
     if step > 1:
-        log.append(f"Rows are {step} minutes apart: each row was stored as the {step} minutes it starts, its readings held over them and its energy "
-                   f"({', '.join(INTERVAL_ENERGY)}) spread evenly")
+        log.append(_step_note(step))
     gaps = int(np.sum(diffs > max(5, step)))
     warnings += _check_values(ts, cols, spans)
     zone = _zone_warning(ts, cols, spans)
@@ -963,11 +1014,7 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
         warnings.append(zone)
     unreadable = int(sum(int(b.sum()) for b in bad.values()))
     del bad
-    if "grid_voltage_v" in cols:  # grid present from voltage (plan Part 7.5; 180 V to confirm); an unreadable voltage stays unknown
-        grid = cols.get("grid_present", np.full(n, np.nan))
-        derive = np.isnan(grid) & volt_read
-        grid[derive] = (cols["grid_voltage_v"][derive] >= 180).astype(float)
-        cols["grid_present"] = grid
+    _grid_from_voltage(cols, volt_read, n)
     if step > 1:
         for c in INTERVAL_ENERGY:
             if c in cols:
@@ -994,6 +1041,85 @@ def import_csv(site_id: str, content: bytes, tz_offset_h: float = 0.0, mapping: 
             "step_min": step, "overlap": res["overlap"], "warnings": warnings, "status": status,
             "from": datetime.fromtimestamp(first, timezone.utc).isoformat(), "to": datetime.fromtimestamp(last, timezone.utc).isoformat(),
             "from_ts": first, "to_ts": last, "file_name": name}
+
+
+# ------------------------------------------------------------------------------------------------ the upload's preview (UX backend ask K15)
+
+#: The rows the preview answers: "HOW THE FIRST ROWS WILL BE READ" (plan C11.4)
+PREVIEW_ROWS = 5
+#: The keys a reading reads as true or false (on or off)
+_STATES = ("grid_present", "genset_running")
+
+
+def _whole_lines(head: str) -> str:
+    """A file's head as the page sends it (its first 64 KB, perhaps cut in the middle of a line): the text after its last line break is read only
+    when it has as many cells as the header, as the mapping guess reads a head (guess_mapping)."""
+    text = head.lstrip("\ufeff")
+    cut = max(text.rfind("\n"), text.rfind("\r"))
+    if cut < 0 or cut == len(text) - 1:
+        return text
+    delim, _ = _dialect(text)
+    header = next(csv.reader(io.StringIO(text), delimiter=delim), [])
+    last = next(csv.reader([text[cut + 1:]], delimiter=delim), [])
+    return text if len(last) >= len(header) else text[:cut + 1]
+
+
+def _value(key: str, v):
+    """A stored reading as the preview answers it: a state as true or false, a number to six decimals (not a float's noise; never -0), missing as
+    None."""
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    if key in _STATES:
+        return bool(v >= 0.5)
+    return round(float(v), 6) + 0.0 if isinstance(v, (int, float, np.floating)) else v     # + 0.0: a reversed 0 reads 0, not -0
+
+
+def preview_csv(head: str, tz_offset_h: float = 0.0, mapping: dict | None = None, now: int | None = None) -> dict:
+    """How the upload will read a file (UX backend ask K15; plan D9.5, C11.4 stage 2): its head read with `mapping` (mapping_of; None reads the columns
+    by their names) and the time zone of its times (`tz_offset_h`), by the upload's own steps: _layout, _read_columns, the window, _in_order, the grid
+    signal, the step, _check_values and the voltage's grid state. Nothing is written. The first PREVIEW_ROWS rows are answered as they will be stored, in
+    time order: `at` the minute in Karachi time (ISO 8601, +05:00) and `values` each key read in its stored unit and the product's sign (battery
+    discharge and grid import positive), the grid's and the genset's state as true or false, an unreadable or impossible reading None; an energy column
+    is the row's own figure, which the upload spreads over the minutes the row stands for (`step_min`). With the keys read (in the file's order), the
+    rows read and skipped (no readable time; the first such cell), the date order used, the header's notes and the readings' warnings, as the upload
+    words them. What the upload refuses it refuses (ValueError) in the same words."""
+    try:
+        timezone(timedelta(hours=tz_offset_h))
+    except (ValueError, OverflowError, TypeError):
+        raise ValueError("The timezone offset is hours from UTC, between -23 and 23") from None
+    content = _whole_lines(head).encode("utf-8")
+    lay = _layout(content, mapping, "auto")
+    log = list(lay.log)
+    parsed, bad_ts, first_bad = _read_columns(content, lay.delim, lay.decimal, lay.at, lay.scale, tz_offset_h, lay.ts_format)
+    if not parsed.ts:
+        raise ValueError(_no_times(first_bad, lay.ts_format))
+    ts = np.frombuffer(parsed.ts, dtype=np.int64)
+    _check_window(ts, _now_ts() if now is None else int(now))
+    read = len(ts)
+    if bad_ts:
+        log.append(f"{bad_ts} rows without a readable ts were skipped")
+    ts, cols, bad, texts, duplicates = _in_order(ts, parsed)
+    cols = {k: np.array(v) for k, v in cols.items()}    # a copy: the checks below blank impossible readings in place
+    if duplicates:
+        log.append(_repeats_note(duplicates))
+    warnings, volt_read = _grid_read(cols, bad, len(ts))
+    step, _, spans = _step_of(ts)
+    if step > 1:
+        log.append(_step_note(step))
+    warnings += _check_values(ts, cols, spans)
+    zone = _zone_warning(ts, cols, spans)
+    if zone:
+        warnings.append(zone)
+    _grid_from_voltage(cols, volt_read, len(ts))
+    keys = [k for k in lay.at if k not in ("ts", TS_TIME)]
+    if "grid_present" in cols and "grid_present" not in keys:
+        keys.insert(keys.index("grid_voltage_v") + 1 if "grid_voltage_v" in keys else 0, "grid_present")
+    rows = []
+    for i in range(min(PREVIEW_ROWS, len(ts))):
+        values = {k: _value(k, cols[k][i] if k in cols else texts[k][i]) for k in keys}
+        rows.append({"at": datetime.fromtimestamp(int(ts[i]), PKT).isoformat(timespec="seconds"), "values": values})
+    return {"rows": rows, "keys": keys, "read": read, "skipped": bad_ts, "first_unreadable": first_bad, "step_min": step, "ts_format": lay.ts_format,
+            "tz_offset_h": tz_offset_h, "notes": log, "warnings": warnings}
 
 
 # ------------------------------------------------------------------------------------------------ reading
