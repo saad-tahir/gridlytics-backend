@@ -753,6 +753,15 @@ finding from two checkers). Each was fixed with a test that fails without the fi
   lines (the later company's lines are after its "made a company") was not chosen: a line written out of that order would be given to the wrong
   company, and a line of no company is only missing from a filter, never shown under the wrong one.
 
+### Batch k8: K20, K21, K23, K26, K27 (13 Nov 2026)
+
+- **K23, stage progress per kind** (plan E6 item 4, E1.3.4): each issue saves `stage_progress`, `{have, need, unit: "days"}`, counted by the stage
+  rule itself as it decides the stage: solar, the whole days of the site's own output in the 14 local days before the issue's day; load, the whole
+  days of unshed readings in the last 21; outages, the whole days of grid readings in the last 28 at the site and on its feeder. The thresholds are
+  one table the rules read (`forecast.STAGE1_DAYS`: 3, 3 and 7), so "2 of 3 days" and the stage cannot disagree. Every forecast page answers the
+  stored issue's (the Outages answer's `forecast` too); null for an issue stored before K23 (the next 15-minute issue carries it), a kind that does
+  not apply and no issue. `have` is not capped at `need`, and an outage count is floored (6.9 days of readings is "6 of 7", stage 0, as the rule).
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

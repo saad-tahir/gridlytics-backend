@@ -44,6 +44,18 @@ SHED_BLOCK_STEPS = 8
 OBSERVED_LAG_MIN = 2
 
 
+#: the days of the site's own data each kind needs for stage 1 (plan Part 5.1 to 5.3): PV and load 3 days of the site's own data, the outage model a
+#: week of grid readings at the site and on its feeder (the pooled history). The stage rules read these, and each issue says how far it is from them
+#: (`stage_progress`, UX backend ask K23), so the count on the page and the rule are one number
+STAGE1_DAYS = {"pv": 3, "load": 3, "outage": 7}
+
+
+def stage_progress(kind: str, have: float) -> dict:
+    """How far a kind is from stage 1 (UX backend ask K23, plan E6 item 4): {have, need, unit}, `have` the whole days counted as the stage rule
+    counts them (it may pass `need`: the kind is at stage 1 then), `need` STAGE1_DAYS. "2 of 3 days" on the Accuracy view's stages strip."""
+    return {"have": int(max(0.0, float(have))), "need": STAGE1_DAYS[kind], "unit": "days"}
+
+
 def align(ts: float) -> int:
     return int(ts) // STEP_S * STEP_S
 
@@ -130,7 +142,7 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
             if ok.sum() * iv > 240:
                 days_ok += 1
                 k_days.append(float(np.sum(pvm[sl][ok]) / max(1e-6, np.sum(csm[sl][ok]))))
-    stage = 1 if days_ok >= 3 else 0
+    stage = 1 if days_ok >= STAGE1_DAYS["pv"] else 0
     month_k = MONTH_K[int(months[0])]
     if stage == 1:
         k = np.array(k_days)
@@ -174,7 +186,7 @@ def pv(site: dict, t0: int, steps: int = STEPS) -> dict:
     # quantiles sorted per step (plan Part 5.1)
     qa = np.maximum.accumulate(np.vstack([q[name] for name in QS]), axis=0)
     q = {name: qa[i] for i, name in enumerate(QS)}
-    return {"stage": stage, "cs": cs, "q": q, "pr": pr, "days": days_ok, "bands": bands}
+    return {"stage": stage, "cs": cs, "q": q, "pr": pr, "days": days_ok, "bands": bands, "stage_progress": stage_progress("pv", days_ok)}
 
 
 # ------------------------------------------------------------------------------------------------ conformal bands
@@ -518,7 +530,8 @@ def load(site: dict, t0: int, steps: int = STEPS) -> dict:
     prof, learnt = critical_profile(site, g)
     crit = prof[hours]
     crit_info = {"crit_learned_hours": int(learnt), "crit_zero": bool(np.all(prof <= 0)), "calendar": cal}
-    if have_days < 3:
+    crit_info["stage_progress"] = stage_progress("load", have_days)
+    if have_days < STAGE1_DAYS["load"]:
         q = {name: tmpl * (1 + 0.25 * (v - 0.5) / 0.45) for name, v in zip(QS, QV)}
         q["q50"] = tmpl
         return {"stage": 0, "q": q, "crit": np.minimum(crit, q["q75"]), "days": have_days,
@@ -829,7 +842,8 @@ def outage(site: dict, t0: int, steps: int = STEPS, now: int | None = None) -> d
         gvec[:cur + remaining] = 0.0
         p_down[:cur + remaining] = 1.0
         observed = {"since": int(obs_ts[k]), "elapsed_min": int(elapsed), "expected_remaining_min": int(remaining * 15)}
-    return {"stage": 1 if days_known >= 7 else 0, "p_down": np.clip(p_down, 0, 1), "p_start": np.clip(p_start, 0, 1), "dur_steps": dur, "g": gvec,
+    return {"stage": 1 if days_known >= STAGE1_DAYS["outage"] else 0, "stage_progress": stage_progress("outage", days_known),
+            "p_down": np.clip(p_down, 0, 1), "p_start": np.clip(p_start, 0, 1), "dur_steps": dur, "g": gvec,
             "observed": observed,
             # no announced windows: no adherence to show (the prior has nothing to apply to); windows entered but none seen whole: the prior, 0 trials
             "adherence": round(adherence, 3) if windows else None, "adherence_windows": trials if windows else None, "median_minutes": med_dur,
@@ -853,16 +867,18 @@ def issue(site: dict, t0: int, save: bool = True, now: int | None = None) -> dic
     if save:
         if p["stage"] is not None:  # a site without PV has no PV issue
             telemetry.save_forecast(site["id"], "pv", t0, p["stage"], VERSION,
-                                    {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr"), "bands": p.get("bands")})
+                                    {"cs": _r(p["cs"]), **{k: _r(v) for k, v in p["q"].items()}, "pr": p.get("pr"), "bands": p.get("bands"),
+                                     "stage_progress": p.get("stage_progress")})
         telemetry.save_forecast(site["id"], "load", t0, l["stage"], VERSION,
                                 {**{k: _r(v) for k, v in l["q"].items()}, "crit": _r(l["crit"]), "crit_learned_hours": l.get("crit_learned_hours"),
-                                 "crit_zero": l.get("crit_zero"), "calendar": l.get("calendar"), "bands": l.get("bands")})
+                                 "crit_zero": l.get("crit_zero"), "calendar": l.get("calendar"), "bands": l.get("bands"),
+                                 "stage_progress": l.get("stage_progress")})
         # an off-grid site's issue (always down, no stage) is still saved: the plan's same-quarter protection reads it
         telemetry.save_forecast(site["id"], "outage", t0, o["stage"] or 0, VERSION,
                                 {"p_down": _r(o["p_down"]), "p_start": _r(o["p_start"]), "dur_steps": [int(x) for x in o["dur_steps"]], "g": _r(o["g"], 0),
                                  "observed": o.get("observed"), "adherence": o.get("adherence"), "adherence_windows": o.get("adherence_windows"),
                                  "off_grid": o.get("off_grid"), "days_known": o.get("days_known"), "pooled": o.get("pooled"),
-                                 "shed_prior": o.get("shed_prior")})
+                                 "shed_prior": o.get("shed_prior"), "stage_progress": o.get("stage_progress")})
     return {"t0": t0, "pv": p, "load": l, "outage": o}
 
 
@@ -938,22 +954,27 @@ def page(site: dict, kind: str) -> dict:
     their actuals and the issue held a day before over them, so the chart shows how the forecast tracked. The tick re-issues every 15 minutes, so the
     latest issue's own actuals are at most one step. `preliminary` follows the design rules (see preliminary()), with `verified_days` and
     `verified_days_needed` beside it. An outage page also carries `announced`: the announced windows over the chart's span (announced_blocks). Every
-    page says whether the forecasts read a weather feed (`weather_feed`, WEATHER_FEED)."""
+    page says whether the forecasts read a weather feed (`weather_feed`, WEATHER_FEED).
+
+    UX backend ask K23 (plan E6 item 4): every issue says how far its kind is from stage 1 (`stage_progress`, null for an issue stored
+    before K23)."""
     na = not_applicable(site, kind)
     if na:
-        return {"kind": kind, "issue": None, "not_applicable": na, "stage": None, "preliminary": False, "weather_feed": WEATHER_FEED}
+        return {"kind": kind, "issue": None, "not_applicable": na, "stage": None, "preliminary": False, "weather_feed": WEATHER_FEED,
+                "stage_progress": None}
     f = telemetry.latest_forecast(site["id"], kind)
     if f is None:
-        return {"kind": kind, "issue": None, "not_applicable": None, "weather_feed": WEATHER_FEED}
+        return {"kind": kind, "issue": None, "not_applicable": None, "weather_feed": WEATHER_FEED, "stage_progress": None}
     t0 = f["belief_time"]
     t = step_times(t0)
     now = int(datetime.now(timezone.utc).timestamp())
     t1 = max(t0, min(now // 60 * 60, t0 + STEPS * STEP_S))  # whole minutes only
     actual = _actual15(site["id"], kind, t0, t1) if kind in PAST_KEYS else None
+    issue = {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version", "stage_progress")}
     out = {"kind": kind, "belief_time": t0, "stage": f["stage"], "model_version": f["model_version"], "t": [int(x) for x in t],
-           "issue": {k: v for k, v in f.items() if k not in ("belief_time", "stage", "model_version")}, "actual": actual,
+           "issue": issue, "actual": actual,
            **preliminary(site["id"], f["stage"]), "past": _past(site["id"], kind, t0) if kind in PAST_KEYS else None, "not_applicable": None,
-           "weather_feed": WEATHER_FEED}
+           "weather_feed": WEATHER_FEED, "stage_progress": f.get("stage_progress")}
     if kind == "outage":
         # the announced windows over the chart's span, the past 24 hours and the issue's 48, from the schedule in force now (pages-C-19)
         sch = schedule(site["id"])
