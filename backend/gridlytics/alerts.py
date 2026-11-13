@@ -861,10 +861,27 @@ def _in(cats: tuple[str, ...]) -> tuple[str, list]:
     return f" AND category IN ({','.join('?' * len(cats))})", list(cats)
 
 
+#: An alert's kind as an address gives it (UX backend ask K26): a rule's name, lower-case ASCII letters, digits and underscores ("forecast_bust",
+#: "forecast_stage_pv", "edge_fallback_engaged")
+_KIND = re.compile(r"[a-z][a-z0-9_]{0,63}")
+#: (not KIND_WORDS: that is the tariff kinds' words, above)
+ALERT_KIND_WORDS = "The kind of alert is a rule's name in lower case, such as forecast_bust"
+
+
+def alert_kind(value) -> str | None:
+    """The `kind` of the inbox's address, or None when not given; refused in one sentence when it is no rule's name in form (UX K26)."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not _KIND.fullmatch(value):
+        raise ValueError(ALERT_KIND_WORDS)
+    return value
+
+
 def listing(state: str | None = None, site_id: str | None = None, category: str | None = None, limit: int = 300,
-            followed_only: bool = False) -> list[dict]:
+            followed_only: bool = False, kind: str | None = None) -> list[dict]:
     """The inbox, most severe first: only the categories the reader receives (`reader_categories`), and with `followed_only` the kinds the person
-    follows (`followed_categories`)."""
+    follows (`followed_categories`). With `kind`, only the alerts of that rule (UX backend ask K26, plan E6 item 8: the Accuracy view's missed
+    forecasts read `forecast_bust`), within the categories the reader receives."""
     cond, args = _in(_categories(followed_only))
     q = "SELECT * FROM alerts WHERE 1=1" + cond
     if state == "active":
@@ -878,6 +895,9 @@ def listing(state: str | None = None, site_id: str | None = None, category: str 
     if category:
         q += " AND category = ?"
         args.append(category)
+    if kind:
+        q += " AND rule = ?"
+        args.append(kind)
     q += " ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, opened_at DESC LIMIT ?"
     args.append(limit)
     with store.connect() as con:

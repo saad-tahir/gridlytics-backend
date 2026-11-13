@@ -694,6 +694,19 @@ def test_a_past_forecast_issue_reaches_every_person_alike_and_no_key(walk):
         assert not any(RUPEES.search(x) for x in _strings(got["key"].json())), kind
 
 
+def test_the_missed_forecasts_by_kind_reach_each_reader_of_the_inbox(walk):
+    """UX backend ask K26 (plan E6 item 8): `?kind=` keeps one rule's alerts within the categories each reader receives; a kind in no form of a
+    rule's name is refused in one sentence, the same for every reader."""
+    client, h = walk["client"], walk["headers"]
+    for reader in ("admin", "operator", "viewer"):
+        r = client.get("/api/alerts", params={"kind": "forecast_bust", "state": "", "every": "true"}, headers=h[reader])
+        assert r.status_code == 200 and all(a["rule"] == "forecast_bust" for a in r.json()), (reader, r.text[:200])
+        bad = client.get("/api/alerts", params={"kind": "Forecast bust"}, headers=h[reader])
+        assert bad.status_code == 422 and bad.json()["detail"] == "The kind of alert is a rule's name in lower case, such as forecast_bust", reader
+    viewer = client.get("/api/alerts", params={"kind": "savings_negative", "state": "", "every": "true"}, headers=h["viewer"]).json()
+    assert viewer == []                                                  # a viewer receives no Savings alert, by kind or not
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

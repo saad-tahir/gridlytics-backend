@@ -371,9 +371,9 @@ def test_the_founder_and_the_administrator_read_when_a_company_was_last_copied(w
 
 
 def test_the_forecasts_section_s_asks_answer_every_role(world):
-    """UX backend asks K20, K21 and K23 (plan step 10): every role opens each kind's issue by its belief time (`?at=`, the plan's ISO time and the
-    page's epoch seconds), reads each PV and load issue's daily energy and each kind's stage progress; a kind that does not apply answers no
-    progress."""
+    """UX backend asks K20, K21, K23 and K26 (plan step 10): every role opens each kind's issue by its belief time (`?at=`, the plan's ISO time and
+    the page's epoch seconds), reads each PV and load issue's daily energy and each kind's stage progress, and the missed forecasts by kind; a kind
+    that does not apply answers no progress."""
     from datetime import datetime, timezone
     client, password, _ = world
     for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
@@ -393,6 +393,8 @@ def test_the_forecasts_section_s_asks_answer_every_role(world):
                     assert r.status_code == 200, (email, row["name"], kind, r.text[:200])
                     past = r.json()
                     assert past["belief_time"] == bt and past["exact"] is True and past["issue"].get("daily_kwh") == latest["issue"].get("daily_kwh")
+            r = client.get("/api/alerts", params={"kind": "forecast_bust", "state": "", "every": "true", "site_id": row["id"]}, headers=h)
+            assert r.status_code == 200 and all(a["rule"] == "forecast_bust" for a in r.json()), (email, r.text[:200])
 
 
 def test_the_viewer_gets_no_rupees(world):

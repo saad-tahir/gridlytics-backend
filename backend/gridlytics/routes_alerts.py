@@ -13,10 +13,15 @@ router = APIRouter()
 
 
 @router.get("/api/alerts")
-def inbox(state: str | None = "active", site_id: str | None = None, category: str | None = None, every: bool = False):
+def inbox(state: str | None = "active", site_id: str | None = None, category: str | None = None, every: bool = False, kind: str | None = None):
     """The inbox: the kinds of alert the person follows (My account's notification choices; round 7 sweeps, the rest of role-analyst-32), or with
-    `every` every kind their role receives."""
-    return out(alerts.listing(state or None, site_id, category, followed_only=not every))
+    `every` every kind their role receives. `kind` keeps one rule's alerts (UX backend ask K26: `?kind=forecast_bust&state=&every=true` is the
+    Accuracy view's missed forecasts, resolved ones too); a kind in no form of a rule's name is refused in one sentence."""
+    try:
+        rule = alerts.alert_kind(kind)
+    except ValueError as exc:
+        raise bad(exc) from None
+    return out(alerts.listing(state or None, site_id, category, followed_only=not every, kind=rule))
 
 
 @router.get("/api/alerts/counts")

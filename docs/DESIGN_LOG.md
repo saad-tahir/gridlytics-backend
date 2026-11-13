@@ -784,6 +784,12 @@ finding from two checkers). Each was fixed with a test that fails without the fi
     day (`forecast.verified_days(before=)`), an outage issue's announced windows from the schedule in force at its time (`forecast.schedule(at=)`).
   - Nothing kept from then: 404 `no_issue`, "No solar forecast issued at or before 14:15 on 12 Nov 2026 is kept"; another company's site is "No
     such site", as on every site route. Every role reads it; a machine key does not (the page's own scope rule).
+- **K26, alerts by kind** (plan E6 item 8, E1.3.8): `GET /api/alerts?kind=` keeps one rule's alerts, within the categories the reader receives
+  (a viewer's `?kind=savings_negative` lists nothing). The kind is a rule's name in form (lower-case ASCII letters, digits and underscores, at most
+  64, starting with a letter), since rules are named per kind of event and connection (`edge_<event>`, `forecast_stage_<kind>`,
+  `regime_expiring_<id>`); one in no such form is refused in one sentence, an unknown one lists nothing. Noted for the page, unchanged here: an
+  alert is raised once while its condition holds, so a day that busts while the day before's alert is still open moves that alert's `detail` to
+  the later day; a run of missed days reads as its last (the daily scores keep every day).
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
