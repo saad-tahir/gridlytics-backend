@@ -43,7 +43,32 @@ def meta():
             "who_can": {p: auth.roles_words(p) for p in auth.PERMISSIONS},
             # who holds each permission, as a list of roles in auth.ROLES order, straight from auth.PERMISSIONS: the role guide and People's
             # consequence line draw it, so neither can drift from what the server allows (UX backend ask K4, plan G9 item 1). No money; every reader
-            "role_matrix": {p: [r for r in auth.ROLES if r in who] for p, who in auth.PERMISSIONS.items()}}
+            "role_matrix": {p: [r for r in auth.ROLES if r in who] for p, who in auth.PERMISSIONS.items()},
+            # the tax status of the company's grid connection saved last, for Set-up C's four boxes to start from ("As at Mill B"), to the roles that
+            # open Set-up (UX backend ask K10, the owner's question Q35: per connection, prefilled); null for a viewer, or with no such connection
+            "company_tax_defaults": company_tax_defaults() if auth.can("see_costs") else None}
+
+
+#: The tax flags Set-up C's DUTY AND TAXES group asks for (plan C6.4), as sites.TaxFlags stores them: the province follows the site's DISCO instead
+TAX_DEFAULT_FLAGS = ("strn", "gst_recoverable", "s235_adjustable", "atl")
+
+
+def company_tax_defaults() -> dict | None:
+    """The four tax flags of the grid connection the company saved last (UX backend ask K10; plan C19.2 item 6, C6.4), with the site it is at: a site
+    that is not removed and is no demo site (a demo's figures are not the company's), a connection of a regime that buys from the grid (an off-grid
+    one bears no bill's taxes). None while the company has none. The province is not among them: it follows the new site's DISCO (sites._from_disco).
+    Last saved by its stamp (to the second), then by the order rows were made."""
+    with store.connect() as con:
+        r = con.execute("SELECT c.id, c.site_id, c.data, c.updated, s.name FROM connections c JOIN sites s ON s.id = c.site_id WHERE s.deleted IS NULL "
+                        "AND s.demo_link IS NULL AND COALESCE(json_extract(c.data, '$.regime'), '') != 'off_grid' "
+                        "ORDER BY c.updated DESC, c.rowid DESC LIMIT 1").fetchone()
+    if r is None:
+        return None
+    tax = (json.loads(r["data"]) or {}).get("tax") or {}
+    flags = {k: bool(tax.get(k, sites.TaxFlags.model_fields[k].default)) for k in TAX_DEFAULT_FLAGS}
+    flags["gst_recoverable"] = flags["gst_recoverable"] and flags["strn"]
+    return {**flags, "site_id": r["site_id"], "site_name": r["name"], "connection_id": r["id"], "saved_at": karachi(r["updated"]),
+            "words": f"As at {r['name']}"}
 
 
 def _icp_categories() -> list[str]:

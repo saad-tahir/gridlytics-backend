@@ -552,6 +552,16 @@ genset was saved before, so no migration or copy of the company's file was neede
   owner's rule (every time meant for people in Pakistan time) overrides; `first_at` and `last_at` are Karachi ISO (+05:00) too, where they were UTC
   (the same moments: the web app formats them with `pktDateTime`). Still `edit_sites`, as the test was; no money.
 
+- **K10, the company's tax defaults** (plan C19.2 item 6, C6.4; optional, built): `GET /api/meta` answers `company_tax_defaults`, the four tax flags
+  (`strn`, `gst_recoverable`, `s235_adjustable`, `atl`) of the grid connection the company saved last, with its site and `words` ("As at Mill B"),
+  so step C's four boxes start from them in place of the server's default. **Owner's question Q35** (the tax status per connection, prefilled from
+  the company's other sites, or moved to Company settings): the recommended answer ships, per connection, prefilled; the server keeps storing it
+  per connection (`sites.TaxFlags`). Decisions: a demo site's connection is not the company's, nor a removed site's, nor an off-grid one (it bears
+  no bill's taxes); the province is left out, since it follows the new site's DISCO (`sites._from_disco`); "last saved" is the connection's
+  `updated` stamp (to the second), then the order rows were made; for the roles that open Set-up (see_costs), null for a viewer (who has no
+  Set-up) and while there is no such connection. On `/api/meta` rather than a new site's answer: step C of a site's second connection needs it too.
+  No money (flags only).
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in
