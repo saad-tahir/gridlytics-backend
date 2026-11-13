@@ -656,6 +656,22 @@ committed (backend 1753 passed; web gates clean). Two defects were found and fix
   1,440). The limits are the server's: a rule sent back with them (the editor's body, or any client that sends the rule as read) is taken and the
   limits never saved. Inside each rule rather than beside the categories, because the answer is `{category: rule}` and the pages read its keys as
   categories. No money: a viewer reads the five energy kinds' limits.
+- **K33, the email alert kinds per reader** (plan G9 item 2, G3.4): `GET /api/platform/notifications` answers `categories` as the inbox gives them
+  (`alerts.reader_categories()`: a viewer Data, Reserve, Battery, Genset and Forecast; an operator eight, no Product; an administrator or an
+  analyst nine), and a save refuses a kind the person does not receive ("You do not receive Savings alerts"). Owner's question Q77 (email choices
+  kept, folded under "Not sending yet", the email checkbox dropped, only the kinds received offered): the recommended yes ships.
+  - **A settled rule wins over the plan here.** G3.4 was written on the inventory's "the server stores it and no code reads it", and makes the
+    card's ticks the `follow` list, with a save of a kind turning `email` on. Since round 7's sweeps (the rest of role-analyst-32) the inbox and
+    its badge list only the kinds in `follow` (`alerts.followed_categories`; the contract's "The inbox follows a person's notification choices"),
+    so ticks that set `follow` would hide every unticked kind from the person's inbox, which G3.4 itself rejects ("a person could unfollow Reserve
+    and miss a critical alert ... the inbox and the counts must stay complete"). The email card's ticks are therefore their own list,
+    `email_kinds`: a save of it with at least one kind sets `email` true (the plan's rule), with none false, and leaves `follow` as it was. Today's
+    page keeps `follow` and `email` ("Email them to me as well": the kinds followed, by email too); a choice made before K33 reads as G3.4's
+    compatibility rule says (the kinds by email are the kinds followed while `email` is true, none while it is false). A kind kept from a role
+    held before is not answered and not read.
+  - **Left for the owner:** the redesigned My account has no control for the inbox's own `follow` list (G3.4 has none, since it believed nothing
+    read it). Whether the inbox keeps following it (today's page and the inbox's "Show every kind" still set and lift it), or lists every kind the
+    role receives, is the owner's call.
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

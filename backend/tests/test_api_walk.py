@@ -291,6 +291,22 @@ def test_every_role_reads_the_alert_thresholds_defaults_and_ranges(world):
         assert client.get("/api/alerts/rules", headers=h).json()["Data"]["limits"]["gap_hours"] == {"default": 1.0, "min": 0.25, "max": 24}, email
 
 
+def test_my_account_offers_each_role_the_alert_kinds_it_receives(world):
+    """UX backend ask K33 (plan step 14b): the email card's kinds are those each role receives (an operator eight, a viewer five); a kind not received
+    is refused in words; ticking kinds for email leaves the inbox's own list as it was."""
+    client, password, _ = world
+    for email, n in (("owner@onyxleaf.demo", 9), ("operator@onyxleaf.demo", 8), ("analyst@onyxleaf.demo", 9), ("viewer@onyxleaf.demo", 5)):
+        h = _login(client, password, email)
+        got = client.get("/api/platform/notifications", headers=h).json()
+        assert len(got["categories"]) == n and got["categories"] == client.get("/api/alerts/counts", headers=h).json()["categories"], email
+    h = _login(client, password, "viewer@onyxleaf.demo")
+    r = client.put("/api/platform/notifications", json={"email_kinds": ["Savings"]}, headers=h)
+    assert r.status_code == 422 and r.json()["detail"] == "You do not receive Savings alerts", r.text
+    r = client.put("/api/platform/notifications", json={"email_kinds": ["Reserve", "Data"]}, headers=h)
+    assert r.status_code == 200 and r.json()["email_kinds"] == ["Data", "Reserve"] and r.json()["email"] is True, r.text
+    assert r.json()["follow"] == r.json()["categories"]
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

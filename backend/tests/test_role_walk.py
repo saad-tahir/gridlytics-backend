@@ -609,6 +609,21 @@ def test_the_alert_thresholds_limits_reach_each_reader_of_the_rules_alike_and_ho
         assert not {k for _, k, _, _ in _items(cats) if isinstance(k, str) and money.is_money(k)}, reader
 
 
+def test_each_reader_is_offered_the_alert_kinds_it_receives_for_email(walk):
+    """UX backend ask K33 (plan G9 item 2): the notification choices offer each person the kinds of alert its role receives, as the inbox does: the
+    viewer the five energy kinds, the operator every kind but Product, the administrator all nine; a key has no choices (403)."""
+    from gridlytics import alerts
+    got = walk["answers"]["/api/platform/notifications"]["/api/platform/notifications"]
+    assert {r: s for r, (s, _) in got.items()} == {"admin": 200, "operator": 200, "viewer": 200}   # the walk reads a key on its site's paths only
+    assert walk["client"].get("/api/platform/notifications", headers=walk["headers"]["key"]).status_code == 403
+    cats = {r: body["categories"] for r, (s, body) in got.items() if s == 200}
+    assert cats == {"admin": list(alerts.CATEGORIES), "operator": [c for c in alerts.CATEGORIES if c != "Product"],
+                    "viewer": list(alerts.ENERGY_CATEGORIES)}, cats
+    for r, (s, body) in got.items():
+        if s == 200:
+            assert set(body["follow"]) <= set(body["categories"]) and set(body["email_kinds"]) <= set(body["categories"]), r
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]
