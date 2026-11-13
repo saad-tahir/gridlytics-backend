@@ -112,13 +112,24 @@ def _fuel(site: dict | None) -> tuple[str, str]:
 def _litres_saved(b: dict, scored: int, has_genset: bool, unit: str = " L") -> str:
     """The fuel a baseline's ledger saved, as the page's ledger says it (savings-ledger.tsx): "not metered" when the genset's fuel was unknown on
     every scored day (verify.summary sums such days as nothing, so its 0.0 is no figure), else the figure in the fuel's `unit` (_fuel); "no genset" at
-    a site without one."""
+    a site without one. The figure is verify.fuel_saved's, the summary's `fuel_saved` (UX K27: one function for the page and the report)."""
     if not has_genset:
         return "no genset"
-    unmetered = int(b.get("genset_unknown_days") or 0)
-    if b.get("litres_saved") is None or (scored > 0 and unmetered >= scored):
-        return "not metered"
-    return smart(b.get("litres_saved"), unit)
+    saved = verify.fuel_saved(b, scored, True)
+    return "not metered" if saved is None else smart(saved, unit)
+
+
+def _peak_avoided(b: dict) -> str:
+    """A baseline's peak-window import avoided as the statement's summary says it, from the summary's `peak_import_kwh_avoided` (verify.
+    peak_import_avoided, UX K27: the Savings page's tile); "-" where none was counted."""
+    v = b.get("peak_import_kwh_avoided")
+    return "-" if v is None or not b.get("peak_import_days") else f"{v:,.0f} kWh"
+
+
+def tariff_notice_sentence(summ: dict) -> str:
+    """The tariff versions awaiting their notification that the period reaches, in the summary's words (verify.period_tariff_notices, UX K27): its
+    figures rest on the version still in force. "" when none."""
+    return " ".join(str(n.get("message") or "") for n in summ.get("tariff_notices") or [] if n.get("message"))
 
 
 def _weeks(x) -> str:
@@ -493,6 +504,8 @@ ARM_WORDS = {"plan": "The plan", "native": "The native settings"}
 #: The claim's row (round 7, audit pages-D-21): the days that claim are those whose plan was followed in full or in part (verify.CLAIMING), a
 #: verified day only one followed in full, so the claim is never said to count "the verified days only"
 CLAIMED_ROW = "Claimed (plan followed in full or in part)"
+#: the ledger's line of the taxes recovered on the claim (UX K27), as the Savings page words it
+TAXES_ROW = "Taxes you recover (not part of the saving)"
 
 
 def _ledger(doc: _Doc, nat: dict, tun: dict, scored: int) -> None:
@@ -511,6 +524,9 @@ def _ledger(doc: _Doc, nat: dict, tun: dict, scored: int) -> None:
     rows += [[LEVER_NAMES.get(k, k.replace("_", " ").capitalize()), cell(nat, k), cell(tun, k)] for k in keys]
     rows += [["Saving, all days", rs(nat.get("saving_rs")), rs(tun.get("saving_rs"))],
              [CLAIMED_ROW, rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))]]
+    # the taxes the company recovers on the claim, not part of the saving (plan 8.2; verify.taxes_recovered, the Savings page's line, UX K27)
+    if nat.get("taxes_recovered_rs") is not None or tun.get("taxes_recovered_rs") is not None:
+        rows.append([TAXES_ROW, rs(nat.get("taxes_recovered_rs")), rs(tun.get("taxes_recovered_rs"))])
     if nat.get("perfect_foresight_rs") is not None:
         rows.append(["Perfect foresight (not achievable, for reference)", rs(nat["perfect_foresight_rs"]), "-"])
     doc.table(rows, [95 * mm, 42 * mm, 42 * mm])
@@ -702,10 +718,15 @@ def _monthly(doc: _Doc, site: dict, kind: str, p0: date, p1: date, today: date, 
         doc.table([["Headline", "Against the native settings", "Against a tuned table"],
                    ["Saving, all days", rs(nat.get("saving_rs")), rs(tun.get("saving_rs"))],
                    [CLAIMED_ROW, rs(nat.get("claimed_rs")), rs(tun.get("claimed_rs"))],
-                   [f"{fuel} saved (Estimated)", _litres_saved(nat, scored, has_genset, unit), _litres_saved(tun, scored, has_genset, unit)],
-                   ["Days that claim (plan followed in full or in part)", str(nat.get("claiming_days", 0)), str(tun.get("claiming_days", 0))],
+                   [f"{fuel} saved (Estimated)", _litres_saved(nat, scored, has_genset, unit), _litres_saved(tun, scored, has_genset, unit)]]
+                  # the grid energy moved out of the peak window (UX K27: the Savings page's tile, by the same function); none off-grid
+                  + ([["Peak-window import avoided", _peak_avoided(nat), _peak_avoided(tun)]] if _on_grid(site) else [])
+                  + [["Days that claim (plan followed in full or in part)", str(nat.get("claiming_days", 0)), str(tun.get("claiming_days", 0))],
                    ["Verified days (plan followed in full)", str(nat.get("verified_days", 0)), str(tun.get("verified_days", 0))]],
                   [95 * mm, 42 * mm, 42 * mm])
+        notices = tariff_notice_sentence(summ)
+        if notices:
+            doc.p(notices, lead="Tariff:")
         unmetered = max(int(nat.get("genset_unknown_days") or 0), int(tun.get("genset_unknown_days") or 0))
         if has_genset and 0 < unmetered:
             doc.p(f"The genset's fuel was not metered on {unmetered} of {scored} days: those days add nothing to the fuel saved or the genset lever.")

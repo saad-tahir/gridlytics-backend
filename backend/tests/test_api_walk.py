@@ -397,6 +397,24 @@ def test_the_forecasts_section_s_asks_answer_every_role(world):
             assert r.status_code == 200 and all(a["rule"] == "forecast_bust" for a in r.json()), (email, r.text[:200])
 
 
+def test_the_savings_summary_additions_answer_every_role(world):
+    """UX backend ask K27 (plan step 11a): every role reads the energy additions (the peak-window import avoided, the fuel saved in its unit, each
+    day's native peak-window import and plan, the tuned table's rows, the tariff notices, Preliminary by both rules); the taxes recovered are money,
+    for the readers of costs alone."""
+    client, password, _ = world
+    for email in ("owner@onyxleaf.demo", "operator@onyxleaf.demo", "analyst@onyxleaf.demo", "viewer@onyxleaf.demo"):
+        h = _login(client, password, email)
+        for row in client.get("/api/fleet", headers=h).json()["sites"]:
+            s = client.get(f"/api/sites/{row['id']}/savings", headers=h).json()
+            assert set(s["preliminary_rules"]) == {"screen", "report"} and isinstance(s["tariff_notices"], list), (email, row["name"])
+            for base in ("native", "tuned"):
+                b = s["baselines"][base]
+                assert {"peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_unit"} <= set(b), (email, base)
+                assert ("taxes_recovered_rs" in b) == (not email.startswith("viewer")), (email, base)
+            assert "rule_table" in s["baselines"]["tuned"]
+            assert all("plan_id" in d and "peak_import_kwh_native" in d for d in s["days"]), (email, row["name"])
+
+
 def test_the_viewer_gets_no_rupees(world):
     client, password, _ = world
     h = _login(client, password, "viewer@onyxleaf.demo")

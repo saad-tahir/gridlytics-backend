@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 
-from . import forecast, optimise, plans, sites, solar, store, tariffs, telemetry, twin, version
+from . import forecast, optimise, plans, savings_export, sites, solar, store, tariffs, telemetry, twin, version
 from .schemas import Refusal
 
 PKT = timezone(timedelta(hours=5))
@@ -2113,6 +2113,74 @@ def _mdi_month(site_id: str, conn: dict | None, bm: str, today: date) -> dict:
     return out
 
 
+# ------------------------------------------------------------------------------------------------ the summary's figures (UX backend ask K27)
+# One function per figure, which verify.summary and the reports (reports.py) both call, so the Savings page and the documents say one figure.
+
+def peak_import_avoided(rows: list[dict]) -> tuple[float, int]:
+    """The grid energy a baseline would have bought in the peak window less what was bought (kWh), over a baseline's scored day rows whose import is
+    known (an unmetered import's peak-window figure is no reading), and the days counted (plan F11 item 1, the tile "Peak-window import avoided").
+    Energy: every reader reads it. A row stored without the arms' peak-window import adds nothing."""
+    total, n = 0.0, 0
+    for d in rows:
+        base, act = d.get("baseline") or {}, d.get("actual") or {}
+        if d.get("import_unknown") or base.get("peak_import_kwh") is None or act.get("peak_import_kwh") is None:
+            continue
+        total += float(base["peak_import_kwh"]) - float(act["peak_import_kwh"])
+        n += 1
+    return round(total, 1), n
+
+
+def fuel_saved(b: dict, scored: int, has_genset: bool) -> float | None:
+    """The fuel a baseline's ledger saved, in the genset's own unit (`fuel_unit`: litres of diesel, MMBtu of gas): None without a genset, or where
+    its fuel was unknown on every scored day (the sum of none is no figure, never 0); the Savings page's tile and the report's "Diesel saved" (plan
+    F11 item 1, sf-01)."""
+    if not has_genset:
+        return None
+    unmetered = int(b.get("genset_unknown_days") or 0)
+    if b.get("litres_saved") is None or (scored > 0 and unmetered >= scored):
+        return None
+    return round(float(b["litres_saved"]), 1)
+
+
+def taxes_recovered(conn: dict | None, claimed: list[tuple[str, dict, float]]) -> float | None:
+    """The taxes the company recovers on a baseline's claim (plan 8.2: every rupee of the ledger is bearable, ex recoverable GST and adjustable s.235,
+    with "taxes you recover" as its own line, so the saving reads as the CFO's ex-GST number; plan F11 item 1): over the claiming days, each as
+    (day, its levers, its share of its month's MDI lever), the day's grid levers (peak window and off-peak energy) and MDI share times the share of a
+    bearable rupee its connection recovers that day (tariffs.recoverable_share). Not part of the saving. The export credit carries none (net
+    billing credits it after tax), nor do the genset, wear and carry-over levers, which no DISCO bill taxes. None off-grid."""
+    if conn is None:
+        return None
+    total = 0.0
+    share: dict[str, float] = {}
+    for day, levers, mdi in claimed:
+        if day not in share:
+            share[day] = tariffs.recoverable_share(conn, date.fromisoformat(day[:10]))
+        grid = sum(float(levers.get(k) or 0.0) for k in ("peak_window", "offpeak_energy"))
+        total += share[day] * (grid + float(mdi or 0.0))
+    return round(total, 2)
+
+
+#: The two rules Preliminary can follow (plan F0.1 decision 15, [req] 10.9; owner's question Q60): the screen's, 28 verified days and the native
+#: capture, and the report's, which also waits for 8 weeks of switchback and the FCA of every month billed (plan 8.5). `preliminary` stays the
+#: report's, as before; `preliminary_rules` answers both, each with the conditions it reads from `final_conditions`
+PRELIMINARY_RULES = {"screen": ("verified_days", "native_capture"), "report": ("verified_days", "native_capture", "switchback_weeks", "fca_billed")}
+
+
+def preliminary_by(conditions: dict, rule: str) -> bool:
+    """Whether a figure is Preliminary under one rule (PRELIMINARY_RULES) from the summary's `final_conditions`."""
+    met = {"verified_days": conditions["verified_days"] >= conditions["verified_days_needed"], "native_capture": bool(conditions["native_capture"]),
+           "switchback_weeks": conditions["switchback_weeks"] >= conditions["switchback_weeks_needed"], "fca_billed": bool(conditions["fca_billed"])}
+    return not all(met[c] for c in PRELIMINARY_RULES[rule])
+
+
+def period_tariff_notices(conn: dict | None, d1: str) -> list[dict]:
+    """The tariff versions awaiting their notification whose start a period reaches by its last day, as rebuilt bills carry them (tariffs.
+    awaiting_notices: words and dates, no rate; plan F11 item 1, F1.1.9's notice); none off-grid."""
+    if conn is None:
+        return []
+    return tariffs.awaiting_notices(date.fromisoformat(d1[:10]))
+
+
 def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
     """The period's ledger per baseline and its days (plan 8.5). Per baseline: `claimed_rs`, the headline (the claiming days' savings, less the
     carry-over still provisional, plus their shares of the MDI lever), with `levers_claimed_rs` its split by lever; `saving_rs` and `levers`, the
@@ -2369,9 +2437,13 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
     # plan 8.5: "Preliminary" until 8 weeks of switchback have run and the FCA of every month in the period has been billed
     sb_weeks = _switchback_weeks(blocks, today)
     fca_billed = (not on_grid) or all(tariffs.fca_billed(mk) for mk in _months_between(bill_month(d0) + "-01", bill_month(d1) + "-01"))
-    out["preliminary"] = (verified < VERIFIED_DAYS_FOR_FINAL or not native_capture or sb_weeks < SWITCHBACK_WEEKS_FOR_FINAL or not fca_billed)
     out["final_conditions"] = {"verified_days": verified, "verified_days_needed": VERIFIED_DAYS_FOR_FINAL, "native_capture": native_capture,
                                "switchback_weeks": round(sb_weeks, 1), "switchback_weeks_needed": SWITCHBACK_WEEKS_FOR_FINAL, "fca_billed": fca_billed}
+    out["preliminary"] = preliminary_by(out["final_conditions"], "report")
+    # UX backend ask K27 (plan F11 item 1): Preliminary by the screen's rule and by the report's (owner's question Q60; PRELIMINARY_RULES)
+    out["preliminary_rules"] = {rule: {"preliminary": preliminary_by(out["final_conditions"], rule), "conditions": list(conds)}
+                                for rule, conds in PRELIMINARY_RULES.items()}
+    _k27_figures(site_id, out, days, d0, d1, conn0, mdi_share)
     out["blocked"] = None if native_capture else "Capture the inverter's native settings first: the baseline is what the inverter did on its own"
     out["method"] = ("Counterfactual replay at 1-minute resolution against the native capture and a tuned table, priced on the bearable-cost basis "
                      "(recoverable GST and adjustable s.235 excluded), with the dated fuel price and the same wear charge on both arms")
@@ -2406,6 +2478,34 @@ def summary(site_id: str, d0: str, d1: str, see_fee: bool = False) -> dict:
                       "claiming_days": sum(m["claiming_days"] for m in used), "scaled": scaled,
                       "preliminary": bool(out["preliminary"] or scaled or not used), "months": used}
     return out
+
+
+def _k27_figures(site_id: str, out: dict, days: dict[str, dict], d0: str, d1: str, conn0: dict | None, mdi_share) -> None:
+    """The summary's additions of UX backend ask K27 (plan F11 item 1), each figure by its own function above: per day the native arm's peak-window
+    import and the plan in force at the day's start; per baseline the peak-window import avoided, the fuel saved in its unit and the taxes recovered
+    on the claim, and for the tuned baseline its table's rows; the tariff notices the period reaches."""
+    at_start = savings_export.plan_at_start(site_id, d0, d1) if days else {}
+    for entry in out["days"]:
+        n = days[entry["day"]].get("native") or {}
+        entry["peak_import_kwh_native"] = (n.get("baseline") or {}).get("peak_import_kwh")
+        entry["plan_id"] = at_start.get(entry["day"])
+    has_genset = bool((sites.assets(site_id) or {}).get("genset"))
+    unit = savings_export.fuel_unit(site_id) or None
+    for base in ("native", "tuned"):
+        b = out["baselines"][base]
+        rows = [(day, by[base]) for day, by in sorted(days.items()) if by.get(base)]
+        avoided, counted = peak_import_avoided([r for _, r in rows])
+        b["peak_import_kwh_avoided"] = avoided if conn0 is not None else None
+        b["peak_import_days"] = counted if conn0 is not None else 0
+        b["fuel_saved"] = fuel_saved(b, len(rows), has_genset)
+        b["fuel_unit"] = unit
+        b["taxes_recovered_rs"] = taxes_recovered(conn0, [(day, r.get("levers") or {}, mdi_share(day, base)) for day, r in rows if _day_claims(r)])
+    rule = next((by["tuned"].get("tuned_rule") for _, by in sorted(days.items(), reverse=True) if (by.get("tuned") or {}).get("tuned_rule")), None)
+    # the tuned table's rows (start, mode, floor, target, grid charge) in the product's own grammar; null where the rule is the native capture itself
+    # (no fixed table beat it) or no day holds a rule
+    table = (rule or {}).get("table") if (rule or {}).get("kind") != "native_capture" else None
+    out["baselines"]["tuned"]["rule_table"] = [dict(r) for r in table] if isinstance(table, list) else None
+    out["tariff_notices"] = period_tariff_notices(conn0, d1)
 
 
 # ------------------------------------------------------------------------------------------------ switchback (Part 8.2)

@@ -707,6 +707,25 @@ def test_the_missed_forecasts_by_kind_reach_each_reader_of_the_inbox(walk):
     assert viewer == []                                                  # a viewer receives no Savings alert, by kind or not
 
 
+def test_the_savings_additions_reach_a_viewer_in_energy_and_the_taxes_do_not(walk):
+    """UX backend ask K27 (plan F11 item 1): the taxes recovered on the claim are a money name, stripped for a viewer; the peak-window import
+    avoided, the fuel saved and its unit, the tuned table's rows, each day's native peak-window import and plan, the tariff notices and Preliminary
+    by both rules reach the viewer as the administrator reads them."""
+    from gridlytics import money
+    assert money.is_money("taxes_recovered_rs")
+    energy = ("peak_import_kwh_avoided", "peak_import_days", "fuel_saved", "fuel_unit")
+    for url, got in walk["answers"]["/api/sites/{site_id}/savings"].items():
+        admin, viewer = got["admin"][1], got["viewer"][1]
+        for base in ("native", "tuned"):
+            assert "taxes_recovered_rs" in admin["baselines"][base] and "taxes_recovered_rs" not in viewer["baselines"][base], (url, base)
+            assert {k: viewer["baselines"][base][k] for k in energy} == {k: admin["baselines"][base][k] for k in energy}, (url, base)
+        assert viewer["baselines"]["tuned"]["rule_table"] == admin["baselines"]["tuned"]["rule_table"], url
+        assert [(d["plan_id"], d["peak_import_kwh_native"]) for d in viewer["days"]] == [(d["plan_id"], d["peak_import_kwh_native"])
+                                                                                         for d in admin["days"]], url
+        assert viewer["tariff_notices"] == admin["tariff_notices"] and viewer["preliminary_rules"] == admin["preliminary_rules"], url
+        assert got["operator"][1]["baselines"]["native"].get("taxes_recovered_rs") == admin["baselines"]["native"]["taxes_recovered_rs"], url
+
+
 def test_answers_that_are_files_pass_unchanged(walk):
     """A CSV or a calendar file is not JSON: the filter leaves it as the route made it."""
     client, h = walk["client"], walk["headers"]

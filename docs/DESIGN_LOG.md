@@ -790,6 +790,30 @@ finding from two checkers). Each was fixed with a test that fails without the fi
   `regime_expiring_<id>`); one in no such form is refused in one sentence, an unknown one lists nothing. Noted for the page, unchanged here: an
   alert is raised once while its condition holds, so a day that busts while the day before's alert is still open moves that alert's `detail` to
   the later day; a run of missed days reads as its last (the daily scores keep every day).
+- **K27, the savings summary's additions** (plan F11 item 1, F1.1.3 to F1.1.9): one function per figure, which `verify.summary` and the monthly
+  statement both read (`verify.peak_import_avoided`, `fuel_saved`, `taxes_recovered`, `preliminary_by`, `period_tariff_notices`, with
+  `savings_export.plan_at_start`); the statement's Summary gains "Peak-window import avoided", its ledger "Taxes you recover (not part of the
+  saving)", its fuel row reads `fuel_saved`, and a tariff notice the month reaches is printed. Decisions:
+  - **Peak-window import avoided** counts every scored day whose import is known (the days of "On all scored days", as `litres_saved` does), not
+    only the claiming days: it is the replay's energy evidence, and a withheld day of unmetered import is no reading. null off-grid.
+  - **Taxes recovered, from the arms:** the ledger's grid levers are bearable rupees, so each claiming day's peak-window and off-peak levers and
+    MDI share times the share of a bearable rupee its connection recovers that day (`tariffs.recoverable_share`: GST where `gst_recoverable`, the
+    s.235 advance where `s235_adjustable`, on the bill amount with GST, further and extra tax, over the bearable stack). On the claim, the band's
+    figure. Export credits carry none (net billing credits them after tax; a legacy agreement's netted units are left out too, so the figure is
+    a little low at a legacy net-metering site), nor do the genset, wear and carry-over levers (no DISCO bill taxes them). Not from rebuilt bills:
+    a period is not a billing period, and rebuilding both arms' bills on every read would take minutes.
+  - **The capture version per day** was answered since round 7 (`native_capture_version`, and the page's `native_captures` with each version's
+    first and last day): nothing new. **The plan per day** is the plan in force when the Karachi day began (`plan_ids`' rule: a held or failed
+    run is no plan in force).
+  - **The tuned table's rows** are served in the product's grammar (start, mode, floor, target, grid charge). The vendor's layout of F1.1.6
+    (program, power W) is not: a brand's programs are compiled from a plan's slots (`delivery.compile_mode_a`), which a static rule has not got.
+  - **Tariff notices:** `tariffs.awaiting_notices` at the period's last day, as rebuilt bills carry them; words and dates, every reader.
+  - **Preliminary by two rules** (owner's question Q60; plan F0.1 decision 15): Q60 gives no recommended answer (the owner's call), while F0.1
+    decision 15 recommends that each figure says which rule it follows. Both are answered (`preliminary_rules`: the screen's, 28 verified days and
+    the native capture; the report's, also 8 weeks of switchback and every FCA billed), and `preliminary` keeps the one rule of before (the
+    report's), so no page or document changes until the owner chooses.
+  - Money: `taxes_recovered_rs` is a `_rs` name, stripped for a viewer and a key (the role walk proves it); every other addition is energy,
+    settings or words, read alike by every reader.
 
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
