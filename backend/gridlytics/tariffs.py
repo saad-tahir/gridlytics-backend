@@ -844,6 +844,15 @@ def is_peak_local(calendar: dict, local: datetime) -> bool:
     return start <= m < end if start <= end else (m >= start or m < end)
 
 
+def peak_share_by_hour(calendar: dict, month: int) -> list[float] | None:
+    """Each hour's share of the day's peak in a month, as the price vector marks it (is_peak_local at the start of each of the hour's four 15-minute
+    steps: an hour whose half is in the window is 0.5), January being 1; None for a month in no season of the calendar. Set-up's PEAK WINDOWS THROUGH
+    THE YEAR draws it (UX backend ask K5), so the strip and the prices read one rule."""
+    if not any(month in (s.get("months") or []) for s in calendar.get("seasons") or []):
+        return None
+    return [sum(is_peak_local(calendar, datetime(2001, month, 1, h, q * 15)) for q in range(4)) / 4.0 for h in range(24)]
+
+
 def site_override(conn: dict | None, on) -> dict:
     """The site override of a connection in force on a day (R9 12.6: the figures its own bills show that differ from the national objects, and its
     MDI block mode and scope), a versioned row keyed by the connection and approved like any version; {} when none is."""
@@ -852,12 +861,20 @@ def site_override(conn: dict | None, on) -> dict:
     return v["body"] if v else {}
 
 
-def calendar_for(conn: dict, on) -> dict:
-    ov = site_override(conn, on)
-    if isinstance(ov.get("calendar"), dict):
-        return ov["calendar"]  # the peak window the site's own bill shows
+def calendar_version(conn: dict, on) -> tuple[dict, str, dict | None]:
+    """The time-of-use calendar a connection is priced on, on a day, with where it comes from and its version: the peak window the site's own bill
+    shows (a site override's calendar: "site_override"), else its DISCO group's calendar in force ("tou"); the version row, or None where no
+    version is in force (no peak then)."""
+    cid = (conn or {}).get("id")
+    ov = resolve("override", str(cid), on) if cid else None
+    if ov is not None and isinstance((ov["body"] or {}).get("calendar"), dict):
+        return ov["body"]["calendar"], "site_override", ov  # the peak window the site's own bill shows
     v = resolve("tou", "ke" if conn["data"].get("disco_group") == "ke" else "xwdisco", on)
-    return v["body"] if v else {"seasons": []}
+    return (v["body"] if v else {"seasons": []}), "tou", v
+
+
+def calendar_for(conn: dict, on) -> dict:
+    return calendar_version(conn, on)[0]
 
 
 def card_for(category: str, on) -> tuple[dict, dict]:

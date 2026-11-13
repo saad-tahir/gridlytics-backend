@@ -114,8 +114,47 @@ def test_the_preview_is_for_see_costs_and_names_its_rupees_as_money(world):
 
 
 def test_another_company_s_site_is_no_site_here(world):
+    """The route answers this company's site (so a 404 below is its own refusal, not a path that is not served), and another company's site, with a
+    connection that could be priced, is no site here, for every role that reads the preview (UX K5 check)."""
     other = identities.company("Another company", own_file=True)
     from gridlytics import platform as platformdb
     with store.use_company(platformdb.company_file(other)):
         theirs = sites.create({"name": "Their Mill", "disco": "LESCO"}, "t")["id"]
-    assert _preview(world, A3, site=theirs).status_code == 404
+        held = sites.put_connection(theirs, B2B, "t")
+    for role in ("admin", "operator", "analyst"):
+        assert _preview(world, B2B, role=role, site=world.site).status_code == 200, role
+        for body in (B2B, {**B2B, "id": held["id"]}):
+            r = _preview(world, body, role=role, site=theirs)
+            assert (r.status_code, r.json()["detail"]) == (404, "No such site"), (role, r.text)
+
+
+def test_the_peak_windows_are_the_price_vector_s_own_rule(world, monkeypatch):
+    """`by_month` is made by the rule that marks the price vector's peak steps (tariffs.is_peak_local on the calendar the connection is priced on,
+    each hour the share of its four 15-minute steps in the window), so the strip and the prices can never disagree (UX K5 check: the strip repeated
+    the rule). Moved to 03:00 to 04:00, the strip and the day's peak steps both move."""
+    from gridlytics import tariffs
+    monkeypatch.setattr(tariffs, "is_peak_local", lambda cal, local: local.hour == 3)
+    p = _preview(world, B2B, site=world.site).json()
+    assert [i for i, x in enumerate(p["peak"]) if x] == [12, 13, 14, 15]
+    assert p["peak_windows"]["by_month"][8] == [0.0] * 3 + [1.0] + [0.0] * 20
+
+
+def test_a_site_override_s_own_window_is_the_strip_s(world):
+    """A connection whose own bill shows a peak window (a site override's calendar, approved from 1 Sep 2026: 16:00 to 22:00 all year) is priced on
+    it and drawn with it: `source` site_override, the override's version, and the day's peak steps 64 to 87 (B-2(b) on 2 Sep 2026)."""
+    from gridlytics import tariffs
+    src = {"kind": "manual", "ref": "test", "verified": "primary"}
+    with world.use():
+        conn = sites.connections(world.site)[0]
+        v = tariffs.propose("override", conn["id"], "2026-09-01", {"name": "From the August 2026 bill",
+                                                                   "calendar": {"seasons": [{"months": list(range(1, 13)), "peak": ["16:00", "22:00"]}]}},
+                            src, "t")
+        tariffs.approve(v["id"], "t")
+    p = _preview(world, {**B2B, "id": conn["id"]}, site=world.site).json()
+    w = p["peak_windows"]
+    assert (w["source"], w["version_id"], w["effective_from"]) == ("site_override", v["id"], "2026-09-01")
+    assert [s["words"] for s in w["seasons"]] == ["All year: peak 16:00 to 22:00"]
+    assert all(row == [0.0] * 16 + [1.0] * 6 + [0.0] * 2 for row in w["by_month"])
+    assert [i for i, x in enumerate(p["peak"]) if x] == list(range(64, 88))
+    # a connection not saved yet has no bill of its own: the DISCO group's windows
+    assert _preview(world, B2B, site=world.site).json()["peak_windows"]["source"] == "tou"

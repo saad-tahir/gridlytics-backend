@@ -1400,37 +1400,19 @@ def _months_words(months: list[int]) -> str:
     return f"{', '.join(names[:-1])} and {names[-1]}"
 
 
-def _peak_share(peak: list) -> list[float]:
-    """The share of each hour of the day inside a peak window [start, end), which may run past midnight (the Tariffs page's peakShareByHour)."""
-    try:
-        s, e = (tariffs._minutes(peak[0]), tariffs._minutes(peak[1]))
-    except (TypeError, ValueError, IndexError, AttributeError):
-        return [0.0] * 24
-    spans = [(s, e)] if e > s else [(s, 1440), (0, e)]
-    return [round(sum(max(0, min(h * 60 + 60, y) - max(h * 60, x)) for x, y in spans) / 60.0, 4) for h in range(24)]
-
-
 def _peak_windows(conn: dict, d: date) -> dict:
     """The time-of-use calendar the connection is priced on, on day `d`, month by hour (plan C6.7, PEAK WINDOWS THROUGH THE YEAR; UX backend ask K5):
-    the site override's own peak window where its bill shows one (tariffs.calendar_for), else the DISCO group's calendar in force; each season with
-    its months and its window in words ("Dec to Feb: peak 17:00 to 21:00"), and `by_month`, January first, the share of each hour in the peak window
-    (null for a month in no season). Windows and times only: no money."""
-    group = "ke" if conn["data"].get("disco_group") == "ke" else "xwdisco"
-    override = tariffs.site_override(conn, d)
-    if isinstance(override.get("calendar"), dict):
-        cal, source, version = override["calendar"], "site_override", tariffs.resolve("override", str(conn.get("id")), d)
-    else:
-        version = tariffs.resolve("tou", group, d)
-        cal, source = (version["body"] if version else {"seasons": []}), "tou"
+    the site override's own peak window where its bill shows one, else the DISCO group's calendar in force (tariffs.calendar_version, the calendar
+    the prices are made on); each season with its months and its window in words ("Dec to Feb: peak 17:00 to 21:00"), and `by_month`, January first,
+    each hour's share of the peak as the price vector marks it (tariffs.peak_share_by_hour; null for a month in no season). Windows and times only:
+    no money."""
+    cal, source, version = tariffs.calendar_version(conn, d)
     seasons = [{"months": list(x.get("months") or []), "peak": list(x.get("peak") or []),
                 "words": f"{_months_words(x.get('months') or [])}: peak {(x.get('peak') or ['', ''])[0]} to {(x.get('peak') or ['', ''])[-1]}"}
                for x in cal.get("seasons") or []]
-    by_month = []
-    for m in range(1, 13):
-        season = next((x for x in seasons if m in x["months"]), None)
-        by_month.append(_peak_share(season["peak"]) if season else None)
-    return {"disco_group": group, "source": source, "version_id": version["id"] if version else None,
-            "effective_from": version["effective_from"] if version else None, "seasons": seasons, "by_month": by_month}
+    return {"disco_group": "ke" if conn["data"].get("disco_group") == "ke" else "xwdisco", "source": source,
+            "version_id": version["id"] if version else None, "effective_from": version["effective_from"] if version else None, "seasons": seasons,
+            "by_month": [tariffs.peak_share_by_hour(cal, m) for m in range(1, 13)]}
 
 
 def _time_of_use(group: str, disco: str | None) -> dict:
