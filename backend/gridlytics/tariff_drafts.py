@@ -11,6 +11,7 @@ Stored in `tariff_drafts` (schema version 8, store._V8), keyed by the id the edi
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import date, datetime, timedelta, timezone
 
@@ -187,9 +188,19 @@ def _leaves(obj, path=()) -> dict[tuple, object]:
     return {path: obj}
 
 
+def change_pct(before, after) -> float | None:
+    """A number's change in percent of what it was, to 0.1: the one rule for every change the tariff editor shows (what a version changes, the
+    preview's and the simulation's rates). None where there is nothing to compare (either is not a number, or it was 0) and where the change is past
+    what a float holds (a rate the library takes, such as 1e308, against one of 2: an answer with inf in it cannot be written; UX K review)."""
+    if not (tariffs._num(before) and tariffs._num(after)) or not before:
+        return None
+    pct = (after - before) / abs(before) * 100
+    return round(pct, 1) if math.isfinite(pct) else None
+
+
 def changes(before: dict | None, after: dict) -> list[dict]:
-    """What a version changes against the one it follows, field by field: {field, path, before, after, change_pct} (the change of a number in
-    percent of what it was, to 0.1; null where either is not a number or it was 0). A field only one of them has reads null on the other side.
+    """What a version changes against the one it follows, field by field: {field, path, before, after, change_pct} (`change_pct`). A field only one
+    of them has reads null on the other side.
     Served under the money name `tariff_changes` (a rate before and after is money)."""
     old, new = _leaves(before or {}), _leaves(after or {})
     out = []
@@ -197,8 +208,8 @@ def changes(before: dict | None, after: dict) -> list[dict]:
         a, b = old.get(path), new.get(path)
         if a == b or not path:
             continue
-        pct = round((b - a) / abs(a) * 100, 1) if tariffs._num(a) and tariffs._num(b) and a else None
-        out.append({"field": ".".join(["body", *(str(x) for x in path)]), "path": ["body", *path], "before": a, "after": b, "change_pct": pct})
+        out.append({"field": ".".join(["body", *(str(x) for x in path)]), "path": ["body", *path], "before": a, "after": b,
+                    "change_pct": change_pct(a, b)})
     return out[:CHANGES_LISTED]
 
 
@@ -302,9 +313,10 @@ def claim(draft_id: str, person: str, body: dict):
     return take
 
 
-def delete(draft_id: str) -> None:
-    with store.connect() as con:
-        con.execute("DELETE FROM tariff_drafts WHERE id = ?", (draft_id,))
+def delete(draft_id: str, con) -> bool:
+    """Remove a draft in the caller's transaction (its discard and the discard's audit line are one step; UX K review): False where it is already
+    gone (submitted or discarded since it was read)."""
+    return con.execute("DELETE FROM tariff_drafts WHERE id = ?", (draft_id,)).rowcount == 1
 
 
 def from_version(v: dict) -> dict:

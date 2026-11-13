@@ -4,6 +4,7 @@ from __future__ import annotations
 import calendar as _calendar
 import json
 import logging
+import math
 import re
 from datetime import date, datetime, timedelta, timezone
 
@@ -283,8 +284,13 @@ def _grid_connection(site: dict, connection_id: str | None) -> dict:
     return conn
 
 
-def _pct(a, b) -> float | None:
-    return round((b - a) / abs(a) * 100, 1) if a not in (None, 0) and b is not None else None
+#: A preview's or a simulation's figures past what a float holds (a rate card's rates have no upper bound in the library: 1e308 Rs/kWh passes its
+#: checks): refused in words, where the answer could not be written and was a server error (UX K review)
+TOO_LARGE = "This version's prices cannot be worked out: a rate in it is too large. Check the rates typed"
+
+
+def _finite(*figures) -> bool:
+    return all(math.isfinite(float(x)) for xs in figures for x in (xs if hasattr(xs, "__iter__") else [xs]))
 
 
 def _mean(xs: list[float]) -> float | None:
@@ -334,11 +340,16 @@ def draft_put(draft_id: str, inp: dict = Body(...)):
 
 @router.delete("/api/tariffs/drafts/{draft_id}")
 def draft_delete(draft_id: str):
-    """Discards a draft: the caller's own, or anyone's for an administrator (Versions' "Your drafts" offers it beside Resume). Audited."""
+    """Discards a draft: the caller's own, or anyone's for an administrator (Versions' "Your drafts" offers it beside Resume). Audited, in the same
+    transaction; a draft gone since it was read is 404."""
     auth.need("edit_tariffs", "Discarding a tariff draft")
     d = _draft_or_404(draft_id)
-    tariff_drafts.delete(draft_id)
-    store.audit(auth.actor(), "discarded a tariff draft", draft_id, {"name": d["name"], "author": d["author"], "mine": d["mine"]})
+    # the draft goes and its audit line is written in one transaction (UX K review): a discard whose line fails leaves the draft, and one that finds it
+    # gone since it was read (submitted, or discarded by a second click) discards nothing and writes nothing
+    with store.write_transaction() as con:
+        if not tariff_drafts.delete(draft_id, con):
+            raise Refusal(404, "No such tariff draft", "not_found")
+        store.audit(auth.actor(), "discarded a tariff draft", draft_id, {"name": d["name"], "author": d["author"], "mine": d["mine"]}, con=con)
     return {"deleted": draft_id}
 
 
@@ -431,6 +442,8 @@ def preview(inp: dict = Body(...)):
             new = week()
     except (LookupError, ValueError) as exc:
         raise bad(exc) from None
+    if not _finite(base["c_imp"], base["c_exp"], new["c_imp"], new["c_exp"]):
+        raise Refusal(422, TOO_LARGE, "invalid")
 
     def arm(v: dict) -> dict:
         return {"c_imp": [round(float(x), 2) for x in v["c_imp"]], "c_exp": [round(float(x), 2) for x in v["c_exp"]],
@@ -443,10 +456,13 @@ def preview(inp: dict = Body(...)):
         x = _mean([p for p, pk in zip(a["c_imp"], a["peak"]) if pk == on_peak])
         y = _mean([p for p, pk in zip(b["c_imp"], b["peak"]) if pk == on_peak])
         if x is not None or y is not None:
-            rates.append({"what": line, "words": words, "in_force_rs_per_kwh": x, "draft_rs_per_kwh": y, "change_pct": _pct(x, y)})
+            rates.append({"what": line, "words": words, "in_force_rs_per_kwh": x, "draft_rs_per_kwh": y, "change_pct": tariff_drafts.change_pct(x, y)})
     x, y = _mean(a["c_exp"]), _mean(b["c_exp"])
     if x or y:
-        rates.append({"what": "export", "words": "Export", "in_force_rs_per_kwh": x, "draft_rs_per_kwh": y, "change_pct": _pct(x, y)})
+        rates.append({"what": "export", "words": "Export", "in_force_rs_per_kwh": x, "draft_rs_per_kwh": y, "change_pct": tariff_drafts.change_pct(x, y)})
+    # a week's mean of prices each within a float can still pass it
+    if not _finite(*(r[k] for r in rates for k in ("in_force_rs_per_kwh", "draft_rs_per_kwh") if r[k] is not None)):
+        raise Refusal(422, TOO_LARGE, "invalid")
     d = conn.get("data") or {}
     return {"site_id": s["id"], "site_name": s["name"], "connection_id": conn["id"], "tariff_category": d.get("tariff_category"),
             "start": d0.isoformat(), "days": req.days, "step_minutes": 15,
@@ -509,6 +525,11 @@ def simulate(inp: dict = Body(...)):
         raise bad(exc) from None
     if not base.get("completeness"):
         raise Refusal(422, "The site has no grid readings in this bill's days: pick a bill or a month with readings", "invalid")
+    # a line past what a float holds does not always reach the total (a draft at 1e308 Rs/kWh rebuilt an energy line of inf and a total of 0): every
+    # amount is checked
+    if not _finite(base["total_rs"], new["total_rs"], new["total_rs"] - base["total_rs"],
+                   *(x for b in (base, new) for ln in b["lines"] for x in ln.values() if isinstance(x, (int, float)) and not isinstance(x, bool))):
+        raise Refusal(422, TOO_LARGE, "invalid")
     ids = {v["id"] for v in extra}
     x, z = base["total_rs"], new["total_rs"]
     return {"site_id": s["id"], "site_name": s["name"], "connection_id": conn["id"], "bill_id": bill_id, "billing_month": base["billing_month"],
@@ -516,7 +537,7 @@ def simulate(inp: dict = Body(...)):
             "estimated": base["completeness"] < verify.BILL_COMPLETENESS_MIN, "what_if": what,
             "reaches": any(v.get("id") in ids for v in new["versions"]),
             "bill": {"in_force_rs": x, "draft_rs": z, "printed_rs": printed, "stored_rs": stored if tariffs._num(stored) else None,
-                     "difference_rs": round(z - x, 2), "change_pct": _pct(x, z),
+                     "difference_rs": round(z - x, 2), "change_pct": tariff_drafts.change_pct(x, z),
                      "in_force_lines": base["lines"], "draft_lines": new["lines"]},
             "tariff_notices": new.get("tariff_notices") or []}
 

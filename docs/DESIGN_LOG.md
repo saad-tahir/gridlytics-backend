@@ -606,6 +606,42 @@ test that fails without the fix (`test_ux_k06_check`, and the K5, K6, K9 and K10
   connection (and a battery for the check) for every role that reads the route: 404 "No such site", the route's own refusal, not an unserved path.
   The K9 role test reads the rows themselves (`sample`) for the administrator and the operator, so it fails without K9.
 
+### Batches k5 and k6, the senior review (13 Nov 2026)
+
+The review of K32 (k5) and K5, K6, K7, K9, K10 and K11 (k6) with their checks ("UX K review" commits). Both suites passed on the batches as
+committed (backend 1753 passed; web gates clean). Two defects were found and fixed, each with a test that fails without its fix
+(`test_ux_k_review_k5_k6`); no answer changed shape.
+
+- **A figure too large to work out was a server error** (K32). The library takes a rate card's rates with no upper bound (a finite number, 0 or
+  more), so a draft at 1e308 Rs/kWh passes every check. The validate answer then held a change of inf % (what a version changes, against a rate of
+  2), the preview a week's mean price of inf, and the simulated bill an energy line of inf (with a total of 0: the bill engine's arithmetic does
+  not carry inf to the total); none of these can be written as JSON, and each was a 500. The change in percent is one rule now
+  (`tariff_drafts.change_pct`: what a version changes, the preview's `rates` and the simulated `bill`, where there were two copies), null where it
+  cannot be worked out; a preview or a simulation whose prices, means or bill lines pass what a float holds is refused (422) in one sentence: "This
+  version's prices cannot be worked out: a rate in it is too large. Check the rates typed".
+- **Discarding a draft is one step with its audit line** (K32). The discard removed the draft and then wrote its line in a second step: a line that
+  failed left the draft gone and unrecorded (an administrator may discard another person's draft), and a second discard of the same draft (a double
+  click, or one after its author submitted it) answered 200 and audited a discard of nothing. The draft goes and its line is written in one
+  transaction now, and a draft gone since it was read is 404 "No such tariff draft", with no line.
+- **The contract's claim for the check's role refusals** (K6 check) said the check is "never ok where the save is then refused". It holds for the
+  roles that save Set-up (`edit_sites`: an administrator and an operator), which the check now follows field by field. An analyst saves no step
+  (every Set-up save is `edit_sites`) and reads Set-up only (plan C20: "the analyst (all read only)"), so the analyst's page sends `{}` or the
+  stored sections; a changed section from an analyst is checked as typed, without the save's 403. The contract now says so.
+- **Checked and found right, no change:** every new answer's rupees are under money names (`c_imp`, `c_exp`, `rates`, `bill`, `tariff_changes`,
+  `tariff_body`, `wear_cost_rs_per_kwh`), and the role walk shows a viewer and a key refused each editor and Set-up route with no rupee in the
+  refusal, and the filter keeping no figure; drafting needs `edit_tariffs`, approving and sending back `approve_tariff`, a waiting version's prices
+  `see_costs`; another company's site, draft or bill is 404 (each company has its own file, and the routes read the site through `full_or_404`);
+  schema 8 is the next free number, made after the copy `store._connect` takes, with its migration test; every new time is Karachi time; the what-if
+  overlay (`tariffs.what_if`) writes nothing and no lookup keeps what it read (no cache in `tariffs`, `verify.month_totals` or `plans.peak_mask`);
+  the contract and the types match the answers. Probes of odd bodies (cards that are not objects, seasons that are not lists, fields of the wrong
+  type for every kind, an unknown connection, a malformed Set-up section of each kind) found no other server error.
+- **Left for the owner, not changed:**
+  - The library takes a rate card's rates and fixed charges, an ICP rate and the PTV fee with no upper bound (an adder's rate is capped at Rs 100/kWh).
+    A version approved at an absurd rate would price every plan and bill at it; the editor now refuses to preview or simulate one that overflows,
+    but validate, submit and approval still take it. A bound per field (for example Rs 1,000/kWh for an energy rate) is a rule of the library and
+    is the owner's to set.
+  - With Q65's answer a company with one administrator cannot approve that administrator's own versions (recorded at batch k5).
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in
