@@ -898,9 +898,10 @@ class _Kept:
 
 #: the month's outages (telemetry.outages over the month so far), reused for a minute while the site's newest reading is the same
 _MONTH_OUTAGES = _Kept(60)
-#: the grid bill so far (verify.bill_so_far), reused for BILL_SO_FAR_REUSE_S while the company's audit trail is unchanged: it rebuilds up to a month of
+#: the grid bill so far (verify.bill_so_far), reused for BILL_SO_FAR_REUSE_S while the company's audit trail and what the bill reads besides the
+#: minutes (verify.bill_so_far_inputs: its period, the credit carried into it, the metering factor) are unchanged: it rebuilds up to a month of
 #: minutes, and it bills whole days only (to the end of yesterday), so what changes it within the day is a bill entered, a tariff, connection or
-#: metering change (each an audit line: read again at once) or a late reading for a past day (read within the reuse)
+#: metering change (read again at once) or a late reading for a past day (read within the reuse)
 BILL_SO_FAR_REUSE_S = 900
 _BILL_SO_FAR = _Kept(BILL_SO_FAR_REUSE_S)
 
@@ -1003,15 +1004,24 @@ def _grid_bill(s: dict, t: date) -> tuple[float | None, dict | None]:
         return None, None
     with store.connect() as con:
         changed = con.execute("SELECT MAX(id) FROM audit").fetchone()[0]
+    # what the bill reads besides the minutes (its period, the credit carried into it, the metering factor) is in the key, and the bill is worked
+    # from the same: entering a bill writes its audit line before the credits are chained and the factor fitted again (UX K18 check)
+    try:
+        inputs = verify.bill_so_far_inputs(s["id"], conn, t)
+    except Exception:  # noqa: BLE001  (as the rebuild below: the band holds the saving alone, never a failed Overview)
+        log.exception("the grid bill so far's period, credit and metering factor could not be read for site %s", s["id"])
+        return None, None
+    if inputs is None:
+        return None, None
 
     def make():
         try:
-            got = verify.bill_so_far(s["id"], conn, t)
+            got = verify.bill_so_far(s["id"], conn, t, inputs)
         except Exception:  # noqa: BLE001  (a tariff that cannot price the period: the band holds the saving alone, never a failed Overview)
             log.exception("the grid bill so far could not be rebuilt for site %s", s["id"])
             got = None
         return {**got, "computed": karachi(now_ts())} if got else None
-    key = (str(store.db_path()), s["id"], t.isoformat(), changed, json.dumps(conn, sort_keys=True, default=str))
+    key = (str(store.db_path()), s["id"], t.isoformat(), changed, json.dumps(conn, sort_keys=True, default=str), json.dumps(inputs, sort_keys=True))
     got = _BILL_SO_FAR.get(key, make)
     if got is None:
         return None, None

@@ -404,7 +404,10 @@ def test_the_energy_bars_reach_a_viewer_and_the_rupee_bars_do_not(walk):
 def test_the_grid_bill_so_far_is_named_as_money_and_reaches_no_viewer(walk):
     """UX backend ask K18 (plan D9.8, D2.10): `month.grid_bill_rs` and `month.grid_bill_rs_basis` are money names (money.is_money), so the API's
     filter strips both for a viewer (and a machine key, which reaches no Overview); the administrator reads a figure at every grid site once a whole
-    day of its billing period has passed (the demo's connections are billed by the calendar month), and none at the off-grid farm."""
+    day of its billing period has passed (the demo's connections are billed by the calendar month, and the bill so far starts after the reading of
+    a bill entered since: the demo's sample bill), and none at the off-grid farm."""
+    from datetime import date, timedelta
+
     from gridlytics import money
     from gridlytics.routes_common import today
     client, h = walk["client"], walk["headers"]
@@ -418,7 +421,12 @@ def test_the_grid_bill_so_far_is_named_as_money_and_reaches_no_viewer(walk):
         bills[names[url.split("/")[3]]] = admin["grid_bill_rs"]
         if admin["grid_bill_rs"] is not None:
             basis = admin["grid_bill_rs_basis"]
-            assert basis["first_day"] == today().replace(day=1).isoformat() and basis["computed"].endswith("+05:00"), url
+            # the calendar month's first day, or the day after the reading of a bill entered since (the demo's sample bill, read two days ago:
+            # the bill so far starts after the DISCO's own reading, K18 check)
+            read = [b["period_end"] for b in client.get(url.replace("/now", "/bills"), headers=h["admin"]).json()
+                    if today().replace(day=1).isoformat() <= b["period_end"] <= today().isoformat()]
+            first = (date.fromisoformat(max(read)) + timedelta(days=1)).isoformat() if read else today().replace(day=1).isoformat()
+            assert basis["first_day"] == first and basis["computed"].endswith("+05:00"), url
     assert bills["Rahim Yar Khan farm (demo)"] is None
     grid = [n for n in bills if n != "Rahim Yar Khan farm (demo)"]
     if today().day > 1:

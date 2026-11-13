@@ -3126,36 +3126,71 @@ def rebuild_bill(site_id: str, conn: dict, p0: date, p1: date, period_start_excl
     return out
 
 
-def bill_so_far(site_id: str, conn: dict | None, day: date) -> dict | None:
+def bill_so_far_period(conn: dict, day: date) -> tuple[date, date]:
+    """The first day of the bill so far and the reading date that closes it (UX backend ask K18). The billing period `day` falls in
+    (tariffs.billing_period_for: from the day after the connection's reading day, the calendar month without one), unless a bill of the connection
+    entered on the Bills page was read since: the DISCO reads the meter a day or more off the reading day, and the bill so far then starts the day
+    after that bill's own reading (UX K18 check: before, the days between the two were billed twice or left out, and the credit the bill carried was
+    dropped). It closes at the reading day after the one that bill was read for (the reading day nearest its reading). A bill whose next reading day
+    has passed (no bill entered for it yet) leaves the billing period to the reading day."""
+    p0, reading = tariffs.billing_period_for(conn, day)
+    with store.connect() as con:
+        end = con.execute("SELECT MAX(period_end) FROM bills WHERE connection_id = ? AND period_end <= ?", (conn["id"], day.isoformat())).fetchone()[0]
+    if end is None:
+        return p0, reading
+    end = date.fromisoformat(end)
+    after, next_reading = tariffs.billing_period_for(conn, end + timedelta(days=1))   # the reading days either side of the bill's own reading
+    before = after - timedelta(days=1)
+    if next_reading - end < end - before:                                           # read early, for the reading day after it
+        next_reading = tariffs.billing_period_for(conn, next_reading + timedelta(days=1))[1]
+    if next_reading < day:                                                         # that reading day has passed: a new period runs
+        return p0, reading
+    return end + timedelta(days=1), next_reading
+
+
+def bill_so_far_inputs(site_id: str, conn: dict | None, day: date) -> dict | None:
+    """What the bill so far reads besides the grid readings (`bill_so_far`): its first day and closing reading (`bill_so_far_period`), the credit the
+    bill before carried into it (`_carried_into`, as entering the bill would take it), and the connection's metering factor (`metering_scalars`, and
+    whether it is applied). The Overview keeps the bill so far under these (UX K18 check: entering a bill writes its audit line before the credits are
+    chained and the factor fitted again, so a figure kept under the audit trail alone could hold the old ones). None where there is no bill so far: no
+    connection, an off-grid one, one the site's readings do not meter (not the plant's), and no whole day since the period began."""
+    if conn is None or not conn.get("plant", True) or (conn.get("data") or {}).get("regime") == "off_grid":
+        return None
+    first, reading = bill_so_far_period(conn, day)
+    if day - timedelta(days=1) < first:
+        return None
+    k_e, k_m = metering_scalars(site_id, conn)
+    return {"first_day": first.isoformat(), "reading": reading.isoformat(), "credit_brought_forward_rs": _carried_into(conn["id"], first),
+            "energy_scalar": k_e, "mdi_scalar": k_m, "calibrated": bool(metering_of(site_id, conn["id"]).get("applied"))}
+
+
+def bill_so_far(site_id: str, conn: dict | None, day: date, inputs: dict | None = None) -> dict | None:
     """The grid bill so far, for the Overview's money band (UX backend ask K18; plan D9.8, D2.10): the bill `day` falls in, rebuilt by
-    `rebuild_bill` (the Bills page's own rebuild) from the billing period's first day (the day after the last meter reading, the calendar month's
-    first without a reading day: tariffs.billing_period_for, the Savings page's billing period) to the day before `day`, the last whole Karachi day.
+    `rebuild_bill` (the Bills page's own rebuild) from the day after the last meter reading (`bill_so_far_period`: the last bill entered where it
+    was read since, else the connection's reading day, the calendar month's first without one) to the day before `day`, the last whole Karachi day.
     The day still running is left out: the rebuild fills a minute no reading covers from the period's own profile, so today's hours to come would be
     billed as estimated. Its month is the bill's (`billed_on`, the reading date that closes it: the adders, the ICP rule, the seasonal month), with the
     credit the bill before carried (`_carried_into`, as entering a bill takes it) and the connection's metering factor where it is calibrated
     (`metering_scalars`, as the ledger prices both arms): the bill the DISCO would print if the meter were read at midnight. Fixed charges are
-    prorated by the days so far, and taxes charged by slab (s.235) are on the amount so far.
+    prorated by the days so far, and taxes charged by slab (s.235) are on the amount so far. `inputs`: `bill_so_far_inputs`, read again when left out.
 
     {total_rs, first_day, last_day, reading, billing_month, days, completeness, estimated, metering}: `completeness` is the share of the days'
     minutes a grid reading covers, `estimated` below BILL_COMPLETENESS_MIN (the rest is filled from the period's profile, an estimate, as the Bills
     page says no verdict there), `metering` "calibrated" where the fitted factor is applied, else "uncalibrated". None for a connection the site's
     readings do not meter (not the plant's), on the billing period's first day (no whole day billed yet) and with no grid reading in the days so far
     (nothing to rebuild from)."""
-    if conn is None or not conn.get("plant", True) or (conn.get("data") or {}).get("regime") == "off_grid":
+    got = bill_so_far_inputs(site_id, conn, day) if inputs is None else inputs
+    if got is None:
         return None
-    p0, reading = tariffs.billing_period_for(conn, day)
-    last = day - timedelta(days=1)
-    if last < p0:
-        return None
-    k_e, k_m = metering_scalars(site_id, conn)
-    bill = rebuild_bill(site_id, conn, p0, last, credit_brought_forward_rs=_carried_into(conn["id"], p0), energy_scalar=k_e, mdi_scalar=k_m,
-                        billed_on=reading)
+    first, reading, last = date.fromisoformat(got["first_day"]), date.fromisoformat(got["reading"]), day - timedelta(days=1)
+    bill = rebuild_bill(site_id, conn, first, last, credit_brought_forward_rs=got["credit_brought_forward_rs"], energy_scalar=got["energy_scalar"],
+                        mdi_scalar=got["mdi_scalar"], billed_on=reading)
     comp = float(bill.get("completeness") or 0.0)
     if comp <= 0.0:
         return None
-    return {"total_rs": bill["total_rs"], "first_day": p0.isoformat(), "last_day": last.isoformat(), "reading": reading.isoformat(),
+    return {"total_rs": bill["total_rs"], "first_day": first.isoformat(), "last_day": last.isoformat(), "reading": reading.isoformat(),
             "billing_month": bill["billing_month"], "days": bill["days"], "completeness": comp, "estimated": comp < BILL_COMPLETENESS_MIN,
-            "metering": "calibrated" if metering_of(site_id, conn["id"]).get("applied") else "uncalibrated"}
+            "metering": "calibrated" if got["calibrated"] else "uncalibrated"}
 
 
 def _connection_label(conns: list[dict], cid: str) -> dict | None:
