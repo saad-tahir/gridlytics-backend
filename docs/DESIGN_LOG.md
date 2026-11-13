@@ -486,6 +486,13 @@ genset was saved before, so no migration or copy of the company's file was neede
     today, so there is nothing to repeat yet.
   - Every refusal of a number field now says a whole bound as a whole number ("at least 12", where "at least 12.0" was said) (`schemas`).
 
+- **K11, the steps' words** (plan C19.2 item 7, C9.3): the activation's refusal names the Set-up step ("the inverter (step B)"), as the
+  redesigned Set-up calls its screens, where it named the wizard's tab, and its 422 carries `missing` ({step, words} a part, in the steps' order,
+  `_activation_missing`'s own list), so Review links each "step B" without reading the sentence; the stage track's "Draft: step C of 6" reads the
+  same list. The set-up warning on a connection priced on the other DISCOs' windows says "(step C)" where it said "(tab C, or Site settings
+  Tariff)": an active site's Site settings become Set-up's summary of the same steps (plan C10). The Pilot page's own tabs ("fix it in tab C" of
+  the switchback rules) are that page's and are not Set-up's: left as they are.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

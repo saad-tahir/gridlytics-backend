@@ -465,7 +465,8 @@ def site_source_test(site_id: str):
 
 def _activation_missing(s: dict) -> list[tuple[str, str]]:
     """What activation still asks for (`s` is full() of the site), each as (the Set-up step that holds it, its words in the refusal), in the steps'
-    order: the refusal of POST /activate and the lifecycle's "Draft: step C of 6" read the same rules (UX backend ask K1)."""
+    order: the refusal of POST /activate and the lifecycle's "Draft: step C of 6" read the same rules (UX backend ask K1). The words name the Set-up
+    step ("step A"), as the redesigned Set-up calls its screens, where they named the wizard's tab (UX backend ask K11, plan C19.2 item 7)."""
     missing = []
     src = (s.get("data") or {}).get("data_source") or {}
     # an off-grid site has no grid to report: its source needs no grid-presence signal (round 7 sweeps, a sites-onboarding review follow-up: the farm was
@@ -474,22 +475,22 @@ def _activation_missing(s: dict) -> list[tuple[str, str]]:
     if not (isinstance(src, dict) and src.get("kind") in sites.DATA_SOURCE_KINDS and (src.get("grid_signal_confirmed") or off_grid)):
         # plan 9.3 tab A: without a grid-presence signal outages cannot be seen and the reserve cannot be planned (audit flow-onboarding-08: a site with no
         # source, or an unconfirmed one, was activated and planned)
-        missing.append(("a", "the data source (tab A)" if off_grid else "the data source, with its grid-presence signal confirmed (tab A)"))
+        missing.append(("a", "the data source (step A)" if off_grid else "the data source, with its grid-presence signal confirmed (step A)"))
     elif sites.grid_connected(s) and sites.source_test(s["id"])["grid_signal"] == "missing":
         # the source's test (plan 9.3: "refuses a source without a grid-present signal"; audit flow-onboarding-22): data arrived, and none of it says
         # whether the grid is up, whatever the tick says
         missing.append(("a", "the grid-presence signal to the data the source sends (the data received has neither grid_present nor the grid voltage; "
-                             "tab A)"))
+                             "step A)"))
     if not (s.get("assets") or {}).get("inverter"):
-        missing.append(("b", "the inverter (tab B)"))
+        missing.append(("b", "the inverter (step B)"))
     if not _grid_settled(s, s.get("connections") or []):
-        missing.append(("c", "the grid connection and tariff (tab C)"))
+        missing.append(("c", "the grid connection and tariff (step C)"))
     elif any((c.get("data") or {}).get("tariff_category") not in tariff_data.CARDS_279 for c in s.get("connections") or []):
         # a connection stored before the category was checked (audit flow-onboarding-07): the tick could price nothing and the site never planned
-        missing.append(("c", "the tariff category of each grid connection (tab C)"))
+        missing.append(("c", "the tariff category of each grid connection (step C)"))
     elif any(sites.group_problem((c.get("data") or {}).get("disco_group"), (s.get("data") or {}).get("disco")) for c in s.get("connections") or []):
         # the site's DISCO changed after its connection was saved: it would be priced with the other DISCO's peak windows (audit flow-onboarding-02)
-        missing.append(("c", "the DISCO group of each grid connection, to match the site's DISCO (tab C)"))
+        missing.append(("c", "the DISCO group of each grid connection, to match the site's DISCO (step C)"))
     return missing
 
 
@@ -501,7 +502,9 @@ def site_activate(site_id: str):
         raise HTTPException(status_code=404, detail="No such site")
     missing = _activation_missing(s)
     if missing:
-        raise Refusal(422, "Add " + " and ".join(words for _, words in missing) + " before activating", "incomplete")
+        # `missing` names each step beside its words, so Review links "step A" to its step without reading the sentence (UX backend ask K11)
+        raise Refusal(422, "Add " + " and ".join(words for _, words in missing) + " before activating", "incomplete",
+                      extra={"missing": [{"step": step, "words": words} for step, words in missing]})
     sites.set_status(site_id, "active")
     store.audit(auth.actor(), "activated a site", site_id)
     return _site_answer(site_id)

@@ -243,12 +243,12 @@ def test_an_off_grid_site_activates_without_a_grid_presence_signal_and_a_grid_si
     # a grid site's source still needs it, and an off-grid site still needs a source
     assert a.put(f"/api/sites/{mill}/connection", json={"tariff_category": "B-2(b)", "sanctioned_load_kw": 400}).status_code == 200
     r = a.post(f"/api/sites/{mill}/activate")
-    assert r.status_code == 422 and "the data source, with its grid-presence signal confirmed (tab A)" in r.json()["detail"], r.text
+    assert r.status_code == 422 and "the data source, with its grid-presence signal confirmed (step A)" in r.json()["detail"], r.text
     with world.use():
         bare = sites.create({"name": "Bare farm", "site_type": "farm"}, "test")["id"]
         sites.put_asset(bare, "inverter", {"kw_ac": 50}, "test")
     r = a.post(f"/api/sites/{bare}/activate")
-    assert r.status_code == 422 and r.json()["detail"] == "Add the data source (tab A) before activating", r.text
+    assert r.status_code == 422 and r.json()["detail"] == "Add the data source (step A) before activating", r.text
     # a site whose connection is of the off_grid regime is off-grid too
     with world.use():
         sites.update(mill, {"data_source": {"kind": "csv", "grid_signal_confirmed": False}}, "test")

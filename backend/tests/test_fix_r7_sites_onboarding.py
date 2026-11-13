@@ -187,7 +187,7 @@ def test_an_empty_or_unknown_tariff_category_is_refused_and_activation_asks_for_
     a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "csv", "grid_signal_confirmed": True}})
     r = a.post(f"/api/sites/{sid}/activate")
     assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
-    assert "the tariff category of each grid connection (tab C)" in r.json()["detail"]
+    assert "the tariff category of each grid connection (step C)" in r.json()["detail"]
     assert _site(a, sid)["status"] != "active"
 
 
@@ -281,17 +281,17 @@ def test_activation_asks_for_a_data_source_whose_grid_signal_was_confirmed(world
     # no data source at all: the site was activated (200) and planned, although outages could not be seen
     r = a.post(f"/api/sites/{sid}/activate")
     assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
-    assert r.json()["detail"] == "Add the data source, with its grid-presence signal confirmed (tab A) before activating"
+    assert r.json()["detail"] == "Add the data source, with its grid-presence signal confirmed (step A) before activating"
     # a source whose grid-presence signal was never confirmed: refused the same way
     assert a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "oem_cloud", "grid_signal_confirmed": False}}).status_code == 200
     r = a.post(f"/api/sites/{sid}/activate")
-    assert r.status_code == 422 and "the data source, with its grid-presence signal confirmed (tab A)" in r.json()["detail"], r.text
+    assert r.status_code == 422 and "the data source, with its grid-presence signal confirmed (step A)" in r.json()["detail"], r.text
     assert _site(a, sid)["status"] != "active"
     # every missing part is named, in tab order
     with world.use():
         sites.remove_asset(sid, "inverter", "test")
     r = a.post(f"/api/sites/{sid}/activate")
-    assert r.json()["detail"] == "Add the data source, with its grid-presence signal confirmed (tab A) and the inverter (tab B) before activating"
+    assert r.json()["detail"] == "Add the data source, with its grid-presence signal confirmed (step A) and the inverter (step B) before activating"
     with world.use():
         sites.put_asset(sid, "inverter", {"kw_ac": 100}, "test")
     assert a.put(f"/api/sites/{sid}", json={"data_source": {"kind": "oem_cloud", "grid_signal_confirmed": True}}).status_code == 200
@@ -453,7 +453,7 @@ def test_a_k_electric_sites_connection_takes_its_own_time_of_use_windows_and_pro
     assert a.put(f"/api/sites/{sid}", json={"disco": "K-Electric", "data_source": {"kind": "csv", "grid_signal_confirmed": True}}).status_code == 200
     r = a.post(f"/api/sites/{sid}/activate")
     assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
-    assert r.json()["detail"] == "Add the DISCO group of each grid connection, to match the site's DISCO (tab C) before activating"
+    assert r.json()["detail"] == "Add the DISCO group of each grid connection, to match the site's DISCO (step C) before activating"
     r = a.put(f"/api/sites/{sid}/connection", json={"id": held["id"], "tariff_category": "B-2(b)", "sanctioned_load_kw": 400})
     assert r.json()["connections"][0]["data"]["disco_group"] == "ke", r.text
     assert a.post(f"/api/sites/{sid}/activate").status_code == 200
@@ -656,7 +656,7 @@ def test_a_source_test_says_what_the_data_carries_and_a_source_without_grid_pres
     r = a.post(f"/api/sites/{sid}/activate")
     assert r.status_code == 422 and r.json()["code"] == "incomplete", r.text
     assert r.json()["detail"] == ("Add the grid-presence signal to the data the source sends (the data received has neither grid_present nor the grid "
-                                  "voltage; tab A) before activating")
+                                  "voltage; step A) before activating")
     # the grid voltage counts (ingest reads grid presence from it): found, and the site is activated
     with world.use():
         telemetry.ingest(sid, [{"ts": now, "pv_power_w": 900, "grid_voltage_v": 231}], "csv")
@@ -724,7 +724,7 @@ def test_a_site_whose_disco_changed_after_its_connection_was_saved_is_told_in_ev
     held = _site(a, sid)["connections"][0]
     assert held["data"]["disco_group"] == "xwdisco"
     warning = ("The grid connection is priced on the other DISCOs' time-of-use windows, but this site's DISCO is K-Electric: save the connection again "
-               "with K-Electric's (tab C, or Site settings Tariff)")
+               "with K-Electric's (step C)")
     r = a.put(f"/api/sites/{sid}", json={"disco": "K-Electric"})
     assert r.status_code == 200 and warning in r.json()["setup_warnings"], r.text
     assert warning in _site(a, sid)["setup_warnings"]
@@ -734,4 +734,4 @@ def test_a_site_whose_disco_changed_after_its_connection_was_saved_is_told_in_ev
     # and the other way round
     r = a.put(f"/api/sites/{sid}", json={"disco": "FESCO"})
     assert ("The grid connection is priced on K-Electric's time-of-use windows, but this site's DISCO is FESCO: save the connection again with the other "
-            "DISCOs' (tab C, or Site settings Tariff)") in r.json()["setup_warnings"], r.text
+            "DISCOs' (step C)") in r.json()["setup_warnings"], r.text

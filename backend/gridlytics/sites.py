@@ -833,7 +833,7 @@ def setup_warnings(site: dict) -> list[str]:
             ke = group_for_disco(d.get("disco")) == "ke"
             held, wanted = ("the other DISCOs'", "K-Electric's") if ke else ("K-Electric's", "the other DISCOs'")
             out.append(f"The grid connection is priced on {held} time-of-use windows, but this site's DISCO is {d['disco']}: save the connection again "
-                       f"with {wanted} (tab C, or Site settings Tariff)")
+                       f"with {wanted} (step C)")
     crit = max([float(x) for x in d.get("critical_load_kw") or [] if isinstance(x, (int, float))] or [0.0])
     if crit > 0 and bat.get("p_dis_kw"):
         by_inverter = bool(inv) and inv < bat["p_dis_kw"]
