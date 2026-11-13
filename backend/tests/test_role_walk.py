@@ -365,6 +365,28 @@ def test_the_plan_names_its_tariff_and_its_fuel_unit_to_every_reader(walk):
         assert got["viewer"][1]["fuel_unit"] == got["admin"][1]["fuel_unit"] == units[fleet[url.split("/")[3]]["name"]], url
 
 
+#: The Overview's This month tiles' energy (UX backend ask K12): no money, every reader reads them
+MONTH_ENERGY = ("peak_import_kwh", "pv_self_pct", "outages", "outages_covered", "unserved_kwh", "battery_cycles")
+
+
+def test_the_overview_s_band_facts_and_this_month_tiles_reach_a_viewer_whole(walk):
+    """UX backend ask K12 (plan D9.2, D2.3, D2.9): the plan in force with its times (`plan`), when the last plan ran out (`plan_expired_at`), today's
+    apply mark (`applied_today`: who, when, how) and the month's energy figures are words, times and energy: the viewer's are the administrator's at
+    every walked site. A machine key reaches no Overview (the site's data is in no scope)."""
+    seen = 0
+    for url, got in walk["answers"]["/api/sites/{site_id}/now"].items():
+        (a_status, admin), (v_status, viewer) = got["admin"], got["viewer"]
+        assert a_status == v_status == 200, url
+        for k in ("plan", "plan_expired_at", "applied_today"):
+            assert k in admin and viewer[k] == admin[k], (url, k)
+        for k in MONTH_ENERGY:
+            assert k in admin["month"] and viewer["month"][k] == admin["month"][k], (url, k)
+        if admin["plan"]:
+            assert admin["plan"]["generated_at"].endswith("+05:00") and admin["plan"]["valid_until"].endswith("+05:00"), url
+        seen += 1
+    assert seen == 4
+
+
 def test_a_request_for_access_is_anyones_to_send_and_only_the_founders_to_read(walk, monkeypatch):
     """UX backend asks K2 and K3: the contact page's request for access goes to the founder from anyone signed in (202 with no body: nothing to filter;
     a site key is refused, as on every path that names no site), and none of the company's readers reaches the founder's Access requests, whose

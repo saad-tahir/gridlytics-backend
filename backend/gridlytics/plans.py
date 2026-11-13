@@ -1902,6 +1902,22 @@ def issued_for(site_id: str, day_local: str) -> dict | None:
     return rows[-1] if rows else None
 
 
+def applied_mark(site_id: str, day_local: str) -> dict | None:
+    """The day's table marked as applied: the latest mark of the day ({plan_id, by, method, created}: who marked it, how it was keyed and when, a
+    stored UTC stamp) with `superseded`, whether a table was issued for the day after every mark and names a plan none of them marked (what the
+    inverter runs is then the table keyed before it: round 7, audit pages-B-02). None when nobody marked the day. The one rule of the control chip
+    ("Following plan (table applied)", or "New table issued: key it in and mark it") and of the Overview's "Today's table applied by Bilal at 07:42"
+    (UX backend ask K12), so the two never disagree."""
+    with store.connect() as con:
+        marks = con.execute("SELECT plan_id, by, method, created FROM applied WHERE site_id = ? AND day_local = ? ORDER BY created, rowid",
+                            (site_id, day_local)).fetchall()
+    if not marks:
+        return None
+    issued = issued_for(site_id, day_local)
+    superseded = bool(issued and issued["plan_id"] not in {m["plan_id"] for m in marks} and issued["issued_at"] > max(m["created"] for m in marks))
+    return {**dict(marks[-1]), "superseded": superseded}
+
+
 def _write_issue(site_id: str, day_local: str, plan_id: str, reason: str, at: int, gain_rs: float | None = None) -> dict:
     row = {"id": store.new_id(), "plan_id": plan_id, "day_local": day_local, "issued_at": _iso(at), "reason": reason, "gain_rs": gain_rs}
     with store.connect() as con:

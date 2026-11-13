@@ -244,6 +244,29 @@ check" commits). No answer the page reads changed shape. What changed:
   named so that the filter leaves it. It now also requires the administrator's gains to be named `gain_rs`, the walk to have seen one, and the
   viewer's and the key's issued rows and held re-issue to hold no number at all.
 
+### Batch k4: K12, K13, K18 (13 Nov 2026)
+
+The Overview's and Fleet's asks (plan step 8). No schema change and no new route: `GET /sites/:id/now` and `GET /fleet` gain fields, every one made
+when the answer is.
+
+- **K12, the band's facts and the This month tiles** (plan D9.2, D2.3, D2.9, D4.2): `GET /now` adds
+  - `plan`: the plan in force (`id`, `generated_at` and `valid_until` in Karachi time, `status_label`, `stage`) and `latest_attempt`, the newest solve
+    when it failed or its guard held it after that plan was made (the band's "The 14:30 solve was held back by the guard ... The 14:15 plan stays in
+    force.", D2.13), which `plans.current` already read; null when no plan is in force. `plan_status` and `stage` stay for the page of before.
+  - `plan_expired_at`: when the last plan ran out, only where that is why none is in force (`plans.held_info`'s `plan_expired`, D2.13's "The last
+    plan ran out at 14:15"); a pause, a release or a native block is the control chip's, so it is null then.
+  - `applied_today`: `{by, at, method, plan_id, superseded}` from `plans.applied_mark`, the latest mark of today, which the control chip now reads too,
+    so "Today's table applied by Bilal at 07:42." and "New table issued: key it in and mark it" come from one rule. `by` is the name the mark
+    stored (the applied log already shows it to every reader); `at` is Karachi time.
+  - In `month`: `peak_import_kwh`, `pv_self_pct`, `outages`, `outages_covered` (D9.2's three), and the swap tiles' `unserved_kwh` (off-grid) and
+    `battery_cycles` (no genset, off-grid), which D2.9's swap rules need for This month and D9.2 did not list. Each is null without its data, never a
+    zero (audit pages-A-09's rule for today's tiles); the peak import is also null off-grid and while any day of the month has no peak figure, never a
+    part of the month. Outages are counted over the month so far (an outage across midnight once), as today's are, reused for a minute while the
+    site's newest reading is the same.
+  - **A day stored without its peak import is aggregated again.** A CSV upload aggregates its days without the tariff's peak flags (only the nightly
+    job and `/now`'s today pass them), so a CSV site's month had no peak figure. `/now` aggregates such a day again with the flags and writes it back
+    once, as it does today's row (round 7, tests-and-perf-10); a day whose tariff calendar cannot be read stays without it.
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

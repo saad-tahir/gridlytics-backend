@@ -1,8 +1,10 @@
 """Sites, the fleet, the overview snapshot, connections, assets, tiers, native captures, overrides and wizard drafts (UI-01, 02, 04, 17)."""
 from __future__ import annotations
 
+import copy
 import json
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
@@ -10,7 +12,7 @@ from fastapi import APIRouter, Body, Header, HTTPException
 from pydantic import ValidationError
 
 from . import alerts, auth, battery, delivery, demo, lifecycle, money, plans, sites, store, store_members, tariff_data, tariffs, telemetry, twin, verify
-from .routes_common import PKT, bad, full_or_404, now_ts, out, put_state, site_or_404, today
+from .routes_common import PKT, bad, full_or_404, karachi, now_ts, out, put_state, site_or_404, today
 from .schemas import Refusal
 
 router = APIRouter()
@@ -111,14 +113,11 @@ def control_state(site: dict, last: dict | None, now: int) -> dict:
     if tier == "monitor":
         return {"key": "recommendation", "label": "Recommendation only"}
     if tier == "advisory_writes":
-        day = today().isoformat()
-        with store.connect() as con:
-            marks = con.execute("SELECT plan_id, created FROM applied WHERE site_id = ? AND day_local = ?", (site["id"], day)).fetchall()
-        ok = bool(marks)
-        issued = plans.issued_for(site["id"], day) if ok else None
-        if issued and issued["plan_id"] not in {m["plan_id"] for m in marks} and issued["issued_at"] > max(m["created"] for m in marks):
+        mark = plans.applied_mark(site["id"], today().isoformat())
+        if mark and mark["superseded"]:
             # today's table was issued again after the mark (round 7, audit pages-B-02): what the inverter runs is the table keyed before it
             return {"key": "unconfirmed", "label": "New table issued: key it in and mark it"}
+        ok = mark is not None
         return {"key": "following" if ok else "unconfirmed", "label": "Following plan (table applied)" if ok else "Table not confirmed today"}
     return {"key": "following", "label": "Following plan"}
 
@@ -779,6 +778,11 @@ def _off_grid(site: dict, conn: dict | None) -> bool:
     return conn["data"].get("regime") == "off_grid" if conn is not None else _grid_settled(site, [])
 
 
+def _self_pct(pv: float | None, exp: float | None) -> float | None:
+    """The share of the solar made that was used on site, not exported (percent, one decimal); None with no solar made."""
+    return round(100 * min(1.0, max(0.0, (pv - (exp or 0)) / pv)), 1) if pv else None
+
+
 def _today_kpis(site: dict, td: dict | None, bs: dict | None, now: int, day: date) -> dict:
     """The Overview's KPI tiles of the plan (R8 2.4) for today in Pakistan time: the share of the solar made that was used on site (not exported), the
     battery's equivalent full cycles (its discharge over the pack's capacity at its present health, nameplate times state of health, as the battery
@@ -786,7 +790,7 @@ def _today_kpis(site: dict, td: dict | None, bs: dict | None, now: int, day: dat
     reading today, no solar yet, no battery, an off-grid site's outages) is None, never a zero (audit pages-A-09)."""
     td = td or {}
     pv, exp, dis = td.get("pv_kwh"), td.get("export_kwh"), td.get("discharge_kwh")
-    self_pct = round(100 * min(1.0, max(0.0, (pv - (exp or 0)) / pv)), 1) if pv else None
+    self_pct = _self_pct(pv, exp)
     e_nom = (bs or {}).get("e_nom_kwh")
     cycles = round(dis / e_nom, 2) if dis is not None and e_nom else None
     outages = covered = None
@@ -843,6 +847,121 @@ def _litres_of_month(s: dict, d0: str, d1: str, last: dict | None, now: int) -> 
     return dict(got)
 
 
+class _Kept:
+    """Answers kept by key for `seconds` (the monotonic clock), the whole store cleared past `size` keys: what the Overview's 30-second poll reads
+    again unchanged. Each caller gets its own copy."""
+
+    def __init__(self, seconds: float, size: int = 512):
+        self.seconds, self.size = seconds, size
+        self.items: dict = {}
+        self.lock = threading.Lock()
+
+    def get(self, key, make):
+        at = time.monotonic()
+        with self.lock:
+            hit = self.items.get(key)
+        if hit is not None and at - hit[0] < self.seconds:
+            return copy.deepcopy(hit[1])
+        got = make()
+        with self.lock:
+            if len(self.items) >= self.size:
+                self.items.clear()
+            self.items[key] = (at, got)
+        return copy.deepcopy(got)
+
+
+#: the month's outages (telemetry.outages over the month so far), reused for a minute while the site's newest reading is the same
+_MONTH_OUTAGES = _Kept(60)
+
+
+def _plan_facts(plan: dict | None) -> dict | None:
+    """The plan in force for the Overview's band (UX backend ask K12; plan D9.2, D2.3): its id, when it was made and until when it stands (ISO 8601,
+    Karachi time), its status in words and its forecasts' stage, and the newest solve when it failed or its guard held it after this plan was made
+    (`latest_attempt`: {id, status, reason, generated_at}; the plan in force stays: "The 14:30 solve was held back by the guard ... The 14:15 plan
+    stays in force."). None when no plan is in force."""
+    if not plan:
+        return None
+    summary = plan.get("summary") or {}
+    late = plan.get("latest_attempt")
+    return {"id": plan["id"], "generated_at": karachi(plan.get("generated_at")), "valid_until": karachi(plan.get("valid_until")),
+            "status_label": summary.get("status_label"), "stage": summary.get("stage"),
+            "latest_attempt": None if not late else {"id": late["id"], "status": late["status"], "reason": late.get("reason") or None,
+                                                     "generated_at": karachi(late.get("generated_at"))}}
+
+
+def _plan_expired_at(site_id: str, now: int) -> str | None:
+    """When the last plan ran out, where that is why no plan is in force (plans.held_info's plan_expired: the ticks stopped or every solve since failed;
+    the inverter runs its own settings): its valid_until in Karachi time. None otherwise, a pause, a release or a native block included, which the
+    control chip names."""
+    held = plans.held_info(site_id, now)
+    return karachi(held.get("since")) if held and held.get("reason") == plans.EXPIRED_REASON else None
+
+
+def _applied_today(site_id: str, day: date) -> dict | None:
+    """Today's table marked as applied, for the band's "Today's table applied by Bilal at 07:42." (UX backend ask K12; plan D9.2, D2.3, D4.2): who
+    marked it (`by`, the person's name), when (`at`, ISO 8601 in Karachi time), how it was keyed (`method`: installer_keyed, vendor_app,
+    owner_keyed or edge_ack), the plan whose table was keyed, and `superseded` when a table issued after the mark names another plan (the control
+    chip then reads "New table issued: key it in and mark it"). The latest mark of the day (plans.applied_mark, the chip's own rule); None unmarked."""
+    mark = plans.applied_mark(site_id, day.isoformat())
+    if mark is None:
+        return None
+    return {"by": mark["by"], "at": karachi(mark["created"]), "method": mark["method"], "plan_id": mark["plan_id"], "superseded": mark["superseded"]}
+
+
+def _with_peak_import(s: dict, tdays: list[dict]) -> list[dict]:
+    """The month's day rows, each with its peak-window import at a grid site: a row stored without it (a CSV upload aggregates its days without the
+    tariff's peak flags, which only the nightly job and GET /now's today pass) is aggregated again with them and written back once, as today's row is
+    (_today_row), keeping what it holds. A day whose tariff calendar cannot be read stays without it. Off-grid, or with no connection: as stored."""
+    conn = (s.get("connections") or [None])[0]
+    if conn is None or _off_grid(s, conn):
+        return tdays
+    out = []
+    for d in tdays:
+        if d.get("peak_import_kwh") is None:
+            day = date.fromisoformat(d["day"])
+            try:
+                flags = plans.peak_mask(conn, twin.minutes_of(day))
+            except (LookupError, ValueError, TypeError):
+                flags = None                         # a tariff the calendar cannot read: the day stays without its peak import, never a 500
+            if flags is not None:
+                row = telemetry.aggregate_day(s["id"], day, flags, keep=d)
+                if row:
+                    d = {"day": d["day"], **row}
+        out.append(d)
+    return out
+
+
+def _month_outages(s: dict, t: date, now: int, last: dict | None) -> tuple[int | None, int | None]:
+    """The month's outages so far and how many the site rode through with no critical load unserved (as today's `today_kpis`, over the month in
+    Karachi time); (None, None) off-grid and without a reading this month."""
+    t0 = int(datetime(t.year, t.month, 1, tzinfo=PKT).timestamp())
+    if last is None or last["ts"] < t0 or _off_grid(s, (s.get("connections") or [None])[0]):
+        return None, None
+
+    def make():
+        log_ = telemetry.outages(s["id"], t0, now)
+        return len(log_), sum(1 for o in log_ if not o["unserved_kwh"])
+    return tuple(_MONTH_OUTAGES.get((str(store.db_path()), s["id"], t0, last["ts"]), make))
+
+
+def _month_energy(s: dict, tdays: list[dict], bs: dict | None, outages: tuple[int | None, int | None]) -> dict:
+    """The month's energy figures for the Overview's This month tiles (UX backend ask K12; plan D9.2, D2.9), from the month's day rows: the grid import
+    bought in the peak windows, the share of the solar made used on site, the outages and those covered, and the swap tiles' unserved load (off-grid)
+    and battery cycles (no genset, off-grid; the discharge over the pack's capacity at its present health, as today's). Each None without its data
+    (no row this month, no solar made, no battery, no grid), never a zero; the peak import also None while a day of the month has no peak figure
+    (its tariff calendar unreadable), never a part of the month."""
+    if not tdays:
+        return {"peak_import_kwh": None, "pv_self_pct": None, "outages": outages[0], "outages_covered": outages[1], "unserved_kwh": None,
+                "battery_cycles": None}
+    off_grid = _off_grid(s, (s.get("connections") or [None])[0])
+    total = lambda k: sum((d.get(k) or 0) for d in tdays)  # noqa: E731
+    peaks = [d.get("peak_import_kwh") for d in tdays]
+    e_nom = (bs or {}).get("e_nom_kwh")
+    return {"peak_import_kwh": None if off_grid or any(p is None for p in peaks) else round(sum(peaks), 1),
+            "pv_self_pct": _self_pct(total("pv_kwh"), total("export_kwh")), "outages": outages[0], "outages_covered": outages[1],
+            "unserved_kwh": round(total("unserved_kwh"), 1), "battery_cycles": round(total("discharge_kwh") / e_nom, 2) if e_nom else None}
+
+
 @router.get("/api/sites/{site_id}/header")
 def site_header(site_id: str):
     """What every site page's header shows (plan Part 9.2): the site's name, tier, status and demo link, the control chip and the last-data stamp, from
@@ -869,6 +988,9 @@ def site_now(site_id: str):
     td = _today_row(s, t, last, stored)
     if td is not None and td is not stored:
         tdays = [d for d in tdays if d["day"] != t.isoformat()] + [td]      # the month's sums with today's fresh row
+    # each day row with its peak-window import (UX K12's This month); a day without a reading (today's, before its first minute) is no row
+    tdays = _with_peak_import(s, [d for d in tdays if d.get("day")])
+    td = next((d for d in tdays if d["day"] == t.isoformat()), td)
     mtd, computed, spark, _ = _mtd_saving(site_id)
     a = s.get("assets") or {}
     caps = {"pv_kw": (a.get("pv") or {}).get("kw_ac"), "battery_kw": (a.get("battery") or {}).get("p_dis_kw"), "genset_kw": (a.get("genset") or {}).get("rated_kw"),
@@ -880,14 +1002,20 @@ def site_now(site_id: str):
     fuel = _litres_of_month(s, t.replace(day=1).isoformat(), t.isoformat(), last, now) if a.get("genset") else {"litres": 0.0, "litres_source": None}
     return out({"site": {k: s[k] for k in ("id", "name", "tier", "status", "demo_link")}, "control": control_state(s, last, now), "now": _snapshot(last),
                 "caps": caps, "now_next": plans.now_and_next(plan, now), "plan_status": (plan or {}).get("summary", {}).get("status_label"),
-                "stage": (plan or {}).get("summary", {}).get("stage"), "today": td,
+                "stage": (plan or {}).get("summary", {}).get("stage"),
+                # the band's plan facts and today's apply mark (UX backend ask K12): the plan in force with its times in Karachi time, when the last
+                # plan ran out where that is why none is in force, and who marked today's table applied
+                "plan": _plan_facts(plan), "plan_expired_at": None if plan else _plan_expired_at(site_id, now),
+                "applied_today": _applied_today(site_id, t), "today": td,
                 "month": {"import_kwh": sum_("import_kwh"), "pv_kwh": sum_("pv_kwh"), "genset_hours": sum_("genset_hours"), "litres": fuel["litres"],
                           "litres_source": fuel["litres_source"],
                           "outage_hours": round(sum((d.get("outage_minutes") or 0) for d in tdays) / 60, 1),
                           "peak_kw": max([d.get("peak_kw") or 0 for d in tdays] or [0]), "saving_rs": mtd,
                           "saving_rs_method": MTD_SAVING_METHOD, "saving_rs_computed": computed,
                           # the month's native-block days, which claim nothing (not money; round 7, audit flow-savings-pilot-bill-18)
-                          "native_block_days": _month_native_block_days(site_id, t)},
+                          "native_block_days": _month_native_block_days(site_id, t),
+                          # the This month tiles' energy (UX backend ask K12): not money, every reader reads them
+                          **_month_energy(s, tdays, bs, _month_outages(s, t, now, last))},
                 # the Battery tile's SoC is battery.state's (the last minute with a reading), marked by its own source, not the newest row's (now.soc_source)
                 "spark": spark, "battery": {**{k: bs.get(k) for k in ("soc_pct", "sigma_pct", "trust", "usable_kwh")},
                                             "soc_source": telemetry.soc_source(site_id, bs)} if bs else None,
