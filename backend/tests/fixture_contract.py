@@ -117,9 +117,18 @@ def paths(obj, prefix: str = "") -> set[str]:
     return out
 
 
+#: The object whose fields follow a slot's reason, not the route's shape: the `detail` of an object that carries a `reason` (a plan step, the current
+#: slot and the next ones of now_next, a fleet site's next event): `rs_per_kwh` while the slot charges from the grid, `p` and `hours` while it holds for an
+#: outage. The fixture is asked for the detail, never for its fields, so the contract does not fail at the hours every demo site's current slot happens
+#: to carry one more of them (UX step 0: it failed at 18:00 in Karachi, when all four sites charged for reserve). Any other `detail` (an alert's, an
+#: audit entry's) keeps its fields asked wherever every element carries them (UX step 0 check: the first fix exempted every `detail`).
+REASON_DETAIL = "detail"
+
+
 def required(obj, prefix: str = "") -> set[str]:
     """The key paths an answer carries wherever it can: every key of an object, and under a list (or a map whose keys are data) only what every one
-    of its elements carries. A field only some elements carry (an alert's detail of its kind, a step's flags) is served where the data has it."""
+    of its elements carries. A field only some elements carry (an alert's detail of its kind, a step's flags) is served where the data has it; the
+    fields of a slot's reason detail (REASON_DETAIL beside a `reason`) are never asked."""
     if isinstance(obj, dict):
         if _is_map(obj, prefix):
             subs = [required(v, f"{prefix}{{}}") for v in obj.values()]
@@ -127,7 +136,7 @@ def required(obj, prefix: str = "") -> set[str]:
         out: set[str] = set()
         for k, v in obj.items():
             here = _key(prefix, k, False)
-            out |= {here} | required(v, here)
+            out |= {here} | (set() if k == REASON_DETAIL and "reason" in obj else required(v, here))
         return out
     if isinstance(obj, list):
         subs = [required(v, f"{prefix}[]") for v in obj]

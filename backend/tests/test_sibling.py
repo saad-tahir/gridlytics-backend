@@ -121,6 +121,20 @@ def test_the_role_map_the_page_tests_use_is_the_one_the_meta_route_answers(tmp_p
     assert "fx.metaRoles" in body and "fx.meta" in body and '"manage_members"' not in body, "metaFor builds the role map from the fixtures"
 
 
+def test_the_web_apps_role_matrix_is_the_servers():
+    # UI/UX plan K4's fallback (G9 item 1; Part H, H3.3): until GET /api/meta sends role_matrix, the web app keeps a static copy of auth.PERMISSIONS in
+    # frontend/src/lib/role-matrix.ts (the role chip's "What you can do here" and the role line read it); its own test holds it to meta_roles.json,
+    # and this one to the map itself, so a change of a permission's roles fails here, naming the file to change
+    from gridlytics import auth
+    text = _web("frontend/src/lib/role-matrix.ts")
+    block = text[text.index("export const ROLE_MATRIX"):]
+    block = block[block.index("{") + 1:block.index("\n};")]
+    copy = {perm: set(re.findall(r'"([a-z]+)"', roles)) for perm, roles in re.findall(r"^\s*([a-z_]+): \[([^\]]*)\],?$", block, re.M)}
+    assert copy == {p: set(who) for p, who in auth.PERMISSIONS.items()}, "change frontend/src/lib/role-matrix.ts's ROLE_MATRIX to auth.PERMISSIONS"
+    roles = re.search(r"export const ROLES: Role\[\] = \[([^\]]*)\];", text)
+    assert roles and set(re.findall(r'"([a-z]+)"', roles.group(1))) == set(auth.ROLES)
+
+
 def test_the_web_apps_sign_in_refusal_table_is_the_servers():
     # api.SIGN_IN_CODES: each code and its status, as the web app's table of what a refusal does (authstate.test.ts) lists them; the table's other
     # rows are the page's own codes (forbidden, invalid)
@@ -289,6 +303,31 @@ def test_the_fixture_contract_sees_a_missing_and_a_stale_field_and_re_captures_w
                                "summary": {"by_site": {"0f0f0f0f0f0f": {"x": 5}}, "control_release": None}},
                       "alerts": [{"old_field_no_one_names": 1}]}
     assert fc.differences(merged, live, names) == (set(), set())
+
+
+def test_the_fields_of_a_reason_detail_are_never_asked_of_a_fixture_whatever_the_hour():
+    # UX step 0: at 18:00 in Karachi every demo site's current slot charged for reserve, so now_next.current.detail carried rs_per_kwh at all four,
+    # and the contract asked the fixtures (captured on a slot that held for an outage) for it; a detail's fields follow the slot's reason, not the route
+    live = {"now_next": {"current": {"reason": "charge_for_reserve", "detail": {"kwh": 78.0, "rs_per_kwh": 26.98}}, "next": [{"detail": {"p": 0.9}}]}}
+    fixture = {"now_next": {"current": {"reason": "hold_for_outage", "detail": {"p": 0.03, "hours": 1}}, "next": [{"detail": {"p": 0.1}}]}}
+    names = fc.backend_names()
+    assert fc.differences(fixture, live, names, [live]) == (set(), set())
+    # the detail itself is still asked for
+    lacking = {"now_next": {"current": {"reason": "hold_for_outage"}, "next": [{"detail": {"p": 0.1}}]}}
+    assert fc.differences(lacking, live, names) == ({"now_next.current.detail"}, set())
+
+
+def test_a_detail_that_does_not_follow_a_slots_reason_keeps_its_fields_asked():
+    # UX step 0 check: the first fix exempted the fields of every `detail` (an alert's, an audit entry's), so a backend rename of a field the web app reads
+    # there would no longer show as missing from the fixtures; only a detail beside a `reason` follows the hour
+    live = {"alerts": [{"kind": "outage_reserve", "detail": {"outages": [], "from_stage": 1}},
+                       {"kind": "outage_reserve", "detail": {"outages": [], "from_stage": 2}}],
+            "audit": {"detail": {"role_before": "viewer", "role": "analyst"}}}
+    fixture = {"alerts": [{"kind": "outage_reserve", "detail": {"outages": []}}], "audit": {"detail": {"role": "analyst"}}}
+    names = fc.backend_names()
+    assert fc.differences(fixture, live, names) == ({"alerts[].detail.from_stage", "audit.detail.role_before"}, set())
+    # beside a reason the same detail's fields are not asked
+    assert fc.required({"reason": "hold_for_outage", "detail": {"p": 0.03}}) == {"reason", "detail"}
 
 
 def test_a_re_capture_runs_on_a_scratch_database_whatever_the_shell_says(tmp_path):
