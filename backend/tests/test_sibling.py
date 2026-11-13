@@ -121,6 +121,20 @@ def test_the_role_map_the_page_tests_use_is_the_one_the_meta_route_answers(tmp_p
     assert "fx.metaRoles" in body and "fx.meta" in body and '"manage_members"' not in body, "metaFor builds the role map from the fixtures"
 
 
+def test_the_web_apps_role_matrix_is_the_servers():
+    # UI/UX plan K4's fallback (G9 item 1; Part H, H3.3): until GET /api/meta sends role_matrix, the web app keeps a static copy of auth.PERMISSIONS in
+    # frontend/src/lib/role-matrix.ts (the role chip's "What you can do here" and the role line read it); its own test holds it to meta_roles.json,
+    # and this one to the map itself, so a change of a permission's roles fails here, naming the file to change
+    from gridlytics import auth
+    text = _web("frontend/src/lib/role-matrix.ts")
+    block = text[text.index("export const ROLE_MATRIX"):]
+    block = block[block.index("{") + 1:block.index("\n};")]
+    copy = {perm: set(re.findall(r'"([a-z]+)"', roles)) for perm, roles in re.findall(r"^\s*([a-z_]+): \[([^\]]*)\],?$", block, re.M)}
+    assert copy == {p: set(who) for p, who in auth.PERMISSIONS.items()}, "change frontend/src/lib/role-matrix.ts's ROLE_MATRIX to auth.PERMISSIONS"
+    roles = re.search(r"export const ROLES: Role\[\] = \[([^\]]*)\];", text)
+    assert roles and set(re.findall(r'"([a-z]+)"', roles.group(1))) == set(auth.ROLES)
+
+
 def test_the_web_apps_sign_in_refusal_table_is_the_servers():
     # api.SIGN_IN_CODES: each code and its status, as the web app's table of what a refusal does (authstate.test.ts) lists them; the table's other
     # rows are the page's own codes (forbidden, invalid)
