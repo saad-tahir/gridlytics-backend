@@ -17,7 +17,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from . import store, tariff_data, telemetry
-from .schemas import Strict, check
+from .schemas import FieldProblem, Strict, check
 
 TIERS = ("monitor", "advisory_writes", "closed_loop")
 DISCO_GROUPS = ("xwdisco", "ke")
@@ -309,6 +309,11 @@ class InverterFields(Strict):
     firmware: str = Field("", max_length=40)
 
 
+#: The entry forms a battery's capacity is given in (plan A8.4, C5.4; UX backend ask K7): its nameplate energy in kWh, or a capacity in Ah at a nominal
+#: voltage (lead-acid and many LFP racks are labelled so)
+BATTERY_ENTRY = ("kwh", "ah")
+
+
 class BatteryFields(Strict):
     nameplate_kwh: float = Field(gt=0, le=100000)
     soh: float = Field(1.0, gt=0.3, le=1.0)
@@ -321,12 +326,59 @@ class BatteryFields(Strict):
     replacement_cost_per_kwh: float = Field(52000.0, ge=0, le=500000)
     warranted_cycles: float = Field(6000.0, ge=100, le=20000)
     warranted_depth: float = Field(0.8, gt=0.1, le=1.0)
+    #: the form the capacity was given in (UX backend ask K7), so set-up reopens the way it was filled in and Review repeats it ("1,000 Ah at 51.2
+    #: V, 51.2 kWh nominal"): "kwh", the nameplate energy as typed; "ah", a capacity in Ah at a nominal voltage, whose kWh nameplate_kwh is (Ah x V
+    #: / 1,000, worked out where the save leaves it out). The engine reads nameplate_kwh alone. The Ah and the voltage are kept with the Ah form only:
+    #: the kWh form keeps neither (null). Left out, the form is the Ah one where a capacity in Ah is given, else kWh (a battery saved before)
+    entry_unit: Literal[BATTERY_ENTRY] = Field("kwh", title="The capacity's entry form")
+    capacity_ah: float | None = Field(None, gt=0, le=10_000_000, title="The capacity (Ah)")
+    nominal_v: float | None = Field(None, ge=12, le=1000, title="The nominal voltage (V)")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _entry_form(cls, v):
+        """The entry form where the save leaves it out, the kWh form without an Ah or a voltage, and the Ah form's kWh where it is left out."""
+        if not isinstance(v, dict):
+            return v
+        unit = v.get("entry_unit")
+        if unit is None:
+            unit = "ah" if v.get("capacity_ah") is not None else "kwh"
+            v = {**v, "entry_unit": unit}
+        if unit == "kwh":
+            return {**v, "capacity_ah": None, "nominal_v": None}
+        if unit == "ah" and v.get("nameplate_kwh") is None:
+            ah, volts = v.get("capacity_ah"), v.get("nominal_v")
+            if not _number(ah):
+                raise FieldProblem("Give the battery's capacity in Ah", "capacity_ah")
+            if not _number(volts):
+                raise FieldProblem("A capacity in Ah needs the battery's nominal voltage (V)", "nominal_v")
+            v = {**v, "nameplate_kwh": round(float(ah) * float(volts) / 1000.0, 3)}
+        return v
 
     @model_validator(mode="after")
     def _band(self):
         if self.soc_min >= self.soc_max:
-            raise ValueError("The battery's lowest state of charge must be below its highest")
+            raise FieldProblem("The battery's lowest state of charge must be below its highest", "soc_min")
         return self
+
+    @model_validator(mode="after")
+    def _ah_agrees(self):
+        """The kWh the plan counts on is the capacity in Ah times the nominal voltage, as the genset's kW is its kVA times its power factor."""
+        if self.entry_unit != "ah":
+            return self
+        if self.capacity_ah is None:
+            raise FieldProblem("Give the battery's capacity in Ah", "capacity_ah")
+        if self.nominal_v is None:
+            raise FieldProblem("A capacity in Ah needs the battery's nominal voltage (V)", "nominal_v")
+        kwh = self.capacity_ah * self.nominal_v / 1000.0
+        if abs(self.nameplate_kwh - kwh) > max(0.05, 0.001 * kwh):
+            raise FieldProblem(f"A battery's energy is its capacity in Ah times its nominal voltage: {_num(self.capacity_ah)} Ah at "
+                               f"{_num(self.nominal_v)} V is {_num(kwh)} kWh", "capacity_ah")
+        return self
+
+
+def _number(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
 #: The upper bound of the genset's money figures and tank, with the sentence a larger one is refused in (the web app's site-form.ts has the same bounds)
@@ -362,6 +414,8 @@ def genset_fuel_unit(genset: dict | None) -> str | None:
 #: A curve in the other fuel's unit: a diesel slope under 0.1 L a kWh would burn under one kWh of diesel for a kWh out, and a gas slope over 0.05 MMBtu
 #: a kWh (under 7 % efficient) or a no-load term over 0.01 MMBtu an hour per rated kW is a diesel curve in litres
 HSD_A_MIN, GAS_A_MAX, GAS_B_MAX = 0.1, 0.05, 0.01
+#: The entry forms a genset's rating is given in (plan A8.3, C5.5; UX backend ask K7): the nameplate's prime rating in kVA with its power factor, or kW
+GENSET_ENTRY = ("kva", "kw")
 
 
 class GensetFields(Strict):
@@ -384,6 +438,10 @@ class GensetFields(Strict):
     #: None: a rating given in kW only, as before
     rated_kva: float | None = Field(None, gt=0, le=62500)
     power_factor: float = Field(0.8, ge=0.5, le=1.0)
+    #: the form the rating was given in (plan A8.3, C5.5; UX backend ask K7), so set-up reopens the way it was filled in and Review repeats it ("500
+    #: kVA at 0.80: 400 kW usable"): "kva", the nameplate's prime rating in kVA at its power factor (rated_kw is their product); "kw", a rating in kW
+    #: alone, with no kVA kept (null). Left out, the form is kVA where a rating in kVA is given, else kW, as a save of before was read
+    rating_entry: Literal[GENSET_ENTRY] = Field("kw", title="The rating's entry form")
 
     @field_validator("c_start_rs", "c_runhr_rs", "c_om_rs_per_kwh", "tank_l")
     @classmethod
@@ -406,21 +464,34 @@ class GensetFields(Strict):
     @model_validator(mode="before")
     @classmethod
     def _kw_from_kva(cls, v):
-        """A rating given in kVA alone: its kW at the power factor (0.8 where it is left out)."""
-        if isinstance(v, dict) and "rated_kw" not in v and isinstance(v.get("rated_kva"), (int, float)) and not isinstance(v.get("rated_kva"), bool):
+        """The rating's entry form where the save leaves it out (UX backend ask K7), the kW form without a kVA, and a rating given in kVA alone: its kW
+        at the power factor (0.8 where it is left out)."""
+        if not isinstance(v, dict):
+            return v
+        form = v.get("rating_entry")
+        if form is None:
+            form = "kva" if _number(v.get("rated_kva")) else "kw"
+            v = {**v, "rating_entry": form}
+        if form == "kw":
+            return {**v, "rated_kva": None}
+        if form == "kva" and v.get("rated_kw") is None:
+            if not _number(v.get("rated_kva")):
+                raise FieldProblem("Give the genset's prime rating in kVA, or choose a rating in kW", "rated_kva")
             pf = v.get("power_factor", 0.8)
-            if isinstance(pf, (int, float)) and not isinstance(pf, bool):
+            if _number(pf):
                 v = {**v, "rated_kw": round(float(v["rated_kva"]) * float(pf), 3)}
         return v
 
     @model_validator(mode="after")
     def _kva_agrees(self):
         """The kW the plan counts on is the nameplate's kVA times its power factor."""
+        if self.rating_entry == "kva" and self.rated_kva is None:
+            raise FieldProblem("Give the genset's prime rating in kVA, or choose a rating in kW", "rated_kva")
         if self.rated_kva is not None:
             kw = self.rated_kva * self.power_factor
             if abs(self.rated_kw - kw) > max(0.05, 0.001 * kw):
-                raise ValueError(f"A genset's rating in kW is its kVA times its power factor: {_num(self.rated_kva)} kVA at {self.power_factor:g} is "
-                                 f"{_num(kw)} kW")
+                raise FieldProblem(f"A genset's rating in kW is its kVA times its power factor: {_num(self.rated_kva)} kVA at {self.power_factor:g} is "
+                                   f"{_num(kw)} kW", "rated_kva")
         return self
 
     @model_validator(mode="after")
@@ -428,13 +499,13 @@ class GensetFields(Strict):
         """A curve in the fuel's own unit, and no tank on piped gas."""
         if self.fuel_kind in GAS_FUELS:
             if self.a > GAS_A_MAX:
-                raise ValueError(f"A gas genset's fuel curve is in MMBtu: its slope (a) is at most {GAS_A_MAX} MMBtu per kWh")
+                raise FieldProblem(f"A gas genset's fuel curve is in MMBtu: its slope (a) is at most {GAS_A_MAX} MMBtu per kWh", "a")
             if self.b > GAS_B_MAX:
-                raise ValueError(f"A gas genset's fuel at no load (b) is at most {GAS_B_MAX} MMBtu an hour per rated kW")
+                raise FieldProblem(f"A gas genset's fuel at no load (b) is at most {GAS_B_MAX} MMBtu an hour per rated kW", "b")
             if self.tank_l > 0:
-                raise ValueError("A genset on piped gas has no tank: its tank is 0 L")
+                raise FieldProblem("A genset on piped gas has no tank: its tank is 0 L", "tank_l")
         elif self.a < HSD_A_MIN:
-            raise ValueError(f"A diesel genset's fuel curve is in litres: its slope (a) is at least {HSD_A_MIN} L per kWh")
+            raise FieldProblem(f"A diesel genset's fuel curve is in litres: its slope (a) is at least {HSD_A_MIN} L per kWh", "a")
         return self
 
 
@@ -665,14 +736,25 @@ def put_connection(site_id: str, fields: dict, by: str, conn_id: str | None = No
     return next(c for c in connections(site_id) if c["id"] == cid)
 
 
+def with_entry_form(role: str, data: dict) -> dict:
+    """A stored asset with its entry form (UX backend ask K7): a battery or genset saved before the form was kept reads as the form it was saved in, as
+    the models take a save that leaves it out (a battery's kWh, a genset's kVA where it has one, else kW)."""
+    if role == "battery":
+        return {"entry_unit": "ah" if data.get("capacity_ah") is not None else "kwh", "capacity_ah": None, "nominal_v": None, **data}
+    if role == "genset":
+        return {"rating_entry": "kva" if data.get("rated_kva") is not None else "kw", **data}
+    return data
+
+
 def assets(site_id: str) -> dict:
-    """The site's assets by role: {'pv': {...}, 'inverter': {...}, 'battery': {...}, 'genset': {...}} (one each in v1)."""
+    """The site's assets by role: {'pv': {...}, 'inverter': {...}, 'battery': {...}, 'genset': {...}} (one each in v1), a battery's and a genset's
+    with their entry form (with_entry_form)."""
     with store.connect() as con:
         rows = con.execute("SELECT * FROM assets WHERE site_id = ? ORDER BY created", (site_id,)).fetchall()
     out: dict = {}
     for r in rows:
         d = store.row(r)
-        out[d["role"]] = {**d["data"], "id": d["id"]}
+        out[d["role"]] = {**with_entry_form(d["role"], d["data"]), "id": d["id"]}
     return out
 
 
@@ -685,14 +767,16 @@ def put_asset(site_id: str, role: str, fields: dict, by: str, if_unchanged=UNCHE
     now = _now()
     with store.write_transaction() as con:
         held = con.execute("SELECT id, data FROM assets WHERE site_id = ? AND role = ?", (site_id, role)).fetchone()
-        check_unchanged(json.loads(held["data"]) if held else None, if_unchanged, f"The {ASSET_NAMES[role]}")
+        # compared as the client read it: with its entry form, which a battery or genset saved before UX K7 does not store
+        check_unchanged(with_entry_form(role, json.loads(held["data"])) if held else None, if_unchanged, f"The {ASSET_NAMES[role]}")
         if held:
             con.execute("UPDATE assets SET data = ?, updated = ? WHERE id = ?", (json.dumps(data), now, held["id"]))
         else:
             con.execute("INSERT INTO assets (id, site_id, role, data, created, updated) VALUES (?,?,?,?,?,?)",
                         (store.new_id(), site_id, role, json.dumps(data), now, now))
         # each changed field before and after, the money settings (the battery's price, the genset's costs) included (round 7, audit security-roles-04)
-        store.audit(by, f"saved the {role}", site_id, {"changes": store.changes(json.loads(held["data"]) if held else None, data)}, con=con)
+        store.audit(by, f"saved the {role}", site_id, {"changes": store.changes(with_entry_form(role, json.loads(held["data"])) if held else None, data)},
+                    con=con)
     return assets(site_id)[role]
 
 

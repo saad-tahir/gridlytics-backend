@@ -465,6 +465,27 @@ without the fix (`test_ux_k32_check`, and the API and role walks); none was wron
   submit, withdraw, a draft read and discarded) and the role walk (submit and discard refused to a viewer, a key and an operator; the operator's
   simulation of a waiting version read); an analyst's discard, submit, preview and simulation of an administrator's draft each read 404.
 
+### Batch k6: K5, K6, K7, K9, K10, K11 (13 Nov 2026)
+
+Set-up's asks (plan C19.2; step 9). No schema change: the entry forms are fields of an asset's stored JSON, read with their form where a battery or
+genset was saved before, so no migration or copy of the company's file was needed.
+
+- **K7, the entry forms** (plan A8.2 to A8.4, C5.4, C5.5): `BatteryFields` keeps `entry_unit` ("kwh" or "ah"), and in the Ah form `capacity_ah` and
+  `nominal_v` (12 to 1,000 V), whose product is `nameplate_kwh`, the one figure the engine reads; `GensetFields` keeps `rating_entry` ("kva" or "kw")
+  beside the kVA and power factor it already stored. The rule is the genset's of round 7 (flow-onboarding-16), applied to both: the canonical figure
+  is worked out from the entry form where the save leaves it out and refused where it disagrees. Decisions the plan left open:
+  - **The other form's figures are not kept.** The kWh form stores no Ah and no voltage, and the kW form no kVA, whatever the save sends: the page
+    may hold the other form's figures while the person switches, and a refusal there would stop a save the person sees as plain; keeping them would
+    store an Ah and a kWh that no longer agree once the kWh is retyped. The stored kWh and kW never move when the form is switched (A8.2, tested
+    three times round).
+  - **A save that leaves the form out** reads as the form it gives (a capacity in Ah, a kVA), else kWh or kW, so the web app of before saves as it
+    did. A battery or genset stored before reads so too (`sites.with_entry_form`), and the optimistic check and the audit compare the stored asset as
+    it is read, so a save sent back with the form it was read with is no conflict and records no change of form.
+  - **The form is not money**: an operator saves it (`edit_sites`).
+  - **"Review and the PDF repeat them"** (C19.2): Review reads the stored form from the site answer. No PDF prints the battery's or the genset's rating
+    today, so there is nothing to repeat yet.
+  - Every refusal of a number field now says a whole bound as a whole number ("at least 12", where "at least 12.0" was said) (`schemas`).
+
 ## 2026-11-08 Round 6: chained savings replays (HANDOFF 8.A.1)
 
 Before, each day's native and tuned replays started from the actual arm's state at 00:00, and the day's carry-over valued the whole end-of-day gap in

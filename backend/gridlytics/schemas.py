@@ -55,31 +55,64 @@ def _clause(text: str) -> str:
     return text[:1].lower() + text[1:] if plain else text
 
 
-def message(exc: ValidationError, model: type[BaseModel] | None = None) -> str:
+def _sentence(e: dict, titles: dict, items: dict) -> str:
+    """One validation error in the refusals' words."""
+    loc = tuple(e["loc"])
+    text = e["msg"].removeprefix("Value error, ")
+    label = _label(loc, titles, items) if loc else ""
+    if not loc or e["type"] == "value_error":
+        return text
+    if e["type"] == "extra_forbidden":
+        return f"Unknown field '{'.'.join(str(p) for p in loc)}'"
+    if e["type"] == "string_too_short":
+        n = (e.get("ctx") or {}).get("min_length", 1)
+        return f"{label} is needed" if n <= 1 else f"{label} must be at least {n} characters"
+    if e["type"] in ("too_long", "too_short"):
+        # a list's length (UX K32 check): pydantic's own words are "List should have at most 7 items after validation, not 8"
+        ctx = e.get("ctx") or {}
+        n = ctx.get("max_length") if e["type"] == "too_long" else ctx.get("min_length")
+        return f"{label} must have {'at most' if e['type'] == 'too_long' else 'at least'} {n} item{'' if n == 1 else 's'}"
+    if e["type"] in _WORDS:
+        # a whole bound of a number field as a whole number: "at least 12", not "at least 12.0" (UX K7)
+        ctx = {k: int(v) if isinstance(v, float) and v.is_integer() else v for k, v in (e.get("ctx") or {}).items()}
+        return _WORDS[e["type"]].format(label=label, **ctx)
+    return f"{label}: {text}"
+
+
+def _names(model: type[BaseModel] | None) -> tuple[dict, dict]:
     fields = model.model_fields if model is not None else {}
     titles = {k: f.title for k, f in fields.items() if f.title}
     items = {k: f.json_schema_extra["item"] for k, f in fields.items() if isinstance(f.json_schema_extra, dict) and f.json_schema_extra.get("item")}
-    parts = []
-    for e in exc.errors()[:4]:
+    return titles, items
+
+
+def problems(exc: ValidationError, model: type[BaseModel] | None = None) -> list[tuple[tuple, str]]:
+    """Every error of a validation, each (the field's path, its sentence in the refusals' words), in pydantic's order: what a set-up check lists one
+    a field (UX backend ask K6). A model's own check that concerns one field (`FieldProblem`, raised inside a model validator, which pydantic places on
+    the model) is placed on that field."""
+    titles, items = _names(model)
+    out = []
+    for e in exc.errors():
         loc = tuple(e["loc"])
-        text = e["msg"].removeprefix("Value error, ")
-        label = _label(loc, titles, items) if loc else ""
-        if not loc or e["type"] == "value_error":
-            parts.append(text)
-        elif e["type"] == "extra_forbidden":
-            parts.append(f"Unknown field '{'.'.join(str(p) for p in loc)}'")
-        elif e["type"] == "string_too_short":
-            n = (e.get("ctx") or {}).get("min_length", 1)
-            parts.append(f"{label} is needed" if n <= 1 else f"{label} must be at least {n} characters")
-        elif e["type"] in ("too_long", "too_short"):
-            # a list's length (UX K32 check): pydantic's own words are "List should have at most 7 items after validation, not 8"
-            ctx = e.get("ctx") or {}
-            n = ctx.get("max_length") if e["type"] == "too_long" else ctx.get("min_length")
-            parts.append(f"{label} must have {'at most' if e['type'] == 'too_long' else 'at least'} {n} item{'' if n == 1 else 's'}")
-        elif e["type"] in _WORDS:
-            parts.append(_WORDS[e["type"]].format(label=label, **(e.get("ctx") or {})))
-        else:
-            parts.append(f"{label}: {text}")
+        err = (e.get("ctx") or {}).get("error")
+        if e["type"] == "value_error" and isinstance(err, FieldProblem):
+            loc = loc + tuple(err.field.split("."))
+        out.append((loc, _sentence(e, titles, items)))
+    return out
+
+
+class FieldProblem(ValueError):
+    """A model's check that concerns one field (`field`, dotted from the model): its refusal reads as any other, one sentence; the set-up check ties it
+    to that field (UX backend ask K6)."""
+
+    def __init__(self, sentence: str, field: str):
+        super().__init__(sentence)
+        self.field = field
+
+
+def message(exc: ValidationError, model: type[BaseModel] | None = None) -> str:
+    titles, items = _names(model)
+    parts = [_sentence(e, titles, items) for e in exc.errors()[:4]]
     more = len(exc.errors()) - 4
     return "; ".join(parts[:1] + [_clause(p) for p in parts[1:]]) + (f"; and {more} more" if more > 0 else "")
 
